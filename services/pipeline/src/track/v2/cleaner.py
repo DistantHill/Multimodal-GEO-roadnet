@@ -1,0 +1,287 @@
+from __future__ import annotations
+
+import math
+from collections.abc import Iterator
+from dataclasses import replace
+
+from .models import (
+    CleanReport,
+    CleanerConfig,
+    CleanerResult,
+    ExcludedIndex,
+    ExcludedPoint,
+    FieldMapping,
+    PointRef,
+    ReadReport,
+    SourceInfo,
+    TrajectoryPoint,
+    TrajectorySourceHandle,
+)
+
+
+EARTH_RADIUS_M = 6_371_000.0
+EXCLUDED_SAMPLE_MAX = 50
+
+
+def clean(
+    source: TrajectorySourceHandle,
+    *,
+    config: CleanerConfig | None = None,
+) -> CleanerResult:
+    cfg = config or CleanerConfig()
+    active: list[TrajectoryPoint] = []
+    excluded: list[ExcludedPoint] = []
+    injected_count = 0
+
+    for vehicle_points in _group_by_vehicle(source.iter_points()):
+        subtracks = _split_by_gaps(vehicle_points, cfg.max_gap_s)
+        rename = len(subtracks) > 1
+        for index, subtrack in enumerate(subtracks, start=1):
+            if rename:
+                subtrack = [_with_vehicle_id(point, f"{point.vehicle_id}_seg{index:02d}") for point in subtrack]
+            kept, removed = _exclude_stationary(subtrack, cfg)
+            excluded.extend(removed)
+            injected_subtrack, count = _inject_orthogonal(kept, cfg)
+            active.extend(injected_subtrack)
+            injected_count += count
+
+    excluded_index = ExcludedIndex(excluded)
+    report = CleanReport(
+        active_count=len(active),
+        excluded_count=len(excluded),
+        injected_count=injected_count,
+        excluded_reasons=excluded_index.reason_counts(),
+        sample_excluded=[(item.point_ref, item.reason) for item in excluded[:EXCLUDED_SAMPLE_MAX]],
+    )
+    return CleanerResult(
+        active=ListTrajectorySourceHandle(active, source_info=source.source_info, field_mapping=source.field_mapping),
+        excluded=excluded_index,
+        report=report,
+    )
+
+
+class ListTrajectorySourceHandle:
+    def __init__(
+        self,
+        points: list[TrajectoryPoint],
+        *,
+        source_info: SourceInfo,
+        field_mapping: FieldMapping,
+    ) -> None:
+        self._points = list(points)
+        self._source_info = source_info
+        self._field_mapping = field_mapping
+        self._closed = False
+        self._report = ReadReport(
+            source_info=source_info,
+            total_rows=len(points),
+            loaded_rows=len(points),
+            skipped_rows=0,
+            warn_count=0,
+            error_count=0,
+            fatal_count=0,
+            sample_errors=[],
+            sample_errors_max=0,
+        )
+
+    @property
+    def source_info(self) -> SourceInfo:
+        return self._source_info
+
+    @property
+    def field_mapping(self) -> FieldMapping:
+        return self._field_mapping
+
+    @property
+    def report(self) -> ReadReport:
+        return self._report
+
+    @property
+    def read_report(self) -> ReadReport:
+        return self._report
+
+    def get_report(self) -> ReadReport:
+        return self._report
+
+    def iter_points(self) -> Iterator[TrajectoryPoint]:
+        if self._closed:
+            raise RuntimeError("trajectory source handle is closed")
+        yield from self._points
+
+    def close(self) -> None:
+        self._closed = True
+
+    def __enter__(self) -> "ListTrajectorySourceHandle":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+
+def _group_by_vehicle(points: Iterator[TrajectoryPoint]) -> Iterator[list[TrajectoryPoint]]:
+    current_vehicle: str | None = None
+    current: list[TrajectoryPoint] = []
+    for point in points:
+        if current_vehicle is None:
+            current_vehicle = point.vehicle_id
+        if point.vehicle_id != current_vehicle:
+            yield current
+            current = []
+            current_vehicle = point.vehicle_id
+        current.append(point)
+    if current:
+        yield current
+
+
+def _split_by_gaps(points: list[TrajectoryPoint], max_gap_s: float) -> list[list[TrajectoryPoint]]:
+    if not points:
+        return []
+    subtracks: list[list[TrajectoryPoint]] = [[points[0]]]
+    for previous, current in zip(points, points[1:]):
+        if current.timestamp - previous.timestamp > max_gap_s:
+            subtracks.append([])
+        subtracks[-1].append(current)
+    return subtracks
+
+
+def _exclude_stationary(
+    points: list[TrajectoryPoint],
+    cfg: CleanerConfig,
+) -> tuple[list[TrajectoryPoint], list[ExcludedPoint]]:
+    if len(points) < 3:
+        return list(points), []
+
+    excluded_refs: set[PointRef] = set()
+    index = 0
+    while index < len(points):
+        if points[index].speed >= cfg.min_speed_mps:
+            index += 1
+            continue
+        start = index
+        while index + 1 < len(points) and points[index + 1].speed < cfg.min_speed_mps:
+            index += 1
+        stop = index
+        if stop > start and points[stop].timestamp - points[start].timestamp > cfg.max_stationary_duration_s:
+            for point in points[start + 1 : stop]:
+                excluded_refs.add(point.point_ref)
+        index += 1
+
+    kept: list[TrajectoryPoint] = []
+    removed: list[ExcludedPoint] = []
+    for point in points:
+        if point.point_ref in excluded_refs:
+            removed.append(ExcludedPoint(point.point_ref, "stationary"))
+        else:
+            kept.append(point)
+    return kept, removed
+
+
+def _inject_orthogonal(
+    points: list[TrajectoryPoint],
+    cfg: CleanerConfig,
+) -> tuple[list[TrajectoryPoint], int]:
+    if len(points) < 2:
+        return list(points), 0
+
+    output: list[TrajectoryPoint] = []
+    injected_count = 0
+    for a, b in zip(points, points[1:]):
+        output.append(a)
+        injected = _orthogonal_candidate(a, b, cfg)
+        if injected is not None:
+            output.append(injected)
+            injected_count += 1
+    output.append(points[-1])
+    return output, injected_count
+
+
+def _orthogonal_candidate(
+    a: TrajectoryPoint,
+    b: TrajectoryPoint,
+    cfg: CleanerConfig,
+) -> TrajectoryPoint | None:
+    if a.vehicle_id != b.vehicle_id:
+        return None
+    delta = angle_delta_deg(a.heading, b.heading)
+    if not cfg.min_heading_delta_deg <= abs(delta) <= cfg.max_heading_delta_deg:
+        return None
+
+    b_xy = lonlat_to_xy_m(b.lon, b.lat, a.lon, a.lat)
+    ray_a = heading_vector((a.heading + 180.0) % 360.0)
+    ray_b = heading_vector((b.heading + 180.0) % 360.0)
+    hit = ray_intersection((0.0, 0.0), ray_a, b_xy, ray_b)
+    if hit is None:
+        return None
+    x, y, distance_a, distance_b = hit
+    if distance_a < 0.0 or distance_b < 0.0:
+        return None
+    if distance_a > cfg.max_extension_m or distance_b > cfg.max_extension_m:
+        return None
+
+    lon, lat = xy_m_to_lonlat(x, y, a.lon, a.lat)
+    return TrajectoryPoint(
+        point_ref=PointRef(
+            source_id=a.point_ref.source_id,
+            source_row_key=f"{a.point_ref.source_row_key}->{b.point_ref.source_row_key}:orthogonal_heading",
+            stable=False,
+            from_ref=a.point_ref.source_row_key,
+            to_ref=b.point_ref.source_row_key,
+            generated_reason="orthogonal_heading",
+        ),
+        vehicle_id=a.vehicle_id,
+        timestamp=(a.timestamp + b.timestamp) / 2.0,
+        lon=lon,
+        lat=lat,
+        heading=(a.heading + delta / 2.0) % 360.0,
+        speed=0.0,
+        extra={},
+    )
+
+
+def _with_vehicle_id(point: TrajectoryPoint, vehicle_id: str) -> TrajectoryPoint:
+    return replace(point, vehicle_id=vehicle_id)
+
+
+def angle_delta_deg(start: float, end: float) -> float:
+    return (end - start + 180.0) % 360.0 - 180.0
+
+
+def heading_vector(heading_deg: float) -> tuple[float, float]:
+    radians = math.radians(heading_deg)
+    return math.sin(radians), math.cos(radians)
+
+
+def ray_intersection(
+    origin_a: tuple[float, float],
+    direction_a: tuple[float, float],
+    origin_b: tuple[float, float],
+    direction_b: tuple[float, float],
+) -> tuple[float, float, float, float] | None:
+    m00 = direction_a[0]
+    m01 = -direction_b[0]
+    m10 = direction_a[1]
+    m11 = -direction_b[1]
+    rhs_x = origin_b[0] - origin_a[0]
+    rhs_y = origin_b[1] - origin_a[1]
+    det = m00 * m11 - m01 * m10
+    if abs(det) < 1e-9:
+        return None
+    ta = (rhs_x * m11 - m01 * rhs_y) / det
+    tb = (m00 * rhs_y - rhs_x * m10) / det
+    x = origin_a[0] + ta * direction_a[0]
+    y = origin_a[1] + ta * direction_a[1]
+    return x, y, ta, tb
+
+
+def lonlat_to_xy_m(lon: float, lat: float, origin_lon: float, origin_lat: float) -> tuple[float, float]:
+    lat0 = math.radians(origin_lat)
+    x = EARTH_RADIUS_M * math.radians(lon - origin_lon) * math.cos(lat0)
+    y = EARTH_RADIUS_M * math.radians(lat - origin_lat)
+    return x, y
+
+
+def xy_m_to_lonlat(x: float, y: float, origin_lon: float, origin_lat: float) -> tuple[float, float]:
+    lat0 = math.radians(origin_lat)
+    lon = origin_lon + math.degrees(x / (EARTH_RADIUS_M * math.cos(lat0)))
+    lat = origin_lat + math.degrees(y / EARTH_RADIUS_M)
+    return lon, lat

@@ -7,10 +7,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from v2._geometry import _to_xy
-from v2.cleaner1 import CleanerConfig, clean
-from v2.exceptions import V2Error
-from v2.intersect2 import (
+from track.v2._geometry import _to_xy
+from track.v2.cleaner1 import CleanerConfig, clean
+from track.v2.exceptions import V2Error
+from track.v2.intersect2 import (
     IntersectConfig,
     IntersectResult,
     _cluster_angles_greedy,
@@ -26,7 +26,7 @@ from v2.intersect2 import (
     _select_hotspot_events,
     detect_intersections,
 )
-from v2.models import (
+from track.v2.models import (
     EntryExitObservation,
     HotspotCluster,
     IntersectReport,
@@ -36,7 +36,7 @@ from v2.models import (
     TrajectoryPoint,
     TurnEvent,
 )
-from v2.parser0 import CsvSource, get_database
+from track.v2.parser0 import CsvSource, get_database
 
 
 # ── Helpers ────────────────────────────────────────────────────────────

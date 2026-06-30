@@ -1,45 +1,18 @@
-"""track.v2 — re-export adapter for the v2 package.
+"""track.v2 — Step-based trajectory pipeline.
 
-The actual implementation lives in the top-level ``v2`` package.
-This module provides the ``track.v2`` import path expected by tests
-and linter-generated code.
+Architecture (linear):
+    Parser 0  →  Cleaner 1  →  Intersect2  →  Clip  →  Fitting  →  Network
+
+Each stage has a single public entry point and produces frozen intermediate
+artifacts. No stage mutates another stage's output.
+
+Intersect2 uses two complementary methods:
+  1. Turn events: bearing-change detection → Getis-Ord G* → DBSCAN
+  2. Orthogonal candidates: Cleaner 1 injection points → DBSCAN
+Both feed into the same topology verification (entry/exit → branch clustering).
 """
 
-from v2.exceptions import (
-    ConfigError,
-    DataSourceCorrupted,
-    FieldSelectionRequired,
-    TrajectoryOrderError,
-    V2Error,
-)
-from v2.models import (
-    CleanReport,
-    CleanerConfig,
-    CleanerResult,
-    CsvSource,
-    EntryExitObservation,
-    ExcludedIndex,
-    ExcludedPoint,
-    FieldMapping,
-    FieldSpec,
-    HotspotCluster,
-    IntersectReport,
-    IntersectionTopology,
-    OrthogonalCandidate,
-    ParseIssue,
-    PointRef,
-    PostgresSource,
-    ReadReport,
-    SourceInfo,
-    TrackModel,
-    TrajectoryPoint,
-    TurnEvent,
-)
-from v2.parser0 import (
-    CsvSource,
-    PostgresSource,
-    TrajectorySourceHandle,
-    get_database,
-)
-from v2.cleaner1 import clean
-from v2.intersect2 import detect_intersections, IntersectConfig, IntersectResult
+from .cleaner1 import clean
+from .intersect2 import IntersectConfig, IntersectResult, detect_intersections
+from .parser0 import get_database
+

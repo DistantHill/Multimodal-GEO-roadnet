@@ -1,2 +1,425 @@
-"""Adapter: routes track.v2.models → v2.models."""
-from v2.models import *
+"""Unified base class for all v2 output models.
+
+All output models inherit from TrackModel, which provides as_dict() and
+format_print(). Parser 0 and Cleaner 1 models (TrajectoryPoint, PointRef,
+FieldSpec, ReadReport, etc.) are defined here per the v2 PRD §3.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import dataclass, field, fields, is_dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Callable, Iterator, Protocol, TextIO
+
+
+ColumnSelector = Callable[[list[str]], dict[str, str]]
+
+
+# ── TrackModel base ────────────────────────────────────────────────
+
+
+class TrackModel:
+    """Base class for all v2 output models.
+
+    Every v2 output is a frozen dataclass inheriting from TrackModel.
+    Subclasses get:
+      - as_dict()       → recursive JSON-safe dict
+      - format_print()  → pretty-print key: value pairs
+    """
+
+    def as_dict(self) -> dict[str, Any]:
+        """Recursive, JSON-safe dictionary representation."""
+        return _to_output_value(self)  # type: ignore[return-value]
+
+    def format_print(
+        self,
+        *,
+        title: str | None = None,
+        file: TextIO | None = None,
+    ) -> None:
+        """Pretty-print as ``title:`` followed by ``  key: value`` lines."""
+        out = file if file is not None else sys.stdout
+        if title is not None:
+            print(title, file=out)
+        for key, value in self.as_dict().items():
+            print(f"  {key}: {_format_scalar(value)}", file=out)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TrackModel:
+        """Wrap a plain dict as a lightweight TrackModel for ad-hoc printing.
+
+        Use when you have a one-off key-value mapping and want
+        ``.format_print()`` without defining a full dataclass.
+        """
+        return _DictModel(data)
+
+
+class _DictModel(TrackModel):
+    """Internal: TrackModel wrapper around a plain dict."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self._data = dict(data)
+
+    def as_dict(self) -> dict[str, Any]:
+        return _to_output_value(self._data)  # type: ignore[return-value]
+
+
+# ── JSON-safe conversion helper ─────────────────────────────────────
+
+
+def _json_key(value: object) -> str:
+    return value if isinstance(value, str) else str(value)
+
+
+def _to_output_value(value: object) -> object:
+    """Recursively convert common Python types to JSON-safe values."""
+    if is_dataclass(value) and not isinstance(value, type):
+        return {f.name: _to_output_value(getattr(value, f.name)) for f in fields(value)}
+    if isinstance(value, dict):
+        return {_json_key(k): _to_output_value(v) for k, v in value.items()}
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)) and not isinstance(value, (bytes, bytearray, str)):
+        return [_to_output_value(v) for v in value]
+    # numpy array
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        return _to_output_value(tolist())
+    item = getattr(value, "item", None)
+    if callable(item):
+        return _to_output_value(item())
+    as_dict = getattr(value, "as_dict", None)
+    if callable(as_dict):
+        return _to_output_value(as_dict())
+    return str(value)
+
+
+def _format_scalar(value: object) -> str:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"{value:,}"
+    return str(value)
+
+
+# ── Parser 0 + Cleaner 1 output models ──────────────────────────────
+
+
+@dataclass(frozen=True)
+class PointRef(TrackModel):
+    """Immutable reference to one point in the source data.
+
+    PRD §3.2
+    """
+
+    source_id: str
+    source_row_key: str
+    stable: bool
+    from_ref: str | None = None
+    to_ref: str | None = None
+    generated_reason: str = ""
+
+
+@dataclass(frozen=True)
+class TrajectoryPoint(TrackModel):
+    """Normalized trajectory point emitted by Parser 0 iter_points().
+
+    PRD §3.1
+    """
+
+    point_ref: PointRef
+    vehicle_id: str
+    timestamp: float
+    lon: float
+    lat: float
+    heading: float
+    speed: float
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FieldSpec(TrackModel):
+    """One canonical field definition from TOML config.
+
+    PRD §3.3
+    """
+
+    canonical: str
+    aliases: tuple[str, ...] = ()
+    required: bool = True
+    type: str = "float"
+    unit_scale: float = 1.0
+    default: Any = None
+    extra: bool = False
+
+
+@dataclass(frozen=True)
+class FieldMapping(TrackModel):
+    """Resolved field mapping for one data source.
+
+    PRD §3.3
+    """
+
+    specs: list[FieldSpec]
+    canonical_to_source: dict[str, str]
+
+
+@dataclass(frozen=True)
+class FieldConfig(TrackModel):
+    """Parser 0 field specs plus data-quality thresholds."""
+
+    specs: list[FieldSpec]
+    sample_errors_max: int = 50
+    max_consecutive_errors: int = 50
+    max_error_ratio: float = 1.0
+
+
+@dataclass(frozen=True)
+class SourceInfo(TrackModel):
+    """Metadata about the opened data source.
+
+    PRD §3.4
+    """
+
+    kind: str
+    path_or_dsn: str
+    encoding: str | None
+    column_count: int
+    columns: list[str]
+
+
+@dataclass(frozen=True)
+class ParseIssue(TrackModel):
+    """One data-quality incident recorded during parsing.
+
+    PRD §3.4
+    """
+
+    point_ref: PointRef | None
+    row_number: int | None
+    level: str
+    reason: str
+    raw_values: dict[str, str]
+
+
+@dataclass(frozen=True)
+class ReadReport(TrackModel):
+    """Parser 0 statistics and error samples.
+
+    PRD §3.4
+    """
+
+    source_info: SourceInfo | None  # None means parse failed before reading rows
+    total_rows: int
+    loaded_rows: int
+    skipped_rows: int
+    warn_count: int
+    error_count: int
+    fatal_count: int
+    sample_errors: list[ParseIssue]
+    sample_errors_max: int
+
+
+@dataclass(frozen=True)
+class CleanReport(TrackModel):
+    """Cleaner 1 statistics and excluded-point samples.
+
+    PRD §3.4
+    """
+
+    active_count: int
+    excluded_count: int
+    injected_count: int
+    excluded_reasons: dict[str, int]
+    sample_excluded: list[tuple[PointRef, str]]
+
+
+@dataclass(frozen=True)
+class ExcludedPoint(TrackModel):
+    """One point removed by Cleaner 1."""
+
+    point_ref: PointRef
+    reason: str
+
+
+@dataclass(frozen=True)
+class ExcludedIndex(TrackModel):
+    """Traceable index of points excluded from downstream algorithms."""
+
+    items: list[ExcludedPoint] = field(default_factory=list)
+
+    def by_reason(self, reason: str) -> list[ExcludedPoint]:
+        return [item for item in self.items if item.reason == reason]
+
+    def reason_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for item in self.items:
+            counts[item.reason] = counts.get(item.reason, 0) + 1
+        return counts
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __iter__(self) -> Iterator[ExcludedPoint]:
+        return iter(self.items)
+
+
+@dataclass(frozen=True)
+class CleanerConfig(TrackModel):
+    """Cleaner 1 configuration."""
+
+    max_extension_m: float = 80.0
+    min_heading_delta_deg: float = 80.0
+    max_heading_delta_deg: float = 100.0
+    max_gap_s: float = 120.0
+    min_speed_mps: float = 0.3
+    max_stationary_duration_s: float = 300.0
+
+
+class TrajectorySourceHandle(Protocol):
+    @property
+    def source_info(self) -> SourceInfo: ...
+
+    @property
+    def report(self) -> ReadReport: ...
+
+    @property
+    def read_report(self) -> ReadReport: ...
+
+    @property
+    def field_mapping(self) -> FieldMapping: ...
+
+    def iter_points(self) -> Iterator[TrajectoryPoint]: ...
+
+    def close(self) -> None: ...
+
+    def __enter__(self) -> "TrajectorySourceHandle": ...
+
+    def __exit__(self, *args: object) -> None: ...
+
+
+@dataclass(frozen=True)
+class CleanerResult(TrackModel):
+    active: TrajectorySourceHandle
+    excluded: ExcludedIndex
+    report: CleanReport
+
+
+@dataclass(frozen=True)
+class CsvSource(TrackModel):
+    path: str | Path
+    encoding: str | None = None
+
+
+@dataclass(frozen=True)
+class PostgresSource(TrackModel):
+    config: Any
+    query: str
+    params: tuple[Any, ...] = ()
+    connection_factory: Callable[[Any], Any] | None = None
+    source_id: str | None = None
+    primary_key_field: str = "point_id"
+
+
+# ── Intersect2 output models ──────────────────────────────────────────
+# PRD v2 Intersect2 §3, §7
+
+
+@dataclass(frozen=True)
+class TurnEvent(TrackModel):
+    """Turn event detected at one trajectory point via bearing change.
+
+    v2 differs from v1: no ``scenario`` field (not present on v2 TrajectoryPoint),
+    and no mutable ``g_star`` (z-scores stored in a separate dict).
+    """
+
+    event_id: int
+    vehicle_id: str
+    timestamp: float
+    lon: float
+    lat: float
+    x: float  # meter coordinate
+    y: float  # meter coordinate
+    in_bearing: float  # mean bearing before turn
+    out_bearing: float  # mean bearing after turn
+    turn_deg: float  # signed turn angle in [-180, 180)
+    score: float  # = abs(turn_deg) for ranking
+
+
+@dataclass(frozen=True)
+class OrthogonalCandidate(TrackModel):
+    """Intersection candidate from orthogonal heading injection.
+
+    Cleaner 1 injects synthetic points where two consecutive headings are
+    ~90° apart (``generated_reason="orthogonal_heading"``). Intersect2
+    extracts these as high-confidence intersection candidates.
+    """
+
+    point_ref: PointRef  # derived PointRef with from_ref / to_ref
+    vehicle_id: str
+    timestamp: float
+    lon: float
+    lat: float
+    x: float
+    y: float
+
+
+@dataclass(frozen=True)
+class HotspotCluster(TrackModel):
+    """A DBSCAN cluster of candidate points (turn events or orthogonal candidates).
+
+    Uses ``tuple`` for events to preserve frozen-dataclass immutability.
+    """
+
+    cluster_id: int
+    centroid_x: float
+    centroid_y: float
+    centroid_lon: float
+    centroid_lat: float
+    radius_m: float
+    events: tuple[TurnEvent, ...] = ()
+    source: str = "turn"  # "turn" or "orthogonal"
+
+
+@dataclass(frozen=True)
+class EntryExitObservation(TrackModel):
+    """One vehicle's entry/exit through an intersection circle."""
+
+    cluster_id: int
+    vehicle_id: str
+    entry_branch_angle: float
+    exit_branch_angle: float
+    inbound_bearing: float
+    outbound_bearing: float
+    turn_deg: float
+
+
+@dataclass(frozen=True)
+class IntersectionTopology(TrackModel):
+    """Extracted road topology for one intersection cluster."""
+
+    cluster_id: int
+    branch_centers_deg: list[float]
+    transition_counts: dict[tuple[int, int], int]
+    observation_count: int
+    is_complete: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class IntersectReport(TrackModel):
+    """Intersect2 aggregated statistics."""
+
+    track_count: int
+    turn_event_count: int
+    hotspot_event_count: int
+    orthogonal_candidate_count: int
+    cluster_count: int
+    cluster_count_turn: int
+    cluster_count_ortho: int
+    complete_intersection_count: int
