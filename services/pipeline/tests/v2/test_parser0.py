@@ -10,14 +10,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from v2.exceptions import (
+from track.v2.exceptions import (
     ConfigError,
     DataSourceCorrupted,
     FieldSelectionRequired,
     TrajectoryOrderError,
     V2Error,
 )
-from v2.models import (
+from track.v2.models import (
     FieldMapping,
     FieldSpec,
     ParseIssue,
@@ -26,7 +26,7 @@ from v2.models import (
     TrajectoryPoint,
     TrackModel,
 )
-from v2.parser0 import (
+from track.v2.parser0 import (
     CsvSource,
     PostgresSource,
     _build_field_mapping,
@@ -219,7 +219,10 @@ class CsvPointRefTest(unittest.TestCase):
             )
             source = CsvSource(csv_path)
             handle = get_database(source)
-            points = list(handle.iter_points())
+            try:
+                points = list(handle.iter_points())
+            finally:
+                handle.close()
             self.assertEqual(len(points), 1)
             ref = points[0].point_ref
             self.assertTrue(ref.stable)
@@ -288,8 +291,11 @@ class TrajectoryOrderErrorTest(unittest.TestCase):
             )
             source = CsvSource(csv_path)
             handle = get_database(source)
-            with self.assertRaises(TrajectoryOrderError) as ctx:
-                list(handle.iter_points())
+            try:
+                with self.assertRaises(TrajectoryOrderError) as ctx:
+                    list(handle.iter_points())
+            finally:
+                handle.close()
             self.assertIn("v1", str(ctx.exception))
             self.assertIsNotNone(ctx.exception.prev_point_ref)
             self.assertIsNotNone(ctx.exception.curr_point_ref)
@@ -307,8 +313,14 @@ class CoreFieldSkipTest(unittest.TestCase):
             )
             source = CsvSource(csv_path)
             handle = get_database(source)
-            with self.assertRaises(Exception):
-                list(handle.iter_points())  # Should skip with error
+            try:
+                points = list(handle.iter_points())
+                report = handle.get_report()
+            finally:
+                handle.close()
+            self.assertEqual(points, [])
+            self.assertEqual(report.skipped_rows, 1)
+            self.assertEqual(report.error_count, 1)
 
 
 class HeadingSpeedWarnTest(unittest.TestCase):
@@ -323,7 +335,10 @@ class HeadingSpeedWarnTest(unittest.TestCase):
             )
             source = CsvSource(csv_path)
             handle = get_database(source)
-            points = list(handle.iter_points())
+            try:
+                points = list(handle.iter_points())
+            finally:
+                handle.close()
             self.assertEqual(len(points), 1)
             self.assertEqual(points[0].speed, 0.0)
 
@@ -341,8 +356,11 @@ class ConsecutiveErrorThresholdTest(unittest.TestCase):
             csv_path = _make_csv(td, "test.csv", csv_content)
             source = CsvSource(csv_path)
             handle = get_database(source)
-            with self.assertRaises(DataSourceCorrupted):
-                list(handle.iter_points())
+            try:
+                with self.assertRaises(DataSourceCorrupted):
+                    list(handle.iter_points())
+            finally:
+                handle.close()
 
 
 class ErrorRatioThresholdTest(unittest.TestCase):
@@ -390,11 +408,14 @@ class ReadReportSerializationTest(unittest.TestCase):
             self.assertEqual(handle.read_report.loaded_rows, 0)
 
             # Consume all points
-            points = list(handle.iter_points())
+            try:
+                points = list(handle.iter_points())
+                report = handle.get_report()
+            finally:
+                handle.close()
             self.assertEqual(len(points), 3)
 
             # After iteration: get_report() has actual counts
-            report = handle.get_report()
             self.assertEqual(report.total_rows, 3)
             self.assertEqual(report.loaded_rows, 3)
             self.assertEqual(report.skipped_rows, 0)
@@ -456,7 +477,10 @@ class ExtraFieldTest(unittest.TestCase):
             )
             source = CsvSource(csv_path)
             handle = get_database(source)
-            points = list(handle.iter_points())
+            try:
+                points = list(handle.iter_points())
+            finally:
+                handle.close()
             self.assertEqual(len(points), 1)
             # road_id and altitude should be in extra
             self.assertIn("road_id", points[0].extra)
@@ -475,7 +499,10 @@ class HeadingNormalizationTest(unittest.TestCase):
             )
             source = CsvSource(csv_path)
             handle = get_database(source)
-            points = list(handle.iter_points())
+            try:
+                points = list(handle.iter_points())
+            finally:
+                handle.close()
             self.assertEqual(len(points), 1)
             self.assertAlmostEqual(points[0].heading % 360, 730 % 360, delta=0.01)
 

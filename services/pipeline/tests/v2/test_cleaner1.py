@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from v2.cleaner1 import (
+from track.v2.cleaner1 import (
     CleanerConfig,
     CleanerResult,
     clean,
@@ -16,14 +16,14 @@ from v2.cleaner1 import (
     _inject_orthogonal,
     _ray_intersection,
 )
-from v2.exceptions import ConfigError, FieldSelectionRequired
-from v2.models import (
+from track.v2.exceptions import ConfigError, FieldSelectionRequired
+from track.v2.models import (
     CleanReport,
     PointRef,
     TrajectoryPoint,
     TrackModel,
 )
-from v2.parser0 import CsvSource, get_database
+from track.v2.parser0 import CsvSource, get_database
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
