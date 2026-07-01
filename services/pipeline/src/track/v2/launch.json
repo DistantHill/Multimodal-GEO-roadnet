@@ -1,0 +1,8 @@
+{
+    "name": "Debug as Module",
+    "type": "debugpy",
+    "request": "launch",
+    "module": "${relativeFileDirname}.${fileBasenameNoExtension}",
+    "cwd": "${fileDirname}",
+    "console": "integratedTerminal"
+}
