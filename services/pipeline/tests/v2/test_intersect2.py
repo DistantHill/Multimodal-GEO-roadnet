@@ -16,6 +16,7 @@ from track.v2.intersect2 import (
     _cluster_angles_greedy,
     _cluster_dbscan,
     _cluster_orthogonal_candidates,
+    _annotate_source_ablation,
     _compute_getis_ord_g_star,
     _detect_turn_events,
     _extract_entry_exit_observations_batch,
@@ -158,6 +159,7 @@ class IntersectReportTest(unittest.TestCase):
         d = report.as_dict()
         self.assertEqual(d["track_count"], 10)
         self.assertEqual(d["cluster_count"], 5)
+        self.assertEqual(d["complete_intersection_source_counts"], {})
 
 
 # ── Group by vehicle tests ─────────────────────────────────────────────
@@ -355,6 +357,9 @@ class DBSCANTest(unittest.TestCase):
         clusters = _cluster_dbscan(events, origin_lon, origin_lat,
                                    eps_m=100.0, min_samples=3)
         self.assertEqual(len(clusters), 2, f"Expected 2 clusters, got {len(clusters)}")
+        self.assertEqual(clusters[0].sources, ("turn",))
+        self.assertEqual(clusters[0].source_counts["turn"], 4)
+        self.assertEqual(clusters[0].source_ratios["turn"], 1.0)
 
     def test_noise_labeled(self):
         """I2-14: Single isolated event labeled as noise."""
@@ -445,6 +450,9 @@ class OrthogonalCandidateTest(unittest.TestCase):
         )
         self.assertEqual(len(clusters), 1)
         self.assertEqual(clusters[0].source, "orthogonal")
+        self.assertEqual(clusters[0].sources, ("orthogonal",))
+        self.assertEqual(clusters[0].source_counts["orthogonal"], 4)
+        self.assertEqual(len(clusters[0].source_point_refs["orthogonal"]), 4)
 
 
 # ── Topology extraction tests ──────────────────────────────────────────
@@ -545,6 +553,10 @@ class ClusterMergeTest(unittest.TestCase):
                                  origin_lon=origin_lon, origin_lat=origin_lat)
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0].source, "merged")
+        self.assertEqual(merged[0].sources, ("orthogonal", "turn"))
+        self.assertEqual(merged[0].source_counts["turn"], 1)
+        self.assertEqual(merged[0].source_counts["orthogonal"], 2)
+        self.assertAlmostEqual(merged[0].source_ratios["orthogonal"], 2 / 3)
 
     def test_no_merge_distant_clusters(self):
         """Distant clusters are not merged."""
@@ -565,6 +577,38 @@ class ClusterMergeTest(unittest.TestCase):
 
 
 # ── End-to-end integration tests ───────────────────────────────────────
+
+class SourceAblationTest(unittest.TestCase):
+    """Source contribution and leave-one-source-out validation."""
+
+    def test_single_source_cluster_marks_source_as_critical(self):
+        origin_lon, origin_lat = 116.0, 39.0
+        events = [
+            TurnEvent(i, f"v{i}", 1000 + i, origin_lon, origin_lat,
+                      i * 2.0, i * 2.0, 0, 90, 90, 90)
+            for i in range(4)
+        ]
+        cfg = IntersectConfig(dbscan_eps_m_turn=100.0, dbscan_min_samples_turn=3)
+        clusters = _cluster_dbscan(
+            events,
+            origin_lon,
+            origin_lat,
+            eps_m=cfg.dbscan_eps_m_turn,
+            min_samples=cfg.dbscan_min_samples_turn,
+        )
+
+        annotated = _annotate_source_ablation(
+            clusters,
+            events,
+            [],
+            cfg,
+            origin_lon,
+            origin_lat,
+        )
+
+        self.assertEqual(len(annotated), 1)
+        self.assertEqual(annotated[0].sources, ("turn",))
+        self.assertEqual(annotated[0].critical_sources, ("turn",))
 
 
 class EndToEndTest(unittest.TestCase):

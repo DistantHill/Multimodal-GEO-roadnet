@@ -349,6 +349,8 @@ class TurnEvent(TrackModel):
     out_bearing: float  # mean bearing after turn
     turn_deg: float  # signed turn angle in [-180, 180)
     score: float  # = abs(turn_deg) for ranking
+    source: str = "turn"
+    point_ref: PointRef | None = None
 
 
 @dataclass(frozen=True)
@@ -382,8 +384,17 @@ class HotspotCluster(TrackModel):
     centroid_lon: float
     centroid_lat: float
     radius_m: float
+    cluster_ref: str = ""        # stable ref → "cluster_{source}_{id}"
     events: tuple[TurnEvent, ...] = ()
-    source: str = "turn"  # "turn" or "orthogonal"
+    source: str = "turn"
+    sources: tuple[str, ...] = ()
+    source_counts: dict[str, int] = field(default_factory=dict)
+    source_ratios: dict[str, float] = field(default_factory=dict)
+    source_point_refs: dict[str, tuple[PointRef, ...]] = field(default_factory=dict)
+    critical_sources: tuple[str, ...] = ()
+    # ── topology intermediate products ──
+    crossing_points: tuple[()] = ()   # tuple[CrossingPoint, ...]; forward-ref via ()
+    inout_points: tuple[()] = ()      # tuple[InOutIntersectionPoint, ...]
 
 
 @dataclass(frozen=True)
@@ -397,6 +408,46 @@ class EntryExitObservation(TrackModel):
     inbound_bearing: float
     outbound_bearing: float
     turn_deg: float
+
+
+@dataclass(frozen=True)
+class CrossingPoint(TrackModel):
+    """A segment-circle intersection point, preserved for replay.
+
+    Produced by ``_extract_entry_exit_observations_batch`` via
+    ``_segment_circle_crossings_batch``.
+    """
+
+    crossing_id: int                # globally unique
+    cluster_ref: str                # FK → HotspotCluster.cluster_ref
+    vehicle_id: str
+    point_ref: PointRef             # segment-start TrajectoryPoint
+    segment_index: int              # index in (flattened) vehicle track
+    crossing_lon: float
+    crossing_lat: float
+    is_entry: bool                  # True=entering circle, False=leaving
+    produced_by: str = "segment_circle_crossings_batch"
+
+
+@dataclass(frozen=True)
+class InOutIntersectionPoint(TrackModel):
+    """Clustered entry/exit direction for one intersection.
+
+    Replaces the bare ``EntryExitObservation`` — retains references back
+    to the ``CrossingPoint`` list so replay can recover the original
+    trajectory segments.
+    """
+
+    point_id: int
+    cluster_ref: str                # FK → HotspotCluster.cluster_ref
+    branch_angle_deg: float
+    is_entry: bool
+    inbound_bearing: float
+    outbound_bearing: float
+    turn_deg: float
+    crossing_refs: tuple[int, ...]  # → CrossingPoint.crossing_id
+    vehicle_id: str
+    produced_by: str = "_cluster_angles_greedy"
 
 
 @dataclass(frozen=True)
@@ -423,3 +474,22 @@ class IntersectReport(TrackModel):
     cluster_count_turn: int
     cluster_count_ortho: int
     complete_intersection_count: int
+    complete_intersection_source_counts: dict[str, int] = field(default_factory=dict)
+    complete_intersection_source_ratios: dict[str, float] = field(default_factory=dict)
+    complete_intersection_critical_source_counts: dict[str, int] = field(default_factory=dict)
+    complete_intersection_critical_source_ratios: dict[str, float] = field(default_factory=dict)
+
+
+# ── Replay output models ────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ReplayCleanResult(TrackModel):
+    """Replay output for one vehicle's cleaner stage."""
+
+    vehicle_id: str
+    original: list[TrajectoryPoint]     # 原始点（时间序）
+    excluded: list[tuple[TrajectoryPoint, str]]   # 被排除 + 原因
+    injected: list[tuple[TrajectoryPoint, TrajectoryPoint, TrajectoryPoint]]
+    #              ↑ injected_pt,      from_original_pt,  to_original_pt
+    active: list[TrajectoryPoint]       # 清洗后

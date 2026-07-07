@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterator
 
 import numpy as np
@@ -33,8 +33,10 @@ from ._geometry import (
 )
 from .exceptions import V2Error
 from .models import (
+    CrossingPoint,
     EntryExitObservation,
     HotspotCluster,
+    InOutIntersectionPoint,
     IntersectReport,
     IntersectionTopology,
     OrthogonalCandidate,
@@ -109,6 +111,217 @@ class IntersectResult(TrackModel):
 
     def get_report(self) -> IntersectReport:
         return self.report
+
+
+def _ratio_dict(counts: dict[str, int]) -> dict[str, float]:
+    total = sum(counts.values())
+    if total <= 0:
+        return {}
+    return {source: count / total for source, count in sorted(counts.items())}
+
+
+def _cluster_sources(cluster: HotspotCluster) -> tuple[str, ...]:
+    if cluster.sources:
+        return cluster.sources
+    if cluster.source_counts:
+        return tuple(sorted(source for source, count in cluster.source_counts.items() if count > 0))
+    if cluster.source and cluster.source != "merged":
+        return (cluster.source,)
+    sources = sorted({event.source for event in cluster.events if event.source})
+    return tuple(sources)
+
+
+def _source_label(sources: tuple[str, ...]) -> str:
+    if len(sources) == 1:
+        return sources[0]
+    if len(sources) > 1:
+        return "merged"
+    return "unknown"
+
+
+def _cluster_source_counts(cluster: HotspotCluster) -> dict[str, int]:
+    if cluster.source_counts:
+        return dict(cluster.source_counts)
+    sources = _cluster_sources(cluster)
+    if len(sources) == 1:
+        return {sources[0]: len(cluster.events)}
+    counts: dict[str, int] = {}
+    for event in cluster.events:
+        counts[event.source] = counts.get(event.source, 0) + 1
+    return counts
+
+
+def _cluster_source_point_refs(cluster: HotspotCluster) -> dict[str, tuple[PointRef, ...]]:
+    if cluster.source_point_refs:
+        return dict(cluster.source_point_refs)
+    refs: dict[str, list[PointRef]] = defaultdict(list)
+    fallback_sources = _cluster_sources(cluster)
+    fallback = fallback_sources[0] if len(fallback_sources) == 1 else cluster.source
+    for event in cluster.events:
+        source = event.source or fallback
+        if event.point_ref is not None:
+            refs[source].append(event.point_ref)
+    return {source: tuple(items) for source, items in refs.items()}
+
+
+def _with_source_provenance(
+    cluster: HotspotCluster,
+    *,
+    source_counts: dict[str, int] | None = None,
+    source_point_refs: dict[str, tuple[PointRef, ...]] | None = None,
+    critical_sources: tuple[str, ...] | None = None,
+) -> HotspotCluster:
+    counts = source_counts if source_counts is not None else _cluster_source_counts(cluster)
+    counts = {source: count for source, count in counts.items() if count > 0}
+    sources = tuple(sorted(counts))
+    refs = source_point_refs if source_point_refs is not None else _cluster_source_point_refs(cluster)
+    return replace(
+        cluster,
+        source=_source_label(sources),
+        sources=sources,
+        source_counts=counts,
+        source_ratios=_ratio_dict(counts),
+        source_point_refs={source: tuple(items) for source, items in refs.items()},
+        critical_sources=tuple(sorted(critical_sources or cluster.critical_sources)),
+    )
+
+
+def _merge_count_dicts(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
+    merged = dict(a)
+    for source, count in b.items():
+        merged[source] = merged.get(source, 0) + count
+    return merged
+
+
+def _merge_ref_dicts(
+    a: dict[str, tuple[PointRef, ...]],
+    b: dict[str, tuple[PointRef, ...]],
+) -> dict[str, tuple[PointRef, ...]]:
+    merged: dict[str, list[PointRef]] = {
+        source: list(items)
+        for source, items in a.items()
+    }
+    for source, items in b.items():
+        merged.setdefault(source, []).extend(items)
+    return {source: tuple(items) for source, items in merged.items()}
+
+
+def _build_candidate_clusters(
+    hotspot_events: list[TurnEvent],
+    orthogonal_candidates: list[OrthogonalCandidate],
+    cfg: IntersectConfig,
+    origin_lon: float,
+    origin_lat: float,
+    *,
+    disabled_sources: set[str] | None = None,
+) -> list[HotspotCluster]:
+    disabled = disabled_sources or set()
+    clusters: list[HotspotCluster] = []
+    if "turn" not in disabled and hotspot_events:
+        clusters.extend(
+            _cluster_dbscan(
+                hotspot_events,
+                origin_lon,
+                origin_lat,
+                eps_m=cfg.dbscan_eps_m_turn,
+                min_samples=cfg.dbscan_min_samples_turn,
+                source="turn",
+            )
+        )
+    if "orthogonal" not in disabled and orthogonal_candidates:
+        clusters.extend(
+            _cluster_orthogonal_candidates(
+                orthogonal_candidates,
+                origin_lon,
+                origin_lat,
+                eps_m=cfg.dbscan_eps_m_ortho,
+                min_samples=cfg.dbscan_min_samples_ortho,
+            )
+        )
+    return _merge_clusters(clusters, cfg.merge_centroid_distance_m, origin_lon, origin_lat)
+
+
+def _is_cluster_rediscovered(
+    cluster: HotspotCluster,
+    candidates: list[HotspotCluster],
+    *,
+    distance_m: float,
+) -> bool:
+    for candidate in candidates:
+        if _distance_m(
+            (cluster.centroid_x, cluster.centroid_y),
+            (candidate.centroid_x, candidate.centroid_y),
+        ) <= distance_m:
+            return True
+    return False
+
+
+def _annotate_source_ablation(
+    clusters: list[HotspotCluster],
+    hotspot_events: list[TurnEvent],
+    orthogonal_candidates: list[OrthogonalCandidate],
+    cfg: IntersectConfig,
+    origin_lon: float,
+    origin_lat: float,
+) -> list[HotspotCluster]:
+    if not clusters:
+        return []
+
+    all_sources = sorted({source for cluster in clusters for source in _cluster_sources(cluster)})
+    reclustered_without: dict[str, list[HotspotCluster]] = {}
+    for source in all_sources:
+        reclustered_without[source] = _build_candidate_clusters(
+            hotspot_events,
+            orthogonal_candidates,
+            cfg,
+            origin_lon,
+            origin_lat,
+            disabled_sources={source},
+        )
+
+    annotated: list[HotspotCluster] = []
+    for cluster in clusters:
+        critical_sources: list[str] = []
+        for source in _cluster_sources(cluster):
+            if not _is_cluster_rediscovered(
+                cluster,
+                reclustered_without.get(source, []),
+                distance_m=cfg.merge_centroid_distance_m,
+            ):
+                critical_sources.append(source)
+        annotated.append(
+            _with_source_provenance(
+                cluster,
+                critical_sources=tuple(critical_sources),
+            )
+        )
+    return annotated
+
+
+def _complete_source_report(
+    clusters: list[HotspotCluster],
+    topologies: list[IntersectionTopology],
+) -> dict[str, dict[str, Any]]:
+    complete_ids = {topology.cluster_id for topology in topologies if topology.is_complete}
+    complete_clusters = [cluster for cluster in clusters if cluster.cluster_id in complete_ids]
+
+    source_counts: dict[str, int] = {}
+    critical_source_counts: dict[str, int] = {}
+    for cluster in complete_clusters:
+        source_counts = _merge_count_dicts(source_counts, _cluster_source_counts(cluster))
+        for source in cluster.critical_sources:
+            critical_source_counts[source] = critical_source_counts.get(source, 0) + 1
+
+    complete_total = max(1, len(complete_clusters))
+    return {
+        "source_counts": source_counts,
+        "source_ratios": _ratio_dict(source_counts),
+        "critical_source_counts": critical_source_counts,
+        "critical_source_ratios": {
+            source: count / complete_total
+            for source, count in sorted(critical_source_counts.items())
+        },
+    }
 
 
 # ── Public entry point ─────────────────────────────────────────────────
@@ -188,44 +401,49 @@ def detect_intersections(
 
     # ── Reassign globally-unique cluster IDs (Methods 1 & 2 start from 0) ─
     merged_clusters = [
-        HotspotCluster(
-            cluster_id=new_id,
-            centroid_x=c.centroid_x,
-            centroid_y=c.centroid_y,
-            centroid_lon=c.centroid_lon,
-            centroid_lat=c.centroid_lat,
-            radius_m=c.radius_m,
-            events=c.events,
-            source=c.source,
-        )
+        replace(c, cluster_id=new_id)
         for new_id, c in enumerate(merged_clusters)
     ]
 
+    merged_clusters = _annotate_source_ablation(
+        merged_clusters,
+        hotspot_events,
+        orthogonal_candidates,
+        cfg,
+        origin_lon,
+        origin_lat,
+    )
+
     # ── Topology verification for each cluster ─────────────────────
-    topologies = _build_intersection_topologies(
+    topologies, annotated_clusters = _build_intersection_topologies(
         merged_clusters, tracks, origin_lon, origin_lat, cfg
     )
 
     # ── Build report ───────────────────────────────────────────────
-    turn_clusters = sum(1 for c in merged_clusters if c.source == "turn")
-    ortho_clusters = sum(1 for c in merged_clusters if c.source == "orthogonal")
+    turn_clusters = sum(1 for c in annotated_clusters if "turn" in _cluster_sources(c))
+    ortho_clusters = sum(1 for c in annotated_clusters if "orthogonal" in _cluster_sources(c))
+    source_report = _complete_source_report(annotated_clusters, topologies)
 
     report = IntersectReport(
         track_count=len(tracks),
         turn_event_count=len(turn_events),
         hotspot_event_count=len(hotspot_events),
         orthogonal_candidate_count=len(orthogonal_candidates),
-        cluster_count=len(merged_clusters),
+        cluster_count=len(annotated_clusters),
         cluster_count_turn=turn_clusters,
         cluster_count_ortho=ortho_clusters,
         complete_intersection_count=sum(1 for t in topologies if t.is_complete),
+        complete_intersection_source_counts=source_report["source_counts"],
+        complete_intersection_source_ratios=source_report["source_ratios"],
+        complete_intersection_critical_source_counts=source_report["critical_source_counts"],
+        complete_intersection_critical_source_ratios=source_report["critical_source_ratios"],
     )
 
     return IntersectResult(
         turn_events=turn_events,
         hotspot_events=hotspot_events,
         orthogonal_candidates=orthogonal_candidates,
-        clusters=merged_clusters,
+        clusters=annotated_clusters,
         topologies=topologies,
         report=report,
     )
@@ -327,6 +545,8 @@ def _detect_turn_events(
                         out_bearing=out_bearing,
                         turn_deg=turn,
                         score=abs_turn,
+                        source="turn",
+                        point_ref=p.point_ref,
                     )
                 )
 
@@ -523,16 +743,21 @@ def _cluster_dbscan(
         cy = sum(e.y for e in cluster_items) / len(cluster_items)
         radius = max(_distance_m((cx, cy), (e.x, e.y)) for e in cluster_items)
         lon, lat = _to_lonlat(cx, cy, origin_lon, origin_lat)
+        cluster = HotspotCluster(
+            cluster_id=cid,
+            centroid_x=cx,
+            centroid_y=cy,
+            centroid_lon=lon,
+            centroid_lat=lat,
+            radius_m=radius,
+            cluster_ref=f"cluster_{source}_{cid}",
+            events=tuple(cluster_items),
+            source=source,
+        )
         clusters.append(
-            HotspotCluster(
-                cluster_id=cid,
-                centroid_x=cx,
-                centroid_y=cy,
-                centroid_lon=lon,
-                centroid_lat=lat,
-                radius_m=radius,
-                events=tuple(cluster_items),
-                source=source,
+            _with_source_provenance(
+                cluster,
+                source_counts={source: len(cluster_items)},
             )
         )
     return clusters
@@ -577,19 +802,26 @@ def _cluster_orthogonal_candidates(
                 out_bearing=0.0,
                 turn_deg=0.0,
                 score=0.0,
+                source="orthogonal",
+                point_ref=c.point_ref,
             )
             for i, c in enumerate(cluster_items)
         )
+        cluster = HotspotCluster(
+            cluster_id=cid,
+            centroid_x=cx,
+            centroid_y=cy,
+            centroid_lon=lon,
+            centroid_lat=lat,
+            radius_m=radius,
+            cluster_ref=f"cluster_orthogonal_{cid}",
+            events=cluster_events,
+            source="orthogonal",
+        )
         clusters.append(
-            HotspotCluster(
-                cluster_id=cid,
-                centroid_x=cx,
-                centroid_y=cy,
-                centroid_lon=lon,
-                centroid_lat=lat,
-                radius_m=radius,
-                events=cluster_events,
-                source="orthogonal",
+            _with_source_provenance(
+                cluster,
+                source_counts={"orthogonal": len(cluster_items)},
             )
         )
     return clusters
@@ -627,8 +859,9 @@ def _merge_clusters(
 
     while remaining:
         ci = remaining.pop(0)
-        merged_source = ci.source
         merged_events = list(ci.events)
+        merged_source_counts = _cluster_source_counts(ci)
+        merged_source_refs = _cluster_source_point_refs(ci)
         cx_sum = ci.centroid_x * len(ci.events)
         cy_sum = ci.centroid_y * len(ci.events)
         total_n = len(ci.events)
@@ -649,9 +882,15 @@ def _merge_clusters(
                 dist = _distance_m((cur_cx, cur_cy), (cj.centroid_x, cj.centroid_y))
                 if dist <= merge_distance_m:
                     # Absorb cj
-                    if cj.source != merged_source:
-                        merged_source = "merged"
                     merged_events.extend(cj.events)
+                    merged_source_counts = _merge_count_dicts(
+                        merged_source_counts,
+                        _cluster_source_counts(cj),
+                    )
+                    merged_source_refs = _merge_ref_dicts(
+                        merged_source_refs,
+                        _cluster_source_point_refs(cj),
+                    )
                     # Update radius: new_radius = max(old_radius, dist + cj.radius_m)
                     candidate_r = dist + cj.radius_m
                     if candidate_r * candidate_r > max_sq:
@@ -674,16 +913,22 @@ def _merge_clusters(
             merged_radius = ci.radius_m
 
         new_lon, new_lat = _to_lonlat(new_cx, new_cy, origin_lon, origin_lat)
+        merged_cluster = HotspotCluster(
+            cluster_id=ci.cluster_id,
+            centroid_x=new_cx,
+            centroid_y=new_cy,
+            centroid_lon=new_lon,
+            centroid_lat=new_lat,
+            radius_m=merged_radius,
+            cluster_ref=ci.cluster_ref,  # keep absorbing cluster's ref
+            events=tuple(merged_events),
+            source=_source_label(tuple(sorted(merged_source_counts))),
+        )
         kept.append(
-            HotspotCluster(
-                cluster_id=ci.cluster_id,
-                centroid_x=new_cx,
-                centroid_y=new_cy,
-                centroid_lon=new_lon,
-                centroid_lat=new_lat,
-                radius_m=merged_radius,
-                events=tuple(merged_events),
-                source=merged_source,
+            _with_source_provenance(
+                merged_cluster,
+                source_counts=merged_source_counts,
+                source_point_refs=merged_source_refs,
             )
         )
 
@@ -779,13 +1024,14 @@ def _build_intersection_topologies(
       4. Evaluate completeness
     """
     topologies: list[IntersectionTopology] = []
+    annotated_clusters: list[HotspotCluster] = []
 
     for cluster in clusters:
         radius = max(
             cfg.min_intersection_radius_m,
             cluster.radius_m + cfg.topology_radius_padding_m,
         )
-        observations = _extract_entry_exit_observations_batch(
+        observations, crossing_points = _extract_entry_exit_observations_batch(
             tracks,
             cluster=cluster,
             origin_lon=origin_lon,
@@ -793,6 +1039,8 @@ def _build_intersection_topologies(
             radius_m=radius,
             bearing_window=cfg.bearing_window,
         )
+        # Attach crossing points to cluster for replay provenance
+        cluster = replace(cluster, crossing_points=tuple(crossing_points))
 
         # Branch angle clustering
         branch_angles: list[float] = []
@@ -840,8 +1088,9 @@ def _build_intersection_topologies(
                 reason=reason,
             )
         )
+        annotated_clusters.append(cluster)
 
-    return topologies
+    return topologies, annotated_clusters
 
 
 def _extract_entry_exit_observations_batch(
@@ -879,7 +1128,7 @@ def _extract_entry_exit_observations_batch(
             segment_meta.append((vehicle_id, seg_idx))
 
     if not starts:
-        return []
+        return [], []
 
     start_xy = np.asarray(starts, dtype=float)
     end_xy = np.asarray(ends, dtype=float)
@@ -921,6 +1170,31 @@ def _extract_entry_exit_observations_batch(
                     (float(crossing_xy_np[flat_idx][0]), float(crossing_xy_np[flat_idx][1])),
                 )
 
+    # ── Collect all crossing points (for replay provenance) ─────
+    crossing_counter = 0
+    crossing_points: list[CrossingPoint] = []
+    for flat_idx, (vehicle_id, seg_idx) in enumerate(segment_meta):
+        if not hit_mask[flat_idx]:
+            continue
+        seg_start_pt = track_lookup[vehicle_id][seg_idx]
+        is_entry = bool(entry_mask[flat_idx])
+        # Convert crossing xy → lon/lat
+        cx_m, cy_m = float(crossing_xy_np[flat_idx][0]), float(crossing_xy_np[flat_idx][1])
+        clon, clat = _to_lonlat(cx_m, cy_m, origin_lon, origin_lat)
+        crossing_points.append(
+            CrossingPoint(
+                crossing_id=crossing_counter,
+                cluster_ref=cluster.cluster_ref,
+                vehicle_id=vehicle_id,
+                point_ref=seg_start_pt.point_ref,
+                segment_index=seg_idx,
+                crossing_lon=clon,
+                crossing_lat=clat,
+                is_entry=is_entry,
+            )
+        )
+        crossing_counter += 1
+
     observations: list[EntryExitObservation] = []
     for vehicle_id, (entry_seg, entry_xy) in entry_by_vehicle.items():
         exit_ = exit_by_vehicle.get(vehicle_id)
@@ -940,4 +1214,4 @@ def _extract_entry_exit_observations_batch(
         )
         if obs is not None:
             observations.append(obs)
-    return observations
+    return observations, crossing_points
