@@ -31,6 +31,7 @@ def clean(
     cfg = config or CleanerConfig()
     active: list[TrajectoryPoint] = []
     excluded: list[ExcludedPoint] = []
+    kept_subtracks: list[list[TrajectoryPoint]] = []
     injected_count = 0
 
     for vehicle_points in _group_by_vehicle(source.iter_points()):
@@ -41,6 +42,7 @@ def clean(
                 subtrack = [_with_vehicle_id(point, f"{point.vehicle_id}_seg{index:02d}") for point in subtrack]
             kept, removed = _exclude_stationary(subtrack, cfg)
             excluded.extend(removed)
+            kept_subtracks.append(kept)
             injected_subtrack, count = _inject_orthogonal(kept, cfg)
             active.extend(injected_subtrack)
             injected_count += count
@@ -57,6 +59,7 @@ def clean(
         active=ListTrajectorySourceHandle(active, source_info=source.source_info, field_mapping=source.field_mapping),
         excluded=excluded_index,
         report=report,
+        kept_subtracks=kept_subtracks,
     )
 
 
@@ -170,7 +173,7 @@ def _exclude_stationary(
     removed: list[ExcludedPoint] = []
     for point in points:
         if point.point_ref in excluded_refs:
-            removed.append(ExcludedPoint(point.point_ref, "stationary"))
+            removed.append(ExcludedPoint(point.point_ref, "stationary", lon=point.lon, lat=point.lat))
         else:
             kept.append(point)
     return kept, removed

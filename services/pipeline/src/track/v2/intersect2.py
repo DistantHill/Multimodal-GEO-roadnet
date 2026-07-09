@@ -108,6 +108,7 @@ class IntersectResult(TrackModel):
     clusters: list[HotspotCluster]  # merged from both methods
     topologies: list[IntersectionTopology]
     report: IntersectReport
+    observations: list[EntryExitObservation] = field(default_factory=list)
 
     def get_report(self) -> IntersectReport:
         return self.report
@@ -415,7 +416,7 @@ def detect_intersections(
     )
 
     # ── Topology verification for each cluster ─────────────────────
-    topologies, annotated_clusters = _build_intersection_topologies(
+    topologies, annotated_clusters, all_observations = _build_intersection_topologies(
         merged_clusters, tracks, origin_lon, origin_lat, cfg
     )
 
@@ -445,6 +446,7 @@ def detect_intersections(
         orthogonal_candidates=orthogonal_candidates,
         clusters=annotated_clusters,
         topologies=topologies,
+        observations=all_observations,
         report=report,
     )
 
@@ -1014,7 +1016,7 @@ def _build_intersection_topologies(
     origin_lon: float,
     origin_lat: float,
     cfg: IntersectConfig,
-) -> list[IntersectionTopology]:
+) -> tuple[list[IntersectionTopology], list[HotspotCluster], list[EntryExitObservation]]:
     """Build IntersectionTopology for each HotspotCluster.
 
     For each cluster:
@@ -1025,6 +1027,7 @@ def _build_intersection_topologies(
     """
     topologies: list[IntersectionTopology] = []
     annotated_clusters: list[HotspotCluster] = []
+    all_observations: list[EntryExitObservation] = []
 
     for cluster in clusters:
         radius = max(
@@ -1041,6 +1044,7 @@ def _build_intersection_topologies(
         )
         # Attach crossing points to cluster for replay provenance
         cluster = replace(cluster, crossing_points=tuple(crossing_points))
+        all_observations.extend(observations)
 
         # Branch angle clustering
         branch_angles: list[float] = []
@@ -1090,7 +1094,7 @@ def _build_intersection_topologies(
         )
         annotated_clusters.append(cluster)
 
-    return topologies, annotated_clusters
+    return topologies, annotated_clusters, all_observations
 
 
 def _extract_entry_exit_observations_batch(

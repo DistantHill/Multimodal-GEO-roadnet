@@ -245,6 +245,8 @@ class ExcludedPoint(TrackModel):
 
     point_ref: PointRef
     reason: str
+    lon: float = 0.0
+    lat: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -308,6 +310,7 @@ class CleanerResult(TrackModel):
     active: TrajectorySourceHandle
     excluded: ExcludedIndex
     report: CleanReport
+    kept_subtracks: list[list[TrajectoryPoint]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

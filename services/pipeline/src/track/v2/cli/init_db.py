@@ -2,76 +2,25 @@
 
 ZH: 连接到已部署的 PostgreSQL 数据库，创建流水线所需的全部数据表。
 通过 --ask-password 在 ps/CMD 窗口中交互式输入密码。
+--reset 会先清空所有表数据再重建（等价于 DROP + CREATE）。
 
 EN: Connect to the deployed PostgreSQL database and create all pipeline tables.
 Use --ask-password for interactive password entry in ps/CMD windows.
+--reset drops all tables first, then recreates them (DROP + CREATE).
 
 Usage / 用法::
 
     python -m track.v2.cli.init_db --ask-password
     python -m track.v2.cli.init_db --host 127.0.0.1 --port 5432 --database postgres --user postgres --ask-password
+    python -m track.v2.cli.init_db --reset --ask-password
 """
 
 from __future__ import annotations
 
 import argparse
 import getpass
-import os
-from dataclasses import dataclass
-from typing import Any
-from urllib.parse import quote_plus
 
-
-# ── Minimal PostgreSQL config & connection (self-contained; no io.postgres dependency) ──
-
-@dataclass(frozen=True)
-class _PostgresConfig:
-    host: str = "127.0.0.1"
-    port: int = 5432
-    database: str = "postgres"
-    user: str = "postgres"
-    password: str = ""
-    connect_timeout: int = 10
-    sslmode: str | None = None
-
-    def dsn(self) -> str:
-        auth = quote_plus(self.user)
-        if self.password:
-            auth += f":{quote_plus(self.password)}"
-        host = quote_plus(self.host)
-        database = quote_plus(self.database)
-        query = f"connect_timeout={self.connect_timeout}"
-        if self.sslmode:
-            query += f"&sslmode={quote_plus(self.sslmode)}"
-        return f"postgresql://{auth}@{host}:{self.port}/{database}?{query}"
-
-    def safe_dsn(self) -> str:
-        auth = quote_plus(self.user)
-        if self.password:
-            auth += ":***"
-        host = quote_plus(self.host)
-        database = quote_plus(self.database)
-        query = f"connect_timeout={self.connect_timeout}"
-        if self.sslmode:
-            query += f"&sslmode={quote_plus(self.sslmode)}"
-        return f"postgresql://{auth}@{host}:{self.port}/{database}?{query}"
-
-
-def _connect(config: _PostgresConfig):
-    """Open a PostgreSQL connection."""
-    try:
-        import psycopg
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "PostgreSQL support requires psycopg. Install with: pip install 'psycopg[binary]'"
-        ) from exc
-    return psycopg.connect(config.dsn())
-
-# ── Default connection parameters (from project CLAUDE.md) ──────────
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 5432
-DEFAULT_DATABASE = "postgres"
-DEFAULT_USER = "postgres"
+from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
 
 # ── DDL statements in pipeline dependency order ─────────────────────
 # ZH: 按流水线阶段顺序排列，先创建被引用表，再创建引用表。
@@ -91,6 +40,9 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             lat             DOUBLE PRECISION NOT NULL,
             heading         DOUBLE PRECISION NOT NULL DEFAULT 0,
             speed           DOUBLE PRECISION NOT NULL DEFAULT 0,
+            geom            geometry(Point, 4326) GENERATED ALWAYS AS (
+                                ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+                            ) STORED,
             extra           JSONB NOT NULL DEFAULT '{}',
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE(source_id, source_row_key)
@@ -103,7 +55,22 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             source_id       TEXT NOT NULL,
             source_row_key  TEXT NOT NULL,
             reason          TEXT NOT NULL,
+            lon             DOUBLE PRECISION NOT NULL,
+            lat             DOUBLE PRECISION NOT NULL,
+            geom            geometry(Point, 4326) GENERATED ALWAYS AS (
+                                ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+                            ) STORED,
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """),
+    ("kept_trajectory_points", """
+        CREATE TABLE IF NOT EXISTS kept_trajectory_points (
+            id                      BIGSERIAL PRIMARY KEY,
+            trajectory_point_id     BIGINT NOT NULL REFERENCES trajectory_points(id),
+            vehicle_id              TEXT NOT NULL,
+            subtrack_index          INTEGER NOT NULL DEFAULT 1,
+            sequence_in_subtrack    INTEGER NOT NULL,
+            created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """),
     ("injected_points", """
@@ -117,6 +84,9 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             y                   DOUBLE PRECISION NOT NULL,
             heading             DOUBLE PRECISION NOT NULL,
             speed               DOUBLE PRECISION NOT NULL DEFAULT 0,
+            geom                geometry(Point, 4326) GENERATED ALWAYS AS (
+                                    ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+                                ) STORED,
             from_source_id      TEXT NOT NULL,
             from_source_row_key TEXT NOT NULL,
             to_source_id        TEXT NOT NULL,
@@ -143,6 +113,9 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             turn_deg            DOUBLE PRECISION NOT NULL,
             score               DOUBLE PRECISION NOT NULL,
             source              TEXT NOT NULL DEFAULT 'turn',
+            geom                geometry(Point, 4326) GENERATED ALWAYS AS (
+                                    ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+                                ) STORED,
             tp_source_id        TEXT,
             tp_source_row_key   TEXT,
             origin_lon          DOUBLE PRECISION NOT NULL,
@@ -160,6 +133,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             centroid_lon        DOUBLE PRECISION NOT NULL,
             centroid_lat        DOUBLE PRECISION NOT NULL,
             radius_m            DOUBLE PRECISION NOT NULL,
+            geom                geometry(Polygon, 4326),  -- app-layer: ST_Buffer(geography, radius_m)
             source              TEXT NOT NULL DEFAULT 'turn',
             sources             JSONB NOT NULL DEFAULT '[]',
             source_counts       JSONB NOT NULL DEFAULT '{}',
@@ -193,6 +167,9 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             crossing_y                  DOUBLE PRECISION NOT NULL,
             crossing_lon                DOUBLE PRECISION NOT NULL,
             crossing_lat                DOUBLE PRECISION NOT NULL,
+            geom                        geometry(Point, 4326) GENERATED ALWAYS AS (
+                                            ST_SetSRID(ST_MakePoint(crossing_lon, crossing_lat), 4326)
+                                        ) STORED,
             branch_angle_deg            DOUBLE PRECISION,
             origin_lon                  DOUBLE PRECISION NOT NULL,
             origin_lat                  DOUBLE PRECISION NOT NULL,
@@ -209,6 +186,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             observation_count           INTEGER NOT NULL,
             is_complete                 BOOLEAN NOT NULL DEFAULT TRUE,
             reason                      TEXT NOT NULL,
+            geom                        geometry(Polygon, 4326),  -- app-layer: derived from candidate_intersections
             created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """),
@@ -233,30 +211,83 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
 # ── Index DDL (separate for cleaner error reporting) ────────────────
 
 INDEX_STATEMENTS: list[tuple[str, str]] = [
+    # ── trajectory_points ──
     ("idx_tp_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_tp_vehicle_ts ON trajectory_points(vehicle_id, timestamp)"),
     ("idx_tp_source_row",      "CREATE INDEX IF NOT EXISTS idx_tp_source_row ON trajectory_points(source_id, source_row_key)"),
+    ("idx_tp_geom",            "CREATE INDEX IF NOT EXISTS idx_tp_geom ON trajectory_points USING GIST (geom)"),
+    # ── excluded_points ──
     ("idx_ep_reason",          "CREATE INDEX IF NOT EXISTS idx_ep_reason ON excluded_points(reason)"),
-    ("idx_ep_source_row",      "CREATE INDEX IF NOT EXISTS idx_ep_source_row ON excluded_points(source_id, source_row_key)"),
+    ("idx_ep_geom",            "CREATE INDEX IF NOT EXISTS idx_ep_geom ON excluded_points USING GIST (geom)"),
+    # ── kept_trajectory_points ──
+    ("idx_ktp_tp_id",          "CREATE INDEX IF NOT EXISTS idx_ktp_tp_id ON kept_trajectory_points(trajectory_point_id)"),
+    ("idx_ktp_vehicle_sub",    "CREATE INDEX IF NOT EXISTS idx_ktp_vehicle_sub ON kept_trajectory_points(vehicle_id, subtrack_index, sequence_in_subtrack)"),
+    # ── injected_points ──
     ("idx_ip_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_ip_vehicle_ts ON injected_points(vehicle_id, timestamp)"),
+    ("idx_ip_geom",            "CREATE INDEX IF NOT EXISTS idx_ip_geom ON injected_points USING GIST (geom)"),
+    # ── turn_events ──
     ("idx_te_event_id",        "CREATE INDEX IF NOT EXISTS idx_te_event_id ON turn_events(event_id)"),
     ("idx_te_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_te_vehicle_ts ON turn_events(vehicle_id, timestamp)"),
     ("idx_te_source",          "CREATE INDEX IF NOT EXISTS idx_te_source ON turn_events(source)"),
     ("idx_te_xy",              "CREATE INDEX IF NOT EXISTS idx_te_xy ON turn_events(x, y)"),
+    ("idx_te_geom",            "CREATE INDEX IF NOT EXISTS idx_te_geom ON turn_events USING GIST (geom)"),
+    # ── candidate_intersections ──
     ("idx_ci_cluster_id",      "CREATE INDEX IF NOT EXISTS idx_ci_cluster_id ON candidate_intersections(cluster_id)"),
     ("idx_ci_source",          "CREATE INDEX IF NOT EXISTS idx_ci_source ON candidate_intersections(source)"),
     ("idx_ci_centroid",        "CREATE INDEX IF NOT EXISTS idx_ci_centroid ON candidate_intersections(centroid_lon, centroid_lat)"),
+    ("idx_ci_geom",            "CREATE INDEX IF NOT EXISTS idx_ci_geom ON candidate_intersections USING GIST (geom)"),
+    # ── candidate_intersection_events ──
     ("idx_cie_ci",             "CREATE INDEX IF NOT EXISTS idx_cie_ci ON candidate_intersection_events(candidate_intersection_id)"),
     ("idx_cie_te",             "CREATE INDEX IF NOT EXISTS idx_cie_te ON candidate_intersection_events(turn_event_id)"),
+    # ── candidate_entry_exit_points ──
     ("idx_ceep_cluster",       "CREATE INDEX IF NOT EXISTS idx_ceep_cluster ON candidate_entry_exit_points(cluster_id, vehicle_id)"),
     ("idx_ceep_type",          "CREATE INDEX IF NOT EXISTS idx_ceep_type ON candidate_entry_exit_points(crossing_type)"),
+    ("idx_ceep_geom",          "CREATE INDEX IF NOT EXISTS idx_ceep_geom ON candidate_entry_exit_points USING GIST (geom)"),
+    # ── intersections ──
     ("idx_int_cluster_id",     "CREATE INDEX IF NOT EXISTS idx_int_cluster_id ON intersections(cluster_id)"),
     ("idx_int_complete",       "CREATE INDEX IF NOT EXISTS idx_int_complete ON intersections(is_complete)"),
+    ("idx_int_geom",           "CREATE INDEX IF NOT EXISTS idx_int_geom ON intersections USING GIST (geom)"),
+    # ── entry_exit_points ──
     ("idx_eep_cluster_vehicle","CREATE INDEX IF NOT EXISTS idx_eep_cluster_vehicle ON entry_exit_points(cluster_id, vehicle_id)"),
     ("idx_eep_intersection",   "CREATE INDEX IF NOT EXISTS idx_eep_intersection ON entry_exit_points(intersection_id)"),
 ]
 
 
-def create_tables(config: _PostgresConfig) -> int:
+def reset_tables(config: PostgresConfig) -> int:
+    """Drop all pipeline tables in reverse dependency order.
+
+    ZH: 按反向依赖顺序删除所有流水线数据表（先删引用表，再删被引用表），
+        清除全部数据。如果表不存在则跳过（IF EXISTS）。
+    EN: Drop all pipeline tables in reverse FK order — referencing tables
+        first, referenced tables last. Skips nonexistent tables (IF EXISTS).
+    """
+    # ZH: 反向遍历 DDL 列表，确保引用表先被删除
+    # EN: Reverse DDL order so referencing tables are dropped before their parents
+    drop_order = reversed(DDL_STATEMENTS)
+    failures = 0
+    tables_dropped = 0
+
+    with pg_connect(config) as conn:
+        with conn.cursor() as cur:
+            print("\n── 重置数据表 / Resetting Tables ──")
+            for name, _ in drop_order:
+                sql = f"DROP TABLE IF EXISTS {name} CASCADE"
+                try:
+                    cur.execute(sql)
+                    status = cur.statusmessage
+                    print(f"  [OK] DROP {name:40s} {status}")
+                    tables_dropped += 1
+                except Exception as exc:
+                    print(f"  [FAIL] DROP {name:40s} {exc}")
+                    failures += 1
+        conn.commit()
+
+    print(f"\n  已删除 / Dropped: {tables_dropped} 表/tables")
+    if failures:
+        print(f"  [FAIL] 失败 / Failures: {failures}")
+    return failures
+
+
+def create_tables(config: PostgresConfig) -> int:
     """Execute all DDL statements and return the number of failures.
 
     ZH: 按序执行所有建表 + 索引 DDL，打印每步结果，返回失败数。
@@ -267,7 +298,7 @@ def create_tables(config: _PostgresConfig) -> int:
     tables_existed = 0
     indexes_created = 0
 
-    with _connect(config) as conn:
+    with pg_connect(config) as conn:
         with conn.cursor() as cur:
             # ── Create tables ──
             print("\n── 创建数据表 / Creating Tables ──")
@@ -307,28 +338,36 @@ def create_tables(config: _PostgresConfig) -> int:
 
 
 def main() -> int:
+    # ZH: 从 .env 加载默认连接参数，CLI 参数可覆盖
+    # EN: Load defaults from .env; CLI args take precedence
+    _env = default_postgres_config()
+
     parser = argparse.ArgumentParser(
         description="Initialize track.v2 PostgreSQL database schema."
     )
-    parser.add_argument("--host", default=DEFAULT_HOST)
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--database", default=DEFAULT_DATABASE)
-    parser.add_argument("--user", default=DEFAULT_USER)
+    parser.add_argument("--host", default=_env.host)
+    parser.add_argument("--port", type=int, default=_env.port)
+    parser.add_argument("--database", default=_env.database)
+    parser.add_argument("--user", default=_env.user)
     parser.add_argument(
         "--ask-password", action="store_true",
-        help="Prompt for password interactively (secure, no echo)."
+        help="Prompt for password interactively (secure, no echo). Overrides .env password."
     )
-    parser.add_argument("--connect-timeout", type=int, default=10)
-    parser.add_argument("--sslmode", default=None)
+    parser.add_argument("--connect-timeout", type=int, default=_env.connect_timeout)
+    parser.add_argument("--sslmode", default=_env.sslmode)
+    parser.add_argument(
+        "--reset", action="store_true",
+        help="Drop all tables (CASCADE) before recreating them, clearing all data."
+    )
     args = parser.parse_args()
 
-    # ── Resolve password ──
+    # ── Resolve password: CLI prompt > .env > empty ──
     if args.ask_password:
         password = getpass.getpass("PostgreSQL password: ")
     else:
-        password = os.getenv("TRACK_PG_PASSWORD", "")
+        password = _env.password
 
-    config = _PostgresConfig(
+    config = PostgresConfig(
         host=args.host,
         port=args.port,
         database=args.database,
@@ -341,6 +380,11 @@ def main() -> int:
     print(f"连接目标 / Target: {config.safe_dsn()}")
 
     try:
+        if args.reset:
+            reset_failures = reset_tables(config)
+            if reset_failures > 0:
+                print("[FAIL] 重置失败，终止操作 / Reset failed, aborting.")
+                return 1
         failures = create_tables(config)
     except RuntimeError as exc:
         print(str(exc))
