@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+from typing import Any
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
 
@@ -289,6 +290,27 @@ def reset_tables(config: PostgresConfig) -> int:
     return failures
 
 
+def _run_migrations(cur: Any) -> None:
+    """Add columns/constraints that may be missing from existing tables.
+
+    ZH: 对已存在的表，添加可能缺失的列或约束。
+        ``CREATE TABLE IF NOT EXISTS`` 不会修改已有表结构，迁移步骤确保新列被添加。
+    """
+    migrations: list[tuple[str, str]] = [
+        (
+            "tp_is_active",
+            "ALTER TABLE trajectory_points ADD COLUMN IF NOT EXISTS "
+            "is_active BOOLEAN NOT NULL DEFAULT TRUE",
+        ),
+    ]
+    for label, sql in migrations:
+        try:
+            cur.execute(sql)
+            print(f"  [OK] migration {label:30s} {cur.statusmessage}")
+        except Exception as exc:
+            print(f"  [SKIP] migration {label:30s} {exc}")
+
+
 def create_tables(config: PostgresConfig) -> int:
     """Execute all DDL statements and return the number of failures.
 
@@ -314,6 +336,10 @@ def create_tables(config: PostgresConfig) -> int:
                 except Exception as exc:
                     print(f"  [FAIL] {name:40s} {exc}")
                     failures += 1
+
+            # ── Migrations: add missing columns to existing tables ──
+            print("\n── 迁移 / Migrations ──")
+            _run_migrations(cur)
 
             # ── Create indexes ──
             print("\n── 创建索引 / Creating Indexes ──")

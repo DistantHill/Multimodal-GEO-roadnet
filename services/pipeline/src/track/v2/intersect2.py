@@ -549,16 +549,22 @@ class SpatialWindowIterator:
 
 
 def _query_spatial_extent(conn: Any, *, table: str = "trajectory_points") -> tuple[float, float, float, float] | None:
-    """Query MIN/MAX lon/lat of active trajectory points."""
+    """Query MIN/MAX lon/lat of active trajectory points.
+
+    Returns ``(lon_min, lat_min, lon_max, lat_max)`` compatible with
+    ``SpatialWindowIterator``.
+    """
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT MIN(lon), MAX(lon), MIN(lat), MAX(lat) "
-            f"FROM {table} WHERE is_active = TRUE"
+            f"FROM {table} WHERE is_active IS NOT FALSE"
         )
         row = cur.fetchone()
     if row is None or row[0] is None:
         return None
-    return float(row[0]), float(row[1]), float(row[2]), float(row[3])
+    # SQL returns (min_lon, max_lon, min_lat, max_lat)
+    # SpatialWindowIterator expects (lon_min, lat_min, lon_max, lat_max)
+    return float(row[0]), float(row[2]), float(row[1]), float(row[3])
 
 
 def _query_active_points_in_window(
@@ -574,7 +580,7 @@ def _query_active_points_in_window(
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
             f"       source_id, source_row_key, extra "
             f"FROM {table} "
-            f"WHERE is_active = TRUE "
+            f"WHERE is_active IS NOT FALSE "
             f"  AND lon BETWEEN %s AND %s "
             f"  AND lat BETWEEN %s AND %s "
             f"ORDER BY vehicle_id, timestamp",
@@ -637,7 +643,7 @@ def _query_active_points_near_cluster(
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
             f"       source_id, source_row_key, extra "
             f"FROM {table} "
-            f"WHERE is_active = TRUE "
+            f"WHERE is_active IS NOT FALSE "
             f"  AND lon BETWEEN %s AND %s "
             f"  AND lat BETWEEN %s AND %s "
             f"ORDER BY vehicle_id, timestamp",
