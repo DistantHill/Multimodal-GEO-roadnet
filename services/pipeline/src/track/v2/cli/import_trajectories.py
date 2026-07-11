@@ -29,6 +29,8 @@ from ..db_writer import insert_trajectory_points
 
 # ── Import logic ─────────────────────────────────────────────────────
 
+BATCH_SIZE = 10_000  # 每批写入行数 / rows per batch insert
+
 
 def main() -> int:
     # ZH: 从 .env 加载默认连接参数，CLI 参数可覆盖
@@ -73,35 +75,58 @@ def main() -> int:
 
     print(f"数据源 / Source CSV: {args.csv}")
     print(f"连接目标 / Target:    {db_config.safe_dsn()}")
+    print(f"目标表  / Table:      {args.table}")
 
     try:
+        t_start = time.perf_counter()
+
         # ── Parser 0: read CSV ──
-        t0 = time.perf_counter()
         source = CsvSource(path=args.csv)
         handle = get_database(source)
-        all_points = list(handle.iter_points())
-        handle.close()
-        t_read = time.perf_counter() - t0
-        print(f"  解析 / Parsed: {len(all_points):,} 点/points ({t_read:.1f}s)")
 
-        if not all_points:
-            print("  无数据 / No data to import.")
-            return 0
+        # ── Stream insert: 每批 BATCH_SIZE 行边读边写 / batch-insert as we read ──
+        total_parsed = 0
+        total_written = 0
 
-        # ── Insert ──
         with pg_connect(db_config) as conn:
-            t0 = time.perf_counter()
-            tp_id_map = insert_trajectory_points(conn, all_points, table=args.table)
+            batch: list = []
+            for point in handle.iter_points():
+                batch.append(point)
+                if len(batch) >= BATCH_SIZE:
+                    t0 = time.perf_counter()
+                    tp_id_map = insert_trajectory_points(conn, batch, table=args.table)
+                    written = len(tp_id_map)
+                    total_written += written
+                    total_parsed += len(batch)
+                    elapsed = time.perf_counter() - t0
+                    print(f"  ... 已解析 / parsed: {total_parsed:>12,}  "
+                          f"已写入 / written: {total_written:>12,}  "
+                          f"({elapsed:.1f}s per batch)")
+                    batch.clear()
+
+            # ── Final batch ──
+            if batch:
+                t0 = time.perf_counter()
+                tp_id_map = insert_trajectory_points(conn, batch, table=args.table)
+                written = len(tp_id_map)
+                total_written += written
+                total_parsed += len(batch)
+                elapsed = time.perf_counter() - t0
+                print(f"  ... 已解析 / parsed: {total_parsed:>12,}  "
+                      f"已写入 / written: {total_written:>12,}  "
+                      f"({elapsed:.1f}s final batch)")
+
             conn.commit()
-            t_write = time.perf_counter() - t0
-            print(f"  写入 / Wrote:  {len(tp_id_map):,} rows ({t_write:.1f}s)")
 
-            skipped = len(all_points) - len(tp_id_map)
-            if skipped > 0:
-                print(f"  跳过 / Skipped: {skipped:,} (重复/duplicate source_id+source_row_key)")
+        handle.close()
 
-            t_total = time.perf_counter() - (t0 - t_write)
-            print(f"\n── 完成 / Done ({t_read + t_write:.1f}s) ──")
+        t_total = time.perf_counter() - t_start
+        skipped = total_parsed - total_written
+        print(f"\n  解析 / Parsed: {total_parsed:,} 点/points")
+        print(f"  写入 / Wrote:  {total_written:,} rows")
+        if skipped > 0:
+            print(f"  跳过 / Skipped: {skipped:,} (重复/duplicate source_id+source_row_key)")
+        print(f"\n── 完成 / Done ({t_total:.1f}s) ──")
 
     except RuntimeError as exc:
         print(str(exc))

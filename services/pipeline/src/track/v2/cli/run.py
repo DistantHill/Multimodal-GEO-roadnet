@@ -75,7 +75,7 @@ def run_pipeline(
         source = PostgresSource(
             config=db_config,
             query=f"SELECT * FROM {pg_source_table} ORDER BY vehicle_id, timestamp",
-            source_id=db_config.database,
+            source_id=pg_source_table,
             primary_key_field="id",
         )
         source_label = f"postgresql://{db_config.database}/{pg_source_table}"
