@@ -954,6 +954,8 @@ def _detect_turn_events(
             continue
 
         xy = [_to_xy(p.lon, p.lat, origin_lon, origin_lat) for p in track]
+        # 直接使用 GPS heading 作为逐段方位角，避免 O(w*(n-2w)) 次 atan2
+        headings = [p.heading for p in track]
 
         for i in range(w, len(track) - w):
             in_leg = _distance_m(xy[i - w], xy[i])
@@ -970,10 +972,8 @@ def _detect_turn_events(
             ):
                 continue
 
-            in_angles = _segment_bearings(xy, i - w, i)
-            out_angles = _segment_bearings(xy, i, i + w)
-            if not in_angles or not out_angles:
-                continue
+            in_angles = headings[i - w : i]
+            out_angles = headings[i : i + w]
 
             in_bearing = _circular_mean_deg(in_angles)
             out_bearing = _circular_mean_deg(out_angles)
@@ -1094,7 +1094,7 @@ def _extract_orthogonal_candidates(
     suggesting a road intersection.
     """
     candidates: list[OrthogonalCandidate] = []
-
+    
     for track in tracks.values():
         for tp in track:
             if tp.point_ref.generated_reason == "orthogonal_heading":
