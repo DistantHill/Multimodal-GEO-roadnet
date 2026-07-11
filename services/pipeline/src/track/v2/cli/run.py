@@ -24,6 +24,7 @@ import time
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
 from ..db_writer import (
+    fetch_trajectory_point_ids,
     insert_candidate_entry_exit_points,
     insert_candidate_intersection_events,
     insert_candidate_intersections,
@@ -92,9 +93,17 @@ def run_pipeline(
         handle.close()
 
         t0 = time.perf_counter()
-        tp_id_map = insert_trajectory_points(conn, all_points, table=table)
-        stats["trajectory_points"] = len(all_points)
-        print(f"  写入 / Wrote: {len(all_points):,} rows ({time.perf_counter() - t0:.1f}s)")
+        if pg_source_table is not None:
+            # ZH: 数据源为 PostgreSQL 表——点已入库，跳过写入，仅查询 ID 映射
+            # EN: Source is a PostgreSQL table — points already in DB, skip insert, only fetch ID map
+            tp_id_map = fetch_trajectory_point_ids(conn, pg_source_table, table=table)
+            stats["trajectory_points"] = len(all_points)
+            print(f"  已存在 / Already in DB: {len(all_points):,} 点/points, "
+                  f"mapped {len(tp_id_map):,} IDs ({time.perf_counter() - t0:.1f}s)")
+        else:
+            tp_id_map = insert_trajectory_points(conn, all_points, table=table)
+            stats["trajectory_points"] = len(all_points)
+            print(f"  写入 / Wrote: {len(all_points):,} rows ({time.perf_counter() - t0:.1f}s)")
 
         # ── Stage 2: Cleaner 1 ────────────────────────────────────────
         print("\n── Cleaner 1: 清洗 / Cleaning ──")

@@ -156,6 +156,28 @@ def insert_trajectory_points(
     return mapping
 
 
+def fetch_trajectory_point_ids(
+    conn: Any,
+    source_id: str,
+    *,
+    table: str = "trajectory_points",
+) -> dict[tuple[str, str], int]:
+    """Fetch existing (source_id, source_row_key) → id mapping from the DB.
+
+    ZH: 从已有表中查询 (source_id, source_row_key) → id 映射。
+        当数据源为 PostgreSQL 表时使用，避免重复插入已存在的数据。
+    """
+    mapping: dict[tuple[str, str], int] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT id, source_id, source_row_key FROM {table} WHERE source_id = %s",
+            (source_id,),
+        )
+        for db_id, sid, srk in cur:
+            mapping[(sid, srk)] = db_id
+    return mapping
+
+
 # ── Cleaner 1 ──────────────────────────────────────────────────────────
 
 def _point_ref_key(point_ref: PointRef) -> tuple[str, str]:
