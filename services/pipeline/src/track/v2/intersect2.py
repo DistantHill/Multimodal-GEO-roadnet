@@ -600,10 +600,12 @@ def _query_active_points_in_window(
             })
 
     # Also query injected_points in same window
+    # ZH: injected_points 没有 source_id 列，用 from_source_id/from_source_row_key 别名
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       source_id, source_row_key "
+            f"       from_source_id AS source_id, "
+            f"       from_source_row_key AS source_row_key "
             f"FROM injected_points "
             f"WHERE lon BETWEEN %s AND %s "
             f"  AND lat BETWEEN %s AND %s "
@@ -668,10 +670,12 @@ def _query_active_points_near_cluster(
             })
 
     # Also query injected_points near cluster
+    # ZH: injected_points 没有 source_id 列，用 from_source_id/from_source_row_key 别名
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       source_id, source_row_key "
+            f"       from_source_id AS source_id, "
+            f"       from_source_row_key AS source_row_key "
             f"FROM injected_points "
             f"WHERE lon BETWEEN %s AND %s "
             f"  AND lat BETWEEN %s AND %s "
