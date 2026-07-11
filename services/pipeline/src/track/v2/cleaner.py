@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Iterator
 from dataclasses import replace
 
@@ -34,6 +35,11 @@ def clean(
     kept_subtracks: list[list[TrajectoryPoint]] = []
     injected_count = 0
 
+    t0 = time.perf_counter()
+    last_t = t0
+    group_count = 0
+    print("  ── 清洗 / Cleaning ...")
+
     for vehicle_points in _group_by_vehicle(source.iter_points()):
         subtracks = _split_by_gaps(vehicle_points, cfg.max_gap_s)
         rename = len(subtracks) > 1
@@ -46,6 +52,14 @@ def clean(
             injected_subtrack, count = _inject_orthogonal(kept, cfg)
             active.extend(injected_subtrack)
             injected_count += count
+
+        group_count += 1
+        now = time.perf_counter()
+        if group_count % 50 == 0 or (now - last_t) >= 3.0:
+            print(f"    ... 已处理 / Processed {group_count} 车辆组/groups ({now - t0:.1f}s)")
+            last_t = now
+
+    print(f"  ── 清洗 / Cleaning: {len(active):,} 点/points ({time.perf_counter() - t0:.1f}s)")
 
     excluded_index = ExcludedIndex(excluded)
     report = CleanReport(

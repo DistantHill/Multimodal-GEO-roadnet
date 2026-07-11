@@ -13,6 +13,7 @@ verified via entry/exit circle-crossing analysis + branch-angle clustering.
 from __future__ import annotations
 
 import math
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterator
@@ -269,8 +270,15 @@ def _annotate_source_ablation(
         return []
 
     all_sources = sorted({source for cluster in clusters for source in _cluster_sources(cluster)})
+    report_ablation = len(all_sources) > 1  # only print ablation progress when there are multiple sources
+    if report_ablation:
+        print(f"    ... 源消融分析 / Source ablation ({len(all_sources)} 源/sources) ...")
+        t_abl = time.perf_counter()
     reclustered_without: dict[str, list[HotspotCluster]] = {}
     for source in all_sources:
+        if report_ablation:
+            print(f"      ... 消融 / Ablating: {source} ...")
+            t1 = time.perf_counter()
         reclustered_without[source] = _build_candidate_clusters(
             hotspot_events,
             orthogonal_candidates,
@@ -279,6 +287,8 @@ def _annotate_source_ablation(
             origin_lat,
             disabled_sources={source},
         )
+        if report_ablation:
+            print(f"      ... 消融 / Ablated {source}: {len(reclustered_without[source])} 簇/clusters ({time.perf_counter() - t1:.1f}s)")
 
     annotated: list[HotspotCluster] = []
     for cluster in clusters:
@@ -296,6 +306,8 @@ def _annotate_source_ablation(
                 critical_sources=tuple(critical_sources),
             )
         )
+    if report_ablation:
+        print(f"    ... 源消融分析: {len(annotated):,} 簇/clusters ({time.perf_counter() - t_abl:.1f}s)")
     return annotated
 
 
@@ -500,6 +512,11 @@ def _detect_turn_events(
     """
     events: list[TurnEvent] = []
     w = cfg.turn_window
+    total_tracks = len(tracks)
+    t0 = time.perf_counter()
+    last_t = t0
+    track_count = 0
+    print(f"  ── 转向事件检测 / Turn event detection ({total_tracks:,} 轨迹/tracks) ...")
 
     for vehicle_id, track in tracks.items():
         if len(track) < 2 * w + 1:
@@ -552,6 +569,13 @@ def _detect_turn_events(
                     )
                 )
 
+        track_count += 1
+        now = time.perf_counter()
+        if track_count % 100 == 0 or (now - last_t) >= 3.0:
+            print(f"    ... 已处理 / Processed {track_count:,}/{total_tracks:,} 轨迹/tracks ({now - t0:.1f}s)")
+            last_t = now
+
+    print(f"  ── 转向事件检测: {len(events):,} 事件/events ({time.perf_counter() - t0:.1f}s)")
     return events
 
 
@@ -568,8 +592,11 @@ def _compute_getis_ord_g_star(
     if n < 2:
         return {e.event_id: 0.0 for e in events}
 
+    t0 = time.perf_counter()
+    last_t = t0
+    print(f"    ... 计算 Getis-Ord G* / Computing G* ({n:,} 事件/events) ...")
     local_counts: list[float] = []
-    for event in events:
+    for i, event in enumerate(events):
         count = 0.0
         ex, ey = event.x, event.y
         for other in events:
@@ -578,6 +605,12 @@ def _compute_getis_ord_g_star(
             if dx * dx + dy * dy <= radius_m * radius_m:
                 count += 1.0
         local_counts.append(count)
+        now = time.perf_counter()
+        if (i + 1) % 500 == 0 or (now - last_t) >= 3.0:
+            print(f"      ... G*: {i + 1:,}/{n:,} 事件/events ({now - t0:.1f}s)")
+            last_t = now
+
+    print(f"    ... G*: {n:,} 事件/events ({time.perf_counter() - t0:.1f}s)")
 
     mean = sum(local_counts) / n
     variance = sum(v * v for v in local_counts) / n - mean * mean
@@ -599,13 +632,17 @@ def _select_hotspot_events(
     if not events:
         return []
 
+    print(f"  ── 热点筛选 / Hotspot selection ({len(events):,} 事件/events) ...")
+    t0 = time.perf_counter()
     z_scores = _compute_getis_ord_g_star(events, cfg.g_star_radius_m)
-    return [
+    result = [
         e
         for e in events
         if z_scores.get(e.event_id, 0.0) >= cfg.g_star_min_z
         and abs(e.turn_deg) >= cfg.min_turn_deg
     ]
+    print(f"  ── 热点筛选: {len(result):,} 事件/events ({time.perf_counter() - t0:.1f}s)")
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -690,6 +727,8 @@ def _run_dbscan(
 
     labels = [_UNVISITED] * n
     cluster_id = 0
+    t0 = time.perf_counter()
+    last_t = t0
 
     for i in range(n):
         if labels[i] != _UNVISITED:
@@ -714,7 +753,12 @@ def _run_dbscan(
                     if labels[nb] in (_UNVISITED, _NOISE) and nb not in seeds:
                         seeds.append(nb)
         cluster_id += 1
+        now = time.perf_counter()
+        if i % 500 == 0 or (now - last_t) >= 3.0:
+            print(f"      ... DBSCAN: {i + 1:,}/{n:,} 点/points, {cluster_id} 簇/clusters ({now - t0:.1f}s)")
+            last_t = now
 
+    print(f"    ... DBSCAN: {n:,} 点/points → {cluster_id:,} 簇/clusters ({time.perf_counter() - t0:.1f}s)")
     return labels
 
 
@@ -734,6 +778,7 @@ def _cluster_dbscan(
 
     xs = [e.x for e in events]
     ys = [e.y for e in events]
+    print(f"    ... DBSCAN 聚类 ({source}) / DBSCAN clustering ({n:,} 点/points) ...")
     labels = _run_dbscan(xs, ys, eps_m=eps_m, min_samples=min_samples)
 
     clusters: list[HotspotCluster] = []
@@ -780,6 +825,7 @@ def _cluster_orthogonal_candidates(
 
     xs = [c.x for c in candidates]
     ys = [c.y for c in candidates]
+    print(f"    ... DBSCAN 聚类 (orthogonal) / DBSCAN clustering ({n:,} 点/points) ...")
     labels = _run_dbscan(xs, ys, eps_m=eps_m, min_samples=min_samples)
 
     clusters: list[HotspotCluster] = []
@@ -1028,8 +1074,13 @@ def _build_intersection_topologies(
     topologies: list[IntersectionTopology] = []
     annotated_clusters: list[HotspotCluster] = []
     all_observations: list[EntryExitObservation] = []
+    total_clusters = len(clusters)
+    t0 = time.perf_counter()
+    print(f"  ── 拓扑验证 / Topology verification ({total_clusters:,} 簇/clusters) ...")
 
     for cluster in clusters:
+        cluster_idx = len(topologies) + 1
+        print(f"    ... 簇 / Cluster {cluster_idx:,}/{total_clusters:,} ({time.perf_counter() - t0:.1f}s)")
         radius = max(
             cfg.min_intersection_radius_m,
             cluster.radius_m + cfg.topology_radius_padding_m,
@@ -1094,6 +1145,7 @@ def _build_intersection_topologies(
         )
         annotated_clusters.append(cluster)
 
+    print(f"  ── 拓扑验证: {len(topologies):,} 拓扑/topologies ({time.perf_counter() - t0:.1f}s)")
     return topologies, annotated_clusters, all_observations
 
 
