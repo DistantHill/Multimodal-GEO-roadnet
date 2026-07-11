@@ -846,7 +846,7 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
             conn, cluster, radius * 2.0, table=cfg.db_table,
         )
         nearby_tracks = _tracks_from_points(nearby_points)
-        observations, _ = _extract_entry_exit_observations_batch(
+        observations, crossing_points = _extract_entry_exit_observations_batch(
             nearby_tracks,
             cluster=cluster,
             origin_lon=origin_lon,
@@ -854,6 +854,8 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
             radius_m=radius,
             bearing_window=cfg.bearing_window,
         )
+        # Attach crossing points to cluster for replay provenance (mirrors in-memory path)
+        cluster = replace(cluster, crossing_points=tuple(crossing_points))
         topology, annotated, cluster_observations = _build_topology_for_cluster(
             cluster, observations, origin_lon, origin_lat, cfg,
         )
