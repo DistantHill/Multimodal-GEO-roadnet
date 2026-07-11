@@ -36,8 +36,11 @@ from ..db_writer import (
     insert_trajectory_points,
     insert_turn_events,
 )
-from ..models import CsvSource, PostgresSource
-from .. import get_database, clean, detect_intersections, IntersectConfig
+from ..models import CsvSource, ExcludedIndex, PostgresSource
+from .. import get_database, detect_intersections, IntersectConfig
+from ..cleaner import clean_vehicle
+from ..sources import StreamVehicleSource
+from ..db_writer import mark_excluded_points
 
 
 # ── Pipeline runner ──────────────────────────────────────────────────
@@ -68,6 +71,7 @@ def run_pipeline(
 
     stats: dict[str, int] = {}
     t_start = time.perf_counter()
+    is_pg_source = pg_source_table is not None
 
     if csv_path is not None:
         source = CsvSource(path=csv_path)
@@ -82,73 +86,92 @@ def run_pipeline(
         source_label = f"postgresql://{db_config.database}/{pg_source_table}"
 
     with pg_connect(db_config) as conn:
-        # ── Stage 1: Parser 0 ─────────────────────────────────────────
-        print("── Parser 0: 读取轨迹点 / Reading trajectory points ──")
+        # ── Stage 1+2: Streamed read → insert → clean (per vehicle) ──
+        print("── Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean ──")
         print(f"  数据源 / Source: {source_label}")
         handle = get_database(source)
+        stream = StreamVehicleSource(handle)
 
-        # Collect all points in memory (needed for Cleaner + Intersect2)
-        all_points = list(handle.iter_points())
-        print(f"  读取 / Read: {len(all_points):,} 点/points")
+        total_raw = 0
+        total_injected = 0
+        tp_id_map: dict[tuple[str, str], int] = {}
+        all_excluded: list = []
+        all_kept_subtracks: list[list] = []
+        all_injected_points: list = []
+
+        t_read = time.perf_counter()
+        vehicle_count = 0
+        for vehicle_points in stream.iter_vehicle_tracks():
+            total_raw += len(vehicle_points)
+            vehicle_count += 1
+
+            if not is_pg_source:
+                # CSV: insert raw points to DB
+                batch_map = insert_trajectory_points(conn, vehicle_points, table=table)
+                tp_id_map.update(batch_map)
+
+            # Clean this vehicle
+            vresult = clean_vehicle(vehicle_points)
+            total_injected += vresult.injected_count
+
+            # Mark excluded points as is_active=FALSE in DB
+            mark_excluded_points(conn, vresult.excluded, table=table)
+            all_excluded.extend(vresult.excluded)
+            all_kept_subtracks.extend(vresult.kept_subtracks)
+
+            # Collect injected points for batch insert
+            for p in vresult.active:
+                if p.point_ref.generated_reason == "orthogonal_heading":
+                    all_injected_points.append(p)
+
+            if vehicle_count % 500 == 0:
+                elapsed = time.perf_counter() - t_read
+                print(f"    ... {vehicle_count:,} 车辆/vehicles, {total_raw:,} 点/points ({elapsed:.1f}s)")
+
+        stream.close()
         handle.close()
+        elapsed_read = time.perf_counter() - t_read
+        print(f"  读取&清洗 / Read&Clean: {total_raw:,} 点/points, "
+              f"{vehicle_count:,} 车辆/vehicles ({elapsed_read:.1f}s)")
 
-        t0 = time.perf_counter()
-        if pg_source_table is not None:
-            # ZH: 数据源为 PostgreSQL 表——点已入库，跳过写入，仅查询 ID 映射
-            # EN: Source is a PostgreSQL table — points already in DB, skip insert, only fetch ID map
+        stats["trajectory_points"] = total_raw
+
+        if is_pg_source:
+            # Points already in DB — fetch existing ID mapping for FK references
+            t0 = time.perf_counter()
             tp_id_map = fetch_trajectory_point_ids(conn, pg_source_table, table=table)
-            stats["trajectory_points"] = len(all_points)
-            print(f"  已存在 / Already in DB: {len(all_points):,} 点/points, "
-                  f"mapped {len(tp_id_map):,} IDs ({time.perf_counter() - t0:.1f}s)")
-        else:
-            tp_id_map = insert_trajectory_points(conn, all_points, table=table)
-            stats["trajectory_points"] = len(all_points)
-            print(f"  写入 / Wrote: {len(all_points):,} rows ({time.perf_counter() - t0:.1f}s)")
+            print(f"  ID 映射 / ID map: {len(tp_id_map):,} entries ({time.perf_counter() - t0:.1f}s)")
 
-        # ── Stage 2: Cleaner 1 ────────────────────────────────────────
-        print("\n── Cleaner 1: 清洗 / Cleaning ──")
-        # Re-create the source handle (clean() needs its own handle)
-        handle2 = get_database(source)
-        result = clean(handle2)
-        handle2.close()
-
-        print(f"  保留 / Active: {result.report.active_count:,}")
-        print(f"  排除 / Excluded: {result.report.excluded_count:,}")
-        print(f"  注入 / Injected: {result.report.injected_count:,}")
+        # ── Batch-write cleaner outputs ──────────────────────────────
+        excluded_index = ExcludedIndex(all_excluded)
+        print(f"  排除 / Excluded: {len(all_excluded):,}")
+        print(f"  注入 / Injected: {total_injected:,}")
 
         t0 = time.perf_counter()
-        insert_excluded_points(conn, result.excluded, tp_id_map)
-        stats["excluded_points"] = len(result.excluded)
-        print(f"  excluded_points: {len(result.excluded):,} rows ({time.perf_counter() - t0:.1f}s)")
+        insert_excluded_points(conn, excluded_index, tp_id_map)
+        stats["excluded_points"] = len(all_excluded)
+        print(f"  excluded_points: {len(all_excluded):,} rows ({time.perf_counter() - t0:.1f}s)")
 
-        t0 = time.perf_counter()
-        if result.kept_subtracks:
-            insert_kept_trajectory_points(conn, result.kept_subtracks, tp_id_map)
-            kept_count = sum(len(st) for st in result.kept_subtracks)
+        if all_kept_subtracks:
+            t0 = time.perf_counter()
+            insert_kept_trajectory_points(conn, all_kept_subtracks, tp_id_map)
+            kept_count = sum(len(st) for st in all_kept_subtracks)
             stats["kept_trajectory_points"] = kept_count
             print(f"  kept_trajectory_points: {kept_count:,} rows ({time.perf_counter() - t0:.1f}s)")
 
-        # Collect active points for injected_points
-        active_points = list(result.active.iter_points())
-        result.active.close()
+        if all_injected_points:
+            t0 = time.perf_counter()
+            insert_injected_points(conn, all_injected_points)
+            stats["injected_points"] = total_injected
+            print(f"  injected_points: {total_injected:,} rows ({time.perf_counter() - t0:.1f}s)")
 
-        t0 = time.perf_counter()
-        insert_injected_points(conn, active_points)
-        injected_count = sum(1 for p in active_points
-                            if p.point_ref.generated_reason == "orthogonal_heading")
-        stats["injected_points"] = injected_count
-        print(f"  injected_points: {injected_count:,} rows ({time.perf_counter() - t0:.1f}s)")
-
-        # ── Stage 3: Intersect2 ───────────────────────────────────────
-        print("\n── Intersect2: 交叉口检测 / Intersection Detection ──")
-        # Re-create active handle for intersect2
-        from ..cleaner import ListTrajectorySourceHandle
-        active_handle = ListTrajectorySourceHandle(
-            active_points,
-            source_info=result.active.source_info,
-            field_mapping=result.active.field_mapping,
+        # ── Stage 3: Intersect2 (DB mode — spatial sliding windows) ──
+        print("\n── Intersect2: 交叉口检测 / Intersection Detection (DB 滑窗模式) ──")
+        icfg = IntersectConfig(
+            query_active_from_db=True,
+            db_table=table,
         )
-        iresult = detect_intersections(active_handle)
+        iresult = detect_intersections(conn=conn, config=icfg)
 
         print(f"  转向事件 / Turn events: {iresult.report.turn_event_count:,}")
         print(f"  热点事件 / Hotspot events: {iresult.report.hotspot_event_count:,}")

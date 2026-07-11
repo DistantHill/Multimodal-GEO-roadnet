@@ -314,6 +314,20 @@ class CleanerResult(TrackModel):
 
 
 @dataclass(frozen=True)
+class CleanerIncrementalResult(TrackModel):
+    """Per-vehicle result from ``clean_vehicle()`` — stream-friendly.
+
+    ZH: 单车辆清洗结果——避免 clean() 内部累积全部车辆的数据，
+        支持逐车流式处理。
+    """
+
+    active: list[TrajectoryPoint]       # 清洗后保留 + 注入点
+    excluded: list[ExcludedPoint]       # 被排除的点
+    kept_subtracks: list[list[TrajectoryPoint]]  # 保留的子轨迹
+    injected_count: int                 # 注入的 orthogonal 点数量
+
+
+@dataclass(frozen=True)
 class CsvSource(TrackModel):
     path: str | Path
     encoding: str | None = None

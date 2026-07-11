@@ -34,6 +34,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             source_id       TEXT NOT NULL,
             source_row_key  TEXT NOT NULL,
             stable          BOOLEAN NOT NULL DEFAULT TRUE,
+            is_active       BOOLEAN NOT NULL DEFAULT TRUE,
             vehicle_id      TEXT NOT NULL,
             timestamp       DOUBLE PRECISION NOT NULL,
             lon             DOUBLE PRECISION NOT NULL,
@@ -215,6 +216,7 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     ("idx_tp_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_tp_vehicle_ts ON trajectory_points(vehicle_id, timestamp)"),
     ("idx_tp_source_row",      "CREATE INDEX IF NOT EXISTS idx_tp_source_row ON trajectory_points(source_id, source_row_key)"),
     ("idx_tp_geom",            "CREATE INDEX IF NOT EXISTS idx_tp_geom ON trajectory_points USING GIST (geom)"),
+    ("idx_tp_active",          "CREATE INDEX IF NOT EXISTS idx_tp_active ON trajectory_points(is_active) WHERE is_active = TRUE"),
     # ── excluded_points ──
     ("idx_ep_reason",          "CREATE INDEX IF NOT EXISTS idx_ep_reason ON excluded_points(reason)"),
     ("idx_ep_geom",            "CREATE INDEX IF NOT EXISTS idx_ep_geom ON excluded_points USING GIST (geom)"),
@@ -226,7 +228,7 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     ("idx_ip_geom",            "CREATE INDEX IF NOT EXISTS idx_ip_geom ON injected_points USING GIST (geom)"),
     # ── turn_events ──
     ("idx_te_event_id",        "CREATE INDEX IF NOT EXISTS idx_te_event_id ON turn_events(event_id)"),
-    ("idx_te_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_te_vehicle_ts ON turn_events(vehicle_id, timestamp)"),
+    ("idx_te_vehicle_ts",      "CREATE UNIQUE INDEX IF NOT EXISTS idx_te_vehicle_ts ON turn_events(vehicle_id, timestamp)"),
     ("idx_te_source",          "CREATE INDEX IF NOT EXISTS idx_te_source ON turn_events(source)"),
     ("idx_te_xy",              "CREATE INDEX IF NOT EXISTS idx_te_xy ON turn_events(x, y)"),
     ("idx_te_geom",            "CREATE INDEX IF NOT EXISTS idx_te_geom ON turn_events USING GIST (geom)"),

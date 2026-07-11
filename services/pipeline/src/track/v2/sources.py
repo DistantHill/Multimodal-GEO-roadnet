@@ -677,3 +677,57 @@ def _close_quietly(resource: Any) -> None:
     close = getattr(resource, "close", None)
     if callable(close):
         close()
+
+
+# ── Streaming vehicle source ────────────────────────────────────────────
+
+
+class StreamVehicleSource:
+    """Yield per-vehicle point lists by detecting vehicle_id changes.
+
+    ZH: 利用 (vehicle_id, timestamp) 排序，检测 vehicle_id 变化，
+        逐车 yield 完整轨迹点列表。内存 = 单车辆点数。
+    """
+
+    def __init__(self, handle: "BaseTrajectorySourceHandle") -> None:
+        self._handle = handle
+        self._closed = False
+
+    @property
+    def source_info(self) -> SourceInfo:
+        return self._handle.source_info
+
+    @property
+    def field_mapping(self) -> FieldMapping:
+        return self._handle.field_mapping
+
+    def iter_vehicle_tracks(self) -> Iterator[list[TrajectoryPoint]]:
+        """Yield one vehicle's worth of points at a time.
+
+        Reads points one-by-one from the underlying handle.  When
+        ``vehicle_id`` changes, the previous vehicle's buffered points
+        are yielded and the buffer resets.
+        """
+        if self._closed:
+            raise RuntimeError("StreamVehicleSource is closed")
+        current_vid: str | None = None
+        current: list[TrajectoryPoint] = []
+        for point in self._handle.iter_points():
+            vid = point.vehicle_id
+            if current_vid is not None and vid != current_vid:
+                yield current
+                current = []
+            current_vid = vid
+            current.append(point)
+        if current:
+            yield current
+
+    def close(self) -> None:
+        self._closed = True
+        self._handle.close()
+
+    def __enter__(self) -> "StreamVehicleSource":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()

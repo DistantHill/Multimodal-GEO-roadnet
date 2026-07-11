@@ -92,6 +92,12 @@ class IntersectConfig(TrackModel):
     min_directed_transitions: int = 3
     bearing_window: int = 2
 
+    # ── Spatial sliding window (DB mode) ───────────────────────────
+    query_active_from_db: bool = False
+    db_table: str = "trajectory_points"
+    spatial_window_size: tuple[float, float] = (2000.0, 2000.0)
+    spatial_window_overlap: float = 0.15
+
 
 # ── Result ─────────────────────────────────────────────────────────────
 
@@ -341,15 +347,32 @@ def _complete_source_report(
 
 
 def detect_intersections(
-    source: TrajectorySourceHandle,
+    source: TrajectorySourceHandle | None = None,
     *,
     config: IntersectConfig | None = None,
+    conn: Any = None,
 ) -> IntersectResult:
     """Run dual-mode intersection detection and topology extraction.
 
     PRD v2 Intersect2 §2
+
+    Two modes:
+      - **Handle mode** (default): ``source`` is a ``TrajectorySourceHandle``.
+        All points are read into memory and grouped by vehicle_id.
+      - **DB mode**: ``conn`` is a psycopg connection and
+        ``config.query_active_from_db`` is True.  Points are queried from
+        the database in spatial sliding windows, dramatically reducing
+        in-memory footprint for large datasets.
     """
     cfg = config or IntersectConfig()
+
+    # ── DB mode: spatial sliding windows ────────────────────────────
+    if conn is not None and cfg.query_active_from_db:
+        return _detect_intersections_db(conn, cfg)
+
+    # ── Handle mode: in-memory (original path) ──────────────────────
+    if source is None:
+        raise V2Error("detect_intersections: 'source' handle is required when not in DB mode")
 
     # ── Buffer all points, group by vehicle ────────────────────────
     tracks, origin_lon, origin_lat = _group_by_vehicle(source)
@@ -456,6 +479,402 @@ def detect_intersections(
         turn_events=turn_events,
         hotspot_events=hotspot_events,
         orthogonal_candidates=orthogonal_candidates,
+        clusters=annotated_clusters,
+        topologies=topologies,
+        observations=all_observations,
+        report=report,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Spatial sliding window (DB mode)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class SpatialWindow:
+    """A single spatial cell with optional overlap padding."""
+    x_min: float
+    y_min: float
+    x_max: float
+    y_max: float
+
+
+class SpatialWindowIterator:
+    """Divide a spatial extent into overlapping windows.
+
+    ZH: 将 lon/lat 范围划分为重叠的空间滑窗。overlap 是四向扩展比例
+        （每侧扩展 overlap%），相邻窗口间实际重叠 = 2 × overlap。
+
+    Parameters
+    ----------
+    extent : (lon_min, lat_min, lon_max, lat_max)
+        Full spatial extent of the data.
+    size : (width_m, height_m)
+        Window size in meters (approximate, converted to degrees).
+    overlap : float
+        Per-side expansion ratio (default 0.15 = 15% each side).
+    """
+
+    def __init__(
+        self,
+        extent: tuple[float, float, float, float],
+        size: tuple[float, float] = (2000.0, 2000.0),
+        overlap: float = 0.15,
+    ) -> None:
+        self._lon_min, self._lat_min, self._lon_max, self._lat_max = extent
+        self._width_m, self._height_m = size
+        self._overlap = overlap
+
+        # Approximate metres → degrees (1° ≈ 111,320 m at equator)
+        self._step_lon = self._width_m / 111320.0
+        self._step_lat = self._height_m / 111320.0
+        self._pad_lon = self._step_lon * overlap
+        self._pad_lat = self._step_lat * overlap
+
+    def iter_windows(self) -> Iterator[SpatialWindow]:
+        """Yield overlapping spatial windows covering the full extent."""
+        lon = self._lon_min
+        while lon < self._lon_max:
+            lat = self._lat_min
+            while lat < self._lat_max:
+                yield SpatialWindow(
+                    x_min=max(self._lon_min, lon - self._pad_lon),
+                    y_min=max(self._lat_min, lat - self._pad_lat),
+                    x_max=min(self._lon_max, lon + self._step_lon + self._pad_lon),
+                    y_max=min(self._lat_max, lat + self._step_lat + self._pad_lat),
+                )
+                lat += self._step_lat
+            lon += self._step_lon
+
+
+def _query_spatial_extent(conn: Any, *, table: str = "trajectory_points") -> tuple[float, float, float, float] | None:
+    """Query MIN/MAX lon/lat of active trajectory points."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT MIN(lon), MAX(lon), MIN(lat), MAX(lat) "
+            f"FROM {table} WHERE is_active = TRUE"
+        )
+        row = cur.fetchone()
+    if row is None or row[0] is None:
+        return None
+    return float(row[0]), float(row[1]), float(row[2]), float(row[3])
+
+
+def _query_active_points_in_window(
+    conn: Any,
+    window: SpatialWindow,
+    *,
+    table: str = "trajectory_points",
+) -> list[TrajectoryPoint]:
+    """Query active trajectory points + injected points in a spatial window."""
+    rows: list[dict[str, Any]] = []
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
+            f"       source_id, source_row_key, extra "
+            f"FROM {table} "
+            f"WHERE is_active = TRUE "
+            f"  AND lon BETWEEN %s AND %s "
+            f"  AND lat BETWEEN %s AND %s "
+            f"ORDER BY vehicle_id, timestamp",
+            (window.x_min, window.x_max, window.y_min, window.y_max),
+        )
+        for row in cur:
+            rows.append({
+                "vehicle_id": row[0],
+                "timestamp": float(row[1]),
+                "lon": float(row[2]),
+                "lat": float(row[3]),
+                "heading": float(row[4]),
+                "speed": float(row[5]),
+                "source_id": row[6],
+                "source_row_key": row[7],
+                "extra": row[8] if isinstance(row[8], dict) else {},
+            })
+
+    # Also query injected_points in same window
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
+            f"       source_id, source_row_key "
+            f"FROM injected_points "
+            f"WHERE lon BETWEEN %s AND %s "
+            f"  AND lat BETWEEN %s AND %s "
+            f"ORDER BY vehicle_id, timestamp",
+            (window.x_min, window.x_max, window.y_min, window.y_max),
+        )
+        for row in cur:
+            rows.append({
+                "vehicle_id": row[0],
+                "timestamp": float(row[1]),
+                "lon": float(row[2]),
+                "lat": float(row[3]),
+                "heading": float(row[4]),
+                "speed": float(row[5]),
+                "source_id": row[6],
+                "source_row_key": row[7],
+                "extra": {},
+            })
+
+    rows.sort(key=lambda r: (r["vehicle_id"], r["timestamp"]))
+    return _build_points_from_rows(rows)
+
+
+def _query_active_points_near_cluster(
+    conn: Any,
+    cluster: HotspotCluster,
+    radius_m: float,
+    *,
+    table: str = "trajectory_points",
+) -> list[TrajectoryPoint]:
+    """Query active points within *radius_m* of a cluster centroid."""
+    # Convert radius_m to approximate degrees
+    radius_deg = radius_m / 111320.0
+    rows: list[dict[str, Any]] = []
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
+            f"       source_id, source_row_key, extra "
+            f"FROM {table} "
+            f"WHERE is_active = TRUE "
+            f"  AND lon BETWEEN %s AND %s "
+            f"  AND lat BETWEEN %s AND %s "
+            f"ORDER BY vehicle_id, timestamp",
+            (
+                cluster.centroid_lon - radius_deg,
+                cluster.centroid_lon + radius_deg,
+                cluster.centroid_lat - radius_deg,
+                cluster.centroid_lat + radius_deg,
+            ),
+        )
+        for row in cur:
+            rows.append({
+                "vehicle_id": row[0],
+                "timestamp": float(row[1]),
+                "lon": float(row[2]),
+                "lat": float(row[3]),
+                "heading": float(row[4]),
+                "speed": float(row[5]),
+                "source_id": row[6],
+                "source_row_key": row[7],
+                "extra": row[8] if isinstance(row[8], dict) else {},
+            })
+
+    # Also query injected_points near cluster
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
+            f"       source_id, source_row_key "
+            f"FROM injected_points "
+            f"WHERE lon BETWEEN %s AND %s "
+            f"  AND lat BETWEEN %s AND %s "
+            f"ORDER BY vehicle_id, timestamp",
+            (
+                cluster.centroid_lon - radius_deg,
+                cluster.centroid_lon + radius_deg,
+                cluster.centroid_lat - radius_deg,
+                cluster.centroid_lat + radius_deg,
+            ),
+        )
+        for row in cur:
+            rows.append({
+                "vehicle_id": row[0],
+                "timestamp": float(row[1]),
+                "lon": float(row[2]),
+                "lat": float(row[3]),
+                "heading": float(row[4]),
+                "speed": float(row[5]),
+                "source_id": row[6],
+                "source_row_key": row[7],
+                "extra": {},
+            })
+
+    rows.sort(key=lambda r: (r["vehicle_id"], r["timestamp"]))
+    return _build_points_from_rows(rows)
+
+
+def _build_points_from_rows(rows: list[dict[str, Any]]) -> list[TrajectoryPoint]:
+    """Convert DB row dicts to TrajectoryPoint objects."""
+    points: list[TrajectoryPoint] = []
+    for r in rows:
+        points.append(TrajectoryPoint(
+            point_ref=PointRef(
+                source_id=r["source_id"],
+                source_row_key=r["source_row_key"],
+                stable=True,
+            ),
+            vehicle_id=r["vehicle_id"],
+            timestamp=r["timestamp"],
+            lon=r["lon"],
+            lat=r["lat"],
+            heading=r["heading"],
+            speed=r["speed"],
+            extra=r["extra"],
+        ))
+    return points
+
+
+def _tracks_from_points(points: list[TrajectoryPoint]) -> dict[str, list[TrajectoryPoint]]:
+    """Group points by vehicle_id into a tracks dict."""
+    tracks: dict[str, list[TrajectoryPoint]] = {}
+    for tp in points:
+        if tp.vehicle_id not in tracks:
+            tracks[tp.vehicle_id] = []
+        tracks[tp.vehicle_id].append(tp)
+    return tracks
+
+
+def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult:
+    """DB-mode intersection detection with spatial sliding windows.
+
+    Queries active trajectory points from the database in overlapping
+    spatial windows to keep in-memory footprint bounded.  Turn events
+    and orthogonal candidates are collected globally (they are much
+    smaller than the full point set), and G*/DBSCAN run on the full set.
+    """
+
+    # ── Query spatial extent ────────────────────────────────────────
+    extent = _query_spatial_extent(conn, table=cfg.db_table)
+    if extent is None:
+        return IntersectResult(
+            turn_events=[], hotspot_events=[], orthogonal_candidates=[],
+            clusters=[], topologies=[],
+            report=IntersectReport(
+                track_count=0, turn_event_count=0, hotspot_event_count=0,
+                orthogonal_candidate_count=0, cluster_count=0,
+                cluster_count_turn=0, cluster_count_ortho=0,
+                complete_intersection_count=0,
+            ),
+        )
+
+    windows = SpatialWindowIterator(
+        extent,
+        size=cfg.spatial_window_size,
+        overlap=cfg.spatial_window_overlap,
+    )
+
+    all_turn_events: list[TurnEvent] = []
+    all_ortho_candidates: list[OrthogonalCandidate] = []
+    origin_lon = (extent[0] + extent[2]) / 2.0
+    origin_lat = (extent[1] + extent[3]) / 2.0
+
+    t0 = time.perf_counter()
+    window_count = 0
+    total_points = 0
+    print(f"  ── 空间滑窗 / Spatial windows ──")
+
+    for window in windows.iter_windows():
+        window_count += 1
+        points = _query_active_points_in_window(conn, window, table=cfg.db_table)
+        if not points:
+            continue
+        total_points += len(points)
+        window_tracks = _tracks_from_points(points)
+
+        # Turn detection per window
+        if cfg.use_turn_events:
+            window_turns = _detect_turn_events(window_tracks, origin_lon, origin_lat, cfg)
+            # Re-index event_id globally
+            for te in window_turns:
+                all_turn_events.append(replace(te, event_id=len(all_turn_events)))
+
+        # Orthogonal extraction per window
+        if cfg.use_orthogonal_candidates:
+            all_ortho_candidates.extend(
+                _extract_orthogonal_candidates(window_tracks, origin_lon, origin_lat)
+            )
+
+    print(f"    ... {window_count} 窗/windows, {total_points:,} 点/points ({time.perf_counter() - t0:.1f}s)")
+
+    # ── Global G* + DBSCAN ──────────────────────────────────────────
+    hotspot_events: list[TurnEvent] = []
+    all_clusters: list[HotspotCluster] = []
+
+    if cfg.use_turn_events and all_turn_events:
+        hotspot_events = _select_hotspot_events(all_turn_events, cfg)
+        if hotspot_events:
+            clusters_turn = _cluster_dbscan(
+                hotspot_events, origin_lon, origin_lat,
+                eps_m=cfg.dbscan_eps_m_turn,
+                min_samples=cfg.dbscan_min_samples_turn,
+                source="turn",
+            )
+            all_clusters.extend(clusters_turn)
+
+    if cfg.use_orthogonal_candidates and all_ortho_candidates:
+        clusters_ortho = _cluster_orthogonal_candidates(
+            all_ortho_candidates, origin_lon, origin_lat,
+            eps_m=cfg.dbscan_eps_m_ortho,
+            min_samples=cfg.dbscan_min_samples_ortho,
+        )
+        all_clusters.extend(clusters_ortho)
+
+    # ── Merge + reindex ─────────────────────────────────────────────
+    merged_clusters = _merge_clusters(all_clusters, cfg.merge_centroid_distance_m,
+                                       origin_lon, origin_lat)
+    merged_clusters = [
+        replace(c, cluster_id=new_id)
+        for new_id, c in enumerate(merged_clusters)
+    ]
+    merged_clusters = _annotate_source_ablation(
+        merged_clusters, hotspot_events, all_ortho_candidates,
+        cfg, origin_lon, origin_lat,
+    )
+
+    # ── Topology verification (per cluster, from DB) ────────────────
+    topologies: list[IntersectionTopology] = []
+    annotated_clusters: list[HotspotCluster] = []
+    all_observations: list[EntryExitObservation] = []
+    total_clusters = len(merged_clusters)
+
+    print(f"  ── 拓扑验证 / Topology verification ({total_clusters:,} 簇/clusters) ...")
+    for cluster in merged_clusters:
+        radius = max(cfg.min_intersection_radius_m,
+                     cluster.radius_m + cfg.topology_radius_padding_m)
+        nearby_points = _query_active_points_near_cluster(
+            conn, cluster, radius * 2.0, table=cfg.db_table,
+        )
+        nearby_tracks = _tracks_from_points(nearby_points)
+        observations, _ = _extract_entry_exit_observations_batch(
+            nearby_tracks,
+            cluster=cluster,
+            origin_lon=origin_lon,
+            origin_lat=origin_lat,
+            radius_m=radius,
+            bearing_window=cfg.bearing_window,
+        )
+        topology, annotated, cluster_observations = _build_topology_for_cluster(
+            cluster, observations, origin_lon, origin_lat, cfg,
+        )
+        topologies.append(topology)
+        annotated_clusters.append(annotated)
+        all_observations.extend(cluster_observations)
+
+    # ── Report ───────────────────────────────────────────────────────
+    turn_clusters = sum(1 for c in annotated_clusters if "turn" in _cluster_sources(c))
+    ortho_clusters = sum(1 for c in annotated_clusters if "orthogonal" in _cluster_sources(c))
+    source_report = _complete_source_report(annotated_clusters, topologies)
+
+    report = IntersectReport(
+        track_count=0,  # Unknown in DB mode
+        turn_event_count=len(all_turn_events),
+        hotspot_event_count=len(hotspot_events),
+        orthogonal_candidate_count=len(all_ortho_candidates),
+        cluster_count=len(annotated_clusters),
+        cluster_count_turn=turn_clusters,
+        cluster_count_ortho=ortho_clusters,
+        complete_intersection_count=sum(1 for t in topologies if t.is_complete),
+        complete_intersection_source_counts=source_report["source_counts"],
+        complete_intersection_source_ratios=source_report["source_ratios"],
+        complete_intersection_critical_source_counts=source_report["critical_source_counts"],
+        complete_intersection_critical_source_ratios=source_report["critical_source_ratios"],
+    )
+
+    return IntersectResult(
+        turn_events=all_turn_events,
+        hotspot_events=hotspot_events,
+        orthogonal_candidates=all_ortho_candidates,
         clusters=annotated_clusters,
         topologies=topologies,
         observations=all_observations,
@@ -1056,6 +1475,66 @@ def _make_observation(
     )
 
 
+def _build_topology_for_cluster(
+    cluster: HotspotCluster,
+    observations: list[EntryExitObservation],
+    origin_lon: float,
+    origin_lat: float,
+    cfg: IntersectConfig,
+) -> tuple[IntersectionTopology, HotspotCluster, list[EntryExitObservation]]:
+    """Build topology for a single cluster from pre-computed observations.
+
+    ZH: 对单个 cluster 构建拓扑：聚类分支角度、构建有向转移矩阵、评估完整性。
+        与 ``_build_intersection_topologies`` 不同，此函数接收已计算好的 observations，
+        适用于 DB 模式（observations 从 DB 查询的 nearby tracks 中提取）。
+    """
+    # Branch angle clustering
+    branch_angles: list[float] = []
+    for obs in observations:
+        branch_angles.append(obs.entry_branch_angle)
+        branch_angles.append(obs.exit_branch_angle)
+    branch_centers = (
+        _cluster_angles_greedy(branch_angles, cfg.branch_threshold_deg)
+        if branch_angles
+        else []
+    )
+
+    # Directed transition matrix
+    transition_counts: dict[tuple[int, int], int] = {}
+    for obs in observations:
+        if not branch_centers:
+            break
+        entry_id = _nearest_angle_id(obs.entry_branch_angle, branch_centers)
+        exit_id = _nearest_angle_id(obs.exit_branch_angle, branch_centers)
+        key = (entry_id, exit_id)
+        transition_counts[key] = transition_counts.get(key, 0) + 1
+
+    is_complete = (
+        len(branch_centers) >= cfg.min_branches
+        and len(observations) >= cfg.min_observations
+        and len(transition_counts) >= cfg.min_directed_transitions
+    )
+    reason = (
+        "complete"
+        if is_complete
+        else (
+            f"branches={len(branch_centers)}, "
+            f"observations={len(observations)}, "
+            f"directed_transitions={len(transition_counts)}"
+        )
+    )
+
+    topology = IntersectionTopology(
+        cluster_id=cluster.cluster_id,
+        branch_centers_deg=branch_centers,
+        transition_counts=transition_counts,
+        observation_count=len(observations),
+        is_complete=is_complete,
+        reason=reason,
+    )
+    return topology, cluster, observations
+
+
 def _build_intersection_topologies(
     clusters: list[HotspotCluster],
     tracks: dict[str, list[TrajectoryPoint]],
@@ -1067,7 +1546,7 @@ def _build_intersection_topologies(
 
     For each cluster:
       1. Batch-compute entry/exit observations for all vehicle tracks
-      2. Cluster branch angles
+      2. Cluster branch angles (delegates to ``_build_topology_for_cluster``)
       3. Build directed transition matrix
       4. Evaluate completeness
     """
@@ -1095,55 +1574,13 @@ def _build_intersection_topologies(
         )
         # Attach crossing points to cluster for replay provenance
         cluster = replace(cluster, crossing_points=tuple(crossing_points))
-        all_observations.extend(observations)
 
-        # Branch angle clustering
-        branch_angles: list[float] = []
-        for obs in observations:
-            branch_angles.append(obs.entry_branch_angle)
-            branch_angles.append(obs.exit_branch_angle)
-        branch_centers = (
-            _cluster_angles_greedy(branch_angles, cfg.branch_threshold_deg)
-            if branch_angles
-            else []
+        topology, annotated, cluster_obs = _build_topology_for_cluster(
+            cluster, observations, origin_lon, origin_lat, cfg,
         )
-
-        # Directed transition matrix
-        transition_counts: dict[tuple[int, int], int] = {}
-        for obs in observations:
-            if not branch_centers:
-                break
-            entry_id = _nearest_angle_id(obs.entry_branch_angle, branch_centers)
-            exit_id = _nearest_angle_id(obs.exit_branch_angle, branch_centers)
-            key = (entry_id, exit_id)
-            transition_counts[key] = transition_counts.get(key, 0) + 1
-
-        is_complete = (
-            len(branch_centers) >= cfg.min_branches
-            and len(observations) >= cfg.min_observations
-            and len(transition_counts) >= cfg.min_directed_transitions
-        )
-        reason = (
-            "complete"
-            if is_complete
-            else (
-                f"branches={len(branch_centers)}, "
-                f"observations={len(observations)}, "
-                f"directed_transitions={len(transition_counts)}"
-            )
-        )
-
-        topologies.append(
-            IntersectionTopology(
-                cluster_id=cluster.cluster_id,
-                branch_centers_deg=branch_centers,
-                transition_counts=transition_counts,
-                observation_count=len(observations),
-                is_complete=is_complete,
-                reason=reason,
-            )
-        )
-        annotated_clusters.append(cluster)
+        topologies.append(topology)
+        annotated_clusters.append(annotated)
+        all_observations.extend(cluster_obs)
 
     print(f"  ── 拓扑验证: {len(topologies):,} 拓扑/topologies ({time.perf_counter() - t0:.1f}s)")
     return topologies, annotated_clusters, all_observations

@@ -156,6 +156,39 @@ def insert_trajectory_points(
     return mapping
 
 
+def mark_excluded_points(
+    conn: Any,
+    excluded: list,
+    *,
+    table: str = "trajectory_points",
+) -> int:
+    """Set ``is_active = FALSE`` for points removed by Cleaner 1.
+
+    ZH: 批量 UPDATE trajectory_points，将被清洗排除的点的 is_active 标记为 FALSE。
+        返回标记行数。
+    """
+    if not excluded:
+        return 0
+
+    keys = [(item.point_ref.source_id, item.point_ref.source_row_key) for item in excluded]
+    total = 0
+    with conn.cursor() as cur:
+        for start in range(0, len(keys), _BATCH):
+            batch = keys[start : start + _BATCH]
+            values_clause = ", ".join("(%s, %s)" for _ in batch)
+            params: list[Any] = []
+            for sid, srk in batch:
+                params.extend([sid, srk])
+            cur.execute(
+                f"UPDATE {table} SET is_active = FALSE "
+                f"FROM (VALUES {values_clause}) AS t(sid, srk) "
+                f"WHERE {table}.source_id = t.sid AND {table}.source_row_key = t.srk",
+                params,
+            )
+            total += cur.rowcount
+    return total
+
+
 def fetch_trajectory_point_ids(
     conn: Any,
     source_id: str,
@@ -324,6 +357,7 @@ def insert_turn_events(
     with conn.cursor() as cur:
         returned = _chunked_insert_returning(
             cur, "turn_events", columns, rows, ["id", "event_id"],
+            on_conflict="ON CONFLICT (vehicle_id, timestamp) DO NOTHING",
         )
     for db_id, event_id in returned:
         mapping[event_id] = db_id

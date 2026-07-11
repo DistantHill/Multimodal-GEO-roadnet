@@ -8,6 +8,7 @@ from dataclasses import replace
 from .models import (
     CleanReport,
     CleanerConfig,
+    CleanerIncrementalResult,
     CleanerResult,
     ExcludedIndex,
     ExcludedPoint,
@@ -24,11 +25,52 @@ EARTH_RADIUS_M = 6_371_000.0
 EXCLUDED_SAMPLE_MAX = 50
 
 
+def clean_vehicle(
+    vehicle_points: list[TrajectoryPoint],
+    *,
+    config: CleanerConfig | None = None,
+) -> CleanerIncrementalResult:
+    """Clean one vehicle's trajectory points.
+
+    ZH: 处理单辆车的轨迹点：按时间间隙切分子轨迹、去除静止段、注入正交候选点。
+        返回该车辆的全部清洗结果，不累积全局状态。
+    """
+    cfg = config or CleanerConfig()
+    active: list[TrajectoryPoint] = []
+    excluded: list[ExcludedPoint] = []
+    kept_subtracks: list[list[TrajectoryPoint]] = []
+    injected_count = 0
+
+    subtracks = _split_by_gaps(vehicle_points, cfg.max_gap_s)
+    rename = len(subtracks) > 1
+    for index, subtrack in enumerate(subtracks, start=1):
+        if rename:
+            subtrack = [_with_vehicle_id(point, f"{point.vehicle_id}_seg{index:02d}") for point in subtrack]
+        kept, removed = _exclude_stationary(subtrack, cfg)
+        excluded.extend(removed)
+        kept_subtracks.append(kept)
+        injected_subtrack, count = _inject_orthogonal(kept, cfg)
+        active.extend(injected_subtrack)
+        injected_count += count
+
+    return CleanerIncrementalResult(
+        active=active,
+        excluded=excluded,
+        kept_subtracks=kept_subtracks,
+        injected_count=injected_count,
+    )
+
+
 def clean(
     source: TrajectorySourceHandle,
     *,
     config: CleanerConfig | None = None,
 ) -> CleanerResult:
+    """Clean all trajectories from a source handle.
+
+    ZH: 对数据源中的全部车辆轨迹执行清洗。内部调用 ``clean_vehicle()`` 逐车处理，
+        累积全局统计和输出。
+    """
     cfg = config or CleanerConfig()
     active: list[TrajectoryPoint] = []
     excluded: list[ExcludedPoint] = []
@@ -41,17 +83,11 @@ def clean(
     print("  ── 清洗 / Cleaning ...")
 
     for vehicle_points in _group_by_vehicle(source.iter_points()):
-        subtracks = _split_by_gaps(vehicle_points, cfg.max_gap_s)
-        rename = len(subtracks) > 1
-        for index, subtrack in enumerate(subtracks, start=1):
-            if rename:
-                subtrack = [_with_vehicle_id(point, f"{point.vehicle_id}_seg{index:02d}") for point in subtrack]
-            kept, removed = _exclude_stationary(subtrack, cfg)
-            excluded.extend(removed)
-            kept_subtracks.append(kept)
-            injected_subtrack, count = _inject_orthogonal(kept, cfg)
-            active.extend(injected_subtrack)
-            injected_count += count
+        result = clean_vehicle(vehicle_points, config=cfg)
+        active.extend(result.active)
+        excluded.extend(result.excluded)
+        kept_subtracks.extend(result.kept_subtracks)
+        injected_count += result.injected_count
 
         group_count += 1
         now = time.perf_counter()
