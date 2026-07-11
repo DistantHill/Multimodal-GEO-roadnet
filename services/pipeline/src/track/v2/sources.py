@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import csv
 import math
-import sys
 
-# ZH: 防止大 CSV 文件因字段过长触发 _csv.Error (默认 131KB)。
-# EN: Prevent _csv.Error on large CSV fields (default 131 KB).
-if sys.maxsize > csv.field_size_limit():
-    csv.field_size_limit(sys.maxsize)
+# ZH: 提高 CSV 字段上限至 10 MB（默认 131 KB），防止合法大字段触发 _csv.Error，
+#     同时避免超大值在遇到损坏行（引号不配对）时导致无限 buffering 和 PermissionError。
+# EN: Raise CSV field size limit to 10 MB (default 131 KB) to allow legit large fields
+#     while preventing infinite buffering / PermissionError on malformed rows (unbalanced quotes).
+_MAX_FIELD_SIZE = 10 * 1024 * 1024  # 10 MB
+if _MAX_FIELD_SIZE > csv.field_size_limit():
+    csv.field_size_limit(_MAX_FIELD_SIZE)
 import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
