@@ -383,7 +383,7 @@ def insert_candidate_intersections(
         "centroid_lon", "centroid_lat", "radius_m",
         "source", "sources", "source_counts", "source_ratios",
         "critical_sources",
-        "turn_event_count", "orthogonal_count", "total_event_count",
+        "turn_event_count", "orthogonal_count", "cross_track_count", "total_event_count",
         "origin_lon", "origin_lat",
         "geom",  # ← must be last: _POLYGON_EXPR is appended to end of placeholders
     ]
@@ -404,6 +404,7 @@ def insert_candidate_intersections(
                 json.dumps(list(c.critical_sources), ensure_ascii=False),
                 len([e for e in c.events if e.source == "turn"]),
                 len([e for e in c.events if e.source == "orthogonal"]),
+                len([e for e in c.events if e.source == "orthogonal_cross_track"]),
                 len(c.events),
                 origin_lon,
                 origin_lat,

@@ -143,6 +143,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             critical_sources    JSONB NOT NULL DEFAULT '[]',
             turn_event_count    INTEGER NOT NULL DEFAULT 0,
             orthogonal_count    INTEGER NOT NULL DEFAULT 0,
+            cross_track_count   INTEGER NOT NULL DEFAULT 0,
             total_event_count   INTEGER NOT NULL DEFAULT 0,
             origin_lon          DOUBLE PRECISION NOT NULL,
             origin_lat          DOUBLE PRECISION NOT NULL,
@@ -301,6 +302,11 @@ def _run_migrations(cur: Any) -> None:
             "tp_is_active",
             "ALTER TABLE trajectory_points ADD COLUMN IF NOT EXISTS "
             "is_active BOOLEAN NOT NULL DEFAULT TRUE",
+        ),
+        (
+            "ci_cross_track_count",
+            "ALTER TABLE candidate_intersections ADD COLUMN IF NOT EXISTS "
+            "cross_track_count INTEGER NOT NULL DEFAULT 0",
         ),
     ]
     for label, sql in migrations:

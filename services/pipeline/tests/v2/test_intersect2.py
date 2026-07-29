@@ -151,9 +151,11 @@ class IntersectReportTest(unittest.TestCase):
             turn_event_count=100,
             hotspot_event_count=50,
             orthogonal_candidate_count=20,
+            cross_track_candidate_count=5,
             cluster_count=5,
             cluster_count_turn=3,
             cluster_count_ortho=2,
+            cluster_count_cross_track=1,
             complete_intersection_count=3,
         )
         d = report.as_dict()

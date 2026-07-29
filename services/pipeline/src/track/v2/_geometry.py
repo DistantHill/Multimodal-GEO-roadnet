@@ -97,6 +97,58 @@ def _segment_bearings(
     return bearings
 
 
+# ── Batch segment-segment intersection (Method 3) ──────────────────────
+
+
+def _batch_segment_intersections(
+    a1: np.ndarray,
+    a2: np.ndarray,
+    ha: np.ndarray,
+    b1: np.ndarray,
+    b2: np.ndarray,
+    hb: np.ndarray,
+    min_angle_deg: float,
+    max_angle_deg: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """NumPy batched segment-segment intersection + orthogonal angle filter.
+
+    ZH: 向量化段到段求交。输入两组段 (A: N 个, B: M 个)，一次 broadcasting
+        完成所有 N×M 组交点计算，同时过滤夹角不在 ``[min, max]`` 范围内的结果。
+
+    Args:
+        a1/a2: ``(N, 2)`` segment A start/end coords in meters.
+        ha: ``(N,)`` heading of each segment A (degrees).
+        b1/b2: ``(M, 2)`` segment B start/end coords in meters.
+        hb: ``(M,)`` heading of each segment B (degrees).
+        min_angle_deg, max_angle_deg: orthogonal angle range.
+
+    Returns:
+        ``(cx, cy, flat_idx)`` where cx/cy are ``(N, M)`` arrays (NaN where
+        no valid crossing), and flat_idx are flat indices of valid hits into
+        the (N, M) grid: ``si = fi // M, sj = fi % M``.
+    """
+    da = a2 - a1          # (N, 2)
+    db = b2 - b1          # (M, 2)
+    # Broadcast to (N, M)
+    det = da[:, None, 0] * (-db[None, :, 1]) - (-db[None, :, 0]) * da[:, None, 1]
+    parallel = np.abs(det) < 1e-12
+    rhs_x = b1[None, :, 0] - a1[:, None, 0]
+    rhs_y = b1[None, :, 1] - a1[:, None, 1]
+    ta_num = rhs_x * (-db[None, :, 1]) - (-db[None, :, 0]) * rhs_y
+    tb_num = da[:, None, 0] * rhs_y - rhs_x * da[:, None, 1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ta = np.where(~parallel, ta_num / det, np.nan)
+        tb = np.where(~parallel, tb_num / det, np.nan)
+    # Bounds + angle filter
+    valid = (~parallel) & (ta >= 0.0) & (ta <= 1.0) & (tb >= 0.0) & (tb <= 1.0)
+    angle = np.abs((hb[None, :] - ha[:, None] + 180.0) % 360.0 - 180.0)
+    valid &= (min_angle_deg <= angle) & (angle <= max_angle_deg)
+    cx = np.where(valid, a1[:, None, 0] + ta * da[:, None, 0], np.nan)
+    cy = np.where(valid, a1[:, None, 1] + ta * da[:, None, 1], np.nan)
+    flat_idx = np.flatnonzero(valid)
+    return cx, cy, flat_idx
+
+
 # ── Segment-circle intersection (scalar) ──────────────────────────────
 
 

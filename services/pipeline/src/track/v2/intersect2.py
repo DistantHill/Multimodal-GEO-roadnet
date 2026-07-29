@@ -22,6 +22,7 @@ import numpy as np
 
 from ._geometry import (
     _angle_delta_deg,
+    _batch_segment_intersections,
     _bearing_deg,
     _branch_angle_from_center,
     _circular_mean_deg,
@@ -79,6 +80,13 @@ class IntersectConfig(TrackModel):
     dbscan_min_samples_turn: int = 4
     dbscan_eps_m_ortho: float = 100.0
     dbscan_min_samples_ortho: int = 3
+
+    # ── Cross-track orthogonal detection (Method 3) ──────────────────
+    cross_track_straightness_deg: float = 15.0
+    cross_track_min_angle_deg: float = 80.0
+    cross_track_max_angle_deg: float = 100.0
+    cross_track_dbscan_eps_m: float = 100.0
+    cross_track_dbscan_min_samples: int = 3
 
     # ── Cluster merge ──────────────────────────────────────────────
     merge_centroid_distance_m: float = 80.0
@@ -343,6 +351,121 @@ def _complete_source_report(
     }
 
 
+# ── Shared pipeline helpers (used by both handle and DB modes) ──────────
+
+
+def _empty_intersect_result() -> IntersectResult:
+    """Common empty result for both modes when no data is available."""
+    return IntersectResult(
+        turn_events=[], hotspot_events=[], orthogonal_candidates=[],
+        clusters=[], topologies=[],
+        report=IntersectReport(
+            track_count=0, turn_event_count=0, hotspot_event_count=0,
+            orthogonal_candidate_count=0, cross_track_candidate_count=0,
+            cluster_count=0, cluster_count_turn=0, cluster_count_ortho=0,
+            cluster_count_cross_track=0, complete_intersection_count=0,
+        ),
+    )
+
+
+def _build_intersect_report(
+    annotated_clusters: list[HotspotCluster],
+    topologies: list[IntersectionTopology],
+    turn_events: list[TurnEvent],
+    hotspot_events: list[TurnEvent],
+    ortho_candidates: list[OrthogonalCandidate],
+    cross_candidates: list[OrthogonalCandidate],
+    track_count: int,
+) -> IntersectReport:
+    """Shared report construction for both modes."""
+    turn_clusters = sum(1 for c in annotated_clusters if "turn" in _cluster_sources(c))
+    ortho_clusters = sum(1 for c in annotated_clusters if "orthogonal" in _cluster_sources(c))
+    cross_clusters = sum(1 for c in annotated_clusters if "orthogonal_cross_track" in _cluster_sources(c))
+    source_report = _complete_source_report(annotated_clusters, topologies)
+    return IntersectReport(
+        track_count=track_count,
+        turn_event_count=len(turn_events),
+        hotspot_event_count=len(hotspot_events),
+        orthogonal_candidate_count=len(ortho_candidates),
+        cross_track_candidate_count=len(cross_candidates),
+        cluster_count=len(annotated_clusters),
+        cluster_count_turn=turn_clusters,
+        cluster_count_ortho=ortho_clusters,
+        cluster_count_cross_track=cross_clusters,
+        complete_intersection_count=sum(1 for t in topologies if t.is_complete),
+        complete_intersection_source_counts=source_report["source_counts"],
+        complete_intersection_source_ratios=source_report["source_ratios"],
+        complete_intersection_critical_source_counts=source_report["critical_source_counts"],
+        complete_intersection_critical_source_ratios=source_report["critical_source_ratios"],
+    )
+
+
+def _cluster_pipeline(
+    turn_events: list[TurnEvent],
+    ortho_candidates: list[OrthogonalCandidate],
+    cross_candidates: list[OrthogonalCandidate],
+    origin_lon: float,
+    origin_lat: float,
+    cfg: IntersectConfig,
+) -> tuple[list[TurnEvent], list[HotspotCluster]]:
+    """Shared G* + DBSCAN ×3 + merge + reindex + ablation for both modes."""
+    all_clusters: list[HotspotCluster] = []
+    hotspot_events: list[TurnEvent] = []
+
+    # ── Method 1: Turn event → G* → DBSCAN ────────────────────────
+    if cfg.use_turn_events and turn_events:
+        hotspot_events = _select_hotspot_events(turn_events, cfg)
+        if hotspot_events:
+            all_clusters.extend(_cluster_dbscan(
+                hotspot_events, origin_lon, origin_lat,
+                eps_m=cfg.dbscan_eps_m_turn,
+                min_samples=cfg.dbscan_min_samples_turn,
+                source="turn",
+            ))
+
+    # ── Method 2: Orthogonal → DBSCAN ──────────────────────────────
+    if cfg.use_orthogonal_candidates and ortho_candidates:
+        all_clusters.extend(_cluster_orthogonal_candidates(
+            ortho_candidates, origin_lon, origin_lat,
+            eps_m=cfg.dbscan_eps_m_ortho,
+            min_samples=cfg.dbscan_min_samples_ortho,
+        ))
+
+    # ── Method 3: Cross-track → DBSCAN ─────────────────────────────
+    if cfg.use_orthogonal_candidates and cross_candidates:
+        all_clusters.extend(_cluster_orthogonal_cross_track_candidates(
+            cross_candidates, origin_lon, origin_lat,
+            eps_m=cfg.cross_track_dbscan_eps_m,
+            min_samples=cfg.cross_track_dbscan_min_samples,
+        ))
+
+    # ── Merge + reindex + ablation ─────────────────────────────────
+    merged = _merge_clusters(all_clusters, cfg.merge_centroid_distance_m,
+                              origin_lon, origin_lat)
+    merged = [replace(c, cluster_id=i) for i, c in enumerate(merged)]
+    annotated = _annotate_source_ablation(
+        merged, hotspot_events, ortho_candidates,
+        cfg, origin_lon, origin_lat,
+    )
+    return hotspot_events, annotated
+
+
+def _extract_methods_123(
+    tracks: dict[str, list[TrajectoryPoint]],
+    origin_lon: float,
+    origin_lat: float,
+    cfg: IntersectConfig,
+) -> tuple[list[TurnEvent], list[OrthogonalCandidate], list[OrthogonalCandidate]]:
+    """Run all three candidate extraction methods on a tracks dict (handle mode)."""
+    turn_events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg) if cfg.use_turn_events else []
+    ortho_candidates: list[OrthogonalCandidate] = []
+    cross_candidates: list[OrthogonalCandidate] = []
+    if cfg.use_orthogonal_candidates:
+        ortho_candidates = _extract_orthogonal_candidates(tracks, origin_lon, origin_lat)
+        cross_candidates = _extract_orthogonal_cross_track_candidates(tracks, origin_lon, origin_lat, cfg)
+    return turn_events, ortho_candidates, cross_candidates
+
+
 # ── Public entry point ─────────────────────────────────────────────────
 
 
@@ -370,119 +493,42 @@ def detect_intersections(
     if conn is not None and cfg.query_active_from_db:
         return _detect_intersections_db(conn, cfg)
 
-    # ── Handle mode: in-memory (original path) ──────────────────────
+    # ── Handle mode: in-memory ─────────────────────────────────────
     if source is None:
         raise V2Error("detect_intersections: 'source' handle is required when not in DB mode")
 
-    # ── Buffer all points, group by vehicle ────────────────────────
     tracks, origin_lon, origin_lat = _group_by_vehicle(source)
     if not tracks:
-        return IntersectResult(
-            turn_events=[],
-            hotspot_events=[],
-            orthogonal_candidates=[],
-            clusters=[],
-            topologies=[],
-            report=IntersectReport(
-                track_count=0,
-                turn_event_count=0,
-                hotspot_event_count=0,
-                orthogonal_candidate_count=0,
-                cluster_count=0,
-                cluster_count_turn=0,
-                cluster_count_ortho=0,
-                complete_intersection_count=0,
-            ),
-        )
+        return _empty_intersect_result()
 
-    turn_events: list[TurnEvent] = []
-    hotspot_events: list[TurnEvent] = []
-    orthogonal_candidates: list[OrthogonalCandidate] = []
-    all_clusters: list[HotspotCluster] = []
-
-    # ── Method 1: Turn event → Getis-Ord G* → DBSCAN ──────────────
-    if cfg.use_turn_events:
-        turn_events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg)
-        if turn_events:
-            hotspot_events = _select_hotspot_events(turn_events, cfg)
-            if hotspot_events:
-                clusters_turn = _cluster_dbscan(
-                    hotspot_events,
-                    origin_lon,
-                    origin_lat,
-                    eps_m=cfg.dbscan_eps_m_turn,
-                    min_samples=cfg.dbscan_min_samples_turn,
-                    source="turn",
-                )
-                all_clusters.extend(clusters_turn)
-
-    # ── Method 2: Orthogonal injection points → DBSCAN ────────────
-    if cfg.use_orthogonal_candidates:
-        orthogonal_candidates = _extract_orthogonal_candidates(
-            tracks, origin_lon, origin_lat
-        )
-        if orthogonal_candidates:
-            clusters_ortho = _cluster_orthogonal_candidates(
-                orthogonal_candidates,
-                origin_lon,
-                origin_lat,
-                eps_m=cfg.dbscan_eps_m_ortho,
-                min_samples=cfg.dbscan_min_samples_ortho,
-            )
-            all_clusters.extend(clusters_ortho)
-
-    # ── Merge overlapping clusters from both methods ──────────────
-    merged_clusters = _merge_clusters(all_clusters, cfg.merge_centroid_distance_m,
-                                         origin_lon, origin_lat)
-
-    # ── Reassign globally-unique cluster IDs (Methods 1 & 2 start from 0) ─
-    merged_clusters = [
-        replace(c, cluster_id=new_id)
-        for new_id, c in enumerate(merged_clusters)
-    ]
-
-    merged_clusters = _annotate_source_ablation(
-        merged_clusters,
-        hotspot_events,
-        orthogonal_candidates,
-        cfg,
-        origin_lon,
-        origin_lat,
+    # ── Methods 1, 2, 3: candidate extraction ──────────────────────
+    turn_events, ortho_candidates, cross_candidates = _extract_methods_123(
+        tracks, origin_lon, origin_lat, cfg
     )
 
-    # ── Topology verification for each cluster ─────────────────────
-    topologies, annotated_clusters, all_observations = _build_intersection_topologies(
-        merged_clusters, tracks, origin_lon, origin_lat, cfg
+    # ── Shared: cluster pipeline (G* + DBSCAN + merge + ablation) ──
+    hotspot_events, annotated_clusters = _cluster_pipeline(
+        turn_events, ortho_candidates, cross_candidates,
+        origin_lon, origin_lat, cfg,
     )
 
-    # ── Build report ───────────────────────────────────────────────
-    turn_clusters = sum(1 for c in annotated_clusters if "turn" in _cluster_sources(c))
-    ortho_clusters = sum(1 for c in annotated_clusters if "orthogonal" in _cluster_sources(c))
-    source_report = _complete_source_report(annotated_clusters, topologies)
-
-    report = IntersectReport(
-        track_count=len(tracks),
-        turn_event_count=len(turn_events),
-        hotspot_event_count=len(hotspot_events),
-        orthogonal_candidate_count=len(orthogonal_candidates),
-        cluster_count=len(annotated_clusters),
-        cluster_count_turn=turn_clusters,
-        cluster_count_ortho=ortho_clusters,
-        complete_intersection_count=sum(1 for t in topologies if t.is_complete),
-        complete_intersection_source_counts=source_report["source_counts"],
-        complete_intersection_source_ratios=source_report["source_ratios"],
-        complete_intersection_critical_source_counts=source_report["critical_source_counts"],
-        complete_intersection_critical_source_ratios=source_report["critical_source_ratios"],
+    # ── Handle-mode topology (in-memory tracks) ────────────────────
+    topologies, annotated_clusters, observations = _build_intersection_topologies(
+        annotated_clusters, tracks, origin_lon, origin_lat, cfg,
     )
 
     return IntersectResult(
         turn_events=turn_events,
         hotspot_events=hotspot_events,
-        orthogonal_candidates=orthogonal_candidates,
+        orthogonal_candidates=ortho_candidates,
         clusters=annotated_clusters,
         topologies=topologies,
-        observations=all_observations,
-        report=report,
+        observations=observations,
+        report=_build_intersect_report(
+            annotated_clusters, topologies,
+            turn_events, hotspot_events, ortho_candidates, cross_candidates,
+            track_count=len(tracks),
+        ),
     )
 
 
@@ -629,6 +675,55 @@ def _query_active_points_in_window(
     return _build_points_from_rows(rows)
 
 
+def _stream_vehicle_tracks_from_db(
+    conn: Any,
+    *,
+    table: str = "trajectory_points",
+) -> Iterator[list[TrajectoryPoint]]:
+    """Stream tracks one vehicle at a time from DB (global, no spatial filter).
+
+    ZH: 从 DB 逐车流式读取轨迹点。使用 UNION ALL 合并 active points 和
+        injected_points，按 (vehicle_id, timestamp) 排序后检测 vehicle_id
+        变化来分组。内存占用 = 单车辆最大点数。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
+            f"       source_id, source_row_key, extra "
+            f"FROM {table} "
+            f"WHERE is_active IS NOT FALSE "
+            f"UNION ALL "
+            f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
+            f"       from_source_id, from_source_row_key, '{{}}'::jsonb "
+            f"FROM injected_points "
+            f"ORDER BY vehicle_id, timestamp"
+        )
+        current_vid: str | None = None
+        current_track: list[TrajectoryPoint] = []
+        for row in cur:
+            vid = str(row[0])
+            if current_vid is not None and vid != current_vid:
+                yield current_track
+                current_track = []
+            current_vid = vid
+            current_track.append(TrajectoryPoint(
+                point_ref=PointRef(
+                    source_id=str(row[6] or ""),
+                    source_row_key=str(row[7] or ""),
+                    stable=True,
+                ),
+                vehicle_id=vid,
+                timestamp=float(row[1]),
+                lon=float(row[2]),
+                lat=float(row[3]),
+                heading=float(row[4]),
+                speed=float(row[5]),
+                extra=row[8] if isinstance(row[8], dict) else {},
+            ))
+        if current_track:
+            yield current_track
+
+
 def _query_active_points_near_cluster(
     conn: Any,
     cluster: HotspotCluster,
@@ -735,44 +830,75 @@ def _tracks_from_points(points: list[TrajectoryPoint]) -> dict[str, list[Traject
     return tracks
 
 
-def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult:
-    """DB-mode intersection detection with spatial sliding windows.
+# ═══════════════════════════════════════════════════════════════════════
+# DB-mode helper functions
+# ═══════════════════════════════════════════════════════════════════════
 
-    Queries active trajectory points from the database in overlapping
-    spatial windows to keep in-memory footprint bounded.  Turn events
-    and orthogonal candidates are collected globally (they are much
-    smaller than the full point set), and G*/DBSCAN run on the full set.
-    """
 
-    # ── Query spatial extent ────────────────────────────────────────
-    extent = _query_spatial_extent(conn, table=cfg.db_table)
-    if extent is None:
-        return IntersectResult(
-            turn_events=[], hotspot_events=[], orthogonal_candidates=[],
-            clusters=[], topologies=[],
-            report=IntersectReport(
-                track_count=0, turn_event_count=0, hotspot_event_count=0,
-                orthogonal_candidate_count=0, cluster_count=0,
-                cluster_count_turn=0, cluster_count_ortho=0,
-                complete_intersection_count=0,
-            ),
-        )
+def _stream_extract_methods_1_2(
+    conn: Any, cfg: IntersectConfig,
+    origin_lon: float, origin_lat: float,
+) -> tuple[list[TurnEvent], list[OrthogonalCandidate]]:
+    """Stream per-vehicle from DB, batch 100 vehicles per Method 1/2 call."""
+    turn_events: list[TurnEvent] = []
+    ortho_candidates: list[OrthogonalCandidate] = []
+    t_total = time.perf_counter()
+    track_count = 0
+    batch: dict[str, list[TrajectoryPoint]] = {}
+    BATCH_SIZE = 100
+
+    for track in _stream_vehicle_tracks_from_db(conn, table=cfg.db_table):
+        vid = track[0].vehicle_id
+        batch[vid] = track
+        track_count += 1
+
+        if len(batch) >= BATCH_SIZE:
+            # ── Flush batch ──
+            if cfg.use_turn_events:
+                for te in _detect_turn_events(batch, origin_lon, origin_lat, cfg):
+                    turn_events.append(replace(te, event_id=len(turn_events)))
+            if cfg.use_orthogonal_candidates:
+                ortho_candidates.extend(
+                    _extract_orthogonal_candidates(batch, origin_lon, origin_lat)
+                )
+            batch.clear()
+
+    # ── Flush remaining ──
+    if batch:
+        if cfg.use_turn_events:
+            for te in _detect_turn_events(batch, origin_lon, origin_lat, cfg):
+                turn_events.append(replace(te, event_id=len(turn_events)))
+        if cfg.use_orthogonal_candidates:
+            ortho_candidates.extend(
+                _extract_orthogonal_candidates(batch, origin_lon, origin_lat)
+            )
+
+    print(f"  ── 流式处理: {track_count:,} 轨迹/tracks → "
+          f"{len(turn_events):,} 转向事件/turn events, "
+          f"{len(ortho_candidates):,} 正交候选/ortho candidates "
+          f"({time.perf_counter() - t_total:.1f}s)")
+    return turn_events, ortho_candidates
+
+
+def _extract_cross_track_windows(
+    conn: Any, cfg: IntersectConfig,
+    extent: tuple[float, float, float, float],
+    origin_lon: float, origin_lat: float,
+) -> list[OrthogonalCandidate]:
+    """Method 3: spatial sliding windows for cross-track segment intersection."""
+    candidates: list[OrthogonalCandidate] = []
+    if not cfg.use_orthogonal_candidates:
+        return candidates
 
     windows = SpatialWindowIterator(
         extent,
         size=cfg.spatial_window_size,
         overlap=cfg.spatial_window_overlap,
     )
-
-    all_turn_events: list[TurnEvent] = []
-    all_ortho_candidates: list[OrthogonalCandidate] = []
-    origin_lon = (extent[0] + extent[2]) / 2.0
-    origin_lat = (extent[1] + extent[3]) / 2.0
-
     t0 = time.perf_counter()
     window_count = 0
     total_points = 0
-    print(f"  ── 空间滑窗 / Spatial windows ──")
+    print(f"  ── 空间滑窗 / Spatial windows (Method 3: orthogonal_cross_track) ──")
 
     for window in windows.iter_windows():
         window_count += 1
@@ -781,65 +907,30 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
             continue
         total_points += len(points)
         window_tracks = _tracks_from_points(points)
-
-        # Turn detection per window
-        if cfg.use_turn_events:
-            window_turns = _detect_turn_events(window_tracks, origin_lon, origin_lat, cfg)
-            # Re-index event_id globally
-            for te in window_turns:
-                all_turn_events.append(replace(te, event_id=len(all_turn_events)))
-
-        # Orthogonal extraction per window
-        if cfg.use_orthogonal_candidates:
-            all_ortho_candidates.extend(
-                _extract_orthogonal_candidates(window_tracks, origin_lon, origin_lat)
-            )
-
-    print(f"    ... {window_count} 窗/windows, {total_points:,} 点/points ({time.perf_counter() - t0:.1f}s)")
-
-    # ── Global G* + DBSCAN ──────────────────────────────────────────
-    hotspot_events: list[TurnEvent] = []
-    all_clusters: list[HotspotCluster] = []
-
-    if cfg.use_turn_events and all_turn_events:
-        hotspot_events = _select_hotspot_events(all_turn_events, cfg)
-        if hotspot_events:
-            clusters_turn = _cluster_dbscan(
-                hotspot_events, origin_lon, origin_lat,
-                eps_m=cfg.dbscan_eps_m_turn,
-                min_samples=cfg.dbscan_min_samples_turn,
-                source="turn",
-            )
-            all_clusters.extend(clusters_turn)
-
-    if cfg.use_orthogonal_candidates and all_ortho_candidates:
-        clusters_ortho = _cluster_orthogonal_candidates(
-            all_ortho_candidates, origin_lon, origin_lat,
-            eps_m=cfg.dbscan_eps_m_ortho,
-            min_samples=cfg.dbscan_min_samples_ortho,
+        candidates.extend(
+            _extract_orthogonal_cross_track_candidates(window_tracks, origin_lon, origin_lat, cfg)
         )
-        all_clusters.extend(clusters_ortho)
 
-    # ── Merge + reindex ─────────────────────────────────────────────
-    merged_clusters = _merge_clusters(all_clusters, cfg.merge_centroid_distance_m,
-                                       origin_lon, origin_lat)
-    merged_clusters = [
-        replace(c, cluster_id=new_id)
-        for new_id, c in enumerate(merged_clusters)
-    ]
-    merged_clusters = _annotate_source_ablation(
-        merged_clusters, hotspot_events, all_ortho_candidates,
-        cfg, origin_lon, origin_lat,
-    )
+    print(f"    ... {window_count} 窗/windows, {total_points:,} 点/points "
+          f"→ {len(candidates):,} 候选/candidates ({time.perf_counter() - t0:.1f}s)")
+    return candidates
 
-    # ── Topology verification (per cluster, from DB) ────────────────
+
+def _build_topologies_from_db(
+    conn: Any,
+    clusters: list[HotspotCluster],
+    cfg: IntersectConfig,
+    origin_lon: float,
+    origin_lat: float,
+) -> tuple[list[IntersectionTopology], list[HotspotCluster], list[EntryExitObservation]]:
+    """Topology verification by querying nearby points from DB per cluster."""
     topologies: list[IntersectionTopology] = []
     annotated_clusters: list[HotspotCluster] = []
     all_observations: list[EntryExitObservation] = []
-    total_clusters = len(merged_clusters)
+    total_clusters = len(clusters)
 
     print(f"  ── 拓扑验证 / Topology verification ({total_clusters:,} 簇/clusters) ...")
-    for cluster in merged_clusters:
+    for cluster in clusters:
         radius = max(cfg.min_intersection_radius_m,
                      cluster.radius_m + cfg.topology_radius_padding_m)
         nearby_points = _query_active_points_near_cluster(
@@ -854,43 +945,65 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
             radius_m=radius,
             bearing_window=cfg.bearing_window,
         )
-        # Attach crossing points to cluster for replay provenance (mirrors in-memory path)
         cluster = replace(cluster, crossing_points=tuple(crossing_points))
-        topology, annotated, cluster_observations = _build_topology_for_cluster(
+        topology, annotated, cluster_obs = _build_topology_for_cluster(
             cluster, observations, origin_lon, origin_lat, cfg,
         )
         topologies.append(topology)
         annotated_clusters.append(annotated)
-        all_observations.extend(cluster_observations)
+        all_observations.extend(cluster_obs)
+    return topologies, annotated_clusters, all_observations
 
-    # ── Report ───────────────────────────────────────────────────────
-    turn_clusters = sum(1 for c in annotated_clusters if "turn" in _cluster_sources(c))
-    ortho_clusters = sum(1 for c in annotated_clusters if "orthogonal" in _cluster_sources(c))
-    source_report = _complete_source_report(annotated_clusters, topologies)
 
-    report = IntersectReport(
-        track_count=0,  # Unknown in DB mode
-        turn_event_count=len(all_turn_events),
-        hotspot_event_count=len(hotspot_events),
-        orthogonal_candidate_count=len(all_ortho_candidates),
-        cluster_count=len(annotated_clusters),
-        cluster_count_turn=turn_clusters,
-        cluster_count_ortho=ortho_clusters,
-        complete_intersection_count=sum(1 for t in topologies if t.is_complete),
-        complete_intersection_source_counts=source_report["source_counts"],
-        complete_intersection_source_ratios=source_report["source_ratios"],
-        complete_intersection_critical_source_counts=source_report["critical_source_counts"],
-        complete_intersection_critical_source_ratios=source_report["critical_source_ratios"],
+def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult:
+    """DB-mode intersection detection.
+
+    ZH: DB 模式交叉口检测。
+        - Method 1+2: 全局流式逐车处理（单车操作，无需空间窗）
+        - Method 3: 空间滑窗内跨车段求交
+        - 共享 _cluster_pipeline + _build_intersect_report
+    """
+    # ── Spatial extent ──────────────────────────────────────────────
+    extent = _query_spatial_extent(conn, table=cfg.db_table)
+    if extent is None:
+        return _empty_intersect_result()
+
+    origin_lon = (extent[0] + extent[2]) / 2.0
+    origin_lat = (extent[1] + extent[3]) / 2.0
+
+    # ── Methods 1 & 2: stream per-vehicle (DB-specific) ─────────────
+    turn_events, ortho_candidates = _stream_extract_methods_1_2(
+        conn, cfg, origin_lon, origin_lat,
+    )
+
+    # ── Method 3: spatial windows (DB-specific) ─────────────────────
+    cross_candidates = _extract_cross_track_windows(
+        conn, cfg, extent, origin_lon, origin_lat,
+    )
+
+    # ── Shared: cluster pipeline (G* + DBSCAN + merge + ablation) ───
+    hotspot_events, annotated_clusters = _cluster_pipeline(
+        turn_events, ortho_candidates, cross_candidates,
+        origin_lon, origin_lat, cfg,
+    )
+
+    # ── DB-mode topology (per-cluster DB queries) ───────────────────
+    topologies, annotated_clusters, observations = _build_topologies_from_db(
+        conn, annotated_clusters, cfg, origin_lon, origin_lat,
     )
 
     return IntersectResult(
-        turn_events=all_turn_events,
+        turn_events=turn_events,
         hotspot_events=hotspot_events,
-        orthogonal_candidates=all_ortho_candidates,
+        orthogonal_candidates=ortho_candidates,
         clusters=annotated_clusters,
         topologies=topologies,
-        observations=all_observations,
-        report=report,
+        observations=observations,
+        report=_build_intersect_report(
+            annotated_clusters, topologies,
+            turn_events, hotspot_events, ortho_candidates, cross_candidates,
+            track_count=0,
+        ),
     )
 
 
@@ -1094,7 +1207,11 @@ def _extract_orthogonal_candidates(
     suggesting a road intersection.
     """
     candidates: list[OrthogonalCandidate] = []
-    
+    total_tracks = len(tracks)
+    t0 = time.perf_counter()
+    last_t = t0
+    track_count = 0
+
     for track in tracks.values():
         for tp in track:
             if tp.point_ref.generated_reason == "orthogonal_heading":
@@ -1111,6 +1228,114 @@ def _extract_orthogonal_candidates(
                     )
                 )
 
+        track_count += 1
+        now = time.perf_counter()
+        if track_count % 100 == 0 or (now - last_t) >= 3.0:
+            print(f"  ── 正交候选 / Ortho candidates: {track_count:,}/{total_tracks:,} "
+                  f"轨迹/tracks, {len(candidates):,} 候选 ({now - t0:.1f}s)")
+            last_t = now
+
+    return candidates
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Method 3: Cross-track orthogonal segment intersection
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _extract_orthogonal_cross_track_candidates(
+    tracks: dict[str, list[TrajectoryPoint]],
+    origin_lon: float,
+    origin_lat: float,
+    cfg: IntersectConfig,
+) -> list[OrthogonalCandidate]:
+    """Multi-vehicle segment crossing detection via NumPy batched intersection.
+
+    ZH: Method 3 —— 多车轨迹段正交交点检测。
+        1. 预过滤：只保留 heading 前后差 ≤ straightness_deg 的"直段"
+        2. 按车辆分组段坐标和 heading
+        3. 每对不同车辆间一次 NumPy broadcasting 完成所有段对的求交+夹角过滤
+
+    段 S_j = (P_j → P_{j+1}) 的方位角用 ``track[j].heading`` 近似。
+    """
+    # ── Step 1: 预过滤直段 (heading 前后差 ≤ straightness_deg) ──────
+    # track_segs[vid] = [(x1,y1, x2,y2, heading, timestamp, seg_idx), ...]
+    track_segs: dict[str, list[tuple[float, float, float, float, float, float, int]]] = {}
+    for vid, track in tracks.items():
+        if len(track) < 2:
+            continue
+        segs: list[tuple[float, float, float, float, float, float, int]] = []
+        for si in range(len(track) - 1):
+            h0 = track[si].heading
+            h1 = track[si + 1].heading
+            if abs(_angle_delta_deg(h0, h1)) > cfg.cross_track_straightness_deg:
+                continue  # 跳过转弯段 / skip turning segments
+            xy0 = _to_xy(track[si].lon, track[si].lat, origin_lon, origin_lat)
+            xy1 = _to_xy(track[si + 1].lon, track[si + 1].lat, origin_lon, origin_lat)
+            segs.append((xy0[0], xy0[1], xy1[0], xy1[1],
+                         track[si].heading, track[si].timestamp, si))
+        if segs:
+            track_segs[vid] = segs
+
+    vehicle_ids = list(track_segs.keys())
+    if len(vehicle_ids) < 2:
+        return []
+
+    # ── Step 2: 每对车辆间 NumPy 批量求交 ──────────────────────────
+    candidates: list[OrthogonalCandidate] = []
+    total_vehicles = len(vehicle_ids)
+    total_pairs = total_vehicles * (total_vehicles - 1) // 2
+    pair_count = 0
+    t0 = time.perf_counter()
+    last_t = t0
+
+    for i in range(len(vehicle_ids)):
+        vid_a = vehicle_ids[i]
+        segs_a = track_segs[vid_a]
+        a1 = np.array([[s[0], s[1]] for s in segs_a], dtype=float)
+        a2 = np.array([[s[2], s[3]] for s in segs_a], dtype=float)
+        ha = np.array([s[4] for s in segs_a], dtype=float)
+        ts_a = [s[5] for s in segs_a]
+
+        for j in range(i + 1, len(vehicle_ids)):
+            vid_b = vehicle_ids[j]
+            segs_b = track_segs[vid_b]
+            b1 = np.array([[s[0], s[1]] for s in segs_b], dtype=float)
+            b2 = np.array([[s[2], s[3]] for s in segs_b], dtype=float)
+            hb = np.array([s[4] for s in segs_b], dtype=float)
+            ts_b = [s[5] for s in segs_b]
+
+            cx, cy, flat_idx = _batch_segment_intersections(
+                a1, a2, ha, b1, b2, hb,
+                cfg.cross_track_min_angle_deg,
+                cfg.cross_track_max_angle_deg,
+            )
+            for fi in flat_idx:
+                si = fi // len(segs_b)
+                sj = fi % len(segs_b)
+                lon, lat = _to_lonlat(
+                    float(cx.flat[fi]), float(cy.flat[fi]),
+                    origin_lon, origin_lat,
+                )
+                ts = (ts_a[si] + ts_b[sj]) / 2.0
+                candidates.append(
+                    OrthogonalCandidate(
+                        point_ref=tracks[vid_a][segs_a[si][6]].point_ref,
+                        vehicle_id=f"{vid_a}|{vid_b}",
+                        timestamp=ts,
+                        lon=lon,
+                        lat=lat,
+                        x=float(cx.flat[fi]),
+                        y=float(cy.flat[fi]),
+                    )
+                )
+
+            pair_count += 1
+            now = time.perf_counter()
+            if pair_count % 100 == 0 or (now - last_t) >= 3.0:
+                print(f"    ... 跨车求交 / Cross-track: {pair_count:,}/{total_pairs:,} "
+                      f"车辆对/pairs, {len(candidates):,} 候选/candidates ({now - t0:.1f}s)")
+                last_t = now
     return candidates
 
 
@@ -1301,6 +1526,75 @@ def _cluster_orthogonal_candidates(
             _with_source_provenance(
                 cluster,
                 source_counts={"orthogonal": len(cluster_items)},
+            )
+        )
+    return clusters
+
+
+def _cluster_orthogonal_cross_track_candidates(
+    candidates: list[OrthogonalCandidate],
+    origin_lon: float,
+    origin_lat: float,
+    *,
+    eps_m: float,
+    min_samples: int,
+) -> list[HotspotCluster]:
+    """DBSCAN-cluster orthogonal_cross_track candidates, wrapping as TurnEvents.
+
+    ZH: 将多车正交候选点包装为 ``TurnEvent(source="orthogonal_cross_track")``
+        后 DBSCAN 聚类。结构与 ``_cluster_orthogonal_candidates`` 一致。
+    """
+    n = len(candidates)
+    if n == 0:
+        return []
+
+    xs = [c.x for c in candidates]
+    ys = [c.y for c in candidates]
+    print(f"    ... DBSCAN 聚类 (orthogonal_cross_track) / DBSCAN clustering ({n:,} 点/points) ...")
+    labels = _run_dbscan(xs, ys, eps_m=eps_m, min_samples=min_samples)
+
+    clusters: list[HotspotCluster] = []
+    for cid in sorted(set(l for l in labels if l >= 0)):
+        cluster_items = [candidates[i] for i, l in enumerate(labels) if l == cid]
+        if not cluster_items:
+            continue
+        cx = sum(c.x for c in cluster_items) / len(cluster_items)
+        cy = sum(c.y for c in cluster_items) / len(cluster_items)
+        radius = max(_distance_m((cx, cy), (c.x, c.y)) for c in cluster_items)
+        lon, lat = _to_lonlat(cx, cy, origin_lon, origin_lat)
+        cluster_events = tuple(
+            TurnEvent(
+                event_id=i,
+                vehicle_id=c.vehicle_id,
+                timestamp=c.timestamp,
+                lon=c.lon,
+                lat=c.lat,
+                x=c.x,
+                y=c.y,
+                in_bearing=0.0,
+                out_bearing=0.0,
+                turn_deg=0.0,
+                score=0.0,
+                source="orthogonal_cross_track",
+                point_ref=c.point_ref,
+            )
+            for i, c in enumerate(cluster_items)
+        )
+        cluster = HotspotCluster(
+            cluster_id=cid,
+            centroid_x=cx,
+            centroid_y=cy,
+            centroid_lon=lon,
+            centroid_lat=lat,
+            radius_m=radius,
+            cluster_ref=f"cluster_orthogonal_cross_track_{cid}",
+            events=cluster_events,
+            source="orthogonal_cross_track",
+        )
+        clusters.append(
+            _with_source_provenance(
+                cluster,
+                source_counts={"orthogonal_cross_track": len(cluster_items)},
             )
         )
     return clusters

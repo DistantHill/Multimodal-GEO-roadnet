@@ -487,9 +487,11 @@ class IntersectReport(TrackModel):
     turn_event_count: int
     hotspot_event_count: int
     orthogonal_candidate_count: int
+    cross_track_candidate_count: int
     cluster_count: int
     cluster_count_turn: int
     cluster_count_ortho: int
+    cluster_count_cross_track: int
     complete_intersection_count: int
     complete_intersection_source_counts: dict[str, int] = field(default_factory=dict)
     complete_intersection_source_ratios: dict[str, float] = field(default_factory=dict)
