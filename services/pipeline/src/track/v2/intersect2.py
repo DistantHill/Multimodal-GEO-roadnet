@@ -631,18 +631,35 @@ def _query_active_points_in_window(
     *,
     table: str = "trajectory_points",
 ) -> list[TrajectoryPoint]:
-    """Query active trajectory points + injected points in a spatial window."""
+    """Query active trajectory points + injected points in a spatial window.
+
+    ZH: 使用 PostGIS GiST 空间索引 (geom && ST_MakeEnvelope) 替代
+        lon/lat BETWEEN，走 R-tree 2D 索引扫描。UNION ALL 合并两表一次往返。
+    """
     rows: list[dict[str, Any]] = []
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
             f"       source_id, source_row_key, extra "
-            f"FROM {table} "
-            f"WHERE is_active IS NOT FALSE "
-            f"  AND lon BETWEEN %s AND %s "
-            f"  AND lat BETWEEN %s AND %s "
+            f"FROM ("
+            f"  SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
+            f"         source_id, source_row_key, extra "
+            f"  FROM {table} "
+            f"  WHERE is_active IS NOT FALSE "
+            f"    AND geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326) "
+            f"  UNION ALL "
+            f"  SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
+            f"         from_source_id AS source_id, "
+            f"         from_source_row_key AS source_row_key, "
+            f"         '{{}}'::jsonb AS extra "
+            f"  FROM injected_points "
+            f"  WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326) "
+            f") AS combined "
             f"ORDER BY vehicle_id, timestamp",
-            (window.x_min, window.x_max, window.y_min, window.y_max),
+            (
+                window.x_min, window.y_min, window.x_max, window.y_max,
+                window.x_min, window.y_min, window.x_max, window.y_max,
+            ),
         )
         for row in cur:
             rows.append({
@@ -657,33 +674,7 @@ def _query_active_points_in_window(
                 "extra": row[8] if isinstance(row[8], dict) else {},
             })
 
-    # Also query injected_points in same window
-    # ZH: injected_points 没有 source_id 列，用 from_source_id/from_source_row_key 别名
-    with conn.cursor() as cur:
-        cur.execute(
-            f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       from_source_id AS source_id, "
-            f"       from_source_row_key AS source_row_key "
-            f"FROM injected_points "
-            f"WHERE lon BETWEEN %s AND %s "
-            f"  AND lat BETWEEN %s AND %s "
-            f"ORDER BY vehicle_id, timestamp",
-            (window.x_min, window.x_max, window.y_min, window.y_max),
-        )
-        for row in cur:
-            rows.append({
-                "vehicle_id": row[0],
-                "timestamp": float(row[1]),
-                "lon": float(row[2]),
-                "lat": float(row[3]),
-                "heading": float(row[4]),
-                "speed": float(row[5]),
-                "source_id": row[6],
-                "source_row_key": row[7],
-                "extra": {},
-            })
-
-    rows.sort(key=lambda r: (r["vehicle_id"], r["timestamp"]))
+    # DB ORDER BY 已保证 (vehicle_id, timestamp) 有序，无需 Python 侧再排
     return _build_points_from_rows(rows)
 
 

@@ -54,7 +54,7 @@ MAX_WINDOWS: int = 0
 VERBOSE_WINDOWS: bool = True
 
 
-def _load_env(env_path: str = "track/v2/.env") -> dict[str, str]:
+def _load_env(env_path: str = r"D:\Ai_Projects\track\track\v2\.env") -> dict[str, str]:
     """从 .env 文件手动解析连接参数。"""
     env: dict[str, str] = {}
     with open(env_path, encoding="utf-8") as f:
