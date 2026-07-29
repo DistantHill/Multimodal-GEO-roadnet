@@ -14,5 +14,6 @@ Both feed into the same topology verification (entry/exit → branch clustering)
 
 from .cleaner1 import clean
 from .intersect2 import IntersectConfig, IntersectResult, detect_intersections
+from .models import CleanerConfig, CsvSource, PostgresSource, TrajectoryPoint
 from .parser0 import get_database
 
