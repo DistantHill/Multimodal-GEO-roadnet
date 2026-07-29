@@ -202,13 +202,17 @@ def run_pipeline(
         clusters_by_id = {c.cluster_id: c for c in iresult.clusters}
         t0 = time.perf_counter()
         int_id_map = insert_intersections(conn, iresult.topologies, ci_id_map, clusters_by_id)
-        stats["intersections"] = len(iresult.topologies)
-        print(f"  intersections: {len(iresult.topologies):,} rows ({time.perf_counter() - t0:.1f}s)")
+        stats["intersections"] = len(int_id_map)
+        print(f"  intersections: {len(int_id_map):,} rows ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
         insert_entry_exit_points(conn, iresult.observations, int_id_map)
-        stats["entry_exit_points"] = len(iresult.observations)
-        print(f"  entry_exit_points: {len(iresult.observations):,} rows ({time.perf_counter() - t0:.1f}s)")
+        entry_exit_count = sum(
+            1 for observation in iresult.observations
+            if observation.cluster_id in int_id_map
+        )
+        stats["entry_exit_points"] = entry_exit_count
+        print(f"  entry_exit_points: {entry_exit_count:,} rows ({time.perf_counter() - t0:.1f}s)")
 
         conn.commit()
         print(f"\n  提交 / Committed.")

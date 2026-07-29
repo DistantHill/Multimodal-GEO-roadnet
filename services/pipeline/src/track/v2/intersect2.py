@@ -593,6 +593,14 @@ class SpatialWindowIterator:
                 lat += self._step_lat
             lon += self._step_lon
 
+    def count_windows(self) -> int:
+        """Return the number of windows that :meth:`iter_windows` will yield."""
+        if self._lon_max <= self._lon_min or self._lat_max <= self._lat_min:
+            return 0
+        lon_count = math.ceil((self._lon_max - self._lon_min) / self._step_lon)
+        lat_count = math.ceil((self._lat_max - self._lat_min) / self._step_lat)
+        return lon_count * lat_count
+
 
 def _query_spatial_extent(conn: Any, *, table: str = "trajectory_points") -> tuple[float, float, float, float] | None:
     """Query MIN/MAX lon/lat of active trajectory points.
@@ -898,10 +906,25 @@ def _extract_cross_track_windows(
     t0 = time.perf_counter()
     window_count = 0
     total_points = 0
+    total_windows = windows.count_windows()
+    last_progress_t = t0
     print(f"  ── 空间滑窗 / Spatial windows (Method 3: orthogonal_cross_track) ──")
 
     for window in windows.iter_windows():
         window_count += 1
+        now = time.perf_counter()
+        if (
+            window_count == 1
+            or window_count == total_windows
+            or window_count % 10 == 0
+            or (now - last_progress_t) >= 3.0
+        ):
+            print(
+                f"    ... Spatial window: {window_count:,}/{total_windows:,}, "
+                f"{total_points:,} points, {len(candidates):,} candidates "
+                f"({now - t0:.1f}s)"
+            )
+            last_progress_t = now
         points = _query_active_points_in_window(conn, window, table=cfg.db_table)
         if not points:
             continue

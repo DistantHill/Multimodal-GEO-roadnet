@@ -6,6 +6,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from track.v2._geometry import _to_xy
 from track.v2.cleaner1 import CleanerConfig, clean
@@ -20,6 +21,7 @@ from track.v2.intersect2 import (
     _compute_getis_ord_g_star,
     _detect_turn_events,
     _extract_entry_exit_observations_batch,
+    _extract_cross_track_windows,
     _extract_orthogonal_candidates,
     _group_by_vehicle,
     _merge_clusters,
@@ -165,6 +167,26 @@ class IntersectReportTest(unittest.TestCase):
 
 
 # ── Group by vehicle tests ─────────────────────────────────────────────
+
+
+class CrossTrackWindowProgressTest(unittest.TestCase):
+    """Method 3 reports window-level progress even for small windows."""
+
+    def test_cross_track_windows_prints_current_and_total_window(self):
+        cfg = IntersectConfig(
+            spatial_window_size=(1_000.0, 1_000.0),
+            spatial_window_overlap=0.0,
+        )
+        with patch("track.v2.intersect2._query_active_points_in_window", return_value=[]), \
+             patch("builtins.print") as print_mock:
+            _extract_cross_track_windows(
+                object(), cfg,
+                extent=(0.0, 0.0, 0.02, 0.02),
+                origin_lon=0.01, origin_lat=0.01,
+            )
+
+        output = "\n".join(str(call.args[0]) for call in print_mock.call_args_list)
+        self.assertIn("Spatial window: 1/9", output)
 
 
 class GroupByVehicleTest(unittest.TestCase):

@@ -502,7 +502,7 @@ def insert_intersections(
     ci_id_map: dict[int, int],
     clusters_by_id: dict[int, HotspotCluster],
 ) -> dict[int, int]:
-    """Insert verified intersections with POLYGON geometry.
+    """Insert only topology-verified intersections with POLYGON geometry.
 
     ZH: 写入验证通过的交叉口。POLYGON geom 从关联的 candidate_intersection
         的 centroid + radius 派生（方案A：应用层计算）。
@@ -520,6 +520,8 @@ def insert_intersections(
     mapping: dict[int, int] = {}
     with conn.cursor() as cur:
         for topo in topologies:
+            if not topo.is_complete:
+                continue
             ci_db_id = ci_id_map.get(topo.cluster_id)
             if ci_db_id is None:
                 continue
