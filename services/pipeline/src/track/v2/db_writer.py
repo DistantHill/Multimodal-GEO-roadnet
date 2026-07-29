@@ -27,6 +27,7 @@ import json
 from typing import Any
 
 from .models import (
+    CrossTrackCandidate,
     EntryExitObservation,
     ExcludedIndex,
     ExcludedPoint,
@@ -316,6 +317,56 @@ def insert_injected_points(
 
 # ── Intersect2 ─────────────────────────────────────────────────────────
 
+def insert_tracks_cross(
+    conn: Any,
+    candidates: list[CrossTrackCandidate],
+) -> int:
+    """Persist deduplicated cross-track candidates and return inserted rows."""
+    if not candidates:
+        return 0
+
+    columns = [
+        "vehicle_id", "timestamp", "lon", "lat", "x", "y",
+        "heading", "speed",
+        "from_source_id", "from_source_row_key",
+        "to_source_id", "to_source_row_key",
+        "generated_reason", "origin_lon", "origin_lat",
+    ]
+    rows = [
+        (
+            candidate.vehicle_id,
+            candidate.timestamp,
+            candidate.lon,
+            candidate.lat,
+            candidate.x,
+            candidate.y,
+            candidate.heading,
+            candidate.speed,
+            candidate.from_source_id,
+            candidate.from_source_row_key,
+            candidate.to_source_id,
+            candidate.to_source_row_key,
+            "orthogonal_cross_track",
+            candidate.origin_lon,
+            candidate.origin_lat,
+        )
+        for candidate in candidates
+    ]
+    with conn.cursor() as cur:
+        inserted = _chunked_insert_returning(
+            cur,
+            "tracks_cross",
+            columns,
+            rows,
+            ["id"],
+            on_conflict=(
+                "ON CONFLICT (vehicle_id, from_source_id, from_source_row_key, "
+                "to_source_id, to_source_row_key) DO NOTHING"
+            ),
+        )
+    return len(inserted)
+
+
 def insert_turn_events(
     conn: Any,
     turn_events: list[TurnEvent],
@@ -439,6 +490,8 @@ def insert_candidate_intersection_events(
         if ci_db_id is None:
             continue
         for event in c.events:
+            if event.source != "turn":
+                continue
             te_db_id = te_id_map.get(event.event_id)
             if te_db_id is not None:
                 rows.append((ci_db_id, te_db_id))

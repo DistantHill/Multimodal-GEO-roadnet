@@ -35,6 +35,7 @@ from ._geometry import (
 )
 from .exceptions import V2Error
 from .models import (
+    CrossTrackCandidate,
     CrossingPoint,
     EntryExitObservation,
     HotspotCluster,
@@ -124,6 +125,7 @@ class IntersectResult(TrackModel):
     topologies: list[IntersectionTopology]
     report: IntersectReport
     observations: list[EntryExitObservation] = field(default_factory=list)
+    cross_track_candidates: list[CrossTrackCandidate] = field(default_factory=list)
 
     def get_report(self) -> IntersectReport:
         return self.report
@@ -365,6 +367,7 @@ def _empty_intersect_result() -> IntersectResult:
             cluster_count=0, cluster_count_turn=0, cluster_count_ortho=0,
             cluster_count_cross_track=0, complete_intersection_count=0,
         ),
+        cross_track_candidates=[],
     )
 
 
@@ -374,7 +377,7 @@ def _build_intersect_report(
     turn_events: list[TurnEvent],
     hotspot_events: list[TurnEvent],
     ortho_candidates: list[OrthogonalCandidate],
-    cross_candidates: list[OrthogonalCandidate],
+    cross_candidates: list[CrossTrackCandidate],
     track_count: int,
 ) -> IntersectReport:
     """Shared report construction for both modes."""
@@ -403,7 +406,7 @@ def _build_intersect_report(
 def _cluster_pipeline(
     turn_events: list[TurnEvent],
     ortho_candidates: list[OrthogonalCandidate],
-    cross_candidates: list[OrthogonalCandidate],
+    cross_candidates: list[CrossTrackCandidate],
     origin_lon: float,
     origin_lat: float,
     cfg: IntersectConfig,
@@ -455,11 +458,11 @@ def _extract_methods_123(
     origin_lon: float,
     origin_lat: float,
     cfg: IntersectConfig,
-) -> tuple[list[TurnEvent], list[OrthogonalCandidate], list[OrthogonalCandidate]]:
+) -> tuple[list[TurnEvent], list[OrthogonalCandidate], list[CrossTrackCandidate]]:
     """Run all three candidate extraction methods on a tracks dict (handle mode)."""
     turn_events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg) if cfg.use_turn_events else []
     ortho_candidates: list[OrthogonalCandidate] = []
-    cross_candidates: list[OrthogonalCandidate] = []
+    cross_candidates: list[CrossTrackCandidate] = []
     if cfg.use_orthogonal_candidates:
         ortho_candidates = _extract_orthogonal_candidates(tracks, origin_lon, origin_lat)
         cross_candidates = _extract_orthogonal_cross_track_candidates(tracks, origin_lon, origin_lat, cfg)
@@ -524,6 +527,7 @@ def detect_intersections(
         clusters=annotated_clusters,
         topologies=topologies,
         observations=observations,
+        cross_track_candidates=cross_candidates,
         report=_build_intersect_report(
             annotated_clusters, topologies,
             turn_events, hotspot_events, ortho_candidates, cross_candidates,
@@ -892,9 +896,10 @@ def _extract_cross_track_windows(
     conn: Any, cfg: IntersectConfig,
     extent: tuple[float, float, float, float],
     origin_lon: float, origin_lat: float,
-) -> list[OrthogonalCandidate]:
+) -> list[CrossTrackCandidate]:
     """Method 3: spatial sliding windows for cross-track segment intersection."""
-    candidates: list[OrthogonalCandidate] = []
+    candidates: list[CrossTrackCandidate] = []
+    seen_segment_pairs: set[tuple[str, str, str, str, str]] = set()
     if not cfg.use_orthogonal_candidates:
         return candidates
 
@@ -930,13 +935,30 @@ def _extract_cross_track_windows(
             continue
         total_points += len(points)
         window_tracks = _tracks_from_points(points)
-        candidates.extend(
-            _extract_orthogonal_cross_track_candidates(window_tracks, origin_lon, origin_lat, cfg)
-        )
+        for candidate in _extract_orthogonal_cross_track_candidates(
+            window_tracks, origin_lon, origin_lat, cfg,
+        ):
+            key = _cross_track_candidate_key(candidate)
+            if key not in seen_segment_pairs:
+                seen_segment_pairs.add(key)
+                candidates.append(candidate)
 
     print(f"    ... {window_count} 窗/windows, {total_points:,} 点/points "
           f"→ {len(candidates):,} 候选/candidates ({time.perf_counter() - t0:.1f}s)")
     return candidates
+
+
+def _cross_track_candidate_key(
+    candidate: CrossTrackCandidate,
+) -> tuple[str, str, str, str, str]:
+    """Stable identity for one canonical A/B segment-pair intersection."""
+    return (
+        candidate.vehicle_id,
+        candidate.from_source_id,
+        candidate.from_source_row_key,
+        candidate.to_source_id,
+        candidate.to_source_row_key,
+    )
 
 
 def _build_topologies_from_db(
@@ -1022,6 +1044,7 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
         clusters=annotated_clusters,
         topologies=topologies,
         observations=observations,
+        cross_track_candidates=cross_candidates,
         report=_build_intersect_report(
             annotated_clusters, topologies,
             turn_events, hotspot_events, ortho_candidates, cross_candidates,
@@ -1271,7 +1294,7 @@ def _extract_orthogonal_cross_track_candidates(
     origin_lon: float,
     origin_lat: float,
     cfg: IntersectConfig,
-) -> list[OrthogonalCandidate]:
+) -> list[CrossTrackCandidate]:
     """Multi-vehicle segment crossing detection via NumPy batched intersection.
 
     ZH: Method 3 —— 多车轨迹段正交交点检测。
@@ -1300,12 +1323,12 @@ def _extract_orthogonal_cross_track_candidates(
         if segs:
             track_segs[vid] = segs
 
-    vehicle_ids = list(track_segs.keys())
+    vehicle_ids = sorted(track_segs)
     if len(vehicle_ids) < 2:
         return []
 
     # ── Step 2: 每对车辆间 NumPy 批量求交 ──────────────────────────
-    candidates: list[OrthogonalCandidate] = []
+    candidates: list[CrossTrackCandidate] = []
     total_vehicles = len(vehicle_ids)
     total_pairs = total_vehicles * (total_vehicles - 1) // 2
     pair_count = 0
@@ -1336,20 +1359,36 @@ def _extract_orthogonal_cross_track_candidates(
             for fi in flat_idx:
                 si = fi // len(segs_b)
                 sj = fi % len(segs_b)
+                a_start = tracks[vid_a][segs_a[si][6]]
+                a_end = tracks[vid_a][segs_a[si][6] + 1]
+                b_start = tracks[vid_b][segs_b[sj][6]]
+                b_end = tracks[vid_b][segs_b[sj][6] + 1]
                 lon, lat = _to_lonlat(
                     float(cx.flat[fi]), float(cy.flat[fi]),
                     origin_lon, origin_lat,
                 )
                 ts = (ts_a[si] + ts_b[sj]) / 2.0
                 candidates.append(
-                    OrthogonalCandidate(
-                        point_ref=tracks[vid_a][segs_a[si][6]].point_ref,
+                    CrossTrackCandidate(
+                        point_ref=a_start.point_ref,
                         vehicle_id=f"{vid_a}|{vid_b}",
                         timestamp=ts,
                         lon=lon,
                         lat=lat,
                         x=float(cx.flat[fi]),
                         y=float(cy.flat[fi]),
+                        heading=segs_a[si][4],
+                        speed=a_start.speed,
+                        from_source_id=a_start.point_ref.source_id,
+                        from_source_row_key=(
+                            f"{a_start.point_ref.source_row_key},{a_end.point_ref.source_row_key}"
+                        ),
+                        to_source_id=b_start.point_ref.source_id,
+                        to_source_row_key=(
+                            f"{b_start.point_ref.source_row_key},{b_end.point_ref.source_row_key}"
+                        ),
+                        origin_lon=origin_lon,
+                        origin_lat=origin_lat,
                     )
                 )
 
@@ -1555,7 +1594,7 @@ def _cluster_orthogonal_candidates(
 
 
 def _cluster_orthogonal_cross_track_candidates(
-    candidates: list[OrthogonalCandidate],
+    candidates: list[CrossTrackCandidate],
     origin_lon: float,
     origin_lat: float,
     *,

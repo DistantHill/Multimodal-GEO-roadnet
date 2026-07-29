@@ -99,6 +99,30 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """),
+    ("tracks_cross", """
+        CREATE TABLE IF NOT EXISTS tracks_cross (
+            id                  BIGSERIAL PRIMARY KEY,
+            vehicle_id          TEXT NOT NULL,
+            timestamp           DOUBLE PRECISION NOT NULL,
+            lon                 DOUBLE PRECISION NOT NULL,
+            lat                 DOUBLE PRECISION NOT NULL,
+            x                   DOUBLE PRECISION NOT NULL,
+            y                   DOUBLE PRECISION NOT NULL,
+            heading             DOUBLE PRECISION NOT NULL,
+            speed               DOUBLE PRECISION NOT NULL DEFAULT 0,
+            geom                geometry(Point, 4326) GENERATED ALWAYS AS (
+                                    ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+                                ) STORED,
+            from_source_id      TEXT NOT NULL,
+            from_source_row_key TEXT NOT NULL,
+            to_source_id        TEXT NOT NULL,
+            to_source_row_key   TEXT NOT NULL,
+            generated_reason    TEXT NOT NULL DEFAULT 'orthogonal_cross_track',
+            origin_lon          DOUBLE PRECISION NOT NULL,
+            origin_lat          DOUBLE PRECISION NOT NULL,
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """),
     # ── Intersect2 ──
     ("turn_events", """
         CREATE TABLE IF NOT EXISTS turn_events (
@@ -228,6 +252,10 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     # ── injected_points ──
     ("idx_ip_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_ip_vehicle_ts ON injected_points(vehicle_id, timestamp)"),
     ("idx_ip_geom",            "CREATE INDEX IF NOT EXISTS idx_ip_geom ON injected_points USING GIST (geom)"),
+    # ── tracks_cross ──
+    ("idx_tc_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_tc_vehicle_ts ON tracks_cross(vehicle_id, timestamp)"),
+    ("idx_tc_geom",            "CREATE INDEX IF NOT EXISTS idx_tc_geom ON tracks_cross USING GIST (geom)"),
+    ("idx_tc_segment_pair",    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tc_segment_pair ON tracks_cross (vehicle_id, from_source_id, from_source_row_key, to_source_id, to_source_row_key)"),
     # ── turn_events ──
     ("idx_te_event_id",        "CREATE INDEX IF NOT EXISTS idx_te_event_id ON turn_events(event_id)"),
     ("idx_te_vehicle_ts",      "CREATE UNIQUE INDEX IF NOT EXISTS idx_te_vehicle_ts ON turn_events(vehicle_id, timestamp)"),

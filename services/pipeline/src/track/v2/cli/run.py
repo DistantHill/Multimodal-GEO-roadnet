@@ -31,6 +31,7 @@ from ..db_writer import (
     insert_entry_exit_points,
     insert_excluded_points,
     insert_injected_points,
+    insert_tracks_cross,
     insert_intersections,
     insert_kept_trajectory_points,
     insert_trajectory_points,
@@ -179,6 +180,11 @@ def run_pipeline(
         print(f"  完整交叉口 / Complete intersections: {iresult.report.complete_intersection_count:,}")
 
         t0 = time.perf_counter()
+        tracks_cross_count = insert_tracks_cross(conn, iresult.cross_track_candidates)
+        stats["tracks_cross"] = tracks_cross_count
+        print(f"  tracks_cross: {tracks_cross_count:,} rows ({time.perf_counter() - t0:.1f}s)")
+
+        t0 = time.perf_counter()
         te_id_map = insert_turn_events(conn, iresult.turn_events)
         stats["turn_events"] = len(iresult.turn_events)
         print(f"  turn_events: {len(iresult.turn_events):,} rows ({time.perf_counter() - t0:.1f}s)")
@@ -300,7 +306,7 @@ def main() -> int:
     print("\n── 写入统计 / Write Summary ──")
     for table in [
         "trajectory_points", "excluded_points", "kept_trajectory_points",
-        "injected_points", "turn_events", "candidate_intersections",
+        "injected_points", "tracks_cross", "turn_events", "candidate_intersections",
         "candidate_intersection_events", "candidate_entry_exit_points",
         "intersections", "entry_exit_points",
     ]:

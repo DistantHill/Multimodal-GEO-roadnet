@@ -22,6 +22,7 @@ from track.v2.intersect2 import (
     _detect_turn_events,
     _extract_entry_exit_observations_batch,
     _extract_cross_track_windows,
+    _extract_orthogonal_cross_track_candidates,
     _extract_orthogonal_candidates,
     _group_by_vehicle,
     _merge_clusters,
@@ -187,6 +188,29 @@ class CrossTrackWindowProgressTest(unittest.TestCase):
 
         output = "\n".join(str(call.args[0]) for call in print_mock.call_args_list)
         self.assertIn("Spatial window: 1/9", output)
+
+    def test_cross_track_windows_deduplicate_overlapping_segment_pairs(self):
+        origin_lon, origin_lat = 116.0, 39.0
+        points = [
+            _make_point("A", "102", 10.0, origin_lon, origin_lat - 0.001, 0.0, 12.0, "table_a"),
+            _make_point("A", "105", 20.0, origin_lon, origin_lat + 0.001, 0.0, 12.0, "table_a"),
+            _make_point("B", "77", 10.0, origin_lon - 0.001, origin_lat, 90.0, 8.0, "table_b"),
+            _make_point("B", "78", 20.0, origin_lon + 0.001, origin_lat, 90.0, 8.0, "table_b"),
+        ]
+        cfg = IntersectConfig(
+            spatial_window_size=(1_000.0, 1_000.0),
+            spatial_window_overlap=0.15,
+        )
+        with patch("track.v2.intersect2._query_active_points_in_window", return_value=points), \
+             patch("builtins.print"):
+            candidates = _extract_cross_track_windows(
+                object(), cfg,
+                extent=(116.0, 39.0, 116.02, 39.02),
+                origin_lon=origin_lon, origin_lat=origin_lat,
+            )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].vehicle_id, "A|B")
 
 
 class GroupByVehicleTest(unittest.TestCase):
@@ -451,6 +475,34 @@ class OrthogonalCandidateTest(unittest.TestCase):
             for c in candidates:
                 self.assertEqual(c.point_ref.generated_reason, "orthogonal_heading")
 
+    def test_cross_track_candidate_keeps_canonical_pair_provenance(self):
+        """Cross-track candidates retain both source segments in A/B order."""
+        origin_lon, origin_lat = 116.0, 39.0
+        tracks = {
+            "B": [
+                _make_point("B", "77", 10.0, origin_lon - 0.001, origin_lat, 90.0, 8.0, "table_b"),
+                _make_point("B", "78", 20.0, origin_lon + 0.001, origin_lat, 90.0, 8.0, "table_b"),
+            ],
+            "A": [
+                _make_point("A", "102", 30.0, origin_lon, origin_lat - 0.001, 0.0, 12.0, "table_a"),
+                _make_point("A", "105", 40.0, origin_lon, origin_lat + 0.001, 0.0, 12.0, "table_a"),
+            ],
+        }
+
+        candidates = _extract_orthogonal_cross_track_candidates(
+            tracks, origin_lon, origin_lat, IntersectConfig(),
+        )
+
+        self.assertEqual(len(candidates), 1)
+        candidate = candidates[0]
+        self.assertEqual(candidate.vehicle_id, "A|B")
+        self.assertEqual(candidate.from_source_id, "table_a")
+        self.assertEqual(candidate.from_source_row_key, "102,105")
+        self.assertEqual(candidate.to_source_id, "table_b")
+        self.assertEqual(candidate.to_source_row_key, "77,78")
+        self.assertEqual(candidate.heading, 0.0)
+        self.assertEqual(candidate.speed, 12.0)
+
     def test_cluster_orthogonal_candidates(self):
         """I2-17: Orthogonal candidates can be clustered."""
         origin_lon, origin_lat = 116.0, 39.0
@@ -704,6 +756,30 @@ class EndToEndTest(unittest.TestCase):
             self.assertEqual(len(result.turn_events), 0,
                              "Straight lines should produce 0 turn events")
             self.assertEqual(len(result.clusters), 0)
+
+    def test_handle_mode_exposes_cross_track_candidates(self):
+        """Public result retains deduplicated cross-track candidates."""
+        with tempfile.TemporaryDirectory() as td:
+            rows = [
+                "vid,lng,lat,included_angle,gps_speed,gps_time_a",
+                "A,116.0,38.999,0,12,10",
+                "A,116.0,39.001,0,12,20",
+                "B,115.999,39.0,90,8,10",
+                "B,116.001,39.0,90,8,20",
+            ]
+            csv_path = _make_csv(td, "cross_track.csv", "\n".join(rows) + "\n")
+            handle = get_database(CsvSource(csv_path))
+            result = detect_intersections(
+                handle,
+                config=IntersectConfig(
+                    use_turn_events=False,
+                    cross_track_dbscan_min_samples=1,
+                ),
+            )
+            handle.close()
+
+        self.assertEqual(len(result.cross_track_candidates), 1)
+        self.assertEqual(result.cross_track_candidates[0].vehicle_id, "A|B")
 
     def test_real_csv_smoke(self):
         """I2-25: Smoke test — detect_intersections on Hfm_130pts.csv."""

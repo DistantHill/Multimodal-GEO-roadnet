@@ -389,6 +389,31 @@ class OrthogonalCandidate(TrackModel):
 
 
 @dataclass(frozen=True)
+class CrossTrackCandidate(TrackModel):
+    """One orthogonal intersection between segments from two vehicles.
+
+    ``from_*`` records the canonical vehicle A segment and ``to_*`` records
+    vehicle B.  Each row key contains the segment's start/end source keys.
+    """
+
+    point_ref: PointRef
+    vehicle_id: str
+    timestamp: float
+    lon: float
+    lat: float
+    x: float
+    y: float
+    heading: float
+    speed: float
+    from_source_id: str
+    from_source_row_key: str
+    to_source_id: str
+    to_source_row_key: str
+    origin_lon: float
+    origin_lat: float
+
+
+@dataclass(frozen=True)
 class HotspotCluster(TrackModel):
     """A DBSCAN cluster of candidate points (turn events or orthogonal candidates).
 
