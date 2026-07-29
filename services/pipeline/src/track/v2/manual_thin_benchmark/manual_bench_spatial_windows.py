@@ -7,7 +7,8 @@
     可以改下面的 CONFIG 区域来调整参数。
 
 依赖：PostgreSQL 已运行且 trajectory_points/injected_points 表有数据。
-连接信息从 track/v2/.env 读取。
+默认连接 track_test 数据库（由 manual_setup_test_db.py 创建）。
+临时切回生产库：``TRACK_BENCH_DB=postgres python manual_bench_spatial_windows.py``
 """
 
 from __future__ import annotations
@@ -21,8 +22,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-import psycopg
-
+from _thin_bench_helpers import connect_test_db, TEST_DB_NAME
 from track.v2.intersect2 import (
     IntersectConfig,
     SpatialWindowIterator,
@@ -54,34 +54,14 @@ MAX_WINDOWS: int = 0
 VERBOSE_WINDOWS: bool = True
 
 
-def _load_env(env_path: str = r"D:\Ai_Projects\track\track\v2\.env") -> dict[str, str]:
-    """从 .env 文件手动解析连接参数。"""
-    env: dict[str, str] = {}
-    with open(env_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip()
-    return env
-
-
 def main() -> None:
-    env = _load_env()
     cfg = IntersectConfig(**CONFIG_OVERRIDES)
 
     print("=" * 60)
-    print("Connecting to PostgreSQL ...")
+    print(f"Connecting to PostgreSQL test DB ({TEST_DB_NAME}) ...")
     t0 = time.perf_counter()
 
-    conn = psycopg.connect(
-        host=env["TRACK_PG_HOST"],
-        port=env["TRACK_PG_PORT"],
-        dbname=env["TRACK_PG_DATABASE"],
-        user=env["TRACK_PG_USER"],
-        password=env["TRACK_PG_PASSWORD"],
-        connect_timeout=int(env.get("TRACK_PG_CONNECT_TIMEOUT", 10)),
-    )
+    conn = connect_test_db()
     print(f"  Connected: {conn.info.host}:{conn.info.port}/{conn.info.dbname} "
           f"(server {conn.info.server_version})")
 
