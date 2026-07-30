@@ -16,9 +16,12 @@ import math
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterator
+from typing import Any, Iterator, TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from .logger import LiveStatus
 
 from ._geometry import (
     _angle_delta_deg,
@@ -108,6 +111,9 @@ class IntersectConfig(TrackModel):
     run_id: str | None = None
     spatial_window_size: tuple[float, float] = (2000.0, 2000.0)
     spatial_window_overlap: float = 0.15
+
+    # ── Live status display (optional, set by CLI for dynamic terminal output) ──
+    live_status: Any = None
 
 
 # ── Result ─────────────────────────────────────────────────────────────
@@ -969,6 +975,7 @@ def _extract_cross_track_windows(
     conn: Any, cfg: IntersectConfig,
     extent: tuple[float, float, float, float],
     origin_lon: float, origin_lat: float,
+    live_status: Any = None,
 ) -> list[CrossTrackCandidate]:
     """Method 3: spatial sliding windows for cross-track segment intersection."""
     candidates: list[CrossTrackCandidate] = []
@@ -987,6 +994,8 @@ def _extract_cross_track_windows(
     total_windows = windows.count_windows()
     last_progress_t = t0
     print(f"  ── 空间滑窗 / Spatial windows (Method 3: orthogonal_cross_track) ──")
+    if live_status is not None:
+        live_status._stage_name = "Intersect2: Spatial Windows"
 
     for window in windows.iter_windows():
         window_count += 1
@@ -997,6 +1006,12 @@ def _extract_cross_track_windows(
             or window_count % 10 == 0
             or (now - last_progress_t) >= 3.0
         ):
+            if live_status is not None and total_windows > 0:
+                live_status.update(
+                    progress=window_count / total_windows,
+                    detail=f"{window_count:,}/{total_windows:,} windows, {total_points:,} pts, {len(candidates):,} candidates",
+                    elapsed=now - t0,
+                )
             print(
                 f"    ... Spatial window: {window_count:,}/{total_windows:,}, "
                 f"{total_points:,} points, {len(candidates):,} candidates "
@@ -1104,26 +1119,53 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
     origin_lon = (extent[0] + extent[2]) / 2.0
     origin_lat = (extent[1] + extent[3]) / 2.0
 
+    live = cfg.live_status
+
     # ── Methods 1 & 2: stream per-vehicle (DB-specific) ─────────────
+    if live is not None:
+        live.update(detail="Method 1+2: Turn events + ortho candidates...")
+    t_stage = time.perf_counter()
     turn_events, ortho_candidates = _stream_extract_methods_1_2(
         conn, cfg, origin_lon, origin_lat,
     )
+    if live is not None:
+        live.update(
+            detail=f"Turn events: {len(turn_events):,}, Ortho: {len(ortho_candidates):,}",
+            elapsed=time.perf_counter() - t_stage,
+        )
 
     # ── Method 3: spatial windows (DB-specific) ─────────────────────
+    t_stage = time.perf_counter()
     cross_candidates = _extract_cross_track_windows(
-        conn, cfg, extent, origin_lon, origin_lat,
+        conn, cfg, extent, origin_lon, origin_lat, live_status=live,
     )
 
     # ── Shared: cluster pipeline (G* + DBSCAN + merge + ablation) ───
+    if live is not None:
+        live.update(detail="Clustering: G* + DBSCAN + merge + ablation...")
+    t_stage = time.perf_counter()
     hotspot_events, annotated_clusters = _cluster_pipeline(
         turn_events, ortho_candidates, cross_candidates,
         origin_lon, origin_lat, cfg,
     )
+    if live is not None:
+        live.update(
+            detail=f"Clusters: {len(annotated_clusters):,}",
+            elapsed=time.perf_counter() - t_stage,
+        )
 
     # ── DB-mode topology (per-cluster DB queries) ───────────────────
+    if live is not None:
+        live.update(detail="Topology verification (per-cluster DB queries)...")
+    t_stage = time.perf_counter()
     topologies, annotated_clusters, observations = _build_topologies_from_db(
         conn, annotated_clusters, cfg, origin_lon, origin_lat,
     )
+    if live is not None:
+        live.update(
+            detail=f"Topologies: {len(topologies):,}",
+            elapsed=time.perf_counter() - t_stage,
+        )
 
     return IntersectResult(
         turn_events=turn_events,

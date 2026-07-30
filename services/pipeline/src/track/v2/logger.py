@@ -294,18 +294,28 @@ def flush_logger() -> None:
 
 class LiveStatus:
     """ZH: 预构建的流水线段实时状态面板。封装 rich.live.Live，显示阶段名、进度条、
-        计数、耗时和吞吐速率。
+        计数、耗时和吞吐速率。若不传 progress，则仅显示统计信息而无进度条，
+        适合总量未知的流式处理场景。
 
     EN: Pre-built pipeline-stage live status panel. Wraps rich.live.Live
         to show stage name, progress bar, counts, elapsed time, and throughput.
+        When progress is never set, shows stats-only mode for streaming with
+        unknown total counts.
 
     Usage / 用法::
 
+        # 有进度条 / With progress bar
         status = LiveStatus("清洗 / Cleaning")
         status.start()
         for batch in batches:
-            # ... process ...
             status.update(progress=0.52, detail="1,203 / 2,314 车辆", elapsed=45.2)
+        status.stop()
+
+        # 无进度条（流式，总量未知）/ Stats-only (streaming, unknown total)
+        status = LiveStatus("清洗 / Cleaning")
+        status.start()
+        for vehicle in stream:
+            status.update(detail=f"{n:,} 车辆, {pts:,} 点", elapsed=t, throughput=f"{rate:.1f} 车辆/s")
         status.stop()
     """
 
@@ -317,7 +327,7 @@ class LiveStatus:
             stage_name: 阶段名称（建议中英双语，如 "清洗 / Cleaning"）
         """
         self._stage_name = stage_name
-        self._progress: float = 0.0
+        self._progress: float | None = None       # None = no progress bar
         self._detail: str = ""
         self._elapsed: float = 0.0
         self._throughput: str = ""
@@ -330,11 +340,11 @@ class LiveStatus:
         elapsed: float | None = None,
         throughput: str = "",
     ) -> None:
-        """ZH: 更新面板内容。
-        EN: Update the panel content.
+        """ZH: 更新面板内容。progress=None 时不显示进度条。
+        EN: Update the panel content. When progress is None, hide the progress bar.
 
         Args:
-            progress: 进度 0.0–1.0
+            progress: 进度 0.0–1.0，None 表示隐藏进度条
             detail: 计数描述，如 "1,203 / 2,314 车辆"
             elapsed: 已用秒数
             throughput: 吞吐描述，如 "26.6 车辆/s"
@@ -378,24 +388,22 @@ class LiveStatus:
     def _render(self):
         """ZH: 渲染当前状态的 rich renderable。
         EN: Render the current state as a rich renderable."""
-        # Progress bar via rich.Progress
-        progress = Progress(
-            TextColumn("[bold]{task.description}"),
-            BarColumn(bar_width=40, complete_style="green", finished_style="green"),
-            TextColumn("{task.percentage:>3.0f}%"),
-            expand=False,
-        )
-        task_id = progress.add_task("", total=100, completed=self._progress * 100)
-
-        # Build a compact panel
         table = Table.grid(padding=(0, 2))
         table.add_column(justify="center")
 
-        # Stage name header (plain text, no emoji for cross-platform safety)
+        # Stage name header
         table.add_row(Text(f"[{self._stage_name}]", style="bold cyan"))
 
-        # Progress bar row
-        table.add_row(progress)
+        # Progress bar row (only if progress was explicitly set)
+        if self._progress is not None:
+            progress = Progress(
+                TextColumn("[bold]{task.description}"),
+                BarColumn(bar_width=40, complete_style="green", finished_style="green"),
+                TextColumn("{task.percentage:>3.0f}%"),
+                expand=False,
+            )
+            progress.add_task("", total=100, completed=self._progress * 100)
+            table.add_row(progress)
 
         # Stats row
         parts = []
@@ -406,7 +414,7 @@ class LiveStatus:
         if self._throughput:
             parts.append(f"> {self._throughput}")
         if parts:
-            table.add_row(Text("  │  ".join(parts), style="dim"))
+            table.add_row(Text("  |  ".join(parts), style="dim"))
 
         return Panel(
             table,

@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
-from ..logger import init_logger, shutdown_logger
+from ..logger import init_logger, shutdown_logger, LiveStatus
 from ..db_writer import (
     create_pipeline_run,
     fetch_trajectory_point_ids,
@@ -124,6 +124,9 @@ def run_pipeline(
         all_kept_subtracks: list[list] = []
         all_injected_points: list = []
 
+        live_clean = LiveStatus("Parser 0 + Cleaner 1: 流式清洗 / Streaming Clean")
+        live_clean.start()
+
         t_read = time.perf_counter()
         vehicle_count = 0
         for vehicle_points in stream.iter_vehicle_tracks():
@@ -153,8 +156,14 @@ def run_pipeline(
 
             if vehicle_count % 500 == 0:
                 elapsed = time.perf_counter() - t_read
-                print(f"    ... {vehicle_count:,} 车辆/vehicles, {total_raw:,} 点/points ({elapsed:.1f}s)")
+                rate = vehicle_count / elapsed if elapsed > 0 else 0
+                live_clean.update(
+                    detail=f"{vehicle_count:,} 车辆, {total_raw:,} 点",
+                    elapsed=elapsed,
+                    throughput=f"{rate:.1f} 车辆/s",
+                )
 
+        live_clean.stop()
         stream.close()
         handle.close()
         elapsed_read = time.perf_counter() - t_read
@@ -210,13 +219,17 @@ def run_pipeline(
         # EN: In PG-table mode source_id is the table name, not the actual
         #     source_id in the data — pass None to query all active points.
         intersect_source_id = source_id if not is_pg_source else None
+        live_intersect = LiveStatus("Intersect2: Cross-track Detection")
+        live_intersect.start()
         icfg = IntersectConfig(
             query_active_from_db=True,
             db_table=table,
             source_id=intersect_source_id,
             run_id=run_id,
+            live_status=live_intersect,
         )
         iresult = detect_intersections(conn=conn, config=icfg)
+        live_intersect.stop()
 
         print(f"  转向事件 / Turn events: {iresult.report.turn_event_count:,}")
         print(f"  热点事件 / Hotspot events: {iresult.report.hotspot_event_count:,}")
