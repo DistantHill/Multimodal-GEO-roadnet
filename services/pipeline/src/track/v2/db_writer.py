@@ -316,9 +316,12 @@ def insert_kept_trajectory_points(
     rows: list[tuple[Any, ...]] = []
     for st_idx, subtrack in enumerate(kept_subtracks, start=1):
         for seq_idx, point in enumerate(subtrack):
-            tp_id = tp_ref_to_id.get(_point_ref_key(point.point_ref))
-            if tp_id is not None:
-                rows.append((tp_id, point.vehicle_id, st_idx, seq_idx))
+            key = _point_ref_key(point.point_ref)
+            tp_id = tp_ref_to_id.get(key) if tp_ref_to_id else None
+            if tp_id is None:
+                # Fallback: source_row_key is the DB primary key in PG mode
+                tp_id = int(point.point_ref.source_row_key)
+            rows.append((tp_id, point.vehicle_id, st_idx, seq_idx))
 
     columns, rows = _with_run(columns, rows, run_id)
     if rows:

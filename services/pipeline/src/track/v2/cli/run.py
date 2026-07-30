@@ -27,7 +27,6 @@ from ..config import PostgresConfig, connect as pg_connect, default_postgres_con
 from ..logger import init_logger, shutdown_logger, LiveStatus
 from ..db_writer import (
     create_pipeline_run,
-    fetch_trajectory_point_ids,
     finish_pipeline_run,
     insert_candidate_entry_exit_points,
     insert_candidate_intersection_events,
@@ -38,7 +37,6 @@ from ..db_writer import (
     insert_tracks_cross,
     insert_intersections,
     insert_kept_trajectory_points,
-    reset_active_points,
     insert_trajectory_points,
     insert_turn_events,
 )
@@ -106,17 +104,16 @@ def run_pipeline(
         # Keep the run record even if a later pipeline statement rolls back.
         # A non-completed row is an explicit interrupted/failed-run record.
         conn.commit()
-        reset_active_points(conn, table=table)
         # ── Stage 1+2: Streamed read → insert → clean (per vehicle) ──
         print("── Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean ──")
         print(f"  数据源 / Source: {source_label}")
         handle = get_database(source)
 
-        # ZH: 快速统计车辆总数，用于进度条。CSV 扫 vehicle_id 列，PG 走 COUNT DISTINCT。
-        # EN: Quick vehicle count for progress bar. CSV scans vehicle_id column, PG uses COUNT DISTINCT.
+        # ZH: 快速统计总行数，用于行计数进度条。CSV 扫全文件，PG 走 COUNT(*)。
+        # EN: Quick row count for row-based progress bar. CSV full scan, PG COUNT(*).
         t_count = time.perf_counter()
-        total_vehicles = handle.count_vehicle_ids()
-        print(f"  车辆总数 / Total vehicles: {total_vehicles:,} ({time.perf_counter() - t_count:.1f}s)")
+        total_rows = handle.count_rows()
+        print(f"  总行数 / Total rows: {total_rows:,} ({time.perf_counter() - t_count:.1f}s)")
         stream = StreamVehicleSource(handle)
 
         total_raw = 0
@@ -160,13 +157,13 @@ def run_pipeline(
             now = time.perf_counter()
             if vehicle_count == 1 or vehicle_count % 500 == 0 or (now - last_update_t) >= 2.0:
                 elapsed = now - t_read
-                rate = vehicle_count / elapsed if elapsed > 0 else 0
-                pct = vehicle_count / total_vehicles if total_vehicles > 0 else 0
+                rate = total_raw / elapsed if elapsed > 0 else 0
+                pct = total_raw / total_rows if total_rows > 0 else 0
                 live_clean.update(
                     progress=pct,
-                    detail=f"{vehicle_count:,}/{total_vehicles:,} 车辆, {total_raw:,} 点",
+                    detail=f"{total_raw:,}/{total_rows:,} 点, {vehicle_count:,} 车辆",
                     elapsed=elapsed,
-                    throughput=f"{rate:.1f} 车辆/s",
+                    throughput=f"{rate:.0f} 点/s",
                 )
                 last_update_t = now
 
@@ -174,9 +171,9 @@ def run_pipeline(
         elapsed_read = time.perf_counter() - t_read
         live_clean.update(
             progress=1.0,
-            detail=f"{vehicle_count:,}/{total_vehicles:,} 车辆, {total_raw:,} 点",
+            detail=f"{total_raw:,}/{total_rows:,} 点, {vehicle_count:,} 车辆",
             elapsed=elapsed_read,
-            throughput=f"{vehicle_count / elapsed_read:.1f} 车辆/s" if elapsed_read > 0 else "",
+            throughput=f"{total_raw / elapsed_read:.0f} 点/s" if elapsed_read > 0 else "",
         )
         live_clean.stop()
         stream.close()
@@ -186,23 +183,7 @@ def run_pipeline(
 
         stats["trajectory_points"] = total_raw
 
-        if is_pg_source:
-            # Points already in DB — fetch existing ID mapping for FK references.
-            # ZH: PG 表模式下，数据可能含多种 source_id，用 pg_source_table 过滤
-            #     会漏掉所有行。当 pg_source_table == table 时不传 source_id，
-            #     查询该表全部点。
-            # EN: In PG-table mode the table may contain multiple source_ids.
-            #     When pg_source_table == table, query all points without filtering.
-            t0 = time.perf_counter()
-            _fetch_src = pg_source_table if pg_source_table != table else None
-            tp_id_map = fetch_trajectory_point_ids(conn, _fetch_src, table=table)
-            print(f"  ID 映射 / ID map: {len(tp_id_map):,} entries ({time.perf_counter() - t0:.1f}s)")
-
         # ── Batch-write cleaner outputs ──────────────────────────────
-        if not is_pg_source or pg_source_table != table:
-            # Imports have just been inserted; read the complete map so repeat
-            # runs keep their raw-point references stable.
-            tp_id_map = fetch_trajectory_point_ids(conn, source_id, table=table)
 
         excluded_index = ExcludedIndex(all_excluded)
         print(f"  排除 / Excluded: {len(all_excluded):,}")

@@ -170,6 +170,13 @@ class BaseTrajectorySourceHandle:
             Does not fully parse all fields — much faster than iter_points()."""
         raise NotImplementedError
 
+    def count_rows(self) -> int:
+        """ZH: 快速统计总行数，用于行计数进度条。
+            不解析任何字段，比 count_vehicle_ids() 更快。
+        EN: Fast row count for row-based progress bar.
+            Parses no fields — faster than count_vehicle_ids()."""
+        raise NotImplementedError
+
     def close(self) -> None:
         self._closed = True
 
@@ -263,7 +270,16 @@ class CsvTrajectorySourceHandle(BaseTrajectorySourceHandle):
                     prev_vid = vid
                     count += 1
         return count
-        self._state.assert_thresholds()
+
+    def count_rows(self) -> int:
+        """ZH: 快速扫描 CSV，统计总行数。比 count_vehicle_ids() 更简单——纯行计数。
+        EN: Fast CSV scan — counts all rows. Simpler than count_vehicle_ids()."""
+        count = 0
+        with open_text_auto(self._path, encoding=self._encoding, newline="") as f:
+            reader = csv.DictReader(f)
+            for _row in reader:
+                count += 1
+        return count
 
 
 class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
@@ -335,6 +351,22 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
                 f"SELECT COUNT(DISTINCT vehicle_id) FROM ({self._source.query}) AS _count_sub"
             )
             cur.execute(count_sql, self._source.params)
+            result = cur.fetchone()
+            return int(result[0]) if result else 0
+        finally:
+            _close_quietly(cur)
+            _close_quietly(conn)
+
+    def count_rows(self) -> int:
+        """ZH: 通过 SELECT COUNT(*) 直接统计总行数，不用 DISTINCT，不走 ORDER BY 子查询。
+        EN: Fast row count via SELECT COUNT(*) — no DISTINCT, no ORDER BY subquery."""
+        conn = self._connect()
+        cur = None
+        try:
+            _configure_postgres_session(conn)
+            cur = conn.cursor()
+            table = self._source.source_id or "trajectory_points"
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
             result = cur.fetchone()
             return int(result[0]) if result else 0
         finally:
