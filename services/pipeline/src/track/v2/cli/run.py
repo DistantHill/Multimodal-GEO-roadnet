@@ -106,7 +106,11 @@ def run_pipeline(
         # Keep the run record even if a later pipeline statement rolls back.
         # A non-completed row is an explicit interrupted/failed-run record.
         conn.commit()
-        reset_active_points(conn, source_id, table=table)
+        # ZH: PG 表模式下数据含多种 source_id，传 None 重置全表而非按表名过滤。
+        # EN: In PG-table mode data may contain multiple source_ids — pass None
+        #     to reset all rows instead of filtering by table name.
+        _reset_src = source_id if not is_pg_source else None
+        reset_active_points(conn, _reset_src, table=table)
         # ── Stage 1+2: Streamed read → insert → clean (per vehicle) ──
         print("── Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean ──")
         print(f"  数据源 / Source: {source_label}")
@@ -160,9 +164,15 @@ def run_pipeline(
         stats["trajectory_points"] = total_raw
 
         if is_pg_source:
-            # Points already in DB — fetch existing ID mapping for FK references
+            # Points already in DB — fetch existing ID mapping for FK references.
+            # ZH: PG 表模式下，数据可能含多种 source_id，用 pg_source_table 过滤
+            #     会漏掉所有行。当 pg_source_table == table 时不传 source_id，
+            #     查询该表全部点。
+            # EN: In PG-table mode the table may contain multiple source_ids.
+            #     When pg_source_table == table, query all points without filtering.
             t0 = time.perf_counter()
-            tp_id_map = fetch_trajectory_point_ids(conn, pg_source_table, table=table)
+            _fetch_src = pg_source_table if pg_source_table != table else None
+            tp_id_map = fetch_trajectory_point_ids(conn, _fetch_src, table=table)
             print(f"  ID 映射 / ID map: {len(tp_id_map):,} entries ({time.perf_counter() - t0:.1f}s)")
 
         # ── Batch-write cleaner outputs ──────────────────────────────
@@ -195,10 +205,15 @@ def run_pipeline(
 
         # ── Stage 3: Intersect2 (DB mode — spatial sliding windows) ──
         print("\n── Intersect2: 交叉口检测 / Intersection Detection (DB 滑窗模式) ──")
+        # ZH: PG 表模式下 source_id 是表名而非实际数据中的 source_id，
+        #     传 None 查询全部 active 点；CSV 模式用文件路径过滤。
+        # EN: In PG-table mode source_id is the table name, not the actual
+        #     source_id in the data — pass None to query all active points.
+        intersect_source_id = source_id if not is_pg_source else None
         icfg = IntersectConfig(
             query_active_from_db=True,
             db_table=table,
-            source_id=source_id,
+            source_id=intersect_source_id,
             run_id=run_id,
         )
         iresult = detect_intersections(conn=conn, config=icfg)

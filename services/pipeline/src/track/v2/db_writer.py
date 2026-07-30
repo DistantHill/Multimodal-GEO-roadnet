@@ -232,41 +232,54 @@ def mark_excluded_points(
 
 def reset_active_points(
     conn: Any,
-    source_id: str,
+    source_id: str | None,
     *,
     table: str = "trajectory_points",
 ) -> int:
     """Reset one source's raw points before deriving a new run.
+
+    ZH: 将来源的 is_active 重置为 TRUE。
+        ``source_id`` 为 None 时重置全表（PG 表模式）。
+    EN: Reset is_active to TRUE for the given source.
+        When ``source_id`` is None, reset all rows (PG-table mode).
 
     Derived cleaner decisions are stored per ``run_id``.  The raw table keeps
     a convenience active flag for DB-mode processing, so it must be restored
     to the complete source before the next run is calculated.
     """
     with conn.cursor() as cur:
-        cur.execute(
-            f"UPDATE {table} SET is_active = TRUE WHERE source_id = %s",
-            (source_id,),
-        )
+        if source_id is None:
+            cur.execute(f"UPDATE {table} SET is_active = TRUE")
+        else:
+            cur.execute(
+                f"UPDATE {table} SET is_active = TRUE WHERE source_id = %s",
+                (source_id,),
+            )
         return cur.rowcount
 
 
 def fetch_trajectory_point_ids(
     conn: Any,
-    source_id: str,
+    source_id: str | None,
     *,
     table: str = "trajectory_points",
 ) -> dict[tuple[str, str], int]:
     """Fetch existing (source_id, source_row_key) → id mapping from the DB.
 
     ZH: 从已有表中查询 (source_id, source_row_key) → id 映射。
-        当数据源为 PostgreSQL 表时使用，避免重复插入已存在的数据。
+        当 ``source_id`` 为 None 时查询全表（用于 PG 表模式）。
+    EN: Fetch (source_id, source_row_key) → id mapping from the DB.
+        When ``source_id`` is None, query all rows (used in PG-table mode).
     """
     mapping: dict[tuple[str, str], int] = {}
     with conn.cursor() as cur:
-        cur.execute(
-            f"SELECT id, source_id, source_row_key FROM {table} WHERE source_id = %s",
-            (source_id,),
-        )
+        if source_id is None:
+            cur.execute(f"SELECT id, source_id, source_row_key FROM {table}")
+        else:
+            cur.execute(
+                f"SELECT id, source_id, source_row_key FROM {table} WHERE source_id = %s",
+                (source_id,),
+            )
         for db_id, sid, srk in cur:
             mapping[(sid, srk)] = db_id
     return mapping
