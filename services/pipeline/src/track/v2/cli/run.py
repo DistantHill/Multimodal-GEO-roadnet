@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
+from ..logger import init_logger, shutdown_logger
 from ..db_writer import (
     create_pipeline_run,
     fetch_trajectory_point_ids,
@@ -320,6 +321,7 @@ def main() -> int:
     )
 
     source_label = args.csv or f"postgresql://{db_config.database}/{args.pg_table}"
+    init_logger()
     print(f"数据源 / Source: {source_label}")
     print(f"连接目标 / Target: {db_config.safe_dsn()}")
 
@@ -338,6 +340,8 @@ def main() -> int:
         import traceback
         traceback.print_exc()
         return 1
+    finally:
+        shutdown_logger()
 
     # ── Summary ──
     print("\n── 写入统计 / Write Summary ──")

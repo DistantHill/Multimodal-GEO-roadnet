@@ -22,6 +22,7 @@ import getpass
 from typing import Any
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
+from ..logger import init_logger, shutdown_logger
 
 # ── DDL statements in pipeline dependency order ─────────────────────
 # ZH: 按流水线阶段顺序排列，先创建被引用表，再创建引用表。
@@ -566,6 +567,7 @@ def main() -> int:
     )
 
     print(f"连接目标 / Target: {config.safe_dsn()}")
+    init_logger()
 
     try:
         if args.reset:
@@ -580,6 +582,8 @@ def main() -> int:
     except Exception as exc:
         print(f"[FAIL] 连接或执行失败 / Connection or execution failed: {exc}")
         return 1
+    finally:
+        shutdown_logger()
 
     return 0 if failures == 0 else 1
 

@@ -22,6 +22,7 @@ import getpass
 import time
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
+from ..logger import init_logger, shutdown_logger
 from ..models import CsvSource
 from .. import get_database
 from ..db_writer import insert_trajectory_points
@@ -72,6 +73,8 @@ def main() -> int:
         connect_timeout=args.connect_timeout,
         sslmode=args.sslmode,
     )
+
+    init_logger()
 
     print(f"数据源 / Source CSV: {args.csv}")
     print(f"连接目标 / Target:    {db_config.safe_dsn()}")
@@ -136,6 +139,8 @@ def main() -> int:
         import traceback
         traceback.print_exc()
         return 1
+    finally:
+        shutdown_logger()
 
     return 0
 
