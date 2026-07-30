@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterator, TYPE_CHECKING
@@ -735,7 +736,11 @@ def _stream_vehicle_tracks_from_db(
         params.append(source_id)
     if run_id is not None:
         params.append(run_id)
-    with conn.cursor() as cur:
+    # ZH: 服务器端命名游标 — PG 按需 FETCH，避免全量物化到 portal。
+    # EN: Server-side named cursor — FETCHes on demand, no full portal materialization.
+    with conn.cursor(
+        name=f"stream_tracks_{uuid.uuid4().hex}",
+    ) as cur:
         cur.execute(
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
             f"       source_id, source_row_key, extra, "

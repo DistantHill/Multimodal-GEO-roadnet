@@ -345,10 +345,17 @@ def main() -> int:
     parser.add_argument("--connect-timeout", type=int, default=_env.connect_timeout)
     parser.add_argument("--sslmode", default=_env.sslmode)
     parser.add_argument(
-        "--table", default="trajectory_points",
-        help="目标表名 / Target table name for trajectory_points (default: trajectory_points)."
+        "--table", default=None,
+        help="目标表名 / Target table name for trajectory_points "
+             "(default: same as --pg-table for PG mode, 'trajectory_points' for CSV mode)."
     )
     args = parser.parse_args()
+
+    # ZH: 若未显式指定 --table，PG 模式默认写到源表（原地工作），CSV 模式写到 trajectory_points。
+    # EN: If --table is not set, default to the PG source table (work in-place)
+    #     or 'trajectory_points' for CSV imports.
+    if args.table is None:
+        args.table = args.pg_table or "trajectory_points"
 
     # ── Resolve password: CLI prompt > .env > empty ──
     if args.ask_password:

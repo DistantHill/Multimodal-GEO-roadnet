@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import math
+import uuid
 
 # ZH: 提高 CSV 字段上限至 10 MB（默认 131 KB），防止合法大字段触发 _csv.Error，
 #     同时避免超大值在遇到损坏行（引号不配对）时导致无限 buffering 和 PermissionError。
@@ -291,7 +292,12 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
         cur = None
         try:
             _configure_postgres_session(conn)
-            cur = conn.cursor()
+            # ZH: 服务器端命名游标 — PG 按需 FETCH，不再全量物化到 portal。
+            # EN: Server-side named cursor — PG FETCHes on demand instead of
+            #     materializing the full result into a portal.
+            cur = conn.cursor(
+                name=f"iter_pts_{uuid.uuid4().hex}",
+            )
             cur.execute(self._source.query, self._source.params)
             columns = [desc[0] for desc in (cur.description or [])]
             for ordinal, row in enumerate(cur, start=1):
