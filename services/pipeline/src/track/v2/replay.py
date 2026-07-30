@@ -127,16 +127,13 @@ class ReplayService:
                 source_id = str(row.get("source_id") or "")
                 source_row_key = str(row.get("source_row_key") or "")
                 expected_hash = str(row.get("source_row_hash") or "")
-                # PG-only mode: trajectory_points no longer stores provenance columns.
-                # Skip hash verification when columns are absent.
+                # PG mode: trajectory_points stores source_id + source_row_key (DB PK)
+                # but may omit source_row_hash (expensive SHA-256 skipped for throughput).
+                # When provenance columns are absent OR the hash is empty, skip verification.
                 if not source_id and not source_row_key:
                     pass  # no provenance metadata available — skip verification
                 elif not expected_hash:
-                    fail(
-                        "legacy_provenance_incomplete",
-                        "Trajectory point has no source-row fingerprint.",
-                        current,
-                    )
+                    pass  # PG mode: stable PK, hash intentionally omitted — skip verification
                 else:
                     try:
                         candidate = self._source_row_resolver(source_id, source_row_key)

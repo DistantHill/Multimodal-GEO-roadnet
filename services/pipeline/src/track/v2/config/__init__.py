@@ -78,6 +78,29 @@ class PostgresConfig:
     password: str = ""
     connect_timeout: int = 10
     sslmode: str | None = None
+    # ZH: TCP keepalive 参数 — 防止防火墙/NAT 断开长时间运行的 named cursor 连接。
+    # EN: TCP keepalive params — prevent firewall/NAT from dropping long-running named-cursor connections.
+    keepalives: bool = True
+    keepalives_idle: int = 60       # 空闲 60s 后开始发 keepalive 探测
+    keepalives_interval: int = 10   # 探测间隔 10s
+    keepalives_count: int = 5       # 最多 5 次探测失败后断连
+    # ZH: TCP user timeout (PG 12+) — 在 TCP 层面定义数据包无 ACK 确认的最长等待时间。
+    # EN: TCP user timeout (PG 12+) — max time to wait for unacknowledged data at TCP level.
+    tcp_user_timeout: int = 30000   # ms
+
+    def _build_query(self) -> str:
+        """Build the query-string portion shared by dsn() and safe_dsn()."""
+        parts = [f"connect_timeout={self.connect_timeout}"]
+        if self.sslmode:
+            parts.append(f"sslmode={quote_plus(self.sslmode)}")
+        if self.keepalives:
+            parts.append("keepalives=1")
+            parts.append(f"keepalives_idle={self.keepalives_idle}")
+            parts.append(f"keepalives_interval={self.keepalives_interval}")
+            parts.append(f"keepalives_count={self.keepalives_count}")
+        if self.tcp_user_timeout:
+            parts.append(f"tcp_user_timeout={self.tcp_user_timeout}")
+        return "&".join(parts)
 
     def dsn(self) -> str:
         """Build a psycopg connection DSN."""
@@ -86,9 +109,7 @@ class PostgresConfig:
             auth += f":{quote_plus(self.password)}"
         host = quote_plus(self.host)
         database = quote_plus(self.database)
-        query = f"connect_timeout={self.connect_timeout}"
-        if self.sslmode:
-            query += f"&sslmode={quote_plus(self.sslmode)}"
+        query = self._build_query()
         return f"postgresql://{auth}@{host}:{self.port}/{database}?{query}"
 
     def safe_dsn(self) -> str:
@@ -98,9 +119,7 @@ class PostgresConfig:
             auth += ":***"
         host = quote_plus(self.host)
         database = quote_plus(self.database)
-        query = f"connect_timeout={self.connect_timeout}"
-        if self.sslmode:
-            query += f"&sslmode={quote_plus(self.sslmode)}"
+        query = self._build_query()
         return f"postgresql://{auth}@{host}:{self.port}/{database}?{query}"
 
 
@@ -138,4 +157,9 @@ def default_postgres_config(env_path: str | Path | None = None) -> PostgresConfi
         password=env.get("TRACK_PG_PASSWORD", ""),
         connect_timeout=int(env.get("TRACK_PG_CONNECT_TIMEOUT", "10")),
         sslmode=env.get("TRACK_PG_SSLMODE") or None,
+        keepalives=env.get("TRACK_PG_KEEPALIVES", "1") not in ("0", "false", "no"),
+        keepalives_idle=int(env.get("TRACK_PG_KEEPALIVES_IDLE", "60")),
+        keepalives_interval=int(env.get("TRACK_PG_KEEPALIVES_INTERVAL", "10")),
+        keepalives_count=int(env.get("TRACK_PG_KEEPALIVES_COUNT", "5")),
+        tcp_user_timeout=int(env.get("TRACK_PG_TCP_USER_TIMEOUT", "30000")),
     )

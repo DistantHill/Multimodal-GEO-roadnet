@@ -122,6 +122,10 @@ def run_pipeline(
         all_excluded: list = []
         all_kept_subtracks: list[list] = []
         all_injected_points: list = []
+        # ZH: 批量累积排除点，每 N 辆车 flush 一次 UPDATE，消除逐车往返开销。
+        # EN: Batch excluded points; flush UPDATE every N vehicles to eliminate per-vehicle round-trips.
+        _pending_excluded: list = []
+        _MARK_FLUSH_EVERY_N = 200
 
         live_clean = LiveStatus("Parser 0 + Cleaner 1: 流式清洗 / Streaming Clean")
         live_clean.start()
@@ -144,9 +148,12 @@ def run_pipeline(
             vresult = clean_vehicle(vehicle_points)
             total_injected += vresult.injected_count
 
-            # Mark excluded points as is_active=FALSE in DB
-            mark_excluded_points(conn, vresult.excluded, table=table, tp_id_map=tp_id_map)
+            # Mark excluded points as is_active=FALSE in DB (batch-accumulated)
+            _pending_excluded.extend(vresult.excluded)
             all_excluded.extend(vresult.excluded)
+            if len(_pending_excluded) >= 2000 or vehicle_count % _MARK_FLUSH_EVERY_N == 0:
+                mark_excluded_points(conn, _pending_excluded, table=table, tp_id_map=tp_id_map)
+                _pending_excluded.clear()
             all_kept_subtracks.extend(vresult.kept_subtracks)
 
             # Collect injected points for batch insert
@@ -168,6 +175,10 @@ def run_pipeline(
                 last_update_t = now
 
         # Final 100% update
+        # Flush remaining pending excluded points
+        if _pending_excluded:
+            mark_excluded_points(conn, _pending_excluded, table=table, tp_id_map=tp_id_map)
+            _pending_excluded.clear()
         elapsed_read = time.perf_counter() - t_read
         live_clean.update(
             progress=1.0,

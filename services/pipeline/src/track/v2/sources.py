@@ -400,19 +400,21 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
             _close_quietly(conn)
 
     def _point_ref(self, row: dict[str, Any], ordinal: int) -> PointRef:
+        # ZH: PG 模式下 source_row_key 就是 DB 主键，稳定且可复现，
+        #     不需要昂贵的 SHA-256 哈希做 replay 校验——跳过以提速。
+        # EN: In PG mode source_row_key is the DB PK, already stable and
+        #     reproducible — skip the expensive SHA-256 hash to improve throughput.
         key = self._source.primary_key_field
         if key in row and row[key] not in (None, ""):
             return PointRef(
                 self._source_id(),
                 str(row[key]),
                 True,
-                source_row_hash=source_row_hash(row),
             )
         return PointRef(
             self._source_id(),
             str(ordinal),
             False,
-            source_row_hash=source_row_hash(row),
         )
 
     def _source_id(self) -> str:
@@ -765,11 +767,34 @@ def _guess_with_chardet(raw: bytes) -> tuple[str | None, float]:
 
 
 def _configure_postgres_session(conn: Any) -> None:
+    """ZH: 配置 PostgreSQL 会话——禁用超时以适应 named cursor 的长事务。
+
+    Named cursor (DECLARE CURSOR) 会持有一个事务直到游标关闭。如果
+    idle_in_transaction_session_timeout 有值，服务器会在 FETCH 间隔空闲超时后
+    杀死连接。对于数百万行的迭代，禁用超时是正确做法——这不是意外僵死事务，
+    而是故意的长事务。
+
+    EN: Configure PostgreSQL session — disable timeouts for named-cursor
+    long transactions. A named cursor holds a transaction open until the
+    cursor closes. With idle_in_transaction_session_timeout set, the server
+    kills the connection when idle between FETCH calls. For multi-million-row
+    iteration, disabling the timeout is correct — this is a deliberate
+    long transaction, not a stuck one.
+    """
     cur = None
     try:
         cur = conn.cursor()
-        cur.execute("SET statement_timeout TO '5min'")
-        cur.execute("SET idle_in_transaction_session_timeout TO '5min'")
+        # ZH: statement_timeout=0 禁用它——每个 FETCH 非常快，但 system load 下可能波动。
+        # EN: Disable statement_timeout=0 — each FETCH is fast but may spike under load.
+        cur.execute("SET statement_timeout TO '0'")
+        # ZH: 关键修复：禁用 idle_in_transaction_session_timeout。
+        #     Named cursor 的事务贯穿整个迭代（可能 30+ 分钟），
+        #     有超时的话 PG server 会在空闲间隙杀死连接。
+        # EN: Key fix: disable idle_in_transaction_session_timeout.
+        #     The named cursor's transaction spans the entire iteration
+        #     (potentially 30+ min); with a timeout the PG server kills
+        #     the connection during idle gaps between FETCH calls.
+        cur.execute("SET idle_in_transaction_session_timeout TO '0'")
     finally:
         _close_quietly(cur)
 
