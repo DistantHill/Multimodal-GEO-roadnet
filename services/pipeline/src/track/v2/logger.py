@@ -55,14 +55,24 @@ _LEVELS: dict[str, int] = {
     "FATAL": 50,
 }
 
-# ANSI escape sequence regex — stripped from log file output
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# ANSI/terminal control regex — stripped from log file output.
+# Covers: CSI sequences (cursor/erase), OSC sequences (title), and NUL bytes.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")       # CSI: ESC[ ... letter
+_OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)")       # OSC: ESC] ... BEL or ESC\
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")  # non-printable except \t, \n
+
+# Rich Live display uses cursor-up + erase sequences for panel refresh.
+# These are CSI sequences ending in A (cursor up) or J/K (erase).
+# Full CSI regex above covers all of them (including rich's hide/show cursor).
 
 
 def _strip_ansi(text: str) -> str:
-    """ZH: 移除 ANSI 转义码，用于写入纯文本 log 文件。
-    EN: Remove ANSI escape codes for plain-text log file output."""
-    return _ANSI_RE.sub("", text)
+    """ZH: 移除 ANSI/终端控制序列和不可打印字符，用于写入纯文本 log 文件。
+    EN: Remove ANSI/terminal control sequences and non-printable chars for log file."""
+    text = _ANSI_RE.sub("", text)
+    text = _OSC_RE.sub("", text)
+    text = _CONTROL_RE.sub("", text)
+    return text
 
 
 # ── Tee stream ──────────────────────────────────────────────────────────

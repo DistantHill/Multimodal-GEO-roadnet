@@ -115,6 +115,12 @@ def run_pipeline(
         print("── Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean ──")
         print(f"  数据源 / Source: {source_label}")
         handle = get_database(source)
+
+        # ZH: 快速统计车辆总数，用于进度条。CSV 扫 vehicle_id 列，PG 走 COUNT DISTINCT。
+        # EN: Quick vehicle count for progress bar. CSV scans vehicle_id column, PG uses COUNT DISTINCT.
+        t_count = time.perf_counter()
+        total_vehicles = handle.count_vehicle_ids()
+        print(f"  车辆总数 / Total vehicles: {total_vehicles:,} ({time.perf_counter() - t_count:.1f}s)")
         stream = StreamVehicleSource(handle)
 
         total_raw = 0
@@ -129,6 +135,7 @@ def run_pipeline(
 
         t_read = time.perf_counter()
         vehicle_count = 0
+        last_update_t = t_read
         for vehicle_points in stream.iter_vehicle_tracks():
             total_raw += len(vehicle_points)
             vehicle_count += 1
@@ -154,19 +161,30 @@ def run_pipeline(
                 if p.point_ref.generated_reason == "orthogonal_heading":
                     all_injected_points.append(p)
 
-            if vehicle_count % 500 == 0:
-                elapsed = time.perf_counter() - t_read
+            now = time.perf_counter()
+            if vehicle_count == 1 or vehicle_count % 500 == 0 or (now - last_update_t) >= 2.0:
+                elapsed = now - t_read
                 rate = vehicle_count / elapsed if elapsed > 0 else 0
+                pct = vehicle_count / total_vehicles if total_vehicles > 0 else 0
                 live_clean.update(
-                    detail=f"{vehicle_count:,} 车辆, {total_raw:,} 点",
+                    progress=pct,
+                    detail=f"{vehicle_count:,}/{total_vehicles:,} 车辆, {total_raw:,} 点",
                     elapsed=elapsed,
                     throughput=f"{rate:.1f} 车辆/s",
                 )
+                last_update_t = now
 
+        # Final 100% update
+        elapsed_read = time.perf_counter() - t_read
+        live_clean.update(
+            progress=1.0,
+            detail=f"{vehicle_count:,}/{total_vehicles:,} 车辆, {total_raw:,} 点",
+            elapsed=elapsed_read,
+            throughput=f"{vehicle_count / elapsed_read:.1f} 车辆/s" if elapsed_read > 0 else "",
+        )
         live_clean.stop()
         stream.close()
         handle.close()
-        elapsed_read = time.perf_counter() - t_read
         print(f"  读取&清洗 / Read&Clean: {total_raw:,} 点/points, "
               f"{vehicle_count:,} 车辆/vehicles ({elapsed_read:.1f}s)")
 

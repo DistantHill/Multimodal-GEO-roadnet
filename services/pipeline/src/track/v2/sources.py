@@ -162,6 +162,13 @@ class BaseTrajectorySourceHandle:
     def iter_points(self) -> Iterator[TrajectoryPoint]:
         raise NotImplementedError
 
+    def count_vehicle_ids(self) -> int:
+        """ZH: 快速统计 distinct vehicle_id 数量，用于进度条显示。
+            不完整解析所有字段，比 iter_points() 快得多。
+        EN: Fast count of distinct vehicle_ids for progress bar display.
+            Does not fully parse all fields — much faster than iter_points()."""
+        raise NotImplementedError
+
     def close(self) -> None:
         self._closed = True
 
@@ -240,6 +247,21 @@ class CsvTrajectorySourceHandle(BaseTrajectorySourceHandle):
                 self._state.mark_loaded()
                 yield point
                 self._state.assert_thresholds()
+
+    def count_vehicle_ids(self) -> int:
+        """ZH: 快速扫描 CSV，仅提取 vehicle_id 列统计 distinct 数量。
+        EN: Fast CSV scan — only reads vehicle_id column to count distinct values."""
+        vehicle_col = self._mapping.canonical_to_source.get("vehicle_id", "vehicle_id")
+        prev_vid: str | None = None
+        count = 0
+        with open_text_auto(self._path, encoding=self._encoding, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                vid = (row.get(vehicle_col) or "").strip()
+                if vid and vid != prev_vid:
+                    prev_vid = vid
+                    count += 1
+        return count
         self._state.assert_thresholds()
 
 
@@ -291,6 +313,24 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
                 yield point
                 self._state.assert_thresholds()
             self._state.assert_thresholds()
+        finally:
+            _close_quietly(cur)
+            _close_quietly(conn)
+
+    def count_vehicle_ids(self) -> int:
+        """ZH: 通过 COUNT(DISTINCT vehicle_id) 查询统计车辆数。
+        EN: Query COUNT(DISTINCT vehicle_id) for vehicle count."""
+        conn = self._connect()
+        cur = None
+        try:
+            _configure_postgres_session(conn)
+            cur = conn.cursor()
+            count_sql = (
+                f"SELECT COUNT(DISTINCT vehicle_id) FROM ({self._source.query}) AS _count_sub"
+            )
+            cur.execute(count_sql, self._source.params)
+            result = cur.fetchone()
+            return int(result[0]) if result else 0
         finally:
             _close_quietly(cur)
             _close_quietly(conn)
