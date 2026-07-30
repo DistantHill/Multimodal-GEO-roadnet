@@ -227,6 +227,7 @@ class CsvPointRefTest(unittest.TestCase):
             ref = points[0].point_ref
             self.assertTrue(ref.stable)
             self.assertEqual(ref.source_row_key, "2")  # row 2 (after header)
+            self.assertEqual(len(ref.source_row_hash), 64)
 
 
 class FakePostgresCursorTest(unittest.TestCase):

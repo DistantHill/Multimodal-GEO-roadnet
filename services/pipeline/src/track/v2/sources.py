@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import math
 
 # ZH: 提高 CSV 字段上限至 10 MB（默认 131 KB），防止合法大字段触发 _csv.Error，
@@ -218,7 +220,12 @@ class CsvTrajectorySourceHandle(BaseTrajectorySourceHandle):
             reader = csv.DictReader(f)
             for row_number, row in enumerate(reader, start=2):
                 self._state.total_rows += 1
-                point_ref = PointRef(str(self._path), str(row_number), True)
+                point_ref = PointRef(
+                    str(self._path.resolve()),
+                    str(row_number),
+                    True,
+                    source_row_hash=source_row_hash(row),
+                )
                 try:
                     point, issues = parse_row(row, point_ref, row_number, self._mapping)
                 except _SkipRow as exc:
@@ -303,8 +310,18 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
     def _point_ref(self, row: dict[str, Any], ordinal: int) -> PointRef:
         key = self._source.primary_key_field
         if key in row and row[key] not in (None, ""):
-            return PointRef(self._source_id(), str(row[key]), True)
-        return PointRef(self._source_id(), str(ordinal), False)
+            return PointRef(
+                self._source_id(),
+                str(row[key]),
+                True,
+                source_row_hash=source_row_hash(row),
+            )
+        return PointRef(
+            self._source_id(),
+            str(ordinal),
+            False,
+            source_row_hash=source_row_hash(row),
+        )
 
     def _source_id(self) -> str:
         if self._source.source_id is not None:
@@ -669,6 +686,26 @@ def _row_to_dict(row: Any, columns: list[str]) -> dict[str, Any]:
     if isinstance(row, dict):
         return dict(row)
     return dict(zip(columns, row))
+
+
+def source_row_hash(row: dict[str, Any]) -> str:
+    """Return a stable SHA-256 fingerprint for one raw source row.
+
+    Replay stores only this fingerprint, then validates a live source row
+    before exposing it.  The source payload itself never lands in the replay
+    metadata.
+    """
+    normalized = {
+        str(key): "" if value is None else str(value)
+        for key, value in row.items()
+    }
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _close_quietly(resource: Any) -> None:

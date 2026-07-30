@@ -24,6 +24,7 @@ Usage / 用法::
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
 from .models import (
@@ -40,6 +41,33 @@ from .models import (
 
 # ── Batch size for multi-row INSERT ───────────────────────────────────
 _BATCH = 500
+
+
+def create_pipeline_run(
+    conn: Any,
+    *,
+    source_id: str,
+    source_kind: str,
+    parameters: dict[str, Any],
+) -> str:
+    """Create one append-only pipeline run and return its UUID."""
+    run_id = str(uuid.uuid4())
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO pipeline_runs (id, source_id, source_kind, parameters, status) "
+            "VALUES (%s, %s, %s, %s, 'running')",
+            (run_id, source_id, source_kind, json.dumps(parameters, ensure_ascii=False)),
+        )
+    return run_id
+
+
+def finish_pipeline_run(conn: Any, run_id: str, *, status: str) -> None:
+    """Finish a pipeline run in the caller's transaction."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE pipeline_runs SET status = %s, finished_at = NOW() WHERE id = %s",
+            (status, run_id),
+        )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -110,6 +138,17 @@ def _chunked_insert(cur: Any, table: str, columns: list[str], rows: list[tuple[A
         cur.execute(sql, params)
 
 
+def _with_run(
+    columns: list[str],
+    rows: list[tuple[Any, ...]],
+    run_id: str | None,
+) -> tuple[list[str], list[tuple[Any, ...]]]:
+    """Attach the mandatory run id to a newly persisted derived record."""
+    if run_id is None:
+        raise ValueError("run_id is required for derived v2 persistence")
+    return ["run_id", *columns], [(run_id, *row) for row in rows]
+
+
 # ── Parser 0 ───────────────────────────────────────────────────────────
 
 def insert_trajectory_points(
@@ -127,7 +166,7 @@ def insert_trajectory_points(
         return {}
 
     columns = [
-        "source_id", "source_row_key", "stable",
+        "source_id", "source_row_key", "source_row_hash", "stable",
         "vehicle_id", "timestamp", "lon", "lat",
         "heading", "speed", "extra",
     ]
@@ -136,6 +175,7 @@ def insert_trajectory_points(
         rows.append((
             p.point_ref.source_id,
             p.point_ref.source_row_key,
+            p.point_ref.source_row_hash,
             p.point_ref.stable,
             p.vehicle_id,
             p.timestamp,
@@ -190,6 +230,26 @@ def mark_excluded_points(
     return total
 
 
+def reset_active_points(
+    conn: Any,
+    source_id: str,
+    *,
+    table: str = "trajectory_points",
+) -> int:
+    """Reset one source's raw points before deriving a new run.
+
+    Derived cleaner decisions are stored per ``run_id``.  The raw table keeps
+    a convenience active flag for DB-mode processing, so it must be restored
+    to the complete source before the next run is calculated.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE {table} SET is_active = TRUE WHERE source_id = %s",
+            (source_id,),
+        )
+        return cur.rowcount
+
+
 def fetch_trajectory_point_ids(
     conn: Any,
     source_id: str,
@@ -222,6 +282,8 @@ def insert_excluded_points(
     conn: Any,
     excluded: ExcludedIndex,
     tp_ref_to_id: dict[tuple[str, str], int] | None = None,
+    *,
+    run_id: str | None = None,
 ) -> None:
     """Insert points removed by Cleaner 1.
 
@@ -241,6 +303,7 @@ def insert_excluded_points(
             item.lat,
         ))
 
+    columns, rows = _with_run(columns, rows, run_id)
     with conn.cursor() as cur:
         _chunked_insert(cur, "excluded_points", columns, rows)
 
@@ -249,6 +312,8 @@ def insert_kept_trajectory_points(
     conn: Any,
     kept_subtracks: list[list[TrajectoryPoint]],
     tp_ref_to_id: dict[tuple[str, str], int],
+    *,
+    run_id: str | None = None,
 ) -> None:
     """Insert FK references for points that survived ``_exclude_stationary``.
 
@@ -263,6 +328,7 @@ def insert_kept_trajectory_points(
             if tp_id is not None:
                 rows.append((tp_id, point.vehicle_id, st_idx, seq_idx))
 
+    columns, rows = _with_run(columns, rows, run_id)
     if rows:
         with conn.cursor() as cur:
             _chunked_insert(cur, "kept_trajectory_points", columns, rows)
@@ -271,6 +337,8 @@ def insert_kept_trajectory_points(
 def insert_injected_points(
     conn: Any,
     active_points: list[TrajectoryPoint],
+    *,
+    run_id: str | None = None,
 ) -> None:
     """Insert synthetic points injected by ``_inject_orthogonal``.
 
@@ -310,6 +378,7 @@ def insert_injected_points(
             0.0,  # origin_lat — set on read
         ))
 
+    columns, rows = _with_run(columns, rows, run_id)
     if rows:
         with conn.cursor() as cur:
             _chunked_insert(cur, "injected_points", columns, rows)
@@ -320,6 +389,8 @@ def insert_injected_points(
 def insert_tracks_cross(
     conn: Any,
     candidates: list[CrossTrackCandidate],
+    *,
+    run_id: str | None = None,
 ) -> int:
     """Persist deduplicated cross-track candidates and return inserted rows."""
     if not candidates:
@@ -352,6 +423,7 @@ def insert_tracks_cross(
         )
         for candidate in candidates
     ]
+    columns, rows = _with_run(columns, rows, run_id)
     with conn.cursor() as cur:
         inserted = _chunked_insert_returning(
             cur,
@@ -360,6 +432,9 @@ def insert_tracks_cross(
             rows,
             ["id"],
             on_conflict=(
+                "ON CONFLICT (run_id, vehicle_id, from_source_id, from_source_row_key, "
+                "to_source_id, to_source_row_key) DO NOTHING"
+                if run_id is not None else
                 "ON CONFLICT (vehicle_id, from_source_id, from_source_row_key, "
                 "to_source_id, to_source_row_key) DO NOTHING"
             ),
@@ -372,6 +447,8 @@ def insert_turn_events(
     turn_events: list[TurnEvent],
     origin_lon: float = 0.0,
     origin_lat: float = 0.0,
+    *,
+    run_id: str | None = None,
 ) -> dict[int, int]:
     """Insert turn events, return ``{event_id: db_id}`` mapping."""
     if not turn_events:
@@ -381,6 +458,7 @@ def insert_turn_events(
         "event_id", "vehicle_id", "timestamp", "lon", "lat",
         "x", "y", "in_bearing", "out_bearing", "turn_deg", "score",
         "source", "tp_source_id", "tp_source_row_key",
+        "from_source_id", "from_source_row_key", "to_source_id", "to_source_row_key",
         "origin_lon", "origin_lat",
     ]
     rows: list[tuple[Any, ...]] = []
@@ -400,15 +478,23 @@ def insert_turn_events(
             te.source,
             te.point_ref.source_id if te.point_ref else None,
             te.point_ref.source_row_key if te.point_ref else None,
+            te.from_source_id,
+            te.from_source_row_key,
+            te.to_source_id,
+            te.to_source_row_key,
             origin_lon,
             origin_lat,
         ))
 
+    columns, rows = _with_run(columns, rows, run_id)
     mapping: dict[int, int] = {}
     with conn.cursor() as cur:
         returned = _chunked_insert_returning(
             cur, "turn_events", columns, rows, ["id", "event_id"],
-            on_conflict="ON CONFLICT (vehicle_id, timestamp) DO NOTHING",
+            on_conflict=(
+                "ON CONFLICT (run_id, vehicle_id, timestamp) DO NOTHING"
+                if run_id is not None else "ON CONFLICT (vehicle_id, timestamp) DO NOTHING"
+            ),
         )
     for db_id, event_id in returned:
         mapping[event_id] = db_id
@@ -420,6 +506,8 @@ def insert_candidate_intersections(
     clusters: list[HotspotCluster],
     origin_lon: float = 0.0,
     origin_lat: float = 0.0,
+    *,
+    run_id: str | None = None,
 ) -> dict[int, int]:
     """Insert candidate intersections with POLYGON geometry.
 
@@ -428,6 +516,8 @@ def insert_candidate_intersections(
     """
     if not clusters:
         return {}
+    if run_id is None:
+        raise ValueError("run_id is required for derived v2 persistence")
 
     columns = [
         "cluster_id", "centroid_x", "centroid_y",
@@ -438,6 +528,7 @@ def insert_candidate_intersections(
         "origin_lon", "origin_lat",
         "geom",  # ← must be last: _POLYGON_EXPR is appended to end of placeholders
     ]
+    columns = ["run_id", *columns]
     mapping: dict[int, int] = {}
     with conn.cursor() as cur:
         for c in clusters:
@@ -449,7 +540,7 @@ def insert_candidate_intersections(
                 c.centroid_lat,
                 c.radius_m,
                 c.source,
-                json.dumps(list(c.sources), ensure_ascii=False),
+                json.dumps(list(c.source_ids), ensure_ascii=False),
                 json.dumps(c.source_counts, ensure_ascii=False),
                 json.dumps(c.source_ratios, ensure_ascii=False),
                 json.dumps(list(c.critical_sources), ensure_ascii=False),
@@ -460,6 +551,7 @@ def insert_candidate_intersections(
                 origin_lon,
                 origin_lat,
             )
+            row = (run_id, *row)
             placeholders = ", ".join(["%s"] * len(columns))
             # Replace the last placeholder (geom) with ST_Buffer expression
             placeholders_parts = ["%s"] * len(columns)
@@ -482,40 +574,68 @@ def insert_candidate_intersection_events(
     clusters: list[HotspotCluster],
     ci_id_map: dict[int, int],
     te_id_map: dict[int, int],
+    *,
+    run_id: str | None = None,
 ) -> None:
-    """Insert many-to-many links between candidate intersections and turn events."""
+    """Persist every cluster member with its typed input source pair.
+
+    ``turn_event_id`` is used only for native turn events.  Orthogonal and
+    cross-track members remain distinct rows and point directly to their
+    source pairs, so their local event ids cannot collide with turn-event ids.
+    """
     rows: list[tuple[Any, ...]] = []
     for c in clusters:
         ci_db_id = ci_id_map.get(c.cluster_id)
         if ci_db_id is None:
             continue
         for event in c.events:
-            if event.source != "turn":
-                continue
-            te_db_id = te_id_map.get(event.event_id)
-            if te_db_id is not None:
-                rows.append((ci_db_id, te_db_id))
+            turn_event_id = (
+                te_id_map.get(event.event_id) if event.source == "turn" else None
+            )
+            from_source_id = event.from_source_id
+            from_source_row_key = event.from_source_row_key
+            if from_source_id is None and event.point_ref is not None:
+                from_source_id = event.point_ref.source_id
+                from_source_row_key = event.point_ref.source_row_key
+            rows.append((
+                ci_db_id,
+                event.source,
+                turn_event_id,
+                from_source_id,
+                from_source_row_key,
+                event.to_source_id,
+                event.to_source_row_key,
+            ))
 
     if rows:
+        columns = [
+            "candidate_intersection_id", "event_kind", "turn_event_id",
+            "from_source_id", "from_source_row_key",
+            "to_source_id", "to_source_row_key",
+        ]
+        columns, rows = _with_run(columns, rows, run_id)
         with conn.cursor() as cur:
-            _chunked_insert(cur, "candidate_intersection_events",
-                            ["candidate_intersection_id", "turn_event_id"], rows)
+            _chunked_insert(cur, "candidate_intersection_events", columns, rows)
 
 
 def insert_candidate_entry_exit_points(
     conn: Any,
     clusters: list[HotspotCluster],
     ci_id_map: dict[int, int],
-) -> dict[int, int]:
+    *,
+    run_id: str | None = None,
+) -> dict[tuple[int, int], int]:
     """Insert crossing points, return ``{crossing_id: db_id}`` mapping."""
     columns = [
         "candidate_intersection_id", "cluster_id", "vehicle_id",
         "segment_index", "crossing_type",
         "crossing_x", "crossing_y", "crossing_lon", "crossing_lat",
         "branch_angle_deg", "origin_lon", "origin_lat",
+        "from_source_id", "from_source_row_key",
+        "to_source_id", "to_source_row_key",
     ]
     rows: list[tuple[Any, ...]] = []
-    crossing_ids: list[int] = []  # parallel to rows
+    crossing_ids: list[tuple[int, int]] = []  # (cluster_id, crossing_id), parallel to rows
     for c in clusters:
         ci_db_id = ci_id_map.get(c.cluster_id)
         if ci_db_id is None:
@@ -535,10 +655,15 @@ def insert_candidate_entry_exit_points(
                 getattr(cp_any, "branch_angle_deg", None),
                 getattr(cp_any, "origin_lon", 0.0),
                 getattr(cp_any, "origin_lat", 0.0),
+                cp_any.point_ref.source_id,
+                cp_any.point_ref.source_row_key,
+                cp_any.end_point_ref.source_id if cp_any.end_point_ref else None,
+                cp_any.end_point_ref.source_row_key if cp_any.end_point_ref else None,
             ))
-            crossing_ids.append(cp_any.crossing_id)
+            crossing_ids.append((c.cluster_id, cp_any.crossing_id))
 
-    mapping: dict[int, int] = {}
+    columns, rows = _with_run(columns, rows, run_id)
+    mapping: dict[tuple[int, int], int] = {}
     if rows:
         with conn.cursor() as cur:
             returned = _chunked_insert_returning(
@@ -554,6 +679,8 @@ def insert_intersections(
     topologies: list[IntersectionTopology],
     ci_id_map: dict[int, int],
     clusters_by_id: dict[int, HotspotCluster],
+    *,
+    run_id: str | None = None,
 ) -> dict[int, int]:
     """Insert only topology-verified intersections with POLYGON geometry.
 
@@ -563,6 +690,8 @@ def insert_intersections(
     """
     if not topologies:
         return {}
+    if run_id is None:
+        raise ValueError("run_id is required for derived v2 persistence")
 
     columns = [
         "candidate_intersection_id", "cluster_id",
@@ -570,6 +699,7 @@ def insert_intersections(
         "observation_count", "is_complete", "reason",
         "geom",
     ]
+    columns = ["run_id", *columns]
     mapping: dict[int, int] = {}
     with conn.cursor() as cur:
         for topo in topologies:
@@ -589,6 +719,7 @@ def insert_intersections(
                 topo.is_complete,
                 topo.reason,
             )
+            row = (run_id, *row)
             # Build geom via ST_Buffer from candidate cluster's centroid + radius
             if cluster is not None:
                 placeholders = ", ".join("%s" for _ in row)
@@ -617,6 +748,9 @@ def insert_entry_exit_points(
     conn: Any,
     observations: list[EntryExitObservation],
     int_id_map: dict[int, int],
+    crossing_id_map: dict[tuple[int, int], int] | None = None,
+    *,
+    run_id: str | None = None,
 ) -> None:
     """Insert entry/exit observations.
 
@@ -630,6 +764,7 @@ def insert_entry_exit_points(
         "intersection_id", "cluster_id", "vehicle_id",
         "entry_branch_angle", "exit_branch_angle",
         "inbound_bearing", "outbound_bearing", "turn_deg",
+        "entry_crossing_id", "exit_crossing_id",
     ]
     rows: list[tuple[Any, ...]] = []
     for obs in observations:
@@ -645,8 +780,11 @@ def insert_entry_exit_points(
             obs.inbound_bearing,
             obs.outbound_bearing,
             obs.turn_deg,
+            (crossing_id_map or {}).get((obs.cluster_id, obs.entry_crossing_id or -1)),
+            (crossing_id_map or {}).get((obs.cluster_id, obs.exit_crossing_id or -1)),
         ))
 
+    columns, rows = _with_run(columns, rows, run_id)
     if rows:
         with conn.cursor() as cur:
             _chunked_insert(cur, "entry_exit_points", columns, rows)

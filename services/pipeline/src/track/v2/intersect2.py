@@ -104,6 +104,8 @@ class IntersectConfig(TrackModel):
     # ── Spatial sliding window (DB mode) ───────────────────────────
     query_active_from_db: bool = False
     db_table: str = "trajectory_points"
+    source_id: str | None = None
+    run_id: str | None = None
     spatial_window_size: tuple[float, float] = (2000.0, 2000.0)
     spatial_window_overlap: float = 0.15
 
@@ -139,8 +141,8 @@ def _ratio_dict(counts: dict[str, int]) -> dict[str, float]:
 
 
 def _cluster_sources(cluster: HotspotCluster) -> tuple[str, ...]:
-    if cluster.sources:
-        return cluster.sources
+    if cluster.algorithm_sources:
+        return cluster.algorithm_sources
     if cluster.source_counts:
         return tuple(sorted(source for source, count in cluster.source_counts.items() if count > 0))
     if cluster.source and cluster.source != "merged":
@@ -193,10 +195,16 @@ def _with_source_provenance(
     counts = {source: count for source, count in counts.items() if count > 0}
     sources = tuple(sorted(counts))
     refs = source_point_refs if source_point_refs is not None else _cluster_source_point_refs(cluster)
+    source_ids = set(cluster.source_ids)
+    for event in cluster.events:
+        source_ids.update(source_id for source_id in event.source_ids if source_id)
+    for point_refs in refs.values():
+        source_ids.update(ref.source_id for ref in point_refs if ref.source_id)
     return replace(
         cluster,
         source=_source_label(sources),
-        sources=sources,
+        algorithm_sources=sources,
+        source_ids=tuple(sorted(source_ids)),
         source_counts=counts,
         source_ratios=_ratio_dict(counts),
         source_point_refs={source: tuple(items) for source, items in refs.items()},
@@ -606,17 +614,24 @@ class SpatialWindowIterator:
         return lon_count * lat_count
 
 
-def _query_spatial_extent(conn: Any, *, table: str = "trajectory_points") -> tuple[float, float, float, float] | None:
+def _query_spatial_extent(
+    conn: Any,
+    *,
+    table: str = "trajectory_points",
+    source_id: str | None = None,
+) -> tuple[float, float, float, float] | None:
     """Query MIN/MAX lon/lat of active trajectory points.
 
     Returns ``(lon_min, lat_min, lon_max, lat_max)`` compatible with
     ``SpatialWindowIterator``.
     """
+    sql = f"SELECT MIN(lon), MAX(lon), MIN(lat), MAX(lat) FROM {table} WHERE is_active IS NOT FALSE"
+    params: tuple[Any, ...] = ()
+    if source_id is not None:
+        sql += " AND source_id = %s"
+        params = (source_id,)
     with conn.cursor() as cur:
-        cur.execute(
-            f"SELECT MIN(lon), MAX(lon), MIN(lat), MAX(lat) "
-            f"FROM {table} WHERE is_active IS NOT FALSE"
-        )
+        cur.execute(sql, params)
         row = cur.fetchone()
     if row is None or row[0] is None:
         return None
@@ -630,6 +645,8 @@ def _query_active_points_in_window(
     window: SpatialWindow,
     *,
     table: str = "trajectory_points",
+    source_id: str | None = None,
+    run_id: str | None = None,
 ) -> list[TrajectoryPoint]:
     """Query active trajectory points + injected points in a spatial window.
 
@@ -637,29 +654,40 @@ def _query_active_points_in_window(
         lon/lat BETWEEN，走 R-tree 2D 索引扫描。UNION ALL 合并两表一次往返。
     """
     rows: list[dict[str, Any]] = []
+    raw_source_clause = " AND source_id = %s" if source_id is not None else ""
+    injected_run_clause = " AND run_id = %s" if run_id is not None else ""
+    params: list[Any] = []
+    if source_id is not None:
+        params.append(source_id)
+    params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
+    params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
+    if run_id is not None:
+        params.append(run_id)
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       source_id, source_row_key, extra "
+            f"       source_id, source_row_key, extra, "
+            f"       NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
+            f"       ''::text AS generated_reason "
             f"FROM ("
             f"  SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"         source_id, source_row_key, extra "
+            f"         source_id, source_row_key, extra, "
+            f"         NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
+            f"         ''::text AS generated_reason "
             f"  FROM {table} "
-            f"  WHERE is_active IS NOT FALSE "
+            f"  WHERE is_active IS NOT FALSE{raw_source_clause} "
             f"    AND geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326) "
             f"  UNION ALL "
             f"  SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
             f"         from_source_id AS source_id, "
             f"         from_source_row_key AS source_row_key, "
-            f"         '{{}}'::jsonb AS extra "
+            f"         '{{}}'::jsonb AS extra, "
+            f"         from_source_row_key, to_source_row_key, generated_reason "
             f"  FROM injected_points "
-            f"  WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326) "
+            f"  WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326){injected_run_clause} "
             f") AS combined "
             f"ORDER BY vehicle_id, timestamp",
-            (
-                window.x_min, window.y_min, window.x_max, window.y_max,
-                window.x_min, window.y_min, window.x_max, window.y_max,
-            ),
+            params,
         )
         for row in cur:
             rows.append({
@@ -672,6 +700,9 @@ def _query_active_points_in_window(
                 "source_id": row[6],
                 "source_row_key": row[7],
                 "extra": row[8] if isinstance(row[8], dict) else {},
+                "from_source_row_key": row[9],
+                "to_source_row_key": row[10],
+                "generated_reason": row[11],
             })
 
     # DB ORDER BY 已保证 (vehicle_id, timestamp) 有序，无需 Python 侧再排
@@ -682,6 +713,8 @@ def _stream_vehicle_tracks_from_db(
     conn: Any,
     *,
     table: str = "trajectory_points",
+    source_id: str | None = None,
+    run_id: str | None = None,
 ) -> Iterator[list[TrajectoryPoint]]:
     """Stream tracks one vehicle at a time from DB (global, no spatial filter).
 
@@ -689,17 +722,28 @@ def _stream_vehicle_tracks_from_db(
         injected_points，按 (vehicle_id, timestamp) 排序后检测 vehicle_id
         变化来分组。内存占用 = 单车辆最大点数。
     """
+    raw_source_clause = " AND source_id = %s" if source_id is not None else ""
+    injected_run_clause = " WHERE run_id = %s" if run_id is not None else ""
+    params: list[Any] = []
+    if source_id is not None:
+        params.append(source_id)
+    if run_id is not None:
+        params.append(run_id)
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       source_id, source_row_key, extra "
+            f"       source_id, source_row_key, extra, "
+            f"       NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
+            f"       ''::text AS generated_reason "
             f"FROM {table} "
-            f"WHERE is_active IS NOT FALSE "
+            f"WHERE is_active IS NOT FALSE{raw_source_clause} "
             f"UNION ALL "
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       from_source_id, from_source_row_key, '{{}}'::jsonb "
-            f"FROM injected_points "
-            f"ORDER BY vehicle_id, timestamp"
+            f"       from_source_id, from_source_row_key, '{{}}'::jsonb, "
+            f"       from_source_row_key, to_source_row_key, generated_reason "
+            f"FROM injected_points{injected_run_clause} "
+            f"ORDER BY vehicle_id, timestamp",
+            params,
         )
         current_vid: str | None = None
         current_track: list[TrajectoryPoint] = []
@@ -713,7 +757,10 @@ def _stream_vehicle_tracks_from_db(
                 point_ref=PointRef(
                     source_id=str(row[6] or ""),
                     source_row_key=str(row[7] or ""),
-                    stable=True,
+                    stable=not bool(row[11]),
+                    from_ref=str(row[9]) if row[9] is not None else None,
+                    to_ref=str(row[10]) if row[10] is not None else None,
+                    generated_reason=str(row[11] or ""),
                 ),
                 vehicle_id=vid,
                 timestamp=float(row[1]),
@@ -733,26 +780,35 @@ def _query_active_points_near_cluster(
     radius_m: float,
     *,
     table: str = "trajectory_points",
+    source_id: str | None = None,
+    run_id: str | None = None,
 ) -> list[TrajectoryPoint]:
     """Query active points within *radius_m* of a cluster centroid."""
     # Convert radius_m to approximate degrees
     radius_deg = radius_m / 111320.0
     rows: list[dict[str, Any]] = []
+    raw_source_clause = " AND source_id = %s" if source_id is not None else ""
+    raw_params: list[Any] = []
+    if source_id is not None:
+        raw_params.append(source_id)
+    raw_params.extend((
+        cluster.centroid_lon - radius_deg,
+        cluster.centroid_lon + radius_deg,
+        cluster.centroid_lat - radius_deg,
+        cluster.centroid_lat + radius_deg,
+    ))
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       source_id, source_row_key, extra "
+            f"       source_id, source_row_key, extra, "
+            f"       NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
+            f"       ''::text AS generated_reason "
             f"FROM {table} "
-            f"WHERE is_active IS NOT FALSE "
+            f"WHERE is_active IS NOT FALSE{raw_source_clause} "
             f"  AND lon BETWEEN %s AND %s "
             f"  AND lat BETWEEN %s AND %s "
             f"ORDER BY vehicle_id, timestamp",
-            (
-                cluster.centroid_lon - radius_deg,
-                cluster.centroid_lon + radius_deg,
-                cluster.centroid_lat - radius_deg,
-                cluster.centroid_lat + radius_deg,
-            ),
+            raw_params,
         )
         for row in cur:
             rows.append({
@@ -765,25 +821,34 @@ def _query_active_points_near_cluster(
                 "source_id": row[6],
                 "source_row_key": row[7],
                 "extra": row[8] if isinstance(row[8], dict) else {},
+                "from_source_row_key": row[9],
+                "to_source_row_key": row[10],
+                "generated_reason": row[11],
             })
 
     # Also query injected_points near cluster
     # ZH: injected_points 没有 source_id 列，用 from_source_id/from_source_row_key 别名
+    injected_run_clause = " AND run_id = %s" if run_id is not None else ""
+    injected_params: list[Any] = [
+        cluster.centroid_lon - radius_deg,
+        cluster.centroid_lon + radius_deg,
+        cluster.centroid_lat - radius_deg,
+        cluster.centroid_lat + radius_deg,
+    ]
+    if run_id is not None:
+        injected_params.append(run_id)
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
             f"       from_source_id AS source_id, "
-            f"       from_source_row_key AS source_row_key "
+            f"       from_source_row_key AS source_row_key, "
+            f"       '{{}}'::jsonb AS extra, "
+            f"       from_source_row_key, to_source_row_key, generated_reason "
             f"FROM injected_points "
             f"WHERE lon BETWEEN %s AND %s "
-            f"  AND lat BETWEEN %s AND %s "
+            f"  AND lat BETWEEN %s AND %s{injected_run_clause} "
             f"ORDER BY vehicle_id, timestamp",
-            (
-                cluster.centroid_lon - radius_deg,
-                cluster.centroid_lon + radius_deg,
-                cluster.centroid_lat - radius_deg,
-                cluster.centroid_lat + radius_deg,
-            ),
+            injected_params,
         )
         for row in cur:
             rows.append({
@@ -795,7 +860,10 @@ def _query_active_points_near_cluster(
                 "speed": float(row[5]),
                 "source_id": row[6],
                 "source_row_key": row[7],
-                "extra": {},
+                "extra": row[8] if isinstance(row[8], dict) else {},
+                "from_source_row_key": row[9],
+                "to_source_row_key": row[10],
+                "generated_reason": row[11],
             })
 
     rows.sort(key=lambda r: (r["vehicle_id"], r["timestamp"]))
@@ -810,7 +878,16 @@ def _build_points_from_rows(rows: list[dict[str, Any]]) -> list[TrajectoryPoint]
             point_ref=PointRef(
                 source_id=r["source_id"],
                 source_row_key=r["source_row_key"],
-                stable=True,
+                stable=not bool(r.get("generated_reason")),
+                from_ref=(
+                    str(r["from_source_row_key"])
+                    if r.get("from_source_row_key") is not None else None
+                ),
+                to_ref=(
+                    str(r["to_source_row_key"])
+                    if r.get("to_source_row_key") is not None else None
+                ),
+                generated_reason=str(r.get("generated_reason") or ""),
             ),
             vehicle_id=r["vehicle_id"],
             timestamp=r["timestamp"],
@@ -850,7 +927,12 @@ def _stream_extract_methods_1_2(
     batch: dict[str, list[TrajectoryPoint]] = {}
     BATCH_SIZE = 100
 
-    for track in _stream_vehicle_tracks_from_db(conn, table=cfg.db_table):
+    for track in _stream_vehicle_tracks_from_db(
+        conn,
+        table=cfg.db_table,
+        source_id=cfg.source_id,
+        run_id=cfg.run_id,
+    ):
         vid = track[0].vehicle_id
         batch[vid] = track
         track_count += 1
@@ -921,7 +1003,13 @@ def _extract_cross_track_windows(
                 f"({now - t0:.1f}s)"
             )
             last_progress_t = now
-        points = _query_active_points_in_window(conn, window, table=cfg.db_table)
+        points = _query_active_points_in_window(
+            conn,
+            window,
+            table=cfg.db_table,
+            source_id=cfg.source_id,
+            run_id=cfg.run_id,
+        )
         if not points:
             continue
         total_points += len(points)
@@ -970,7 +1058,12 @@ def _build_topologies_from_db(
         radius = max(cfg.min_intersection_radius_m,
                      cluster.radius_m + cfg.topology_radius_padding_m)
         nearby_points = _query_active_points_near_cluster(
-            conn, cluster, radius * 2.0, table=cfg.db_table,
+            conn,
+            cluster,
+            radius * 2.0,
+            table=cfg.db_table,
+            source_id=cfg.source_id,
+            run_id=cfg.run_id,
         )
         nearby_tracks = _tracks_from_points(nearby_points)
         observations, crossing_points = _extract_entry_exit_observations_batch(
@@ -1000,7 +1093,11 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
         - 共享 _cluster_pipeline + _build_intersect_report
     """
     # ── Spatial extent ──────────────────────────────────────────────
-    extent = _query_spatial_extent(conn, table=cfg.db_table)
+    extent = _query_spatial_extent(
+        conn,
+        table=cfg.db_table,
+        source_id=cfg.source_id,
+    )
     if extent is None:
         return _empty_intersect_result()
 
@@ -1147,6 +1244,9 @@ def _detect_turn_events(
                         score=abs_turn,
                         source="turn",
                         point_ref=p.point_ref,
+                        source_ids=(p.point_ref.source_id,),
+                        from_source_id=p.point_ref.source_id,
+                        from_source_row_key=p.point_ref.source_row_key,
                     )
                 )
 
@@ -1561,6 +1661,11 @@ def _cluster_orthogonal_candidates(
                 score=0.0,
                 source="orthogonal",
                 point_ref=c.point_ref,
+                source_ids=(c.point_ref.source_id,),
+                from_source_id=c.point_ref.source_id,
+                from_source_row_key=c.point_ref.from_ref,
+                to_source_id=c.point_ref.source_id,
+                to_source_row_key=c.point_ref.to_ref,
             )
             for i, c in enumerate(cluster_items)
         )
@@ -1630,6 +1735,11 @@ def _cluster_orthogonal_cross_track_candidates(
                 score=0.0,
                 source="orthogonal_cross_track",
                 point_ref=c.point_ref,
+                source_ids=tuple(sorted({c.from_source_id, c.to_source_id})),
+                from_source_id=c.from_source_id,
+                from_source_row_key=c.from_source_row_key,
+                to_source_id=c.to_source_id,
+                to_source_row_key=c.to_source_row_key,
             )
             for i, c in enumerate(cluster_items)
         )
@@ -1814,6 +1924,8 @@ def _make_observation(
     exit_seg: int,
     exit_xy: tuple[float, float],
     bearing_window: int,
+    entry_crossing_id: int | None = None,
+    exit_crossing_id: int | None = None,
 ) -> EntryExitObservation | None:
     """Build a single EntryExitObservation from matched entry/exit segments."""
     inbound_angles = _segment_bearings(xy, entry_seg - bearing_window, entry_seg + 1)
@@ -1831,6 +1943,8 @@ def _make_observation(
         inbound_bearing=inbound_bearing,
         outbound_bearing=outbound_bearing,
         turn_deg=_angle_delta_deg(inbound_bearing, outbound_bearing),
+        entry_crossing_id=entry_crossing_id,
+        exit_crossing_id=exit_crossing_id,
     )
 
 
@@ -2025,6 +2139,7 @@ def _extract_entry_exit_observations_batch(
     # ── Collect all crossing points (for replay provenance) ─────
     crossing_counter = 0
     crossing_points: list[CrossingPoint] = []
+    crossing_id_by_segment: dict[tuple[str, int, bool], int] = {}
     for flat_idx, (vehicle_id, seg_idx) in enumerate(segment_meta):
         if not hit_mask[flat_idx]:
             continue
@@ -2043,8 +2158,10 @@ def _extract_entry_exit_observations_batch(
                 crossing_lon=clon,
                 crossing_lat=clat,
                 is_entry=is_entry,
+                end_point_ref=track_lookup[vehicle_id][seg_idx + 1].point_ref,
             )
         )
+        crossing_id_by_segment[(vehicle_id, seg_idx, is_entry)] = crossing_counter
         crossing_counter += 1
 
     observations: list[EntryExitObservation] = []
@@ -2063,6 +2180,8 @@ def _extract_entry_exit_observations_batch(
             exit_seg=exit_seg,
             exit_xy=exit_xy,
             bearing_window=bearing_window,
+            entry_crossing_id=crossing_id_by_segment.get((vehicle_id, entry_seg, True)),
+            exit_crossing_id=crossing_id_by_segment.get((vehicle_id, exit_seg, False)),
         )
         if obs is not None:
             observations.append(obs)

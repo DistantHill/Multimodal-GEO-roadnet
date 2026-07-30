@@ -123,6 +123,7 @@ class PointRef(TrackModel):
     from_ref: str | None = None
     to_ref: str | None = None
     generated_reason: str = ""
+    source_row_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -368,6 +369,11 @@ class TurnEvent(TrackModel):
     score: float  # = abs(turn_deg) for ranking
     source: str = "turn"
     point_ref: PointRef | None = None
+    source_ids: tuple[str, ...] = ()
+    from_source_id: str | None = None
+    from_source_row_key: str | None = None
+    to_source_id: str | None = None
+    to_source_row_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -429,7 +435,8 @@ class HotspotCluster(TrackModel):
     cluster_ref: str = ""        # stable ref → "cluster_{source}_{id}"
     events: tuple[TurnEvent, ...] = ()
     source: str = "turn"
-    sources: tuple[str, ...] = ()
+    algorithm_sources: tuple[str, ...] = ()
+    source_ids: tuple[str, ...] = ()
     source_counts: dict[str, int] = field(default_factory=dict)
     source_ratios: dict[str, float] = field(default_factory=dict)
     source_point_refs: dict[str, tuple[PointRef, ...]] = field(default_factory=dict)
@@ -437,6 +444,17 @@ class HotspotCluster(TrackModel):
     # ── topology intermediate products ──
     crossing_points: tuple[()] = ()   # tuple[CrossingPoint, ...]; forward-ref via ()
     inout_points: tuple[()] = ()      # tuple[InOutIntersectionPoint, ...]
+
+    @property
+    def sources(self) -> tuple[str, ...]:
+        """Backward-compatible alias for algorithm source labels.
+
+        ``candidate_intersections.sources`` is now reserved for physical
+        ``source_id`` values.  Algorithm provenance remains available through
+        this compatibility property plus ``source_counts`` and
+        ``critical_sources``.
+        """
+        return self.algorithm_sources
 
 
 @dataclass(frozen=True)
@@ -450,6 +468,8 @@ class EntryExitObservation(TrackModel):
     inbound_bearing: float
     outbound_bearing: float
     turn_deg: float
+    entry_crossing_id: int | None = None
+    exit_crossing_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -468,6 +488,7 @@ class CrossingPoint(TrackModel):
     crossing_lon: float
     crossing_lat: float
     is_entry: bool                  # True=entering circle, False=leaving
+    end_point_ref: PointRef | None = None
     produced_by: str = "segment_circle_crossings_batch"
 
 

@@ -28,12 +28,24 @@ from ..config import PostgresConfig, connect as pg_connect, default_postgres_con
 # EN: Ordered by pipeline stage and FK dependency — referenced tables first.
 
 DDL_STATEMENTS: list[tuple[str, str]] = [
+    ("pipeline_runs", """
+        CREATE TABLE IF NOT EXISTS pipeline_runs (
+            id              UUID PRIMARY KEY,
+            source_id       TEXT NOT NULL,
+            source_kind     TEXT NOT NULL,
+            parameters      JSONB NOT NULL DEFAULT '{}',
+            status          TEXT NOT NULL,
+            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at     TIMESTAMPTZ
+        )
+    """),
     # ── Parser 0 ──
     ("trajectory_points", """
         CREATE TABLE IF NOT EXISTS trajectory_points (
             id              BIGSERIAL PRIMARY KEY,
             source_id       TEXT NOT NULL,
             source_row_key  TEXT NOT NULL,
+            source_row_hash TEXT NOT NULL DEFAULT '',
             stable          BOOLEAN NOT NULL DEFAULT TRUE,
             is_active       BOOLEAN NOT NULL DEFAULT TRUE,
             vehicle_id      TEXT NOT NULL,
@@ -54,6 +66,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("excluded_points", """
         CREATE TABLE IF NOT EXISTS excluded_points (
             id              BIGSERIAL PRIMARY KEY,
+            run_id          UUID NOT NULL REFERENCES pipeline_runs(id),
             source_id       TEXT NOT NULL,
             source_row_key  TEXT NOT NULL,
             reason          TEXT NOT NULL,
@@ -68,6 +81,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("kept_trajectory_points", """
         CREATE TABLE IF NOT EXISTS kept_trajectory_points (
             id                      BIGSERIAL PRIMARY KEY,
+            run_id                  UUID NOT NULL REFERENCES pipeline_runs(id),
             trajectory_point_id     BIGINT NOT NULL REFERENCES trajectory_points(id),
             vehicle_id              TEXT NOT NULL,
             subtrack_index          INTEGER NOT NULL DEFAULT 1,
@@ -78,6 +92,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("injected_points", """
         CREATE TABLE IF NOT EXISTS injected_points (
             id                  BIGSERIAL PRIMARY KEY,
+            run_id              UUID NOT NULL REFERENCES pipeline_runs(id),
             vehicle_id          TEXT NOT NULL,
             timestamp           DOUBLE PRECISION NOT NULL,
             lon                 DOUBLE PRECISION NOT NULL,
@@ -102,6 +117,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("tracks_cross", """
         CREATE TABLE IF NOT EXISTS tracks_cross (
             id                  BIGSERIAL PRIMARY KEY,
+            run_id              UUID NOT NULL REFERENCES pipeline_runs(id),
             vehicle_id          TEXT NOT NULL,
             timestamp           DOUBLE PRECISION NOT NULL,
             lon                 DOUBLE PRECISION NOT NULL,
@@ -127,6 +143,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("turn_events", """
         CREATE TABLE IF NOT EXISTS turn_events (
             id                  BIGSERIAL PRIMARY KEY,
+            run_id              UUID NOT NULL REFERENCES pipeline_runs(id),
             event_id            INTEGER NOT NULL,
             vehicle_id          TEXT NOT NULL,
             timestamp           DOUBLE PRECISION NOT NULL,
@@ -144,6 +161,10 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
                                 ) STORED,
             tp_source_id        TEXT,
             tp_source_row_key   TEXT,
+            from_source_id      TEXT,
+            from_source_row_key TEXT,
+            to_source_id        TEXT,
+            to_source_row_key   TEXT,
             origin_lon          DOUBLE PRECISION NOT NULL,
             origin_lat          DOUBLE PRECISION NOT NULL,
             g_star_z            DOUBLE PRECISION,
@@ -153,6 +174,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("candidate_intersections", """
         CREATE TABLE IF NOT EXISTS candidate_intersections (
             id                  BIGSERIAL PRIMARY KEY,
+            run_id              UUID NOT NULL REFERENCES pipeline_runs(id),
             cluster_id          INTEGER NOT NULL,
             centroid_x          DOUBLE PRECISION NOT NULL,
             centroid_y          DOUBLE PRECISION NOT NULL,
@@ -177,14 +199,20 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("candidate_intersection_events", """
         CREATE TABLE IF NOT EXISTS candidate_intersection_events (
             id                          BIGSERIAL PRIMARY KEY,
+            run_id                      UUID NOT NULL REFERENCES pipeline_runs(id),
             candidate_intersection_id   BIGINT NOT NULL REFERENCES candidate_intersections(id),
-            turn_event_id               BIGINT NOT NULL REFERENCES turn_events(id),
-            UNIQUE(candidate_intersection_id, turn_event_id)
+            event_kind                  TEXT NOT NULL,
+            turn_event_id               BIGINT REFERENCES turn_events(id),
+            from_source_id              TEXT,
+            from_source_row_key         TEXT,
+            to_source_id                TEXT,
+            to_source_row_key           TEXT
         )
     """),
     ("candidate_entry_exit_points", """
         CREATE TABLE IF NOT EXISTS candidate_entry_exit_points (
             id                          BIGSERIAL PRIMARY KEY,
+            run_id                      UUID NOT NULL REFERENCES pipeline_runs(id),
             candidate_intersection_id   BIGINT NOT NULL REFERENCES candidate_intersections(id),
             cluster_id                  INTEGER NOT NULL,
             vehicle_id                  TEXT NOT NULL,
@@ -200,12 +228,17 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             branch_angle_deg            DOUBLE PRECISION,
             origin_lon                  DOUBLE PRECISION NOT NULL,
             origin_lat                  DOUBLE PRECISION NOT NULL,
+            from_source_id              TEXT,
+            from_source_row_key         TEXT,
+            to_source_id                TEXT,
+            to_source_row_key           TEXT,
             created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """),
     ("intersections", """
         CREATE TABLE IF NOT EXISTS intersections (
             id                          BIGSERIAL PRIMARY KEY,
+            run_id                      UUID NOT NULL REFERENCES pipeline_runs(id),
             candidate_intersection_id   BIGINT NOT NULL REFERENCES candidate_intersections(id),
             cluster_id                  INTEGER NOT NULL,
             branch_centers_deg          JSONB NOT NULL DEFAULT '[]',
@@ -220,6 +253,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("entry_exit_points", """
         CREATE TABLE IF NOT EXISTS entry_exit_points (
             id                  BIGSERIAL PRIMARY KEY,
+            run_id              UUID NOT NULL REFERENCES pipeline_runs(id),
             intersection_id     BIGINT NOT NULL REFERENCES intersections(id),
             cluster_id          INTEGER NOT NULL,
             vehicle_id          TEXT NOT NULL,
@@ -255,10 +289,10 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     # ── tracks_cross ──
     ("idx_tc_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_tc_vehicle_ts ON tracks_cross(vehicle_id, timestamp)"),
     ("idx_tc_geom",            "CREATE INDEX IF NOT EXISTS idx_tc_geom ON tracks_cross USING GIST (geom)"),
-    ("idx_tc_segment_pair",    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tc_segment_pair ON tracks_cross (vehicle_id, from_source_id, from_source_row_key, to_source_id, to_source_row_key)"),
+    ("idx_tc_segment_pair",    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tc_segment_pair ON tracks_cross (run_id, vehicle_id, from_source_id, from_source_row_key, to_source_id, to_source_row_key)"),
     # ── turn_events ──
     ("idx_te_event_id",        "CREATE INDEX IF NOT EXISTS idx_te_event_id ON turn_events(event_id)"),
-    ("idx_te_vehicle_ts",      "CREATE UNIQUE INDEX IF NOT EXISTS idx_te_vehicle_ts ON turn_events(vehicle_id, timestamp)"),
+    ("idx_te_vehicle_ts",      "CREATE UNIQUE INDEX IF NOT EXISTS idx_te_vehicle_ts ON turn_events(run_id, vehicle_id, timestamp)"),
     ("idx_te_source",          "CREATE INDEX IF NOT EXISTS idx_te_source ON turn_events(source)"),
     ("idx_te_xy",              "CREATE INDEX IF NOT EXISTS idx_te_xy ON turn_events(x, y)"),
     ("idx_te_geom",            "CREATE INDEX IF NOT EXISTS idx_te_geom ON turn_events USING GIST (geom)"),
@@ -281,6 +315,7 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     # ── entry_exit_points ──
     ("idx_eep_cluster_vehicle","CREATE INDEX IF NOT EXISTS idx_eep_cluster_vehicle ON entry_exit_points(cluster_id, vehicle_id)"),
     ("idx_eep_intersection",   "CREATE INDEX IF NOT EXISTS idx_eep_intersection ON entry_exit_points(intersection_id)"),
+    ("idx_pr_source",          "CREATE INDEX IF NOT EXISTS idx_pr_source ON pipeline_runs(source_id, started_at DESC)"),
 ]
 
 
@@ -336,6 +371,97 @@ def _run_migrations(cur: Any) -> None:
             "ALTER TABLE candidate_intersections ADD COLUMN IF NOT EXISTS "
             "cross_track_count INTEGER NOT NULL DEFAULT 0",
         ),
+        (
+            "tp_source_row_hash",
+            "ALTER TABLE trajectory_points ADD COLUMN IF NOT EXISTS "
+            "source_row_hash TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "excluded_run_id",
+            "ALTER TABLE excluded_points ADD COLUMN IF NOT EXISTS "
+            "run_id UUID REFERENCES pipeline_runs(id)",
+        ),
+        (
+            "kept_run_id",
+            "ALTER TABLE kept_trajectory_points ADD COLUMN IF NOT EXISTS "
+            "run_id UUID REFERENCES pipeline_runs(id)",
+        ),
+        (
+            "injected_run_id",
+            "ALTER TABLE injected_points ADD COLUMN IF NOT EXISTS "
+            "run_id UUID REFERENCES pipeline_runs(id)",
+        ),
+        (
+            "cross_run_id",
+            "ALTER TABLE tracks_cross ADD COLUMN IF NOT EXISTS "
+            "run_id UUID REFERENCES pipeline_runs(id)",
+        ),
+        (
+            "turn_run_id",
+            "ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS "
+            "run_id UUID REFERENCES pipeline_runs(id)",
+        ),
+        (
+            "turn_source_pairs",
+            "ALTER TABLE turn_events "
+            "ADD COLUMN IF NOT EXISTS from_source_id TEXT, "
+            "ADD COLUMN IF NOT EXISTS from_source_row_key TEXT, "
+            "ADD COLUMN IF NOT EXISTS to_source_id TEXT, "
+            "ADD COLUMN IF NOT EXISTS to_source_row_key TEXT",
+        ),
+        (
+            "candidate_run_id",
+            "ALTER TABLE candidate_intersections ADD COLUMN IF NOT EXISTS "
+            "run_id UUID REFERENCES pipeline_runs(id)",
+        ),
+        (
+            "candidate_event_run_id",
+            "ALTER TABLE candidate_intersection_events ADD COLUMN IF NOT EXISTS "
+            "run_id UUID REFERENCES pipeline_runs(id)",
+        ),
+        (
+            "candidate_event_kind",
+            "ALTER TABLE candidate_intersection_events ADD COLUMN IF NOT EXISTS "
+            "event_kind TEXT NOT NULL DEFAULT 'turn'",
+        ),
+        (
+            "candidate_event_source_pairs",
+            "ALTER TABLE candidate_intersection_events "
+            "ADD COLUMN IF NOT EXISTS from_source_id TEXT, "
+            "ADD COLUMN IF NOT EXISTS from_source_row_key TEXT, "
+            "ADD COLUMN IF NOT EXISTS to_source_id TEXT, "
+            "ADD COLUMN IF NOT EXISTS to_source_row_key TEXT",
+        ),
+        (
+            "candidate_event_turn_nullable",
+            "ALTER TABLE candidate_intersection_events "
+            "ALTER COLUMN turn_event_id DROP NOT NULL",
+        ),
+        (
+            "crossing_run_id",
+            "ALTER TABLE candidate_entry_exit_points ADD COLUMN IF NOT EXISTS "
+            "run_id UUID REFERENCES pipeline_runs(id)",
+        ),
+        (
+            "crossing_segment_refs",
+            "ALTER TABLE candidate_entry_exit_points "
+            "ADD COLUMN IF NOT EXISTS from_source_id TEXT, "
+            "ADD COLUMN IF NOT EXISTS from_source_row_key TEXT, "
+            "ADD COLUMN IF NOT EXISTS to_source_id TEXT, "
+            "ADD COLUMN IF NOT EXISTS to_source_row_key TEXT",
+        ),
+        (
+            "intersection_run_id",
+            "ALTER TABLE intersections ADD COLUMN IF NOT EXISTS "
+            "run_id UUID REFERENCES pipeline_runs(id)",
+        ),
+        (
+            "entry_exit_run_id",
+            "ALTER TABLE entry_exit_points ADD COLUMN IF NOT EXISTS "
+            "run_id UUID REFERENCES pipeline_runs(id)",
+        ),
+        ("replace_cross_unique_index", "DROP INDEX IF EXISTS idx_tc_segment_pair"),
+        ("replace_turn_unique_index", "DROP INDEX IF EXISTS idx_te_vehicle_ts"),
     ]
     for label, sql in migrations:
         try:

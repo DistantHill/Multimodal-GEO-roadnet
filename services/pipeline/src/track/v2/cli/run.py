@@ -21,10 +21,13 @@ from __future__ import annotations
 import argparse
 import getpass
 import time
+from pathlib import Path
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
 from ..db_writer import (
+    create_pipeline_run,
     fetch_trajectory_point_ids,
+    finish_pipeline_run,
     insert_candidate_entry_exit_points,
     insert_candidate_intersection_events,
     insert_candidate_intersections,
@@ -34,6 +37,7 @@ from ..db_writer import (
     insert_tracks_cross,
     insert_intersections,
     insert_kept_trajectory_points,
+    reset_active_points,
     insert_trajectory_points,
     insert_turn_events,
 )
@@ -52,7 +56,7 @@ def run_pipeline(
     csv_path: str | None = None,
     pg_source_table: str | None = None,
     table: str = "trajectory_points",
-) -> dict[str, int]:
+) -> dict[str, int | str]:
     """Run the full pipeline and write all outputs to PostgreSQL.
 
     ZH: 运行完整流水线并将所有阶段产物写入数据库。返回各表写入行数统计。
@@ -70,13 +74,15 @@ def run_pipeline(
     if csv_path is None and pg_source_table is None:
         raise ValueError("必须指定 --csv 或 --pg-table / either csv_path or pg_source_table must be provided")
 
-    stats: dict[str, int] = {}
+    stats: dict[str, int | str] = {}
     t_start = time.perf_counter()
     is_pg_source = pg_source_table is not None
 
     if csv_path is not None:
         source = CsvSource(path=csv_path)
         source_label = csv_path
+        source_id = str(Path(csv_path).resolve())
+        source_kind = "csv"
     else:
         source = PostgresSource(
             config=db_config,
@@ -85,8 +91,21 @@ def run_pipeline(
             primary_key_field="id",
         )
         source_label = f"postgresql://{db_config.database}/{pg_source_table}"
+        source_id = str(pg_source_table)
+        source_kind = "postgres_table"
 
     with pg_connect(db_config) as conn:
+        run_id = create_pipeline_run(
+            conn,
+            source_id=source_id,
+            source_kind=source_kind,
+            parameters={"target_table": table},
+        )
+        stats["run_id"] = run_id
+        # Keep the run record even if a later pipeline statement rolls back.
+        # A non-completed row is an explicit interrupted/failed-run record.
+        conn.commit()
+        reset_active_points(conn, source_id, table=table)
         # ── Stage 1+2: Streamed read → insert → clean (per vehicle) ──
         print("── Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean ──")
         print(f"  数据源 / Source: {source_label}")
@@ -106,8 +125,10 @@ def run_pipeline(
             total_raw += len(vehicle_points)
             vehicle_count += 1
 
-            if not is_pg_source:
-                # CSV: insert raw points to DB
+            if not is_pg_source or pg_source_table != table:
+                # Persist both CSV rows and project-table rows as replayable
+                # raw points.  Reading the target table itself is the sole
+                # case where the rows already live in that table.
                 batch_map = insert_trajectory_points(conn, vehicle_points, table=table)
                 tp_id_map.update(batch_map)
 
@@ -144,25 +165,30 @@ def run_pipeline(
             print(f"  ID 映射 / ID map: {len(tp_id_map):,} entries ({time.perf_counter() - t0:.1f}s)")
 
         # ── Batch-write cleaner outputs ──────────────────────────────
+        if not is_pg_source or pg_source_table != table:
+            # Imports have just been inserted; read the complete map so repeat
+            # runs keep their raw-point references stable.
+            tp_id_map = fetch_trajectory_point_ids(conn, source_id, table=table)
+
         excluded_index = ExcludedIndex(all_excluded)
         print(f"  排除 / Excluded: {len(all_excluded):,}")
         print(f"  注入 / Injected: {total_injected:,}")
 
         t0 = time.perf_counter()
-        insert_excluded_points(conn, excluded_index, tp_id_map)
+        insert_excluded_points(conn, excluded_index, tp_id_map, run_id=run_id)
         stats["excluded_points"] = len(all_excluded)
         print(f"  excluded_points: {len(all_excluded):,} rows ({time.perf_counter() - t0:.1f}s)")
 
         if all_kept_subtracks:
             t0 = time.perf_counter()
-            insert_kept_trajectory_points(conn, all_kept_subtracks, tp_id_map)
+            insert_kept_trajectory_points(conn, all_kept_subtracks, tp_id_map, run_id=run_id)
             kept_count = sum(len(st) for st in all_kept_subtracks)
             stats["kept_trajectory_points"] = kept_count
             print(f"  kept_trajectory_points: {kept_count:,} rows ({time.perf_counter() - t0:.1f}s)")
 
         if all_injected_points:
             t0 = time.perf_counter()
-            insert_injected_points(conn, all_injected_points)
+            insert_injected_points(conn, all_injected_points, run_id=run_id)
             stats["injected_points"] = total_injected
             print(f"  injected_points: {total_injected:,} rows ({time.perf_counter() - t0:.1f}s)")
 
@@ -171,6 +197,8 @@ def run_pipeline(
         icfg = IntersectConfig(
             query_active_from_db=True,
             db_table=table,
+            source_id=source_id,
+            run_id=run_id,
         )
         iresult = detect_intersections(conn=conn, config=icfg)
 
@@ -180,39 +208,47 @@ def run_pipeline(
         print(f"  完整交叉口 / Complete intersections: {iresult.report.complete_intersection_count:,}")
 
         t0 = time.perf_counter()
-        tracks_cross_count = insert_tracks_cross(conn, iresult.cross_track_candidates)
+        tracks_cross_count = insert_tracks_cross(conn, iresult.cross_track_candidates, run_id=run_id)
         stats["tracks_cross"] = tracks_cross_count
         print(f"  tracks_cross: {tracks_cross_count:,} rows ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
-        te_id_map = insert_turn_events(conn, iresult.turn_events)
+        te_id_map = insert_turn_events(conn, iresult.turn_events, run_id=run_id)
         stats["turn_events"] = len(iresult.turn_events)
         print(f"  turn_events: {len(iresult.turn_events):,} rows ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
-        ci_id_map = insert_candidate_intersections(conn, iresult.clusters)
+        ci_id_map = insert_candidate_intersections(conn, iresult.clusters, run_id=run_id)
         stats["candidate_intersections"] = len(iresult.clusters)
         print(f"  candidate_intersections: {len(iresult.clusters):,} rows ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
-        insert_candidate_intersection_events(conn, iresult.clusters, ci_id_map, te_id_map)
+        insert_candidate_intersection_events(
+            conn, iresult.clusters, ci_id_map, te_id_map, run_id=run_id,
+        )
         stats["candidate_intersection_events"] = sum(len(c.events) for c in iresult.clusters)
         print(f"  candidate_intersection_events: {stats['candidate_intersection_events']:,} rows ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
-        ceep_id_map = insert_candidate_entry_exit_points(conn, iresult.clusters, ci_id_map)
+        ceep_id_map = insert_candidate_entry_exit_points(
+            conn, iresult.clusters, ci_id_map, run_id=run_id,
+        )
         ceep_count = sum(len(c.crossing_points) for c in iresult.clusters)
         stats["candidate_entry_exit_points"] = ceep_count
         print(f"  candidate_entry_exit_points: {ceep_count:,} rows ({time.perf_counter() - t0:.1f}s)")
 
         clusters_by_id = {c.cluster_id: c for c in iresult.clusters}
         t0 = time.perf_counter()
-        int_id_map = insert_intersections(conn, iresult.topologies, ci_id_map, clusters_by_id)
+        int_id_map = insert_intersections(
+            conn, iresult.topologies, ci_id_map, clusters_by_id, run_id=run_id,
+        )
         stats["intersections"] = len(int_id_map)
         print(f"  intersections: {len(int_id_map):,} rows ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
-        insert_entry_exit_points(conn, iresult.observations, int_id_map)
+        insert_entry_exit_points(
+            conn, iresult.observations, int_id_map, ceep_id_map, run_id=run_id,
+        )
         entry_exit_count = sum(
             1 for observation in iresult.observations
             if observation.cluster_id in int_id_map
@@ -220,6 +256,7 @@ def run_pipeline(
         stats["entry_exit_points"] = entry_exit_count
         print(f"  entry_exit_points: {entry_exit_count:,} rows ({time.perf_counter() - t0:.1f}s)")
 
+        finish_pipeline_run(conn, run_id, status="completed")
         conn.commit()
         print(f"\n  提交 / Committed.")
 
