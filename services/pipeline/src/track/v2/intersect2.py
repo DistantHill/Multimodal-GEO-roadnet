@@ -633,12 +633,8 @@ def _query_spatial_extent(
     ``SpatialWindowIterator``.
     """
     sql = f"SELECT MIN(lon), MAX(lon), MIN(lat), MAX(lat) FROM {table} WHERE is_active IS NOT FALSE"
-    params: tuple[Any, ...] = ()
-    if source_id is not None:
-        sql += " AND source_id = %s"
-        params = (source_id,)
     with conn.cursor() as cur:
-        cur.execute(sql, params)
+        cur.execute(sql)
         row = cur.fetchone()
     if row is None or row[0] is None:
         return None
@@ -661,11 +657,8 @@ def _query_active_points_in_window(
         lon/lat BETWEEN，走 R-tree 2D 索引扫描。UNION ALL 合并两表一次往返。
     """
     rows: list[dict[str, Any]] = []
-    raw_source_clause = " AND source_id = %s" if source_id is not None else ""
     injected_run_clause = " AND run_id = %s" if run_id is not None else ""
-    params: list[Any] = []
-    if source_id is not None:
-        params.append(source_id)
+    params: list[Any] = [source_id or ""]
     params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
     params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
     if run_id is not None:
@@ -678,11 +671,11 @@ def _query_active_points_in_window(
             f"       ''::text AS generated_reason "
             f"FROM ("
             f"  SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"         source_id, source_row_key, extra, "
+            f"         %s::text AS source_id, id::text AS source_row_key, extra, "
             f"         NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
             f"         ''::text AS generated_reason "
             f"  FROM {table} "
-            f"  WHERE is_active IS NOT FALSE{raw_source_clause} "
+            f"  WHERE is_active IS NOT FALSE "
             f"    AND geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326) "
             f"  UNION ALL "
             f"  SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
@@ -729,11 +722,8 @@ def _stream_vehicle_tracks_from_db(
         injected_points，按 (vehicle_id, timestamp) 排序后检测 vehicle_id
         变化来分组。内存占用 = 单车辆最大点数。
     """
-    raw_source_clause = " AND source_id = %s" if source_id is not None else ""
     injected_run_clause = " WHERE run_id = %s" if run_id is not None else ""
-    params: list[Any] = []
-    if source_id is not None:
-        params.append(source_id)
+    params: list[Any] = [source_id or ""]
     if run_id is not None:
         params.append(run_id)
     # ZH: 服务器端命名游标 — PG 按需 FETCH，避免全量物化到 portal。
@@ -743,11 +733,11 @@ def _stream_vehicle_tracks_from_db(
     ) as cur:
         cur.execute(
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       source_id, source_row_key, extra, "
+            f"       %s::text AS source_id, id::text AS source_row_key, extra, "
             f"       NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
             f"       ''::text AS generated_reason "
             f"FROM {table} "
-            f"WHERE is_active IS NOT FALSE{raw_source_clause} "
+            f"WHERE is_active IS NOT FALSE "
             f"UNION ALL "
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
             f"       from_source_id, from_source_row_key, '{{}}'::jsonb, "
@@ -798,24 +788,20 @@ def _query_active_points_near_cluster(
     # Convert radius_m to approximate degrees
     radius_deg = radius_m / 111320.0
     rows: list[dict[str, Any]] = []
-    raw_source_clause = " AND source_id = %s" if source_id is not None else ""
-    raw_params: list[Any] = []
-    if source_id is not None:
-        raw_params.append(source_id)
-    raw_params.extend((
+    raw_params: list[Any] = [source_id or "",
         cluster.centroid_lon - radius_deg,
         cluster.centroid_lon + radius_deg,
         cluster.centroid_lat - radius_deg,
         cluster.centroid_lat + radius_deg,
-    ))
+    ]
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       source_id, source_row_key, extra, "
+            f"       %s::text AS source_id, id::text AS source_row_key, extra, "
             f"       NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
             f"       ''::text AS generated_reason "
             f"FROM {table} "
-            f"WHERE is_active IS NOT FALSE{raw_source_clause} "
+            f"WHERE is_active IS NOT FALSE "
             f"  AND lon BETWEEN %s AND %s "
             f"  AND lat BETWEEN %s AND %s "
             f"ORDER BY vehicle_id, timestamp",

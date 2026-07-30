@@ -44,10 +44,6 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("trajectory_points", """
         CREATE TABLE IF NOT EXISTS trajectory_points (
             id              BIGSERIAL PRIMARY KEY,
-            source_id       TEXT NOT NULL,
-            source_row_key  TEXT NOT NULL,
-            source_row_hash TEXT NOT NULL DEFAULT '',
-            stable          BOOLEAN NOT NULL DEFAULT TRUE,
             is_active       BOOLEAN NOT NULL DEFAULT TRUE,
             vehicle_id      TEXT NOT NULL,
             timestamp       DOUBLE PRECISION NOT NULL,
@@ -59,8 +55,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
                                 ST_SetSRID(ST_MakePoint(lon, lat), 4326)
                             ) STORED,
             extra           JSONB NOT NULL DEFAULT '{}',
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE(source_id, source_row_key)
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """),
     # ── Cleaner 1 ──
@@ -275,7 +270,6 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
 INDEX_STATEMENTS: list[tuple[str, str]] = [
     # ── trajectory_points ──
     ("idx_tp_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_tp_vehicle_ts ON trajectory_points(vehicle_id, timestamp)"),
-    ("idx_tp_source_row",      "CREATE INDEX IF NOT EXISTS idx_tp_source_row ON trajectory_points(source_id, source_row_key)"),
     ("idx_tp_geom",            "CREATE INDEX IF NOT EXISTS idx_tp_geom ON trajectory_points USING GIST (geom)"),
     ("idx_tp_active",          "CREATE INDEX IF NOT EXISTS idx_tp_active ON trajectory_points(is_active) WHERE is_active = TRUE"),
     # ── excluded_points ──
@@ -371,11 +365,6 @@ def _run_migrations(cur: Any) -> None:
             "ci_cross_track_count",
             "ALTER TABLE candidate_intersections ADD COLUMN IF NOT EXISTS "
             "cross_track_count INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "tp_source_row_hash",
-            "ALTER TABLE trajectory_points ADD COLUMN IF NOT EXISTS "
-            "source_row_hash TEXT NOT NULL DEFAULT ''",
         ),
         (
             "excluded_run_id",

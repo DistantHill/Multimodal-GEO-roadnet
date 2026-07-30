@@ -166,17 +166,12 @@ def insert_trajectory_points(
         return {}
 
     columns = [
-        "source_id", "source_row_key", "source_row_hash", "stable",
         "vehicle_id", "timestamp", "lon", "lat",
         "heading", "speed", "extra",
     ]
     rows: list[tuple[Any, ...]] = []
     for p in points:
         rows.append((
-            p.point_ref.source_id,
-            p.point_ref.source_row_key,
-            p.point_ref.source_row_hash,
-            p.point_ref.stable,
             p.vehicle_id,
             p.timestamp,
             p.lon,
@@ -189,11 +184,10 @@ def insert_trajectory_points(
     mapping: dict[tuple[str, str], int] = {}
     with conn.cursor() as cur:
         returned = _chunked_insert_returning(
-            cur, table, columns, rows, ["id", "source_id", "source_row_key"],
-            on_conflict="ON CONFLICT (source_id, source_row_key) DO NOTHING",
+            cur, table, columns, rows, ["id"],
         )
-    for db_id, sid, srk in returned:
-        mapping[(sid, srk)] = db_id
+    for (db_id,), p in zip(returned, points):
+        mapping[(p.point_ref.source_id, p.point_ref.source_row_key)] = db_id
     return mapping
 
 
@@ -202,60 +196,50 @@ def mark_excluded_points(
     excluded: list,
     *,
     table: str = "trajectory_points",
+    tp_id_map: dict | None = None,
 ) -> int:
     """Set ``is_active = FALSE`` for points removed by Cleaner 1.
 
     ZH: 批量 UPDATE trajectory_points，将被清洗排除的点的 is_active 标记为 FALSE。
-        返回标记行数。
+        返回标记行数。通过 ``tp_id_map`` 将 PointRef 翻译为 DB id；
+        若无映射（原地场景），``source_row_key`` 本身就是 id。
     """
     if not excluded:
         return 0
 
-    keys = [(item.point_ref.source_id, item.point_ref.source_row_key) for item in excluded]
-    total = 0
+    ids: list[int] = []
+    for item in excluded:
+        key = (item.point_ref.source_id, item.point_ref.source_row_key)
+        if tp_id_map and key in tp_id_map:
+            ids.append(tp_id_map[key])
+        else:
+            ids.append(int(item.point_ref.source_row_key))
+
     with conn.cursor() as cur:
-        for start in range(0, len(keys), _BATCH):
-            batch = keys[start : start + _BATCH]
-            values_clause = ", ".join("(%s, %s)" for _ in batch)
-            params: list[Any] = []
-            for sid, srk in batch:
-                params.extend([sid, srk])
-            cur.execute(
-                f"UPDATE {table} SET is_active = FALSE "
-                f"FROM (VALUES {values_clause}) AS t(sid, srk) "
-                f"WHERE {table}.source_id = t.sid AND {table}.source_row_key = t.srk",
-                params,
-            )
-            total += cur.rowcount
-    return total
+        cur.execute(
+            f"UPDATE {table} SET is_active = FALSE WHERE id = ANY(%s::bigint[])",
+            (ids,),
+        )
+    return cur.rowcount
 
 
 def reset_active_points(
     conn: Any,
-    source_id: str | None,
     *,
     table: str = "trajectory_points",
 ) -> int:
-    """Reset one source's raw points before deriving a new run.
+    """Reset all raw points' is_active flag before deriving a new run.
 
-    ZH: 将来源的 is_active 重置为 TRUE。
-        ``source_id`` 为 None 时重置全表（PG 表模式）。
-    EN: Reset is_active to TRUE for the given source.
-        When ``source_id`` is None, reset all rows (PG-table mode).
+    ZH: 将全表的 is_active 重置为 TRUE。
+    EN: Reset is_active to TRUE for all rows in the table.
 
     Derived cleaner decisions are stored per ``run_id``.  The raw table keeps
     a convenience active flag for DB-mode processing, so it must be restored
     to the complete source before the next run is calculated.
     """
     with conn.cursor() as cur:
-        if source_id is None:
-            cur.execute(f"UPDATE {table} SET is_active = TRUE")
-        else:
-            cur.execute(
-                f"UPDATE {table} SET is_active = TRUE WHERE source_id = %s",
-                (source_id,),
-            )
-        return cur.rowcount
+        cur.execute(f"UPDATE {table} SET is_active = TRUE")
+    return cur.rowcount
 
 
 def fetch_trajectory_point_ids(
@@ -264,24 +248,19 @@ def fetch_trajectory_point_ids(
     *,
     table: str = "trajectory_points",
 ) -> dict[tuple[str, str], int]:
-    """Fetch existing (source_id, source_row_key) → id mapping from the DB.
+    """Fetch id → (source_id, source_row_key) mapping from the DB.
 
-    ZH: 从已有表中查询 (source_id, source_row_key) → id 映射。
-        当 ``source_id`` 为 None 时查询全表（用于 PG 表模式）。
-    EN: Fetch (source_id, source_row_key) → id mapping from the DB.
-        When ``source_id`` is None, query all rows (used in PG-table mode).
+    ZH: 从已有表中查询 id，构造 (source_id, str(id)) → id 映射。
+        ``source_id`` 参数用于构造映射 key，不用于 SQL 过滤。
+    EN: Fetch ids from the table, build (source_id, str(id)) → id mapping.
+        ``source_id`` is used only for constructing the map key, not for filtering.
     """
     mapping: dict[tuple[str, str], int] = {}
+    src = source_id or ""
     with conn.cursor() as cur:
-        if source_id is None:
-            cur.execute(f"SELECT id, source_id, source_row_key FROM {table}")
-        else:
-            cur.execute(
-                f"SELECT id, source_id, source_row_key FROM {table} WHERE source_id = %s",
-                (source_id,),
-            )
-        for db_id, sid, srk in cur:
-            mapping[(sid, srk)] = db_id
+        cur.execute(f"SELECT id FROM {table}")
+        for (db_id,) in cur:
+            mapping[(src, str(db_id))] = db_id
     return mapping
 
 

@@ -106,11 +106,7 @@ def run_pipeline(
         # Keep the run record even if a later pipeline statement rolls back.
         # A non-completed row is an explicit interrupted/failed-run record.
         conn.commit()
-        # ZH: PG 表模式下数据含多种 source_id，传 None 重置全表而非按表名过滤。
-        # EN: In PG-table mode data may contain multiple source_ids — pass None
-        #     to reset all rows instead of filtering by table name.
-        _reset_src = source_id if not is_pg_source else None
-        reset_active_points(conn, _reset_src, table=table)
+        reset_active_points(conn, table=table)
         # ── Stage 1+2: Streamed read → insert → clean (per vehicle) ──
         print("── Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean ──")
         print(f"  数据源 / Source: {source_label}")
@@ -152,7 +148,7 @@ def run_pipeline(
             total_injected += vresult.injected_count
 
             # Mark excluded points as is_active=FALSE in DB
-            mark_excluded_points(conn, vresult.excluded, table=table)
+            mark_excluded_points(conn, vresult.excluded, table=table, tp_id_map=tp_id_map)
             all_excluded.extend(vresult.excluded)
             all_kept_subtracks.extend(vresult.kept_subtracks)
 
@@ -232,11 +228,11 @@ def run_pipeline(
 
         # ── Stage 3: Intersect2 (DB mode — spatial sliding windows) ──
         print("\n── Intersect2: 交叉口检测 / Intersection Detection (DB 滑窗模式) ──")
-        # ZH: PG 表模式下 source_id 是表名而非实际数据中的 source_id，
-        #     传 None 查询全部 active 点；CSV 模式用文件路径过滤。
-        # EN: In PG-table mode source_id is the table name, not the actual
-        #     source_id in the data — pass None to query all active points.
-        intersect_source_id = source_id if not is_pg_source else None
+        # ZH: source_id 作为 intersect2 查询中 %s::text AS source_id 的参数值。
+        #     PG 模式用表名，CSV 模式用文件路径。
+        # EN: source_id used as the parameter for %s::text AS source_id in
+        #     intersect2 queries — table name for PG, file path for CSV.
+        intersect_source_id = pg_source_table if is_pg_source else source_id
         live_intersect = LiveStatus("Intersect2: Cross-track Detection")
         live_intersect.start()
         icfg = IntersectConfig(

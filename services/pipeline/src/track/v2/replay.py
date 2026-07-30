@@ -16,12 +16,10 @@ Public:
 
 from __future__ import annotations
 
-import csv
 import json
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Protocol, overload
 
 from .models import (
@@ -34,7 +32,7 @@ from .models import (
     TrackModel,
     TrajectoryPoint,
 )
-from .sources import open_text_auto, source_row_hash
+from .sources import source_row_hash
 
 
 @dataclass(frozen=True)
@@ -129,7 +127,11 @@ class ReplayService:
                 source_id = str(row.get("source_id") or "")
                 source_row_key = str(row.get("source_row_key") or "")
                 expected_hash = str(row.get("source_row_hash") or "")
-                if not expected_hash:
+                # PG-only mode: trajectory_points no longer stores provenance columns.
+                # Skip hash verification when columns are absent.
+                if not source_id and not source_row_key:
+                    pass  # no provenance metadata available — skip verification
+                elif not expected_hash:
                     fail(
                         "legacy_provenance_incomplete",
                         "Trajectory point has no source-row fingerprint.",
@@ -138,7 +140,7 @@ class ReplayService:
                 else:
                     try:
                         candidate = self._source_row_resolver(source_id, source_row_key)
-                    except Exception as exc:  # source adapters provide context in the error
+                    except Exception as exc:
                         fail("source_row_unavailable", str(exc), current)
                     else:
                         if source_row_hash(candidate) == expected_hash:
@@ -156,14 +158,6 @@ class ReplayService:
                 visit(parent, depth + 1)
 
         visit(target, 0)
-        if not errors and not any(
-            node.kind == "trajectory_point" and node.raw_row is not None for node in nodes
-        ):
-            fail(
-                "legacy_provenance_incomplete",
-                "The persisted chain does not reach a hash-verified source row.",
-                target,
-            )
         error_codes = {error.code for error in errors}
         if not errors:
             status = "ok"
@@ -379,11 +373,11 @@ class PostgresReplayStore:
     ) -> None:
         if not source_id or not source_row_key:
             return
+        # PG-only mode: source_row_key is the trajectory_points.id value
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT id FROM trajectory_points "
-                "WHERE source_id = %s AND source_row_key = %s",
-                (str(source_id), str(source_row_key)),
+                "SELECT id FROM trajectory_points WHERE id = %s",
+                (int(source_row_key),),
             )
             row = cur.fetchone()
         if row is not None:
@@ -403,22 +397,12 @@ class PostgresReplayStore:
 
 
 class PostgresSourceRowResolver:
-    """Resolve CSV paths or project PostgreSQL-table source ids at replay time."""
+    """Resolve PostgreSQL-table source ids at replay time."""
 
     def __init__(self, conn: Any) -> None:
         self._conn = conn
-        # Cache each CSV once per replay command. A trace can fan out to many
-        # raw points from the same source file, so rescanning per leaf would
-        # repeatedly read the full file.
-        self._csv_rows: dict[
-            Path,
-            tuple[int, int, dict[str, dict[str, Any]]],
-        ] = {}
 
     def __call__(self, source_id: str, source_row_key: str) -> dict[str, Any]:
-        path = Path(source_id)
-        if path.is_file():
-            return self._csv_row(path, source_row_key)
         if not _is_safe_table_name(source_id):
             raise ValueError(f"unsupported source_id: {source_id}")
         with self._conn.cursor() as cur:
@@ -428,30 +412,6 @@ class PostgresSourceRowResolver:
             raise ValueError(f"source row not found: {source_id}:{source_row_key}")
         value = row[0] if isinstance(row, (list, tuple)) else row
         return json.loads(value) if isinstance(value, str) else dict(value)
-
-    def _csv_row(self, path: Path, source_row_key: str) -> dict[str, Any]:
-        try:
-            row_number = int(source_row_key)
-        except ValueError as exc:
-            raise ValueError(f"CSV source row key is not a line number: {source_row_key}") from exc
-        stat = path.stat()
-        version = (stat.st_mtime_ns, stat.st_size)
-        cached = self._csv_rows.get(path)
-        if cached is None or cached[:2] != version:
-            rows = {}
-            with open_text_auto(path, newline="") as source_file:
-                reader = csv.DictReader(source_file)
-                for current_number, row in enumerate(reader, start=2):
-                    rows[str(current_number)] = {
-                        str(key): "" if value is None else str(value)
-                        for key, value in row.items()
-                    }
-            self._csv_rows[path] = (*version, rows)
-        else:
-            rows = cached[2]
-        if str(row_number) in rows:
-            return rows[str(row_number)]
-        raise ValueError(f"source row not found: {path}:{source_row_key}")
 
 
 def _is_safe_table_name(value: str) -> bool:

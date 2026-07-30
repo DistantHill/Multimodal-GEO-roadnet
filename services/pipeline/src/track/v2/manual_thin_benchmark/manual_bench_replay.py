@@ -42,7 +42,6 @@ from track.v2.replay import (
     ReplayService,
     ReplayTarget,
 )
-from track.v2.sources import source_row_hash
 
 
 def _write_csv(path: Path, rows: int) -> dict[str, str]:
@@ -73,9 +72,8 @@ def _seed_candidate_chain(
         )
         cur.execute(
             "INSERT INTO trajectory_points "
-            "(source_id, source_row_key, source_row_hash, vehicle_id, timestamp, lon, lat) "
-            "VALUES (%s, %s, %s, 'bench', 0, 116.0, 39.0)",
-            (source_id, source_row_key, source_row_hash(raw_row)),
+            "(vehicle_id, timestamp, lon, lat) "
+            "VALUES ('bench', 0, 116.0, 39.0)",
         )
         cur.execute(
             "INSERT INTO candidate_intersections "

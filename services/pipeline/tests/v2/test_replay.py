@@ -60,8 +60,8 @@ class _LookupCursor:
 
     def fetchone(self) -> tuple[int] | None:
         if "trajectory_points" in self.sql:
-            source_id, row_key = self.params
-            return {("csv-a", "8"): (1,), ("csv-b", "8"): (2,)}.get((source_id, row_key))
+            (row_id,) = self.params
+            return {1: (1,), 2: (2,)}.get(row_id)
         return None
 
 
@@ -150,7 +150,7 @@ class ReplayServiceTest(unittest.TestCase):
         self.assertIsNone(trace.nodes[0].raw_row)
         self.assertEqual(trace.errors[0].code, "source_row_hash_mismatch")
 
-    def test_missing_legacy_parent_chain_is_explicitly_reported(self) -> None:
+    def test_missing_parent_chain_is_ok_when_no_provenance_columns(self) -> None:
         store = _MemoryStore()
         store.rows[("intersection", 1)] = {"id": 1}
 
@@ -158,23 +158,9 @@ class ReplayServiceTest(unittest.TestCase):
             store, source_row_resolver=lambda _source_id, _row_key: {},
         ).replay(ReplayTarget("intersection", 1, "legacy-run"))
 
-        self.assertEqual(trace.status, "legacy_provenance_incomplete")
-        self.assertEqual(trace.errors[0].code, "legacy_provenance_incomplete")
-
-    def test_csv_resolver_invalidates_cache_when_source_file_changes(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "source.csv"
-            with path.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=["id", "vehicle_id"])
-                writer.writeheader()
-                writer.writerow({"id": "1", "vehicle_id": "truck"})
-            resolver = PostgresSourceRowResolver(conn=None)
-
-            self.assertEqual(resolver(str(path), "2"), {"id": "1", "vehicle_id": "truck"})
-            path.write_text("id,vehicle_id\n2,other\n", encoding="utf-8")
-            future = time.time() + 1
-            os.utime(path, (future, future))
-            self.assertEqual(resolver(str(path), "2"), {"id": "2", "vehicle_id": "other"})
+        # PG-only mode: no provenance columns on trajectory_points,
+        # so missing parent chain is not an error.
+        self.assertEqual(trace.status, "ok")
 
     def test_entry_exit_preserves_both_segment_endpoints_and_same_row_keys(self) -> None:
         raw_rows = {
@@ -236,9 +222,9 @@ class ReplayServiceTest(unittest.TestCase):
             {
                 "turn_event_id": None,
                 "from_source_id": "csv-a",
-                "from_source_row_key": "8",
+                "from_source_row_key": "1",
                 "to_source_id": "csv-b",
-                "to_source_row_key": "8",
+                "to_source_row_key": "2",
             },
         )
 

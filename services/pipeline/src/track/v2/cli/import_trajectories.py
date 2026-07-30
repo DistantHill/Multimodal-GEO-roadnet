@@ -1,13 +1,10 @@
 """Import CSV trajectory data into the ``trajectory_points`` table.
 
 ZH: 独立的 CSV → trajectory_points 导入 CLI。只做 Parser 0 解析 + 入库，
-    不运行后续清洗/交叉口检测阶段。重复的 ``(source_id, source_row_key)``
-    会因 UNIQUE 约束自动跳过（ON CONFLICT DO NOTHING）。
+    不运行后续清洗/交叉口检测阶段。
 
 EN: Standalone CSV → trajectory_points import CLI. Runs only Parser 0 parsing +
-    insert, without downstream cleaning/intersection stages. Duplicate
-    ``(source_id, source_row_key)`` rows are silently skipped via the UNIQUE
-    constraint.
+    insert, without downstream cleaning/intersection stages.
 
 Usage / 用法::
 
@@ -128,7 +125,7 @@ def main() -> int:
         print(f"\n  解析 / Parsed: {total_parsed:,} 点/points")
         print(f"  写入 / Wrote:  {total_written:,} rows")
         if skipped > 0:
-            print(f"  跳过 / Skipped: {skipped:,} (重复/duplicate source_id+source_row_key)")
+            print(f"  跳过 / Skipped: {skipped:,}")
         print(f"\n── 完成 / Done ({t_total:.1f}s) ──")
 
     except RuntimeError as exc:
