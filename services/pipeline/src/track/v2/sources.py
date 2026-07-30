@@ -358,29 +358,43 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
             _close_quietly(conn)
 
     def count_rows(self) -> int:
-        """ZH: 通过 SELECT COUNT(*) 直接统计总行数，不用 DISTINCT，不走 ORDER BY 子查询。
-        EN: Fast row count via SELECT COUNT(*) — no DISTINCT, no ORDER BY subquery."""
+        """ZH: 从 pg_class 读取估算行数——纯元数据查询，毫秒级。
+            用于进度条百分比，不必精确到个位数。
+        EN: Read estimated row count from pg_class — pure metadata query, sub-ms.
+            Used for progress bar percentage; exact precision is unnecessary."""
         conn = self._connect()
         cur = None
         try:
             _configure_postgres_session(conn)
             cur = conn.cursor()
             table = self._source.source_id or "trajectory_points"
-            cur.execute(f"SELECT COUNT(*) FROM {table}")
+            cur.execute(
+                "SELECT c.reltuples::bigint FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE c.relname = %s AND n.nspname = current_schema()",
+                (table,),
+            )
             result = cur.fetchone()
-            return int(result[0]) if result else 0
+            return int(result[0]) if result and result[0] else 0
         finally:
             _close_quietly(cur)
             _close_quietly(conn)
 
     def _discover_columns(self) -> list[str]:
+        """ZH: 从 information_schema 读取列名——纯元数据查询，不碰数据行。
+        EN: Read column names from information_schema — pure metadata query, zero data rows touched."""
         conn = self._connect()
         cur = None
         try:
             _configure_postgres_session(conn)
             cur = conn.cursor()
-            cur.execute(self._source.query, self._source.params)
-            return [desc[0] for desc in (cur.description or [])]
+            table = self._source.source_id or "trajectory_points"
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = %s ORDER BY ordinal_position",
+                (table,),
+            )
+            return [row[0] for row in cur.fetchall()]
         finally:
             _close_quietly(cur)
             _close_quietly(conn)
