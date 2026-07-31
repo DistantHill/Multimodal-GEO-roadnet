@@ -55,16 +55,20 @@ def run_pipeline(
     csv_path: str | None = None,
     pg_source_table: str | None = None,
     table: str = "trajectory_points",
+    skip_clean: bool = False,
 ) -> dict[str, int | str]:
     """Run the full pipeline and write all outputs to PostgreSQL.
 
     ZH: 运行完整流水线并将所有阶段产物写入数据库。返回各表写入行数统计。
         ``csv_path`` 和 ``pg_source_table`` 必须且只能指定一个。
         ``table`` 指定 trajectory_points 的目标表名。
+        ``skip_clean`` 跳过 Parser0+Cleaner1，直接从 is_active 列读取已清洗结果。
     EN: Run the full pipeline and write all stage outputs to the database.
         Returns per-table row counts. Exactly one of ``csv_path`` or
         ``pg_source_table`` must be provided. ``table`` specifies the target
         table name for trajectory_points.
+        ``skip_clean`` skips Parser0+Cleaner1 and reads pre-cleaned results
+        from the is_active column directly.
     """
     import psycopg
 
@@ -98,7 +102,7 @@ def run_pipeline(
             conn,
             source_id=source_id,
             source_kind=source_kind,
-            parameters={"target_table": table},
+            parameters={"target_table": table, "skip_clean": skip_clean},
         )
         stats["run_id"] = run_id
         # Keep the run record even if a later pipeline statement rolls back.
@@ -114,8 +118,6 @@ def run_pipeline(
         t_count = time.perf_counter()
         total_rows = handle.count_rows()
         print(f"  总行数 / Total rows: {total_rows:,} ({time.perf_counter() - t_count:.1f}s)")
-        stream = StreamVehicleSource(handle)
-
         total_raw = 0
         total_injected = 0
         tp_id_map: dict[tuple[str, str], int] = {}
@@ -127,72 +129,106 @@ def run_pipeline(
         _pending_excluded: list = []
         _MARK_FLUSH_EVERY_N = 200
 
-        live_clean = LiveStatus("Parser 0 + Cleaner 1: 流式清洗 / Streaming Clean")
-        live_clean.start()
+        if skip_clean:
+            # ZH: 跳过 Parser0+Cleaner1——is_active 已在之前运行中持久化，
+            #     直接复用已有清洗结果，省去逐行 parse_row + clean_vehicle + mark_excluded。
+            # EN: Skip Parser0+Cleaner1 — is_active is already persisted from a
+            #     prior run; reuse existing clean results directly.
+            handle.close()
+            total_raw = total_rows
+            vehicle_count = 0
+            stats["trajectory_points"] = total_raw
+            print(f"  跳过清洗 / Skip clean: {total_raw:,} 点 (is_active 已持久化/persisted)")
+        else:
+            stream = StreamVehicleSource(handle)
+            live_clean = LiveStatus("Parser 0 + Cleaner 1: 流式清洗 / Streaming Clean")
+            live_clean.start()
 
-        t_read = time.perf_counter()
-        vehicle_count = 0
-        last_update_t = t_read
-        for vehicle_points in stream.iter_vehicle_tracks():
-            total_raw += len(vehicle_points)
-            vehicle_count += 1
+            t_read = time.perf_counter()
+            vehicle_count = 0
+            last_update_t = t_read
+            for vehicle_points in stream.iter_vehicle_tracks():
+                total_raw += len(vehicle_points)
+                vehicle_count += 1
 
-            if not is_pg_source or pg_source_table != table:
-                # Persist both CSV rows and project-table rows as replayable
-                # raw points.  Reading the target table itself is the sole
-                # case where the rows already live in that table.
-                batch_map = insert_trajectory_points(conn, vehicle_points, table=table)
-                tp_id_map.update(batch_map)
+                # ZH: 始终向 trajectory_points 插入以保证 FK 完整性。
+                #     仅当直接从 trajectory_points 本身读取时才可跳过
+                #     （行已存在且 source_row_key 即为 trajectory_points.id）。
+                #     自定义 --pg-table 的源表仍需插入 trajectory_points，
+                #     因为 kept_trajectory_points 等表的外键硬编码指向 trajectory_points(id)。
+                # EN: Always insert into trajectory_points for FK integrity.
+                #     The skip is safe only when reading from trajectory_points
+                #     itself (rows already exist and source_row_key equals
+                #     trajectory_points.id).  Custom --pg-table sources must
+                #     still populate trajectory_points because downstream FK
+                #     tables (kept_trajectory_points, etc.) reference
+                #     trajectory_points(id) directly.
+                if not is_pg_source or pg_source_table != "trajectory_points":
+                    batch_map = insert_trajectory_points(conn, vehicle_points, table="trajectory_points")
+                    tp_id_map.update(batch_map)
 
-            # Clean this vehicle
-            vresult = clean_vehicle(vehicle_points)
-            total_injected += vresult.injected_count
+                # Clean this vehicle
+                vresult = clean_vehicle(vehicle_points)
+                total_injected += vresult.injected_count
 
-            # Mark excluded points as is_active=FALSE in DB (batch-accumulated)
-            _pending_excluded.extend(vresult.excluded)
-            all_excluded.extend(vresult.excluded)
-            if len(_pending_excluded) >= 2000 or vehicle_count % _MARK_FLUSH_EVERY_N == 0:
-                mark_excluded_points(conn, _pending_excluded, table=table, tp_id_map=tp_id_map)
+                # Mark excluded points as is_active=FALSE in DB (batch-accumulated)
+                _pending_excluded.extend(vresult.excluded)
+                all_excluded.extend(vresult.excluded)
+                if len(_pending_excluded) >= 2000 or vehicle_count % _MARK_FLUSH_EVERY_N == 0:
+                    # ZH: 仅当目标表为 trajectory_points 时使用 tp_id_map
+                    #     （其中存储的是 trajectory_points 的 DB id）。
+                    #     自定义 --pg-table 的原地更新直接用 source_row_key
+                    #     （即源表自身的主键），因为 tp_id_map 此时引用的是
+                    #     trajectory_points 的 id，与源表主键不同。
+                    # EN: Only pass tp_id_map when the target table is
+                    #     trajectory_points (the mapping stores
+                    #     trajectory_points DB ids).  Custom --pg-table
+                    #     in-place updates use source_row_key directly
+                    #     (the source table's own PK), since tp_id_map
+                    #     references trajectory_points ids which differ.
+                    _mark_map = tp_id_map if table == "trajectory_points" else {}
+                    mark_excluded_points(conn, _pending_excluded, table=table, tp_id_map=_mark_map)
+                    _pending_excluded.clear()
+                all_kept_subtracks.extend(vresult.kept_subtracks)
+
+                # Collect injected points for batch insert
+                for p in vresult.active:
+                    if p.point_ref.generated_reason == "orthogonal_heading":
+                        all_injected_points.append(p)
+
+                now = time.perf_counter()
+                if vehicle_count == 1 or vehicle_count % 500 == 0 or (now - last_update_t) >= 2.0:
+                    elapsed = now - t_read
+                    rate = total_raw / elapsed if elapsed > 0 else 0
+                    pct = total_raw / total_rows if total_rows > 0 else 0
+                    live_clean.update(
+                        progress=pct,
+                        detail=f"{total_raw:,}/{total_rows:,} 点, {vehicle_count:,} 车辆",
+                        elapsed=elapsed,
+                        throughput=f"{rate:.0f} 点/s",
+                    )
+                    last_update_t = now
+
+            # Final 100% update
+            # Flush remaining pending excluded points
+            if _pending_excluded:
+                _mark_map = tp_id_map if table == "trajectory_points" else {}
+                mark_excluded_points(conn, _pending_excluded, table=table, tp_id_map=_mark_map)
                 _pending_excluded.clear()
-            all_kept_subtracks.extend(vresult.kept_subtracks)
+            elapsed_read = time.perf_counter() - t_read
+            live_clean.update(
+                progress=1.0,
+                detail=f"{total_raw:,}/{total_rows:,} 点, {vehicle_count:,} 车辆",
+                elapsed=elapsed_read,
+                throughput=f"{total_raw / elapsed_read:.0f} 点/s" if elapsed_read > 0 else "",
+            )
+            live_clean.stop()
+            stream.close()
+            handle.close()
+            print(f"  读取&清洗 / Read&Clean: {total_raw:,} 点/points, "
+                  f"{vehicle_count:,} 车辆/vehicles ({elapsed_read:.1f}s)")
 
-            # Collect injected points for batch insert
-            for p in vresult.active:
-                if p.point_ref.generated_reason == "orthogonal_heading":
-                    all_injected_points.append(p)
-
-            now = time.perf_counter()
-            if vehicle_count == 1 or vehicle_count % 500 == 0 or (now - last_update_t) >= 2.0:
-                elapsed = now - t_read
-                rate = total_raw / elapsed if elapsed > 0 else 0
-                pct = total_raw / total_rows if total_rows > 0 else 0
-                live_clean.update(
-                    progress=pct,
-                    detail=f"{total_raw:,}/{total_rows:,} 点, {vehicle_count:,} 车辆",
-                    elapsed=elapsed,
-                    throughput=f"{rate:.0f} 点/s",
-                )
-                last_update_t = now
-
-        # Final 100% update
-        # Flush remaining pending excluded points
-        if _pending_excluded:
-            mark_excluded_points(conn, _pending_excluded, table=table, tp_id_map=tp_id_map)
-            _pending_excluded.clear()
-        elapsed_read = time.perf_counter() - t_read
-        live_clean.update(
-            progress=1.0,
-            detail=f"{total_raw:,}/{total_rows:,} 点, {vehicle_count:,} 车辆",
-            elapsed=elapsed_read,
-            throughput=f"{total_raw / elapsed_read:.0f} 点/s" if elapsed_read > 0 else "",
-        )
-        live_clean.stop()
-        stream.close()
-        handle.close()
-        print(f"  读取&清洗 / Read&Clean: {total_raw:,} 点/points, "
-              f"{vehicle_count:,} 车辆/vehicles ({elapsed_read:.1f}s)")
-
-        stats["trajectory_points"] = total_raw
+            stats["trajectory_points"] = total_raw
 
         # ── Batch-write cleaner outputs ──────────────────────────────
 
@@ -231,7 +267,7 @@ def run_pipeline(
             query_active_from_db=True,
             db_table=table,
             source_id=intersect_source_id,
-            run_id=run_id,
+            run_id=None if skip_clean else run_id,
             live_status=live_intersect,
         )
         iresult = detect_intersections(conn=conn, config=icfg)
@@ -337,7 +373,17 @@ def main() -> int:
         help="目标表名 / Target table name for trajectory_points "
              "(default: same as --pg-table for PG mode, 'trajectory_points' for CSV mode)."
     )
+    parser.add_argument(
+        "--skip-clean", action="store_true",
+        help="跳过 Parser0+Cleaner1，直接从 trajectory_points.is_active 读取已清洗结果进入 Intersect2。"
+             "仅支持 --pg-table 模式 / Requires --pg-table mode."
+    )
     args = parser.parse_args()
+
+    # ZH: --skip-clean 仅对 PG 源有效
+    # EN: --skip-clean is only valid with --pg-table
+    if args.skip_clean and not args.pg_table:
+        parser.error("--skip-clean 仅支持 --pg-table 模式 / requires --pg-table")
 
     # ZH: 若未显式指定 --table，PG 模式默认写到源表（原地工作），CSV 模式写到 trajectory_points。
     # EN: If --table is not set, default to the PG source table (work in-place)
@@ -372,6 +418,7 @@ def main() -> int:
             csv_path=args.csv,
             pg_source_table=args.pg_table,
             table=args.table,
+            skip_clean=args.skip_clean,
         )
     except RuntimeError as exc:
         print(str(exc))
