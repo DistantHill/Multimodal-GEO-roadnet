@@ -44,7 +44,7 @@ from track.v2.cli.init_db import create_tables, reset_tables
 from track.v2.config import PostgresConfig
 
 # ── 测试数据库名从共享 helper 获取（统一入口） ──
-from _thin_bench_helpers import load_test_env, TEST_DB_NAME
+from track.v2.manual_thin_benchmark._thin_bench_helpers import load_test_env, TEST_DB_NAME
 
 
 def _env_config(database: str) -> PostgresConfig:
