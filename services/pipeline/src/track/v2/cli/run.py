@@ -32,7 +32,6 @@ from ..db_writer import (
     insert_candidate_intersection_events,
     insert_candidate_intersections,
     insert_entry_exit_points,
-    insert_excluded_points,
     insert_injected_points,
     insert_tracks_cross,
     insert_intersections,
@@ -40,7 +39,7 @@ from ..db_writer import (
     insert_trajectory_points,
     insert_turn_events,
 )
-from ..models import CsvSource, ExcludedIndex, PostgresSource
+from ..models import CsvSource, PostgresSource
 from .. import get_database, detect_intersections, IntersectConfig
 from ..cleaner import clean_vehicle
 from ..sources import StreamVehicleSource
@@ -121,7 +120,7 @@ def run_pipeline(
         total_raw = 0
         total_injected = 0
         tp_id_map: dict[tuple[str, str], int] = {}
-        all_excluded: list = []
+        total_excluded = 0
         all_kept_subtracks: list[list] = []
         all_injected_points: list = []
         # ZH: 批量累积排除点，每 N 辆车 flush 一次 UPDATE，消除逐车往返开销。
@@ -173,7 +172,7 @@ def run_pipeline(
 
                 # Mark excluded points as is_active=FALSE in DB (batch-accumulated)
                 _pending_excluded.extend(vresult.excluded)
-                all_excluded.extend(vresult.excluded)
+                total_excluded += len(vresult.excluded)
                 if len(_pending_excluded) >= 2000 or vehicle_count % _MARK_FLUSH_EVERY_N == 0:
                     # ZH: 仅当目标表为 trajectory_points 时使用 tp_id_map
                     #     （其中存储的是 trajectory_points 的 DB id）。
@@ -232,14 +231,8 @@ def run_pipeline(
 
         # ── Batch-write cleaner outputs ──────────────────────────────
 
-        excluded_index = ExcludedIndex(all_excluded)
-        print(f"  排除 / Excluded: {len(all_excluded):,}")
+        print(f"  排除 / Excluded: {total_excluded:,}")
         print(f"  注入 / Injected: {total_injected:,}")
-
-        t0 = time.perf_counter()
-        insert_excluded_points(conn, excluded_index, tp_id_map, run_id=run_id)
-        stats["excluded_points"] = len(all_excluded)
-        print(f"  excluded_points: {len(all_excluded):,} rows ({time.perf_counter() - t0:.1f}s)")
 
         if all_kept_subtracks:
             t0 = time.perf_counter()
@@ -434,7 +427,7 @@ def main() -> int:
     # ── Summary ──
     print("\n── 写入统计 / Write Summary ──")
     for table in [
-        "trajectory_points", "excluded_points", "kept_trajectory_points",
+        "trajectory_points", "kept_trajectory_points",
         "injected_points", "tracks_cross", "turn_events", "candidate_intersections",
         "candidate_intersection_events", "candidate_entry_exit_points",
         "intersections", "entry_exit_points",

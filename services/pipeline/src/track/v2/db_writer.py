@@ -21,6 +21,17 @@ Usage / 用法::
     )
 """
 
+# ── 改动清单 / Change Log ──────────────────────────────────────────────
+# #  改动                             效果
+# 1  _BATCH 500 → 5000               所有 INSERT 批量写入往返次数减少 10 倍
+# 2  insert_kept_trajectory_points   16M 行从 ~32,000 次 INSERT 往返变成
+#    改用 COPY FROM STDIN             一次 COPY 流式写入，走 PG 原生批量协议
+# 3  insert_injected_points          调用方 run.py 已按 orthogonal_heading
+#    去掉重复过滤                     预过滤，函数内无需再筛
+# 4  移除 excluded_points 写入       排除信息仅反映在 trajectory_points.is_active，
+#                                   不再单独写 excluded_points 表（表结构保留）
+# ────────────────────────────────────────────────────────────────────────
+
 from __future__ import annotations
 
 import json
@@ -40,7 +51,7 @@ from .models import (
 )
 
 # ── Batch size for multi-row INSERT ───────────────────────────────────
-_BATCH = 500
+_BATCH = 5000
 
 
 def create_pipeline_run(
@@ -311,22 +322,27 @@ def insert_kept_trajectory_points(
 
     ZH: 写入保留点引用——每个子轨迹的保留点通过 FK 指向 trajectory_points。
         ``kept_subtracks`` 的每个元素是 Cleaner 1 的一个 subtrack 的保留点列表。
+        使用 PostgreSQL COPY FROM STDIN 流式写入，避免逐批 INSERT 的网络往返开销。
     """
-    columns = ["trajectory_point_id", "vehicle_id", "subtrack_index", "sequence_in_subtrack"]
-    rows: list[tuple[Any, ...]] = []
-    for st_idx, subtrack in enumerate(kept_subtracks, start=1):
-        for seq_idx, point in enumerate(subtrack):
-            key = _point_ref_key(point.point_ref)
-            tp_id = tp_ref_to_id.get(key) if tp_ref_to_id else None
-            if tp_id is None:
-                # Fallback: source_row_key is the DB primary key in PG mode
-                tp_id = int(point.point_ref.source_row_key)
-            rows.append((tp_id, point.vehicle_id, st_idx, seq_idx))
+    if run_id is None:
+        raise ValueError("run_id is required for derived v2 persistence")
+    if not kept_subtracks:
+        return
 
-    columns, rows = _with_run(columns, rows, run_id)
-    if rows:
-        with conn.cursor() as cur:
-            _chunked_insert(cur, "kept_trajectory_points", columns, rows)
+    with conn.cursor() as cur:
+        with cur.copy(
+            "COPY kept_trajectory_points "
+            "(run_id, trajectory_point_id, vehicle_id, subtrack_index, sequence_in_subtrack) "
+            "FROM STDIN"
+        ) as copy:
+            for st_idx, subtrack in enumerate(kept_subtracks, start=1):
+                for seq_idx, point in enumerate(subtrack):
+                    key = _point_ref_key(point.point_ref)
+                    tp_id = tp_ref_to_id.get(key) if tp_ref_to_id else None
+                    if tp_id is None:
+                        # Fallback: source_row_key is the DB primary key in PG mode
+                        tp_id = int(point.point_ref.source_row_key)
+                    copy.write_row((run_id, tp_id, point.vehicle_id, st_idx, seq_idx))
 
 
 def insert_injected_points(
@@ -337,10 +353,9 @@ def insert_injected_points(
 ) -> None:
     """Insert synthetic points injected by ``_inject_orthogonal``.
 
-    ZH: 从 active 列表中筛选 generated_reason="orthogonal_heading" 的点写入注入表。
+    ZH: 写入注入的合成点。调用方已按 generated_reason="orthogonal_heading" 预过滤。
     """
-    injected = [p for p in active_points if p.point_ref.generated_reason == "orthogonal_heading"]
-    if not injected:
+    if not active_points:
         return
 
     columns = [
@@ -351,7 +366,7 @@ def insert_injected_points(
         "generated_reason", "origin_lon", "origin_lat",
     ]
     rows: list[tuple[Any, ...]] = []
-    for p in injected:
+    for p in active_points:
         ref = p.point_ref
         # x/y are not stored directly on TrajectoryPoint — compute from first point as origin
         # The cleaner doesn't store x/y either, so we leave them as 0.0
