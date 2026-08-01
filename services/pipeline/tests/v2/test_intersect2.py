@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import math
+import random
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from track.v2._geometry import _to_xy
+import numpy as np
+
+from track.v2._geometry import _paired_segment_intersections, _to_lonlat, _to_xy
 from track.v2.cleaner1 import CleanerConfig, clean
 from track.v2.exceptions import V2Error
 from track.v2.intersect2 import (
     IntersectConfig,
     IntersectResult,
+    _CROSS_TRACK_MAX_GRID_CELLS_PER_SEGMENT,
+    _CROSS_TRACK_PAIR_BATCH_SIZE,
     _cluster_angles_greedy,
     _cluster_dbscan,
+    _cluster_orthogonal_cross_track_candidates,
     _cluster_orthogonal_candidates,
     _annotate_source_ablation,
     _compute_getis_ord_g_star,
@@ -23,8 +29,12 @@ from track.v2.intersect2 import (
     _extract_entry_exit_observations_batch,
     _extract_cross_track_windows,
     _extract_orthogonal_cross_track_candidates,
+    _extract_orthogonal_cross_track_candidates_legacy,
     _extract_orthogonal_candidates,
     _group_by_vehicle,
+    _cross_track_grid,
+    _iter_cross_track_pair_batches,
+    _prepare_cross_track_segments,
     _merge_clusters,
     _nearest_angle_id,
     _select_hotspot_events,
@@ -170,6 +180,36 @@ class IntersectReportTest(unittest.TestCase):
 # ── Group by vehicle tests ─────────────────────────────────────────────
 
 
+class PairedSegmentIntersectionTest(unittest.TestCase):
+    """Exact cross-track geometry operates on explicit segment pairs only."""
+
+    def test_exact_intersection_uses_matching_pairs_without_cartesian_product(self):
+        a1 = np.array([[0.0, -1.0], [10.0, -1.0]])
+        a2 = np.array([[0.0, 1.0], [10.0, 1.0]])
+        b1 = np.array([[-1.0, 0.0], [9.0, 2.0]])
+        b2 = np.array([[1.0, 0.0], [11.0, 2.0]])
+        ha = np.array([0.0, 0.0])
+        hb = np.array([90.0, 90.0])
+
+        xs, ys, hit_indices = _paired_segment_intersections(
+            a1, a2, ha, b1, b2, hb, 80.0, 100.0,
+        )
+
+        self.assertEqual(hit_indices.tolist(), [0])
+        self.assertEqual(xs.tolist(), [0.0])
+        self.assertEqual(ys.tolist(), [0.0])
+
+    def test_pair_batches_never_exceed_the_configured_limit(self):
+        """Dense cells remain memory bounded before exact geometry runs."""
+        side = math.isqrt(_CROSS_TRACK_PAIR_BATCH_SIZE) + 1
+        batches = list(_iter_cross_track_pair_batches(list(range(side)), list(range(side))))
+
+        self.assertEqual(sum(len(a_ids) for a_ids, _ in batches), side * side)
+        self.assertTrue(all(len(a_ids) <= _CROSS_TRACK_PAIR_BATCH_SIZE for a_ids, _ in batches))
+        self.assertEqual(batches[0][0][0], 0)
+        self.assertEqual(batches[-1][1][-1], side - 1)
+
+
 class CrossTrackWindowProgressTest(unittest.TestCase):
     """Method 3 reports window-level progress even for small windows."""
 
@@ -200,15 +240,38 @@ class CrossTrackWindowProgressTest(unittest.TestCase):
         cfg = IntersectConfig(
             spatial_window_size=(1_000.0, 1_000.0),
             spatial_window_overlap=0.15,
+            cross_track_dbscan_min_samples=1,
         )
         with patch("track.v2.intersect2._query_active_points_in_window", return_value=points), \
-             patch("builtins.print"):
+              patch("builtins.print"):
+            legacy_candidates = _extract_cross_track_windows(
+                object(), cfg,
+                extent=(116.0, 39.0, 116.02, 39.02),
+                origin_lon=origin_lon, origin_lat=origin_lat,
+                candidate_extractor=_extract_orthogonal_cross_track_candidates_legacy,
+            )
             candidates = _extract_cross_track_windows(
                 object(), cfg,
                 extent=(116.0, 39.0, 116.02, 39.02),
                 origin_lon=origin_lon, origin_lat=origin_lat,
             )
 
+        self.assertEqual(
+            [candidate.as_dict() for candidate in candidates],
+            [candidate.as_dict() for candidate in legacy_candidates],
+        )
+        self.assertEqual(
+            [cluster.as_dict() for cluster in _cluster_orthogonal_cross_track_candidates(
+                candidates, origin_lon, origin_lat,
+                eps_m=cfg.cross_track_dbscan_eps_m,
+                min_samples=cfg.cross_track_dbscan_min_samples,
+            )],
+            [cluster.as_dict() for cluster in _cluster_orthogonal_cross_track_candidates(
+                legacy_candidates, origin_lon, origin_lat,
+                eps_m=cfg.cross_track_dbscan_eps_m,
+                min_samples=cfg.cross_track_dbscan_min_samples,
+            )],
+        )
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].vehicle_id, "A|B")
 
@@ -504,6 +567,179 @@ class OrthogonalCandidateTest(unittest.TestCase):
         self.assertEqual(candidate.to_source_row_key, "77,78")
         self.assertEqual(candidate.heading, 0.0)
         self.assertEqual(candidate.speed, 12.0)
+
+    def test_cross_track_grid_deduplicates_multicell_hits_in_legacy_order(self):
+        """Long segments cross many cells but emit each ordered pair once."""
+        origin_lon, origin_lat = 116.0, 39.0
+        tracks = {
+            "A": [
+                _make_point("A", "a0", 10.0, origin_lon, origin_lat - 0.003, 0.0, 12.0),
+                _make_point("A", "a1", 20.0, origin_lon, origin_lat, 0.0, 12.0),
+                _make_point("A", "a2", 30.0, origin_lon, origin_lat + 0.003, 0.0, 12.0),
+            ],
+            "B": [
+                _make_point("B", "b0", 10.0, origin_lon - 0.003, origin_lat - 0.0015, 90.0, 8.0),
+                _make_point("B", "b1", 20.0, origin_lon + 0.003, origin_lat - 0.0015, 90.0, 8.0),
+            ],
+            "C": [
+                _make_point("C", "c0", 10.0, origin_lon - 0.003, origin_lat + 0.0015, 90.0, 8.0),
+                _make_point("C", "c1", 20.0, origin_lon + 0.003, origin_lat + 0.0015, 90.0, 8.0),
+            ],
+        }
+
+        candidates, pair_count, total_pairs = _extract_orthogonal_cross_track_candidates(
+            tracks, origin_lon, origin_lat, IntersectConfig(),
+        )
+
+        self.assertEqual((pair_count, total_pairs), (3, 3))
+        self.assertEqual(
+            [
+                (candidate.vehicle_id, candidate.from_source_row_key, candidate.to_source_row_key)
+                for candidate in candidates
+            ],
+            [("A|B", "a0,a1", "b0,b1"), ("A|C", "a1,a2", "c0,c1")],
+        )
+
+    def test_cross_track_grid_keeps_intersection_on_cell_boundary(self):
+        """An intersection at the projected origin is not lost to cell ownership."""
+        origin_lon, origin_lat = 116.0, 39.0
+        tracks = {
+            "A": [
+                _make_point("A", "a0", 10.0, origin_lon, origin_lat - 0.001, 0.0, 12.0),
+                _make_point("A", "a1", 20.0, origin_lon, origin_lat + 0.001, 0.0, 12.0),
+            ],
+            "B": [
+                _make_point("B", "b0", 10.0, origin_lon - 0.001, origin_lat, 90.0, 8.0),
+                _make_point("B", "b1", 20.0, origin_lon + 0.001, origin_lat, 90.0, 8.0),
+            ],
+        }
+
+        candidates, _, _ = _extract_orthogonal_cross_track_candidates(
+            tracks, origin_lon, origin_lat, IntersectConfig(),
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertAlmostEqual(candidates[0].x, 0.0, places=9)
+        self.assertAlmostEqual(candidates[0].y, 0.0, places=9)
+
+    def test_nonfinite_coordinates_match_legacy_miss_semantics(self):
+        """NaN/Inf coordinates must not make grid preparation fail early."""
+        origin_lon, origin_lat = 116.0, 39.0
+        for nonfinite in (float("nan"), float("inf")):
+            tracks = {
+                "A": [
+                    _make_point("A", "a0", 10.0, origin_lon, origin_lat - 0.001, 0.0, 12.0),
+                    _make_point("A", "a1", 20.0, origin_lon, origin_lat + 0.001, 0.0, 12.0),
+                ],
+                "B": [
+                    _make_point("B", "b0", 10.0, nonfinite, origin_lat - 0.001, 90.0, 8.0),
+                    _make_point("B", "b1", 20.0, nonfinite, origin_lat + 0.001, 90.0, 8.0),
+                ],
+                "C": [
+                    _make_point("C", "c0", 10.0, origin_lon - 0.001, origin_lat, 90.0, 8.0),
+                    _make_point("C", "c1", 20.0, origin_lon + 0.001, origin_lat, 90.0, 8.0),
+                ],
+            }
+            with np.errstate(all="ignore"):
+                legacy = _extract_orthogonal_cross_track_candidates_legacy(
+                    tracks, origin_lon, origin_lat, IntersectConfig(),
+                )
+                bounded = _extract_orthogonal_cross_track_candidates(
+                    tracks, origin_lon, origin_lat, IntersectConfig(),
+                )
+            self.assertEqual(legacy[1:], bounded[1:])
+            self.assertEqual(
+                [candidate.as_dict() for candidate in legacy[0]],
+                [candidate.as_dict() for candidate in bounded[0]],
+            )
+
+    def test_oversized_aabb_uses_bounded_fallback_without_losing_hit(self):
+        """A long segment is not expanded into more than the private cell cap."""
+        origin_lon, origin_lat = 116.0, 39.0
+        tracks = {
+            "A": [
+                _make_point("A", "a0", 10.0, origin_lon, origin_lat - 2.0, 0.0, 12.0),
+                _make_point("A", "a1", 20.0, origin_lon, origin_lat + 2.0, 0.0, 12.0),
+            ],
+            "B": [
+                _make_point("B", "b0", 10.0, origin_lon - 3.0, origin_lat, 90.0, 8.0),
+                _make_point("B", "b1", 20.0, origin_lon + 3.0, origin_lat, 90.0, 8.0),
+            ],
+        }
+        segments, _ = _prepare_cross_track_segments(
+            tracks, origin_lon, origin_lat, IntersectConfig(),
+        )
+        grid, overflow_ids = _cross_track_grid(segments)
+        self.assertEqual(overflow_ids, [0, 1])
+        self.assertLessEqual(sum(len(ids) for ids in grid.values()), _CROSS_TRACK_MAX_GRID_CELLS_PER_SEGMENT)
+
+        legacy = _extract_orthogonal_cross_track_candidates_legacy(
+            tracks, origin_lon, origin_lat, IntersectConfig(),
+        )
+        bounded = _extract_orthogonal_cross_track_candidates(
+            tracks, origin_lon, origin_lat, IntersectConfig(),
+        )
+        self.assertEqual(legacy[1:], bounded[1:])
+        self.assertEqual(
+            [candidate.as_dict() for candidate in legacy[0]],
+            [candidate.as_dict() for candidate in bounded[0]],
+        )
+
+    def test_seeded_cross_track_differential_preserves_candidates_and_clusters(self):
+        """Grid ownership matches the legacy oracle across adversarial small tracks."""
+        origin_lon, origin_lat = 116.0, 39.0
+        cfg = IntersectConfig(cross_track_dbscan_min_samples=1)
+
+        for seed in range(20):
+            rng = random.Random(seed)
+            headings = {
+                "A": 0.0,
+                "B": 90.0,
+                "C": 80.0,
+                "D": 100.0 if seed % 2 else float("nan"),
+            }
+            tracks: dict[str, list[TrajectoryPoint]] = {}
+            for vehicle_id, heading in headings.items():
+                track: list[TrajectoryPoint] = []
+                for point_index in range(4):
+                    if vehicle_id == "B" and point_index == 1 and seed % 3 == 0:
+                        x, y = _to_xy(track[-1].lon, track[-1].lat, origin_lon, origin_lat)
+                    else:
+                        x = rng.choice((-300.0, -100.0, 0.0, 100.0, 300.0)) + rng.uniform(-30.0, 30.0)
+                        y = rng.choice((-300.0, -100.0, 0.0, 100.0, 300.0)) + rng.uniform(-30.0, 30.0)
+                    lon, lat = _to_lonlat(x, y, origin_lon, origin_lat)
+                    track.append(_make_point(
+                        vehicle_id, f"{vehicle_id}{seed}-{point_index}", float(point_index),
+                        lon, lat, heading, 8.0,
+                    ))
+                tracks[vehicle_id] = track
+
+            with np.errstate(all="ignore"), patch("builtins.print"):
+                legacy = _extract_orthogonal_cross_track_candidates_legacy(
+                    tracks, origin_lon, origin_lat, cfg,
+                )
+                bounded = _extract_orthogonal_cross_track_candidates(
+                    tracks, origin_lon, origin_lat, cfg,
+                )
+            self.assertEqual(legacy[1:], bounded[1:], f"seed={seed}")
+            self.assertEqual(
+                [candidate.as_dict() for candidate in legacy[0]],
+                [candidate.as_dict() for candidate in bounded[0]],
+                f"seed={seed}",
+            )
+            self.assertEqual(
+                [cluster.as_dict() for cluster in _cluster_orthogonal_cross_track_candidates(
+                    legacy[0], origin_lon, origin_lat,
+                    eps_m=cfg.cross_track_dbscan_eps_m,
+                    min_samples=cfg.cross_track_dbscan_min_samples,
+                )],
+                [cluster.as_dict() for cluster in _cluster_orthogonal_cross_track_candidates(
+                    bounded[0], origin_lon, origin_lat,
+                    eps_m=cfg.cross_track_dbscan_eps_m,
+                    min_samples=cfg.cross_track_dbscan_min_samples,
+                )],
+                f"seed={seed}",
+            )
 
     def test_cluster_orthogonal_candidates(self):
         """I2-17: Orthogonal candidates can be clustered."""

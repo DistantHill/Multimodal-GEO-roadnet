@@ -149,6 +149,73 @@ def _batch_segment_intersections(
     return cx, cy, flat_idx
 
 
+def _paired_segment_intersections(
+    a1: np.ndarray,
+    a2: np.ndarray,
+    ha: np.ndarray,
+    b1: np.ndarray,
+    b2: np.ndarray,
+    hb: np.ndarray,
+    min_angle_deg: float,
+    max_angle_deg: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Intersect explicitly paired segments without an ``N×M`` broadcast.
+
+    All six array inputs have the same leading dimension. The returned
+    indices address that paired input dimension, letting callers retain their
+    own segment provenance while this helper keeps only a compact numeric
+    working set.
+    """
+    if len(a1) == 0:
+        empty_float = np.empty(0, dtype=float)
+        return empty_float, empty_float, np.empty(0, dtype=int)
+
+    angle = np.abs((hb - ha + 180.0) % 360.0 - 180.0)
+    a_min_x = np.minimum(a1[:, 0], a2[:, 0])
+    a_max_x = np.maximum(a1[:, 0], a2[:, 0])
+    a_min_y = np.minimum(a1[:, 1], a2[:, 1])
+    a_max_y = np.maximum(a1[:, 1], a2[:, 1])
+    b_min_x = np.minimum(b1[:, 0], b2[:, 0])
+    b_max_x = np.maximum(b1[:, 0], b2[:, 0])
+    b_min_y = np.minimum(b1[:, 1], b2[:, 1])
+    b_max_y = np.maximum(b1[:, 1], b2[:, 1])
+    candidate = (
+        (min_angle_deg <= angle) & (angle <= max_angle_deg)
+        & (a_min_x <= b_max_x) & (b_min_x <= a_max_x)
+        & (a_min_y <= b_max_y) & (b_min_y <= a_max_y)
+    )
+    input_idx = np.flatnonzero(candidate)
+    if len(input_idx) == 0:
+        empty_float = np.empty(0, dtype=float)
+        return empty_float, empty_float, np.empty(0, dtype=int)
+
+    aa1 = a1[input_idx]
+    aa2 = a2[input_idx]
+    bb1 = b1[input_idx]
+    bb2 = b2[input_idx]
+    da = aa2 - aa1
+    db = bb2 - bb1
+    det = da[:, 0] * (-db[:, 1]) - (-db[:, 0]) * da[:, 1]
+    parallel = np.abs(det) < 1e-12
+    rhs_x = bb1[:, 0] - aa1[:, 0]
+    rhs_y = bb1[:, 1] - aa1[:, 1]
+    ta_num = rhs_x * (-db[:, 1]) - (-db[:, 0]) * rhs_y
+    tb_num = da[:, 0] * rhs_y - rhs_x * da[:, 1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ta = np.where(~parallel, ta_num / det, np.nan)
+        tb = np.where(~parallel, tb_num / det, np.nan)
+    valid = (~parallel) & (ta >= 0.0) & (ta <= 1.0) & (tb >= 0.0) & (tb <= 1.0)
+    valid_idx = np.flatnonzero(valid)
+    if len(valid_idx) == 0:
+        empty_float = np.empty(0, dtype=float)
+        return empty_float, empty_float, np.empty(0, dtype=int)
+    return (
+        aa1[valid_idx, 0] + ta[valid_idx] * da[valid_idx, 0],
+        aa1[valid_idx, 1] + ta[valid_idx] * da[valid_idx, 1],
+        input_idx[valid_idx],
+    )
+
+
 # ── Segment-circle intersection (scalar) ──────────────────────────────
 
 
