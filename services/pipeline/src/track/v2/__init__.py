@@ -13,8 +13,23 @@ Both feed into the same topology verification (entry/exit → branch clustering)
 """
 
 from .cleaner1 import clean
+from .clip import extract_clips, extract_clips_for_run
 from .intersect2 import IntersectConfig, IntersectResult, detect_intersections
-from .models import CleanerConfig, CsvSource, PostgresSource, TrajectoryPoint
+from .models import (
+    CleanerConfig,
+    ClipConfig,
+    ClipEndpoint,
+    ClipInput,
+    ClipIntersection,
+    ClipReport,
+    ClipResult,
+    ClipTrack,
+    CsvSource,
+    PointRef,
+    PostgresSource,
+    TrackClip,
+    TrajectoryPoint,
+)
 from .parser0 import get_database
 from .replay import ReplayService, ReplayTarget
 

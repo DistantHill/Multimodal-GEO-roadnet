@@ -242,6 +242,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             observation_count           INTEGER NOT NULL,
             is_complete                 BOOLEAN NOT NULL DEFAULT TRUE,
             reason                      TEXT NOT NULL,
+            clip_radius_m               DOUBLE PRECISION NOT NULL,
             geom                        geometry(Polygon, 4326),  -- app-layer: derived from candidate_intersections
             created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
@@ -444,6 +445,11 @@ def _run_migrations(cur: Any) -> None:
             "intersection_run_id",
             "ALTER TABLE intersections ADD COLUMN IF NOT EXISTS "
             "run_id UUID REFERENCES pipeline_runs(id)",
+        ),
+        (
+            "intersection_clip_radius",
+            "ALTER TABLE intersections ADD COLUMN IF NOT EXISTS "
+            "clip_radius_m DOUBLE PRECISION",
         ),
         (
             "entry_exit_run_id",

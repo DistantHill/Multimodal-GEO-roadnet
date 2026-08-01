@@ -531,6 +531,7 @@ class IntersectionTopology(TrackModel):
     observation_count: int
     is_complete: bool
     reason: str
+    clip_radius_m: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -551,6 +552,89 @@ class IntersectReport(TrackModel):
     complete_intersection_source_ratios: dict[str, float] = field(default_factory=dict)
     complete_intersection_critical_source_counts: dict[str, int] = field(default_factory=dict)
     complete_intersection_critical_source_ratios: dict[str, float] = field(default_factory=dict)
+
+
+# ── Clip output models ──────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class ClipIntersection(TrackModel):
+    """One verified intersection circle used for trajectory clipping."""
+
+    cluster_id: int
+    lon: float
+    lat: float
+    radius_m: float
+
+
+@dataclass(frozen=True, slots=True)
+class ClipTrack(TrackModel):
+    """One time-ordered trip presented to the Clip module."""
+
+    vehicle_id: str
+    trip_id: str
+    points: tuple[TrajectoryPoint, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ClipInput(TrackModel):
+    """Complete, storage-independent input for one Clip extraction."""
+
+    intersections: tuple[ClipIntersection, ...]
+    tracks: tuple[ClipTrack, ...]
+    run_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ClipEndpoint(TrackModel):
+    """An exact trip or interpolated intersection endpoint."""
+
+    kind: str
+    lon: float
+    lat: float
+    timestamp: float
+    cluster_id: int | None
+    segment_index: int
+    segment_fraction: float
+
+
+@dataclass(frozen=True, slots=True)
+class TrackClip(TrackModel):
+    """One trajectory fragment outside verified intersection circles."""
+
+    clip_id: str
+    vehicle_id: str
+    trip_id: str
+    clip_type: str
+    start: ClipEndpoint
+    end: ClipEndpoint
+    points: tuple[TrajectoryPoint, ...]
+    distance_m: float
+    point_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ClipReport(TrackModel):
+    total_vehicles: int
+    total_clips: int
+    inter_intersection_clips: int
+    boundary_clips: int
+    total_points_in_clips: int
+    unmatched_entry_count: int = 0
+    unmatched_exit_count: int = 0
+    skipped_degenerate_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ClipResult(TrackModel):
+    clips: tuple[TrackClip, ...]
+    report: ClipReport
+    run_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ClipConfig(TrackModel):
+    include_boundary_clips: bool = True
 
 
 # ── Replay output models ────────────────────────────────────────────

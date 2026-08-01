@@ -2252,6 +2252,10 @@ def _build_topology_for_cluster(
         observation_count=len(observations),
         is_complete=is_complete,
         reason=reason,
+        clip_radius_m=max(
+            cfg.min_intersection_radius_m,
+            cluster.radius_m + cfg.topology_radius_padding_m,
+        ),
     )
     return topology, cluster, observations
 
