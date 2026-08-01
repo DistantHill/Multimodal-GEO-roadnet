@@ -224,6 +224,7 @@ def mark_excluded_points(
         若无映射（原地场景），``source_row_key`` 本身就是 id。
     """
     if not excluded:
+        print("  mark_excluded_points: 没有点被标记排除 / no points to mark")
         return 0
 
     ids: list[int] = []
@@ -233,7 +234,6 @@ def mark_excluded_points(
             ids.append(tp_id_map[key])
         else:
             ids.append(int(item.point_ref.source_row_key))
-
     with conn.cursor() as cur:
         cur.execute(
             f"UPDATE {table} SET is_active = FALSE WHERE id = ANY(%s::bigint[])",
