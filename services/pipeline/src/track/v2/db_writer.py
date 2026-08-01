@@ -345,7 +345,8 @@ def insert_kept_trajectory_points(
     with conn.cursor() as cur:
         with cur.copy(
             "COPY kept_trajectory_points "
-            "(run_id, trajectory_point_id, vehicle_id, subtrack_index, sequence_in_subtrack) "
+            "(run_id, trajectory_point_id, source_id, source_row_key, "
+            "vehicle_id, subtrack_index, sequence_in_subtrack) "
             "FROM STDIN"
         ) as copy:
             for st_idx, subtrack in enumerate(kept_subtracks, start=1):
@@ -355,7 +356,15 @@ def insert_kept_trajectory_points(
                     if tp_id is None:
                         # Fallback: source_row_key is the DB primary key in PG mode
                         tp_id = int(point.point_ref.source_row_key)
-                    copy.write_row((run_id, tp_id, point.vehicle_id, st_idx, seq_idx))
+                    copy.write_row((
+                        run_id,
+                        tp_id,
+                        point.point_ref.source_id,
+                        point.point_ref.source_row_key,
+                        point.vehicle_id,
+                        st_idx,
+                        seq_idx,
+                    ))
 
 
 def insert_injected_points(

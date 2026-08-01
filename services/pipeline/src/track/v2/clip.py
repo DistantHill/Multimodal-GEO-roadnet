@@ -248,16 +248,18 @@ def _load_clip_input_for_run(
     if skip_clean:
         point_sql = (
             "SELECT tp.vehicle_id, 0 AS subtrack_index, tp.id AS sequence_in_subtrack, "
-            "tp.id, tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, tp.extra "
+            "%s::text AS point_source_id, tp.id::text AS source_row_key, "
+            "tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, tp.extra "
             f"FROM {table} AS tp "
             "WHERE tp.is_active IS NOT FALSE "
             "ORDER BY tp.vehicle_id, tp.timestamp, tp.id"
         )
-        point_params: tuple[object, ...] = ()
+        point_params: tuple[object, ...] = (source_id,)
     else:
         point_sql = (
             "SELECT ktp.vehicle_id, ktp.subtrack_index, ktp.sequence_in_subtrack, "
-            "tp.id, tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, tp.extra "
+            "ktp.source_id, ktp.source_row_key, "
+            "tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, tp.extra "
             "FROM kept_trajectory_points AS ktp "
             f"JOIN {table} AS tp ON tp.id = ktp.trajectory_point_id "
             "WHERE ktp.run_id = %s AND tp.is_active IS NOT FALSE "
@@ -272,16 +274,20 @@ def _load_clip_input_for_run(
         for row in cur:
             vehicle_id = str(row[0])
             subtrack_index = int(row[1])
+            if row[3] is None or row[4] is None:
+                raise ValueError(
+                    f"pipeline run {run_id} predates persisted source references"
+                )
             grouped.setdefault((vehicle_id, subtrack_index), []).append(
                 TrajectoryPoint(
-                    point_ref=PointRef(str(source_id), str(row[3]), stable=True),
+                    point_ref=PointRef(str(row[3]), str(row[4]), stable=True),
                     vehicle_id=vehicle_id,
-                    timestamp=float(row[4]),
-                    lon=float(row[5]),
-                    lat=float(row[6]),
-                    heading=float(row[7]),
-                    speed=float(row[8]),
-                    extra=row[9] if isinstance(row[9], dict) else {},
+                    timestamp=float(row[5]),
+                    lon=float(row[6]),
+                    lat=float(row[7]),
+                    heading=float(row[8]),
+                    speed=float(row[9]),
+                    extra=row[10] if isinstance(row[10], dict) else {},
                 )
             )
 

@@ -79,6 +79,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             id                      BIGSERIAL PRIMARY KEY,
             run_id                  UUID NOT NULL REFERENCES pipeline_runs(id),
             trajectory_point_id     BIGINT NOT NULL,
+            source_id               TEXT NOT NULL,
+            source_row_key          TEXT NOT NULL,
             vehicle_id              TEXT NOT NULL,
             subtrack_index          INTEGER NOT NULL DEFAULT 1,
             sequence_in_subtrack    INTEGER NOT NULL,
@@ -376,6 +378,12 @@ def _run_migrations(cur: Any) -> None:
             "kept_run_id",
             "ALTER TABLE kept_trajectory_points ADD COLUMN IF NOT EXISTS "
             "run_id UUID REFERENCES pipeline_runs(id)",
+        ),
+        (
+            "kept_source_ref",
+            "ALTER TABLE kept_trajectory_points "
+            "ADD COLUMN IF NOT EXISTS source_id TEXT, "
+            "ADD COLUMN IF NOT EXISTS source_row_key TEXT",
         ),
         (
             "injected_run_id",

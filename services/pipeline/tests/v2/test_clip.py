@@ -243,7 +243,10 @@ class _ReplayConnection:
 class ClipDatabaseReplayTest(unittest.TestCase):
     def test_completed_run_replays_its_intersections_and_kept_active_points(self) -> None:
         point_rows = [
-            ("vehicle-1", 1, index, index + 1, float(index * 10), x / _METERS_PER_DEGREE, 0.0, 90.0, 5.0, {})
+            (
+                "vehicle-1", 1, index, "synthetic", str(index + 1),
+                float(index * 10), x / _METERS_PER_DEGREE, 0.0, 90.0, 5.0, {},
+            )
             for index, x in enumerate(range(-300, 301, 50))
         ]
         conn = _ReplayConnection([
@@ -261,8 +264,10 @@ class ClipDatabaseReplayTest(unittest.TestCase):
         self.assertEqual(result.report.inter_intersection_clips, 1)
         point_query, point_params = conn.executions[2]
         self.assertIn("kept_trajectory_points", point_query)
+        self.assertIn("ktp.source_id", point_query)
         self.assertIn("is_active IS NOT FALSE", point_query)
         self.assertEqual(point_params, ("run-1",))
+        self.assertEqual(result.clips[0].points[0].point_ref.source_id, "synthetic")
 
     def test_incomplete_run_is_rejected_before_loading_artifacts(self) -> None:
         conn = _ReplayConnection([
@@ -297,7 +302,10 @@ class ClipDatabaseReplayTest(unittest.TestCase):
 
     def test_skip_clean_replay_splits_current_active_points_at_recorded_gap(self) -> None:
         point_rows = [
-            ("vehicle-1", 0, index + 1, index + 1, timestamp, x / _METERS_PER_DEGREE, 0.0, 90.0, 5.0, {})
+            (
+                "vehicle-1", 0, index + 1, "synthetic", str(index + 1),
+                timestamp, x / _METERS_PER_DEGREE, 0.0, 90.0, 5.0, {},
+            )
             for index, (timestamp, x) in enumerate(((0.0, -50), (10.0, 0), (500.0, 50), (510.0, 100)))
         ]
         conn = _ReplayConnection([
