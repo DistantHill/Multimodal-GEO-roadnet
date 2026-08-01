@@ -187,7 +187,7 @@ class CrossTrackWindowProgressTest(unittest.TestCase):
             )
 
         output = "\n".join(str(call.args[0]) for call in print_mock.call_args_list)
-        self.assertIn("Spatial window: 1/9", output)
+        self.assertIn("当前窗口/Current window:\t1/9", output)
 
     def test_cross_track_windows_deduplicate_overlapping_segment_pairs(self):
         origin_lon, origin_lat = 116.0, 39.0
@@ -489,11 +489,13 @@ class OrthogonalCandidateTest(unittest.TestCase):
             ],
         }
 
-        candidates = _extract_orthogonal_cross_track_candidates(
+        candidates, pair_count, total_pairs = _extract_orthogonal_cross_track_candidates(
             tracks, origin_lon, origin_lat, IntersectConfig(),
         )
 
         self.assertEqual(len(candidates), 1)
+        self.assertEqual(pair_count, 1)
+        self.assertEqual(total_pairs, 1)
         candidate = candidates[0]
         self.assertEqual(candidate.vehicle_id, "A|B")
         self.assertEqual(candidate.from_source_id, "table_a")

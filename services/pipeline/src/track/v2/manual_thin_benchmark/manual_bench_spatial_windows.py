@@ -131,7 +131,7 @@ def main() -> None:
 
         # ── Step 3: extract candidates ──
         t3 = time.perf_counter()
-        candidates = _extract_orthogonal_cross_track_candidates(
+        candidates, _, _ = _extract_orthogonal_cross_track_candidates(
             window_tracks, origin_lon, origin_lat, cfg,
         )
         t_extract += time.perf_counter() - t3

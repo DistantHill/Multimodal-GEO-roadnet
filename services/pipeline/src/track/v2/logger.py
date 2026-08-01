@@ -339,6 +339,7 @@ class LiveStatus:
         self._stage_name = stage_name
         self._progress: float | None = None       # None = no progress bar
         self._detail: str = ""
+        self._sub_detail: str = ""                # nested/secondary progress line
         self._elapsed: float = 0.0
         self._throughput: str = ""
         self._live: Live | None = None
@@ -347,26 +348,35 @@ class LiveStatus:
         self,
         progress: float | None = None,
         detail: str = "",
+        sub_detail: str = "",
         elapsed: float | None = None,
         throughput: str = "",
+        stage: str | None = None,
     ) -> None:
         """ZH: 更新面板内容。progress=None 时不显示进度条。
         EN: Update the panel content. When progress is None, hide the progress bar.
 
         Args:
             progress: 进度 0.0–1.0，None 表示隐藏进度条
-            detail: 计数描述，如 "1,203 / 2,314 车辆"
+            detail: 计数描述，如 "1,203 / 2,314 车辆"。空字符串不覆盖已有值。
+            sub_detail: 嵌套进度行（如窗口内的跨车求交进度）。
+                       空字符串会清除该行——与 detail 不同。
             elapsed: 已用秒数
             throughput: 吞吐描述，如 "26.6 车辆/s"
+            stage: 动态阶段名；非 None 时覆盖 __init__ 的 stage_name
         """
         if progress is not None:
             self._progress = max(0.0, min(1.0, progress))
         if detail:
             self._detail = detail
+        # sub_detail: always assign — empty string clears the row
+        self._sub_detail = sub_detail
         if elapsed is not None:
             self._elapsed = elapsed
         if throughput:
             self._throughput = throughput
+        if stage is not None:
+            self._stage_name = stage
 
         if self._live is not None:
             self._live.update(self._render())
@@ -399,7 +409,7 @@ class LiveStatus:
         """ZH: 渲染当前状态的 rich renderable。
         EN: Render the current state as a rich renderable."""
         table = Table.grid(padding=(0, 2))
-        table.add_column(justify="center")
+        table.add_column(justify="left")
 
         # Stage name header
         table.add_row(Text(f"[{self._stage_name}]", style="bold cyan"))
@@ -425,6 +435,10 @@ class LiveStatus:
             parts.append(f"> {self._throughput}")
         if parts:
             table.add_row(Text("  |  ".join(parts), style="dim"))
+
+        # Sub-detail row (nested progress, e.g. cross-track inside a spatial window)
+        if self._sub_detail:
+            table.add_row(Text(self._sub_detail, style="dim italic"))
 
         return Panel(
             table,
