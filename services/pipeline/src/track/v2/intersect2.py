@@ -498,7 +498,7 @@ def detect_intersections(
     PRD v2 Intersect2 §2
 
     Two modes:
-      - **Handle mode** (default): ``source`` is a ``TrajectorySourceHandle``.
+      - **Handle mode**: ``source`` is a ``TrajectorySourceHandle``.
         All points are read into memory and grouped by vehicle_id.
       - **DB mode**: ``conn`` is a psycopg connection and
         ``config.query_active_from_db`` is True.  Points are queried from
@@ -507,30 +507,34 @@ def detect_intersections(
     """
     cfg = config or IntersectConfig()
 
-    # ── DB mode: spatial sliding windows ────────────────────────────
     if conn is not None and cfg.query_active_from_db:
         return _detect_intersections_db(conn, cfg)
+    elif source is not None:
+        return _detect_intersections_handle(source, cfg)
+    else:
+        raise V2Error(
+            "detect_intersections: provide either 'source' (handle mode) "
+            "or 'conn' + query_active_from_db (DB mode)"
+        )
 
-    # ── Handle mode: in-memory ─────────────────────────────────────
-    if source is None:
-        raise V2Error("detect_intersections: 'source' handle is required when not in DB mode")
 
+def _detect_intersections_handle(
+    source: TrajectorySourceHandle,
+    cfg: IntersectConfig,
+) -> IntersectResult:
     tracks, origin_lon, origin_lat = _group_by_vehicle(source)
     if not tracks:
         return _empty_intersect_result()
 
-    # ── Methods 1, 2, 3: candidate extraction ──────────────────────
     turn_events, ortho_candidates, cross_candidates = _extract_methods_123(
-        tracks, origin_lon, origin_lat, cfg
+        tracks, origin_lon, origin_lat, cfg,
     )
 
-    # ── Shared: cluster pipeline (G* + DBSCAN + merge + ablation) ──
     hotspot_events, annotated_clusters = _cluster_pipeline(
         turn_events, ortho_candidates, cross_candidates,
         origin_lon, origin_lat, cfg,
     )
 
-    # ── Handle-mode topology (in-memory tracks) ────────────────────
     topologies, annotated_clusters, observations = _build_intersection_topologies(
         annotated_clusters, tracks, origin_lon, origin_lat, cfg,
     )
