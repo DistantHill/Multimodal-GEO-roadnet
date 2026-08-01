@@ -11,6 +11,7 @@ import json
 import sys
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import date, datetime
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Callable, Iterator, Protocol, TextIO
 
@@ -110,7 +111,7 @@ def _format_scalar(value: object) -> str:
 # ── Parser 0 + Cleaner 1 output models ──────────────────────────────
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PointRef(TrackModel):
     """Immutable reference to one point in the source data.
 
@@ -126,7 +127,7 @@ class PointRef(TrackModel):
     source_row_hash: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TrajectoryPoint(TrackModel):
     """Normalized trajectory point emitted by Parser 0 iter_points().
 
@@ -168,6 +169,13 @@ class FieldMapping(TrackModel):
 
     specs: list[FieldSpec]
     canonical_to_source: dict[str, str]
+
+    @cached_property
+    def specs_by_canonical(self) -> dict[str, FieldSpec]:
+        """ZH: 按 canonical 名索引的 spec 缓存——parse_row 热路径每行都需要，
+            预构建避免每行重建 dict。
+        EN: Canonical-name → FieldSpec cache for the parse_row hot path."""
+        return {spec.canonical: spec for spec in self.specs}
 
 
 @dataclass(frozen=True)

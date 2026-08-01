@@ -314,14 +314,37 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
             cur = conn.cursor(
                 name=f"iter_pts_{uuid.uuid4().hex}",
             )
+            # ZH: psycopg3 默认 itersize=100（非 psycopg2 的 2000），1M 行=10k 次 FETCH。
+            #     增大到 10000 减少 ~100x 往返；itersize 是 mutable 属性，非构造参数。
+            # EN: psycopg3 defaults to itersize=100 (not 2000 like psycopg2).
+            #     Bump to 10k to cut FETCH round-trips ~100x; itersize is mutable.
+            cur.itersize = 10_000
             cur.execute(self._source.query, self._source.params)
             columns = [desc[0] for desc in (cur.description or [])]
+
+            # ── 预计算：列名→位置，用于元组快速路径跳过 dict 分配 ──
+            #     Pre-compute column→position index for tuple fast-path
+            #     (avoids per-row _row_to_dict + _raw_value double lookup).
+            col_index: dict[str, int] = {name: i for i, name in enumerate(columns)}
+            specs = self._mapping.specs_by_canonical
+            # 构建 canonical→tuple_index 的子集（仅含 spec 中定义的 canonical 字段）
+            _fast_col_index: dict[str, int] = {}
+            for spec in self._mapping.specs:
+                src_col = self._mapping.canonical_to_source.get(spec.canonical)
+                if src_col and src_col in col_index:
+                    _fast_col_index[spec.canonical] = col_index[src_col]
+
+            # PK 列索引（用于 _point_ref）
+            pk_field = self._source.primary_key_field
+            pk_idx: int | None = col_index.get(pk_field) if pk_field else None
+            source_id = self._source_id()
+
             for ordinal, row in enumerate(cur, start=1):
                 self._state.total_rows += 1
-                row_dict = _row_to_dict(row, columns)
-                point_ref = self._point_ref(row_dict, ordinal)
                 try:
-                    point, issues = parse_row(row_dict, point_ref, ordinal, self._mapping)
+                    point, issues = _parse_row_from_tuple(
+                        row, ordinal, _fast_col_index, specs, source_id, pk_idx,
+                    )
                 except _SkipRow as exc:
                     self._state.add_issue(exc.issue)
                     self._state.assert_thresholds()
@@ -442,13 +465,143 @@ class _SkipRow(Exception):
         super().__init__(issue.reason)
 
 
+def _parse_row_from_tuple(
+    row: tuple,
+    ordinal: int,
+    col_index: dict[str, int],       # canonical → tuple position
+    specs: dict[str, FieldSpec],
+    source_id: str,
+    pk_idx: int | None,
+) -> tuple[TrajectoryPoint, list[ParseIssue]]:
+    """ZH: PG 元组快速解析路径——跳过 _row_to_dict dict 分配 + _raw_value 双 dict 查找，
+        直接用 tuple[row_idx] 索引。保留 parse_row 全部校验语义。
+    EN: Fast-path tuple parser for PG rows — skips per-row dict allocation and
+        double dict lookup in _raw_value. Preserves all parse_row validation.
+    """
+    issues: list[ParseIssue] = []
+
+    # ── PointRef from tuple PK column ──
+    if pk_idx is not None:
+        pk_val = row[pk_idx]
+        if pk_val not in (None, ""):
+            point_ref = PointRef(source_id, str(pk_val), True)
+        else:
+            point_ref = PointRef(source_id, str(ordinal), False)
+    else:
+        point_ref = PointRef(source_id, str(ordinal), False)
+
+    def _fast_issue(level: str, reason: str) -> ParseIssue:
+        return ParseIssue(
+            point_ref=point_ref, row_number=ordinal,
+            level=level, reason=reason, raw_values={},
+        )
+
+    # ── vehicle_id (required str) ──
+    vid_spec = specs.get("vehicle_id")
+    if vid_spec is None:
+        raise _SkipRow(_fast_issue("ERROR", "vehicle_id spec not found"))
+    vid_raw = row[col_index["vehicle_id"]] if "vehicle_id" in col_index else None
+    vehicle_id = "" if vid_raw is None else str(vid_raw).strip()
+    if not vehicle_id:
+        raise _SkipRow(_fast_issue("ERROR", "vehicle_id missing"))
+
+    # ── timestamp (required) ──
+    ts_spec = specs.get("timestamp")
+    if ts_spec is None:
+        raise _SkipRow(_fast_issue("ERROR", "timestamp spec not found"))
+    ts_raw = row[col_index["timestamp"]] if "timestamp" in col_index else None
+    try:
+        timestamp = _parse_timestamp(ts_raw) * ts_spec.unit_scale
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _SkipRow(_fast_issue("ERROR", "timestamp invalid")) from exc
+    if not math.isfinite(timestamp):
+        raise _SkipRow(_fast_issue("ERROR", "timestamp non-finite"))
+
+    # ── lon (required float) ──
+    lon_spec = specs.get("lon")
+    if lon_spec is None:
+        raise _SkipRow(_fast_issue("ERROR", "lon spec not found"))
+    lon_raw = row[col_index["lon"]] if "lon" in col_index else None
+    try:
+        lon = float(lon_raw) * lon_spec.unit_scale
+    except (TypeError, ValueError) as exc:
+        raise _SkipRow(_fast_issue("ERROR", "lon invalid")) from exc
+    if not math.isfinite(lon):
+        raise _SkipRow(_fast_issue("ERROR", "lon non-finite"))
+    if not -180.0 <= lon <= 180.0:
+        raise _SkipRow(_fast_issue("ERROR", "lon out of bounds"))
+
+    # ── lat (required float) ──
+    lat_spec = specs.get("lat")
+    if lat_spec is None:
+        raise _SkipRow(_fast_issue("ERROR", "lat spec not found"))
+    lat_raw = row[col_index["lat"]] if "lat" in col_index else None
+    try:
+        lat = float(lat_raw) * lat_spec.unit_scale
+    except (TypeError, ValueError) as exc:
+        raise _SkipRow(_fast_issue("ERROR", "lat invalid")) from exc
+    if not math.isfinite(lat):
+        raise _SkipRow(_fast_issue("ERROR", "lat non-finite"))
+    if not -90.0 <= lat <= 90.0:
+        raise _SkipRow(_fast_issue("ERROR", "lat out of bounds"))
+
+    # ── heading (optional float) ──
+    hdg_spec = specs.get("heading")
+    heading: float = 0.0
+    if hdg_spec is not None and "heading" in col_index:
+        hdg_raw = row[col_index["heading"]]
+        if hdg_raw in (None, ""):
+            heading = _float_default(hdg_spec)
+        else:
+            try:
+                heading = float(hdg_raw) * hdg_spec.unit_scale
+            except (TypeError, ValueError):
+                heading = _float_default(hdg_spec)
+                issues.append(_fast_issue("WARN", "heading invalid; using default"))
+    if not math.isfinite(heading):
+        heading = _float_default(hdg_spec) if hdg_spec else 0.0
+        issues.append(_fast_issue("WARN", "heading non-finite; using default"))
+    elif not 0.0 <= heading < 360.0:
+        heading %= 360.0
+        issues.append(_fast_issue("WARN", "heading normalized to [0, 360)"))
+
+    # ── speed (optional float) ──
+    spd_spec = specs.get("speed")
+    speed: float = 0.0
+    if spd_spec is not None and "speed" in col_index:
+        spd_raw = row[col_index["speed"]]
+        if spd_raw in (None, ""):
+            speed = _float_default(spd_spec)
+        else:
+            try:
+                speed = float(spd_raw) * spd_spec.unit_scale
+            except (TypeError, ValueError):
+                speed = _float_default(spd_spec)
+                issues.append(_fast_issue("WARN", "speed invalid; using default"))
+    if not math.isfinite(speed) or speed < 0.0:
+        speed = _float_default(spd_spec) if spd_spec else 0.0
+        issues.append(_fast_issue("WARN", "speed invalid; using default"))
+
+    point = TrajectoryPoint(
+        point_ref=point_ref,
+        vehicle_id=vehicle_id,
+        timestamp=timestamp,
+        lon=lon,
+        lat=lat,
+        heading=heading,
+        speed=speed,
+        extra={},
+    )
+    return point, issues
+
+
 def parse_row(
     row: dict[str, Any],
     point_ref: PointRef,
     row_number: int,
     mapping: FieldMapping,
 ) -> tuple[TrajectoryPoint, list[ParseIssue]]:
-    specs = {spec.canonical: spec for spec in mapping.specs}
+    specs = mapping.specs_by_canonical
     issues: list[ParseIssue] = []
 
     vehicle_id = _required_str(row, specs["vehicle_id"], mapping, point_ref, row_number)
