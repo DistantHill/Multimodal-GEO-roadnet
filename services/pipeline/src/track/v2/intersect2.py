@@ -1022,6 +1022,7 @@ def _extract_cross_track_windows(
         window_tracks = _tracks_from_points(points)
         for candidate in _extract_orthogonal_cross_track_candidates(
             window_tracks, origin_lon, origin_lat, cfg,
+            live_status=live_status,
         ):
             key = _cross_track_candidate_key(candidate)
             if key not in seen_segment_pairs:
@@ -1413,11 +1414,35 @@ def _extract_orthogonal_candidates(
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _emit_cross_track_progress(
+    live_status: Any,
+    pair_count: int,
+    total_pairs: int,
+    candidate_count: int,
+    elapsed: float,
+) -> None:
+    """ZH: 跨车求交进度输出（format string + 输出分支的唯一一处）。
+    EN: Cross-track progress emit — single source of truth for format + routing."""
+    detail = (
+        f"跨车求交 / Cross-track: {pair_count:,}/{total_pairs:,} "
+        f"车辆对/pairs, {candidate_count:,} 候选/candidates"
+    )
+    if live_status is not None:
+        live_status.update(
+            progress=pair_count / total_pairs,
+            detail=detail,
+            elapsed=elapsed,
+        )
+    else:
+        print(f"    ... {detail} ({elapsed:.1f}s)")
+
+
 def _extract_orthogonal_cross_track_candidates(
     tracks: dict[str, list[TrajectoryPoint]],
     origin_lon: float,
     origin_lat: float,
     cfg: IntersectConfig,
+    live_status: Any = None,
 ) -> list[CrossTrackCandidate]:
     """Multi-vehicle segment crossing detection via NumPy batched intersection.
 
@@ -1427,6 +1452,10 @@ def _extract_orthogonal_cross_track_candidates(
         3. 每对不同车辆间一次 NumPy broadcasting 完成所有段对的求交+夹角过滤
 
     段 S_j = (P_j → P_{j+1}) 的方位角用 ``track[j].heading`` 近似。
+
+    If *live_status* is a ``LiveStatus`` panel, progress is rendered as a
+    sub-progress bar under "Intersect2: Spatial Windows"; otherwise a periodic
+    print fallback is used (handle mode).
     """
     # ── Step 1: 预过滤直段 (heading 前后差 ≤ straightness_deg) ──────
     # track_segs[vid] = [(x1,y1, x2,y2, heading, timestamp, seg_idx), ...]
@@ -1519,9 +1548,16 @@ def _extract_orthogonal_cross_track_candidates(
             pair_count += 1
             now = time.perf_counter()
             if pair_count % 100 == 0 or (now - last_t) >= 3.0:
-                print(f"    ... 跨车求交 / Cross-track: {pair_count:,}/{total_pairs:,} "
-                      f"车辆对/pairs, {len(candidates):,} 候选/candidates ({now - t0:.1f}s)")
+                _emit_cross_track_progress(
+                    live_status, pair_count, total_pairs,
+                    len(candidates), now - t0,
+                )
                 last_t = now
+
+    elapsed = time.perf_counter() - t0
+    _emit_cross_track_progress(
+        None, pair_count, total_pairs, len(candidates), elapsed,
+    )
     return candidates
 
 
