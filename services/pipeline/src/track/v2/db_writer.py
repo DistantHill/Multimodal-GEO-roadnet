@@ -736,7 +736,7 @@ def insert_intersections(
             clip_radius_m = topo.clip_radius_m or (
                 cluster.radius_m if cluster is not None else 0.0
             )
-            if clip_radius_m <= 0.0:
+            if not clip_radius_m > 0.0:
                 raise ValueError(
                     f"complete intersection {topo.cluster_id} requires a positive clip radius"
                 )

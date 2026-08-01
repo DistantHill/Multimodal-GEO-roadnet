@@ -234,7 +234,7 @@ def _load_clip_input_for_run(
         for cluster_id, lon, lat, radius_m in cur:
             if radius_m is None:
                 raise ValueError(f"pipeline run {run_id} predates Clip radius persistence")
-            if float(radius_m) <= 0.0:
+            if not math.isfinite(float(radius_m)) or float(radius_m) <= 0.0:
                 raise ValueError(f"pipeline run {run_id} has an invalid Clip radius")
             intersections.append(
                 ClipIntersection(
@@ -376,7 +376,9 @@ def _extract_track_clips(
     trip_start = _trip_endpoint(track, start=True)
     trip_end = _trip_endpoint(track, start=False)
     if not events:
-        if include_boundaries:
+        if include_boundaries and not _inside_any_intersection(
+            track.points[0], intersections
+        ):
             append_clip(trip_start, trip_end, "full_track")
         return clips, skipped, unmatched_entries, unmatched_exits
 
@@ -455,12 +457,26 @@ def _crossing_events(
             previous = deduplicated[-1]
             if (
                 previous.endpoint.cluster_id == event.endpoint.cluster_id
-                and previous.endpoint.kind == event.endpoint.kind
                 and abs(previous.progress - event.progress) <= _EPS
             ):
+                if previous.endpoint.kind != event.endpoint.kind:
+                    # An outside -> boundary -> outside reversal touches the
+                    # circle at a shared vertex but never enters its interior.
+                    deduplicated.pop()
                 continue
         deduplicated.append(event)
     return deduplicated
+
+
+def _inside_any_intersection(
+    point: TrajectoryPoint,
+    intersections: tuple[ClipIntersection, ...],
+) -> bool:
+    for intersection in intersections:
+        x, y = _to_xy(point.lon, point.lat, intersection.lon, intersection.lat)
+        if math.hypot(x, y) < intersection.radius_m - _EPS:
+            return True
+    return False
 
 
 def _circle_crossing_fractions(
@@ -480,7 +496,11 @@ def _circle_crossing_fractions(
         return ()
     root = math.sqrt(discriminant)
     values = sorted(((-qb - root) / (2.0 * qa), (-qb + root) / (2.0 * qa)))
-    return tuple(value for value in values if -_EPS <= value <= 1.0 + _EPS)
+    return tuple(
+        min(1.0, max(0.0, value))
+        for value in values
+        if -_EPS <= value <= 1.0 + _EPS
+    )
 
 
 def _trip_endpoint(track: ClipTrack, *, start: bool) -> ClipEndpoint:

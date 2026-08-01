@@ -76,6 +76,42 @@ class ClipExtractionTest(unittest.TestCase):
         self.assertEqual(result.clips[0].start.kind, "trip_start")
         self.assertEqual(result.clips[0].end.kind, "trip_end")
 
+    def test_track_entirely_inside_an_intersection_produces_no_road_clip(self) -> None:
+        source = ClipInput(
+            intersections=(ClipIntersection(10, 0.0, 0.0, 20.0),),
+            tracks=(
+                ClipTrack(
+                    "vehicle-1",
+                    "trip-1",
+                    (_point("vehicle-1", 0, -10), _point("vehicle-1", 1, 10)),
+                ),
+            ),
+        )
+
+        result = extract_clips(source)
+
+        self.assertEqual(result.clips, ())
+
+    def test_outside_track_reversing_at_boundary_is_not_split(self) -> None:
+        source = ClipInput(
+            intersections=(ClipIntersection(10, 0.0, 0.0, 20.0),),
+            tracks=(
+                ClipTrack(
+                    "vehicle-1",
+                    "trip-1",
+                    (
+                        _point("vehicle-1", 0, -100),
+                        _point("vehicle-1", 1, -20),
+                        _point("vehicle-1", 2, -100),
+                    ),
+                ),
+            ),
+        )
+
+        result = extract_clips(source)
+
+        self.assertEqual([clip.clip_type for clip in result.clips], ["full_track"])
+
     def test_one_long_segment_can_enter_and_exit_the_same_intersection(self) -> None:
         points = (_point("vehicle-1", 0, -200), _point("vehicle-1", 1, 200))
         source = ClipInput(

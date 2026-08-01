@@ -442,6 +442,8 @@ def main() -> int:
             table=args.table,
             skip_clean=args.skip_clean,
         )
+        _print_write_summary(stats)
+        return 0
     except RuntimeError as exc:
         print(str(exc))
         return 2
@@ -453,7 +455,9 @@ def main() -> int:
     finally:
         shutdown_logger()
 
-    # ── Summary ──
+
+def _print_write_summary(stats: dict[str, int | str]) -> None:
+    """Print model-driven Clip fields plus persisted table row counts."""
     print("\n── 写入统计 / Write Summary ──")
     for table in [
         "trajectory_points", "kept_trajectory_points",
@@ -466,7 +470,6 @@ def main() -> int:
     for name, value in stats.items():
         if name.startswith("clip_") and isinstance(value, int):
             print(f"  {name:40s} {value:>10,}")
-    return 0
 
 
 if __name__ == "__main__":

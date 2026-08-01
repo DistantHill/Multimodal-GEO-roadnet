@@ -600,7 +600,11 @@ class ClipEndpoint(TrackModel):
 
 @dataclass(frozen=True, slots=True)
 class TrackClip(TrackModel):
-    """One trajectory fragment outside verified intersection circles."""
+    """One trajectory fragment outside verified intersection circles.
+
+    ``points`` contains only source points strictly inside the exact endpoint
+    bounds. ``point_count`` includes both explicit endpoints.
+    """
 
     clip_id: str
     vehicle_id: str
@@ -615,6 +619,8 @@ class TrackClip(TrackModel):
 
 @dataclass(frozen=True, slots=True)
 class ClipReport(TrackModel):
+    """Aggregate counts; ``total_points_in_clips`` includes endpoints."""
+
     total_vehicles: int
     total_clips: int
     inter_intersection_clips: int

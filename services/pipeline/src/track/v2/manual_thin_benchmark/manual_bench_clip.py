@@ -118,22 +118,25 @@ def main() -> int:
         candidate_count += len(candidates)
 
         phase_started = time.perf_counter()
+        segment_crossings = 0
         for candidate in candidates:
             relative_start = (start_xy[0] - candidate.x, start_xy[1] - candidate.y)
             relative_end = (end_xy[0] - candidate.x, end_xy[1] - candidate.y)
-            crossing_count += len(
+            segment_crossings += len(
                 _circle_crossing_fractions(
                     relative_start,
                     relative_end,
                     candidate.value.radius_m,
                 )
             )
+        crossing_count += segment_crossings
         root_s += time.perf_counter() - phase_started
 
-        if verbose and segment_index % 2_000 == 0:
+        if verbose:
             print(
-                f"  segments={segment_index:,}/{args.points - 1:,} "
-                f"candidates={candidate_count:,} crossings={crossing_count:,}"
+                f"  segment={segment_index:,}/{args.points - 1:,} "
+                f"state={'full' if candidates else 'empty'} "
+                f"candidates={len(candidates):,} crossings={segment_crossings:,}"
             )
     loop_wall_s = time.perf_counter() - loop_started
 
