@@ -111,9 +111,14 @@ def _chunked_insert_returning(
         return []
     col_list = ", ".join(columns)
     ret_list = ", ".join(returning_cols)
+    # ZH: PG 协议层参数上限 65535，按列数动态限制每批行数。
+    #     _BATCH=5000 * 15列 = 75,000 > 65,535 → 需要缩批。
+    # EN: PG wire protocol caps params at 65535; limit rows per batch by column count.
+    _max_rows = max(1, 65535 // len(columns))
+    _effective_batch = min(_BATCH, _max_rows)
     all_returned: list[tuple[Any, ...]] = []
-    for start in range(0, len(rows), _BATCH):
-        batch = rows[start : start + _BATCH]
+    for start in range(0, len(rows), _effective_batch):
+        batch = rows[start : start + _effective_batch]
         # psycopg 3: build parameterized multi-row VALUES instead of mogrify
         row_placeholders: list[str] = []
         params: list[Any] = []
@@ -136,9 +141,12 @@ def _chunked_insert(cur: Any, table: str, columns: list[str], rows: list[tuple[A
     if not rows:
         return
     col_list = ", ".join(columns)
-    placeholders = ", ".join(f"%({i})s" if isinstance(row, dict) else "%s" for i, row in enumerate(rows[:1]))
-    for start in range(0, len(rows), _BATCH):
-        batch = rows[start : start + _BATCH]
+    # ZH: PG 协议层参数上限 65535，按列数动态限制每批行数。
+    # EN: PG wire protocol caps params at 65535; limit rows per batch by column count.
+    _max_rows = max(1, 65535 // len(columns))
+    _effective_batch = min(_BATCH, _max_rows)
+    for start in range(0, len(rows), _effective_batch):
+        batch = rows[start : start + _effective_batch]
         # Build multi-row VALUES
         batch_strs = []
         params: list[Any] = []
@@ -318,11 +326,16 @@ def insert_kept_trajectory_points(
     *,
     run_id: str | None = None,
 ) -> None:
-    """Insert FK references for points that survived ``_exclude_stationary``.
+    """Persist references for points that survived ``_exclude_stationary``.
 
-    ZH: 写入保留点引用——每个子轨迹的保留点通过 FK 指向 trajectory_points。
-        ``kept_subtracks`` 的每个元素是 Cleaner 1 的一个 subtrack 的保留点列表。
+    ZH: 写入保留点引用——每个子轨迹的保留点通过 trajectory_point_id 指向源数据行。
+        CSV 模式：tp_ref_to_id 存 trajectory_points 自增 ID → 走 FK 映射。
+        PG 模式：tp_ref_to_id 为空 → 直接用 source_row_key（即源表主键）作为 trajectory_point_id 值。
         使用 PostgreSQL COPY FROM STDIN 流式写入，避免逐批 INSERT 的网络往返开销。
+    EN: Persist per-point references for kept subtracks.  CSV mode uses
+        ``tp_ref_to_id`` to map to ``trajectory_points`` auto-increment IDs.
+        PG mode (empty map) stores the source PK (``source_row_key``) directly
+        as ``trajectory_point_id``.  Uses COPY FROM STDIN for streaming write.
     """
     if run_id is None:
         raise ValueError("run_id is required for derived v2 persistence")

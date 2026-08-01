@@ -150,19 +150,16 @@ def run_pipeline(
                 total_raw += len(vehicle_points)
                 vehicle_count += 1
 
-                # ZH: 始终向 trajectory_points 插入以保证 FK 完整性。
-                #     仅当直接从 trajectory_points 本身读取时才可跳过
-                #     （行已存在且 source_row_key 即为 trajectory_points.id）。
-                #     自定义 --pg-table 的源表仍需插入 trajectory_points，
-                #     因为 kept_trajectory_points 等表的外键硬编码指向 trajectory_points(id)。
-                # EN: Always insert into trajectory_points for FK integrity.
-                #     The skip is safe only when reading from trajectory_points
-                #     itself (rows already exist and source_row_key equals
-                #     trajectory_points.id).  Custom --pg-table sources must
-                #     still populate trajectory_points because downstream FK
-                #     tables (kept_trajectory_points, etc.) reference
-                #     trajectory_points(id) directly.
-                if not is_pg_source or pg_source_table != "trajectory_points":
+                # ZH: CSV 源需要写入 trajectory_points 以获得自增 ID 供下游 FK 引用。
+                #     PG 源（无论表名）跳过——下游表直接用源表主键（source_row_key）做引用，
+                #     kept_trajectory_points.trajectory_point_id 已解除 FK 约束，
+                #     直接存储源表主键值即可。
+                # EN: CSV sources write to trajectory_points to obtain auto-increment
+                #     IDs for downstream FK references.  PG sources (any table) skip
+                #     this — downstream tables use the source PK (source_row_key)
+                #     directly; kept_trajectory_points.trajectory_point_id FK has
+                #     been dropped, so the raw PK value is stored as-is.
+                if not is_pg_source:
                     batch_map = insert_trajectory_points(conn, vehicle_points, table="trajectory_points")
                     tp_id_map.update(batch_map)
 
@@ -246,6 +243,10 @@ def run_pipeline(
             insert_injected_points(conn, all_injected_points, run_id=run_id)
             stats["injected_points"] = total_injected
             print(f"  injected_points: {total_injected:,} rows ({time.perf_counter() - t0:.1f}s)")
+
+        # ZH: Clean 阶段完成后立即提交，即使 Intersect2 失败清洗结果也不会丢失。
+        # EN: Commit clean results immediately so they survive an Intersect2 failure.
+        conn.commit()
 
         # ── Stage 3: Intersect2 (DB mode — spatial sliding windows) ──
         print("\n── Intersect2: 交叉口检测 / Intersection Detection (DB 滑窗模式) ──")

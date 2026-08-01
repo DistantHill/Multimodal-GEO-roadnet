@@ -78,7 +78,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         CREATE TABLE IF NOT EXISTS kept_trajectory_points (
             id                      BIGSERIAL PRIMARY KEY,
             run_id                  UUID NOT NULL REFERENCES pipeline_runs(id),
-            trajectory_point_id     BIGINT NOT NULL REFERENCES trajectory_points(id),
+            trajectory_point_id     BIGINT NOT NULL,
             vehicle_id              TEXT NOT NULL,
             subtrack_index          INTEGER NOT NULL DEFAULT 1,
             sequence_in_subtrack    INTEGER NOT NULL,
@@ -452,6 +452,17 @@ def _run_migrations(cur: Any) -> None:
         ),
         ("replace_cross_unique_index", "DROP INDEX IF EXISTS idx_tc_segment_pair"),
         ("replace_turn_unique_index", "DROP INDEX IF EXISTS idx_te_vehicle_ts"),
+        (
+            "ktp_drop_tp_fk",
+            "DO $$ DECLARE cname text; BEGIN "
+            "SELECT con.conname INTO cname FROM pg_constraint con "
+            "JOIN pg_class rel ON rel.oid = con.conrelid "
+            "WHERE rel.relname = 'kept_trajectory_points' "
+            "AND con.contype = 'f' AND con.confrelid = 'trajectory_points'::regclass; "
+            "IF cname IS NOT NULL THEN "
+            "EXECUTE 'ALTER TABLE kept_trajectory_points DROP CONSTRAINT ' || cname; "
+            "END IF; END $$",
+        ),
     ]
     for label, sql in migrations:
         try:
