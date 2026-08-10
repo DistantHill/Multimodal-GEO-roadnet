@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 
 from .logger import log_info
 
+from ._perf import PerfTracker, TimedStage, timed_iter, track_for_loops
+
 from ._geometry import (
     _angle_delta_deg,
     _batch_segment_intersections,
@@ -55,6 +57,21 @@ from .models import (
     TurnEvent,
 )
 from .parser0 import TrajectorySourceHandle
+
+
+def _perf_iter(perf, iterable, *, name, total=None, track=True):
+    """Wrap ``iterable`` with per-iteration timing when a ``perf`` tracker
+    is supplied; otherwise pass through untouched (zero-overhead).
+
+    ZH: 有 ``perf`` 追踪器时对迭代逐次计时；否则原样直通（零开销）。
+        ``timed_iter`` 内部的迭代深度上限在超过 3 层时同样会自动退化。
+    EN: Time each iteration via ``perf`` when a tracker is present; otherwise
+        return the raw iterable. ``timed_iter`` itself auto-passthroughs
+        past the iteration-depth limit.
+    """
+    if perf is not None:
+        return perf.timed_iter(iterable, name=name, total=total, track=track)
+    return iterable
 
 
 # ── Config ────────────────────────────────────────────────────────────
@@ -249,6 +266,7 @@ def _build_candidate_clusters(
     origin_lat: float,
     *,
     disabled_sources: set[str] | None = None,
+    perf: PerfTracker | None = None,
 ) -> list[HotspotCluster]:
     disabled = disabled_sources or set()
     clusters: list[HotspotCluster] = []
@@ -261,6 +279,7 @@ def _build_candidate_clusters(
                 eps_m=cfg.dbscan_eps_m_turn,
                 min_samples=cfg.dbscan_min_samples_turn,
                 source="turn",
+                perf=perf,
             )
         )
     if "orthogonal" not in disabled and orthogonal_candidates:
@@ -271,9 +290,10 @@ def _build_candidate_clusters(
                 origin_lat,
                 eps_m=cfg.dbscan_eps_m_ortho,
                 min_samples=cfg.dbscan_min_samples_ortho,
+                perf=perf,
             )
         )
-    return _merge_clusters(clusters, cfg.merge_centroid_distance_m, origin_lon, origin_lat)
+    return _merge_clusters(clusters, cfg.merge_centroid_distance_m, origin_lon, origin_lat, perf=perf)
 
 
 def _is_cluster_rediscovered(
@@ -300,6 +320,7 @@ def _annotate_source_ablation(
     origin_lat: float,
     *,
     live_status: Any = None,
+    perf: PerfTracker | None = None,
 ) -> list[HotspotCluster]:
     if not clusters:
         return []
@@ -310,7 +331,7 @@ def _annotate_source_ablation(
         log_info(f"    源消融分析 / Source ablation ({len(all_sources)} 源/sources) ...")
         t_abl = time.perf_counter()
     reclustered_without: dict[str, list[HotspotCluster]] = {}
-    for idx, source in enumerate(all_sources):
+    for idx, source in enumerate(_perf_iter(perf, all_sources, name="ablation_sources")):
         if report_ablation:
             log_info(f"      消融 / Ablating: {source} ...")
             t1 = time.perf_counter()
@@ -321,6 +342,7 @@ def _annotate_source_ablation(
             origin_lon,
             origin_lat,
             disabled_sources={source},
+            perf=perf,
         )
         if report_ablation:
             log_info(f"      消融 / Ablated {source}: {len(reclustered_without[source])} 簇/clusters ({time.perf_counter() - t1:.1f}s)")
@@ -334,7 +356,7 @@ def _annotate_source_ablation(
                 )
 
     annotated: list[HotspotCluster] = []
-    for cluster in clusters:
+    for cluster in _perf_iter(perf, clusters, name="ablation_clusters"):
         critical_sources: list[str] = []
         for source in _cluster_sources(cluster):
             if not _is_cluster_rediscovered(
@@ -462,6 +484,7 @@ def _cluster_pipeline(
     cfg: IntersectConfig,
     *,
     live_status: Any = None,
+    perf: PerfTracker | None = None,
 ) -> tuple[list[TurnEvent], list[HotspotCluster]]:
     """Shared G* + DBSCAN ×3 + merge + reindex + ablation for both modes."""
     all_clusters: list[HotspotCluster] = []
@@ -469,7 +492,7 @@ def _cluster_pipeline(
 
     # ── Method 1: Turn event → G* → DBSCAN ────────────────────────
     if cfg.use_turn_events and turn_events:
-        hotspot_events = _select_hotspot_events(turn_events, cfg, live_status=live_status)
+        hotspot_events = _select_hotspot_events(turn_events, cfg, live_status=live_status, perf=perf)
         if hotspot_events:
             all_clusters.extend(_cluster_dbscan(
                 hotspot_events, origin_lon, origin_lat,
@@ -477,6 +500,7 @@ def _cluster_pipeline(
                 min_samples=cfg.dbscan_min_samples_turn,
                 source="turn",
                 live_status=live_status,
+                perf=perf,
             ))
 
     # ── Method 2: Orthogonal → DBSCAN ──────────────────────────────
@@ -486,6 +510,7 @@ def _cluster_pipeline(
             eps_m=cfg.dbscan_eps_m_ortho,
             min_samples=cfg.dbscan_min_samples_ortho,
             live_status=live_status,
+            perf=perf,
         ))
 
     # ── Method 3: Cross-track → DBSCAN ─────────────────────────────
@@ -495,16 +520,18 @@ def _cluster_pipeline(
             eps_m=cfg.cross_track_dbscan_eps_m,
             min_samples=cfg.cross_track_dbscan_min_samples,
             live_status=live_status,
+            perf=perf,
         ))
 
     # ── Merge + reindex + ablation ─────────────────────────────────
     merged = _merge_clusters(all_clusters, cfg.merge_centroid_distance_m,
-                              origin_lon, origin_lat)
+                              origin_lon, origin_lat, perf=perf)
     merged = [replace(c, cluster_id=i) for i, c in enumerate(merged)]
     annotated = _annotate_source_ablation(
         merged, hotspot_events, ortho_candidates,
         cfg, origin_lon, origin_lat,
         live_status=live_status,
+        perf=perf,
     )
     return hotspot_events, annotated
 
@@ -516,14 +543,15 @@ def _extract_methods_123(
     cfg: IntersectConfig,
     *,
     live_status: Any = None,
+    perf: PerfTracker | None = None,
 ) -> tuple[list[TurnEvent], list[OrthogonalCandidate], list[CrossTrackCandidate]]:
     """Run all three candidate extraction methods on a tracks dict (handle mode)."""
-    turn_events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg, live_status=live_status) if cfg.use_turn_events else []
+    turn_events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg, live_status=live_status, perf=perf) if cfg.use_turn_events else []
     ortho_candidates: list[OrthogonalCandidate] = []
     cross_candidates: list[CrossTrackCandidate] = []
     if cfg.use_orthogonal_candidates:
-        ortho_candidates = _extract_orthogonal_candidates(tracks, origin_lon, origin_lat, live_status=live_status)
-        cross_candidates, _, _ = _extract_orthogonal_cross_track_candidates(tracks, origin_lon, origin_lat, cfg, live_status=live_status)
+        ortho_candidates = _extract_orthogonal_candidates(tracks, origin_lon, origin_lat, live_status=live_status, perf=perf)
+        cross_candidates, _, _ = _extract_orthogonal_cross_track_candidates(tracks, origin_lon, origin_lat, cfg, live_status=live_status, perf=perf)
     return turn_events, ortho_candidates, cross_candidates
 
 
@@ -581,23 +609,28 @@ def _detect_intersections_handle(
             own_live = True
         except Exception:
             live = None
+    tracker = PerfTracker("intersect2_handle")
     try:
-        turn_events, ortho_candidates, cross_candidates = _extract_methods_123(
-            tracks, origin_lon, origin_lat, cfg,
-            live_status=live,
-        )
+        with tracker.stage("extract_methods_123"):
+            turn_events, ortho_candidates, cross_candidates = _extract_methods_123(
+                tracks, origin_lon, origin_lat, cfg,
+                live_status=live, perf=tracker,
+            )
 
-        hotspot_events, annotated_clusters = _cluster_pipeline(
-            turn_events, ortho_candidates, cross_candidates,
-            origin_lon, origin_lat, cfg,
-            live_status=live,
-        )
+        with tracker.stage("cluster_pipeline"):
+            hotspot_events, annotated_clusters = _cluster_pipeline(
+                turn_events, ortho_candidates, cross_candidates,
+                origin_lon, origin_lat, cfg,
+                live_status=live, perf=tracker,
+            )
 
-        topologies, annotated_clusters, observations = _build_intersection_topologies(
-            annotated_clusters, tracks, origin_lon, origin_lat, cfg,
-            live_status=live,
-        )
+        with tracker.stage("topology"):
+            topologies, annotated_clusters, observations = _build_intersection_topologies(
+                annotated_clusters, tracks, origin_lon, origin_lat, cfg,
+                live_status=live, perf=tracker,
+            )
 
+        log_info(tracker.report())
         return IntersectResult(
             turn_events=turn_events,
             hotspot_events=hotspot_events,
@@ -983,8 +1016,15 @@ def _stream_extract_methods_1_2(
     origin_lon: float, origin_lat: float,
     *,
     live_status: Any = None,
+    perf: PerfTracker | None = None,
 ) -> tuple[list[TurnEvent], list[OrthogonalCandidate]]:
-    """Stream per-vehicle from DB, batch 100 vehicles per Method 1/2 call."""
+    """Stream per-vehicle from DB, batch 100 vehicles per Method 1/2 call.
+
+    ZH: 外层 ``for track in _stream_vehicle_tracks_from_db(...)`` 是生成器流，
+        逐迭代计时噪声大，整体由调用方 ``tracker.stage("stream_m1_m2")`` 计时。
+    EN: The outer per-track generator stream is timed as a whole by the caller's
+        ``tracker.stage("stream_m1_m2")`` — per-iteration timing would be noisy.
+    """
     turn_events: list[TurnEvent] = []
     ortho_candidates: list[OrthogonalCandidate] = []
     t_total = time.perf_counter()
@@ -1006,11 +1046,11 @@ def _stream_extract_methods_1_2(
         if len(batch) >= BATCH_SIZE:
             # ── Flush batch ──
             if cfg.use_turn_events:
-                for te in _detect_turn_events(batch, origin_lon, origin_lat, cfg):
+                for te in _detect_turn_events(batch, origin_lon, origin_lat, cfg, perf=perf):
                     turn_events.append(replace(te, event_id=len(turn_events)))
             if cfg.use_orthogonal_candidates:
                 ortho_candidates.extend(
-                    _extract_orthogonal_candidates(batch, origin_lon, origin_lat)
+                    _extract_orthogonal_candidates(batch, origin_lon, origin_lat, perf=perf)
                 )
             batch.clear()
 
@@ -1028,11 +1068,11 @@ def _stream_extract_methods_1_2(
     # ── Flush remaining ──
     if batch:
         if cfg.use_turn_events:
-            for te in _detect_turn_events(batch, origin_lon, origin_lat, cfg):
+            for te in _detect_turn_events(batch, origin_lon, origin_lat, cfg, perf=perf):
                 turn_events.append(replace(te, event_id=len(turn_events)))
         if cfg.use_orthogonal_candidates:
             ortho_candidates.extend(
-                _extract_orthogonal_candidates(batch, origin_lon, origin_lat)
+                _extract_orthogonal_candidates(batch, origin_lon, origin_lat, perf=perf)
             )
 
     log_info(f"── 流式处理: {track_count:,} 轨迹/tracks → "
@@ -1047,6 +1087,8 @@ def _extract_cross_track_windows(
     extent: tuple[float, float, float, float],
     origin_lon: float, origin_lat: float,
     live_status: Any = None,
+    *,
+    perf: PerfTracker | None = None,
 ) -> list[CrossTrackCandidate]:
     """Method 3: spatial sliding windows for cross-track segment intersection."""
     candidates: list[CrossTrackCandidate] = []
@@ -1067,7 +1109,7 @@ def _extract_cross_track_windows(
     last_cross_sub = ""
     log_info(f"── 空间滑窗 / Spatial windows (Method 3: orthogonal_cross_track) ──")
 
-    for window in windows.iter_windows():
+    for window in _perf_iter(perf, windows.iter_windows(), name="spatial_windows", total=total_windows):
         window_count += 1
         now = time.perf_counter()
 
@@ -1104,7 +1146,7 @@ def _extract_cross_track_windows(
         window_tracks = _tracks_from_points(points)
         win_cands, w_pairs, w_total = _extract_orthogonal_cross_track_candidates(
             window_tracks, origin_lon, origin_lat, cfg,
-            live_status=live_status, sub_detail=True,
+            live_status=live_status, sub_detail=True, perf=perf,
         )
         added = 0
         for candidate in win_cands:
@@ -1148,6 +1190,7 @@ def _build_topologies_from_db(
     origin_lat: float,
     *,
     live_status: Any = None,
+    perf: PerfTracker | None = None,
 ) -> tuple[list[IntersectionTopology], list[HotspotCluster], list[EntryExitObservation]]:
     """Topology verification by querying nearby points from DB per cluster."""
     topologies: list[IntersectionTopology] = []
@@ -1158,7 +1201,7 @@ def _build_topologies_from_db(
     log_info(f"── 拓扑验证 / Topology verification ({total_clusters:,} 簇/clusters) ...")
     t0 = time.perf_counter()
     cluster_idx = 0
-    for cluster in clusters:
+    for cluster in _perf_iter(perf, clusters, name="topo_clusters", total=total_clusters):
         cluster_idx += 1
         _route_progress(
             live_status,
@@ -1218,15 +1261,18 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
 
     live = cfg.live_status
 
+    tracker = PerfTracker("intersect2_db")
+
     # ── Methods 1 & 2: stream per-vehicle (DB-specific) ─────────────
     if live is not None:
         live.update(stage="Intersect2: 流式 / Stream M1+M2",
                     detail="Method 1+2: Turn events + ortho candidates...")
     t_stage = time.perf_counter()
-    turn_events, ortho_candidates = _stream_extract_methods_1_2(
-        conn, cfg, origin_lon, origin_lat,
-        live_status=live,
-    )
+    with tracker.stage("stream_m1_m2"):
+        turn_events, ortho_candidates = _stream_extract_methods_1_2(
+            conn, cfg, origin_lon, origin_lat,
+            live_status=live, perf=tracker,
+        )
     if live is not None:
         live.update(
             detail=f"Turn events: {len(turn_events):,}, Ortho: {len(ortho_candidates):,}",
@@ -1235,20 +1281,22 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
 
     # ── Method 3: spatial windows (DB-specific) ─────────────────────
     t_stage = time.perf_counter()
-    cross_candidates = _extract_cross_track_windows(
-        conn, cfg, extent, origin_lon, origin_lat, live_status=live,
-    )
+    with tracker.stage("cross_track_windows"):
+        cross_candidates = _extract_cross_track_windows(
+            conn, cfg, extent, origin_lon, origin_lat, live_status=live, perf=tracker,
+        )
 
     # ── Shared: cluster pipeline (G* + DBSCAN + merge + ablation) ───
     if live is not None:
         live.update(stage="Intersect2: 聚类 / Clustering",
                     detail="G* + DBSCAN + merge + ablation...")
     t_stage = time.perf_counter()
-    hotspot_events, annotated_clusters = _cluster_pipeline(
-        turn_events, ortho_candidates, cross_candidates,
-        origin_lon, origin_lat, cfg,
-        live_status=live,
-    )
+    with tracker.stage("cluster_pipeline"):
+        hotspot_events, annotated_clusters = _cluster_pipeline(
+            turn_events, ortho_candidates, cross_candidates,
+            origin_lon, origin_lat, cfg,
+            live_status=live, perf=tracker,
+        )
     if live is not None:
         live.update(
             detail=f"Clusters: {len(annotated_clusters):,}",
@@ -1260,16 +1308,18 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
         live.update(stage="Intersect2: 拓扑验证 / Topology",
                     detail="Topology verification (per-cluster DB queries)...")
     t_stage = time.perf_counter()
-    topologies, annotated_clusters, observations = _build_topologies_from_db(
-        conn, annotated_clusters, cfg, origin_lon, origin_lat,
-        live_status=live,
-    )
+    with tracker.stage("topology_db"):
+        topologies, annotated_clusters, observations = _build_topologies_from_db(
+            conn, annotated_clusters, cfg, origin_lon, origin_lat,
+            live_status=live, perf=tracker,
+        )
     if live is not None:
         live.update(
             detail=f"Topologies: {len(topologies):,}",
             elapsed=time.perf_counter() - t_stage,
         )
 
+    log_info(tracker.report())
     return IntersectResult(
         turn_events=turn_events,
         hotspot_events=hotspot_events,
@@ -1327,6 +1377,7 @@ def _detect_turn_events(
     cfg: IntersectConfig,
     *,
     live_status: Any = None,
+    perf: PerfTracker | None = None,
 ) -> list[TurnEvent]:
     """Multi-point window bearing-change detection for all tracks.
 
@@ -1343,7 +1394,7 @@ def _detect_turn_events(
     track_count = 0
     log_info(f"── 转向事件检测 / Turn event detection ({total_tracks:,} 轨迹/tracks) ...")
 
-    for vehicle_id, track in tracks.items():
+    for vehicle_id, track in _perf_iter(perf, tracks.items(), name="tracks_turn"):
         if len(track) < 2 * w + 1:
             continue
 
@@ -1413,16 +1464,27 @@ def _detect_turn_events(
     return events
 
 
+@track_for_loops(
+    {
+        "enumerate(events)": "gstar_events",
+        "events": "gstar_neighbors",
+    },
+    depth=2,
+)
 def _compute_getis_ord_g_star(
     events: list[TurnEvent], radius_m: float,
     *,
     live_status: Any = None,
+    perf: PerfTracker | None = None,
 ) -> dict[int, float]:
     """Return {event_id: z_score} for Getis-Ord G* spatial concentration.
 
     Uses a binary intensity model: each event contributes 1.0 to local
     count if within ``radius_m``. Since TurnEvent is frozen, z-scores
     are returned as a separate dict instead of mutating event fields.
+
+    For-loop timing is auto-injected by ``@track_for_loops`` —
+    ``gstar_events`` (depth 1) and ``gstar_neighbors`` (depth 2).
     """
     n = len(events)
     if n < 2:
@@ -1471,6 +1533,7 @@ def _select_hotspot_events(
     events: list[TurnEvent], cfg: IntersectConfig,
     *,
     live_status: Any = None,
+    perf: PerfTracker | None = None,
 ) -> list[TurnEvent]:
     """Filter turn events by Getis-Ord G* z-score and minimum turn angle."""
     if not events:
@@ -1478,7 +1541,7 @@ def _select_hotspot_events(
 
     log_info(f"── 热点筛选 / Hotspot selection ({len(events):,} 事件/events) ...")
     t0 = time.perf_counter()
-    z_scores = _compute_getis_ord_g_star(events, cfg.g_star_radius_m, live_status=live_status)
+    z_scores = _compute_getis_ord_g_star(events, cfg.g_star_radius_m, live_status=live_status, perf=perf)
     result = [
         e
         for e in events
@@ -1500,6 +1563,7 @@ def _extract_orthogonal_candidates(
     origin_lat: float,
     *,
     live_status: Any = None,
+    perf: PerfTracker | None = None,
 ) -> list[OrthogonalCandidate]:
     """Extract Cleaner 1 orthogonal injection points as candidates.
 
@@ -1514,7 +1578,7 @@ def _extract_orthogonal_candidates(
     last_t = t0
     track_count = 0
 
-    for track in tracks.values():
+    for track in _perf_iter(perf, tracks.values(), name="tracks_ortho", total=total_tracks):
         for tp in track:
             if tp.point_ref.generated_reason == "orthogonal_heading":
                 x, y = _to_xy(tp.lon, tp.lat, origin_lon, origin_lat)
@@ -1604,6 +1668,7 @@ def _extract_orthogonal_cross_track_candidates(
     live_status: Any = None,
     *,
     sub_detail: bool = False,
+    perf: PerfTracker | None = None,
 ) -> tuple[list[CrossTrackCandidate], int, int]:
     """Multi-vehicle segment crossing detection via NumPy batched intersection.
 
@@ -1651,7 +1716,7 @@ def _extract_orthogonal_cross_track_candidates(
     t0 = time.perf_counter()
     last_t = t0
 
-    for i in range(len(vehicle_ids)):
+    for i in _perf_iter(perf, range(len(vehicle_ids)), name="cross_track_vehicle_i", total=len(vehicle_ids)):
         vid_a = vehicle_ids[i]
         segs_a = track_segs[vid_a]
         a1 = np.array([[s[0], s[1]] for s in segs_a], dtype=float)
@@ -1659,6 +1724,8 @@ def _extract_orthogonal_cross_track_candidates(
         ha = np.array([s[4] for s in segs_a], dtype=float)
         ts_a = [s[5] for s in segs_a]
 
+        # ZH: 内层 j 循环由 NumPy 批量求交处理，不做逐迭代计时。
+        # EN: Inner j loop is handled by the NumPy batch — not timed per-iteration.
         for j in range(i + 1, len(vehicle_ids)):
             vid_b = vehicle_ids[j]
             segs_b = track_segs[vid_b]
@@ -1760,6 +1827,7 @@ def _run_dbscan(
     min_samples: int,
     live_status: Any = None,
     stage: str = "DBSCAN",
+    perf: PerfTracker | None = None,
 ) -> list[int]:
     """Pure Python DBSCAN on (xs, ys) coordinates.
 
@@ -1775,7 +1843,7 @@ def _run_dbscan(
     t0 = time.perf_counter()
     last_t = t0
 
-    for i in range(n):
+    for i in _perf_iter(perf, range(n), name="dbscan_points", total=n):
         if labels[i] != _UNVISITED:
             continue
         neighbors = _neighbors_indices(xs, ys, i, eps_m)
@@ -1785,6 +1853,10 @@ def _run_dbscan(
 
         labels[i] = cluster_id
         seeds = [nb for nb in neighbors if nb != i]
+        # ZH: while 循环不是可迭代对象，跳过逐迭代计时（仅 seed 展开阶段的
+        #     内层 for 循环被计时）。
+        # EN: ``while`` is not an iterable — no per-iteration timing here;
+        #     only the inner seed-expansion for loop is timed.
         while seeds:
             current = seeds.pop()
             if labels[current] == _NOISE:
@@ -1794,7 +1866,7 @@ def _run_dbscan(
             labels[current] = cluster_id
             cur_neighbors = _neighbors_indices(xs, ys, current, eps_m)
             if len(cur_neighbors) >= min_samples:
-                for nb in cur_neighbors:
+                for nb in _perf_iter(perf, cur_neighbors, name="dbscan_seed_neighbors"):
                     if labels[nb] in (_UNVISITED, _NOISE) and nb not in seeds:
                         seeds.append(nb)
         cluster_id += 1
@@ -1822,6 +1894,7 @@ def _cluster_dbscan(
     min_samples: int,
     source: str = "turn",
     live_status: Any = None,
+    perf: PerfTracker | None = None,
 ) -> list[HotspotCluster]:
     """DBSCAN-cluster TurnEvents and build HotspotClusters."""
     n = len(events)
@@ -1832,7 +1905,7 @@ def _cluster_dbscan(
     ys = [e.y for e in events]
     log_info(f"    DBSCAN 聚类 ({source}) / DBSCAN clustering ({n:,} 点/points) ...")
     labels = _run_dbscan(xs, ys, eps_m=eps_m, min_samples=min_samples,
-                          live_status=live_status, stage=source)
+                          live_status=live_status, stage=source, perf=perf)
 
     clusters: list[HotspotCluster] = []
     for cid in sorted(set(l for l in labels if l >= 0)):
@@ -1871,6 +1944,7 @@ def _cluster_orthogonal_candidates(
     eps_m: float,
     min_samples: int,
     live_status: Any = None,
+    perf: PerfTracker | None = None,
 ) -> list[HotspotCluster]:
     """DBSCAN-cluster OrthogonalCandidates, wrapping them as TurnEvents."""
     n = len(candidates)
@@ -1881,7 +1955,7 @@ def _cluster_orthogonal_candidates(
     ys = [c.y for c in candidates]
     log_info(f"    DBSCAN 聚类 (orthogonal) / DBSCAN clustering ({n:,} 点/points) ...")
     labels = _run_dbscan(xs, ys, eps_m=eps_m, min_samples=min_samples,
-                          live_status=live_status, stage="orthogonal")
+                          live_status=live_status, stage="orthogonal", perf=perf)
 
     clusters: list[HotspotCluster] = []
     for cid in sorted(set(l for l in labels if l >= 0)):
@@ -1943,6 +2017,7 @@ def _cluster_orthogonal_cross_track_candidates(
     eps_m: float,
     min_samples: int,
     live_status: Any = None,
+    perf: PerfTracker | None = None,
 ) -> list[HotspotCluster]:
     """DBSCAN-cluster orthogonal_cross_track candidates, wrapping as TurnEvents.
 
@@ -1957,7 +2032,7 @@ def _cluster_orthogonal_cross_track_candidates(
     ys = [c.y for c in candidates]
     log_info(f"    DBSCAN 聚类 (orthogonal_cross_track) / DBSCAN clustering ({n:,} 点/points) ...")
     labels = _run_dbscan(xs, ys, eps_m=eps_m, min_samples=min_samples,
-                          live_status=live_status, stage="orthogonal_cross_track")
+                          live_status=live_status, stage="orthogonal_cross_track", perf=perf)
 
     clusters: list[HotspotCluster] = []
     for cid in sorted(set(l for l in labels if l >= 0)):
@@ -2021,6 +2096,8 @@ def _merge_clusters(
     merge_distance_m: float,
     origin_lon: float,
     origin_lat: float,
+    *,
+    perf: PerfTracker | None = None,
 ) -> list[HotspotCluster]:
     """Merge clusters whose centroids are within ``merge_distance_m``.
 
@@ -2041,6 +2118,10 @@ def _merge_clusters(
     )
     kept: list[HotspotCluster] = []
 
+    # ZH: ``while remaining`` 不是可迭代对象，跳过逐迭代计时；仅内部扫描循环
+    #     用 ``merge_scan`` 计时（每个外层 while 迭代各计时一轮）。
+    # EN: ``while`` is not an iterable — the outer absorb loop is not timed;
+    #     the inner scan ``for cj in remaining`` is timed as ``merge_scan``.
     while remaining:
         ci = remaining.pop(0)
         merged_events = list(ci.events)
@@ -2062,7 +2143,7 @@ def _merge_clusters(
             cur_cx = cx_sum / total_n if total_n > 0 else ci.centroid_x
             cur_cy = cy_sum / total_n if total_n > 0 else ci.centroid_y
 
-            for cj in remaining:
+            for cj in _perf_iter(perf, remaining, name="merge_scan"):
                 dist = _distance_m((cur_cx, cur_cy), (cj.centroid_x, cj.centroid_y))
                 if dist <= merge_distance_m:
                     # Absorb cj
@@ -2264,6 +2345,7 @@ def _build_intersection_topologies(
     cfg: IntersectConfig,
     *,
     live_status: Any = None,
+    perf: PerfTracker | None = None,
 ) -> tuple[list[IntersectionTopology], list[HotspotCluster], list[EntryExitObservation]]:
     """Build IntersectionTopology for each HotspotCluster.
 
@@ -2280,7 +2362,7 @@ def _build_intersection_topologies(
     t0 = time.perf_counter()
     log_info(f"── 拓扑验证 / Topology verification ({total_clusters:,} 簇/clusters) ...")
 
-    for cluster in clusters:
+    for cluster in _perf_iter(perf, clusters, name="topo_clusters", total=total_clusters):
         cluster_idx = len(topologies) + 1
         _route_progress(
             live_status,
