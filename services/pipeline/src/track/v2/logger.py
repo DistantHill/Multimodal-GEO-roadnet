@@ -249,6 +249,13 @@ def init_logger(
 
         _log_file = open(str(log_path), "w", encoding="utf-8", buffering=1)
 
+        # ZH: 强制 stdout/stderr 走 UTF-8 编码，避免 pipe 环境（conda run 等）下
+        #     退化为系统 ANSI 编码（如 CP936）导致中文乱码。
+        # EN: Force stdout/stderr to UTF-8 so pipe environments (conda run, etc.)
+        #     don't fall back to the system ANSI codepage (e.g. CP936) and mangle CJK text.
+        _original_stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+
         # ZH: Console 必须绑定原始 stdout，避免 tee 写回自身导致无限递归。
         # EN: Console must bind to the real stdout so tee writes don't loop back.
         _term_console = Console(file=_original_stdout, highlight=False)

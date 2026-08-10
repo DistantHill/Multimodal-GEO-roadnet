@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import sys
 import time
 from pathlib import Path
 
@@ -350,6 +351,11 @@ def replay_clips(db_config: PostgresConfig, run_id: str) -> ClipResult:
 
 
 def main() -> int:
+    # ZH: 强制 stdout/stderr 走 UTF-8，确保 pipe 环境（conda run 等）下中文不乱码。
+    # EN: Force stdout/stderr to UTF-8 so CJK text survives pipe environments (conda run etc.).
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
     # ZH: 从 .env 加载默认连接参数，CLI 参数可覆盖
     # EN: Load defaults from .env; CLI args take precedence
     _env = default_postgres_config()
