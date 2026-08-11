@@ -36,8 +36,10 @@ from track.v2.intersect2 import (
     _getis_local_counts_grid,
     _getis_local_counts_scan,
     _group_by_vehicle,
+    _build_dbscan_grid,
     _merge_clusters,
     _nearest_angle_id,
+    _run_dbscan,
     _query_active_points_in_window,
     _select_hotspot_events,
     detect_intersections,
@@ -952,6 +954,46 @@ class HotspotSelectionTest(unittest.TestCase):
 
 
 class DBSCANTest(unittest.TestCase):
+    @staticmethod
+    def _historical_scan_oracle(xs, ys, eps_m, min_samples):
+        unvisited, noise = -99, -1
+        labels = [unvisited] * len(xs)
+        cluster_id = 0
+        def neighbors(index):
+            result = []
+            eps_sq = eps_m * eps_m
+            for candidate in range(len(xs)):
+                # Match the c12 baseline's multiplication semantics exactly:
+                # huge finite deltas become ``inf`` instead of raising as
+                # Python's ``value ** 2`` does.
+                dx = xs[candidate] - xs[index]
+                dy = ys[candidate] - ys[index]
+                if dx * dx + dy * dy <= eps_sq:
+                    result.append(candidate)
+            return result
+        for index in range(len(xs)):
+            if labels[index] != unvisited:
+                continue
+            near = neighbors(index)
+            if len(near) < min_samples:
+                labels[index] = noise
+                continue
+            labels[index] = cluster_id
+            seeds = [candidate for candidate in near if candidate != index]
+            while seeds:
+                current = seeds.pop()
+                if labels[current] == noise:
+                    labels[current] = cluster_id
+                if labels[current] != unvisited:
+                    continue
+                labels[current] = cluster_id
+                current_near = neighbors(current)
+                if len(current_near) >= min_samples:
+                    for candidate in current_near:
+                        if labels[candidate] in (unvisited, noise) and candidate not in seeds:
+                            seeds.append(candidate)
+            cluster_id += 1
+        return labels
     """I2-13 ~ I2-15: DBSCAN clustering."""
 
     def test_two_clusters_found(self):
@@ -995,6 +1037,69 @@ class DBSCANTest(unittest.TestCase):
         clusters = _cluster_dbscan(events, origin_lon, origin_lat,
                                    eps_m=200.0, min_samples=3)
         self.assertEqual(len(clusters), 1)
+
+    def test_labels_match_historical_boundary_contract(self):
+        """The spatial index preserves labels, IDs, order, and <= eps semantics."""
+        cases = (
+            ([], [], 1.0, 1, []),
+            ([0.0], [0.0], 1.0, 1, [0]),
+            ([0.0, 3.0, 6.0], [0.0, 0.0, 0.0], 1.0, 2, [-1, -1, -1]),
+            ([0.0, 0.1, 0.2, 10.0, 10.1, 10.2], [0.0] * 6, 0.5, 2, [0, 0, 0, 1, 1, 1]),
+            ([0.0, 0.9, 1.8, 2.7, 3.6], [0.0] * 5, 1.0, 2, [0, 0, 0, 0, 0]),
+            ([-1.0, -1.0, -1.0, -4.0, -4.0], [-1.0, -1.0, -1.0, 3.0, 3.0], 0.1, 2, [0, 0, 0, 1, 1]),
+            ([0.0, 1.0, math.nextafter(1.0, math.inf)], [0.0] * 3, 1.0, 1, [0, 0, 0]),
+            ([0.0, 0.0], [0.0, 0.0], 0.0, 2, [0, 0]),
+            ([0.0, 0.5], [0.0, 0.0], -1.0, 2, [0, 0]),
+            ([math.nan], [0.0], 1.0, 1, [-1]),
+            ([0.0, 1.0], [0.0, 0.0], math.nan, 1, [-1, -1]),
+            ([0.0, 1.0], [0.0, 0.0], math.inf, 1, [0, 0]),
+            ([0.0, math.inf], [0.0, 0.0], 1.0, 1, [0, -1]),
+            ([0.0], [0.0], 1.0, 0, [0]),
+            ([0.0], [0.0], 1.0, -1, [0]),
+        )
+        for xs, ys, eps_m, min_samples, expected in cases:
+            with self.subTest(xs=xs, eps_m=eps_m, min_samples=min_samples):
+                self.assertEqual(
+                    _run_dbscan(xs, ys, eps_m=eps_m, min_samples=min_samples),
+                    expected,
+                )
+        with self.assertRaises(IndexError):
+            _run_dbscan([0.0, 1.0], [0.0], eps_m=1.0, min_samples=1)
+
+    def test_grid_matches_historical_scan_across_zero_exact_boundary(self):
+        """A one-ULP/cross-zero cell boundary cannot hide an exact neighbour."""
+        xs = [-1e-300, 1.0, math.nextafter(1.0, math.inf), math.nextafter(-1e-300, -math.inf)]
+        ys = [0.0] * len(xs)
+        expected = [0, 0, 0, 0]
+        self.assertEqual(_run_dbscan(xs, ys, eps_m=1.0, min_samples=1), expected)
+
+    def test_many_disconnected_clusters_do_not_require_cluster_sized_resets(self):
+        """Regression shape for per-cluster queue clearing: 400 singleton clusters."""
+        xs = [float(index * 10) for index in range(400)]
+        self.assertEqual(_run_dbscan(xs, [0.0] * len(xs), eps_m=0.1, min_samples=1), list(range(400)))
+
+    def test_large_grid_cross_zero_and_nextafter_matches_scan_oracle(self):
+        xs = [-1e-300, 1.0, math.nextafter(1.0, math.inf)] + [1000.0 + i * 10.0 for i in range(254)]
+        ys = [0.0] * len(xs)
+        expected = self._historical_scan_oracle(xs, ys, 1.0, 1)
+        with patch("track.v2.intersect2._neighbors_indices", side_effect=AssertionError("full scan fallback forbidden")):
+            actual = _run_dbscan(xs, ys, eps_m=1.0, min_samples=1)
+        self.assertEqual(actual, expected)
+
+    def test_large_finite_coordinates_fall_back_before_unbounded_cell_range(self):
+        xs = [1e308, math.nextafter(1e308, -math.inf)] + [float(i * 10) for i in range(255)]
+        ys = [0.0] * len(xs)
+        expected = self._historical_scan_oracle(xs, ys, 1.0, 1)
+        build_results = []
+        def observe_build(*args):
+            value = _build_dbscan_grid(*args)
+            build_results.append(value)
+            return value
+        with patch("track.v2.intersect2._build_dbscan_grid", side_effect=observe_build) as build_grid:
+            actual = _run_dbscan(xs, ys, eps_m=1.0, min_samples=1)
+        build_grid.assert_called_once_with(xs, ys, 1.0)
+        self.assertEqual(build_results, [None])
+        self.assertEqual(actual, expected)
 
 
 # ── Orthogonal candidate tests (Method 2) ──────────────────────────────

@@ -2035,7 +2035,91 @@ def _neighbors_indices(
     return result
 
 
-def _run_dbscan(
+def _build_dbscan_grid(
+    xs: list[float],
+    ys: list[float],
+    eps_m: float,
+) -> dict[tuple[int, int], list[int]] | None:
+    """Build an exact, bounded-per-query spatial index for DBSCAN.
+
+    ``None`` deliberately selects the historical full scan for invalid/private
+    boundary inputs.  That preserves the legacy exception/label behaviour for
+    zero or negative eps, unequal coordinate vectors, and non-finite values.
+    """
+    # ``eps_sq`` is also part of the historical predicate.  If it overflows,
+    # the scan treats many infinite squared distances as neighbours; retain
+    # that private edge behaviour rather than attempting a grid approximation.
+    if (eps_m <= 0.0 or not math.isfinite(eps_m) or not math.isfinite(eps_m * eps_m)
+            or len(xs) != len(ys)):
+        return None
+    grid: dict[tuple[int, int], list[int]] = {}
+    for index, (x, y) in enumerate(zip(xs, ys)):
+        if not math.isfinite(x) or not math.isfinite(y):
+            return None
+        # Adjacent-cell enumeration is only safe when the conservatively
+        # rounded query interval remains a tiny, enumerable span.  At very
+        # large finite coordinates (for example 1e308 with eps=1), one ULP is
+        # enormously wider than eps and would otherwise create a practically
+        # unbounded ``range``.  Preserve historical scan semantics instead.
+        if (_dbscan_grid_axis_bounds(x, eps_m) is None
+                or _dbscan_grid_axis_bounds(y, eps_m) is None):
+            return None
+        try:
+            cell = (math.floor(x / eps_m), math.floor(y / eps_m))
+        except OverflowError:
+            return None
+        grid.setdefault(cell, []).append(index)
+    return grid
+
+
+def _dbscan_grid_axis_bounds(value: float, eps_m: float) -> tuple[int, int] | None:
+    """Return a conservative, safely enumerable cell interval for one axis."""
+    try:
+        low = math.floor(math.nextafter(value - eps_m, -math.inf) / eps_m)
+        high = math.floor(math.nextafter(value + eps_m, math.inf) / eps_m)
+    except (OverflowError, ValueError):
+        return None
+    if high < low or high - low > 8:
+        return None
+    return low, high
+
+
+def _grid_neighbors_indices(
+    xs: list[float],
+    ys: list[float],
+    index: int,
+    eps_m: float,
+    grid: dict[tuple[int, int], list[int]],
+) -> list[int]:
+    """Return exact neighbours in original-index order from all overlapping cells.
+
+    The usual ``+-1`` cell shortcut is not safe at a floating-point cell
+    boundary.  For example, ``-1e-300`` and ``1.0`` are exactly one ``eps``
+    apart, while their floor cells differ by two.  Expand arithmetic bounds by
+    one ULP before flooring; the original squared-distance predicate removes
+    the small number of conservative false candidates.
+    """
+    base_x, base_y = xs[index], ys[index]
+    eps_sq = eps_m * eps_m
+    result: list[int] = []
+    x_bounds = _dbscan_grid_axis_bounds(base_x, eps_m)
+    y_bounds = _dbscan_grid_axis_bounds(base_y, eps_m)
+    if x_bounds is None or y_bounds is None:
+        raise RuntimeError("DBSCAN grid invariant violated after construction")
+    low_x, high_x = x_bounds
+    low_y, high_y = y_bounds
+    for grid_x in range(low_x, high_x + 1):
+        for grid_y in range(low_y, high_y + 1):
+            for candidate in grid.get((grid_x, grid_y), ()):
+                dx = xs[candidate] - base_x
+                dy = ys[candidate] - base_y
+                if dx * dx + dy * dy <= eps_sq:
+                    result.append(candidate)
+    result.sort()
+    return result
+
+
+def _run_dbscan_large_dispatch(
     xs: list[float],
     ys: list[float],
     *,
@@ -2055,10 +2139,95 @@ def _run_dbscan(
         return []
 
     labels = [_UNVISITED] * n
+    # The scan has lower constant overhead on tiny inputs (the mandatory
+    # boundary/wrapper cases), while the grid is reserved for the large
+    # workload it was introduced to accelerate.
+    grid = _build_dbscan_grid(xs, ys, eps_m)
+
+    def neighbors_for(index: int) -> list[int]:
+        if grid is None:
+            return _neighbors_indices(xs, ys, index, eps_m)
+        return _grid_neighbors_indices(xs, ys, index, eps_m, grid)
+
     cluster_id = 0
+    # One allocation for the complete run.  An epoch marker is equivalent to a
+    # per-cluster ``queued`` boolean but avoids O(cluster_count * n) clearing.
+    queued_epoch = [0] * n
     t0 = time.perf_counter()
     last_t = t0
 
+    for i in _perf_iter(perf, range(n), name="dbscan_points", total=n):
+        if labels[i] != _UNVISITED:
+            continue
+        neighbors = neighbors_for(i)
+        if len(neighbors) < min_samples:
+            labels[i] = _NOISE
+            continue
+
+        labels[i] = cluster_id
+        seeds = [nb for nb in neighbors if nb != i]
+        epoch = cluster_id + 1
+        for seed in seeds:
+            queued_epoch[seed] = epoch
+        # ZH: while 循环不是可迭代对象，跳过逐迭代计时（仅 seed 展开阶段的
+        #     内层 for 循环被计时）。
+        # EN: ``while`` is not an iterable — no per-iteration timing here;
+        #     only the inner seed-expansion for loop is timed.
+        while seeds:
+            current = seeds.pop()
+            if labels[current] == _NOISE:
+                labels[current] = cluster_id
+            if labels[current] != _UNVISITED:
+                continue
+            labels[current] = cluster_id
+            cur_neighbors = neighbors_for(current)
+            if len(cur_neighbors) >= min_samples:
+                for nb in _perf_iter(perf, cur_neighbors, name="dbscan_seed_neighbors"):
+                    if labels[nb] in (_UNVISITED, _NOISE) and queued_epoch[nb] != epoch:
+                        seeds.append(nb)
+                        queued_epoch[nb] = epoch
+        cluster_id += 1
+        now = time.perf_counter()
+        if i % 500 == 0 or (now - last_t) >= 3.0:
+            _route_progress(
+                live_status,
+                detail=f"DBSCAN:\t{i + 1:,}/{n:,}\t点/points,\t{cluster_id}\t簇/clusters",
+                progress=(i + 1) / n,
+                elapsed=now - t0,
+                stage=f"Intersect2: DBSCAN ({stage})",
+            )
+            last_t = now
+
+    log_info(f"    DBSCAN: {n:,} 点/points → {cluster_id:,} 簇/clusters ({time.perf_counter() - t0:.1f}s)")
+    return labels
+
+
+def _run_dbscan(
+    xs: list[float],
+    ys: list[float],
+    *,
+    eps_m: float,
+    min_samples: int,
+    live_status: Any = None,
+    stage: str = "DBSCAN",
+    perf: PerfTracker | None = None,
+) -> list[int]:
+    """Run the compact historical scan for small inputs and grid path otherwise."""
+    n = len(xs)
+    if n == 0:
+        return []
+    if n > 256:
+        return _run_dbscan_large_dispatch(
+            xs, ys, eps_m=eps_m, min_samples=min_samples,
+            live_status=live_status, stage=stage, perf=perf,
+        )
+
+    # Keep this frame intentionally close to c12.  The large-path locals
+    # (grid, closure and epoch queue) must not inflate boundary microcases.
+    labels = [_UNVISITED] * n
+    cluster_id = 0
+    t0 = time.perf_counter()
+    last_t = t0
     for i in _perf_iter(perf, range(n), name="dbscan_points", total=n):
         if labels[i] != _UNVISITED:
             continue
@@ -2066,13 +2235,8 @@ def _run_dbscan(
         if len(neighbors) < min_samples:
             labels[i] = _NOISE
             continue
-
         labels[i] = cluster_id
         seeds = [nb for nb in neighbors if nb != i]
-        # ZH: while 循环不是可迭代对象，跳过逐迭代计时（仅 seed 展开阶段的
-        #     内层 for 循环被计时）。
-        # EN: ``while`` is not an iterable — no per-iteration timing here;
-        #     only the inner seed-expansion for loop is timed.
         while seeds:
             current = seeds.pop()
             if labels[current] == _NOISE:
@@ -2096,7 +2260,6 @@ def _run_dbscan(
                 stage=f"Intersect2: DBSCAN ({stage})",
             )
             last_t = now
-
     log_info(f"    DBSCAN: {n:,} 点/points → {cluster_id:,} 簇/clusters ({time.perf_counter() - t0:.1f}s)")
     return labels
 
