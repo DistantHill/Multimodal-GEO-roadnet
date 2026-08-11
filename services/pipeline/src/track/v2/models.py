@@ -643,6 +643,117 @@ class ClipConfig(TrackModel):
     include_boundary_clips: bool = True
 
 
+# ── Fitting output models ───────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class FittingConfig(TrackModel):
+    """Configuration for fitting one centerline per connected pair."""
+
+    point_spacing_m: float = 50.0
+    fit_sample_spacing_m: float = 10.0
+    min_clips_per_pair: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class Centerline(TrackModel):
+    """One physical road centerline in canonical cluster-id direction."""
+
+    from_cluster_id: int
+    to_cluster_id: int
+    points: tuple[tuple[float, float], ...]
+    length_m: float
+    source_clip_ids: tuple[str, ...]
+    forward_clip_count: int
+    reverse_clip_count: int
+
+    @property
+    def source_clip_count(self) -> int:
+        return self.forward_clip_count + self.reverse_clip_count
+
+
+@dataclass(frozen=True, slots=True)
+class FitIssue(TrackModel):
+    """A rejected clip or connected pair, retained for auditability."""
+
+    from_cluster_id: int | None
+    to_cluster_id: int | None
+    reason: str
+    clip_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FitReport(TrackModel):
+    input_clip_count: int
+    eligible_clip_count: int
+    connected_pair_count: int
+    fitted_centerline_count: int
+    skipped_clip_count: int
+    skipped_pair_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class FitResult(TrackModel):
+    centerlines: tuple[Centerline, ...]
+    issues: tuple[FitIssue, ...]
+    report: FitReport
+    run_id: str | None = None
+
+
+# ── Network output models ───────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkConfig(TrackModel):
+    include_isolated_nodes: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkNode(TrackModel):
+    cluster_id: int
+    lon: float
+    lat: float
+    radius_m: float
+    degree: int
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkEdge(TrackModel):
+    edge_id: str
+    from_cluster_id: int
+    to_cluster_id: int
+    points: tuple[tuple[float, float], ...]
+    length_m: float
+    source_clip_count: int
+    forward_clip_count: int
+    reverse_clip_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkIssue(TrackModel):
+    from_cluster_id: int
+    to_cluster_id: int
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkReport(TrackModel):
+    input_centerline_count: int
+    node_count: int
+    edge_count: int
+    isolated_node_count: int
+    skipped_centerline_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkResult(TrackModel):
+    nodes: tuple[NetworkNode, ...]
+    edges: tuple[NetworkEdge, ...]
+    issues: tuple[NetworkIssue, ...]
+    report: NetworkReport
+    run_id: str | None = None
+
+
 # ── Replay output models ────────────────────────────────────────────
 
 

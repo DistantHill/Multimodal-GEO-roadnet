@@ -14,8 +14,11 @@ Both feed into the same topology verification (entry/exit → branch clustering)
 
 from .cleaner1 import clean
 from .clip import extract_clips, extract_clips_for_run
+from .fitting import fit_centerlines
 from .intersect2 import IntersectConfig, IntersectResult, detect_intersections
+from .network import build_network
 from .models import (
+    Centerline,
     CleanerConfig,
     ClipConfig,
     ClipEndpoint,
@@ -25,6 +28,16 @@ from .models import (
     ClipResult,
     ClipTrack,
     CsvSource,
+    FitIssue,
+    FitReport,
+    FitResult,
+    FittingConfig,
+    NetworkConfig,
+    NetworkEdge,
+    NetworkIssue,
+    NetworkNode,
+    NetworkReport,
+    NetworkResult,
     PointRef,
     PostgresSource,
     TrackClip,

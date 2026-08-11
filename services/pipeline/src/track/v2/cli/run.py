@@ -1,12 +1,12 @@
-"""Pipeline runner: Parser 0 → Cleaner 1 → Intersect2 → Clip.
+"""Pipeline runner: Parser 0 → Cleaner 1 → Intersect2 → Clip → Fitting → Network.
 
-ZH: 端到端流水线 CLI 入口。读取 CSV 或 PostgreSQL 表，运行四个阶段；前三阶段
-    的产物写入 PostgreSQL，Clip 返回纯内存结果。也可按 run_id 单独重放 Clip。
+ZH: 端到端流水线 CLI 入口。读取 CSV 或 PostgreSQL 表，运行六个阶段；前三阶段
+    的产物写入 PostgreSQL，后三阶段返回纯内存结果。也可按 run_id 单独重放 Clip。
     --csv、--pg-table 和 --replay-clips 互斥。
 
-EN: End-to-end pipeline CLI. It reads CSV or PostgreSQL, runs four stages,
-    persists the first three stages, and returns Clip as a pure in-memory
-    result. Clip can also be replayed by run_id. --csv, --pg-table, and
+EN: End-to-end pipeline CLI. It reads CSV or PostgreSQL, runs six stages,
+    persists the first three stages, and keeps the final three as pure
+    in-memory results. Clip can also be replayed by run_id. --csv, --pg-table, and
     --replay-clips are mutually exclusive.
 
 Usage / 用法::
@@ -41,8 +41,17 @@ from ..db_writer import (
     insert_trajectory_points,
     insert_turn_events,
 )
-from ..models import CleanerConfig, ClipResult, CsvSource, PostgresSource
+from ..models import (
+    CleanerConfig,
+    ClipResult,
+    CsvSource,
+    FitResult,
+    NetworkResult,
+    PostgresSource,
+)
 from ..clip import extract_clips_for_run
+from ..fitting import fit_centerlines
+from ..network import build_network
 from .. import get_database, detect_intersections, IntersectConfig
 from ..cleaner import clean_vehicle
 from ..sources import StreamVehicleSource
@@ -317,6 +326,18 @@ def run_pipeline(
         _add_clip_stats(stats, clip_result)
         _print_clip_report(clip_result)
 
+        # ── Stage 5: Fitting (one centerline per connected pair) ────────────
+        print("\n── Fitting: 中心线拟合 / Centerline fitting ──")
+        fit_result = fit_centerlines(clip_result)
+        _add_fit_stats(stats, fit_result)
+        fit_result.report.format_print(title="  Fitting 报告 / Fitting report")
+
+        # ── Stage 6: Network (intersections as nodes, centerlines as edges) ─
+        print("\n── Network: 路网组装 / Network assembly ──")
+        network_result = build_network(fit_result, iresult)
+        _add_network_stats(stats, network_result)
+        network_result.report.format_print(title="  Network 报告 / Network report")
+
         finish_pipeline_run(conn, run_id, status="completed")
         conn.commit()
         print(f"\n  提交 / Committed.")
@@ -341,6 +362,26 @@ def _print_clip_report(result: ClipResult) -> None:
     result.report.format_print(title="  Clip 报告 / Clip report")
 
 
+def _add_fit_stats(stats: dict[str, int | str], result: FitResult) -> None:
+    stats.update(
+        {
+            f"fitting_{name}": value
+            for name, value in result.report.as_dict().items()
+            if isinstance(value, int)
+        }
+    )
+
+
+def _add_network_stats(stats: dict[str, int | str], result: NetworkResult) -> None:
+    stats.update(
+        {
+            f"network_{name}": value
+            for name, value in result.report.as_dict().items()
+            if isinstance(value, int)
+        }
+    )
+
+
 def replay_clips(db_config: PostgresConfig, run_id: str) -> ClipResult:
     """Replay the pure Clip stage from one completed pipeline run."""
     with pg_connect(db_config) as conn:
@@ -361,7 +402,9 @@ def main() -> int:
     _env = default_postgres_config()
 
     parser = argparse.ArgumentParser(
-        description="Run track.v2 through Clip, or replay Clip from a completed run."
+        description=(
+            "Run track.v2 through Network, or replay Clip from a completed run."
+        )
     )
     # ── 互斥数据源 / Mutually exclusive data sources ──
     source_group = parser.add_mutually_exclusive_group(required=True)
