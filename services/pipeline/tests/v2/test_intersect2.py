@@ -16,6 +16,7 @@ from track.v2._geometry import (
     _iter_bounded_segment_intersections,
     _to_xy,
 )
+from track.v2._perf import PerfTracker
 from track.v2.cleaner1 import CleanerConfig, clean
 from track.v2.exceptions import V2Error
 from track.v2.intersect2 import (
@@ -32,6 +33,8 @@ from track.v2.intersect2 import (
     _extract_cross_track_windows,
     _extract_orthogonal_cross_track_candidates,
     _extract_orthogonal_candidates,
+    _getis_local_counts_grid,
+    _getis_local_counts_scan,
     _group_by_vehicle,
     _merge_clusters,
     _nearest_angle_id,
@@ -789,6 +792,139 @@ class GetisOrdGStarTest(unittest.TestCase):
         events = [TurnEvent(0, "v1", 1000, 116, 39, 0, 0, 0, 90, 90, 90)]
         z = _compute_getis_ord_g_star(events, radius_m=180.0)
         self.assertEqual(z[0], 0.0)
+
+    def test_radius_boundary_and_non_contiguous_ids_match_exact_scan(self):
+        """G* keeps inclusive-radius semantics without relying on sequential IDs."""
+        radius = 180.0
+        below = math.nextafter(radius, 0.0)
+        above = math.nextafter(radius, math.inf)
+        events = [
+            TurnEvent(10, "v1", 1, 116, 39, 0.0, 0.0, 0, 90, 90, 90),
+            TurnEvent(27, "v2", 2, 116, 39, radius, 0.0, 0, 90, 90, 90),
+            TurnEvent(51, "v3", 3, 116, 39, below, 0.0, 0, 90, 90, 90),
+            TurnEvent(88, "v4", 4, 116, 39, above, 0.0, 0, 90, 90, 90),
+            TurnEvent(103, "v5", 5, 116, 39, -radius, 0.0, 0, 90, 90, 90),
+        ]
+        radius_sq = radius * radius
+        counts = [
+            sum((other.x - event.x) ** 2 + (other.y - event.y) ** 2 <= radius_sq for other in events)
+            for event in events
+        ]
+        mean = sum(counts) / len(counts)
+        variance = sum(value * value for value in counts) / len(counts) - mean * mean
+        expected = {
+            event.event_id: (count - mean) / math.sqrt(variance)
+            for event, count in zip(events, counts)
+        }
+        self.assertEqual(_compute_getis_ord_g_star(events, radius), expected)
+
+    @staticmethod
+    def _large_events(points: list[tuple[float, float]]) -> list[TurnEvent]:
+        """Build >256 non-contiguous IDs so the production grid is mandatory."""
+        return [
+            TurnEvent(10_000 + index * 13, f"v{index}", 1_700_000_000 + index,
+                      116.0, 39.0, x, y, 0.0, 90.0, 90.0,
+                      20.0 if index % 17 == 0 else 90.0)
+            for index, (x, y) in enumerate(points)
+        ]
+
+    def _assert_large_grid_matches_scan(self, label: str, points: list[tuple[float, float]]) -> None:
+        events = self._large_events(points)
+        self.assertGreater(len(events), 256, label)
+        radius = 180.0
+        expected_counts = _getis_local_counts_scan(events, radius)
+        mean = sum(expected_counts) / len(expected_counts)
+        variance = sum(count * count for count in expected_counts) / len(expected_counts) - mean * mean
+        std = math.sqrt(max(variance, 0.0))
+        expected_z = {
+            event.event_id: 0.0 if std == 0.0 else (count - mean) / std
+            for event, count in zip(events, expected_counts)
+        }
+        cfg = IntersectConfig(g_star_radius_m=radius, g_star_min_z=0.5, min_turn_deg=45.0)
+        expected_selected = [
+            event.event_id for event in events
+            if expected_z[event.event_id] >= cfg.g_star_min_z
+            and abs(event.turn_deg) >= cfg.min_turn_deg
+        ]
+        # If the threshold/fallback regresses, this mock makes the test fail:
+        # successful computation proves the actual grid path was exercised.
+        with patch("track.v2.intersect2._getis_local_counts_scan", side_effect=AssertionError("scan fallback used")):
+            actual_counts = _getis_local_counts_grid(events, radius)
+            actual_z = _compute_getis_ord_g_star(events, radius)
+            actual_selected = [event.event_id for event in _select_hotspot_events(events, cfg)]
+        self.assertEqual(actual_counts, expected_counts, label)
+        self.assertEqual(actual_z, expected_z, label)
+        self.assertEqual(actual_selected, expected_selected, label)
+
+    def test_large_grid_seams_duplicates_negative_and_all_coincident(self):
+        """Grid is used and exact at radius seams, negative cells and duplicates."""
+        radius = 180.0
+        below = math.nextafter(radius, 0.0)
+        above = math.nextafter(radius, math.inf)
+        cases = {
+            "radius_nextafter": [(0.0, 0.0), (radius, 0.0), (below, 0.0), (above, 0.0), (-radius, 0.0)] * 52,
+            "cross_zero_cell_seam": [(-1e-300, 0.0), (radius, 0.0), (below, 0.0), (above, 0.0), (-radius, 0.0)] * 52,
+            "negative_duplicates": [(-180.0, -180.0), (-180.0, -180.0), (-0.1, -0.1), (-360.0, -0.1), (-540.0, -180.0)] * 52,
+            "all_coincident": [(3.0, -4.0)] * 260,
+        }
+        for label, points in cases.items():
+            with self.subTest(label=label):
+                self._assert_large_grid_matches_scan(label, points)
+
+    def test_large_grid_perf_live_and_repeated_calls_keep_contract(self):
+        """Grid keeps G* telemetry names, 500-event live progress and no state leakage."""
+        events = self._large_events([(index * 400.0, -index * 400.0) for index in range(600)])
+
+        class Live:
+            def __init__(self):
+                self.calls: list[dict[str, object]] = []
+
+            def update(self, **kwargs):
+                self.calls.append(kwargs)
+
+        live = Live()
+        tracker = PerfTracker("gstar-test")
+        first = _compute_getis_ord_g_star(events, 180.0, live_status=live, perf=tracker)
+        second = _compute_getis_ord_g_star(events, 180.0, live_status=live, perf=tracker)
+        self.assertEqual(first, second)
+        self.assertTrue(live.calls, "G* must report at least every 500 events")
+        report = tracker.report()
+        self.assertIn("gstar_events", report)
+        self.assertIn("gstar_neighbors", report)
+
+    def test_negative_and_overflow_radius_preserve_historical_scan(self):
+        """Negative radii use abs cells; overflowed squared radii explicitly scan."""
+        events = self._large_events([(index * 400.0, -index * 400.0) for index in range(260)])
+        for radius in (-180.0, 1e308):
+            with self.subTest(radius=radius):
+                self.assertEqual(
+                    _getis_local_counts_grid(events, radius),
+                    _getis_local_counts_scan(events, radius),
+                )
+
+    def test_huge_finite_coordinate_span_falls_back_without_enumeration(self):
+        """Huge finite quotient ULPs cannot create an unbounded cell range."""
+        events = self._large_events([(1e308, float(index * 3)) for index in range(257)])
+        expected_counts = _getis_local_counts_scan(events, 1.0)
+        with patch("track.v2.intersect2._getis_local_counts_scan", wraps=_getis_local_counts_scan) as fallback:
+            actual_counts = _getis_local_counts_grid(events, 1.0)
+        self.assertEqual(actual_counts, expected_counts)
+        fallback.assert_called_once()
+        mean = sum(expected_counts) / len(expected_counts)
+        variance = sum(count * count for count in expected_counts) / len(expected_counts) - mean * mean
+        std = math.sqrt(max(variance, 0.0))
+        expected_z = {
+            event.event_id: 0.0 if std == 0.0 else (count - mean) / std
+            for event, count in zip(events, expected_counts)
+        }
+        cfg = IntersectConfig(g_star_radius_m=1.0, g_star_min_z=0.5, min_turn_deg=45.0)
+        expected_selected = [
+            event.event_id for event in events
+            if expected_z[event.event_id] >= cfg.g_star_min_z
+            and abs(event.turn_deg) >= cfg.min_turn_deg
+        ]
+        self.assertEqual(_compute_getis_ord_g_star(events, 1.0), expected_z)
+        self.assertEqual([event.event_id for event in _select_hotspot_events(events, cfg)], expected_selected)
 
 
 class HotspotSelectionTest(unittest.TestCase):

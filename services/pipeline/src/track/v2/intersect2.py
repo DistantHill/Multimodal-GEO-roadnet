@@ -1500,13 +1500,6 @@ def _detect_turn_events(
     return events
 
 
-@track_for_loops(
-    {
-        "enumerate(events)": "gstar_events",
-        "events": "gstar_neighbors",
-    },
-    depth=2,
-)
 def _compute_getis_ord_g_star(
     events: list[TurnEvent], radius_m: float,
     *,
@@ -1519,8 +1512,10 @@ def _compute_getis_ord_g_star(
     count if within ``radius_m``. Since TurnEvent is frozen, z-scores
     are returned as a separate dict instead of mutating event fields.
 
-    For-loop timing is auto-injected by ``@track_for_loops`` —
-    ``gstar_events`` (depth 1) and ``gstar_neighbors`` (depth 2).
+    Uses an exact uniform grid: candidates come from a conservatively expanded,
+    bounded intersecting-cell range (at most four cells per axis), then retain
+    the historical squared-distance ``<=`` predicate as the exact filter. The
+    grid retains only event indexes, never neighbour collections.
     """
     n = len(events)
     if n < 2:
@@ -1529,26 +1524,14 @@ def _compute_getis_ord_g_star(
     t0 = time.perf_counter()
     last_t = t0
     log_info(f"    计算 Getis-Ord G* / Computing G* ({n:,} 事件/events) ...")
-    local_counts: list[float] = []
-    for i, event in enumerate(events):
-        count = 0.0
-        ex, ey = event.x, event.y
-        for other in events:
-            dx = other.x - ex
-            dy = other.y - ey
-            if dx * dx + dy * dy <= radius_m * radius_m:
-                count += 1.0
-        local_counts.append(count)
-        now = time.perf_counter()
-        if (i + 1) % 500 == 0 or (now - last_t) >= 3.0:
-            _route_progress(
-                live_status,
-                detail=f"G*:\t{i + 1:,}/{n:,}\t事件/events",
-                progress=(i + 1) / n,
-                elapsed=now - t0,
-                stage="Intersect2: G* 热点 / Hotspot G*",
-            )
-            last_t = now
+    if not math.isfinite(radius_m) or any(not math.isfinite(e.x) or not math.isfinite(e.y) for e in events):
+        # Preserve the historical IEEE comparison behaviour for inputs a grid
+        # cannot represent (NaN/Inf), rather than raising a new exception.
+        local_counts = _getis_local_counts_scan(events, radius_m, live_status=live_status, perf=perf, started=t0)
+    else:
+        local_counts = _getis_local_counts_grid(
+            events, radius_m, live_status=live_status, perf=perf, started=t0,
+        )
 
     log_info(f"    G*: {n:,} 事件/events ({time.perf_counter() - t0:.1f}s)")
 
@@ -1563,6 +1546,134 @@ def _compute_getis_ord_g_star(
         e.event_id: (lc - mean) / std
         for e, lc in zip(events, local_counts)
     }
+
+
+def _getis_local_counts_scan(
+    events: list[TurnEvent], radius_m: float, *, live_status: Any = None,
+    perf: PerfTracker | None = None, started: float | None = None,
+) -> list[float]:
+    """Historical exact comparison path for non-representable grid inputs."""
+    radius_sq = radius_m * radius_m
+    # The default hot path needs no instrumentation.  Keeping this compact
+    # also preserves the small-input cost profile of the former inline scan.
+    if perf is None and live_status is None:
+        local_counts: list[float] = []
+        for event in events:
+            count = 0.0
+            ex, ey = event.x, event.y
+            for other in events:
+                dx = other.x - ex
+                dy = other.y - ey
+                if dx * dx + dy * dy <= radius_sq:
+                    count += 1.0
+            local_counts.append(count)
+        return local_counts
+    local_counts: list[float] = []
+    begin = started or time.perf_counter()
+    last_t = begin
+    outer_events = _perf_iter(perf, enumerate(events), name="gstar_events", total=len(events))
+    for i, event in outer_events:
+        count = 0.0
+        neighbors = events if perf is None else _perf_iter(perf, events, name="gstar_neighbors", total=len(events))
+        for other in neighbors:
+            dx = other.x - event.x
+            dy = other.y - event.y
+            if dx * dx + dy * dy <= radius_sq:
+                count += 1.0
+        local_counts.append(count)
+        now = time.perf_counter()
+        if (i + 1) % 500 == 0 or (now - last_t) >= 3.0:
+            _route_progress(live_status, detail=f"G*:\t{i + 1:,}/{len(events):,}\t事件/events",
+                            progress=(i + 1) / len(events), elapsed=now - begin,
+                            stage="Intersect2: G* 热点 / Hotspot G*")
+            last_t = now
+    return local_counts
+
+
+def _getis_local_counts_grid(
+    events: list[TurnEvent], radius_m: float, *, live_status: Any = None,
+    perf: PerfTracker | None = None, started: float | None = None,
+    phase_timings: dict[str, float] | None = None,
+) -> list[float]:
+    """Exact radius counts without allocating neighbour lists or NxN matrices."""
+    cell_size = abs(radius_m)
+    if cell_size == 0.0 or len(events) <= 256:
+        return _getis_local_counts_scan(events, radius_m, live_status=live_status, perf=perf, started=started)
+    # Finite operands can still produce an infinite cell quotient for a tiny
+    # positive radius.  floor(inf) would newly raise; use the historical scan.
+    if any(not math.isfinite(event.x / cell_size) or not math.isfinite(event.y / cell_size)
+           or not math.isfinite((event.x - cell_size) / cell_size)
+           or not math.isfinite((event.x + cell_size) / cell_size)
+           or not math.isfinite((event.y - cell_size) / cell_size)
+           or not math.isfinite((event.y + cell_size) / cell_size)
+           for event in events):
+        return _getis_local_counts_scan(events, radius_m, live_status=live_status, perf=perf, started=started)
+    radius_sq = radius_m * radius_m
+    if not math.isfinite(radius_sq):
+        # Historical squared-distance arithmetic overflows to infinity; its
+        # resulting IEEE comparison cannot be bounded by finite grid cells.
+        return _getis_local_counts_scan(events, radius_m, live_status=live_status, perf=perf, started=started)
+    cell_bounds: list[tuple[int, int, int, int]] = []
+    for event in events:
+        min_cell_x = math.floor(math.nextafter((event.x - cell_size) / cell_size, -math.inf))
+        max_cell_x = math.floor(math.nextafter((event.x + cell_size) / cell_size, math.inf))
+        min_cell_y = math.floor(math.nextafter((event.y - cell_size) / cell_size, -math.inf))
+        max_cell_y = math.floor(math.nextafter((event.y + cell_size) / cell_size, math.inf))
+        # A one-radius interval normally intersects at most four cells after
+        # outward nextafter expansion.  At huge coordinates a single quotient
+        # ULP can span ~1e292 integer cells; never attempt to enumerate it.
+        if max_cell_x - min_cell_x + 1 > 4 or max_cell_y - min_cell_y + 1 > 4:
+            return _getis_local_counts_scan(events, radius_m, live_status=live_status, perf=perf, started=started)
+        cell_bounds.append((min_cell_x, max_cell_x, min_cell_y, max_cell_y))
+    cells: dict[tuple[int, int], list[int]] = defaultdict(list)
+    build_started = time.perf_counter()
+    for index, event in enumerate(events):
+        cells[(math.floor(event.x / cell_size), math.floor(event.y / cell_size))].append(index)
+    if phase_timings is not None:
+        phase_timings["grid_build_seconds"] = time.perf_counter() - build_started
+
+    local_counts: list[float] = []
+    count_started = time.perf_counter()
+    last_t = started or time.perf_counter()
+    for i, event in _perf_iter(perf, enumerate(events), name="gstar_events", total=len(events)):
+        # Do not assume a fixed +/- one-cell stencil.  Floating-point
+        # subtraction can round an exact radius crossing across a cell seam
+        # (notably x=-tiny versus x=radius).  Expand the inclusive coordinate
+        # interval outward by one representable value, then retain the legacy
+        # squared-distance predicate as the exact final filter.
+        # Apply nextafter after division: applying it before division can
+        # underflow back to signed zero (0 / cell_size), losing cell -1.
+        min_cell_x, max_cell_x, min_cell_y, max_cell_y = cell_bounds[i]
+        count = 0.0
+        for neighbor_x in range(min_cell_x, max_cell_x + 1):
+            for neighbor_y in range(min_cell_y, max_cell_y + 1):
+                # Keep the historical telemetry name, but its work now means
+                # exact candidate comparisons from the conservatively bounded
+                # intersecting cells, rather than a fabricated all-events scan.
+                candidate_indexes = _perf_iter(
+                    perf, cells.get((neighbor_x, neighbor_y), ()),
+                    name="gstar_neighbors",
+                )
+                for other_index in candidate_indexes:
+                    other = events[other_index]
+                    dx = other.x - event.x
+                    dy = other.y - event.y
+                    if dx * dx + dy * dy <= radius_sq:
+                        count += 1.0
+        local_counts.append(count)
+        now = time.perf_counter()
+        if (i + 1) % 500 == 0 or (now - last_t) >= 3.0:
+            _route_progress(
+                live_status,
+                detail=f"G*:\t{i + 1:,}/{len(events):,}\t事件/events",
+                progress=(i + 1) / len(events),
+                elapsed=now - (started or now),
+                stage="Intersect2: G* 热点 / Hotspot G*",
+            )
+            last_t = now
+    if phase_timings is not None:
+        phase_timings["radius_count_seconds"] = time.perf_counter() - count_started
+    return local_counts
 
 
 def _select_hotspot_events(
