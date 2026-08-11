@@ -31,6 +31,7 @@ from ._perf import PerfTracker, TimedStage, timed_iter, track_for_loops
 from ._geometry import (
     _angle_delta_deg,
     _batch_segment_intersections,
+    _iter_bounded_segment_intersections,
     _bearing_deg,
     _branch_angle_from_center,
     _circular_mean_deg,
@@ -749,6 +750,7 @@ def _query_active_points_in_window(
     table: str = "trajectory_points",
     source_id: str | None = None,
     run_id: str | None = None,
+    telemetry: dict[str, int | float] | None = None,
 ) -> list[TrajectoryPoint]:
     """Query active trajectory points + injected points in a spatial window.
 
@@ -762,6 +764,7 @@ def _query_active_points_in_window(
     params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
     if run_id is not None:
         params.append(run_id)
+    query_started = time.perf_counter() if telemetry is not None else 0.0
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
@@ -805,7 +808,18 @@ def _query_active_points_in_window(
             })
 
     # DB ORDER BY 已保证 (vehicle_id, timestamp) 有序，无需 Python 侧再排
-    return _build_points_from_rows(rows)
+    if telemetry is not None:
+        telemetry["query_seconds"] = telemetry.get("query_seconds", 0.0) + (
+            time.perf_counter() - query_started
+        )
+        telemetry["queried_rows"] = telemetry.get("queried_rows", 0) + len(rows)
+        materialization_started = time.perf_counter()
+    points = _build_points_from_rows(rows)
+    if telemetry is not None:
+        telemetry["materialization_seconds"] = telemetry.get(
+            "materialization_seconds", 0.0
+        ) + (time.perf_counter() - materialization_started)
+    return points
 
 
 def _stream_vehicle_tracks_from_db(
@@ -1089,6 +1103,7 @@ def _extract_cross_track_windows(
     live_status: Any = None,
     *,
     perf: PerfTracker | None = None,
+    telemetry: dict[str, int | float] | None = None,
 ) -> list[CrossTrackCandidate]:
     """Method 3: spatial sliding windows for cross-track segment intersection."""
     candidates: list[CrossTrackCandidate] = []
@@ -1137,24 +1152,45 @@ def _extract_cross_track_windows(
             table=cfg.db_table,
             source_id=cfg.source_id,
             run_id=cfg.run_id,
+            telemetry=telemetry,
         )
         if not points:
             log_info(f"Window {window_count} Done, 累计处理点数/sum points: {total_points:,}")
             continue
 
         total_points += len(points)
+        group_started = time.perf_counter() if telemetry is not None else 0.0
         window_tracks = _tracks_from_points(points)
+        if telemetry is not None:
+            telemetry["group_sort_seconds"] = telemetry.get(
+                "group_sort_seconds", 0.0
+            ) + (time.perf_counter() - group_started)
         win_cands, w_pairs, w_total = _extract_orthogonal_cross_track_candidates(
             window_tracks, origin_lon, origin_lat, cfg,
             live_status=live_status, sub_detail=True, perf=perf,
+            telemetry=telemetry,
         )
         added = 0
+        dedupe_started = time.perf_counter() if telemetry is not None else 0.0
         for candidate in win_cands:
             key = _cross_track_candidate_key(candidate)
             if key not in seen_segment_pairs:
                 seen_segment_pairs.add(key)
                 candidates.append(candidate)
                 added += 1
+        if telemetry is not None:
+            telemetry["dedupe_seconds"] = telemetry.get("dedupe_seconds", 0.0) + (
+                time.perf_counter() - dedupe_started
+            )
+            telemetry["windows_with_points"] = telemetry.get("windows_with_points", 0) + 1
+            telemetry["window_vehicle_pairs"] = telemetry.get("window_vehicle_pairs", 0) + w_pairs
+            telemetry["window_vehicle_pairs_total"] = telemetry.get(
+                "window_vehicle_pairs_total", 0
+            ) + w_total
+            telemetry["dedupe_added"] = telemetry.get("dedupe_added", 0) + added
+            telemetry["dedupe_removed"] = telemetry.get("dedupe_removed", 0) + (
+                len(win_cands) - added
+            )
 
         last_cross_sub = (
             f"跨车求交/Cross-track:\t{w_pairs:,}/{w_total:,}\t车辆对/pairs,\t"
@@ -1669,6 +1705,8 @@ def _extract_orthogonal_cross_track_candidates(
     *,
     sub_detail: bool = False,
     perf: PerfTracker | None = None,
+    telemetry: dict[str, int | float] | None = None,
+    vehicle_aabb_prefilter: bool = True,
 ) -> tuple[list[CrossTrackCandidate], int, int]:
     """Multi-vehicle segment crossing detection via NumPy batched intersection.
 
@@ -1687,6 +1725,8 @@ def _extract_orthogonal_cross_track_candidates(
     """
     # ── Step 1: 预过滤直段 (heading 前后差 ≤ straightness_deg) ──────
     # track_segs[vid] = [(x1,y1, x2,y2, heading, timestamp, seg_idx), ...]
+    extraction_started = time.perf_counter() if telemetry is not None else 0.0
+    segment_started = time.perf_counter() if telemetry is not None else 0.0
     track_segs: dict[str, list[tuple[float, float, float, float, float, float, int]]] = {}
     for vid, track in tracks.items():
         if len(track) < 2:
@@ -1704,9 +1744,43 @@ def _extract_orthogonal_cross_track_candidates(
         if segs:
             track_segs[vid] = segs
 
+    if telemetry is not None:
+        telemetry["segment_build_seconds"] = telemetry.get(
+            "segment_build_seconds", 0.0
+        ) + (time.perf_counter() - segment_started)
+        telemetry["segments"] = telemetry.get("segments", 0) + sum(
+            len(segments) for segments in track_segs.values()
+        )
+
     vehicle_ids = sorted(track_segs)
     if len(vehicle_ids) < 2:
         return [], 0, 0
+
+    # Construct each vehicle's compact arrays once per window.  Pair traversal
+    # below only reads these values, preserving vehicle and segment order.
+    array_started = time.perf_counter() if telemetry is not None else 0.0
+    segment_arrays: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, list[float]]] = {}
+    for vehicle_id in vehicle_ids:
+        segments = track_segs[vehicle_id]
+        segment_arrays[vehicle_id] = (
+            np.array([[s[0], s[1]] for s in segments], dtype=float),
+            np.array([[s[2], s[3]] for s in segments], dtype=float),
+            np.array([s[4] for s in segments], dtype=float),
+            [s[5] for s in segments],
+        )
+    vehicle_aabbs = {
+        vehicle_id: (
+            float(np.minimum(arrays[0][:, 0], arrays[1][:, 0]).min()),
+            float(np.maximum(arrays[0][:, 0], arrays[1][:, 0]).max()),
+            float(np.minimum(arrays[0][:, 1], arrays[1][:, 1]).min()),
+            float(np.maximum(arrays[0][:, 1], arrays[1][:, 1]).max()),
+        )
+        for vehicle_id, arrays in segment_arrays.items()
+    }
+    if telemetry is not None:
+        telemetry["array_build_seconds"] = telemetry.get(
+            "array_build_seconds", 0.0
+        ) + (time.perf_counter() - array_started)
 
     # ── Step 2: 每对车辆间 NumPy 批量求交 ──────────────────────────
     candidates: list[CrossTrackCandidate] = []
@@ -1719,61 +1793,87 @@ def _extract_orthogonal_cross_track_candidates(
     for i in _perf_iter(perf, range(len(vehicle_ids)), name="cross_track_vehicle_i", total=len(vehicle_ids)):
         vid_a = vehicle_ids[i]
         segs_a = track_segs[vid_a]
-        a1 = np.array([[s[0], s[1]] for s in segs_a], dtype=float)
-        a2 = np.array([[s[2], s[3]] for s in segs_a], dtype=float)
-        ha = np.array([s[4] for s in segs_a], dtype=float)
-        ts_a = [s[5] for s in segs_a]
+        a1, a2, ha, ts_a = segment_arrays[vid_a]
 
         # ZH: 内层 j 循环由 NumPy 批量求交处理，不做逐迭代计时。
         # EN: Inner j loop is handled by the NumPy batch — not timed per-iteration.
         for j in range(i + 1, len(vehicle_ids)):
             vid_b = vehicle_ids[j]
             segs_b = track_segs[vid_b]
-            b1 = np.array([[s[0], s[1]] for s in segs_b], dtype=float)
-            b2 = np.array([[s[2], s[3]] for s in segs_b], dtype=float)
-            hb = np.array([s[4] for s in segs_b], dtype=float)
-            ts_b = [s[5] for s in segs_b]
+            b1, b2, hb, ts_b = segment_arrays[vid_b]
 
-            cx, cy, flat_idx = _batch_segment_intersections(
-                a1, a2, ha, b1, b2, hb,
-                cfg.cross_track_min_angle_deg,
-                cfg.cross_track_max_angle_deg,
+            if telemetry is not None:
+                telemetry["vehicle_pairs"] = telemetry.get("vehicle_pairs", 0) + 1
+                telemetry["segment_pair_space"] = telemetry.get(
+                    "segment_pair_space", 0
+                ) + len(segs_a) * len(segs_b)
+
+            a_box = vehicle_aabbs[vid_a]
+            b_box = vehicle_aabbs[vid_b]
+            # Closed overlap intentionally keeps endpoint crossings.  The
+            # private switch is an oracle seam for regression tests; normal
+            # callers always use the bounded broad phase.
+            overlaps = not vehicle_aabb_prefilter or (
+                a_box[0] <= b_box[1] and b_box[0] <= a_box[1]
+                and a_box[2] <= b_box[3] and b_box[2] <= a_box[3]
             )
-            for fi in flat_idx:
-                si = fi // len(segs_b)
-                sj = fi % len(segs_b)
-                a_start = tracks[vid_a][segs_a[si][6]]
-                a_end = tracks[vid_a][segs_a[si][6] + 1]
-                b_start = tracks[vid_b][segs_b[sj][6]]
-                b_end = tracks[vid_b][segs_b[sj][6] + 1]
-                lon, lat = _to_lonlat(
-                    float(cx.flat[fi]), float(cy.flat[fi]),
-                    origin_lon, origin_lat,
-                )
-                ts = (ts_a[si] + ts_b[sj]) / 2.0
-                candidates.append(
-                    CrossTrackCandidate(
-                        point_ref=a_start.point_ref,
-                        vehicle_id=f"{vid_a}|{vid_b}",
-                        timestamp=ts,
-                        lon=lon,
-                        lat=lat,
-                        x=float(cx.flat[fi]),
-                        y=float(cy.flat[fi]),
-                        heading=segs_a[si][4],
-                        speed=a_start.speed,
-                        from_source_id=a_start.point_ref.source_id,
-                        from_source_row_key=(
-                            f"{a_start.point_ref.source_row_key},{a_end.point_ref.source_row_key}"
-                        ),
-                        to_source_id=b_start.point_ref.source_id,
-                        to_source_row_key=(
-                            f"{b_start.point_ref.source_row_key},{b_end.point_ref.source_row_key}"
-                        ),
-                        origin_lon=origin_lon,
-                        origin_lat=origin_lat,
+            if telemetry is not None:
+                telemetry["vehicle_aabb_pairs"] = telemetry.get("vehicle_aabb_pairs", 0) + 1
+                telemetry["vehicle_aabb_rejected"] = telemetry.get("vehicle_aabb_rejected", 0) + int(not overlaps)
+            if overlaps and telemetry is not None:
+                telemetry["vehicle_kernel_pairs"] = telemetry.get("vehicle_kernel_pairs", 0) + 1
+
+            for a_offset, cx, cy, flat_idx in (
+                _iter_bounded_segment_intersections(
+                    a1, a2, ha, b1, b2, hb,
+                    cfg.cross_track_min_angle_deg,
+                    cfg.cross_track_max_angle_deg,
+                    telemetry=telemetry,
+                ) if overlaps else ()
+            ):
+                payload_started = time.perf_counter() if telemetry is not None else 0.0
+                for x, y, fi in zip(cx, cy, flat_idx):
+                    si = a_offset + fi // len(segs_b)
+                    sj = fi % len(segs_b)
+                    a_start = tracks[vid_a][segs_a[si][6]]
+                    a_end = tracks[vid_a][segs_a[si][6] + 1]
+                    b_start = tracks[vid_b][segs_b[sj][6]]
+                    b_end = tracks[vid_b][segs_b[sj][6] + 1]
+                    lon, lat = _to_lonlat(
+                        float(x), float(y),
+                        origin_lon, origin_lat,
                     )
-                )
+                    ts = (ts_a[si] + ts_b[sj]) / 2.0
+                    candidates.append(
+                        CrossTrackCandidate(
+                            point_ref=a_start.point_ref,
+                            vehicle_id=f"{vid_a}|{vid_b}",
+                            timestamp=ts,
+                            lon=lon,
+                            lat=lat,
+                            x=float(x),
+                            y=float(y),
+                            heading=segs_a[si][4],
+                            speed=a_start.speed,
+                            from_source_id=a_start.point_ref.source_id,
+                            from_source_row_key=(
+                                f"{a_start.point_ref.source_row_key},"
+                                f"{a_end.point_ref.source_row_key}"
+                            ),
+                            to_source_id=b_start.point_ref.source_id,
+                            to_source_row_key=(
+                                f"{b_start.point_ref.source_row_key},"
+                                f"{b_end.point_ref.source_row_key}"
+                            ),
+                            origin_lon=origin_lon,
+                            origin_lat=origin_lat,
+                        )
+                    )
+                if telemetry is not None:
+                    telemetry["payload_seconds"] = telemetry.get(
+                        "payload_seconds", 0.0
+                    ) + (time.perf_counter() - payload_started)
+                    telemetry["exact_hits"] = telemetry.get("exact_hits", 0) + len(flat_idx)
 
             pair_count += 1
             now = time.perf_counter()
@@ -1790,6 +1890,11 @@ def _extract_orthogonal_cross_track_candidates(
         live_status, pair_count, total_pairs, len(candidates), elapsed,
         sub_detail=sub_detail, final=True,
     )
+    if telemetry is not None:
+        telemetry["cross_track_seconds"] = telemetry.get(
+            "cross_track_seconds", 0.0
+        ) + (time.perf_counter() - extraction_started)
+        telemetry["output_candidates"] = telemetry.get("output_candidates", 0) + len(candidates)
     return candidates, pair_count, total_pairs
 
 

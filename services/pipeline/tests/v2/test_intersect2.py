@@ -8,12 +8,20 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from track.v2._geometry import _to_xy
+import numpy as np
+
+from track.v2 import intersect2 as intersect2_module
+from track.v2._geometry import (
+    _batch_segment_intersections,
+    _iter_bounded_segment_intersections,
+    _to_xy,
+)
 from track.v2.cleaner1 import CleanerConfig, clean
 from track.v2.exceptions import V2Error
 from track.v2.intersect2 import (
     IntersectConfig,
     IntersectResult,
+    SpatialWindow,
     _cluster_angles_greedy,
     _cluster_dbscan,
     _cluster_orthogonal_candidates,
@@ -27,6 +35,7 @@ from track.v2.intersect2 import (
     _group_by_vehicle,
     _merge_clusters,
     _nearest_angle_id,
+    _query_active_points_in_window,
     _select_hotspot_events,
     detect_intersections,
 )
@@ -168,6 +177,426 @@ class IntersectReportTest(unittest.TestCase):
 
 
 # ── Group by vehicle tests ─────────────────────────────────────────────
+
+
+class CompactAabbBroadPhaseTest(unittest.TestCase):
+    """Regression coverage for the strict window broad/exact seam."""
+
+    def test_aabb_rejection_skips_exact_pairs_and_keeps_closed_endpoint(self):
+        # First A segment is disjoint from both B segments.  The second touches
+        # B[0] at an endpoint; closed AABBs must retain that historical hit.
+        a1 = np.array([[0.0, 0.0], [10.0, 0.0]])
+        a2 = np.array([[1.0, 0.0], [11.0, 0.0]])
+        ha = np.array([90.0, 90.0])
+        b1 = np.array([[10.0, -1.0], [30.0, -1.0]])
+        b2 = np.array([[10.0, 1.0], [30.0, 1.0]])
+        hb = np.array([0.0, 0.0])
+        telemetry: dict[str, int] = {}
+
+        blocks = list(_iter_bounded_segment_intersections(
+            a1, a2, ha, b1, b2, hb, 80.0, 100.0,
+            max_matrix_elements=2, telemetry=telemetry,
+        ))
+
+        self.assertEqual(telemetry["broad_pairs"], 1)
+        self.assertEqual(telemetry["exact_pairs"], 1)
+        self.assertEqual(telemetry["exact_skipped_pairs"], 3)
+        self.assertEqual(telemetry["empty_broad_blocks"], 1)
+        self.assertEqual(len(blocks), 1)
+        a_offset, cx, cy, flat_idx = blocks[0]
+        self.assertEqual(a_offset, 1)
+        self.assertEqual(flat_idx.tolist(), [0])
+        self.assertEqual(cx.tolist(), [10.0])
+        self.assertEqual(cy.tolist(), [0.0])
+
+    def test_compact_exact_matches_dense_kernel_in_row_major_order(self):
+        a1 = np.array([[0.0, 0.0], [0.0, 2.0], [0.0, 4.0]])
+        a2 = np.array([[4.0, 0.0], [4.0, 2.0], [4.0, 4.0]])
+        ha = np.array([90.0, 90.0, 90.0])
+        b1 = np.array([[1.0, -1.0], [3.0, -1.0], [8.0, -1.0]])
+        b2 = np.array([[1.0, 5.0], [3.0, 5.0], [8.0, 5.0]])
+        hb = np.array([0.0, 0.0, 0.0])
+
+        dense_x, dense_y, dense_hits = _batch_segment_intersections(
+            a1, a2, ha, b1, b2, hb, 80.0, 100.0,
+        )
+        compact_hits: list[int] = []
+        compact_xy: list[tuple[float, float]] = []
+        for a_offset, cx, cy, flat_idx in _iter_bounded_segment_intersections(
+            a1, a2, ha, b1, b2, hb, 80.0, 100.0,
+            max_matrix_elements=3,
+        ):
+            compact_hits.extend((a_offset * len(b1) + flat_idx).tolist())
+            compact_xy.extend(zip(cx.tolist(), cy.tolist()))
+
+        self.assertEqual(compact_hits, dense_hits.tolist())
+        self.assertEqual(
+            compact_xy,
+            [(float(dense_x.flat[i]), float(dense_y.flat[i])) for i in dense_hits],
+        )
+
+    def test_b_segments_over_cap_are_two_dimensionally_bounded(self):
+        """B wider than the cap never creates an oversized broad/exact block."""
+        a1 = np.array([[0.0, 0.0], [0.0, 2.0]])
+        a2 = np.array([[7.0, 0.0], [7.0, 2.0]])
+        ha = np.array([90.0, 90.0])
+        b1 = np.array([[float(x), -1.0] for x in range(8)])
+        b2 = np.array([[float(x), 3.0] for x in range(8)])
+        hb = np.zeros(8)
+        cap = 3
+        telemetry: dict[str, int] = {}
+
+        dense_x, dense_y, dense_hits = _batch_segment_intersections(
+            a1, a2, ha, b1, b2, hb, 80.0, 100.0,
+        )
+        bounded_hits: list[int] = []
+        bounded_xy: list[tuple[float, float]] = []
+        for a_offset, cx, cy, flat_idx in _iter_bounded_segment_intersections(
+            a1, a2, ha, b1, b2, hb, 80.0, 100.0,
+            max_matrix_elements=cap,
+            telemetry=telemetry,
+        ):
+            bounded_hits.extend((a_offset * len(b1) + flat_idx).tolist())
+            bounded_xy.extend(zip(cx.tolist(), cy.tolist()))
+
+        self.assertEqual(bounded_hits, dense_hits.tolist())
+        self.assertEqual(
+            bounded_xy,
+            [(float(dense_x.flat[i]), float(dense_y.flat[i])) for i in dense_hits],
+        )
+        self.assertEqual(telemetry["matrix_element_cap"], cap)
+        self.assertLessEqual(telemetry["max_broad_block_pairs"], cap)
+        self.assertLessEqual(telemetry["max_exact_chunk_pairs"], cap)
+        self.assertEqual(telemetry["broad_pairs"], len(a1) * len(b1))
+        self.assertEqual(telemetry["exact_pairs"], len(a1) * len(b1))
+        self.assertGreater(telemetry["broad_blocks"], len(a1))
+
+    def test_hybrid_threshold_boundary_preserves_dense_hits_order_xy_and_cap(self):
+        """1023/1024 use dense-direct; 1025 falls back to bounded broad."""
+        for pairs, direct in ((1023, True), (1024, True), (1025, False)):
+            a1 = np.array([[0.0, 0.0]])
+            a2 = np.array([[2.0, 0.0]])
+            ha = np.array([90.0])
+            b1 = np.array([[1.0, -1.0]] * pairs)
+            b2 = np.array([[1.0, 1.0]] * pairs)
+            hb = np.zeros(pairs)
+            dense_x, dense_y, dense_hits = _batch_segment_intersections(
+                a1, a2, ha, b1, b2, hb, 80.0, 100.0,
+            )
+            telemetry: dict[str, int] = {}
+            blocks = list(_iter_bounded_segment_intersections(
+                a1, a2, ha, b1, b2, hb, 80.0, 100.0,
+                max_matrix_elements=262_144, telemetry=telemetry,
+            ))
+            hits = [index for offset, _x, _y, flat in blocks for index in (offset + flat).tolist()]
+            xy = [(float(x), float(y)) for _offset, cx, cy, _flat in blocks for x, y in zip(cx, cy)]
+            self.assertEqual(hits, dense_hits.tolist())
+            self.assertEqual(xy, [(float(dense_x.flat[i]), float(dense_y.flat[i])) for i in dense_hits])
+            if direct:
+                self.assertEqual(telemetry["dense_direct_blocks"], 1)
+                self.assertEqual(telemetry["dense_direct_pairs"], pairs)
+                self.assertEqual(telemetry["max_dense_direct_pairs"], pairs)
+                self.assertNotIn("broad_blocks", telemetry)
+            else:
+                self.assertEqual(telemetry["broad_blocks"], 1)
+                self.assertLessEqual(telemetry["max_broad_block_pairs"], 262_144)
+                self.assertLessEqual(telemetry["max_exact_chunk_pairs"], 262_144)
+
+    def test_dense_direct_never_exceeds_smaller_matrix_cap(self):
+        a1 = np.array([[0.0, 0.0]])
+        a2 = np.array([[2.0, 0.0]])
+        ha = np.array([90.0])
+        b1 = np.array([[1.0, -1.0]] * 64)
+        b2 = np.array([[1.0, 1.0]] * 64)
+        telemetry: dict[str, int] = {}
+        list(_iter_bounded_segment_intersections(a1, a2, ha, b1, b2, np.zeros(64), 80.0, 100.0, max_matrix_elements=32, telemetry=telemetry))
+        self.assertNotIn("dense_direct_blocks", telemetry)
+        self.assertLessEqual(telemetry["max_broad_block_pairs"], 32)
+        self.assertLessEqual(telemetry["max_exact_chunk_pairs"], 32)
+
+
+class VehicleAabbPrefilterTest(unittest.TestCase):
+    def _track(self, vehicle, points, heading):
+        return [_make_point(vehicle, f"{vehicle}-{i}", float(i), lon, lat, heading, 1.0)
+                for i, (lon, lat) in enumerate(points)]
+
+    @staticmethod
+    def _payload(candidate):
+        """The historical no-prefilter oracle must match every output field."""
+        return (
+            candidate.point_ref,
+            candidate.vehicle_id,
+            candidate.timestamp,
+            candidate.lon,
+            candidate.lat,
+            candidate.x,
+            candidate.y,
+            candidate.heading,
+            candidate.speed,
+            candidate.from_source_id,
+            candidate.from_source_row_key,
+            candidate.to_source_id,
+            candidate.to_source_row_key,
+            candidate.origin_lon,
+            candidate.origin_lat,
+        )
+
+    def _historical_oracle(self, tracks, origin_lon=116.0, origin_lat=39.0):
+        """Run the exact historical all-vehicle-pairs path, without AABB reject."""
+        return _extract_orthogonal_cross_track_candidates(
+            tracks, origin_lon, origin_lat, IntersectConfig(),
+            vehicle_aabb_prefilter=False,
+        )
+
+    def test_rejected_pairs_skip_kernel_but_keep_pair_count(self):
+        tracks = {"A": self._track("A", [(116, 39), (116.001, 39)], 90),
+                  "B": self._track("B", [(117, 40), (117.001, 40)], 90)}
+        telemetry = {}
+        with patch("track.v2.intersect2._iter_bounded_segment_intersections") as kernel:
+            candidates, pairs, total = _extract_orthogonal_cross_track_candidates(tracks, 116, 39, IntersectConfig(), telemetry=telemetry)
+        self.assertEqual((candidates, pairs, total), ([], 1, 1))
+        kernel.assert_not_called()
+        self.assertEqual(telemetry["vehicle_aabb_pairs"], telemetry["vehicle_aabb_rejected"] + telemetry.get("vehicle_kernel_pairs", 0))
+
+    def test_closed_endpoint_calls_kernel_and_preserves_candidate_order(self):
+        tracks = {"A": self._track("A", [(116, 38.999), (116, 39)], 0),
+                  "B": self._track("B", [(115.999, 39), (116, 39)], 90)}
+        telemetry = {}
+        with patch("track.v2.intersect2._iter_bounded_segment_intersections", wraps=_iter_bounded_segment_intersections) as kernel:
+            candidates, pairs, total = _extract_orthogonal_cross_track_candidates(tracks, 116, 39, IntersectConfig(), telemetry=telemetry)
+        self.assertEqual((pairs, total), (1, 1)); self.assertTrue(kernel.called)
+        self.assertEqual(telemetry["vehicle_aabb_rejected"], 0)
+        self.assertEqual([item.vehicle_id for item in candidates], sorted(item.vehicle_id for item in candidates))
+
+    def test_closed_endpoint_returns_known_intersection_and_full_payload_matches_oracle(self):
+        """AABB endpoint inclusion is non-vacuous and exactly historical."""
+        tracks = {
+            "A": [
+                _make_point("A", "A-start", 10.0, 116.0, 38.999, 0.0, 12.0, "source-a"),
+                _make_point("A", "A-end", 20.0, 116.0, 39.0, 0.0, 13.0, "source-a"),
+            ],
+            "B": [
+                _make_point("B", "B-start", 30.0, 115.999, 39.0, 90.0, 8.0, "source-b"),
+                _make_point("B", "B-end", 40.0, 116.0, 39.0, 90.0, 9.0, "source-b"),
+            ],
+        }
+        oracle, oracle_pairs, oracle_total = self._historical_oracle(tracks)
+        telemetry: dict[str, int] = {}
+        with patch(
+            "track.v2.intersect2._iter_bounded_segment_intersections",
+            wraps=_iter_bounded_segment_intersections,
+        ) as kernel:
+            actual, pairs, total = _extract_orthogonal_cross_track_candidates(
+                tracks, 116.0, 39.0, IntersectConfig(), telemetry=telemetry,
+            )
+
+        self.assertEqual((pairs, total), (oracle_pairs, oracle_total))
+        self.assertEqual(len(actual), 1)
+        self.assertEqual(kernel.call_count, 1)
+        candidate = actual[0]
+        self.assertEqual(candidate.vehicle_id, "A|B")
+        self.assertAlmostEqual(candidate.x, 0.0)
+        self.assertAlmostEqual(candidate.y, 0.0)
+        self.assertAlmostEqual(candidate.lon, 116.0)
+        self.assertAlmostEqual(candidate.lat, 39.0)
+        self.assertEqual(candidate.point_ref, PointRef("source-a", "A-start", stable=True))
+        self.assertEqual(candidate.from_source_id, "source-a")
+        self.assertEqual(candidate.from_source_row_key, "A-start,A-end")
+        self.assertEqual(candidate.to_source_id, "source-b")
+        self.assertEqual(candidate.to_source_row_key, "B-start,B-end")
+        self.assertEqual([self._payload(item) for item in actual], [self._payload(item) for item in oracle])
+        self.assertEqual(telemetry["vehicle_aabb_pairs"], 1)
+        self.assertEqual(telemetry["vehicle_aabb_rejected"], 0)
+
+    def test_mixed_vehicle_pairs_account_kernel_and_rejection_and_match_oracle(self):
+        """A/B intersects; every pair containing C is rejected before the kernel."""
+        tracks = {
+            "A": self._track("A", [(116.0, 38.999), (116.0, 39.001)], 0.0),
+            "B": self._track("B", [(115.999, 39.0), (116.001, 39.0)], 90.0),
+            "C": self._track("C", [(117.0, 40.0), (117.001, 40.0)], 90.0),
+        }
+        oracle, oracle_pairs, oracle_total = self._historical_oracle(tracks)
+        telemetry: dict[str, int] = {}
+        with patch(
+            "track.v2.intersect2._iter_bounded_segment_intersections",
+            wraps=_iter_bounded_segment_intersections,
+        ) as kernel:
+            actual, pairs, total = _extract_orthogonal_cross_track_candidates(
+                tracks, 116.0, 39.0, IntersectConfig(), telemetry=telemetry,
+            )
+
+        self.assertEqual((pairs, total), (3, 3))
+        self.assertEqual((pairs, total), (oracle_pairs, oracle_total))
+        self.assertEqual(kernel.call_count, 1)
+        self.assertEqual(telemetry["vehicle_aabb_pairs"], 3)
+        self.assertEqual(telemetry["vehicle_aabb_rejected"], 2)
+        self.assertEqual(telemetry["vehicle_kernel_pairs"], 1)
+        self.assertEqual(
+            telemetry["vehicle_aabb_pairs"],
+            telemetry["vehicle_aabb_rejected"] + telemetry["vehicle_kernel_pairs"],
+        )
+        self.assertEqual([self._payload(item) for item in actual], [self._payload(item) for item in oracle])
+
+    def test_all_rejected_pairs_emit_intermediate_and_final_progress(self):
+        """15 separated vehicles exercise the 100-pair progress update branch."""
+        tracks = {
+            f"V{index:02d}": self._track(
+                f"V{index:02d}",
+                [(116.0 + index, 39.0), (116.001 + index, 39.0)],
+                90.0,
+            )
+            for index in range(15)
+        }
+        telemetry: dict[str, int] = {}
+        with patch("track.v2.intersect2._emit_cross_track_progress", wraps=intersect2_module._emit_cross_track_progress) as progress, \
+             patch("track.v2.intersect2._iter_bounded_segment_intersections") as kernel:
+            candidates, pairs, total = _extract_orthogonal_cross_track_candidates(
+                tracks, 116.0, 39.0, IntersectConfig(), telemetry=telemetry,
+            )
+
+        self.assertEqual((candidates, pairs, total), ([], 105, 105))
+        kernel.assert_not_called()
+        self.assertEqual(telemetry["vehicle_aabb_pairs"], 105)
+        self.assertEqual(telemetry["vehicle_aabb_rejected"], 105)
+        self.assertNotIn("vehicle_kernel_pairs", telemetry)
+        observed = [(call.args[1], call.args[2], call.kwargs.get("final", False)) for call in progress.call_args_list]
+        self.assertIn((100, 105, False), observed)
+        self.assertIn((105, 105, True), observed)
+
+
+class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
+    """Window queries preserve normal behavior when telemetry is disabled."""
+
+    _ROWS = [(
+        "vehicle-1", 123.5, 116.1, 39.2, 90.0, 8.0,
+        "source-A", "row-7", {"tag": "kept"}, None, None, "",
+    )]
+
+    class _Cursor:
+        def __init__(self, rows):
+            self.rows = rows
+            self.query = None
+            self.params = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def execute(self, query, params):
+            self.query = query
+            self.params = params
+
+        def __iter__(self):
+            return iter(self.rows)
+
+    class _Connection:
+        def __init__(self, rows):
+            self.cursor_instance = ActivePointsWindowQueryTelemetryTest._Cursor(rows)
+
+        def cursor(self):
+            return self.cursor_instance
+
+    def test_query_without_telemetry_returns_points_and_preserves_query_contract(self):
+        conn = self._Connection(self._ROWS)
+        window = SpatialWindow(-1.0, -2.0, 3.0, 4.0)
+
+        points = _query_active_points_in_window(
+            conn,
+            window,
+            table="custom_points",
+            source_id="source-A",
+            run_id="run-9",
+            telemetry=None,
+        )
+
+        self.assertIn("FROM custom_points", conn.cursor_instance.query)
+        self.assertIn("AND run_id = %s", conn.cursor_instance.query)
+        self.assertEqual(
+            conn.cursor_instance.params,
+            ["source-A", -1.0, -2.0, 3.0, 4.0, -1.0, -2.0, 3.0, 4.0, "run-9"],
+        )
+        self.assertEqual(len(points), 1)
+        point = points[0]
+        self.assertEqual(point.vehicle_id, "vehicle-1")
+        self.assertEqual(point.timestamp, 123.5)
+        self.assertEqual((point.lon, point.lat), (116.1, 39.2))
+        self.assertEqual(point.point_ref, PointRef("source-A", "row-7", stable=True))
+        self.assertEqual(point.extra, {"tag": "kept"})
+
+    def test_query_with_telemetry_records_disjoint_query_and_materialization_phases(self):
+        conn = self._Connection(self._ROWS)
+        telemetry: dict[str, int | float] = {}
+
+        with patch(
+            "track.v2.intersect2.time.perf_counter",
+            side_effect=(10.0, 12.5, 20.0, 20.75),
+        ):
+            points = _query_active_points_in_window(
+                conn,
+                SpatialWindow(-1.0, -2.0, 3.0, 4.0),
+                telemetry=telemetry,
+            )
+
+        self.assertEqual(len(points), 1)
+        self.assertEqual(telemetry["queried_rows"], 1)
+        self.assertEqual(telemetry["query_seconds"], 2.5)
+        self.assertEqual(telemetry["materialization_seconds"], 0.75)
+
+
+class PerfWindowsGateContractTest(unittest.TestCase):
+    """The frozen performance gate is immutable and formal-real checks fail closed."""
+
+    def test_manifest_writer_is_write_once(self):
+        from track.v2.manual_thin_benchmark.perf_windows_gate import _write_manifest_once
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "gate_manifest.json"
+            output.write_text("frozen\n", encoding="utf-8")
+
+            with self.assertRaises(FileExistsError):
+                _write_manifest_once(output, {"replacement": True})
+
+            self.assertEqual(output.read_text(encoding="utf-8"), "frozen\n")
+
+    def test_real_gate_rejects_drifted_incomplete_database(self):
+        from track.v2.manual_thin_benchmark.manual_bench_windows import _validate_real_gate
+
+        frozen = {
+            "available": True,
+            "database": "track_test",
+            "table": "trajectory_points",
+            "row_count": 1_000_000,
+            "extent": [108.8, 34.6, 110.9, 35.899982],
+            "stable_id_checksum": "frozen-checksum",
+        }
+        observed = {
+            "available": True,
+            "read_only": True,
+            "database": "track_test",
+            "table": "trajectory_points",
+            "row_count": 200_000,
+            "extent": [108.8, 34.600008, 110.899942, 35.899963],
+            "columns": ["id", "vehicle_id", "timestamp", "lon", "lat"],
+            "source_row_key_checksum": None,
+            "full_table_sha256": None,
+        }
+
+        validation = _validate_real_gate(frozen, observed)
+
+        self.assertFalse(validation["formal_valid"])
+        self.assertEqual(
+            set(validation["error_codes"]),
+            {
+                "frozen_schema_sha256_missing",
+                "frozen_full_table_sha256_missing",
+                "row_count_mismatch",
+                "extent_mismatch",
+                "source_row_key_missing",
+                "source_row_key_checksum_mismatch",
+            },
+        )
 
 
 class CrossTrackWindowProgressTest(unittest.TestCase):
