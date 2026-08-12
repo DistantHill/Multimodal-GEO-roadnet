@@ -59,6 +59,12 @@ from .models import (
     TrajectoryPoint,
     TurnEvent,
 )
+from .db.queries import (
+    build_active_in_window_sql,
+    build_spatial_extent_sql,
+    build_stream_all_sql,
+    row_to_dict,
+)
 from .parser0 import TrajectorySourceHandle
 
 
@@ -734,7 +740,7 @@ def _query_spatial_extent(
     Returns ``(lon_min, lat_min, lon_max, lat_max)`` compatible with
     ``SpatialWindowIterator``.
     """
-    sql = f"SELECT MIN(lon), MAX(lon), MIN(lat), MAX(lat) FROM {table} WHERE is_active IS NOT FALSE"
+    sql = build_spatial_extent_sql(table)
     with conn.cursor() as cur:
         cur.execute(sql)
         row = cur.fetchone()
@@ -760,54 +766,20 @@ def _query_active_points_in_window(
         lon/lat BETWEEN，走 R-tree 2D 索引扫描。UNION ALL 合并两表一次往返。
     """
     rows: list[dict[str, Any]] = []
-    injected_run_clause = " AND run_id = %s" if run_id is not None else ""
+    has_run_id = run_id is not None
     params: list[Any] = [source_id or ""]
     params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
     params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
-    if run_id is not None:
+    if has_run_id:
         params.append(run_id)
     query_started = time.perf_counter() if telemetry is not None else 0.0
     with conn.cursor() as cur:
         cur.execute(
-            f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       source_id, source_row_key, extra, "
-            f"       NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
-            f"       ''::text AS generated_reason "
-            f"FROM ("
-            f"  SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"         %s::text AS source_id, id::text AS source_row_key, extra, "
-            f"         NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
-            f"         ''::text AS generated_reason "
-            f"  FROM {table} "
-            f"  WHERE is_active IS NOT FALSE "
-            f"    AND geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326) "
-            f"  UNION ALL "
-            f"  SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"         from_source_id AS source_id, "
-            f"         from_source_row_key AS source_row_key, "
-            f"         '{{}}'::jsonb AS extra, "
-            f"         from_source_row_key, to_source_row_key, generated_reason "
-            f"  FROM injected_points "
-            f"  WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326){injected_run_clause} "
-            f") AS combined "
-            f"ORDER BY vehicle_id, timestamp",
+            build_active_in_window_sql(table, has_run_id=has_run_id),
             params,
         )
         for row in cur:
-            rows.append({
-                "vehicle_id": row[0],
-                "timestamp": float(row[1]),
-                "lon": float(row[2]),
-                "lat": float(row[3]),
-                "heading": float(row[4]),
-                "speed": float(row[5]),
-                "source_id": row[6],
-                "source_row_key": row[7],
-                "extra": row[8] if isinstance(row[8], dict) else {},
-                "from_source_row_key": row[9],
-                "to_source_row_key": row[10],
-                "generated_reason": row[11],
-            })
+            rows.append(row_to_dict(row))
 
     # DB ORDER BY 已保证 (vehicle_id, timestamp) 有序，无需 Python 侧再排
     if telemetry is not None:
@@ -837,9 +809,9 @@ def _stream_vehicle_tracks_from_db(
         injected_points，按 (vehicle_id, timestamp) 排序后检测 vehicle_id
         变化来分组。内存占用 = 单车辆最大点数。
     """
-    injected_run_clause = " WHERE run_id = %s" if run_id is not None else ""
+    has_run_id = run_id is not None
     params: list[Any] = [source_id or ""]
-    if run_id is not None:
+    if has_run_id:
         params.append(run_id)
     # ZH: 服务器端命名游标 — PG 按需 FETCH，避免全量物化到 portal。
     # EN: Server-side named cursor — FETCHes on demand, no full portal materialization.
@@ -847,18 +819,7 @@ def _stream_vehicle_tracks_from_db(
         name=f"stream_tracks_{uuid.uuid4().hex}",
     ) as cur:
         cur.execute(
-            f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       %s::text AS source_id, id::text AS source_row_key, extra, "
-            f"       NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
-            f"       ''::text AS generated_reason "
-            f"FROM {table} "
-            f"WHERE is_active IS NOT FALSE "
-            f"UNION ALL "
-            f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       from_source_id, from_source_row_key, '{{}}'::jsonb, "
-            f"       from_source_row_key, to_source_row_key, generated_reason "
-            f"FROM injected_points{injected_run_clause} "
-            f"ORDER BY vehicle_id, timestamp",
+            build_stream_all_sql(table, has_run_id=has_run_id),
             params,
         )
         current_vid: str | None = None
@@ -899,87 +860,28 @@ def _query_active_points_near_cluster(
     source_id: str | None = None,
     run_id: str | None = None,
 ) -> list[TrajectoryPoint]:
-    """Query active points within *radius_m* of a cluster centroid."""
-    # Convert radius_m to approximate degrees
+    """Query active points within *radius_m* of a cluster centroid.
+
+    ZH: 委托 ``_query_active_points_in_window``，将 cluster centroid + radius_m
+        转换为 SpatialWindow 后走 GiST 空间索引查询。自动获得 UNION ALL 一次往返、
+        DB 侧 ORDER BY（无需 Python 排序），且 telemetry 可选跟踪。
+    """
     radius_deg = radius_m / 111320.0
-    rows: list[dict[str, Any]] = []
-    raw_params: list[Any] = [source_id or "",
-        cluster.centroid_lon - radius_deg,
-        cluster.centroid_lon + radius_deg,
-        cluster.centroid_lat - radius_deg,
-        cluster.centroid_lat + radius_deg,
-    ]
-    with conn.cursor() as cur:
-        cur.execute(
-            f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       %s::text AS source_id, id::text AS source_row_key, extra, "
-            f"       NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
-            f"       ''::text AS generated_reason "
-            f"FROM {table} "
-            f"WHERE is_active IS NOT FALSE "
-            f"  AND lon BETWEEN %s AND %s "
-            f"  AND lat BETWEEN %s AND %s "
-            f"ORDER BY vehicle_id, timestamp",
-            raw_params,
-        )
-        for row in cur:
-            rows.append({
-                "vehicle_id": row[0],
-                "timestamp": float(row[1]),
-                "lon": float(row[2]),
-                "lat": float(row[3]),
-                "heading": float(row[4]),
-                "speed": float(row[5]),
-                "source_id": row[6],
-                "source_row_key": row[7],
-                "extra": row[8] if isinstance(row[8], dict) else {},
-                "from_source_row_key": row[9],
-                "to_source_row_key": row[10],
-                "generated_reason": row[11],
-            })
-
-    # Also query injected_points near cluster
-    # ZH: injected_points 没有 source_id 列，用 from_source_id/from_source_row_key 别名
-    injected_run_clause = " AND run_id = %s" if run_id is not None else ""
-    injected_params: list[Any] = [
-        cluster.centroid_lon - radius_deg,
-        cluster.centroid_lon + radius_deg,
-        cluster.centroid_lat - radius_deg,
-        cluster.centroid_lat + radius_deg,
-    ]
-    if run_id is not None:
-        injected_params.append(run_id)
-    with conn.cursor() as cur:
-        cur.execute(
-            f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       from_source_id AS source_id, "
-            f"       from_source_row_key AS source_row_key, "
-            f"       '{{}}'::jsonb AS extra, "
-            f"       from_source_row_key, to_source_row_key, generated_reason "
-            f"FROM injected_points "
-            f"WHERE lon BETWEEN %s AND %s "
-            f"  AND lat BETWEEN %s AND %s{injected_run_clause} "
-            f"ORDER BY vehicle_id, timestamp",
-            injected_params,
-        )
-        for row in cur:
-            rows.append({
-                "vehicle_id": row[0],
-                "timestamp": float(row[1]),
-                "lon": float(row[2]),
-                "lat": float(row[3]),
-                "heading": float(row[4]),
-                "speed": float(row[5]),
-                "source_id": row[6],
-                "source_row_key": row[7],
-                "extra": row[8] if isinstance(row[8], dict) else {},
-                "from_source_row_key": row[9],
-                "to_source_row_key": row[10],
-                "generated_reason": row[11],
-            })
-
-    rows.sort(key=lambda r: (r["vehicle_id"], r["timestamp"]))
-    return _build_points_from_rows(rows)
+    # Window x/y are *lon/lat* degrees (not meters) — SpatialWindow stores
+    # the coordinate system of the extent it was built from.
+    window = SpatialWindow(
+        x_min=cluster.centroid_lon - radius_deg,
+        y_min=cluster.centroid_lat - radius_deg,
+        x_max=cluster.centroid_lon + radius_deg,
+        y_max=cluster.centroid_lat + radius_deg,
+    )
+    return _query_active_points_in_window(
+        conn,
+        window,
+        table=table,
+        source_id=source_id,
+        run_id=run_id,
+    )
 
 
 def _build_points_from_rows(rows: list[dict[str, Any]]) -> list[TrajectoryPoint]:
