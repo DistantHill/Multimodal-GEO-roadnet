@@ -1,19 +1,20 @@
-"""End-to-end pipeline runner: Parser 0 → Cleaner 1 → Intersect2 → PostgreSQL.
+"""Pipeline runner: Parser 0 → Cleaner 1 → Intersect2 → Clip → Fitting → Network.
 
-ZH: 端到端流水线 CLI 入口。读取 CSV 或 PostgreSQL 表，依次运行三个流水线阶段，
-    所有产物写入 PostgreSQL 数据库。CLI 仅负责参数解析和委托。
-    --csv 和 --pg-table 互斥——必须指定其中一个作为数据源。
+ZH: 端到端流水线 CLI 入口。读取 CSV 或 PostgreSQL 表，运行六个阶段；前三阶段
+    的产物写入 PostgreSQL，后三阶段返回纯内存结果。也可按 run_id 单独重放 Clip。
+    --csv、--pg-table 和 --replay-clips 互斥。
 
-EN: End-to-end pipeline CLI. Reads CSV or a PostgreSQL table, runs all three
-    pipeline stages, writes all outputs to PostgreSQL. CLI handles argument
-    parsing only. --csv and --pg-table are mutually exclusive — exactly one
-    must be provided as the data source.
+EN: End-to-end pipeline CLI. It reads CSV or PostgreSQL, runs six stages,
+    persists the first three stages, and keeps the final three as pure
+    in-memory results. Clip can also be replayed by run_id. --csv, --pg-table, and
+    --replay-clips are mutually exclusive.
 
 Usage / 用法::
 
     python -m track.v2.cli.run --csv track/data/guiji_20230301_top10w.csv --ask-password
     python -m track.v2.cli.run --csv data.csv --host 127.0.0.1 --port 15432 --database trajectory --user track_user --ask-password
     python -m track.v2.cli.run --pg-table trajectory_points --host 127.0.0.1 --port 15432 --database trajectory --user track_user --ask-password
+    python -m track.v2.cli.run --replay-clips RUN_ID --ask-password
 """
 
 from __future__ import annotations
@@ -40,7 +41,17 @@ from ..db_writer import (
     insert_trajectory_points,
     insert_turn_events,
 )
-from ..models import CsvSource, PostgresSource
+from ..models import (
+    CleanerConfig,
+    ClipResult,
+    CsvSource,
+    FitResult,
+    NetworkResult,
+    PostgresSource,
+)
+from ..clip import extract_clips_for_run
+from ..fitting import fit_centerlines
+from ..network import build_network
 from .. import get_database, detect_intersections, IntersectConfig
 from ..cleaner import clean_vehicle
 from ..sources import StreamVehicleSource
@@ -57,14 +68,14 @@ def run_pipeline(
     table: str = "trajectory_points",
     skip_clean: bool = False,
 ) -> dict[str, int | str]:
-    """Run the full pipeline and write all outputs to PostgreSQL.
+    """Run the full pipeline, persisting replay inputs and reporting Clip.
 
     ZH: 运行完整流水线并将所有阶段产物写入数据库。返回各表写入行数统计。
         ``csv_path`` 和 ``pg_source_table`` 必须且只能指定一个。
         ``table`` 指定 trajectory_points 的目标表名。
         ``skip_clean`` 跳过 Parser0+Cleaner1，直接从 is_active 列读取已清洗结果。
-    EN: Run the full pipeline and write all stage outputs to the database.
-        Returns per-table row counts. Exactly one of ``csv_path`` or
+    EN: Run the full pipeline, persist Parser/Cleaner/Intersect artifacts, and
+        compute the in-memory Clip result. Returns row/result counts. Exactly one of ``csv_path`` or
         ``pg_source_table`` must be provided. ``table`` specifies the target
         table name for trajectory_points.
         ``skip_clean`` skips Parser0+Cleaner1 and reads pre-cleaned results
@@ -102,7 +113,11 @@ def run_pipeline(
             conn,
             source_id=source_id,
             source_kind=source_kind,
-            parameters={"target_table": table, "skip_clean": skip_clean},
+            parameters={
+                "target_table": table,
+                "skip_clean": skip_clean,
+                "cleaner_max_gap_s": CleanerConfig().max_gap_s,
+            },
         )
         stats["run_id"] = run_id
         # Keep the run record even if a later pipeline statement rolls back.
@@ -305,6 +320,24 @@ def run_pipeline(
         stats["entry_exit_points"] = entry_exit_count
         print(f"  entry_exit_points: {entry_exit_count:,} rows ({time.perf_counter() - t0:.1f}s)")
 
+        # ── Stage 4: Clip (pure result, replayable from this run) ────────────
+        print("\n── Clip: 路段切分 / Track clipping ──")
+        clip_result = extract_clips_for_run(conn, run_id, allow_running=True)
+        _add_clip_stats(stats, clip_result)
+        _print_clip_report(clip_result)
+
+        # ── Stage 5: Fitting (one centerline per connected pair) ────────────
+        print("\n── Fitting: 中心线拟合 / Centerline fitting ──")
+        fit_result = fit_centerlines(clip_result)
+        _add_fit_stats(stats, fit_result)
+        fit_result.report.format_print(title="  Fitting 报告 / Fitting report")
+
+        # ── Stage 6: Network (intersections as nodes, centerlines as edges) ─
+        print("\n── Network: 路网组装 / Network assembly ──")
+        network_result = build_network(fit_result, iresult)
+        _add_network_stats(stats, network_result)
+        network_result.report.format_print(title="  Network 报告 / Network report")
+
         finish_pipeline_run(conn, run_id, status="completed")
         conn.commit()
         print(f"\n  提交 / Committed.")
@@ -313,6 +346,46 @@ def run_pipeline(
     stats["_elapsed_s"] = int(elapsed)
     print(f"\n── 完成 / Done ({elapsed:.1f}s) ──")
     return stats
+
+
+def _add_clip_stats(stats: dict[str, int | str], result: ClipResult) -> None:
+    stats.update(
+        {
+            f"clip_{name}": value
+            for name, value in result.report.as_dict().items()
+            if isinstance(value, int)
+        }
+    )
+
+
+def _print_clip_report(result: ClipResult) -> None:
+    result.report.format_print(title="  Clip 报告 / Clip report")
+
+
+def _add_fit_stats(stats: dict[str, int | str], result: FitResult) -> None:
+    stats.update(
+        {
+            f"fitting_{name}": value
+            for name, value in result.report.as_dict().items()
+            if isinstance(value, int)
+        }
+    )
+
+
+def _add_network_stats(stats: dict[str, int | str], result: NetworkResult) -> None:
+    stats.update(
+        {
+            f"network_{name}": value
+            for name, value in result.report.as_dict().items()
+            if isinstance(value, int)
+        }
+    )
+
+
+def replay_clips(db_config: PostgresConfig, run_id: str) -> ClipResult:
+    """Replay the pure Clip stage from one completed pipeline run."""
+    with pg_connect(db_config) as conn:
+        return extract_clips_for_run(conn, run_id)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────
@@ -329,7 +402,9 @@ def main() -> int:
     _env = default_postgres_config()
 
     parser = argparse.ArgumentParser(
-        description="Run track.v2 pipeline and write all outputs to PostgreSQL."
+        description=(
+            "Run track.v2 through Network, or replay Clip from a completed run."
+        )
     )
     # ── 互斥数据源 / Mutually exclusive data sources ──
     source_group = parser.add_mutually_exclusive_group(required=True)
@@ -340,6 +415,10 @@ def main() -> int:
     source_group.add_argument(
         "--pg-table", metavar="TABLE",
         help="从 PostgreSQL 表读取输入轨迹点 / Read input trajectory points from a PostgreSQL table."
+    )
+    source_group.add_argument(
+        "--replay-clips", metavar="RUN_ID",
+        help="从已完成的流水线运行重放 Clip / Replay Clip from a completed pipeline run."
     )
     parser.add_argument("--host", default=_env.host)
     parser.add_argument("--port", type=int, default=_env.port)
@@ -390,12 +469,21 @@ def main() -> int:
         sslmode=args.sslmode,
     )
 
-    source_label = args.csv or f"postgresql://{db_config.database}/{args.pg_table}"
+    source_label = (
+        f"pipeline-run:{args.replay_clips}"
+        if args.replay_clips
+        else args.csv or f"postgresql://{db_config.database}/{args.pg_table}"
+    )
     init_logger()
     print(f"数据源 / Source: {source_label}")
     print(f"连接目标 / Target: {db_config.safe_dsn()}")
 
     try:
+        if args.replay_clips:
+            clip_result = replay_clips(db_config, args.replay_clips)
+            print("\n── Clip 回放 / Clip Replay ──")
+            _print_clip_report(clip_result)
+            return 0
         stats = run_pipeline(
             db_config,
             csv_path=args.csv,
@@ -403,6 +491,8 @@ def main() -> int:
             table=args.table,
             skip_clean=args.skip_clean,
         )
+        _print_write_summary(stats)
+        return 0
     except RuntimeError as exc:
         print(str(exc))
         return 2
@@ -414,7 +504,9 @@ def main() -> int:
     finally:
         shutdown_logger()
 
-    # ── Summary ──
+
+def _print_write_summary(stats: dict[str, int | str]) -> None:
+    """Print model-driven Clip fields plus persisted table row counts."""
     print("\n── 写入统计 / Write Summary ──")
     for table in [
         "trajectory_points", "kept_trajectory_points",
@@ -424,7 +516,9 @@ def main() -> int:
     ]:
         if table in stats:
             print(f"  {table:40s} {stats[table]:>10,} rows")
-    return 0
+    for name, value in stats.items():
+        if name.startswith("clip_") and isinstance(value, int):
+            print(f"  {name:40s} {value:>10,}")
 
 
 if __name__ == "__main__":

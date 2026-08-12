@@ -152,9 +152,9 @@ def default_postgres_config(env_path: str | Path | None = None) -> PostgresConfi
     return PostgresConfig(
         host=env.get("TRACK_PG_HOST", "127.0.0.1"),
         port=int(env.get("TRACK_PG_PORT", "5432")),
-        database=env.get("TRACK_PG_DATABASE", "postgres"),
+        database=env.get("TRACK_PG_DATABASE", "track_test"),
         user=env.get("TRACK_PG_USER", "postgres"),
-        password=env.get("TRACK_PG_PASSWORD", ""),
+        password=env.get("TRACK_PG_PASSWORD", "asdf"),
         connect_timeout=int(env.get("TRACK_PG_CONNECT_TIMEOUT", "10")),
         sslmode=env.get("TRACK_PG_SSLMODE") or None,
         keepalives=env.get("TRACK_PG_KEEPALIVES", "1") not in ("0", "false", "no"),

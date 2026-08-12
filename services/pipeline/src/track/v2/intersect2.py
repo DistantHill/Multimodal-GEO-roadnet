@@ -17,7 +17,7 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterator, TYPE_CHECKING
+from typing import Any, Callable, Iterator, TYPE_CHECKING
 
 import numpy as np
 
@@ -36,6 +36,7 @@ from ._geometry import (
     _branch_angle_from_center,
     _circular_mean_deg,
     _distance_m,
+    _paired_segment_intersections,
     _segment_bearings,
     _segment_circle_crossing,
     _segment_circle_crossings_batch,
@@ -1101,30 +1102,49 @@ def _extract_cross_track_windows(
     extent: tuple[float, float, float, float],
     origin_lon: float, origin_lat: float,
     live_status: Any = None,
-    *,
+    candidate_extractor: Callable[..., tuple[list[CrossTrackCandidate], int, int]] | None = None,
+    timing: dict[str, float] | None = None,
+    verbose: bool = False,
+    windows_override: list[SpatialWindow] | None = None,
     perf: PerfTracker | None = None,
     telemetry: dict[str, int | float] | None = None,
+    **kwargs,
 ) -> list[CrossTrackCandidate]:
-    """Method 3: spatial sliding windows for cross-track segment intersection."""
+    """Method 3: spatial sliding windows for cross-track segment intersection.
+
+    The keyword-only benchmark seams never alter production results:
+    ``candidate_extractor`` selects the legacy oracle, while ``timing``,
+    ``verbose`` and ``windows_override`` expose the complete window stage to
+    the manual benchmark without changing production results.
+    """
     candidates: list[CrossTrackCandidate] = []
     seen_segment_pairs: set[tuple[str, str, str, str, str]] = set()
     if not cfg.use_orthogonal_candidates:
         return candidates
+    extractor = candidate_extractor or _extract_orthogonal_cross_track_candidates
 
-    windows = SpatialWindowIterator(
-        extent,
-        size=cfg.spatial_window_size,
-        overlap=cfg.spatial_window_overlap,
-    )
+    if windows_override is None:
+        windows = SpatialWindowIterator(
+            extent,
+            size=cfg.spatial_window_size,
+            overlap=cfg.spatial_window_overlap,
+        )
+        window_iterator = windows.iter_windows()
+        total_windows = windows.count_windows()
+    else:
+        window_iterator = iter(windows_override)
+        total_windows = len(windows_override)
     t0 = time.perf_counter()
     window_count = 0
     total_points = 0
-    total_windows = windows.count_windows()
     last_progress_t = t0
     last_cross_sub = ""
     log_info(f"── 空间滑窗 / Spatial windows (Method 3: orthogonal_cross_track) ──")
 
-    for window in _perf_iter(perf, windows.iter_windows(), name="spatial_windows", total=total_windows):
+    for window in _perf_iter(perf, 
+        windows.iter_windows(), 
+        name="spatial_windows", 
+        total=total_windows):
         window_count += 1
         now = time.perf_counter()
 
@@ -1146,6 +1166,7 @@ def _extract_cross_track_windows(
                       f"{total_points:,} pts ({now - t0:.1f}s)")
                 last_progress_t = now
 
+        t_query = time.perf_counter() if timing is not None or verbose else 0.0
         points = _query_active_points_in_window(
             conn,
             window,
@@ -1154,22 +1175,36 @@ def _extract_cross_track_windows(
             run_id=cfg.run_id,
             telemetry=telemetry,
         )
+        query_elapsed = time.perf_counter() - t_query if timing is not None or verbose else 0.0
+        if timing is not None:
+            timing["query_s"] = timing.get("query_s", 0.0) + query_elapsed
+            timing["windows"] = timing.get("windows", 0.0) + 1.0
         if not points:
+            if timing is not None:
+                timing["empty_windows"] = timing.get("empty_windows", 0.0) + 1.0
+            if verbose:
+                print(f"window={window_count:,} points=0 query_s={query_elapsed:.3f}")
             log_info(f"Window {window_count} Done, 累计处理点数/sum points: {total_points:,}")
             continue
 
         total_points += len(points)
         group_started = time.perf_counter() if telemetry is not None else 0.0
+        t_tracks = time.perf_counter() if timing is not None or verbose else 0.0
         window_tracks = _tracks_from_points(points)
+        track_elapsed = time.perf_counter() - t_tracks if timing is not None or verbose else 0.0
+        t_extract = time.perf_counter() if timing is not None or verbose else 0.0
         if telemetry is not None:
             telemetry["group_sort_seconds"] = telemetry.get(
                 "group_sort_seconds", 0.0
             ) + (time.perf_counter() - group_started)
-        win_cands, w_pairs, w_total = _extract_orthogonal_cross_track_candidates(
-            window_tracks, origin_lon, origin_lat, cfg,
-            live_status=live_status, sub_detail=True, perf=perf,
-            telemetry=telemetry,
-        )
+        if candidate_extractor is None:
+            win_cands, w_pairs, w_total = _extract_orthogonal_cross_track_candidates(
+                window_tracks, origin_lon, origin_lat, cfg,
+                live_status=live_status, sub_detail=True, perf=perf,
+                telemetry=telemetry,
+            )
+        extract_elapsed = time.perf_counter() - t_extract if timing is not None or verbose else 0.0
+        t_dedup = time.perf_counter() if timing is not None or verbose else 0.0
         added = 0
         dedupe_started = time.perf_counter() if telemetry is not None else 0.0
         for candidate in win_cands:
@@ -1190,6 +1225,23 @@ def _extract_cross_track_windows(
             telemetry["dedupe_added"] = telemetry.get("dedupe_added", 0) + added
             telemetry["dedupe_removed"] = telemetry.get("dedupe_removed", 0) + (
                 len(win_cands) - added
+            )
+        dedup_elapsed = time.perf_counter() - t_dedup if timing is not None or verbose else 0.0
+        if timing is not None:
+            timing["points"] = timing.get("points", 0.0) + len(points)
+            timing["track_grouping_s"] = timing.get("track_grouping_s", 0.0) + track_elapsed
+            timing["candidate_extraction_s"] = timing.get("candidate_extraction_s", 0.0) + extract_elapsed
+            timing["dedup_s"] = timing.get("dedup_s", 0.0) + dedup_elapsed
+            timing["candidates_before_dedup"] = (
+                timing.get("candidates_before_dedup", 0.0) + len(win_cands)
+            )
+            timing["candidates_after_dedup"] = timing.get("candidates_after_dedup", 0.0) + added
+        if verbose:
+            print(
+                f"window={window_count:,} points={len(points):,} tracks={len(window_tracks):,} "
+                f"query_s={query_elapsed:.3f} group_s={track_elapsed:.3f} "
+                f"extract_s={extract_elapsed:.3f} dedup_s={dedup_elapsed:.3f} "
+                f"candidates={len(win_cands):,}->{added:,}"
             )
 
         last_cross_sub = (
@@ -1807,7 +1859,7 @@ def _emit_cross_track_progress(
     return detail
 
 
-def _extract_orthogonal_cross_track_candidates(
+def _extract_orthogonal_cross_track_candidates_legacy(
     tracks: dict[str, list[TrajectoryPoint]],
     origin_lon: float,
     origin_lat: float,
@@ -2007,6 +2059,319 @@ def _extract_orthogonal_cross_track_candidates(
         ) + (time.perf_counter() - extraction_started)
         telemetry["output_candidates"] = telemetry.get("output_candidates", 0) + len(candidates)
     return candidates, pair_count, total_pairs
+
+
+_CROSS_TRACK_GRID_CELL_M = 100.0
+_CROSS_TRACK_PAIR_BATCH_SIZE = 65_536
+_CROSS_TRACK_MAX_GRID_CELLS_PER_SEGMENT = 4_096
+
+
+@dataclass(frozen=True)
+class _CrossTrackSegment:
+    """One legacy-window segment plus the data needed for bounded matching."""
+
+    vehicle_id: str
+    vehicle_rank: int
+    segment_index: int
+    start: TrajectoryPoint
+    end: TrajectoryPoint
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    heading: float
+    timestamp: float
+    cell_span: tuple[int, int, int, int] | None
+
+
+def _cross_track_grid_span(
+    x1: float, y1: float, x2: float, y2: float,
+) -> tuple[int, int, int, int] | None:
+    """Return a closed-cell span, or ``None`` for non-finite coordinates.
+
+    Legacy NumPy comparisons turn NaN/Inf segment coordinates into misses.
+    Keeping those segments out of the grid preserves that behaviour instead
+    of allowing ``math.floor`` to raise before exact geometry rejects them.
+    """
+    if not all(math.isfinite(value) for value in (x1, y1, x2, y2)):
+        return None
+    cell_m = _CROSS_TRACK_GRID_CELL_M
+    return (
+        math.floor(min(x1, x2) / cell_m),
+        math.floor(max(x1, x2) / cell_m),
+        math.floor(min(y1, y2) / cell_m),
+        math.floor(max(y1, y2) / cell_m),
+    )
+
+
+def _prepare_cross_track_segments(
+    tracks: dict[str, list[TrajectoryPoint]],
+    origin_lon: float,
+    origin_lat: float,
+    cfg: IntersectConfig,
+) -> tuple[list[_CrossTrackSegment], int]:
+    """Preserve legacy straight-segment filtering in stable vehicle order."""
+    per_vehicle: list[tuple[str, list[tuple[int, float, float, float, float]]]] = []
+    for vehicle_id in sorted(tracks):
+        track = tracks[vehicle_id]
+        raw_segments: list[tuple[int, float, float, float, float]] = []
+        for segment_index in range(len(track) - 1):
+            start = track[segment_index]
+            end = track[segment_index + 1]
+            if abs(_angle_delta_deg(start.heading, end.heading)) > cfg.cross_track_straightness_deg:
+                continue
+            x1, y1 = _to_xy(start.lon, start.lat, origin_lon, origin_lat)
+            x2, y2 = _to_xy(end.lon, end.lat, origin_lon, origin_lat)
+            raw_segments.append((segment_index, x1, y1, x2, y2))
+        if raw_segments:
+            per_vehicle.append((vehicle_id, raw_segments))
+
+    segments: list[_CrossTrackSegment] = []
+    for vehicle_rank, (vehicle_id, raw_segments) in enumerate(per_vehicle):
+        track = tracks[vehicle_id]
+        for segment_index, x1, y1, x2, y2 in raw_segments:
+            start = track[segment_index]
+            segments.append(_CrossTrackSegment(
+                vehicle_id=vehicle_id,
+                vehicle_rank=vehicle_rank,
+                segment_index=segment_index,
+                start=start,
+                end=track[segment_index + 1],
+                x1=x1,
+                y1=y1,
+                x2=x2,
+                y2=y2,
+                heading=start.heading,
+                timestamp=start.timestamp,
+                cell_span=_cross_track_grid_span(x1, y1, x2, y2),
+            ))
+    return segments, len(per_vehicle)
+
+
+def _cross_track_grid(
+    segments: list[_CrossTrackSegment],
+) -> tuple[dict[tuple[int, int], list[int]], list[int]]:
+    """Assign normal AABBs to cells and retain very long spans for fallback.
+
+    Long segments still receive every exact comparison they require, but do
+    not materialise an unbounded number of grid memberships. Non-finite XY is
+    deliberately absent: legacy NumPy geometry rejects it as a miss.
+    """
+    grid: dict[tuple[int, int], list[int]] = defaultdict(list)
+    overflow_segment_ids: list[int] = []
+    for segment_id, segment in enumerate(segments):
+        if segment.cell_span is None:
+            continue
+        cell_min_x, cell_max_x, cell_min_y, cell_max_y = segment.cell_span
+        cell_count = (cell_max_x - cell_min_x + 1) * (cell_max_y - cell_min_y + 1)
+        if cell_count > _CROSS_TRACK_MAX_GRID_CELLS_PER_SEGMENT:
+            overflow_segment_ids.append(segment_id)
+            continue
+        for cell_x in range(cell_min_x, cell_max_x + 1):
+            for cell_y in range(cell_min_y, cell_max_y + 1):
+                grid[(cell_x, cell_y)].append(segment_id)
+    return grid, overflow_segment_ids
+
+
+def _iter_cross_track_pair_batches(
+    segment_ids_a: list[int],
+    segment_ids_b: list[int],
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Yield the Cartesian product in bounded index batches."""
+    a_ids = np.asarray(segment_ids_a, dtype=int)
+    b_ids = np.asarray(segment_ids_b, dtype=int)
+    total = len(a_ids) * len(b_ids)
+    for offset in range(0, total, _CROSS_TRACK_PAIR_BATCH_SIZE):
+        flat = np.arange(
+            offset,
+            min(offset + _CROSS_TRACK_PAIR_BATCH_SIZE, total),
+            dtype=np.int64,
+        )
+        yield a_ids[flat // len(b_ids)], b_ids[flat % len(b_ids)]
+
+
+def _iter_cross_track_overflow_pair_batches(
+    segments: list[_CrossTrackSegment],
+    overflow_segment_ids: list[int],
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Yield every long-AABB pair once, with the standard exact-batch cap."""
+    finite_segment_ids = [
+        segment_id for segment_id, segment in enumerate(segments)
+        if segment.cell_span is not None
+    ]
+    overflow_ids = set(overflow_segment_ids)
+    a_ids: list[int] = []
+    b_ids: list[int] = []
+    for overflow_id in overflow_segment_ids:
+        overflow = segments[overflow_id]
+        for other_id in finite_segment_ids:
+            if other_id == overflow_id or segments[other_id].vehicle_rank == overflow.vehicle_rank:
+                continue
+            if other_id in overflow_ids and other_id < overflow_id:
+                continue
+            other = segments[other_id]
+            if overflow.vehicle_rank < other.vehicle_rank:
+                a_ids.append(overflow_id)
+                b_ids.append(other_id)
+            else:
+                a_ids.append(other_id)
+                b_ids.append(overflow_id)
+            if len(a_ids) == _CROSS_TRACK_PAIR_BATCH_SIZE:
+                yield np.asarray(a_ids, dtype=int), np.asarray(b_ids, dtype=int)
+                a_ids.clear()
+                b_ids.clear()
+    if a_ids:
+        yield np.asarray(a_ids, dtype=int), np.asarray(b_ids, dtype=int)
+
+
+def _cross_track_candidate_from_segments(
+    segment_a: _CrossTrackSegment,
+    segment_b: _CrossTrackSegment,
+    x: float,
+    y: float,
+    origin_lon: float,
+    origin_lat: float,
+) -> CrossTrackCandidate:
+    """Build the legacy public candidate payload from one canonical hit."""
+    lon, lat = _to_lonlat(x, y, origin_lon, origin_lat)
+    return CrossTrackCandidate(
+        point_ref=segment_a.start.point_ref,
+        vehicle_id=f"{segment_a.vehicle_id}|{segment_b.vehicle_id}",
+        timestamp=(segment_a.timestamp + segment_b.timestamp) / 2.0,
+        lon=lon,
+        lat=lat,
+        x=x,
+        y=y,
+        heading=segment_a.heading,
+        speed=segment_a.start.speed,
+        from_source_id=segment_a.start.point_ref.source_id,
+        from_source_row_key=(
+            f"{segment_a.start.point_ref.source_row_key},{segment_a.end.point_ref.source_row_key}"
+        ),
+        to_source_id=segment_b.start.point_ref.source_id,
+        to_source_row_key=(
+            f"{segment_b.start.point_ref.source_row_key},{segment_b.end.point_ref.source_row_key}"
+        ),
+        origin_lon=origin_lon,
+        origin_lat=origin_lat,
+    )
+
+
+def _extract_orthogonal_cross_track_candidates(
+    tracks: dict[str, list[TrajectoryPoint]],
+    origin_lon: float,
+    origin_lat: float,
+    cfg: IntersectConfig,
+    live_status: Any = None,
+    *,
+    sub_detail: bool = False,
+) -> tuple[list[CrossTrackCandidate], int, int]:
+    """Find orthogonal cross-track intersections with bounded pair batches.
+
+    The external interface and legacy window semantics are unchanged. A
+    segment-AABB grid removes distant segment pairs before the exact 1-D
+    NumPy calculation; each pair has one canonical owner grid cell.
+    """
+    segments, vehicle_count = _prepare_cross_track_segments(
+        tracks, origin_lon, origin_lat, cfg,
+    )
+    if vehicle_count < 2:
+        return [], 0, 0
+
+    total_pairs = vehicle_count * (vehicle_count - 1) // 2
+    starts = np.array([(segment.x1, segment.y1) for segment in segments], dtype=float)
+    ends = np.array([(segment.x2, segment.y2) for segment in segments], dtype=float)
+    headings = np.array([segment.heading for segment in segments], dtype=float)
+    grid, overflow_segment_ids = _cross_track_grid(segments)
+    ordered_candidates: list[tuple[tuple[int, int, int, int], CrossTrackCandidate]] = []
+    t0 = time.perf_counter()
+
+    for cell_x, cell_y in sorted(grid):
+        by_vehicle: dict[int, list[int]] = defaultdict(list)
+        for segment_id in grid[(cell_x, cell_y)]:
+            by_vehicle[segments[segment_id].vehicle_rank].append(segment_id)
+        vehicle_ranks = sorted(by_vehicle)
+        for rank_index, vehicle_rank_a in enumerate(vehicle_ranks):
+            for vehicle_rank_b in vehicle_ranks[rank_index + 1:]:
+                for segment_ids_a, segment_ids_b in _iter_cross_track_pair_batches(
+                    by_vehicle[vehicle_rank_a], by_vehicle[vehicle_rank_b],
+                ):
+                    owner_mask = np.fromiter(
+                        (
+                            max(segments[int(a_id)].cell_span[0], segments[int(b_id)].cell_span[0]) == cell_x
+                            and max(segments[int(a_id)].cell_span[2], segments[int(b_id)].cell_span[2]) == cell_y
+                            for a_id, b_id in zip(segment_ids_a, segment_ids_b)
+                        ),
+                        dtype=bool,
+                        count=len(segment_ids_a),
+                    )
+                    if not np.any(owner_mask):
+                        continue
+                    segment_ids_a = segment_ids_a[owner_mask]
+                    segment_ids_b = segment_ids_b[owner_mask]
+                    xs, ys, hit_indices = _paired_segment_intersections(
+                        starts[segment_ids_a],
+                        ends[segment_ids_a],
+                        headings[segment_ids_a],
+                        starts[segment_ids_b],
+                        ends[segment_ids_b],
+                        headings[segment_ids_b],
+                        cfg.cross_track_min_angle_deg,
+                        cfg.cross_track_max_angle_deg,
+                    )
+                    for x, y, hit_index in zip(xs, ys, hit_indices):
+                        segment_a = segments[int(segment_ids_a[hit_index])]
+                        segment_b = segments[int(segment_ids_b[hit_index])]
+                        ordered_candidates.append((
+                            (
+                                segment_a.vehicle_rank,
+                                segment_b.vehicle_rank,
+                                segment_a.segment_index,
+                                segment_b.segment_index,
+                            ),
+                            _cross_track_candidate_from_segments(
+                                segment_a, segment_b, float(x), float(y),
+                                origin_lon, origin_lat,
+                            ),
+                        ))
+
+    for segment_ids_a, segment_ids_b in _iter_cross_track_overflow_pair_batches(
+        segments, overflow_segment_ids,
+    ):
+        xs, ys, hit_indices = _paired_segment_intersections(
+            starts[segment_ids_a],
+            ends[segment_ids_a],
+            headings[segment_ids_a],
+            starts[segment_ids_b],
+            ends[segment_ids_b],
+            headings[segment_ids_b],
+            cfg.cross_track_min_angle_deg,
+            cfg.cross_track_max_angle_deg,
+        )
+        for x, y, hit_index in zip(xs, ys, hit_indices):
+            segment_a = segments[int(segment_ids_a[hit_index])]
+            segment_b = segments[int(segment_ids_b[hit_index])]
+            ordered_candidates.append((
+                (
+                    segment_a.vehicle_rank,
+                    segment_b.vehicle_rank,
+                    segment_a.segment_index,
+                    segment_b.segment_index,
+                ),
+                _cross_track_candidate_from_segments(
+                    segment_a, segment_b, float(x), float(y),
+                    origin_lon, origin_lat,
+                ),
+            ))
+
+    ordered_candidates.sort(key=lambda item: item[0])
+    candidates = [candidate for _, candidate in ordered_candidates]
+    elapsed = time.perf_counter() - t0
+    _emit_cross_track_progress(
+        live_status, total_pairs, total_pairs, len(candidates), elapsed,
+        sub_detail=sub_detail, final=True,
+    )
+    return candidates, total_pairs, total_pairs
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2712,6 +3077,10 @@ def _build_topology_for_cluster(
         observation_count=len(observations),
         is_complete=is_complete,
         reason=reason,
+        clip_radius_m=max(
+            cfg.min_intersection_radius_m,
+            cluster.radius_m + cfg.topology_radius_padding_m,
+        ),
     )
     return topology, cluster, observations
 

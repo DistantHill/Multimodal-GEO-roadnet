@@ -345,7 +345,8 @@ def insert_kept_trajectory_points(
     with conn.cursor() as cur:
         with cur.copy(
             "COPY kept_trajectory_points "
-            "(run_id, trajectory_point_id, vehicle_id, subtrack_index, sequence_in_subtrack) "
+            "(run_id, trajectory_point_id, source_id, source_row_key, "
+            "vehicle_id, subtrack_index, sequence_in_subtrack) "
             "FROM STDIN"
         ) as copy:
             for st_idx, subtrack in enumerate(kept_subtracks, start=1):
@@ -355,7 +356,15 @@ def insert_kept_trajectory_points(
                     if tp_id is None:
                         # Fallback: source_row_key is the DB primary key in PG mode
                         tp_id = int(point.point_ref.source_row_key)
-                    copy.write_row((run_id, tp_id, point.vehicle_id, st_idx, seq_idx))
+                    copy.write_row((
+                        run_id,
+                        tp_id,
+                        point.point_ref.source_id,
+                        point.point_ref.source_row_key,
+                        point.vehicle_id,
+                        st_idx,
+                        seq_idx,
+                    ))
 
 
 def insert_injected_points(
@@ -720,6 +729,7 @@ def insert_intersections(
         "candidate_intersection_id", "cluster_id",
         "branch_centers_deg", "transition_counts",
         "observation_count", "is_complete", "reason",
+        "clip_radius_m",
         "geom",
     ]
     columns = ["run_id", *columns]
@@ -732,6 +742,13 @@ def insert_intersections(
             if ci_db_id is None:
                 continue
             cluster = clusters_by_id.get(topo.cluster_id)
+            clip_radius_m = topo.clip_radius_m or (
+                cluster.radius_m if cluster is not None else 0.0
+            )
+            if not clip_radius_m > 0.0:
+                raise ValueError(
+                    f"complete intersection {topo.cluster_id} requires a positive clip radius"
+                )
             row = (
                 ci_db_id,
                 topo.cluster_id,
@@ -741,6 +758,7 @@ def insert_intersections(
                 topo.observation_count,
                 topo.is_complete,
                 topo.reason,
+                clip_radius_m,
             )
             row = (run_id, *row)
             # Build geom via ST_Buffer from candidate cluster's centroid + radius
@@ -752,7 +770,7 @@ def insert_intersections(
                     f"VALUES ({placeholders}) "
                     f"RETURNING id, cluster_id"
                 )
-                cur.execute(sql, row + (cluster.centroid_lon, cluster.centroid_lat, cluster.radius_m))
+                cur.execute(sql, row + (cluster.centroid_lon, cluster.centroid_lat, clip_radius_m))
             else:
                 placeholders = ", ".join("%s" for _ in row)
                 placeholders += ", NULL"

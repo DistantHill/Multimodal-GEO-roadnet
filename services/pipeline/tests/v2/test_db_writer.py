@@ -80,6 +80,7 @@ class InsertIntersectionsTest(unittest.TestCase):
             observation_count=8,
             is_complete=True,
             reason="complete",
+            clip_radius_m=145.0,
         )
 
         result = insert_intersections(
@@ -92,9 +93,12 @@ class InsertIntersectionsTest(unittest.TestCase):
 
         self.assertEqual(result, {20: 1})
         self.assertEqual(len(conn.recording_cursor.executions), 1)
-        _, params = conn.recording_cursor.executions[0]
+        sql, params = conn.recording_cursor.executions[0]
+        self.assertIn("clip_radius_m", sql)
         self.assertEqual(params[2], 20)
         self.assertIs(params[6], True)
+        self.assertEqual(params[8], 145.0)
+        self.assertEqual(params[-1], 145.0)
 
 
 class InsertTracksCrossTest(unittest.TestCase):

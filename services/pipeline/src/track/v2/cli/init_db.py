@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import re
 from typing import Any
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
@@ -79,6 +80,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             id                      BIGSERIAL PRIMARY KEY,
             run_id                  UUID NOT NULL REFERENCES pipeline_runs(id),
             trajectory_point_id     BIGINT NOT NULL,
+            source_id               TEXT NOT NULL,
+            source_row_key          TEXT NOT NULL,
             vehicle_id              TEXT NOT NULL,
             subtrack_index          INTEGER NOT NULL DEFAULT 1,
             sequence_in_subtrack    INTEGER NOT NULL,
@@ -197,7 +200,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             id                          BIGSERIAL PRIMARY KEY,
             run_id                      UUID NOT NULL REFERENCES pipeline_runs(id),
             candidate_intersection_id   BIGINT NOT NULL REFERENCES candidate_intersections(id),
-            event_kind                  TEXT NOT NULL,
+            event_kind                  TEXT NOT NULL DEFAULT 'turn',
             turn_event_id               BIGINT REFERENCES turn_events(id),
             from_source_id              TEXT,
             from_source_row_key         TEXT,
@@ -242,6 +245,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             observation_count           INTEGER NOT NULL,
             is_complete                 BOOLEAN NOT NULL DEFAULT TRUE,
             reason                      TEXT NOT NULL,
+            clip_radius_m               DOUBLE PRECISION NOT NULL,
             geom                        geometry(Polygon, 4326),  -- app-layer: derived from candidate_intersections
             created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
@@ -349,106 +353,219 @@ def reset_tables(config: PostgresConfig) -> int:
     return failures
 
 
-def _run_migrations(cur: Any) -> None:
-    """Add columns/constraints that may be missing from existing tables.
+# ── Auto column migration helpers ────────────────────────────────────
+# ZH: 从 CREATE TABLE DDL 中解析列定义，对比 information_schema.columns，
+#     自动生成 ALTER TABLE ADD COLUMN IF NOT EXISTS，消除手动维护迁移列表的需求。
+# EN: Parse column definitions from CREATE TABLE DDL, diff against
+#     information_schema.columns, and auto-generate ALTER TABLE ADD COLUMN
+#     IF NOT EXISTS — eliminating the need for a hand-maintained migration list.
 
-    ZH: 对已存在的表，添加可能缺失的列或约束。
-        ``CREATE TABLE IF NOT EXISTS`` 不会修改已有表结构，迁移步骤确保新列被添加。
+
+def _strip_sql_comments(text: str) -> str:
+    """Remove SQL single-line comments (``-- ...``) from *text*.
+
+    ZH: 去掉 ``--`` 注释，防止注释中的括号和逗号干扰 DDL 解析。
+    EN: Strip ``--`` comments so their parens/commas don't break the DDL parser.
     """
+    return re.sub(r"--[^\n]*", "", text)
+
+
+def _matching_paren(text: str, open_idx: int) -> int:
+    """Return the index of the closing paren that matches ``text[open_idx]``."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    raise ValueError("Unmatched parenthesis in DDL")
+
+
+def _split_top_level(text: str, sep: str = ",") -> list[str]:
+    """Split *text* by *sep*, but only when paren-depth is zero.
+
+    ZH: 按分隔符切分，但跳过括号内的分隔符。
+        保护 ``geometry(Point, 4326)``、``ST_MakePoint(lon, lat)`` 等片段。
+    """
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for char in text:
+        if char == "(":
+            depth += 1
+            current.append(char)
+        elif char == ")":
+            depth -= 1
+            current.append(char)
+        elif char == sep and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
+def parse_ddl_columns(ddl: str) -> dict[str, str]:
+    """Parse a ``CREATE TABLE`` DDL string, returning ``{column_name: definition}``.
+
+    ZH: 从 CREATE TABLE DDL 中提取列定义。跳过 GENERATED 列、SERIAL 类型
+        和表级约束（PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY / CONSTRAINT）。
+
+    EN: Extract column definitions from a CREATE TABLE DDL. Skips GENERATED
+        columns, SERIAL types, and table-level constraints.
+    """
+    text = _strip_sql_comments(ddl)
+    try:
+        open_idx = text.index("(")
+    except ValueError:
+        return {}
+    close_idx = _matching_paren(text, open_idx)
+    body = text[open_idx + 1 : close_idx]
+
+    columns: dict[str, str] = {}
+    for part in _split_top_level(body):
+        part = part.strip()
+        if not part:
+            continue
+        up = part.upper().lstrip()
+
+        # Skip table-level constraints
+        if up.startswith(
+            ("PRIMARY KEY", "UNIQUE", "CHECK", "FOREIGN KEY", "CONSTRAINT")
+        ):
+            continue
+
+        # Split into column-name and the rest
+        first_space = part.find(" ")
+        if first_space == -1:
+            continue
+        col_name = part[:first_space].strip()
+        col_def = part[first_space + 1 :].strip()
+        if not col_def:
+            continue
+
+        columns[col_name] = col_def
+
+    return columns
+
+
+def column_to_alter_fragment(col_name: str, col_def: str) -> str | None:
+    """Convert a CREATE TABLE column definition into an ALTER TABLE-safe fragment.
+
+    ZH: 将 CREATE TABLE 的列定义转为 ALTER TABLE ADD COLUMN 安全形式。
+        - GENERATED ALWAYS AS / SERIAL → 返回 None（无法通过 ALTER 添加）
+        - NOT NULL 无 DEFAULT → 去除 NOT NULL（现有行会是 NULL）
+        - PRIMARY KEY / UNIQUE → 去除（有数据的表无法加约束）
+
+    Returns the ALTER-safe type + constraint fragment, or *None* to skip.
+    """
+    defn = col_def.strip()
+    if not defn:
+        return None
+
+    # Skip generated (computed) columns — can't ALTER ADD
+    if re.search(r"\bGENERATED\s+ALWAYS\s+AS\b", defn, re.IGNORECASE):
+        return None
+
+    # Skip SERIAL types — PostgreSQL auto-creates the sequence
+    type_token = defn.split(maxsplit=1)[0].upper()
+    if type_token in ("SERIAL", "SMALLSERIAL", "BIGSERIAL"):
+        return None
+
+    # NOT NULL without DEFAULT → strip NOT NULL (existing rows get NULL)
+    has_not_null = bool(re.search(r"\bNOT\s+NULL\b", defn, re.IGNORECASE))
+    has_default = bool(re.search(r"\bDEFAULT\b", defn, re.IGNORECASE))
+    if has_not_null and not has_default:
+        defn = re.sub(r"\bNOT\s+NULL\b", "", defn, flags=re.IGNORECASE)
+
+    # Strip inline PRIMARY KEY / UNIQUE (can't add to populated table)
+    defn = re.sub(r"\bPRIMARY\s+KEY\b", "", defn, flags=re.IGNORECASE)
+    defn = re.sub(r"\bUNIQUE\b", "", defn, flags=re.IGNORECASE)
+
+    # Collapse whitespace
+    return re.sub(r"\s+", " ", defn).strip()
+
+
+def build_auto_migrations(
+    table_name: str, ddl: str, existing: set[str]
+) -> list[tuple[str, str | None, str | None]]:
+    """Diff DDL columns against existing columns; return migration entries.
+
+    ZH: 对比 DDL 和数据库实际列，返回 ``[(column_name, fragment|None, sql|None)]``。
+        纯函数，不接触数据库——是测试核心。
+    """
+    expected = parse_ddl_columns(ddl)
+    out: list[tuple[str, str | None, str | None]] = []
+    for col, defn in expected.items():
+        if col in existing:
+            continue
+        fragment = column_to_alter_fragment(col, defn)
+        sql = (
+            None
+            if fragment is None
+            else f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {col} {fragment}"
+        )
+        out.append((col, fragment, sql))
+    return out
+
+
+def _fetch_existing_columns(cur: Any, table_name: str) -> set[str]:
+    """Query *information_schema.columns* for the current column set."""
+    cur.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = %s",
+        (table_name,),
+    )
+    return {row[0] for row in cur.fetchall()}
+
+
+def _auto_add_missing_columns(cur: Any, table_name: str, ddl: str) -> int:
+    """Compare DDL vs live columns and add any missing ones.
+
+    ZH: 对比 DDL 与实际列，动态执行 ``ALTER TABLE ADD COLUMN IF NOT EXISTS``。
+        跳过无法通过 ALTER 添加的列（GENERATED / SERIAL）。
+        返回失败数（0 = 全部成功或无需变更）。
+    """
+    existing = _fetch_existing_columns(cur, table_name)
+    failures = 0
+    for col, fragment, sql in build_auto_migrations(table_name, ddl, existing):
+        if fragment is None:
+            print(
+                f"  [SKIP] auto-add {table_name}.{col:28s} "
+                f"generated/serial — cannot ALTER"
+            )
+            continue
+        try:
+            cur.execute(sql)
+            print(
+                f"  [OK] auto-add {table_name}.{col:28s} "
+                f"{cur.statusmessage}"
+            )
+        except Exception as exc:
+            print(f"  [FAIL] auto-add {table_name}.{col:28s} {exc}")
+            failures += 1
+    return failures
+
+
+def _run_migrations(cur: Any) -> None:
+    """Structural changes that cannot be auto-detected from the DDL.
+
+    ZH: DDL 无法表达的结构性变更（DROP NOT NULL / DROP INDEX / DROP FK）。
+        可自动检测的列添加已由 ``_auto_add_missing_columns`` 处理。
+    """
+    # ZH: 仅保留 DDL 无法表达的结构性变更。
+    #     列添加已由 _auto_add_missing_columns 自动处理。
+    # EN: Only structural changes that the DDL cannot express.
+    #     Column additions are handled automatically by _auto_add_missing_columns.
     migrations: list[tuple[str, str]] = [
-        (
-            "tp_is_active",
-            "ALTER TABLE trajectory_points ADD COLUMN IF NOT EXISTS "
-            "is_active BOOLEAN NOT NULL DEFAULT TRUE",
-        ),
-        (
-            "ci_cross_track_count",
-            "ALTER TABLE candidate_intersections ADD COLUMN IF NOT EXISTS "
-            "cross_track_count INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "excluded_run_id",
-            "ALTER TABLE excluded_points ADD COLUMN IF NOT EXISTS "
-            "run_id UUID REFERENCES pipeline_runs(id)",
-        ),
-        (
-            "kept_run_id",
-            "ALTER TABLE kept_trajectory_points ADD COLUMN IF NOT EXISTS "
-            "run_id UUID REFERENCES pipeline_runs(id)",
-        ),
-        (
-            "injected_run_id",
-            "ALTER TABLE injected_points ADD COLUMN IF NOT EXISTS "
-            "run_id UUID REFERENCES pipeline_runs(id)",
-        ),
-        (
-            "cross_run_id",
-            "ALTER TABLE tracks_cross ADD COLUMN IF NOT EXISTS "
-            "run_id UUID REFERENCES pipeline_runs(id)",
-        ),
-        (
-            "turn_run_id",
-            "ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS "
-            "run_id UUID REFERENCES pipeline_runs(id)",
-        ),
-        (
-            "turn_source_pairs",
-            "ALTER TABLE turn_events "
-            "ADD COLUMN IF NOT EXISTS from_source_id TEXT, "
-            "ADD COLUMN IF NOT EXISTS from_source_row_key TEXT, "
-            "ADD COLUMN IF NOT EXISTS to_source_id TEXT, "
-            "ADD COLUMN IF NOT EXISTS to_source_row_key TEXT",
-        ),
-        (
-            "candidate_run_id",
-            "ALTER TABLE candidate_intersections ADD COLUMN IF NOT EXISTS "
-            "run_id UUID REFERENCES pipeline_runs(id)",
-        ),
-        (
-            "candidate_event_run_id",
-            "ALTER TABLE candidate_intersection_events ADD COLUMN IF NOT EXISTS "
-            "run_id UUID REFERENCES pipeline_runs(id)",
-        ),
-        (
-            "candidate_event_kind",
-            "ALTER TABLE candidate_intersection_events ADD COLUMN IF NOT EXISTS "
-            "event_kind TEXT NOT NULL DEFAULT 'turn'",
-        ),
-        (
-            "candidate_event_source_pairs",
-            "ALTER TABLE candidate_intersection_events "
-            "ADD COLUMN IF NOT EXISTS from_source_id TEXT, "
-            "ADD COLUMN IF NOT EXISTS from_source_row_key TEXT, "
-            "ADD COLUMN IF NOT EXISTS to_source_id TEXT, "
-            "ADD COLUMN IF NOT EXISTS to_source_row_key TEXT",
-        ),
         (
             "candidate_event_turn_nullable",
             "ALTER TABLE candidate_intersection_events "
             "ALTER COLUMN turn_event_id DROP NOT NULL",
-        ),
-        (
-            "crossing_run_id",
-            "ALTER TABLE candidate_entry_exit_points ADD COLUMN IF NOT EXISTS "
-            "run_id UUID REFERENCES pipeline_runs(id)",
-        ),
-        (
-            "crossing_segment_refs",
-            "ALTER TABLE candidate_entry_exit_points "
-            "ADD COLUMN IF NOT EXISTS from_source_id TEXT, "
-            "ADD COLUMN IF NOT EXISTS from_source_row_key TEXT, "
-            "ADD COLUMN IF NOT EXISTS to_source_id TEXT, "
-            "ADD COLUMN IF NOT EXISTS to_source_row_key TEXT",
-        ),
-        (
-            "intersection_run_id",
-            "ALTER TABLE intersections ADD COLUMN IF NOT EXISTS "
-            "run_id UUID REFERENCES pipeline_runs(id)",
-        ),
-        (
-            "entry_exit_run_id",
-            "ALTER TABLE entry_exit_points ADD COLUMN IF NOT EXISTS "
-            "run_id UUID REFERENCES pipeline_runs(id)",
         ),
         ("replace_cross_unique_index", "DROP INDEX IF EXISTS idx_tc_segment_pair"),
         ("replace_turn_unique_index", "DROP INDEX IF EXISTS idx_te_vehicle_ts"),
@@ -498,8 +615,17 @@ def create_tables(config: PostgresConfig) -> int:
                     print(f"  [FAIL] {name:40s} {exc}")
                     failures += 1
 
-            # ── Migrations: add missing columns to existing tables ──
-            print("\n── 迁移 / Migrations ──")
+            # ── Auto column migrations: diff DDL vs information_schema ──
+            print("\n── 自动列迁移 / Auto Column Migrations ──")
+            for name, ddl in DDL_STATEMENTS:
+                try:
+                    failures += _auto_add_missing_columns(cur, name, ddl)
+                except Exception as exc:
+                    print(f"  [FAIL] auto-migrate {name:40s} {exc}")
+                    failures += 1
+
+            # ── Structural migrations (DROP NOT NULL / DROP INDEX / DROP FK) ──
+            print("\n── 结构性迁移 / Structural Migrations ──")
             _run_migrations(cur)
 
             # ── Create indexes ──

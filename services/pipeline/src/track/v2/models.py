@@ -531,6 +531,7 @@ class IntersectionTopology(TrackModel):
     observation_count: int
     is_complete: bool
     reason: str
+    clip_radius_m: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -551,6 +552,206 @@ class IntersectReport(TrackModel):
     complete_intersection_source_ratios: dict[str, float] = field(default_factory=dict)
     complete_intersection_critical_source_counts: dict[str, int] = field(default_factory=dict)
     complete_intersection_critical_source_ratios: dict[str, float] = field(default_factory=dict)
+
+
+# ── Clip output models ──────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class ClipIntersection(TrackModel):
+    """One verified intersection circle used for trajectory clipping."""
+
+    cluster_id: int
+    lon: float
+    lat: float
+    radius_m: float
+
+
+@dataclass(frozen=True, slots=True)
+class ClipTrack(TrackModel):
+    """One time-ordered trip presented to the Clip module."""
+
+    vehicle_id: str
+    trip_id: str
+    points: tuple[TrajectoryPoint, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ClipInput(TrackModel):
+    """Complete, storage-independent input for one Clip extraction."""
+
+    intersections: tuple[ClipIntersection, ...]
+    tracks: tuple[ClipTrack, ...]
+    run_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ClipEndpoint(TrackModel):
+    """An exact trip or interpolated intersection endpoint."""
+
+    kind: str
+    lon: float
+    lat: float
+    timestamp: float
+    cluster_id: int | None
+    segment_index: int
+    segment_fraction: float
+
+
+@dataclass(frozen=True, slots=True)
+class TrackClip(TrackModel):
+    """One trajectory fragment outside verified intersection circles.
+
+    ``points`` contains only source points strictly inside the exact endpoint
+    bounds. ``point_count`` includes both explicit endpoints.
+    """
+
+    clip_id: str
+    vehicle_id: str
+    trip_id: str
+    clip_type: str
+    start: ClipEndpoint
+    end: ClipEndpoint
+    points: tuple[TrajectoryPoint, ...]
+    distance_m: float
+    point_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ClipReport(TrackModel):
+    """Aggregate counts; ``total_points_in_clips`` includes endpoints."""
+
+    total_vehicles: int
+    total_clips: int
+    inter_intersection_clips: int
+    boundary_clips: int
+    total_points_in_clips: int
+    unmatched_entry_count: int = 0
+    unmatched_exit_count: int = 0
+    skipped_degenerate_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ClipResult(TrackModel):
+    clips: tuple[TrackClip, ...]
+    report: ClipReport
+    run_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ClipConfig(TrackModel):
+    include_boundary_clips: bool = True
+
+
+# ── Fitting output models ───────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class FittingConfig(TrackModel):
+    """Configuration for fitting one centerline per connected pair."""
+
+    point_spacing_m: float = 50.0
+    fit_sample_spacing_m: float = 10.0
+    min_clips_per_pair: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class Centerline(TrackModel):
+    """One physical road centerline in canonical cluster-id direction."""
+
+    from_cluster_id: int
+    to_cluster_id: int
+    points: tuple[tuple[float, float], ...]
+    length_m: float
+    source_clip_ids: tuple[str, ...]
+    forward_clip_count: int
+    reverse_clip_count: int
+
+    @property
+    def source_clip_count(self) -> int:
+        return self.forward_clip_count + self.reverse_clip_count
+
+
+@dataclass(frozen=True, slots=True)
+class FitIssue(TrackModel):
+    """A rejected clip or connected pair, retained for auditability."""
+
+    from_cluster_id: int | None
+    to_cluster_id: int | None
+    reason: str
+    clip_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FitReport(TrackModel):
+    input_clip_count: int
+    eligible_clip_count: int
+    connected_pair_count: int
+    fitted_centerline_count: int
+    skipped_clip_count: int
+    skipped_pair_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class FitResult(TrackModel):
+    centerlines: tuple[Centerline, ...]
+    issues: tuple[FitIssue, ...]
+    report: FitReport
+    run_id: str | None = None
+
+
+# ── Network output models ───────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkConfig(TrackModel):
+    include_isolated_nodes: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkNode(TrackModel):
+    cluster_id: int
+    lon: float
+    lat: float
+    radius_m: float
+    degree: int
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkEdge(TrackModel):
+    edge_id: str
+    from_cluster_id: int
+    to_cluster_id: int
+    points: tuple[tuple[float, float], ...]
+    length_m: float
+    source_clip_count: int
+    forward_clip_count: int
+    reverse_clip_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkIssue(TrackModel):
+    from_cluster_id: int
+    to_cluster_id: int
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkReport(TrackModel):
+    input_centerline_count: int
+    node_count: int
+    edge_count: int
+    isolated_node_count: int
+    skipped_centerline_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkResult(TrackModel):
+    nodes: tuple[NetworkNode, ...]
+    edges: tuple[NetworkEdge, ...]
+    issues: tuple[NetworkIssue, ...]
+    report: NetworkReport
+    run_id: str | None = None
 
 
 # ── Replay output models ────────────────────────────────────────────
