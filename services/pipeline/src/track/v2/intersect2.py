@@ -2494,74 +2494,68 @@ def _extract_entry_exit_observations_batch(
     origin_lat: float,
     radius_m: float,
     bearing_window: int = 2,
-) -> list[EntryExitObservation]:
+) -> tuple[list[EntryExitObservation], list[CrossingPoint]]:
     """Batch-compute entry/exit observations for one intersection candidate.
 
     All trajectory segments are flattened into ``(n, 2)`` matrices and
     intersected with the candidate circle in one NumPy call. The Python
-    loop that remains only walks segment metadata to pair each vehicle's
-    first entry with the following exit.
+    loop that remains walks segment metadata to pair every entry with its
+    following exit — a vehicle crossing the circle multiple times yields one
+    observation per crossing.
     """
     center = (cluster.centroid_x, cluster.centroid_y)
     starts: list[tuple[float, float]] = []
     ends: list[tuple[float, float]] = []
     segment_meta: list[tuple[str, int]] = []  # (vehicle_id, seg_idx)
-    track_lookup: dict[str, list[TrajectoryPoint]] = {}
-    xy_lookup: dict[str, list[tuple[float, float]]] = {}
+    track_points_lookup: dict[str, list[TrajectoryPoint]] = {}
+    xy_points_lookup: dict[str, list[tuple[float, float]]] = {}
 
     for vehicle_id, track in tracks.items():
         if len(track) < 2:
             continue
-        xy = [_to_xy(p.lon, p.lat, origin_lon, origin_lat) for p in track]
-        track_lookup[vehicle_id] = track
-        xy_lookup[vehicle_id] = xy
-        for seg_idx in range(len(xy) - 1):
-            starts.append(xy[seg_idx])
-            ends.append(xy[seg_idx + 1])
+        xy_points = [_to_xy(p.lon, p.lat, origin_lon, origin_lat) for p in track]
+        track_points_lookup[vehicle_id] = track
+        xy_points_lookup[vehicle_id] = xy_points
+        for seg_idx in range(len(xy_points) - 1):
+            starts.append(xy_points[seg_idx])
+            ends.append(xy_points[seg_idx + 1])
             segment_meta.append((vehicle_id, seg_idx))
 
     if not starts:
         return [], []
 
-    start_xy = np.asarray(starts, dtype=float)
-    end_xy = np.asarray(ends, dtype=float)
+    starts_xy = np.asarray(starts, dtype=float)
+    ends_xy = np.asarray(ends, dtype=float)
     center_xy = np.asarray(center, dtype=float)
     radius_sq = radius_m * radius_m
     start_inside = (
-        np.einsum("ij,ij->i", start_xy - center_xy, start_xy - center_xy)
+        np.einsum("ij,ij->i", starts_xy - center_xy, starts_xy - center_xy)
         <= radius_sq
     )
     end_inside = (
-        np.einsum("ij,ij->i", end_xy - center_xy, end_xy - center_xy)
+        np.einsum("ij,ij->i", ends_xy - center_xy, ends_xy - center_xy)
         <= radius_sq
     )
     hit_mask, crossing_xy_np = _segment_circle_crossings_batch(
-        start_xy, end_xy, center, radius_m
+        starts_xy, ends_xy, center, radius_m
     )
 
     entry_mask = (~start_inside) & end_inside & hit_mask
     exit_mask = start_inside & (~end_inside) & hit_mask
-    entry_by_vehicle: dict[str, tuple[int, tuple[float, float]]] = {}
-    exit_by_vehicle: dict[str, tuple[int, tuple[float, float]]] = {}
+    # (vehicle_id, entry_seg, entry_crossing, exit_seg, exit_crossing)
+    pairs: list[tuple[str, int, tuple[float, float], int, tuple[float, float]]] = []
+    pending_entry: dict[str, tuple[int, tuple[float, float]]] = {}
 
     for flat_idx, (vehicle_id, seg_idx) in enumerate(segment_meta):
-        if vehicle_id not in entry_by_vehicle and entry_mask[flat_idx]:
-            entry_by_vehicle[vehicle_id] = (
-                seg_idx,
-                (float(crossing_xy_np[flat_idx][0]), float(crossing_xy_np[flat_idx][1])),
-            )
-            continue
-        if (
-            vehicle_id in entry_by_vehicle
-            and vehicle_id not in exit_by_vehicle
-            and exit_mask[flat_idx]
-        ):
-            entry_seg = entry_by_vehicle[vehicle_id][0]
-            if seg_idx >= entry_seg:
-                exit_by_vehicle[vehicle_id] = (
-                    seg_idx,
-                    (float(crossing_xy_np[flat_idx][0]), float(crossing_xy_np[flat_idx][1])),
-                )
+        crossing = (
+            float(crossing_xy_np[flat_idx][0]),
+            float(crossing_xy_np[flat_idx][1]),
+        )
+        if entry_mask[flat_idx] and vehicle_id not in pending_entry:
+            pending_entry[vehicle_id] = (seg_idx, crossing)
+        elif exit_mask[flat_idx] and vehicle_id in pending_entry:
+            entry_seg, entry_crossing = pending_entry.pop(vehicle_id)
+            pairs.append((vehicle_id, entry_seg, entry_crossing, seg_idx, crossing))
 
     # ── Collect all crossing points (for replay provenance) ─────
     crossing_counter = 0
@@ -2570,7 +2564,7 @@ def _extract_entry_exit_observations_batch(
     for flat_idx, (vehicle_id, seg_idx) in enumerate(segment_meta):
         if not hit_mask[flat_idx]:
             continue
-        seg_start_pt = track_lookup[vehicle_id][seg_idx]
+        seg_start_pt = track_points_lookup[vehicle_id][seg_idx]
         is_entry = bool(entry_mask[flat_idx])
         # Convert crossing xy → lon/lat
         cx_m, cy_m = float(crossing_xy_np[flat_idx][0]), float(crossing_xy_np[flat_idx][1])
@@ -2585,21 +2579,17 @@ def _extract_entry_exit_observations_batch(
                 crossing_lon=clon,
                 crossing_lat=clat,
                 is_entry=is_entry,
-                end_point_ref=track_lookup[vehicle_id][seg_idx + 1].point_ref,
+                end_point_ref=track_points_lookup[vehicle_id][seg_idx + 1].point_ref,
             )
         )
         crossing_id_by_segment[(vehicle_id, seg_idx, is_entry)] = crossing_counter
         crossing_counter += 1
 
     observations: list[EntryExitObservation] = []
-    for vehicle_id, (entry_seg, entry_xy) in entry_by_vehicle.items():
-        exit_ = exit_by_vehicle.get(vehicle_id)
-        if exit_ is None:
-            continue
-        exit_seg, exit_xy = exit_
+    for vehicle_id, entry_seg, entry_xy, exit_seg, exit_xy in pairs:
         obs = _make_observation(
-            track_lookup[vehicle_id],
-            xy_lookup[vehicle_id],
+            track_points_lookup[vehicle_id],
+            xy_points_lookup[vehicle_id],
             cluster_id=cluster.cluster_id,
             center=center,
             entry_seg=entry_seg,
