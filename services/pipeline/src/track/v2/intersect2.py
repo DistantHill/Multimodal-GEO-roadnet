@@ -136,6 +136,7 @@ class IntersectConfig(TrackModel):
     # ── Spatial sliding window (DB mode) ───────────────────────────
     query_active_from_db: bool = False
     db_table: str = "trajectory_points"
+    kept_table: str | None = None
     source_id: str | None = None
     run_id: str | None = None
     spatial_window_size: tuple[float, float] = (2000.0, 2000.0)
@@ -733,16 +734,22 @@ def _query_spatial_extent(
     conn: Any,
     *,
     table: str = "trajectory_points",
+    kept_table: str | None = None,
     source_id: str | None = None,
+    run_id: str | None = None,
 ) -> tuple[float, float, float, float] | None:
     """Query MIN/MAX lon/lat of active trajectory points.
 
+    ZH: kept 模式 (``kept_table`` 非空) 时 JOIN 清洗结果表并绑定 ``ktp.run_id``。
     Returns ``(lon_min, lat_min, lon_max, lat_max)`` compatible with
     ``SpatialWindowIterator``.
     """
-    sql = build_spatial_extent_sql(table)
+    if kept_table is not None and run_id is None:
+        raise ValueError("kept_table requires run_id")
+    sql = build_spatial_extent_sql(table, kept_table=kept_table)
+    params: tuple[Any, ...] = (run_id,) if kept_table is not None else ()
     with conn.cursor() as cur:
-        cur.execute(sql)
+        cur.execute(sql, params)
         row = cur.fetchone()
     if row is None or row[0] is None:
         return None
@@ -756,6 +763,7 @@ def _query_active_points_in_window(
     window: SpatialWindow,
     *,
     table: str = "trajectory_points",
+    kept_table: str | None = None,
     source_id: str | None = None,
     run_id: str | None = None,
     telemetry: dict[str, int | float] | None = None,
@@ -764,18 +772,28 @@ def _query_active_points_in_window(
 
     ZH: 使用 PostGIS GiST 空间索引 (geom && ST_MakeEnvelope) 替代
         lon/lat BETWEEN，走 R-tree 2D 索引扫描。UNION ALL 合并两表一次往返。
+        kept 模式 (``kept_table`` 非空) 时 trajectory 分支 JOIN 清洗结果表，
+        首参绑定 ``ktp.run_id``（而非 raw 模式的 source_id）。
     """
     rows: list[dict[str, Any]] = []
     has_run_id = run_id is not None
-    params: list[Any] = [source_id or ""]
-    params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
-    params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
-    if has_run_id:
+    if kept_table is not None and run_id is None:
+        raise ValueError("kept_table requires run_id")
+    if kept_table is not None:
+        params: list[Any] = [run_id]
+        params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
+        params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
         params.append(run_id)
+    else:
+        params = [source_id or ""]
+        params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
+        params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
+        if has_run_id:
+            params.append(run_id)
     query_started = time.perf_counter() if telemetry is not None else 0.0
     with conn.cursor() as cur:
         cur.execute(
-            build_active_in_window_sql(table, has_run_id=has_run_id),
+            build_active_in_window_sql(table, has_run_id=has_run_id, kept_table=kept_table),
             params,
         )
         for row in cur:
@@ -800,6 +818,7 @@ def _stream_vehicle_tracks_from_db(
     conn: Any,
     *,
     table: str = "trajectory_points",
+    kept_table: str | None = None,
     source_id: str | None = None,
     run_id: str | None = None,
 ) -> Iterator[list[TrajectoryPoint]]:
@@ -808,18 +827,25 @@ def _stream_vehicle_tracks_from_db(
     ZH: 从 DB 逐车流式读取轨迹点。使用 UNION ALL 合并 active points 和
         injected_points，按 (vehicle_id, timestamp) 排序后检测 vehicle_id
         变化来分组。内存占用 = 单车辆最大点数。
+        kept 模式 (``kept_table`` 非空) 时 trajectory 分支 JOIN 清洗结果表，
+        绑定 ``ktp.run_id`` 与 ``injected_points.run_id``。
     """
     has_run_id = run_id is not None
-    params: list[Any] = [source_id or ""]
-    if has_run_id:
-        params.append(run_id)
+    if kept_table is not None and run_id is None:
+        raise ValueError("kept_table requires run_id")
+    if kept_table is not None:
+        params: list[Any] = [run_id, run_id]
+    else:
+        params = [source_id or ""]
+        if has_run_id:
+            params.append(run_id)
     # ZH: 服务器端命名游标 — PG 按需 FETCH，避免全量物化到 portal。
     # EN: Server-side named cursor — FETCHes on demand, no full portal materialization.
     with conn.cursor(
         name=f"stream_tracks_{uuid.uuid4().hex}",
     ) as cur:
         cur.execute(
-            build_stream_all_sql(table, has_run_id=has_run_id),
+            build_stream_all_sql(table, has_run_id=has_run_id, kept_table=kept_table),
             params,
         )
         current_vid: str | None = None
@@ -857,6 +883,7 @@ def _query_active_points_near_cluster(
     radius_m: float,
     *,
     table: str = "trajectory_points",
+    kept_table: str | None = None,
     source_id: str | None = None,
     run_id: str | None = None,
 ) -> list[TrajectoryPoint]:
@@ -879,6 +906,7 @@ def _query_active_points_near_cluster(
         conn,
         window,
         table=table,
+        kept_table=kept_table,
         source_id=source_id,
         run_id=run_id,
     )
@@ -954,6 +982,7 @@ def _stream_extract_methods_1_2(
     for track in _stream_vehicle_tracks_from_db(
         conn,
         table=cfg.db_table,
+        kept_table=cfg.kept_table,
         source_id=cfg.source_id,
         run_id=cfg.run_id,
     ):
@@ -1074,6 +1103,7 @@ def _extract_cross_track_windows(
             conn,
             window,
             table=cfg.db_table,
+            kept_table=cfg.kept_table,
             source_id=cfg.source_id,
             run_id=cfg.run_id,
             telemetry=telemetry,
@@ -1211,6 +1241,7 @@ def _build_topologies_from_db(
             cluster,
             radius * 2.0,
             table=cfg.db_table,
+            kept_table=cfg.kept_table,
             source_id=cfg.source_id,
             run_id=cfg.run_id,
         )
@@ -1245,7 +1276,9 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
     extent = _query_spatial_extent(
         conn,
         table=cfg.db_table,
+        kept_table=cfg.kept_table,
         source_id=cfg.source_id,
+        run_id=cfg.run_id,
     )
     if extent is None:
         return _empty_intersect_result()

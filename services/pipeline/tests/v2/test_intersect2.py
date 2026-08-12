@@ -592,6 +592,40 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
         self.assertEqual(point.point_ref, PointRef("source-A", "row-7", stable=True))
         self.assertEqual(point.extra, {"tag": "kept"})
 
+    def test_query_kept_mode_joins_clean_table_and_binds_run_id_first(self):
+        conn = self._Connection(self._ROWS)
+        window = SpatialWindow(-1.0, -2.0, 3.0, 4.0)
+
+        points = _query_active_points_in_window(
+            conn,
+            window,
+            table="tp",
+            kept_table="ktp",
+            source_id="source-A",
+            run_id="run-9",
+            telemetry=None,
+        )
+
+        self.assertIn("FROM ktp AS ktp", conn.cursor_instance.query)
+        self.assertIn("JOIN tp AS tp ON tp.id = ktp.trajectory_point_id", conn.cursor_instance.query)
+        self.assertIn("ktp.run_id = %s", conn.cursor_instance.query)
+        self.assertEqual(
+            conn.cursor_instance.params,
+            ["run-9", -1.0, -2.0, 3.0, 4.0, -1.0, -2.0, 3.0, 4.0, "run-9"],
+        )
+        self.assertEqual(len(points), 1)
+
+    def test_query_kept_mode_requires_run_id(self):
+        conn = self._Connection(self._ROWS)
+
+        with self.assertRaises(ValueError):
+            _query_active_points_in_window(
+                conn,
+                SpatialWindow(-1.0, -2.0, 3.0, 4.0),
+                kept_table="ktp",
+                run_id=None,
+            )
+
     def test_query_with_telemetry_records_disjoint_query_and_materialization_phases(self):
         conn = self._Connection(self._ROWS)
         telemetry: dict[str, int | float] = {}

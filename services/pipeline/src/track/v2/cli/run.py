@@ -259,6 +259,7 @@ def run_pipeline(
         icfg = IntersectConfig(
             query_active_from_db=True,
             db_table=table,
+            kept_table=None if skip_clean else "kept_trajectory_points",
             source_id=intersect_source_id,
             run_id=None if skip_clean else run_id,
             live_status=live_intersect,
