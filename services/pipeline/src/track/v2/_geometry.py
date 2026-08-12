@@ -150,6 +150,157 @@ def _batch_segment_intersections(
     return cx, cy, flat_idx
 
 
+def _iter_bounded_segment_intersections(
+    a1: np.ndarray,
+    a2: np.ndarray,
+    ha: np.ndarray,
+    b1: np.ndarray,
+    b2: np.ndarray,
+    hb: np.ndarray,
+    min_angle_deg: float,
+    max_angle_deg: float,
+    *,
+    max_matrix_elements: int = 262_144,
+    dense_direct_threshold: int = 1_024,
+    telemetry: dict[str, int | float] | None = None,
+) -> Iterator[tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
+    """Yield bounded exact-kernel hits in baseline row-major order."""
+    if max_matrix_elements < 1:
+        raise ValueError("max_matrix_elements must be at least 1")
+    if telemetry is not None:
+        telemetry["matrix_element_cap"] = max_matrix_elements
+    if len(a1) == 0 or len(b1) == 0:
+        return
+
+    pair_elements = len(a1) * len(b1)
+    if pair_elements <= min(dense_direct_threshold, max_matrix_elements):
+        exact_started = time.perf_counter() if telemetry is not None else 0.0
+        cx, cy, flat_idx = _batch_segment_intersections(
+            a1, a2, ha, b1, b2, hb, min_angle_deg, max_angle_deg,
+        )
+        if telemetry is not None:
+            telemetry["dense_direct_pairs"] = telemetry.get("dense_direct_pairs", 0) + pair_elements
+            telemetry["dense_direct_blocks"] = telemetry.get("dense_direct_blocks", 0) + 1
+            telemetry["max_dense_direct_pairs"] = max(
+                telemetry.get("max_dense_direct_pairs", 0), pair_elements,
+            )
+            telemetry["exact_seconds"] = telemetry.get("exact_seconds", 0.0) + (
+                time.perf_counter() - exact_started
+            )
+            telemetry["exact_pairs"] = telemetry.get("exact_pairs", 0) + pair_elements
+        if len(flat_idx):
+            yield 0, cx.ravel()[flat_idx], cy.ravel()[flat_idx], flat_idx
+        return
+
+    columns_per_block = min(len(b1), max_matrix_elements)
+    rows_per_block = max(1, max_matrix_elements // columns_per_block)
+    for a_start in range(0, len(a1), rows_per_block):
+        a_stop = min(len(a1), a_start + rows_per_block)
+        broad_started = time.perf_counter() if telemetry is not None else 0.0
+        a_min_x = np.minimum(a1[a_start:a_stop, 0], a2[a_start:a_stop, 0])
+        a_max_x = np.maximum(a1[a_start:a_stop, 0], a2[a_start:a_stop, 0])
+        a_min_y = np.minimum(a1[a_start:a_stop, 1], a2[a_start:a_stop, 1])
+        a_max_y = np.maximum(a1[a_start:a_stop, 1], a2[a_start:a_stop, 1])
+        for b_start in range(0, len(b1), columns_per_block):
+            b_stop = min(len(b1), b_start + columns_per_block)
+            b_min_x = np.minimum(b1[b_start:b_stop, 0], b2[b_start:b_stop, 0])
+            b_max_x = np.maximum(b1[b_start:b_stop, 0], b2[b_start:b_stop, 0])
+            b_min_y = np.minimum(b1[b_start:b_stop, 1], b2[b_start:b_stop, 1])
+            b_max_y = np.maximum(b1[b_start:b_stop, 1], b2[b_start:b_stop, 1])
+            broad = (
+                (a_min_x[:, None] <= b_max_x[None, :])
+                & (b_min_x[None, :] <= a_max_x[:, None])
+                & (a_min_y[:, None] <= b_max_y[None, :])
+                & (b_min_y[None, :] <= a_max_y[:, None])
+            )
+            broad_flat = np.flatnonzero(broad)
+            if telemetry is not None:
+                telemetry["broad_seconds"] = telemetry.get("broad_seconds", 0.0) + (
+                    time.perf_counter() - broad_started
+                )
+                telemetry["broad_blocks"] = telemetry.get("broad_blocks", 0) + 1
+                telemetry["max_broad_block_pairs"] = max(
+                    telemetry.get("max_broad_block_pairs", 0), int(broad.size),
+                )
+                telemetry["broad_pairs"] = telemetry.get("broad_pairs", 0) + len(broad_flat)
+                telemetry["exact_skipped_pairs"] = telemetry.get("exact_skipped_pairs", 0) + (
+                    broad.size - len(broad_flat)
+                )
+                telemetry["empty_broad_blocks"] = telemetry.get("empty_broad_blocks", 0) + int(
+                    len(broad_flat) == 0
+                )
+            if len(broad_flat) == 0:
+                broad_started = time.perf_counter() if telemetry is not None else 0.0
+                continue
+
+            local_a = broad_flat // (b_stop - b_start)
+            b_indices = b_start + broad_flat % (b_stop - b_start)
+            full_flat = local_a * len(b1) + b_indices
+            for pair_start in range(0, len(full_flat), max_matrix_elements):
+                pair_stop = pair_start + max_matrix_elements
+                pair_flat = full_flat[pair_start:pair_stop]
+                pair_a = local_a[pair_start:pair_stop]
+                pair_b = b_indices[pair_start:pair_stop]
+                a_indices = a_start + pair_a
+                exact_started = time.perf_counter() if telemetry is not None else 0.0
+                cx, cy, valid = _compact_segment_intersections(
+                    a1, a2, ha, b1, b2, hb, a_indices, pair_b,
+                    min_angle_deg, max_angle_deg,
+                )
+                if telemetry is not None:
+                    telemetry["exact_seconds"] = telemetry.get("exact_seconds", 0.0) + (
+                        time.perf_counter() - exact_started
+                    )
+                    telemetry["exact_chunks"] = telemetry.get("exact_chunks", 0) + 1
+                    telemetry["max_exact_chunk_pairs"] = max(
+                        telemetry.get("max_exact_chunk_pairs", 0), len(pair_flat),
+                    )
+                    telemetry["exact_pairs"] = telemetry.get("exact_pairs", 0) + len(pair_flat)
+                if np.any(valid):
+                    yield a_start, cx[valid], cy[valid], pair_flat[valid]
+            broad_started = time.perf_counter() if telemetry is not None else 0.0
+
+
+def _compact_segment_intersections(
+    a1: np.ndarray,
+    a2: np.ndarray,
+    ha: np.ndarray,
+    b1: np.ndarray,
+    b2: np.ndarray,
+    hb: np.ndarray,
+    a_indices: np.ndarray,
+    b_indices: np.ndarray,
+    min_angle_deg: float,
+    max_angle_deg: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run the historical exact formula on an AABB-compacted pair vector."""
+    a1_x = a1[a_indices, 0]
+    a1_y = a1[a_indices, 1]
+    da_x = a2[a_indices, 0] - a1_x
+    da_y = a2[a_indices, 1] - a1_y
+    b1_x = b1[b_indices, 0]
+    b1_y = b1[b_indices, 1]
+    db_x = b2[b_indices, 0] - b1_x
+    db_y = b2[b_indices, 1] - b1_y
+    det = da_x * (-db_y) - (-db_x) * da_y
+    parallel = np.abs(det) < 1e-12
+    rhs_x = b1_x - a1_x
+    rhs_y = b1_y - a1_y
+    ta_num = rhs_x * (-db_y) - (-db_x) * rhs_y
+    tb_num = da_x * rhs_y - rhs_x * da_y
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ta = np.where(~parallel, ta_num / det, np.nan)
+        tb = np.where(~parallel, tb_num / det, np.nan)
+    angle = np.abs((hb[b_indices] - ha[a_indices] + 180.0) % 360.0 - 180.0)
+    valid = (
+        (~parallel)
+        & (ta >= 0.0) & (ta <= 1.0)
+        & (tb >= 0.0) & (tb <= 1.0)
+        & (min_angle_deg <= angle) & (angle <= max_angle_deg)
+    )
+    return a1_x + ta * da_x, a1_y + ta * da_y, valid
+
+
 def _paired_segment_intersections(
     a1: np.ndarray,
     a2: np.ndarray,

@@ -43,13 +43,15 @@ if str(_OUTPUT_HELPERS_DIR) not in sys.path:
     sys.path.insert(0, str(_OUTPUT_HELPERS_DIR))
 
 from output import write_json
+from track.v2.cross_track import (
+    extract_cross_track_candidates_legacy as _extract_orthogonal_cross_track_candidates_legacy,
+    extract_cross_track_candidates as _extract_orthogonal_cross_track_candidates,
+)
 from track.v2.intersect2 import (
     IntersectConfig,
     SpatialWindowIterator,
     _cluster_orthogonal_cross_track_candidates,
     _extract_cross_track_windows,
-    _extract_orthogonal_cross_track_candidates,
-    _extract_orthogonal_cross_track_candidates_legacy,
     _query_spatial_extent,
 )
 from track.v2.manual_thin_benchmark._thin_bench_helpers import connect_test_db

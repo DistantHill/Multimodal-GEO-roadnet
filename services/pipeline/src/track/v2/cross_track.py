@@ -1,0 +1,400 @@
+"""Method 3 cross-track candidate extraction.
+
+The module owns segment preparation, spatial indexing, bounded exact matching,
+candidate provenance, deterministic ordering, progress, and benchmark oracles.
+Callers only need :func:`extract_cross_track_candidates`.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Iterator
+
+import numpy as np
+
+from ._geometry import (
+    _angle_delta_deg,
+    _paired_segment_intersections,
+    _to_lonlat,
+    _to_xy,
+)
+from ._perf import PerfTracker
+from .models import CrossTrackCandidate, TrajectoryPoint
+from ._cross_track_legacy import extract_cross_track_candidates_legacy
+
+
+# Structural memory bounds owned by this module's implementation.
+_GRID_CELL_M = 1_000.0
+_PAIR_BATCH_SIZE = 65_536
+_MAX_GRID_CELLS_PER_SEGMENT = 40
+
+
+@dataclass(frozen=True)
+class _CrossTrackSegment:
+    """One source segment plus the data needed for bounded matching."""
+
+    vehicle_id: str
+    vehicle_rank: int
+    segment_index: int
+    start: TrajectoryPoint
+    end: TrajectoryPoint
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    heading: float
+    timestamp: float
+    cell_span: tuple[int, int, int, int] | None
+
+
+def extract_cross_track_candidates(
+    tracks: dict[str, list[TrajectoryPoint]],
+    origin_lon: float,
+    origin_lat: float,
+    cfg: Any,
+    live_status: Any = None,
+    *,
+    sub_detail: bool = False,
+    perf: PerfTracker | None = None,
+    telemetry: dict[str, int | float] | None = None,
+) -> tuple[list[CrossTrackCandidate], int, int]:
+    """Return cross-track candidates in stable vehicle/segment order."""
+    extraction_started = time.perf_counter() if telemetry is not None else 0.0
+    segment_started = time.perf_counter() if telemetry is not None else 0.0
+    segments, vehicle_count = _prepare_segments(tracks, origin_lon, origin_lat, cfg)
+    if telemetry is not None:
+        telemetry["segment_build_seconds"] = telemetry.get(
+            "segment_build_seconds", 0.0,
+        ) + (time.perf_counter() - segment_started)
+        telemetry["segments"] = telemetry.get("segments", 0) + len(segments)
+    if vehicle_count < 2:
+        return [], 0, 0
+
+    total_pairs = vehicle_count * (vehicle_count - 1) // 2
+    array_started = time.perf_counter() if telemetry is not None else 0.0
+    starts = np.array([(segment.x1, segment.y1) for segment in segments], dtype=float)
+    ends = np.array([(segment.x2, segment.y2) for segment in segments], dtype=float)
+    headings = np.array([segment.heading for segment in segments], dtype=float)
+    grid, overflow_segment_ids = _build_grid(segments)
+    if telemetry is not None:
+        telemetry["array_build_seconds"] = telemetry.get(
+            "array_build_seconds", 0.0,
+        ) + (time.perf_counter() - array_started)
+        telemetry["vehicle_pairs"] = telemetry.get("vehicle_pairs", 0) + total_pairs
+
+    ordered_candidates: list[tuple[tuple[int, int, int, int], CrossTrackCandidate]] = []
+    started = time.perf_counter()
+    cells = sorted(grid)
+    cell_iter = perf.timed_iter(cells, name="cross_track_grid_cells", total=len(cells)) if perf else cells
+    for cell_x, cell_y in cell_iter:
+        by_vehicle: dict[int, list[int]] = defaultdict(list)
+        for segment_id in grid[(cell_x, cell_y)]:
+            by_vehicle[segments[segment_id].vehicle_rank].append(segment_id)
+        vehicle_ranks = sorted(by_vehicle)
+        for rank_index, vehicle_rank_a in enumerate(vehicle_ranks):
+            for vehicle_rank_b in vehicle_ranks[rank_index + 1:]:
+                for segment_ids_a, segment_ids_b in _iter_pair_batches(
+                    by_vehicle[vehicle_rank_a], by_vehicle[vehicle_rank_b],
+                ):
+                    owner_mask = np.fromiter(
+                        (
+                            max(segments[int(a_id)].cell_span[0], segments[int(b_id)].cell_span[0]) == cell_x
+                            and max(segments[int(a_id)].cell_span[2], segments[int(b_id)].cell_span[2]) == cell_y
+                            for a_id, b_id in zip(segment_ids_a, segment_ids_b)
+                        ),
+                        dtype=bool,
+                        count=len(segment_ids_a),
+                    )
+                    if not np.any(owner_mask):
+                        continue
+                    segment_ids_a = segment_ids_a[owner_mask]
+                    segment_ids_b = segment_ids_b[owner_mask]
+                    _append_pair_hits(
+                        ordered_candidates,
+                        segments,
+                        starts,
+                        ends,
+                        headings,
+                        segment_ids_a,
+                        segment_ids_b,
+                        cfg,
+                        origin_lon,
+                        origin_lat,
+                    )
+
+    for segment_ids_a, segment_ids_b in _iter_overflow_pair_batches(
+        segments, overflow_segment_ids,
+    ):
+        _append_pair_hits(
+            ordered_candidates,
+            segments,
+            starts,
+            ends,
+            headings,
+            segment_ids_a,
+            segment_ids_b,
+            cfg,
+            origin_lon,
+            origin_lat,
+        )
+
+    ordered_candidates.sort(key=lambda item: item[0])
+    candidates = [candidate for _, candidate in ordered_candidates]
+    elapsed = time.perf_counter() - started
+    _emit_progress(
+        live_status,
+        total_pairs,
+        total_pairs,
+        len(candidates),
+        elapsed,
+        sub_detail=sub_detail,
+        final=True,
+    )
+    if telemetry is not None:
+        telemetry["cross_track_seconds"] = telemetry.get(
+            "cross_track_seconds", 0.0,
+        ) + (time.perf_counter() - extraction_started)
+        telemetry["output_candidates"] = telemetry.get("output_candidates", 0) + len(candidates)
+    return candidates, total_pairs, total_pairs
+
+
+def _append_pair_hits(
+    ordered_candidates: list[tuple[tuple[int, int, int, int], CrossTrackCandidate]],
+    segments: list[_CrossTrackSegment],
+    starts: np.ndarray,
+    ends: np.ndarray,
+    headings: np.ndarray,
+    segment_ids_a: np.ndarray,
+    segment_ids_b: np.ndarray,
+    cfg: Any,
+    origin_lon: float,
+    origin_lat: float,
+) -> None:
+    xs, ys, hit_indices = _paired_segment_intersections(
+        starts[segment_ids_a],
+        ends[segment_ids_a],
+        headings[segment_ids_a],
+        starts[segment_ids_b],
+        ends[segment_ids_b],
+        headings[segment_ids_b],
+        cfg.cross_track_min_angle_deg,
+        cfg.cross_track_max_angle_deg,
+    )
+    for x, y, hit_index in zip(xs, ys, hit_indices):
+        segment_a = segments[int(segment_ids_a[hit_index])]
+        segment_b = segments[int(segment_ids_b[hit_index])]
+        ordered_candidates.append((
+            (
+                segment_a.vehicle_rank,
+                segment_b.vehicle_rank,
+                segment_a.segment_index,
+                segment_b.segment_index,
+            ),
+            _candidate_from_segments(
+                segment_a,
+                segment_b,
+                float(x),
+                float(y),
+                origin_lon,
+                origin_lat,
+            ),
+        ))
+
+
+def _grid_span(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+) -> tuple[int, int, int, int] | None:
+    """Return a closed-cell span; non-finite segments retain miss semantics."""
+    if not all(math.isfinite(value) for value in (x1, y1, x2, y2)):
+        return None
+    cell_m = _GRID_CELL_M
+    return (
+        math.floor(min(x1, x2) / cell_m),
+        math.floor(max(x1, x2) / cell_m),
+        math.floor(min(y1, y2) / cell_m),
+        math.floor(max(y1, y2) / cell_m),
+    )
+
+
+def _prepare_segments(
+    tracks: dict[str, list[TrajectoryPoint]],
+    origin_lon: float,
+    origin_lat: float,
+    cfg: Any,
+) -> tuple[list[_CrossTrackSegment], int]:
+    """Preserve straight-segment filtering in stable vehicle order."""
+    per_vehicle: list[tuple[str, list[tuple[int, float, float, float, float]]]] = []
+    for vehicle_id in sorted(tracks):
+        track = tracks[vehicle_id]
+        raw_segments: list[tuple[int, float, float, float, float]] = []
+        for segment_index in range(len(track) - 1):
+            start = track[segment_index]
+            end = track[segment_index + 1]
+            if abs(_angle_delta_deg(start.heading, end.heading)) > cfg.cross_track_straightness_deg:
+                continue
+            x1, y1 = _to_xy(start.lon, start.lat, origin_lon, origin_lat)
+            x2, y2 = _to_xy(end.lon, end.lat, origin_lon, origin_lat)
+            raw_segments.append((segment_index, x1, y1, x2, y2))
+        if raw_segments:
+            per_vehicle.append((vehicle_id, raw_segments))
+
+    segments: list[_CrossTrackSegment] = []
+    for vehicle_rank, (vehicle_id, raw_segments) in enumerate(per_vehicle):
+        track = tracks[vehicle_id]
+        for segment_index, x1, y1, x2, y2 in raw_segments:
+            start = track[segment_index]
+            segments.append(_CrossTrackSegment(
+                vehicle_id=vehicle_id,
+                vehicle_rank=vehicle_rank,
+                segment_index=segment_index,
+                start=start,
+                end=track[segment_index + 1],
+                x1=x1,
+                y1=y1,
+                x2=x2,
+                y2=y2,
+                heading=start.heading,
+                timestamp=start.timestamp,
+                cell_span=_grid_span(x1, y1, x2, y2),
+            ))
+    return segments, len(per_vehicle)
+
+
+def _build_grid(
+    segments: list[_CrossTrackSegment],
+) -> tuple[dict[tuple[int, int], list[int]], list[int]]:
+    """Assign bounded AABBs to cells and retain long spans for exact fallback."""
+    grid: dict[tuple[int, int], list[int]] = defaultdict(list)
+    overflow_segment_ids: list[int] = []
+    for segment_id, segment in enumerate(segments):
+        if segment.cell_span is None:
+            continue
+        cell_min_x, cell_max_x, cell_min_y, cell_max_y = segment.cell_span
+        cell_count = (cell_max_x - cell_min_x + 1) * (cell_max_y - cell_min_y + 1)
+        if cell_count > _MAX_GRID_CELLS_PER_SEGMENT:
+            overflow_segment_ids.append(segment_id)
+            continue
+        for cell_x in range(cell_min_x, cell_max_x + 1):
+            for cell_y in range(cell_min_y, cell_max_y + 1):
+                grid[(cell_x, cell_y)].append(segment_id)
+    return grid, overflow_segment_ids
+
+
+def _iter_pair_batches(
+    segment_ids_a: list[int],
+    segment_ids_b: list[int],
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Yield a Cartesian product in bounded index batches."""
+    a_ids = np.asarray(segment_ids_a, dtype=int)
+    b_ids = np.asarray(segment_ids_b, dtype=int)
+    total = len(a_ids) * len(b_ids)
+    for offset in range(0, total, _PAIR_BATCH_SIZE):
+        flat = np.arange(
+            offset,
+            min(offset + _PAIR_BATCH_SIZE, total),
+            dtype=np.int64,
+        )
+        yield a_ids[flat // len(b_ids)], b_ids[flat % len(b_ids)]
+
+
+def _iter_overflow_pair_batches(
+    segments: list[_CrossTrackSegment],
+    overflow_segment_ids: list[int],
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Yield every long-AABB pair once under the standard batch bound."""
+    finite_segment_ids = [
+        segment_id for segment_id, segment in enumerate(segments)
+        if segment.cell_span is not None
+    ]
+    overflow_ids = set(overflow_segment_ids)
+    a_ids: list[int] = []
+    b_ids: list[int] = []
+    for overflow_id in overflow_segment_ids:
+        overflow = segments[overflow_id]
+        for other_id in finite_segment_ids:
+            if other_id == overflow_id or segments[other_id].vehicle_rank == overflow.vehicle_rank:
+                continue
+            if other_id in overflow_ids and other_id < overflow_id:
+                continue
+            other = segments[other_id]
+            if overflow.vehicle_rank < other.vehicle_rank:
+                a_ids.append(overflow_id)
+                b_ids.append(other_id)
+            else:
+                a_ids.append(other_id)
+                b_ids.append(overflow_id)
+            if len(a_ids) == _PAIR_BATCH_SIZE:
+                yield np.asarray(a_ids, dtype=int), np.asarray(b_ids, dtype=int)
+                a_ids.clear()
+                b_ids.clear()
+    if a_ids:
+        yield np.asarray(a_ids, dtype=int), np.asarray(b_ids, dtype=int)
+
+
+def _candidate_from_segments(
+    segment_a: _CrossTrackSegment,
+    segment_b: _CrossTrackSegment,
+    x: float,
+    y: float,
+    origin_lon: float,
+    origin_lat: float,
+) -> CrossTrackCandidate:
+    """Build the public candidate payload from one canonical hit."""
+    lon, lat = _to_lonlat(x, y, origin_lon, origin_lat)
+    return CrossTrackCandidate(
+        point_ref=segment_a.start.point_ref,
+        vehicle_id=f"{segment_a.vehicle_id}|{segment_b.vehicle_id}",
+        timestamp=(segment_a.timestamp + segment_b.timestamp) / 2.0,
+        lon=lon,
+        lat=lat,
+        x=x,
+        y=y,
+        heading=segment_a.heading,
+        speed=segment_a.start.speed,
+        from_source_id=segment_a.start.point_ref.source_id,
+        from_source_row_key=(
+            f"{segment_a.start.point_ref.source_row_key},{segment_a.end.point_ref.source_row_key}"
+        ),
+        to_source_id=segment_b.start.point_ref.source_id,
+        to_source_row_key=(
+            f"{segment_b.start.point_ref.source_row_key},{segment_b.end.point_ref.source_row_key}"
+        ),
+        origin_lon=origin_lon,
+        origin_lat=origin_lat,
+    )
+
+
+def _emit_progress(
+    live_status: Any,
+    pair_count: int,
+    total_pairs: int,
+    candidate_count: int,
+    elapsed: float,
+    *,
+    sub_detail: bool = False,
+    final: bool = False,
+) -> str:
+    """Emit the single cross-track progress format."""
+    detail = (
+        f"跨车求交/Cross-track:\t{pair_count:,}/{total_pairs:,}\t车辆对/pairs,\t"
+        f"{candidate_count:,}\t候选/candidates"
+    )
+    line = detail if final else f"计算中：{detail}"
+    if live_status is not None:
+        if sub_detail:
+            live_status.update(sub_detail=line, elapsed=elapsed)
+        else:
+            live_status.update(
+                progress=(pair_count / total_pairs) if total_pairs else 0.0,
+                detail=line,
+                elapsed=elapsed,
+            )
+    else:
+        print(f"    ... {line} ({elapsed:.1f}s)")
+    return detail

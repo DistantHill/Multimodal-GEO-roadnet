@@ -14,7 +14,6 @@ import numpy as np
 from track.v2._geometry import _paired_segment_intersections, _to_lonlat, _to_xy
 import numpy as np
 
-from track.v2 import intersect2 as intersect2_module
 from track.v2._geometry import (
     _batch_segment_intersections,
     _iter_bounded_segment_intersections,
@@ -22,12 +21,20 @@ from track.v2._geometry import (
 )
 from track.v2._perf import PerfTracker
 from track.v2.cleaner1 import CleanerConfig, clean
+from track.v2.cross_track import (
+    _MAX_GRID_CELLS_PER_SEGMENT,
+    _PAIR_BATCH_SIZE,
+    _build_grid as _cross_track_grid,
+    extract_cross_track_candidates_legacy as _extract_orthogonal_cross_track_candidates_legacy,
+    _iter_pair_batches as _iter_cross_track_pair_batches,
+    _prepare_segments as _prepare_cross_track_segments,
+    extract_cross_track_candidates as _extract_orthogonal_cross_track_candidates,
+)
+from track.v2 import _cross_track_legacy as cross_track_legacy_module
 from track.v2.exceptions import V2Error
 from track.v2.intersect2 import (
     IntersectConfig,
     IntersectResult,
-    _CROSS_TRACK_MAX_GRID_CELLS_PER_SEGMENT,
-    _CROSS_TRACK_PAIR_BATCH_SIZE,
     SpatialWindow,
     _cluster_angles_greedy,
     _cluster_dbscan,
@@ -38,15 +45,10 @@ from track.v2.intersect2 import (
     _detect_turn_events,
     _extract_entry_exit_observations_batch,
     _extract_cross_track_windows,
-    _extract_orthogonal_cross_track_candidates,
-    _extract_orthogonal_cross_track_candidates_legacy,
     _extract_orthogonal_candidates,
     _getis_local_counts_grid,
     _getis_local_counts_scan,
     _group_by_vehicle,
-    _cross_track_grid,
-    _iter_cross_track_pair_batches,
-    _prepare_cross_track_segments,
     _build_dbscan_grid,
     _merge_clusters,
     _nearest_angle_id,
@@ -216,11 +218,14 @@ class PairedSegmentIntersectionTest(unittest.TestCase):
 
     def test_pair_batches_never_exceed_the_configured_limit(self):
         """Dense cells remain memory bounded before exact geometry runs."""
-        side = math.isqrt(_CROSS_TRACK_PAIR_BATCH_SIZE) + 1
+        side = math.isqrt(_PAIR_BATCH_SIZE) + 1
         batches = list(_iter_cross_track_pair_batches(list(range(side)), list(range(side))))
 
         self.assertEqual(sum(len(a_ids) for a_ids, _ in batches), side * side)
-        self.assertTrue(all(len(a_ids) <= _CROSS_TRACK_PAIR_BATCH_SIZE for a_ids, _ in batches))
+        self.assertTrue(all(
+            len(a_ids) <= _PAIR_BATCH_SIZE
+            for a_ids, _ in batches
+        ))
         self.assertEqual(batches[0][0][0], 0)
         self.assertEqual(batches[-1][1][-1], side - 1)
 
@@ -368,7 +373,6 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
 
     @staticmethod
     def _payload(candidate):
-        """The historical no-prefilter oracle must match every output field."""
         return (
             candidate.point_ref,
             candidate.vehicle_id,
@@ -388,8 +392,7 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
         )
 
     def _historical_oracle(self, tracks, origin_lon=116.0, origin_lat=39.0):
-        """Run the exact historical all-vehicle-pairs path, without AABB reject."""
-        return _extract_orthogonal_cross_track_candidates(
+        return _extract_orthogonal_cross_track_candidates_legacy(
             tracks, origin_lon, origin_lat, IntersectConfig(),
             vehicle_aabb_prefilter=False,
         )
@@ -398,24 +401,37 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
         tracks = {"A": self._track("A", [(116, 39), (116.001, 39)], 90),
                   "B": self._track("B", [(117, 40), (117.001, 40)], 90)}
         telemetry = {}
-        with patch("track.v2.intersect2._iter_bounded_segment_intersections") as kernel:
-            candidates, pairs, total = _extract_orthogonal_cross_track_candidates(tracks, 116, 39, IntersectConfig(), telemetry=telemetry)
+        with patch("track.v2._cross_track_legacy._iter_bounded_segment_intersections") as kernel:
+            candidates, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
+                tracks, 116, 39, IntersectConfig(), telemetry=telemetry,
+            )
         self.assertEqual((candidates, pairs, total), ([], 1, 1))
         kernel.assert_not_called()
-        self.assertEqual(telemetry["vehicle_aabb_pairs"], telemetry["vehicle_aabb_rejected"] + telemetry.get("vehicle_kernel_pairs", 0))
+        self.assertEqual(
+            telemetry["vehicle_aabb_pairs"],
+            telemetry["vehicle_aabb_rejected"] + telemetry.get("vehicle_kernel_pairs", 0),
+        )
 
     def test_closed_endpoint_calls_kernel_and_preserves_candidate_order(self):
         tracks = {"A": self._track("A", [(116, 38.999), (116, 39)], 0),
                   "B": self._track("B", [(115.999, 39), (116, 39)], 90)}
         telemetry = {}
-        with patch("track.v2.intersect2._iter_bounded_segment_intersections", wraps=_iter_bounded_segment_intersections) as kernel:
-            candidates, pairs, total = _extract_orthogonal_cross_track_candidates(tracks, 116, 39, IntersectConfig(), telemetry=telemetry)
-        self.assertEqual((pairs, total), (1, 1)); self.assertTrue(kernel.called)
+        with patch(
+            "track.v2._cross_track_legacy._iter_bounded_segment_intersections",
+            wraps=_iter_bounded_segment_intersections,
+        ) as kernel:
+            candidates, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
+                tracks, 116, 39, IntersectConfig(), telemetry=telemetry,
+            )
+        self.assertEqual((pairs, total), (1, 1))
+        self.assertTrue(kernel.called)
         self.assertEqual(telemetry["vehicle_aabb_rejected"], 0)
-        self.assertEqual([item.vehicle_id for item in candidates], sorted(item.vehicle_id for item in candidates))
+        self.assertEqual(
+            [item.vehicle_id for item in candidates],
+            sorted(item.vehicle_id for item in candidates),
+        )
 
     def test_closed_endpoint_returns_known_intersection_and_full_payload_matches_oracle(self):
-        """AABB endpoint inclusion is non-vacuous and exactly historical."""
         tracks = {
             "A": [
                 _make_point("A", "A-start", 10.0, 116.0, 38.999, 0.0, 12.0, "source-a"),
@@ -429,10 +445,10 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
         oracle, oracle_pairs, oracle_total = self._historical_oracle(tracks)
         telemetry: dict[str, int] = {}
         with patch(
-            "track.v2.intersect2._iter_bounded_segment_intersections",
+            "track.v2._cross_track_legacy._iter_bounded_segment_intersections",
             wraps=_iter_bounded_segment_intersections,
         ) as kernel:
-            actual, pairs, total = _extract_orthogonal_cross_track_candidates(
+            actual, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
                 tracks, 116.0, 39.0, IntersectConfig(), telemetry=telemetry,
             )
 
@@ -455,7 +471,6 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
         self.assertEqual(telemetry["vehicle_aabb_rejected"], 0)
 
     def test_mixed_vehicle_pairs_account_kernel_and_rejection_and_match_oracle(self):
-        """A/B intersects; every pair containing C is rejected before the kernel."""
         tracks = {
             "A": self._track("A", [(116.0, 38.999), (116.0, 39.001)], 0.0),
             "B": self._track("B", [(115.999, 39.0), (116.001, 39.0)], 90.0),
@@ -464,10 +479,10 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
         oracle, oracle_pairs, oracle_total = self._historical_oracle(tracks)
         telemetry: dict[str, int] = {}
         with patch(
-            "track.v2.intersect2._iter_bounded_segment_intersections",
+            "track.v2._cross_track_legacy._iter_bounded_segment_intersections",
             wraps=_iter_bounded_segment_intersections,
         ) as kernel:
-            actual, pairs, total = _extract_orthogonal_cross_track_candidates(
+            actual, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
                 tracks, 116.0, 39.0, IntersectConfig(), telemetry=telemetry,
             )
 
@@ -484,7 +499,6 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
         self.assertEqual([self._payload(item) for item in actual], [self._payload(item) for item in oracle])
 
     def test_all_rejected_pairs_emit_intermediate_and_final_progress(self):
-        """15 separated vehicles exercise the 100-pair progress update branch."""
         tracks = {
             f"V{index:02d}": self._track(
                 f"V{index:02d}",
@@ -494,9 +508,13 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
             for index in range(15)
         }
         telemetry: dict[str, int] = {}
-        with patch("track.v2.intersect2._emit_cross_track_progress", wraps=intersect2_module._emit_cross_track_progress) as progress, \
-             patch("track.v2.intersect2._iter_bounded_segment_intersections") as kernel:
-            candidates, pairs, total = _extract_orthogonal_cross_track_candidates(
+        with patch(
+            "track.v2._cross_track_legacy._emit_progress",
+            wraps=cross_track_legacy_module._emit_progress,
+        ) as progress, patch(
+            "track.v2._cross_track_legacy._iter_bounded_segment_intersections",
+        ) as kernel:
+            candidates, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
                 tracks, 116.0, 39.0, IntersectConfig(), telemetry=telemetry,
             )
 
@@ -505,7 +523,10 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
         self.assertEqual(telemetry["vehicle_aabb_pairs"], 105)
         self.assertEqual(telemetry["vehicle_aabb_rejected"], 105)
         self.assertNotIn("vehicle_kernel_pairs", telemetry)
-        observed = [(call.args[1], call.args[2], call.kwargs.get("final", False)) for call in progress.call_args_list]
+        observed = [
+            (call.args[1], call.args[2], call.kwargs.get("final", False))
+            for call in progress.call_args_list
+        ]
         self.assertIn((100, 105, False), observed)
         self.assertIn((105, 105, True), observed)
 
@@ -1342,7 +1363,10 @@ class OrthogonalCandidateTest(unittest.TestCase):
         )
         grid, overflow_ids = _cross_track_grid(segments)
         self.assertEqual(overflow_ids, [0, 1])
-        self.assertLessEqual(sum(len(ids) for ids in grid.values()), _CROSS_TRACK_MAX_GRID_CELLS_PER_SEGMENT)
+        self.assertLessEqual(
+            sum(len(ids) for ids in grid.values()),
+            _MAX_GRID_CELLS_PER_SEGMENT,
+        )
 
         legacy = _extract_orthogonal_cross_track_candidates_legacy(
             tracks, origin_lon, origin_lat, IntersectConfig(),
