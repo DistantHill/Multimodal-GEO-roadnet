@@ -2329,7 +2329,7 @@ def _nearest_angle_id(angle: float, centers: list[float]) -> int:
 
 def _make_observation(
     track: list[TrajectoryPoint],
-    xy: list[tuple[float, float]],
+    points: list[tuple[float, float]],
     *,
     cluster_id: int,
     center: tuple[float, float],
@@ -2342,8 +2342,8 @@ def _make_observation(
     exit_crossing_id: int | None = None,
 ) -> EntryExitObservation | None:
     """Build a single EntryExitObservation from matched entry/exit segments."""
-    inbound_angles = _segment_bearings(xy, entry_seg - bearing_window, entry_seg + 1)
-    outbound_angles = _segment_bearings(xy, exit_seg, exit_seg + bearing_window + 1)
+    inbound_angles = _segment_bearings(points, entry_seg - bearing_window, entry_seg + 1)
+    outbound_angles = _segment_bearings(points, exit_seg, exit_seg + bearing_window + 1)
     if not inbound_angles or not outbound_angles:
         return None
 

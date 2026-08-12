@@ -83,7 +83,7 @@ def _circular_mean_deg(angles: Iterable[float]) -> float:
 
 
 def _segment_bearings(
-    xy: list[tuple[float, float]], start: int, stop: int
+    points: list[tuple[float, float]], start: int, stop: int
 ) -> list[float]:
     """Bearings for segment indices [start, stop).
 
@@ -91,10 +91,10 @@ def _segment_bearings(
     """
     bearings: list[float] = []
     lo = max(0, start)
-    hi = min(len(xy) - 1, stop)
+    hi = min(len(points) - 1, stop)
     for i in range(lo, hi):
-        if _distance_m(xy[i], xy[i + 1]) > 1e-6:
-            bearings.append(_bearing_deg(xy[i], xy[i + 1]))
+        if _distance_m(points[i], points[i + 1]) > 1e-6:
+            bearings.append(_bearing_deg(points[i], points[i + 1]))
     return bearings
 
 
