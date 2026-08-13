@@ -8,8 +8,8 @@ if str(_PROJECT_ROOT) not in sys.path:
 from track.v2.clip import extract_clips_for_run
 from track.v2.config import connect, default_postgres_config
 
-RUN_ID = "64024dbb-a001-42aa-b4dc-2e3f11e57f1c"
-PAIRS = {(18, 106), (106, 18)}
+RUN_ID = "a06566cc-c860-4efd-9ae2-c536a7d1477b"
+PAIRS = {(55,79), (79,55)}
 
 
 def main() -> None:
