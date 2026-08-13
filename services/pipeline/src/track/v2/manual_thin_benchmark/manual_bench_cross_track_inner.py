@@ -137,16 +137,16 @@ def _percentile(values: list[float], percentile: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
-def _print_step_summary(label: str, wall_s: list[float], timings: list[dict[str, float]]) -> None:
+def _print_step_summary(label: str, wall_s: list[float], telemetries: list[dict[str, int | float]]) -> None:
     median_wall = statistics.median(wall_s)
     aggregate_wall = sum(wall_s)
     totals = {
-        key: sum(timing.get(key, 0.0) for timing in timings)
-        for key in ("query_s", "track_grouping_s", "candidate_extraction_s", "dedup_s")
+        key: sum(t.get(key, 0.0) for t in telemetries)
+        for key in ("query_seconds", "group_sort_seconds", "candidate_extraction_seconds", "dedupe_seconds")
     }
-    points = sum(timing.get("points", 0.0) for timing in timings)
-    windows = sum(timing.get("windows", 0.0) for timing in timings)
-    empty_windows = sum(timing.get("empty_windows", 0.0) for timing in timings)
+    points = sum(t.get("queried_rows", 0.0) for t in telemetries)
+    windows = sum(t.get("windows", 0.0) for t in telemetries)
+    empty_windows = sum(t.get("empty_windows", 0.0) for t in telemetries)
     unattributed = max(0.0, aggregate_wall - sum(totals.values()))
     print(
         f"{label} median_wall_s={median_wall:.3f} p50_s={_percentile(wall_s, 50):.3f} "
@@ -192,10 +192,9 @@ def _run_stage(
     origin_lat: float,
     extractor: Callable[..., tuple[list[object], int, int]],
     *,
-    verbose: bool,
     windows_override: list[object],
-) -> tuple[list[object], float, dict[str, float]]:
-    timing: dict[str, float] = {}
+) -> tuple[list[object], float, dict[str, int | float]]:
+    telemetry: dict[str, int | float] = {}
     started = time.perf_counter()
     candidates = _extract_cross_track_windows(
         conn,
@@ -205,11 +204,10 @@ def _run_stage(
         origin_lat,
         live_status=_QuietLiveStatus(),
         candidate_extractor=extractor,  # type: ignore[arg-type]
-        timing=timing,
-        verbose=verbose,
         windows_override=windows_override,  # type: ignore[arg-type]
+        telemetry=telemetry,
     )
-    return candidates, time.perf_counter() - started, timing
+    return candidates, time.perf_counter() - started, telemetry
 
 
 def main() -> int:
@@ -223,7 +221,6 @@ def main() -> int:
         help="Maximum windows when --window-index is 0; 0 means every window.",
     )
     parser.add_argument("--repetitions", type=int, default=3, help="Legacy/new stage repetitions.")
-    parser.add_argument("--verbose", action="store_true", help="Print independent timings for every window.")
     parser.add_argument(
         "--write-baseline",
         metavar="FILENAME.json",
@@ -283,8 +280,8 @@ def main() -> int:
         )
         legacy_times: list[float] = []
         optimized_times: list[float] = []
-        legacy_timings: list[dict[str, float]] = []
-        optimized_timings: list[dict[str, float]] = []
+        legacy_timings: list[dict[str, int | float]] = []
+        optimized_timings: list[dict[str, int | float]] = []
         peak_rss_mib: list[float] = []
         first_snapshot: dict[str, object] | None = None
 
@@ -295,11 +292,10 @@ def main() -> int:
             )
             if repetition % 2:
                 order = tuple(reversed(order))
-            results: dict[str, tuple[list[object], float, dict[str, float]]] = {}
+            results: dict[str, tuple[list[object], float, dict[str, int | float]]] = {}
             for label, extractor in order:
                 results[label] = _run_stage(
                     conn, cfg, extent, origin_lon, origin_lat, extractor,
-                    verbose=args.verbose,
                     windows_override=selected,
                 )
             legacy, legacy_wall, legacy_timing = results["legacy"]

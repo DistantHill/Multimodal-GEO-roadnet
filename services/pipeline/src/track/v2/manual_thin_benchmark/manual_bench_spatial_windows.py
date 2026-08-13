@@ -26,12 +26,12 @@ from track.v2.manual_thin_benchmark._thin_bench_helpers import connect_test_db, 
 from track.v2.intersect2 import (
     IntersectConfig,
     SpatialWindowIterator,
-    _build_points_from_rows,
     _extract_orthogonal_cross_track_candidates,
     _query_active_points_in_window,
     _query_spatial_extent,
     _tracks_from_points,
 )
+from track.v2.db.query import _build_points_from_rows
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONFIG —— 在这里改参数
