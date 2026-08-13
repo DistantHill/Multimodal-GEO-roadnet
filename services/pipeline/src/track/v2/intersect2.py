@@ -820,7 +820,7 @@ def _extract_cross_track_windows(
         if not points:
             if telemetry is not None:
                 telemetry["empty_windows"] = telemetry.get("empty_windows", 0) + 1
-            log_info(f"Window {window_count} Done, 累计处理点数/sum points: {total_points:,}")
+            # log_info(f"Window {window_count} Done, 累计处理点数/sum points: {total_points:,}")
             continue
 
         total_points += len(points)
