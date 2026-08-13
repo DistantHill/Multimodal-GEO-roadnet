@@ -1163,7 +1163,7 @@ def _detect_turn_events(
 
         track_count += 1
         now = time.perf_counter()
-        if track_count % 100 == 0 or (now - last_t) >= 3.0:
+        if track_count % 10000 == 0 or (now - last_t) >= 3.0:
             _route_progress(
                 live_status,
                 detail=f"已处理/Processed:\t{track_count:,}/{total_tracks:,}\t轨迹/tracks",
@@ -1420,7 +1420,7 @@ def _extract_orthogonal_candidates(
 
         track_count += 1
         now = time.perf_counter()
-        if track_count % 100 == 0 or (now - last_t) >= 3.0:
+        if track_count % 10000 == 0 or (now - last_t) >= 3.0:
             _route_progress(
                 live_status,
                 detail=f"正交候选/Ortho:\t{track_count:,}/{total_tracks:,}\t轨迹/tracks,\t{len(candidates):,}\t候选",
