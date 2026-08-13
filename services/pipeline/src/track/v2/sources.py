@@ -411,13 +411,12 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
         try:
             _configure_postgres_session(conn)
             cur = conn.cursor()
-            table = self._source.source_id or "trajectory_points"
+            query = self._source.query.rstrip().removesuffix(";")
             cur.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = %s ORDER BY ordinal_position",
-                (table,),
+                f"SELECT * FROM ({query}) AS source_columns LIMIT 0",
+                self._source.params,
             )
-            return [row[0] for row in cur.fetchall()]
+            return [desc[0] for desc in (cur.description or [])]
         finally:
             _close_quietly(cur)
             _close_quietly(conn)

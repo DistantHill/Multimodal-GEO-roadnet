@@ -140,7 +140,7 @@ class IntersectConfig(TrackModel):
     db_table: str = "trajectory_points"
     kept_table: str | None = None
     source_id: str | None = None
-    run_id: str | None = None
+    clean_id: str | None = None
     spatial_window_size: tuple[float, float] = (2000.0, 2000.0)
     spatial_window_overlap: float = 0.15
 
@@ -694,7 +694,7 @@ def _stream_extract_methods_1_2(
         table=cfg.db_table,
         kept_table=cfg.kept_table,
         source_id=cfg.source_id,
-        run_id=cfg.run_id,
+        clean_id=cfg.clean_id,
     ):
         vid = track[0].vehicle_id
         batch[vid] = track
@@ -812,7 +812,7 @@ def _extract_cross_track_windows(
             table=cfg.db_table,
             kept_table=cfg.kept_table,
             source_id=cfg.source_id,
-            run_id=cfg.run_id,
+            clean_id=cfg.clean_id,
             telemetry=telemetry,
         )
         if telemetry is not None:
@@ -929,7 +929,7 @@ def _build_topologies_from_db(
             table=cfg.db_table,
             kept_table=cfg.kept_table,
             source_id=cfg.source_id,
-            run_id=cfg.run_id,
+            clean_id=cfg.clean_id,
         )
         nearby_tracks = _tracks_from_points(nearby_points)
         observations, crossing_points = _extract_entry_exit_observations_batch(
@@ -964,7 +964,7 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
         table=cfg.db_table,
         kept_table=cfg.kept_table,
         source_id=cfg.source_id,
-        run_id=cfg.run_id,
+        clean_id=cfg.clean_id,
     )
     if extent is None:
         return _empty_intersect_result()

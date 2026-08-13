@@ -1,20 +1,18 @@
 """Pipeline runner: Parser 0 → Cleaner 1 → Intersect2 → Clip → Fitting → Network.
 
-ZH: 端到端流水线 CLI 入口。读取 CSV 或 PostgreSQL 表，运行六个阶段；前三阶段
-    的产物写入 PostgreSQL，后三阶段返回纯内存结果。也可按 run_id 单独重放 Clip。
-    --csv、--pg-table 和 --replay-clips 互斥。
+ZH: 端到端流水线 CLI 入口。完整模式读取 CSV 或 PostgreSQL 表并创建 Clean Run，
+    也可按 --clean-id 复用一个已完成 Clean Run；每次都创建新的 Detect Run。
 
-EN: End-to-end pipeline CLI. It reads CSV or PostgreSQL, runs six stages,
-    persists the first three stages, and keeps the final three as pure
-    in-memory results. Clip can also be replayed by run_id. --csv, --pg-table, and
-    --replay-clips are mutually exclusive.
+EN: End-to-end pipeline CLI. Full mode creates a Clean Run from CSV or a
+    PostgreSQL table; --clean-id reuses one completed Clean Run. Every
+    invocation creates a new Detect Run.
 
 Usage / 用法::
 
     python -m track.v2.cli.run --csv track/data/guiji_20230301_top10w.csv --ask-password
     python -m track.v2.cli.run --csv data.csv --host 127.0.0.1 --port 15432 --database trajectory --user track_user --ask-password
     python -m track.v2.cli.run --pg-table trajectory_points --host 127.0.0.1 --port 15432 --database trajectory --user track_user --ask-password
-    python -m track.v2.cli.run --replay-clips RUN_ID --ask-password
+    python -m track.v2.cli.run --clean-id UUID --ask-password
 """
 
 from __future__ import annotations
@@ -23,13 +21,21 @@ import argparse
 import getpass
 import sys
 import time
+import uuid
 from pathlib import Path
+
+import psycopg
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
 from ..logger import init_logger, shutdown_logger, LiveStatus
 from ..db_writer import (
-    create_pipeline_run,
-    finish_pipeline_run,
+    create_clean_run,
+    create_detect_run,
+    create_fit_run,
+    fetch_clean_run,
+    finish_clean_run,
+    finish_detect_run,
+    finish_fit_run,
     insert_candidate_entry_exit_points,
     insert_candidate_intersection_events,
     insert_candidate_intersections,
@@ -37,21 +43,23 @@ from ..db_writer import (
     insert_injected_points,
     insert_tracks_cross,
     insert_intersections,
+    insert_centerline_bundle,
     insert_kept_trajectory_points,
     insert_trajectory_points,
     insert_turn_events,
-    latest_completed_run_id,
 )
 from ..models import (
     CleanerConfig,
+    ClipConfig,
     ClipResult,
     CsvSource,
     FitResult,
+    FittingConfig,
     NetworkResult,
     PostgresSource,
 )
-from ..clip import extract_clips_for_run
-from ..fitting import fit_centerlines
+from ..clip import extract_clips_for_detect
+from ..fitting import fit_centerline_variants
 from ..network import build_network
 from .. import get_database, detect_intersections, IntersectConfig
 from ..cleaner import clean_vehicle
@@ -66,34 +74,25 @@ def run_pipeline(
     *,
     csv_path: str | None = None,
     pg_source_table: str | None = None,
+    clean_id: str | None = None,
     table: str = "trajectory_points",
-    skip_clean: bool = False,
-    kept_run_id: str | None = None,
-) -> dict[str, int | str]:
+) -> dict[str, int | str | list[int]]:
     """Run the full pipeline, persisting replay inputs and reporting Clip.
 
     ZH: 运行完整流水线并将所有阶段产物写入数据库。返回各表写入行数统计。
-        ``csv_path`` 和 ``pg_source_table`` 必须且只能指定一个。
+        ``csv_path``、``pg_source_table`` 和 ``clean_id`` 必须且只能指定一个。
         ``table`` 指定 trajectory_points 的目标表名。
-        ``skip_clean`` 跳过 Parser0+Cleaner1，复用上次清洗的
-        kept_trajectory_points（默认最近一次 completed run，可用 ``kept_run_id`` 指定）。
     EN: Run the full pipeline, persist Parser/Cleaner/Intersect artifacts, and
-        compute the in-memory Clip result. Returns row/result counts. Exactly one of ``csv_path`` or
-        ``pg_source_table`` must be provided. ``table`` specifies the target
+        compute the in-memory Clip result. Exactly one of ``csv_path``,
+        ``pg_source_table``, or ``clean_id`` must be provided. ``table`` specifies the target
         table name for trajectory_points.
-        ``skip_clean`` skips Parser0+Cleaner1 and reuses the prior run's
-        kept_trajectory_points (most recent completed run by default, or
-        ``kept_run_id`` when specified).
     """
-    import psycopg
+    if sum(value is not None for value in (csv_path, pg_source_table, clean_id)) != 1:
+        raise ValueError("exactly one of csv_path, pg_source_table, or clean_id is required")
 
-    if csv_path is not None and pg_source_table is not None:
-        raise ValueError("只能指定 --csv 或 --pg-table 中的一个 / csv_path and pg_source_table are mutually exclusive")
-    if csv_path is None and pg_source_table is None:
-        raise ValueError("必须指定 --csv 或 --pg-table / either csv_path or pg_source_table must be provided")
-
-    stats: dict[str, int | str] = {}
+    stats: dict[str, int | str | list[int]] = {}
     t_start = time.perf_counter()
+    reuse_clean = clean_id is not None
     is_pg_source = pg_source_table is not None
 
     if csv_path is not None:
@@ -101,7 +100,7 @@ def run_pipeline(
         source_label = csv_path
         source_id = str(Path(csv_path).resolve())
         source_kind = "csv"
-    else:
+    elif pg_source_table is not None:
         source = PostgresSource(
             config=db_config,
             query=f"SELECT * FROM {pg_source_table} ORDER BY vehicle_id, timestamp",
@@ -113,52 +112,55 @@ def run_pipeline(
         source_kind = "postgres_table"
 
     with pg_connect(db_config) as conn:
-        run_id = create_pipeline_run(
-            conn,
-            source_id=source_id,
-            source_kind=source_kind,
-            parameters={
-                "target_table": table,
-                "skip_clean": skip_clean,
-                "cleaner_max_gap_s": CleanerConfig().max_gap_s,
-            },
-        )
-        stats["run_id"] = run_id
-        # Keep the run record even if a later pipeline statement rolls back.
-        # A non-completed row is an explicit interrupted/failed-run record.
-        conn.commit()
+        if reuse_clean:
+            clean_record = fetch_clean_run(conn, str(clean_id))
+            if clean_record.status != "completed":
+                raise ValueError(f"Clean Run {clean_id} is not completed")
+            table = str(clean_record.parameters["target_table"])
+            source_id = clean_record.source_id
+            source_kind = clean_record.source_kind
+            is_pg_source = source_kind == "postgres_table"
+        else:
+            clean_id = create_clean_run(
+                conn,
+                source_id=source_id,
+                source_kind=source_kind,
+                parameters={
+                    "target_table": table,
+                    "cleaner_max_gap_s": CleanerConfig().max_gap_s,
+                },
+            )
+            conn.commit()
+        stats["clean_id"] = str(clean_id)
+
+        if reuse_clean:
+            total_raw = 0
+            total_injected = 0
+            total_excluded = 0
+            tp_id_map: dict[tuple[str, str], int] = {}
+            all_cleaned_subtracks: list = []
+        else:
+            assert clean_id is not None
         # ── Stage 1+2: Streamed read → insert → clean (per vehicle) ──
-        print("── Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean ──")
-        print(f"  数据源 / Source: {source_label}")
-        handle = get_database(source)
+            print("── Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean ──")
+            print(f"  数据源 / Source: {source_label}")
+            handle = get_database(source)
 
         # ZH: 快速统计总行数，用于行计数进度条。CSV 扫全文件，PG 走 COUNT(*)。
         # EN: Quick row count for row-based progress bar. CSV full scan, PG COUNT(*).
-        t_count = time.perf_counter()
-        total_rows = handle.count_rows()
-        print(f"  总行数 / Total rows: {total_rows:,} ({time.perf_counter() - t_count:.1f}s)")
-        total_raw = 0
-        total_injected = 0
-        tp_id_map: dict[tuple[str, str], int] = {}
-        total_excluded = 0
-        all_kept_subtracks: list[list] = []
-        all_injected_points: list = []
+            t_count = time.perf_counter()
+            total_rows = handle.count_rows()
+            print(f"  总行数 / Total rows: {total_rows:,} ({time.perf_counter() - t_count:.1f}s)")
+            total_raw = 0
+            total_injected = 0
+            tp_id_map = {}
+            total_excluded = 0
+            all_cleaned_subtracks = []
         # ZH: 批量累积排除点，每 N 辆车 flush 一次 UPDATE，消除逐车往返开销。
         # EN: Batch excluded points; flush UPDATE every N vehicles to eliminate per-vehicle round-trips.
-        _pending_excluded: list = []
-        _MARK_FLUSH_EVERY_N = 200
+            _pending_excluded: list = []
+            _MARK_FLUSH_EVERY_N = 200
 
-        if skip_clean:
-            # ZH: 跳过 Parser0+Cleaner1——is_active 已在之前运行中持久化，
-            #     直接复用已有清洗结果，省去逐行 parse_row + clean_vehicle + mark_excluded。
-            # EN: Skip Parser0+Cleaner1 — is_active is already persisted from a
-            #     prior run; reuse existing clean results directly.
-            handle.close()
-            total_raw = total_rows
-            vehicle_count = 0
-            stats["trajectory_points"] = total_raw
-            print(f"  跳过清洗 / Skip clean: {total_raw:,} 点 (is_active 已持久化/persisted)")
-        else:
             stream = StreamVehicleSource(handle)
             live_clean = LiveStatus("Parser 0 + Cleaner 1: 流式清洗 / Streaming Clean")
             live_clean.start()
@@ -170,7 +172,7 @@ def run_pipeline(
                 total_raw += len(vehicle_points)
                 vehicle_count += 1
                 if not is_pg_source:
-                    batch_map = insert_trajectory_points(conn, vehicle_points, table="trajectory_points")
+                    batch_map = insert_trajectory_points(conn, vehicle_points, table=table)
                     tp_id_map.update(batch_map)
                 vresult = clean_vehicle(vehicle_points)
                 total_injected += vresult.injected_count
@@ -188,12 +190,7 @@ def run_pipeline(
                     _mark_map = tp_id_map if table == "trajectory_points" else {}
                     mark_excluded_points(conn, _pending_excluded, table=table, tp_id_map=_mark_map)
                     _pending_excluded.clear()
-                all_kept_subtracks.extend(vresult.kept_subtracks)
-
-                # Collect injected points for batch insert
-                for p in vresult.active:
-                    if p.point_ref.generated_reason == "orthogonal_heading":
-                        all_injected_points.append(p)
+                all_cleaned_subtracks.extend(vresult.subtracks)
 
                 now = time.perf_counter()
                 if vehicle_count == 1 or vehicle_count % 500 == 0 or (now - last_update_t) >= 2.0:
@@ -234,21 +231,31 @@ def run_pipeline(
         print(f"  排除 / Excluded: {total_excluded:,}")
         print(f"  注入 / Injected: {total_injected:,}")
 
-        if all_kept_subtracks:
+        if all_cleaned_subtracks:
             t0 = time.perf_counter()
-            insert_kept_trajectory_points(conn, all_kept_subtracks, tp_id_map, run_id=run_id)
-            kept_count = sum(len(st) for st in all_kept_subtracks)
+            insert_kept_trajectory_points(conn, all_cleaned_subtracks, tp_id_map, clean_id=clean_id)
+            kept_count = sum(len(st.kept) for st in all_cleaned_subtracks)
             stats["kept_trajectory_points"] = kept_count
             print(f"  kept_trajectory_points: {kept_count:,} rows ({time.perf_counter() - t0:.1f}s)")
 
-        if all_injected_points:
+        if total_injected:
             t0 = time.perf_counter()
-            insert_injected_points(conn, all_injected_points, run_id=run_id)
+            insert_injected_points(conn, all_cleaned_subtracks, clean_id=clean_id)
             stats["injected_points"] = total_injected
             print(f"  injected_points: {total_injected:,} rows ({time.perf_counter() - t0:.1f}s)")
 
         # ZH: 即使 Intersect2 失败清洗结果也不会丢失。
         # EN: they survive an Intersect2 failure.
+        if not reuse_clean:
+            finish_clean_run(conn, clean_id, status="completed")
+            conn.commit()
+
+        detect_id = create_detect_run(
+            conn,
+            clean_id=clean_id,
+            parameters={"target_table": table},
+        )
+        stats["detect_id"] = detect_id
         conn.commit()
 
         # ── Stage 3: Intersect2 (DB mode — spatial sliding windows) ──
@@ -257,30 +264,15 @@ def run_pipeline(
         #     PG 模式用表名，CSV 模式用文件路径。
         # EN: source_id used as the parameter for %s::text AS source_id in
         #     intersect2 queries — table name for PG, file path for CSV.
-        intersect_source_id = pg_source_table if is_pg_source else source_id
+        intersect_source_id = source_id
         live_intersect = LiveStatus("Intersect2: Cross-track Detection")
         live_intersect.start()
-        # ZH: skip_clean 时复用上次清洗的 kept_trajectory_points——默认取最近一次
-        #     completed run（可用 --run-id 指定）。非 skip_clean 读本次 run。
-        # EN: Under --skip-clean, reuse the prior run's kept_trajectory_points —
-        #     most recent completed run by default (overridable via --run-id).
-        if skip_clean:
-            input_run_id = kept_run_id or latest_completed_run_id(
-                conn, source_id=intersect_source_id
-            )
-            if input_run_id is None:
-                raise RuntimeError(
-                    "--skip-clean 需要一次已完成的清洗 run："
-                    "用 --run-id 指定，或先跑一次完整 pipeline 生成 kept_trajectory_points"
-                )
-        else:
-            input_run_id = run_id
         icfg = IntersectConfig(
             query_active_from_db=True,
             db_table=table,
             kept_table="kept_trajectory_points",
             source_id=intersect_source_id,
-            run_id=input_run_id,
+            clean_id=clean_id,
             live_status=live_intersect,
         )
         iresult = detect_intersections(conn=conn, config=icfg)
@@ -292,30 +284,30 @@ def run_pipeline(
         print(f"  完整交叉口 / Complete intersections: {iresult.report.complete_intersection_count:,}")
 
         t0 = time.perf_counter()
-        tracks_cross_count = insert_tracks_cross(conn, iresult.cross_track_candidates, run_id=run_id)
+        tracks_cross_count = insert_tracks_cross(conn, iresult.cross_track_candidates, detect_id=detect_id)
         stats["tracks_cross"] = tracks_cross_count
         print(f"  tracks_cross: {tracks_cross_count:,} rows ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
-        te_id_map = insert_turn_events(conn, iresult.turn_events, run_id=run_id)
+        te_id_map = insert_turn_events(conn, iresult.turn_events, detect_id=detect_id)
         stats["turn_events"] = len(iresult.turn_events)
         print(f"  turn_events: {len(iresult.turn_events):,} rows ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
-        ci_id_map = insert_candidate_intersections(conn, iresult.clusters, run_id=run_id)
+        ci_id_map = insert_candidate_intersections(conn, iresult.clusters, detect_id=detect_id)
         stats["candidate_intersections"] = len(iresult.clusters)
         print(f"  candidate_intersections: {len(iresult.clusters):,} rows ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
         insert_candidate_intersection_events(
-            conn, iresult.clusters, ci_id_map, te_id_map, run_id=run_id,
+            conn, iresult.clusters, ci_id_map, te_id_map, detect_id=detect_id,
         )
         stats["candidate_intersection_events"] = sum(len(c.events) for c in iresult.clusters)
         print(f"  candidate_intersection_events: {stats['candidate_intersection_events']:,} rows ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
         ceep_id_map = insert_candidate_entry_exit_points(
-            conn, iresult.clusters, ci_id_map, run_id=run_id,
+            conn, iresult.clusters, ci_id_map, detect_id=detect_id,
         )
         ceep_count = sum(len(c.crossing_points) for c in iresult.clusters)
         stats["candidate_entry_exit_points"] = ceep_count
@@ -324,14 +316,14 @@ def run_pipeline(
         clusters_by_id = {c.cluster_id: c for c in iresult.clusters}
         t0 = time.perf_counter()
         int_id_map = insert_intersections(
-            conn, iresult.topologies, ci_id_map, clusters_by_id, run_id=run_id,
+            conn, iresult.topologies, ci_id_map, clusters_by_id, detect_id=detect_id,
         )
         stats["intersections"] = len(int_id_map)
         print(f"  intersections: {len(int_id_map):,} rows ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
         insert_entry_exit_points(
-            conn, iresult.observations, int_id_map, ceep_id_map, run_id=run_id,
+            conn, iresult.observations, int_id_map, ceep_id_map, detect_id=detect_id,
         )
         entry_exit_count = sum(
             1 for observation in iresult.observations
@@ -340,26 +332,66 @@ def run_pipeline(
         stats["entry_exit_points"] = entry_exit_count
         print(f"  entry_exit_points: {entry_exit_count:,} rows ({time.perf_counter() - t0:.1f}s)")
 
-        # ── Stage 4: Clip (pure result, replayable from this run) ────────────
+        finish_detect_run(conn, detect_id, status="completed")
+        conn.commit()
+
+        # ── Stage 4: Clip (pure result, replayable from this Detect Run) ────────────
         print("\n── Clip: 路段切分 / Track clipping ──")
-        clip_result = extract_clips_for_run(conn, run_id, allow_running=True)
+        clip_config = ClipConfig()
+        clip_result = extract_clips_for_detect(
+            conn, detect_id, config=clip_config,
+        )
         _add_clip_stats(stats, clip_result)
         _print_clip_report(clip_result)
 
         # ── Stage 5: Fitting (one centerline per connected pair) ────────────
         print("\n── Fitting: 中心线拟合 / Centerline fitting ──")
-        fit_result = fit_centerlines(clip_result)
-        _add_fit_stats(stats, fit_result)
-        fit_result.report.format_print(title="  Fitting 报告 / Fitting report")
+        fitting_config = FittingConfig()
+        fit_id = create_fit_run(
+            conn,
+            detect_id=detect_id,
+            clip_config=clip_config,
+            fitting_config=fitting_config,
+        )
+        stats["fit_id"] = fit_id
+        conn.commit()
+        try:
+            fit_bundle = fit_centerline_variants(clip_result, config=fitting_config)
+            centerline_ids = insert_centerline_bundle(
+                conn, fit_bundle, clip_result, fit_id=fit_id, detect_id=detect_id,
+            )
+            report = {
+                "combined": {
+                    "report": fit_bundle.combined.report.as_dict(),
+                    "issues": [issue.as_dict() for issue in fit_bundle.combined.issues],
+                },
+                "a_to_b": {
+                    "report": fit_bundle.a_to_b.report.as_dict(),
+                    "issues": [issue.as_dict() for issue in fit_bundle.a_to_b.issues],
+                },
+                "b_to_a": {
+                    "report": fit_bundle.b_to_a.report.as_dict(),
+                    "issues": [issue.as_dict() for issue in fit_bundle.b_to_a.issues],
+                },
+            }
+            finish_fit_run(conn, fit_id, status="completed", report=report)
+            conn.commit()
+        except (psycopg.Error, RuntimeError, ValueError):
+            conn.rollback()
+            finish_fit_run(conn, fit_id, status="failed")
+            conn.commit()
+            raise
+        stats["centerlines"] = len(centerline_ids)
+        stats["centerline_ids"] = list(centerline_ids)
+        _add_fit_stats(stats, fit_bundle.combined)
+        fit_bundle.combined.report.format_print(title="  Fitting 报告 / Fitting report")
 
         # ── Stage 6: Network (intersections as nodes, centerlines as edges) ─
         print("\n── Network: 路网组装 / Network assembly ──")
-        network_result = build_network(fit_result, iresult)
+        network_result = build_network(fit_bundle.combined, iresult)
         _add_network_stats(stats, network_result)
         network_result.report.format_print(title="  Network 报告 / Network report")
 
-        finish_pipeline_run(conn, run_id, status="completed")
-        conn.commit()
         print(f"\n  提交 / Committed.")
 
     elapsed = time.perf_counter() - t_start
@@ -368,7 +400,7 @@ def run_pipeline(
     return stats
 
 
-def _add_clip_stats(stats: dict[str, int | str], result: ClipResult) -> None:
+def _add_clip_stats(stats: dict[str, int | str | list[int]], result: ClipResult) -> None:
     stats.update(
         {
             f"clip_{name}": value
@@ -382,7 +414,7 @@ def _print_clip_report(result: ClipResult) -> None:
     result.report.format_print(title="  Clip 报告 / Clip report")
 
 
-def _add_fit_stats(stats: dict[str, int | str], result: FitResult) -> None:
+def _add_fit_stats(stats: dict[str, int | str | list[int]], result: FitResult) -> None:
     stats.update(
         {
             f"fitting_{name}": value
@@ -392,7 +424,7 @@ def _add_fit_stats(stats: dict[str, int | str], result: FitResult) -> None:
     )
 
 
-def _add_network_stats(stats: dict[str, int | str], result: NetworkResult) -> None:
+def _add_network_stats(stats: dict[str, int | str | list[int]], result: NetworkResult) -> None:
     stats.update(
         {
             f"network_{name}": value
@@ -402,13 +434,14 @@ def _add_network_stats(stats: dict[str, int | str], result: NetworkResult) -> No
     )
 
 
-def replay_clips(db_config: PostgresConfig, run_id: str) -> ClipResult:
-    """Replay the pure Clip stage from one completed pipeline run."""
-    with pg_connect(db_config) as conn:
-        return extract_clips_for_run(conn, run_id)
-
-
 # ── CLI ───────────────────────────────────────────────────────────────
+
+
+def _uuid_arg(value: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a UUID") from exc
 
 
 def main() -> int:
@@ -422,9 +455,7 @@ def main() -> int:
     _env = default_postgres_config()
 
     parser = argparse.ArgumentParser(
-        description=(
-            "Run track.v2 through Network, or replay Clip from a completed run."
-        )
+        description="Run track.v2 through Network."
     )
     # ── 互斥数据源 / Mutually exclusive data sources ──
     source_group = parser.add_mutually_exclusive_group(required=True)
@@ -437,8 +468,8 @@ def main() -> int:
         help="从 PostgreSQL 表读取输入轨迹点 / Read input trajectory points from a PostgreSQL table."
     )
     source_group.add_argument(
-        "--replay-clips", metavar="RUN_ID",
-        help="从已完成的流水线运行重放 Clip / Replay Clip from a completed pipeline run."
+        "--clean-id", metavar="UUID", type=_uuid_arg,
+        help="复用一个已完成 Clean Run，只创建新的 Detect Run / Reuse one completed Clean Run."
     )
     parser.add_argument("--host", default=_env.host)
     parser.add_argument("--port", type=int, default=_env.port)
@@ -455,28 +486,10 @@ def main() -> int:
         help="目标表名 / Target table name for trajectory_points "
              "(default: same as --pg-table for PG mode, 'trajectory_points' for CSV mode)."
     )
-    parser.add_argument(
-        "--skip-clean", action="store_true",
-        help="跳过 Parser0+Cleaner1，复用上次清洗的 kept_trajectory_points 进入 Intersect2"
-             "（默认最近一次 completed run，可用 --run-id 指定）。"
-             "仅支持 --pg-table 模式 / Requires --pg-table mode."
-    )
-    parser.add_argument(
-        "--run-id", metavar="RUN_ID",
-        help="配合 --skip-clean：读取指定 run 的 kept_trajectory_points 清洗结果"
-             "（默认取最近一次 completed run）。"
-    )
     args = parser.parse_args()
 
-    # ZH: --skip-clean 仅对 PG 源有效
-    # EN: --skip-clean is only valid with --pg-table
-    if args.skip_clean and not args.pg_table:
-        parser.error("--skip-clean 仅支持 --pg-table 模式 / requires --pg-table")
-
-    # ZH: --run-id 仅在 --skip-clean 下有意义（用于复用指定 run 的清洗结果）
-    # EN: --run-id is only meaningful with --skip-clean
-    if args.run_id and not args.skip_clean:
-        parser.error("--run-id 仅在 --skip-clean 下使用 / requires --skip-clean")
+    if args.clean_id and args.table is not None:
+        parser.error("--clean-id 不可覆盖 --table / cannot override --table")
 
     # ZH: 若未显式指定 --table，PG 模式默认写到源表（原地工作），CSV 模式写到 trajectory_points。
     # EN: If --table is not set, default to the PG source table (work in-place)
@@ -501,8 +514,7 @@ def main() -> int:
     )
 
     source_label = (
-        f"pipeline-run:{args.replay_clips}"
-        if args.replay_clips
+        f"clean:{args.clean_id}" if args.clean_id
         else args.csv or f"postgresql://{db_config.database}/{args.pg_table}"
     )
     init_logger()
@@ -510,18 +522,12 @@ def main() -> int:
     print(f"连接目标 / Target: {db_config.safe_dsn()}")
 
     try:
-        if args.replay_clips:
-            clip_result = replay_clips(db_config, args.replay_clips)
-            print("\n── Clip 回放 / Clip Replay ──")
-            _print_clip_report(clip_result)
-            return 0
         stats = run_pipeline(
             db_config,
             csv_path=args.csv,
             pg_source_table=args.pg_table,
+            clean_id=str(args.clean_id) if args.clean_id else None,
             table=args.table,
-            skip_clean=args.skip_clean,
-            kept_run_id=args.run_id,
         )
         _print_write_summary(stats)
         return 0
@@ -537,7 +543,7 @@ def main() -> int:
         shutdown_logger()
 
 
-def _print_write_summary(stats: dict[str, int | str]) -> None:
+def _print_write_summary(stats: dict[str, int | str | list[int]]) -> None:
     """Print model-driven Clip fields plus persisted table row counts."""
     print("\n── 写入统计 / Write Summary ──")
     for table in [

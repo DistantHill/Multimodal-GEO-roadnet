@@ -36,10 +36,15 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from .models import (
+    CenterlineFitBundle,
+    ClipConfig,
+    ClipResult,
     CrossTrackCandidate,
+    CleanedSubtrack,
     EntryExitObservation,
     ExcludedIndex,
     ExcludedPoint,
@@ -48,75 +53,211 @@ from .models import (
     PointRef,
     TrajectoryPoint,
     TurnEvent,
+    FittingConfig,
 )
 
 # ── Batch size for multi-row INSERT ───────────────────────────────────
 _BATCH = 5000
 
 
-def create_pipeline_run(
+@dataclass(frozen=True, slots=True)
+class CleanRunRecord:
+    id: str
+    source_id: str
+    source_kind: str
+    parameters: dict[str, Any]
+    status: str
+
+
+def create_clean_run(
     conn: Any,
     *,
     source_id: str,
     source_kind: str,
     parameters: dict[str, Any],
 ) -> str:
-    """Create one append-only pipeline run and return its UUID."""
-    run_id = str(uuid.uuid4())
+    """Create one append-only Clean Run and return its UUID."""
+    clean_id = str(uuid.uuid4())
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO pipeline_runs (id, source_id, source_kind, parameters, status) "
+            "INSERT INTO clean_runs (id, source_id, source_kind, parameters, status) "
             "VALUES (%s, %s, %s, %s, 'running')",
-            (run_id, source_id, source_kind, json.dumps(parameters, ensure_ascii=False)),
+            (clean_id, source_id, source_kind, json.dumps(parameters, ensure_ascii=False)),
         )
-    return run_id
+    return clean_id
 
 
-def finish_pipeline_run(conn: Any, run_id: str, *, status: str) -> None:
-    """Finish a pipeline run in the caller's transaction."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE pipeline_runs SET status = %s, finished_at = NOW() WHERE id = %s",
-            (status, run_id),
-        )
-
-
-def latest_completed_run_id(
+def create_detect_run(
     conn: Any,
     *,
-    source_id: str | None = None,
-) -> str | None:
-    """Return the most recent completed clean pipeline run's id.
-
-    ZH: 返回最近一次真正执行过清洗（``skip_clean=false``）且 ``completed`` 的
-        pipeline run id——只跳过清洗的 run 不会写入 kept_trajectory_points，
-        必须被排除。传 ``source_id`` 时只在该数据源内查找。用于 ``--skip-clean``
-        复用上次清洗结果。
-    EN: Return the id of the most recently completed run that actually ran the
-        cleaner (``skip_clean=false``) — skip-clean runs never write
-        kept_trajectory_points and must be excluded. Optionally scoped to
-        ``source_id``. Used by ``--skip-clean`` to reuse the prior clean.
-    """
-    if source_id is not None:
-        sql = (
-            "SELECT id FROM pipeline_runs "
-            "WHERE status = 'completed' AND source_id = %s "
-            "AND parameters->>'skip_clean' = 'false' "
-            "ORDER BY started_at DESC LIMIT 1"
-        )
-        params: tuple[Any, ...] = (source_id,)
-    else:
-        sql = (
-            "SELECT id FROM pipeline_runs "
-            "WHERE status = 'completed' "
-            "AND parameters->>'skip_clean' = 'false' "
-            "ORDER BY started_at DESC LIMIT 1"
-        )
-        params = ()
+    clean_id: str,
+    parameters: dict[str, Any],
+) -> str:
+    """Create one Detect Run owned by a Clean Run."""
+    detect_id = str(uuid.uuid4())
     with conn.cursor() as cur:
-        cur.execute(sql, params)
+        cur.execute(
+            "INSERT INTO detect_runs (id, clean_id, parameters, status) "
+            "VALUES (%s, %s, %s, 'running')",
+            (detect_id, clean_id, json.dumps(parameters, ensure_ascii=False)),
+        )
+    return detect_id
+
+
+def create_fit_run(
+    conn: Any,
+    *,
+    detect_id: str,
+    clip_config: ClipConfig,
+    fitting_config: FittingConfig,
+) -> str:
+    """Create one append-only Fit Run and return its UUID."""
+    fit_id = str(uuid.uuid4())
+    parameters = {
+        "clip": clip_config.as_dict(),
+        "fitting": fitting_config.as_dict(),
+    }
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fit_runs "
+            "(id, detect_id, clip_algorithm, clip_version, fitting_algorithm, "
+            "fitting_version, parameters, status) "
+            "SELECT %s, d.id, 'circle_segment_clip', 'v1', "
+            "'normalized_arc_coordinate_median', 'v1', %s, 'running' "
+            "FROM detect_runs AS d WHERE d.id = %s AND d.status = 'completed' "
+            "RETURNING id",
+            (fit_id, json.dumps(parameters, ensure_ascii=False), detect_id),
+        )
+        if cur.fetchone() is None:
+            raise ValueError(f"Detect Run {detect_id} is not completed")
+    return fit_id
+
+
+def finish_clean_run(conn: Any, clean_id: str, *, status: str) -> None:
+    """Finish a Clean Run in the caller's transaction."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE clean_runs SET status = %s, finished_at = NOW() WHERE id = %s",
+            (status, clean_id),
+        )
+
+
+def finish_detect_run(conn: Any, detect_id: str, *, status: str) -> None:
+    """Finish a Detect Run in the caller's transaction."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE detect_runs SET status = %s, finished_at = NOW() WHERE id = %s",
+            (status, detect_id),
+        )
+
+
+def finish_fit_run(
+    conn: Any,
+    fit_id: str,
+    *,
+    status: str,
+    report: dict[str, Any] | None = None,
+) -> None:
+    """Finish a running Fit Run exactly once."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE fit_runs SET status = %s, report = %s, finished_at = NOW() "
+            "WHERE id = %s AND status = 'running'",
+            (
+                status,
+                json.dumps(report, ensure_ascii=False) if report is not None else None,
+                fit_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise ValueError(f"Fit Run {fit_id} is not running")
+
+
+def insert_centerline_bundle(
+    conn: Any,
+    bundle: CenterlineFitBundle,
+    clips: ClipResult,
+    *,
+    fit_id: str,
+    detect_id: str,
+) -> tuple[int, ...]:
+    """Persist successful centerlines and their ordered source-clip manifests."""
+    clips_by_id = {clip.clip_id: clip for clip in clips.clips}
+    centerline_ids: list[int] = []
+    for result in (bundle.combined, bundle.a_to_b, bundle.b_to_a):
+        for centerline in result.centerlines:
+            points_wkt = ", ".join(f"{lon} {lat}" for lon, lat in centerline.points)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO centerlines "
+                    "(fit_id, detect_id, variant, from_cluster_id, to_cluster_id, geom, "
+                    "length_m, forward_clip_count, reverse_clip_count) "
+                    "VALUES (%s, %s, %s, %s, %s, ST_GeomFromText(%s, 4326), %s, %s, %s) "
+                    "RETURNING id",
+                    (
+                        fit_id, detect_id, centerline.variant,
+                        centerline.from_cluster_id, centerline.to_cluster_id,
+                        f"LINESTRING({points_wkt})", centerline.length_m,
+                        centerline.forward_clip_count, centerline.reverse_clip_count,
+                    ),
+                )
+                row = cur.fetchone()
+            centerline_id = int(row[0])
+            centerline_ids.append(centerline_id)
+            manifest_rows: list[tuple[Any, ...]] = []
+            for input_ordinal, clip_id in enumerate(centerline.source_clip_ids):
+                clip = clips_by_id[clip_id]
+                start_cluster_id = clip.start.cluster_id
+                end_cluster_id = clip.end.cluster_id
+                assert start_cluster_id is not None and end_cluster_id is not None
+                manifest_rows.append((
+                    centerline_id, input_ordinal, clip.clip_id, clip.vehicle_id,
+                    clip.subtrack_index, clip.clip_ordinal_in_track,
+                    start_cluster_id, clip.start.segment_index,
+                    clip.start.segment_fraction, clip.interior_start_index,
+                    clip.interior_end_index_exclusive, end_cluster_id,
+                    clip.end.segment_index, clip.end.segment_fraction,
+                    start_cluster_id != centerline.from_cluster_id,
+                    clip.point_count,
+                ))
+            with conn.cursor() as cur:
+                _chunked_insert(
+                    cur,
+                    "centerline_source_clips",
+                    [
+                        "centerline_id", "input_ordinal", "clip_id", "vehicle_id",
+                        "subtrack_index", "clip_ordinal_in_track", "start_cluster_id",
+                        "start_segment_index", "start_segment_fraction",
+                        "interior_start_index", "interior_end_index_exclusive",
+                        "end_cluster_id", "end_segment_index", "end_segment_fraction",
+                        "reverse_to_centerline_direction", "input_point_count",
+                    ],
+                    manifest_rows,
+                )
+    return tuple(centerline_ids)
+
+
+def fetch_clean_run(conn: Any, clean_id: str) -> CleanRunRecord:
+    """Load one Clean Run for explicit Detect reuse."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, source_id, source_kind, parameters, status "
+            "FROM clean_runs WHERE id = %s",
+            (clean_id,),
+        )
         row = cur.fetchone()
-    return str(row[0]) if row is not None else None
+    if row is None:
+        raise ValueError(f"unknown Clean Run: {clean_id}")
+    parameters = row[3] if isinstance(row[3], dict) else json.loads(row[3])
+    if not isinstance(parameters, dict):
+        raise ValueError("Clean Run parameters must be a JSON object")
+    return CleanRunRecord(
+        id=str(row[0]),
+        source_id=str(row[1]),
+        source_kind=str(row[2]),
+        parameters=parameters,
+        status=str(row[4]),
+    )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -195,15 +336,16 @@ def _chunked_insert(cur: Any, table: str, columns: list[str], rows: list[tuple[A
         cur.execute(sql, params)
 
 
-def _with_run(
+def _with_stage_id(
     columns: list[str],
     rows: list[tuple[Any, ...]],
-    run_id: str | None,
+    column_name: str,
+    stage_id: str | None,
 ) -> tuple[list[str], list[tuple[Any, ...]]]:
-    """Attach the mandatory run id to a newly persisted derived record."""
-    if run_id is None:
-        raise ValueError("run_id is required for derived v2 persistence")
-    return ["run_id", *columns], [(run_id, *row) for row in rows]
+    """Attach the mandatory stage id to newly persisted derived records."""
+    if stage_id is None:
+        raise ValueError(f"{column_name} is required for derived v2 persistence")
+    return [column_name, *columns], [(stage_id, *row) for row in rows]
 
 
 # ── Parser 0 ───────────────────────────────────────────────────────────
@@ -290,7 +432,7 @@ def reset_active_points(
     ZH: 将全表的 is_active 重置为 TRUE。
     EN: Reset is_active to TRUE for all rows in the table.
 
-    Derived cleaner decisions are stored per ``run_id``.  The raw table keeps
+    Derived cleaner decisions are stored per ``clean_id``.  The raw table keeps
     a convenience active flag for DB-mode processing, so it must be restored
     to the complete source before the next run is calculated.
     """
@@ -332,7 +474,7 @@ def insert_excluded_points(
     excluded: ExcludedIndex,
     tp_ref_to_id: dict[tuple[str, str], int] | None = None,
     *,
-    run_id: str | None = None,
+    clean_id: str | None = None,
 ) -> None:
     """Insert points removed by Cleaner 1.
 
@@ -352,17 +494,17 @@ def insert_excluded_points(
             item.lat,
         ))
 
-    columns, rows = _with_run(columns, rows, run_id)
+    columns, rows = _with_stage_id(columns, rows, "clean_id", clean_id)
     with conn.cursor() as cur:
         _chunked_insert(cur, "excluded_points", columns, rows)
 
 
 def insert_kept_trajectory_points(
     conn: Any,
-    kept_subtracks: list[list[TrajectoryPoint]],
+    kept_subtracks: list[CleanedSubtrack],
     tp_ref_to_id: dict[tuple[str, str], int],
     *,
-    run_id: str | None = None,
+    clean_id: str | None = None,
 ) -> None:
     """Persist references for points that survived ``_exclude_stationary``.
 
@@ -375,63 +517,70 @@ def insert_kept_trajectory_points(
         PG mode (empty map) stores the source PK (``source_row_key``) directly
         as ``trajectory_point_id``.  Uses COPY FROM STDIN for streaming write.
     """
-    if run_id is None:
-        raise ValueError("run_id is required for derived v2 persistence")
+    if clean_id is None:
+        raise ValueError("clean_id is required for derived v2 persistence")
     if not kept_subtracks:
         return
 
     with conn.cursor() as cur:
         with cur.copy(
             "COPY kept_trajectory_points "
-            "(run_id, trajectory_point_id, source_id, source_row_key, "
+            "(clean_id, trajectory_point_id, source_id, source_row_key, "
             "vehicle_id, subtrack_index, sequence_in_subtrack) "
             "FROM STDIN"
         ) as copy:
-            for st_idx, subtrack in enumerate(kept_subtracks, start=1):
-                for seq_idx, point in enumerate(subtrack):
+            for subtrack in kept_subtracks:
+                for seq_idx, point in enumerate(subtrack.kept):
                     key = _point_ref_key(point.point_ref)
                     tp_id = tp_ref_to_id.get(key) if tp_ref_to_id else None
                     if tp_id is None:
                         # Fallback: source_row_key is the DB primary key in PG mode
                         tp_id = int(point.point_ref.source_row_key)
                     copy.write_row((
-                        run_id,
+                        clean_id,
                         tp_id,
                         point.point_ref.source_id,
                         point.point_ref.source_row_key,
                         point.vehicle_id,
-                        st_idx,
+                        subtrack.subtrack_index,
                         seq_idx,
                     ))
 
 
 def insert_injected_points(
     conn: Any,
-    active_points: list[TrajectoryPoint],
+    subtracks: list[CleanedSubtrack],
     *,
-    run_id: str | None = None,
+    clean_id: str | None = None,
 ) -> None:
     """Insert synthetic points injected by ``_inject_orthogonal``.
 
     ZH: 写入注入的合成点。调用方已按 generated_reason="orthogonal_heading" 预过滤。
     """
-    if not active_points:
+    if not subtracks:
         return
 
     columns = [
-        "vehicle_id", "timestamp", "lon", "lat", "x", "y",
+        "vehicle_id", "subtrack_index", "after_sequence_in_subtrack",
+        "source_id", "source_row_key", "timestamp", "lon", "lat", "x", "y",
         "heading", "speed",
         "from_source_id", "from_source_row_key",
         "to_source_id", "to_source_row_key",
         "generated_reason", "origin_lon", "origin_lat",
     ]
     rows: list[tuple[Any, ...]] = []
-    for p in active_points:
-        ref = p.point_ref
+    for subtrack in subtracks:
+        kept_sequence = -1
+        for p in subtrack.active:
+            if not p.point_ref.generated_reason:
+                kept_sequence += 1
+                continue
+            ref = p.point_ref
         # x/y are not stored directly on TrajectoryPoint — compute from first point as origin
         # The cleaner doesn't store x/y either, so we leave them as 0.0
-        rows.append((
-            p.vehicle_id,
+            rows.append((
+            p.vehicle_id, subtrack.subtrack_index, kept_sequence,
+            ref.source_id, ref.source_row_key,
             p.timestamp,
             p.lon,
             p.lat,
@@ -446,9 +595,9 @@ def insert_injected_points(
             ref.generated_reason,
             0.0,  # origin_lon — set on read
             0.0,  # origin_lat — set on read
-        ))
+            ))
 
-    columns, rows = _with_run(columns, rows, run_id)
+    columns, rows = _with_stage_id(columns, rows, "clean_id", clean_id)
     if rows:
         with conn.cursor() as cur:
             _chunked_insert(cur, "injected_points", columns, rows)
@@ -460,7 +609,7 @@ def insert_tracks_cross(
     conn: Any,
     candidates: list[CrossTrackCandidate],
     *,
-    run_id: str | None = None,
+    detect_id: str | None = None,
 ) -> int:
     """Persist deduplicated cross-track candidates and return inserted rows."""
     if not candidates:
@@ -493,7 +642,7 @@ def insert_tracks_cross(
         )
         for candidate in candidates
     ]
-    columns, rows = _with_run(columns, rows, run_id)
+    columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
     with conn.cursor() as cur:
         inserted = _chunked_insert_returning(
             cur,
@@ -502,10 +651,7 @@ def insert_tracks_cross(
             rows,
             ["id"],
             on_conflict=(
-                "ON CONFLICT (run_id, vehicle_id, from_source_id, from_source_row_key, "
-                "to_source_id, to_source_row_key) DO NOTHING"
-                if run_id is not None else
-                "ON CONFLICT (vehicle_id, from_source_id, from_source_row_key, "
+                "ON CONFLICT (detect_id, vehicle_id, from_source_id, from_source_row_key, "
                 "to_source_id, to_source_row_key) DO NOTHING"
             ),
         )
@@ -518,7 +664,7 @@ def insert_turn_events(
     origin_lon: float = 0.0,
     origin_lat: float = 0.0,
     *,
-    run_id: str | None = None,
+    detect_id: str | None = None,
 ) -> dict[int, int]:
     """Insert turn events, return ``{event_id: db_id}`` mapping."""
     if not turn_events:
@@ -556,14 +702,13 @@ def insert_turn_events(
             origin_lat,
         ))
 
-    columns, rows = _with_run(columns, rows, run_id)
+    columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
     mapping: dict[int, int] = {}
     with conn.cursor() as cur:
         returned = _chunked_insert_returning(
             cur, "turn_events", columns, rows, ["id", "event_id"],
             on_conflict=(
-                "ON CONFLICT (run_id, vehicle_id, timestamp) DO NOTHING"
-                if run_id is not None else "ON CONFLICT (vehicle_id, timestamp) DO NOTHING"
+                "ON CONFLICT (detect_id, vehicle_id, timestamp) DO NOTHING"
             ),
         )
     for db_id, event_id in returned:
@@ -577,7 +722,7 @@ def insert_candidate_intersections(
     origin_lon: float = 0.0,
     origin_lat: float = 0.0,
     *,
-    run_id: str | None = None,
+    detect_id: str | None = None,
 ) -> dict[int, int]:
     """Insert candidate intersections with POLYGON geometry.
 
@@ -586,8 +731,8 @@ def insert_candidate_intersections(
     """
     if not clusters:
         return {}
-    if run_id is None:
-        raise ValueError("run_id is required for derived v2 persistence")
+    if detect_id is None:
+        raise ValueError("detect_id is required for derived v2 persistence")
 
     columns = [
         "cluster_id", "centroid_x", "centroid_y",
@@ -598,7 +743,7 @@ def insert_candidate_intersections(
         "origin_lon", "origin_lat",
         "geom",  # ← must be last: _POLYGON_EXPR is appended to end of placeholders
     ]
-    columns = ["run_id", *columns]
+    columns = ["detect_id", *columns]
     mapping: dict[int, int] = {}
     with conn.cursor() as cur:
         for c in clusters:
@@ -621,7 +766,7 @@ def insert_candidate_intersections(
                 origin_lon,
                 origin_lat,
             )
-            row = (run_id, *row)
+            row = (detect_id, *row)
             placeholders = ", ".join(["%s"] * len(columns))
             # Replace the last placeholder (geom) with ST_Buffer expression
             placeholders_parts = ["%s"] * len(columns)
@@ -645,7 +790,7 @@ def insert_candidate_intersection_events(
     ci_id_map: dict[int, int],
     te_id_map: dict[int, int],
     *,
-    run_id: str | None = None,
+    detect_id: str | None = None,
 ) -> None:
     """Persist every cluster member with its typed input source pair.
 
@@ -683,7 +828,7 @@ def insert_candidate_intersection_events(
             "from_source_id", "from_source_row_key",
             "to_source_id", "to_source_row_key",
         ]
-        columns, rows = _with_run(columns, rows, run_id)
+        columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
         with conn.cursor() as cur:
             _chunked_insert(cur, "candidate_intersection_events", columns, rows)
 
@@ -693,7 +838,7 @@ def insert_candidate_entry_exit_points(
     clusters: list[HotspotCluster],
     ci_id_map: dict[int, int],
     *,
-    run_id: str | None = None,
+    detect_id: str | None = None,
 ) -> dict[tuple[int, int], int]:
     """Insert crossing points, return ``{crossing_id: db_id}`` mapping."""
     columns = [
@@ -732,7 +877,7 @@ def insert_candidate_entry_exit_points(
             ))
             crossing_ids.append((c.cluster_id, cp_any.crossing_id))
 
-    columns, rows = _with_run(columns, rows, run_id)
+    columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
     mapping: dict[tuple[int, int], int] = {}
     if rows:
         with conn.cursor() as cur:
@@ -750,7 +895,7 @@ def insert_intersections(
     ci_id_map: dict[int, int],
     clusters_by_id: dict[int, HotspotCluster],
     *,
-    run_id: str | None = None,
+    detect_id: str | None = None,
 ) -> dict[int, int]:
     """Insert only topology-verified intersections with POLYGON geometry.
 
@@ -760,8 +905,8 @@ def insert_intersections(
     """
     if not topologies:
         return {}
-    if run_id is None:
-        raise ValueError("run_id is required for derived v2 persistence")
+    if detect_id is None:
+        raise ValueError("detect_id is required for derived v2 persistence")
 
     columns = [
         "candidate_intersection_id", "cluster_id",
@@ -770,7 +915,7 @@ def insert_intersections(
         "clip_radius_m",
         "geom",
     ]
-    columns = ["run_id", *columns]
+    columns = ["detect_id", *columns]
     mapping: dict[int, int] = {}
     with conn.cursor() as cur:
         for topo in topologies:
@@ -798,7 +943,7 @@ def insert_intersections(
                 topo.reason,
                 clip_radius_m,
             )
-            row = (run_id, *row)
+            row = (detect_id, *row)
             # Build geom via ST_Buffer from candidate cluster's centroid + radius
             if cluster is not None:
                 placeholders = ", ".join("%s" for _ in row)
@@ -829,7 +974,7 @@ def insert_entry_exit_points(
     int_id_map: dict[int, int],
     crossing_id_map: dict[tuple[int, int], int] | None = None,
     *,
-    run_id: str | None = None,
+    detect_id: str | None = None,
 ) -> None:
     """Insert entry/exit observations.
 
@@ -863,7 +1008,7 @@ def insert_entry_exit_points(
             (crossing_id_map or {}).get((obs.cluster_id, obs.exit_crossing_id or -1)),
         ))
 
-    columns, rows = _with_run(columns, rows, run_id)
+    columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
     if rows:
         with conn.cursor() as cur:
             _chunked_insert(cur, "entry_exit_points", columns, rows)

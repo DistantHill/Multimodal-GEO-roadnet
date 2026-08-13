@@ -81,20 +81,20 @@ def build_spatial_extent_sql(
     ZH: 查询 active points 的空间范围 (lon_min, lat_min, lon_max, lat_max)。
         使用 ``is_active = TRUE`` 以匹配 partial index ``idx_tp_active``。
         ``kept_table`` 非空时 JOIN 清洗结果表（几何列取自 ``table``），
-        按 ``ktp.run_id`` 只读本次 run 的 kept 结果。
+        按 ``ktp.clean_id`` 只读本次 Clean Run 的 kept 结果。
 
     EN: When ``kept_table`` is set, JOIN the clean-result table against
-        ``table`` for the geometry columns, filtered by ``ktp.run_id``.
+        ``table`` for the geometry columns, filtered by ``ktp.clean_id``.
 
     Parameter placeholders (in order, caller must bind):
-        Kept mode only: 1. %s — ktp.run_id
+        Kept mode only: 1. %s — ktp.clean_id
     """
     if kept_table is not None:
         return (
             f"SELECT MIN(tp.lon), MAX(tp.lon), MIN(tp.lat), MAX(tp.lat) "
             f"FROM {kept_table} AS ktp "
             f"JOIN {table} AS tp ON tp.id = ktp.trajectory_point_id "
-            f"WHERE ktp.run_id = %s AND tp.is_active IS NOT FALSE"
+            f"WHERE ktp.clean_id = %s"
         )
     return (
         f"SELECT MIN(lon), MAX(lon), MIN(lat), MAX(lat) "
@@ -105,7 +105,7 @@ def build_spatial_extent_sql(
 def build_active_in_window_sql(
     table: str = "trajectory_points",
     *,
-    has_run_id: bool = False,
+    has_clean_id: bool = False,
     kept_table: str | None = None,
 ) -> str:
     """UNION ALL query for active + injected points inside a spatial bbox.
@@ -114,25 +114,25 @@ def build_active_in_window_sql(
         使用 ``geom && ST_MakeEnvelope()`` 走 GiST R-tree 2D 空间索引。
         ``kept_table`` 非空时，trajectory 分支改为 JOIN 清洗结果表
         (``kept_table`` 存 vehicle_id/subtrack 切分，几何列取自 ``table``)，
-        且 ``ktp.run_id`` 必填，只读本次 run 的 kept 结果。
+        且 ``ktp.clean_id`` 必填，只读本次 Clean Run 的 kept 结果。
 
     EN: When ``kept_table`` is set, the trajectory branch JOINs the clean-result
         table (which carries the _seg-suffixed vehicle_id / subtrack splits)
-        against ``table`` for geometry columns, filtered by ``ktp.run_id``.
+        against ``table`` for geometry columns, filtered by ``ktp.clean_id``.
 
     Parameter placeholders (in order, caller must bind):
         Raw mode (``kept_table`` is None):
             1.  %s::text                         — source_id literal
             2-5. ST_MakeEnvelope (traj. bbox)    — x_min, y_min, x_max, y_max
             6-9. ST_MakeEnvelope (inj. bbox)     — x_min, y_min, x_max, y_max
-            10.  run_id (optional, only when ``has_run_id=True``)
+            10.  clean_id (optional, only when ``has_clean_id=True``)
         Kept mode (``kept_table`` set):
-            1.  %s                              — ktp.run_id
+            1.  %s                              — ktp.clean_id
             2-5. ST_MakeEnvelope (kept traj.)   — x_min, y_min, x_max, y_max
             6-9. ST_MakeEnvelope (inj. bbox)    — x_min, y_min, x_max, y_max
-            10.  %s                              — injected_points.run_id
+            10.  %s                              — injected_points.clean_id
     """
-    injected_run_clause = " AND run_id = %s" if (has_run_id or kept_table is not None) else ""
+    injected_clean_clause = " AND clean_id = %s" if (has_clean_id or kept_table is not None) else ""
     if kept_table is not None:
         return (
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
@@ -146,13 +146,12 @@ def build_active_in_window_sql(
             f"         ''::text AS generated_reason "
             f"  FROM {kept_table} AS ktp "
             f"  JOIN {table} AS tp ON tp.id = ktp.trajectory_point_id "
-            f"  WHERE ktp.run_id = %s "
-            f"    AND tp.is_active IS NOT FALSE "
+            f"  WHERE ktp.clean_id = %s "
             f"    AND tp.geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326) "
             f"  UNION ALL "
             f"  SELECT {_IP_UNIFIED_COLS} "
             f"  FROM injected_points "
-            f"  WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326){injected_run_clause} "
+            f"  WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326){injected_clean_clause} "
             f") AS combined "
             f"ORDER BY vehicle_id, timestamp"
         )
@@ -169,7 +168,7 @@ def build_active_in_window_sql(
         f"  UNION ALL "
         f"  SELECT {_IP_UNIFIED_COLS} "
         f"  FROM injected_points "
-        f"  WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326){injected_run_clause} "
+        f"  WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326){injected_clean_clause} "
         f") AS combined "
         f"ORDER BY vehicle_id, timestamp"
     )
@@ -178,7 +177,7 @@ def build_active_in_window_sql(
 def build_stream_all_sql(
     table: str = "trajectory_points",
     *,
-    has_run_id: bool = False,
+    has_clean_id: bool = False,
     kept_table: str | None = None,
 ) -> str:
     """UNION ALL query to stream all active + injected points (no spatial filter).
@@ -188,21 +187,21 @@ def build_stream_all_sql(
         使用 ``is_active = TRUE`` 以匹配 partial index ``idx_tp_active``。
         ``kept_table`` 非空时，trajectory 分支改为 JOIN 清洗结果表
         (``kept_table`` 的 vehicle_id 带 _seg 后缀，几何列取自 ``table``)，
-        并按 ``ktp.run_id`` 只读本次 run。
+        并按 ``ktp.clean_id`` 只读本次 Clean Run。
 
     EN: When ``kept_table`` is set, the trajectory branch JOINs the clean-result
         table (suffixed vehicle_id) against ``table`` for geometry columns,
-        filtered by ``ktp.run_id``.
+        filtered by ``ktp.clean_id``.
 
     Parameter placeholders (in order, caller must bind):
         Raw mode (``kept_table`` is None):
             1.  %s::text          — source_id literal
-            2.  run_id (optional) — only when ``has_run_id=True``
+            2.  clean_id (optional) — only when ``has_clean_id=True``
         Kept mode (``kept_table`` set):
-            1.  %s               — ktp.run_id
-            2.  %s               — injected_points.run_id
+            1.  %s               — ktp.clean_id
+            2.  %s               — injected_points.clean_id
     """
-    injected_run_clause = " WHERE run_id = %s" if (has_run_id or kept_table is not None) else ""
+    injected_clean_clause = " WHERE clean_id = %s" if (has_clean_id or kept_table is not None) else ""
     if kept_table is not None:
         return (
             f"SELECT ktp.vehicle_id, tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, "
@@ -211,10 +210,10 @@ def build_stream_all_sql(
             f"       ''::text AS generated_reason "
             f"FROM {kept_table} AS ktp "
             f"JOIN {table} AS tp ON tp.id = ktp.trajectory_point_id "
-            f"WHERE ktp.run_id = %s AND tp.is_active IS NOT FALSE "
+            f"WHERE ktp.clean_id = %s "
             f"UNION ALL "
             f"SELECT {_IP_UNIFIED_COLS} "
-            f"FROM injected_points{injected_run_clause} "
+            f"FROM injected_points{injected_clean_clause} "
             f"ORDER BY vehicle_id, timestamp"
         )
     return (
@@ -223,6 +222,6 @@ def build_stream_all_sql(
         f"WHERE is_active = TRUE "
         f"UNION ALL "
         f"SELECT {_IP_UNIFIED_COLS} "
-        f"FROM injected_points{injected_run_clause} "
+        f"FROM injected_points{injected_clean_clause} "
         f"ORDER BY vehicle_id, timestamp"
     )

@@ -139,7 +139,7 @@ class _FakeConnection:
         self.cursors: list[_FakeCursor] = []
         self.closed = False
 
-    def cursor(self):
+    def cursor(self, **_kwargs):
         cursor = _FakeCursor(self.columns, self.rows)
         self.cursors.append(cursor)
         return cursor

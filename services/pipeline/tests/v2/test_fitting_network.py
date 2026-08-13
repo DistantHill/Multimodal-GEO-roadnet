@@ -13,9 +13,10 @@ from track.v2 import (
     TrajectoryPoint,
     PointRef,
     fit_centerlines,
+    fit_centerline_variants,
     build_network,
 )
-from track.v2.models import HotspotCluster, IntersectionTopology, IntersectReport
+from track.v2.models import FittingConfig, HotspotCluster, IntersectionTopology, IntersectReport
 
 
 _METERS_PER_DEGREE = 111_194.92664455874
@@ -84,11 +85,49 @@ def _clip_result(*clips: TrackClip) -> ClipResult:
             boundary_clips=0,
             total_points_in_clips=sum(clip.point_count for clip in clips),
         ),
-        run_id="run-fit-test",
+        detect_id="detect-fit-test",
     )
 
 
 class FittingStageTest(unittest.TestCase):
+    def test_fixed_variants_preserve_combined_and_fit_both_directions(self) -> None:
+        forward = _clip("forward", 10, 20, [(0, 10), (100, 10), (200, 10)])
+        reverse = _clip("reverse", 20, 10, [(200, -10), (100, -10), (0, -10)])
+        clips = _clip_result(forward, reverse)
+
+        bundle = fit_centerline_variants(clips)
+
+        self.assertEqual(bundle.combined, fit_centerlines(clips))
+        self.assertEqual(bundle.combined.centerlines[0].variant, "combined")
+        self.assertEqual(bundle.a_to_b.centerlines[0].variant, "directed")
+        self.assertEqual(bundle.b_to_a.centerlines[0].variant, "directed")
+        self.assertEqual(bundle.a_to_b.centerlines[0].source_clip_ids, ("forward",))
+        self.assertEqual(bundle.b_to_a.centerlines[0].source_clip_ids, ("reverse",))
+        self.assertEqual(
+            (
+                bundle.b_to_a.centerlines[0].from_cluster_id,
+                bundle.b_to_a.centerlines[0].to_cluster_id,
+            ),
+            (20, 10),
+        )
+        self.assertGreater(
+            bundle.b_to_a.centerlines[0].points[0][0],
+            bundle.b_to_a.centerlines[0].points[-1][0],
+        )
+
+    def test_minimum_clip_count_is_applied_independently_to_three_paths(self) -> None:
+        forward = _clip("forward", 10, 20, [(0, 10), (100, 10), (200, 10)])
+        reverse = _clip("reverse", 20, 10, [(200, -10), (100, -10), (0, -10)])
+
+        bundle = fit_centerline_variants(
+            _clip_result(forward, reverse),
+            config=FittingConfig(min_clips_per_pair=2),
+        )
+
+        self.assertEqual(len(bundle.combined.centerlines), 1)
+        self.assertEqual(bundle.a_to_b.centerlines, ())
+        self.assertEqual(bundle.b_to_a.centerlines, ())
+
     def test_bidirectional_tracks_fit_one_canonical_centerline_at_50m_spacing(self) -> None:
         forward = _clip("forward", 10, 20, [(0, 10), (100, 10), (200, 10)])
         reverse = _clip("reverse", 20, 10, [(200, -10), (100, -10), (0, -10)])
@@ -263,6 +302,14 @@ class NetworkStageTest(unittest.TestCase):
                             to_cluster_id=10,
                         ),
                     ),
+                ),
+                intersections,
+            )
+        with self.assertRaisesRegex(ValueError, "requires combined"):
+            build_network(
+                replace(
+                    fits,
+                    centerlines=(replace(fits.centerlines[0], variant="directed"),),
                 ),
                 intersections,
             )

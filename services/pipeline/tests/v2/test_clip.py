@@ -12,7 +12,7 @@ from track.v2 import (
     PointRef,
     TrajectoryPoint,
     extract_clips,
-    extract_clips_for_run,
+    extract_clips_for_detect,
 )
 
 
@@ -38,7 +38,7 @@ class ClipExtractionTest(unittest.TestCase):
             for index, x_m in enumerate(range(-300, 301, 50))
         )
         source = ClipInput(
-            run_id="run-1",
+            detect_id="detect-1",
             intersections=(
                 ClipIntersection(cluster_id=10, lon=-100 / _METERS_PER_DEGREE, lat=0.0, radius_m=20.0),
                 ClipIntersection(cluster_id=20, lon=100 / _METERS_PER_DEGREE, lat=0.0, radius_m=20.0),
@@ -63,7 +63,7 @@ class ClipExtractionTest(unittest.TestCase):
     def test_track_without_intersections_is_one_full_boundary_clip(self) -> None:
         points = tuple(_point("vehicle-1", index, x_m) for index, x_m in enumerate((-50, 0, 50)))
         source = ClipInput(
-            run_id="run-1",
+            detect_id="detect-1",
             intersections=(),
             tracks=(ClipTrack(vehicle_id="vehicle-1", trip_id="trip-1", points=points),),
         )
@@ -241,16 +241,24 @@ class _ReplayConnection:
 
 
 class ClipDatabaseReplayTest(unittest.TestCase):
-    def test_completed_run_replays_its_intersections_and_kept_active_points(self) -> None:
+    def test_completed_detect_loads_intersections_then_parent_clean_members(self) -> None:
         point_rows = [
             (
                 "vehicle-1", 1, index, "synthetic", str(index + 1),
                 float(index * 10), x / _METERS_PER_DEGREE, 0.0, 90.0, 5.0, {},
+                None, None, "",
             )
             for index, x in enumerate(range(-300, 301, 50))
         ]
+        point_rows.append(
+            (
+                "vehicle-1", 1, 99, "synthetic", "6->7:orthogonal_heading",
+                55.0, 0.0, 0.0, 45.0, 0.0, {}, "6", "7", "orthogonal_heading",
+            )
+        )
+        point_rows.sort(key=lambda row: float(row[5]))
         conn = _ReplayConnection([
-            [("synthetic", "csv", {"target_table": "trajectory_points", "skip_clean": False}, "completed")],
+            [("clean-1", "synthetic", {"target_table": "trajectory_points"}, "completed")],
             [
                 (10, -100 / _METERS_PER_DEGREE, 0.0, 20.0),
                 (20, 100 / _METERS_PER_DEGREE, 0.0, 20.0),
@@ -258,72 +266,41 @@ class ClipDatabaseReplayTest(unittest.TestCase):
             point_rows,
         ])
 
-        result = extract_clips_for_run(conn, "run-1")
+        result = extract_clips_for_detect(conn, "detect-1")
 
-        self.assertEqual(result.run_id, "run-1")
+        self.assertEqual(result.detect_id, "detect-1")
         self.assertEqual(result.report.inter_intersection_clips, 1)
         point_query, point_params = conn.executions[2]
         self.assertIn("kept_trajectory_points", point_query)
+        self.assertIn("injected_points", point_query)
         self.assertIn("ktp.source_id", point_query)
-        self.assertIn("is_active IS NOT FALSE", point_query)
-        self.assertEqual(point_params, ("run-1",))
+        self.assertNotIn("is_active", point_query)
+        self.assertIn(
+            "ORDER BY vehicle_id, subtrack_index, anchor_sequence, point_kind",
+            point_query,
+        )
+        self.assertNotIn("ORDER BY vehicle_id, subtrack_index, timestamp", point_query)
+        self.assertEqual(point_params, ("clean-1", "clean-1"))
         self.assertEqual(result.clips[0].points[0].point_ref.source_id, "synthetic")
 
     def test_incomplete_run_is_rejected_before_loading_artifacts(self) -> None:
         conn = _ReplayConnection([
-            [("synthetic", "csv", {"target_table": "trajectory_points"}, "running")],
+            [("clean-1", "synthetic", {"target_table": "trajectory_points"}, "running")],
         ])
 
         with self.assertRaisesRegex(ValueError, "is not completed"):
-            extract_clips_for_run(conn, "run-1")
+            extract_clips_for_detect(conn, "detect-1")
 
         self.assertEqual(len(conn.executions), 1)
 
-    def test_pipeline_can_validate_running_run_before_marking_it_complete(self) -> None:
-        conn = _ReplayConnection([
-            [("synthetic", "csv", {"target_table": "trajectory_points"}, "running")],
-            [],
-            [],
-        ])
-
-        result = extract_clips_for_run(conn, "run-1", allow_running=True)
-
-        self.assertEqual(result.run_id, "run-1")
-        self.assertEqual(result.report.total_clips, 0)
-
     def test_run_without_persisted_clip_radius_is_rejected(self) -> None:
         conn = _ReplayConnection([
-            [("synthetic", "csv", {"target_table": "trajectory_points"}, "completed")],
+            [("clean-1", "synthetic", {"target_table": "trajectory_points"}, "completed")],
             [(10, 0.0, 0.0, None)],
         ])
 
         with self.assertRaisesRegex(ValueError, "predates Clip radius persistence"):
-            extract_clips_for_run(conn, "legacy-run")
-
-    def test_skip_clean_replay_splits_current_active_points_at_recorded_gap(self) -> None:
-        point_rows = [
-            (
-                "vehicle-1", 0, index + 1, "synthetic", str(index + 1),
-                timestamp, x / _METERS_PER_DEGREE, 0.0, 90.0, 5.0, {},
-            )
-            for index, (timestamp, x) in enumerate(((0.0, -50), (10.0, 0), (500.0, 50), (510.0, 100)))
-        ]
-        conn = _ReplayConnection([
-            [(
-                "synthetic",
-                "postgres_table",
-                {"target_table": "raw_points", "skip_clean": True, "cleaner_max_gap_s": 120.0},
-                "completed",
-            )],
-            [],
-            point_rows,
-        ])
-
-        result = extract_clips_for_run(conn, "run-1")
-
-        self.assertEqual(result.report.total_vehicles, 1)
-        self.assertEqual(result.report.total_clips, 2)
-        self.assertEqual([clip.clip_type for clip in result.clips], ["full_track", "full_track"])
+            extract_clips_for_detect(conn, "legacy-detect")
 
 
 if __name__ == "__main__":

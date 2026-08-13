@@ -1,4 +1,4 @@
-"""Public replay-service behaviour tests."""
+﻿"""Public replay-service behaviour tests."""
 
 from __future__ import annotations
 
@@ -8,14 +8,18 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from track.v2.replay import (
     PostgresReplayStore,
     PostgresSourceRowResolver,
     ReplayService,
     ReplayTarget,
+    replay_centerline_inputs,
 )
 from track.v2.sources import source_row_hash
+from track.v2.cli.replay import _target_from_args
 
 
 class _MemoryStore:
@@ -60,7 +64,7 @@ class _LookupCursor:
 
     def fetchone(self) -> tuple[int] | None:
         if "trajectory_points" in self.sql:
-            (row_id,) = self.params
+            row_id = self.params[0]
             return {1: (1,), 2: (2,)}.get(row_id)
         return None
 
@@ -74,6 +78,114 @@ class _LookupConnection:
 
 
 class ReplayServiceTest(unittest.TestCase):
+    def test_centerline_replay_returns_grouped_current_points_and_bracket_refs(self) -> None:
+        class SequenceCursor:
+            def __init__(self, conn):
+                self.conn = conn
+                self.rows = []
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return None
+            def execute(self, sql, params):
+                self.conn.sql.append(sql)
+                self.rows = self.conn.responses.pop(0)
+            def fetchone(self):
+                return self.rows[0] if self.rows else None
+            def __iter__(self):
+                return iter(self.rows)
+        class SequenceConnection:
+            def __init__(self, responses):
+                self.responses = responses
+                self.sql = []
+            def cursor(self):
+                return SequenceCursor(self)
+
+        point_rows = [
+            ("vehicle-1", 2, index, "source", str(index), float(index),
+             100.0 + index, 30.0, 90.0, 5.0, {}, None, None, "")
+            for index in range(4)
+        ]
+        manifest = [
+            (0, "clip-1", "vehicle-1", 2, 20, 0, 0.5, 1, 3,
+             10, 2, 0.5, True, 4),
+        ]
+        conn = SequenceConnection([
+            [("fit-1", "detect-1", "directed", 10, 20,
+              "LINESTRING(0 0,1 1)", 1, 0)],
+            [("clean-1", "source", {"target_table": "trajectory_points"}, "completed")],
+            point_rows,
+            manifest,
+        ])
+
+        result = replay_centerline_inputs(conn, 7)
+
+        self.assertEqual(result.centerline_wkt, "LINESTRING(0 0,1 1)")
+        self.assertEqual(len(result.clips), 1)
+        clip = result.clips[0]
+        self.assertEqual(
+            [point.point_ref.source_row_key for point in clip.interior_points],
+            ["1", "2"],
+        )
+        self.assertEqual(
+            [ref.source_row_key for ref in clip.start.bracket_refs], ["0", "1"],
+        )
+        self.assertGreater(clip.points[0].lon, clip.points[-1].lon)
+        self.assertNotIn("is_active", conn.sql[2])
+
+    def test_cli_target_uses_the_stage_id_required_by_kind(self) -> None:
+        parser = MagicMock()
+        clean = _target_from_args(
+            parser,
+            SimpleNamespace(
+                kind="kept_trajectory_point", id=7,
+                clean_id="clean-1", detect_id=None,
+            ),
+        )
+        detect = _target_from_args(
+            parser,
+            SimpleNamespace(
+                kind="intersection", id=8,
+                clean_id=None, detect_id="detect-1",
+            ),
+        )
+        raw = _target_from_args(
+            parser,
+            SimpleNamespace(
+                kind="trajectory_point", id=9,
+                clean_id=None, detect_id=None,
+            ),
+        )
+        centerline = _target_from_args(
+            parser,
+            SimpleNamespace(
+                kind="centerline", id=10, clean_id=None, detect_id=None,
+            ),
+        )
+
+        self.assertEqual(clean, ReplayTarget("kept_trajectory_point", 7, clean_id="clean-1"))
+        self.assertEqual(detect, ReplayTarget("intersection", 8, detect_id="detect-1"))
+        self.assertEqual(raw, ReplayTarget("trajectory_point", 9))
+        self.assertEqual(centerline, ReplayTarget("centerline", 10))
+        parser.error.assert_not_called()
+
+    def test_postgres_store_filters_clean_and_detect_kinds_by_named_stage_id(self) -> None:
+        conn = _LookupConnection()
+        store = PostgresReplayStore(conn)
+
+        store.get_entity(ReplayTarget("kept_trajectory_point", 7, clean_id="clean-1"))
+        self.assertIn("clean_id = %s", conn.cursor_.sql)
+        self.assertEqual(conn.cursor_.params, [7, "clean-1"])
+
+        store.get_entity(ReplayTarget("intersection", 8, detect_id="detect-1"))
+        self.assertIn("detect_id = %s", conn.cursor_.sql)
+        self.assertEqual(conn.cursor_.params, [8, "detect-1"])
+
+        store.get_entity(ReplayTarget("trajectory_point", 9))
+        self.assertNotIn("clean_id", conn.cursor_.sql)
+        self.assertNotIn("detect_id", conn.cursor_.sql)
+        self.assertEqual(conn.cursor_.params, [9])
+
     def test_intersection_replays_through_candidate_and_event_to_raw_row(self) -> None:
         raw_row = {"id": "42", "vehicle_id": "truck-1", "lon": "116.1"}
         store = _MemoryStore()
@@ -96,24 +208,24 @@ class ReplayServiceTest(unittest.TestCase):
         store.links.update(
             {
                 ("intersection", 30): [
-                    ("candidate", ReplayTarget("candidate_intersection", 20, "run-1")),
-                    ("entry_exit_observation", ReplayTarget("entry_exit_point", 50, "run-1")),
+                    ("candidate", ReplayTarget("candidate_intersection", 20, detect_id="detect-1")),
+                    ("entry_exit_observation", ReplayTarget("entry_exit_point", 50, detect_id="detect-1")),
                 ],
                 ("candidate_intersection", 20): [
-                    ("member_event", ReplayTarget("candidate_intersection_event", 15, "run-1")),
-                    ("crossing", ReplayTarget("candidate_entry_exit_point", 40, "run-1")),
+                    ("member_event", ReplayTarget("candidate_intersection_event", 15, detect_id="detect-1")),
+                    ("crossing", ReplayTarget("candidate_entry_exit_point", 40, detect_id="detect-1")),
                 ],
-                ("candidate_intersection_event", 15): [("turn_event", ReplayTarget("turn_event", 10, "run-1"))],
-                ("turn_event", 10): [("input_point", ReplayTarget("trajectory_point", 1, None))],
-                ("candidate_entry_exit_point", 40): [("segment_start", ReplayTarget("trajectory_point", 1, None))],
-                ("entry_exit_point", 50): [("entry_crossing", ReplayTarget("candidate_entry_exit_point", 40, "run-1"))],
+                ("candidate_intersection_event", 15): [("turn_event", ReplayTarget("turn_event", 10, detect_id="detect-1"))],
+                ("turn_event", 10): [("input_point", ReplayTarget("trajectory_point", 1))],
+                ("candidate_entry_exit_point", 40): [("segment_start", ReplayTarget("trajectory_point", 1))],
+                ("entry_exit_point", 50): [("entry_crossing", ReplayTarget("candidate_entry_exit_point", 40, detect_id="detect-1"))],
             }
         )
 
         trace = ReplayService(
             store,
             source_row_resolver=lambda _source_id, _row_key: raw_row,
-        ).replay(ReplayTarget("intersection", 30, "run-1"))
+        ).replay(ReplayTarget("intersection", 30, detect_id="detect-1"))
 
         self.assertEqual(trace.status, "ok")
         self.assertEqual(
@@ -144,7 +256,7 @@ class ReplayServiceTest(unittest.TestCase):
         trace = ReplayService(
             store,
             source_row_resolver=lambda _source_id, _row_key: changed_row,
-        ).replay(ReplayTarget("trajectory_point", 1, None))
+        ).replay(ReplayTarget("trajectory_point", 1))
 
         self.assertEqual(trace.status, "source_mismatch")
         self.assertIsNone(trace.nodes[0].raw_row)
@@ -156,7 +268,7 @@ class ReplayServiceTest(unittest.TestCase):
 
         trace = ReplayService(
             store, source_row_resolver=lambda _source_id, _row_key: {},
-        ).replay(ReplayTarget("intersection", 1, "legacy-run"))
+        ).replay(ReplayTarget("intersection", 1, detect_id="legacy-detect"))
 
         # PG-only mode: no provenance columns on trajectory_points,
         # so missing parent chain is not an error.
@@ -183,22 +295,22 @@ class ReplayServiceTest(unittest.TestCase):
         })
         store.links.update({
             ("entry_exit_point", 30): [
-                ("entry_crossing", ReplayTarget("candidate_entry_exit_point", 20, "run-1")),
-                ("exit_crossing", ReplayTarget("candidate_entry_exit_point", 21, "run-1")),
+                ("entry_crossing", ReplayTarget("candidate_entry_exit_point", 20, detect_id="detect-1")),
+                ("exit_crossing", ReplayTarget("candidate_entry_exit_point", 21, detect_id="detect-1")),
             ],
             ("candidate_entry_exit_point", 20): [
-                ("segment_start", ReplayTarget("trajectory_point", 1, None)),
-                ("segment_end", ReplayTarget("trajectory_point", 2, None)),
+                ("segment_start", ReplayTarget("trajectory_point", 1)),
+                ("segment_end", ReplayTarget("trajectory_point", 2)),
             ],
             ("candidate_entry_exit_point", 21): [
-                ("segment_start", ReplayTarget("trajectory_point", 3, None)),
+                ("segment_start", ReplayTarget("trajectory_point", 3)),
             ],
         })
 
         trace = ReplayService(
             store,
             source_row_resolver=lambda source_id, row_key: raw_rows[(source_id, row_key)],
-        ).replay(ReplayTarget("entry_exit_point", 30, "run-1"))
+        ).replay(ReplayTarget("entry_exit_point", 30, detect_id="detect-1"))
 
         self.assertEqual(trace.status, "ok")
         self.assertEqual(
@@ -209,16 +321,17 @@ class ReplayServiceTest(unittest.TestCase):
 
     def test_postgres_store_expands_complete_intersection_and_typed_source_pairs(self) -> None:
         store = PostgresReplayStore(_LookupConnection())
-        target = ReplayTarget("intersection", 30, "run-1")
+        target = ReplayTarget("intersection", 30, detect_id="detect-1")
 
         intersection_parents = store.parent_refs(
             target, {"candidate_intersection_id": 20},
         )
         candidate_parents = store.parent_refs(
-            ReplayTarget("candidate_intersection", 20, "run-1"), {},
+            ReplayTarget("candidate_intersection", 20, detect_id="detect-1"), {},
         )
+        self.assertEqual(store._conn.cursor_.params, (20, "detect-1"))
         member_parents = store.parent_refs(
-            ReplayTarget("candidate_intersection_event", 15, "run-1"),
+            ReplayTarget("candidate_intersection_event", 15, detect_id="detect-1"),
             {
                 "turn_event_id": None,
                 "from_source_id": "csv-a",
@@ -258,18 +371,18 @@ class ReplayServiceTest(unittest.TestCase):
         ]
         for db_id, kind in enumerate(kinds, start=10):
             store.rows[(kind, db_id)] = {"id": db_id}
-            store.links[(kind, db_id)] = [("raw", ReplayTarget("trajectory_point", 1, None))]
+            store.links[(kind, db_id)] = [("raw", ReplayTarget("trajectory_point", 1))]
         store.rows[("candidate_intersection", 17)] = {"id": 17}
         store.links[("candidate_intersection", 17)] = [
-            ("member_event", ReplayTarget("candidate_intersection_event", 15, "run-1")),
+            ("member_event", ReplayTarget("candidate_intersection_event", 15, detect_id="detect-1")),
         ]
         store.rows[("intersection", 18)] = {"id": 18}
         store.links[("intersection", 18)] = [
-            ("candidate", ReplayTarget("candidate_intersection", 17, "run-1")),
+            ("candidate", ReplayTarget("candidate_intersection", 17, detect_id="detect-1")),
         ]
         store.rows[("entry_exit_point", 19)] = {"id": 19}
         store.links[("entry_exit_point", 19)] = [
-            ("entry_crossing", ReplayTarget("candidate_entry_exit_point", 16, "run-1")),
+            ("entry_crossing", ReplayTarget("candidate_entry_exit_point", 16, detect_id="detect-1")),
         ]
 
         service = ReplayService(
@@ -278,7 +391,7 @@ class ReplayServiceTest(unittest.TestCase):
         )
         for kind in ["trajectory_point", *kinds]:
             db_id = 1 if kind == "trajectory_point" else 10 + kinds.index(kind)
-            trace = service.replay(ReplayTarget(kind, db_id, None if kind == "trajectory_point" else "run-1"))
+            trace = service.replay(ReplayTarget(kind, db_id, clean_id="clean-1" if kind in {"excluded_point", "kept_trajectory_point", "injected_point"} else None, detect_id="detect-1" if kind not in {"trajectory_point", "excluded_point", "kept_trajectory_point", "injected_point"} else None))
             self.assertEqual(trace.status, "ok", kind)
 
 

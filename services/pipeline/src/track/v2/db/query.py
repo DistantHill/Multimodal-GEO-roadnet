@@ -97,18 +97,18 @@ def _query_spatial_extent(
     table: str = "trajectory_points",
     kept_table: str | None = None,
     source_id: str | None = None,
-    run_id: str | None = None,
+    clean_id: str | None = None,
 ) -> tuple[float, float, float, float] | None:
     """Query MIN/MAX lon/lat of active trajectory points.
 
-    ZH: kept 模式 (``kept_table`` 非空) 时 JOIN 清洗结果表并绑定 ``ktp.run_id``。
+    ZH: kept 模式 (``kept_table`` 非空) 时 JOIN 清洗结果表并绑定 ``ktp.clean_id``。
     Returns ``(lon_min, lat_min, lon_max, lat_max)`` compatible with
     ``SpatialWindowIterator``.
     """
-    if kept_table is not None and run_id is None:
-        raise ValueError("kept_table requires run_id")
+    if kept_table is not None and clean_id is None:
+        raise ValueError("kept_table requires clean_id")
     sql = build_spatial_extent_sql(table, kept_table=kept_table)
-    params: tuple[Any, ...] = (run_id,) if kept_table is not None else ()
+    params: tuple[Any, ...] = (clean_id,) if kept_table is not None else ()
     with conn.cursor() as cur:
         cur.execute(sql, params)
         row = cur.fetchone()
@@ -126,7 +126,7 @@ def _query_active_points_in_window(
     table: str = "trajectory_points",
     kept_table: str | None = None,
     source_id: str | None = None,
-    run_id: str | None = None,
+    clean_id: str | None = None,
     telemetry: dict[str, int | float] | None = None,
 ) -> list[TrajectoryPoint]:
     """Query active trajectory points + injected points in a spatial window.
@@ -134,27 +134,27 @@ def _query_active_points_in_window(
     ZH: 使用 PostGIS GiST 空间索引 (geom && ST_MakeEnvelope) 替代
         lon/lat BETWEEN，走 R-tree 2D 索引扫描。UNION ALL 合并两表一次往返。
         kept 模式 (``kept_table`` 非空) 时 trajectory 分支 JOIN 清洗结果表，
-        首参绑定 ``ktp.run_id``（而非 raw 模式的 source_id）。
+        首参绑定 ``ktp.clean_id``（而非 raw 模式的 source_id）。
     """
     rows: list[dict[str, Any]] = []
-    has_run_id = run_id is not None
-    if kept_table is not None and run_id is None:
-        raise ValueError("kept_table requires run_id")
+    has_clean_id = clean_id is not None
+    if kept_table is not None and clean_id is None:
+        raise ValueError("kept_table requires clean_id")
     if kept_table is not None:
-        params: list[Any] = [run_id]
+        params: list[Any] = [clean_id]
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
-        params.append(run_id)
+        params.append(clean_id)
     else:
         params = [source_id or ""]
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
-        if has_run_id:
-            params.append(run_id)
+        if has_clean_id:
+            params.append(clean_id)
     query_started = time.perf_counter() if telemetry is not None else 0.0
     with conn.cursor() as cur:
         cur.execute(
-            build_active_in_window_sql(table, has_run_id=has_run_id, kept_table=kept_table),
+            build_active_in_window_sql(table, has_clean_id=has_clean_id, kept_table=kept_table),
             params,
         )
         for row in cur:
@@ -181,7 +181,7 @@ def _stream_vehicle_tracks_from_db(
     table: str = "trajectory_points",
     kept_table: str | None = None,
     source_id: str | None = None,
-    run_id: str | None = None,
+    clean_id: str | None = None,
 ) -> Iterator[list[TrajectoryPoint]]:
     """Stream tracks one vehicle at a time from DB (global, no spatial filter).
 
@@ -189,24 +189,24 @@ def _stream_vehicle_tracks_from_db(
         injected_points，按 (vehicle_id, timestamp) 排序后检测 vehicle_id
         变化来分组。内存占用 = 单车辆最大点数。
         kept 模式 (``kept_table`` 非空) 时 trajectory 分支 JOIN 清洗结果表，
-        绑定 ``ktp.run_id`` 与 ``injected_points.run_id``。
+        绑定 ``ktp.clean_id`` 与 ``injected_points.clean_id``。
     """
-    has_run_id = run_id is not None
-    if kept_table is not None and run_id is None:
-        raise ValueError("kept_table requires run_id")
+    has_clean_id = clean_id is not None
+    if kept_table is not None and clean_id is None:
+        raise ValueError("kept_table requires clean_id")
     if kept_table is not None:
-        params: list[Any] = [run_id, run_id]
+        params: list[Any] = [clean_id, clean_id]
     else:
         params = [source_id or ""]
-        if has_run_id:
-            params.append(run_id)
+        if has_clean_id:
+            params.append(clean_id)
     # ZH: 服务器端命名游标 — PG 按需 FETCH，避免全量物化到 portal。
     # EN: Server-side named cursor — FETCHes on demand, no full portal materialization.
     with conn.cursor(
         name=f"stream_tracks_{uuid.uuid4().hex}",
     ) as cur:
         cur.execute(
-            build_stream_all_sql(table, has_run_id=has_run_id, kept_table=kept_table),
+            build_stream_all_sql(table, has_clean_id=has_clean_id, kept_table=kept_table),
             params,
         )
         current_vid: str | None = None
@@ -246,7 +246,7 @@ def _query_active_points_near_cluster(
     table: str = "trajectory_points",
     kept_table: str | None = None,
     source_id: str | None = None,
-    run_id: str | None = None,
+    clean_id: str | None = None,
 ) -> list[TrajectoryPoint]:
     """Query active points within *radius_m* of a cluster centroid.
 
@@ -269,7 +269,7 @@ def _query_active_points_near_cluster(
         table=table,
         kept_table=kept_table,
         source_id=source_id,
-        run_id=run_id,
+        clean_id=clean_id,
     )
 
 

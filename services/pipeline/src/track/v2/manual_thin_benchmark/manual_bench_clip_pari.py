@@ -5,16 +5,16 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from track.v2.clip import extract_clips_for_run
+from track.v2.clip import extract_clips_for_detect
 from track.v2.config import connect, default_postgres_config
 
-RUN_ID = "a06566cc-c860-4efd-9ae2-c536a7d1477b"
+DETECT_ID = "a06566cc-c860-4efd-9ae2-c536a7d1477b"
 PAIRS = {(55,79), (79,55)}
 
 
 def main() -> None:
     with connect(default_postgres_config()) as conn:
-        result = extract_clips_for_run(conn, RUN_ID)
+        result = extract_clips_for_detect(conn, DETECT_ID)
 
     clips = [
         clip

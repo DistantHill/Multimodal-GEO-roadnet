@@ -33,6 +33,8 @@ def build_network(
     seen_pairs: set[tuple[int, int]] = set()
 
     for centerline in fits.centerlines:
+        if centerline.variant != "combined":
+            raise ValueError("Network requires combined centerlines")
         pair = (centerline.from_cluster_id, centerline.to_cluster_id)
         if pair[0] >= pair[1]:
             raise ValueError(
@@ -93,7 +95,7 @@ def build_network(
             isolated_node_count=isolated_count,
             skipped_centerline_count=len(issues),
         ),
-        run_id=fits.run_id,
+        detect_id=fits.detect_id,
     )
 
 
