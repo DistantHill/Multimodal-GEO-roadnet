@@ -10,6 +10,7 @@ from track.v2.db_writer import (
     insert_candidate_intersections,
     insert_intersections,
     insert_tracks_cross,
+    latest_completed_run_id,
 )
 from track.v2.models import (
     CrossTrackCandidate,
@@ -60,6 +61,59 @@ def _cluster(cluster_id: int) -> HotspotCluster:
         centroid_lat=39.0,
         radius_m=100.0,
     )
+
+
+class LatestCompletedRunIdTest(unittest.TestCase):
+    class _Cursor:
+        def __init__(self, row):
+            self.row = row
+            self.sql = None
+            self.params = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def execute(self, sql, params):
+            self.sql = sql
+            self.params = params
+
+        def fetchone(self):
+            return self.row
+
+    class _Conn:
+        def __init__(self, row):
+            self.cursor_instance = LatestCompletedRunIdTest._Cursor(row)
+
+        def cursor(self):
+            return self.cursor_instance
+
+    def test_returns_id_and_scopes_by_source(self):
+        conn = self._Conn(("run-abc",))
+
+        result = latest_completed_run_id(conn, source_id="table_x")
+
+        self.assertEqual(result, "run-abc")
+        self.assertIn("source_id = %s", conn.cursor_instance.sql)
+        self.assertIn("parameters->>'skip_clean' = 'false'", conn.cursor_instance.sql)
+        self.assertEqual(conn.cursor_instance.params, ("table_x",))
+
+    def test_no_source_omits_filter(self):
+        conn = self._Conn(("run-1",))
+
+        result = latest_completed_run_id(conn)
+
+        self.assertEqual(result, "run-1")
+        self.assertNotIn("source_id = %s", conn.cursor_instance.sql)
+        self.assertIn("parameters->>'skip_clean' = 'false'", conn.cursor_instance.sql)
+        self.assertEqual(conn.cursor_instance.params, ())
+
+    def test_no_row_returns_none(self):
+        conn = self._Conn(None)
+
+        self.assertIsNone(latest_completed_run_id(conn))
 
 
 class InsertIntersectionsTest(unittest.TestCase):

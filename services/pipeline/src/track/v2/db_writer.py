@@ -81,6 +81,44 @@ def finish_pipeline_run(conn: Any, run_id: str, *, status: str) -> None:
         )
 
 
+def latest_completed_run_id(
+    conn: Any,
+    *,
+    source_id: str | None = None,
+) -> str | None:
+    """Return the most recent completed clean pipeline run's id.
+
+    ZH: 返回最近一次真正执行过清洗（``skip_clean=false``）且 ``completed`` 的
+        pipeline run id——只跳过清洗的 run 不会写入 kept_trajectory_points，
+        必须被排除。传 ``source_id`` 时只在该数据源内查找。用于 ``--skip-clean``
+        复用上次清洗结果。
+    EN: Return the id of the most recently completed run that actually ran the
+        cleaner (``skip_clean=false``) — skip-clean runs never write
+        kept_trajectory_points and must be excluded. Optionally scoped to
+        ``source_id``. Used by ``--skip-clean`` to reuse the prior clean.
+    """
+    if source_id is not None:
+        sql = (
+            "SELECT id FROM pipeline_runs "
+            "WHERE status = 'completed' AND source_id = %s "
+            "AND parameters->>'skip_clean' = 'false' "
+            "ORDER BY started_at DESC LIMIT 1"
+        )
+        params: tuple[Any, ...] = (source_id,)
+    else:
+        sql = (
+            "SELECT id FROM pipeline_runs "
+            "WHERE status = 'completed' "
+            "AND parameters->>'skip_clean' = 'false' "
+            "ORDER BY started_at DESC LIMIT 1"
+        )
+        params = ()
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+    return str(row[0]) if row is not None else None
+
+
 # ── Helpers ────────────────────────────────────────────────────────────
 
 _POLYGON_EXPR = (

@@ -40,6 +40,7 @@ from ..db_writer import (
     insert_kept_trajectory_points,
     insert_trajectory_points,
     insert_turn_events,
+    latest_completed_run_id,
 )
 from ..models import (
     CleanerConfig,
@@ -67,19 +68,22 @@ def run_pipeline(
     pg_source_table: str | None = None,
     table: str = "trajectory_points",
     skip_clean: bool = False,
+    kept_run_id: str | None = None,
 ) -> dict[str, int | str]:
     """Run the full pipeline, persisting replay inputs and reporting Clip.
 
     ZH: 运行完整流水线并将所有阶段产物写入数据库。返回各表写入行数统计。
         ``csv_path`` 和 ``pg_source_table`` 必须且只能指定一个。
         ``table`` 指定 trajectory_points 的目标表名。
-        ``skip_clean`` 跳过 Parser0+Cleaner1，直接从 is_active 列读取已清洗结果。
+        ``skip_clean`` 跳过 Parser0+Cleaner1，复用上次清洗的
+        kept_trajectory_points（默认最近一次 completed run，可用 ``kept_run_id`` 指定）。
     EN: Run the full pipeline, persist Parser/Cleaner/Intersect artifacts, and
         compute the in-memory Clip result. Returns row/result counts. Exactly one of ``csv_path`` or
         ``pg_source_table`` must be provided. ``table`` specifies the target
         table name for trajectory_points.
-        ``skip_clean`` skips Parser0+Cleaner1 and reads pre-cleaned results
-        from the is_active column directly.
+        ``skip_clean`` skips Parser0+Cleaner1 and reuses the prior run's
+        kept_trajectory_points (most recent completed run by default, or
+        ``kept_run_id`` when specified).
     """
     import psycopg
 
@@ -256,12 +260,27 @@ def run_pipeline(
         intersect_source_id = pg_source_table if is_pg_source else source_id
         live_intersect = LiveStatus("Intersect2: Cross-track Detection")
         live_intersect.start()
+        # ZH: skip_clean 时复用上次清洗的 kept_trajectory_points——默认取最近一次
+        #     completed run（可用 --run-id 指定）。非 skip_clean 读本次 run。
+        # EN: Under --skip-clean, reuse the prior run's kept_trajectory_points —
+        #     most recent completed run by default (overridable via --run-id).
+        if skip_clean:
+            input_run_id = kept_run_id or latest_completed_run_id(
+                conn, source_id=intersect_source_id
+            )
+            if input_run_id is None:
+                raise RuntimeError(
+                    "--skip-clean 需要一次已完成的清洗 run："
+                    "用 --run-id 指定，或先跑一次完整 pipeline 生成 kept_trajectory_points"
+                )
+        else:
+            input_run_id = run_id
         icfg = IntersectConfig(
             query_active_from_db=True,
             db_table=table,
-            kept_table=None if skip_clean else "kept_trajectory_points",
+            kept_table="kept_trajectory_points",
             source_id=intersect_source_id,
-            run_id=None if skip_clean else run_id,
+            run_id=input_run_id,
             live_status=live_intersect,
         )
         iresult = detect_intersections(conn=conn, config=icfg)
@@ -438,8 +457,14 @@ def main() -> int:
     )
     parser.add_argument(
         "--skip-clean", action="store_true",
-        help="跳过 Parser0+Cleaner1，直接从 trajectory_points.is_active 读取已清洗结果进入 Intersect2。"
+        help="跳过 Parser0+Cleaner1，复用上次清洗的 kept_trajectory_points 进入 Intersect2"
+             "（默认最近一次 completed run，可用 --run-id 指定）。"
              "仅支持 --pg-table 模式 / Requires --pg-table mode."
+    )
+    parser.add_argument(
+        "--run-id", metavar="RUN_ID",
+        help="配合 --skip-clean：读取指定 run 的 kept_trajectory_points 清洗结果"
+             "（默认取最近一次 completed run）。"
     )
     args = parser.parse_args()
 
@@ -447,6 +472,11 @@ def main() -> int:
     # EN: --skip-clean is only valid with --pg-table
     if args.skip_clean and not args.pg_table:
         parser.error("--skip-clean 仅支持 --pg-table 模式 / requires --pg-table")
+
+    # ZH: --run-id 仅在 --skip-clean 下有意义（用于复用指定 run 的清洗结果）
+    # EN: --run-id is only meaningful with --skip-clean
+    if args.run_id and not args.skip_clean:
+        parser.error("--run-id 仅在 --skip-clean 下使用 / requires --skip-clean")
 
     # ZH: 若未显式指定 --table，PG 模式默认写到源表（原地工作），CSV 模式写到 trajectory_points。
     # EN: If --table is not set, default to the PG source table (work in-place)
@@ -491,6 +521,7 @@ def main() -> int:
             pg_source_table=args.pg_table,
             table=args.table,
             skip_clean=args.skip_clean,
+            kept_run_id=args.run_id,
         )
         _print_write_summary(stats)
         return 0
