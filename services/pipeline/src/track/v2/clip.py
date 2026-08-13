@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-import json
 import math
-import re
 from dataclasses import dataclass
 
 from ._geometry import _distance_m, _to_xy
+from .db.clip_queries import (
+    fetch_clean_points,
+    fetch_intersections,
+    fetch_raw_points,
+    fetch_run_row,
+)
 from .models import (
     ClipConfig,
     ClipEndpoint,
@@ -16,7 +20,6 @@ from .models import (
     ClipReport,
     ClipResult,
     ClipTrack,
-    PointRef,
     TrackClip,
     TrajectoryPoint,
 )
@@ -202,111 +205,59 @@ def _load_clip_input_for_run(
     *,
     allow_running: bool = False,
 ) -> ClipInput:
-    with conn.cursor() as cur:  # type: ignore[attr-defined]
-        cur.execute(
-            "SELECT source_id, source_kind, parameters, status "
-            "FROM pipeline_runs WHERE id = %s",
-            (run_id,),
-        )
-        run_row = cur.fetchone()
-    if run_row is None:
-        raise ValueError(f"unknown pipeline run: {run_id}")
-    source_id, _source_kind, raw_parameters, status = run_row
+    run_row = fetch_run_row(conn, run_id)
     accepted_statuses = {"completed", "running"} if allow_running else {"completed"}
-    if status not in accepted_statuses:
+    if run_row.status not in accepted_statuses:
         raise ValueError(f"pipeline run {run_id} is not completed")
-    parameters = _decode_parameters(raw_parameters)
-    table = _quoted_table_name(str(parameters.get("target_table", "trajectory_points")))
-    skip_clean = bool(parameters.get("skip_clean", False))
-    cleaner_max_gap_s = float(parameters.get("cleaner_max_gap_s", 120.0))
 
-    intersections: list[ClipIntersection] = []
-    with conn.cursor() as cur:  # type: ignore[attr-defined]
-        cur.execute(
-            "SELECT i.cluster_id, ci.centroid_lon, ci.centroid_lat, i.clip_radius_m "
-            "FROM intersections AS i "
-            "JOIN candidate_intersections AS ci "
-            "ON ci.id = i.candidate_intersection_id "
-            "WHERE i.run_id = %s AND i.is_complete IS TRUE "
-            "ORDER BY i.cluster_id",
-            (run_id,),
-        )
-        for cluster_id, lon, lat, radius_m in cur:
-            if radius_m is None:
-                raise ValueError(f"pipeline run {run_id} predates Clip radius persistence")
-            if not math.isfinite(float(radius_m)) or float(radius_m) <= 0.0:
-                raise ValueError(f"pipeline run {run_id} has an invalid Clip radius")
-            intersections.append(
-                ClipIntersection(
-                    cluster_id=int(cluster_id),
-                    lon=float(lon),
-                    lat=float(lat),
-                    radius_m=float(radius_m),
-                )
-            )
+    params = run_row.parameters
+    table = str(params.get("target_table", "trajectory_points"))
+    skip_clean = bool(params.get("skip_clean", False))
+
+    intersections = fetch_intersections(conn, run_id)
 
     if skip_clean:
-        point_sql = (
-            "SELECT tp.vehicle_id, 0 AS subtrack_index, tp.id AS sequence_in_subtrack, "
-            "%s::text AS point_source_id, tp.id::text AS source_row_key, "
-            "tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, tp.extra "
-            f"FROM {table} AS tp "
-            "WHERE tp.is_active IS NOT FALSE "
-            "ORDER BY tp.vehicle_id, tp.timestamp, tp.id"
+        grouped = fetch_raw_points(conn, table, run_row.source_id)
+        grouped = _split_by_time_gaps(
+            grouped,
+            max_gap_s=float(params.get("cleaner_max_gap_s", 120.0)),
         )
-        point_params: tuple[object, ...] = (source_id,)
     else:
-        point_sql = (
-            "SELECT ktp.vehicle_id, ktp.subtrack_index, ktp.sequence_in_subtrack, "
-            "ktp.source_id, ktp.source_row_key, "
-            "tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, tp.extra "
-            "FROM kept_trajectory_points AS ktp "
-            f"JOIN {table} AS tp ON tp.id = ktp.trajectory_point_id "
-            "WHERE ktp.run_id = %s AND tp.is_active IS NOT FALSE "
-            "ORDER BY ktp.vehicle_id, ktp.subtrack_index, "
-            "ktp.sequence_in_subtrack, tp.id"
-        )
-        point_params = (run_id,)
+        grouped = fetch_clean_points(conn, table, run_id)
 
-    grouped: dict[tuple[str, int], list[TrajectoryPoint]] = {}
-    with conn.cursor() as cur:  # type: ignore[attr-defined]
-        cur.execute(point_sql, point_params)
-        for row in cur:
-            vehicle_id = str(row[0])
-            subtrack_index = int(row[1])
-            if row[3] is None or row[4] is None:
-                raise ValueError(
-                    f"pipeline run {run_id} predates persisted source references"
-                )
-            grouped.setdefault((vehicle_id, subtrack_index), []).append(
-                TrajectoryPoint(
-                    point_ref=PointRef(str(row[3]), str(row[4]), stable=True),
-                    vehicle_id=vehicle_id,
-                    timestamp=float(row[5]),
-                    lon=float(row[6]),
-                    lat=float(row[7]),
-                    heading=float(row[8]),
-                    speed=float(row[9]),
-                    extra=row[10] if isinstance(row[10], dict) else {},
-                )
-            )
+    return ClipInput(
+        intersections=tuple(intersections),
+        tracks=_build_clip_tracks(grouped),
+        run_id=run_id,
+    )
 
-    if skip_clean:
-        split_grouped: dict[tuple[str, int], list[TrajectoryPoint]] = {}
-        for (vehicle_id, _), points in grouped.items():
-            subtrack_index = 1
-            current: list[TrajectoryPoint] = []
-            for point in points:
-                if current and point.timestamp - current[-1].timestamp > cleaner_max_gap_s:
-                    split_grouped[(vehicle_id, subtrack_index)] = current
-                    subtrack_index += 1
-                    current = []
-                current.append(point)
-            if current:
-                split_grouped[(vehicle_id, subtrack_index)] = current
-        grouped = split_grouped
 
-    tracks = tuple(
+def _split_by_time_gaps(
+    grouped: dict[tuple[str, int], list[TrajectoryPoint]],
+    *,
+    max_gap_s: float,
+) -> dict[tuple[str, int], list[TrajectoryPoint]]:
+    """Split raw-point groups into subtracks wherever the time gap exceeds *max_gap_s*."""
+    result: dict[tuple[str, int], list[TrajectoryPoint]] = {}
+    for (vehicle_id, _), points in grouped.items():
+        subtrack_index = 1
+        current: list[TrajectoryPoint] = []
+        for point in points:
+            if current and point.timestamp - current[-1].timestamp > max_gap_s:
+                result[(vehicle_id, subtrack_index)] = current
+                subtrack_index += 1
+                current = []
+            current.append(point)
+        if current:
+            result[(vehicle_id, subtrack_index)] = current
+    return result
+
+
+def _build_clip_tracks(
+    grouped: dict[tuple[str, int], list[TrajectoryPoint]],
+) -> tuple[ClipTrack, ...]:
+    """Convert grouped points into ClipTrack tuples."""
+    return tuple(
         ClipTrack(
             vehicle_id=vehicle_id,
             trip_id=f"{vehicle_id}:subtrack-{subtrack_index:04d}",
@@ -314,28 +265,6 @@ def _load_clip_input_for_run(
         )
         for (vehicle_id, subtrack_index), points in grouped.items()
     )
-    return ClipInput(
-        intersections=tuple(intersections),
-        tracks=tracks,
-        run_id=run_id,
-    )
-
-
-def _decode_parameters(value: object) -> dict[str, object]:
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        decoded = json.loads(value)
-        if isinstance(decoded, dict):
-            return decoded
-    raise ValueError("pipeline run parameters must be a JSON object")
-
-
-def _quoted_table_name(value: str) -> str:
-    parts = value.split(".")
-    if not parts or any(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) is None for part in parts):
-        raise ValueError(f"invalid trajectory table name: {value!r}")
-    return ".".join(f'"{part}"' for part in parts)
 
 
 def _extract_track_clips(
