@@ -7,32 +7,54 @@ from track.v2.cli.run import main
 from track.v2.config import PostgresConfig
 
 
-class ClipCliTest(unittest.TestCase):
-    def test_replay_clips_is_a_standalone_data_source_mode(self) -> None:
-        config = PostgresConfig(
-            host="localhost",
-            port=5432,
-            database="track",
-            user="track",
-            password="",
+class RunCliCleanReuseTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.config = PostgresConfig(
+            host="localhost", port=5432, database="track", user="track", password="",
         )
-        sentinel_result = object()
 
+    def test_clean_id_is_a_standalone_source_mode(self) -> None:
+        clean_id = "11111111-1111-1111-1111-111111111111"
         with (
-            patch("sys.argv", ["track.v2.cli.run", "--replay-clips", "run-123"]),
-            patch("track.v2.cli.run.default_postgres_config", return_value=config),
+            patch("sys.argv", ["track.v2.cli.run", "--clean-id", clean_id]),
+            patch("track.v2.cli.run.default_postgres_config", return_value=self.config),
             patch("track.v2.cli.run.init_logger"),
             patch("track.v2.cli.run.shutdown_logger"),
-            patch("track.v2.cli.run.replay_clips", return_value=sentinel_result) as replay,
-            patch("track.v2.cli.run._print_clip_report") as print_report,
-            patch("track.v2.cli.run.run_pipeline") as run_pipeline,
+            patch("track.v2.cli.run.run_pipeline", return_value={}) as run_pipeline,
+            patch("track.v2.cli.run._print_write_summary"),
         ):
             exit_code = main()
 
         self.assertEqual(exit_code, 0)
-        replay.assert_called_once_with(config, "run-123")
-        print_report.assert_called_once_with(sentinel_result)
-        run_pipeline.assert_not_called()
+        run_pipeline.assert_called_once_with(
+            self.config,
+            csv_path=None,
+            pg_source_table=None,
+            clean_id=clean_id,
+            table="trajectory_points",
+        )
+
+    def test_clean_id_rejects_table_override(self) -> None:
+        clean_id = "11111111-1111-1111-1111-111111111111"
+        with (
+            patch("sys.argv", ["track.v2.cli.run", "--clean-id", clean_id, "--table", "other"]),
+            patch("track.v2.cli.run.default_postgres_config", return_value=self.config),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            main()
+
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_old_ambiguous_flags_are_not_accepted(self) -> None:
+        for flag in ("--skip-clean", "--run-id", "--replay-clips"):
+            with self.subTest(flag=flag):
+                with (
+                    patch("sys.argv", ["track.v2.cli.run", flag, "value"]),
+                    patch("track.v2.cli.run.default_postgres_config", return_value=self.config),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    main()
+            self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

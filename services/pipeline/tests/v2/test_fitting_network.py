@@ -84,7 +84,7 @@ def _clip_result(*clips: TrackClip) -> ClipResult:
             boundary_clips=0,
             total_points_in_clips=sum(clip.point_count for clip in clips),
         ),
-        run_id="run-fit-test",
+        detect_id="detect-fit-test",
     )
 
 

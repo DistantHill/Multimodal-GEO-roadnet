@@ -63,12 +63,18 @@ def _seed_candidate_chain(
     raw_row: dict[str, str],
 ) -> tuple[str, int]:
     """Insert one candidate/member/raw chain; caller owns the transaction."""
-    run_id = str(uuid.uuid4())
+    clean_id = str(uuid.uuid4())
+    detect_id = str(uuid.uuid4())
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO pipeline_runs (id, source_id, source_kind, parameters, status) "
-            "VALUES (%s, %s, 'csv', '{}', 'running')",
-            (run_id, source_id),
+            "INSERT INTO clean_runs (id, source_id, source_kind, parameters, status) "
+            "VALUES (%s, %s, 'csv', '{}', 'completed')",
+            (clean_id, source_id),
+        )
+        cur.execute(
+            "INSERT INTO detect_runs (id, clean_id, parameters, status) "
+            "VALUES (%s, %s, '{}', 'completed')",
+            (detect_id, clean_id),
         )
         cur.execute(
             "INSERT INTO trajectory_points "
@@ -77,18 +83,18 @@ def _seed_candidate_chain(
         )
         cur.execute(
             "INSERT INTO candidate_intersections "
-            "(run_id, cluster_id, centroid_x, centroid_y, centroid_lon, centroid_lat, radius_m, origin_lon, origin_lat) "
+            "(detect_id, cluster_id, centroid_x, centroid_y, centroid_lon, centroid_lat, radius_m, origin_lon, origin_lat) "
             "VALUES (%s, 1, 0, 0, 116.0, 39.0, 1, 116.0, 39.0) RETURNING id",
-            (run_id,),
+            (detect_id,),
         )
         candidate_id = int(cur.fetchone()[0])
         cur.execute(
             "INSERT INTO candidate_intersection_events "
-            "(run_id, candidate_intersection_id, event_kind, from_source_id, from_source_row_key, to_source_id, to_source_row_key) "
+            "(detect_id, candidate_intersection_id, event_kind, from_source_id, from_source_row_key, to_source_id, to_source_row_key) "
             "VALUES (%s, %s, 'benchmark', %s, %s, %s, %s)",
-            (run_id, candidate_id, source_id, source_row_key, source_id, source_row_key),
+            (detect_id, candidate_id, source_id, source_row_key, source_id, source_row_key),
         )
-    return run_id, candidate_id
+    return detect_id, candidate_id
 
 
 def main() -> int:
@@ -106,7 +112,7 @@ def main() -> int:
         source_row_key = str(args.csv_rows + 1)
         conn = connect_test_db()
         try:
-            run_id, candidate_id = _seed_candidate_chain(
+            detect_id, candidate_id = _seed_candidate_chain(
                 conn, str(csv_path), source_row_key, raw_row,
             )
             store = PostgresReplayStore(conn)
@@ -125,7 +131,9 @@ def main() -> int:
                 started = time.perf_counter()
                 trace = ReplayService(
                     store, source_row_resolver=resolver,
-                ).replay(ReplayTarget("candidate_intersection", candidate_id, run_id))
+                ).replay(ReplayTarget(
+                    "candidate_intersection", candidate_id, detect_id=detect_id,
+                ))
                 replay_seconds += time.perf_counter() - started
                 if trace.status != "ok":
                     raise RuntimeError(f"unexpected replay status: {trace.status}")

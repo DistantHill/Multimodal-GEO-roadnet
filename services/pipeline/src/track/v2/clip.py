@@ -9,8 +9,7 @@ from ._geometry import _distance_m, _to_xy
 from .db.clip_queries import (
     fetch_clean_points,
     fetch_intersections,
-    fetch_raw_points,
-    fetch_run_row,
+    fetch_detect_row,
 )
 from .models import (
     ClipConfig,
@@ -138,7 +137,7 @@ def extract_clips(
             track,
             source.intersections,
             include_boundaries=cfg.include_boundary_clips,
-            run_id=source.run_id,
+            detect_id=source.detect_id,
         )
         clips.extend(track_clips)
         skipped_degenerate += skipped
@@ -159,7 +158,7 @@ def extract_clips(
             unmatched_exit_count=unmatched_exits,
             skipped_degenerate_count=skipped_degenerate,
         ),
-        run_id=source.run_id,
+        detect_id=source.detect_id,
     )
 
 
@@ -182,75 +181,35 @@ def _validate_input(source: ClipInput) -> None:
             )
 
 
-def extract_clips_for_run(
+def extract_clips_for_detect(
     conn: object,
-    run_id: str,
+    detect_id: str,
     *,
     config: ClipConfig | None = None,
-    allow_running: bool = False,
 ) -> ClipResult:
-    """Extract clips from one persisted run.
-
-    Historical replay accepts completed runs only. The pipeline runner may set
-    ``allow_running`` while validating its just-written Intersect2 artifacts
-    in the same transaction, before marking that run completed.
-    """
-    source = _load_clip_input_for_run(conn, run_id, allow_running=allow_running)
+    """Extract clips from one completed Detect Run."""
+    source = _load_clip_input_for_detect(conn, detect_id)
     return extract_clips(source, config=config)
 
 
-def _load_clip_input_for_run(
+def _load_clip_input_for_detect(
     conn: object,
-    run_id: str,
-    *,
-    allow_running: bool = False,
+    detect_id: str,
 ) -> ClipInput:
-    run_row = fetch_run_row(conn, run_id)
-    accepted_statuses = {"completed", "running"} if allow_running else {"completed"}
-    if run_row.status not in accepted_statuses:
-        raise ValueError(f"pipeline run {run_id} is not completed")
+    run_row = fetch_detect_row(conn, detect_id)
+    if run_row.status != "completed":
+        raise ValueError(f"Detect Run {detect_id} is not completed")
 
     params = run_row.parameters
     table = str(params.get("target_table", "trajectory_points"))
-    skip_clean = bool(params.get("skip_clean", False))
-
-    intersections = fetch_intersections(conn, run_id)
-
-    if skip_clean:
-        grouped = fetch_raw_points(conn, table, run_row.source_id)
-        grouped = _split_by_time_gaps(
-            grouped,
-            max_gap_s=float(params.get("cleaner_max_gap_s", 120.0)),
-        )
-    else:
-        grouped = fetch_clean_points(conn, table, run_id)
+    intersections = fetch_intersections(conn, detect_id)
+    grouped = fetch_clean_points(conn, table, run_row.clean_id)
 
     return ClipInput(
         intersections=tuple(intersections),
         tracks=_build_clip_tracks(grouped),
-        run_id=run_id,
+        detect_id=detect_id,
     )
-
-
-def _split_by_time_gaps(
-    grouped: dict[tuple[str, int], list[TrajectoryPoint]],
-    *,
-    max_gap_s: float,
-) -> dict[tuple[str, int], list[TrajectoryPoint]]:
-    """Split raw-point groups into subtracks wherever the time gap exceeds *max_gap_s*."""
-    result: dict[tuple[str, int], list[TrajectoryPoint]] = {}
-    for (vehicle_id, _), points in grouped.items():
-        subtrack_index = 1
-        current: list[TrajectoryPoint] = []
-        for point in points:
-            if current and point.timestamp - current[-1].timestamp > max_gap_s:
-                result[(vehicle_id, subtrack_index)] = current
-                subtrack_index += 1
-                current = []
-            current.append(point)
-        if current:
-            result[(vehicle_id, subtrack_index)] = current
-    return result
 
 
 def _build_clip_tracks(
@@ -272,7 +231,7 @@ def _extract_track_clips(
     intersections: tuple[ClipIntersection, ...],
     *,
     include_boundaries: bool,
-    run_id: str | None,
+    detect_id: str | None,
 ) -> tuple[list[TrackClip], int, int, int]:
     events = _crossing_events(track, intersections)
     clips: list[TrackClip] = []
@@ -296,7 +255,7 @@ def _extract_track_clips(
         ordinal = len(clips)
         clips.append(
             TrackClip(
-                clip_id=f"{run_id or 'memory'}:{track.vehicle_id}:{track.trip_id}:{ordinal:04d}",
+                clip_id=f"{detect_id or 'memory'}:{track.vehicle_id}:{track.trip_id}:{ordinal:04d}",
                 vehicle_id=track.vehicle_id,
                 trip_id=track.trip_id,
                 clip_type=clip_type,

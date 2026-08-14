@@ -6,11 +6,14 @@ import unittest
 from dataclasses import replace
 
 from track.v2.db_writer import (
+    create_clean_run,
+    create_detect_run,
+    finish_clean_run,
+    finish_detect_run,
     insert_candidate_intersection_events,
     insert_candidate_intersections,
     insert_intersections,
     insert_tracks_cross,
-    latest_completed_run_id,
 )
 from track.v2.models import (
     CrossTrackCandidate,
@@ -63,7 +66,7 @@ def _cluster(cluster_id: int) -> HotspotCluster:
     )
 
 
-class LatestCompletedRunIdTest(unittest.TestCase):
+class RunRegistryWriterTest(unittest.TestCase):
     class _Cursor:
         def __init__(self, row):
             self.row = row
@@ -85,35 +88,39 @@ class LatestCompletedRunIdTest(unittest.TestCase):
 
     class _Conn:
         def __init__(self, row):
-            self.cursor_instance = LatestCompletedRunIdTest._Cursor(row)
+            self.cursor_instance = RunRegistryWriterTest._Cursor(row)
 
         def cursor(self):
             return self.cursor_instance
 
-    def test_returns_id_and_scopes_by_source(self):
-        conn = self._Conn(("run-abc",))
-
-        result = latest_completed_run_id(conn, source_id="table_x")
-
-        self.assertEqual(result, "run-abc")
-        self.assertIn("source_id = %s", conn.cursor_instance.sql)
-        self.assertIn("parameters->>'skip_clean' = 'false'", conn.cursor_instance.sql)
-        self.assertEqual(conn.cursor_instance.params, ("table_x",))
-
-    def test_no_source_omits_filter(self):
-        conn = self._Conn(("run-1",))
-
-        result = latest_completed_run_id(conn)
-
-        self.assertEqual(result, "run-1")
-        self.assertNotIn("source_id = %s", conn.cursor_instance.sql)
-        self.assertIn("parameters->>'skip_clean' = 'false'", conn.cursor_instance.sql)
-        self.assertEqual(conn.cursor_instance.params, ())
-
-    def test_no_row_returns_none(self):
+    def test_clean_and_detect_runs_have_distinct_ids_and_explicit_parent(self):
         conn = self._Conn(None)
 
-        self.assertIsNone(latest_completed_run_id(conn))
+        clean_id = create_clean_run(
+            conn, source_id="table_x", source_kind="postgres_table",
+            parameters={"target_table": "table_x"},
+        )
+        clean_sql = conn.cursor_instance.sql
+        clean_params = conn.cursor_instance.params
+        detect_id = create_detect_run(
+            conn, clean_id=clean_id, parameters={"window": [2000, 2000]}
+        )
+
+        self.assertNotEqual(clean_id, detect_id)
+        self.assertIn("INSERT INTO clean_runs", clean_sql)
+        self.assertEqual(clean_params[0], clean_id)
+        self.assertIn("INSERT INTO detect_runs", conn.cursor_instance.sql)
+        self.assertEqual(conn.cursor_instance.params[:2], (detect_id, clean_id))
+
+    def test_stage_completion_updates_only_its_registry(self):
+        conn = self._Conn(None)
+
+        finish_clean_run(conn, "clean-1", status="completed")
+        self.assertIn("UPDATE clean_runs", conn.cursor_instance.sql)
+        self.assertEqual(conn.cursor_instance.params, ("completed", "clean-1"))
+        finish_detect_run(conn, "detect-1", status="completed")
+        self.assertIn("UPDATE detect_runs", conn.cursor_instance.sql)
+        self.assertEqual(conn.cursor_instance.params, ("completed", "detect-1"))
 
 
 class InsertIntersectionsTest(unittest.TestCase):
@@ -142,7 +149,7 @@ class InsertIntersectionsTest(unittest.TestCase):
             [incomplete, complete],
             {10: 110, 20: 120},
             {10: _cluster(10), 20: _cluster(20)},
-            run_id="run-1",
+            detect_id="detect-1",
         )
 
         self.assertEqual(result, {20: 1})
@@ -176,20 +183,20 @@ class InsertTracksCrossTest(unittest.TestCase):
         )
         conn = _RecordingConnection()
 
-        written = insert_tracks_cross(conn, [candidate], run_id="run-1")
+        written = insert_tracks_cross(conn, [candidate], detect_id="detect-1")
 
         self.assertEqual(written, 1)
         sql, params = conn.recording_cursor.executions[0]
         self.assertIn("INSERT INTO tracks_cross", sql)
         self.assertIn(
-            "ON CONFLICT (run_id, vehicle_id, from_source_id, from_source_row_key, "
+            "ON CONFLICT (detect_id, vehicle_id, from_source_id, from_source_row_key, "
             "to_source_id, to_source_row_key) DO NOTHING",
             sql,
         )
         self.assertEqual(
             params,
             [
-                "run-1", "A|B", 15.0, 116.0, 39.0, 1.5, 2.5, 0.0, 12.0,
+                "detect-1", "A|B", 15.0, 116.0, 39.0, 1.5, 2.5, 0.0, 12.0,
                 "table_a", "102,105", "table_b", "77,78",
                 "orthogonal_cross_track", 116.0, 39.0,
             ],
@@ -206,12 +213,12 @@ class InsertTracksCrossTest(unittest.TestCase):
         )
         conn = _RecordingConnection()
 
-        insert_tracks_cross(conn, [candidate], run_id="run-1")
-        insert_tracks_cross(conn, [candidate], run_id="run-2")
+        insert_tracks_cross(conn, [candidate], detect_id="detect-1")
+        insert_tracks_cross(conn, [candidate], detect_id="detect-2")
 
         self.assertEqual(
             [params[0] for _, params in conn.recording_cursor.executions],
-            ["run-1", "run-2"],
+            ["detect-1", "detect-2"],
         )
 
 
@@ -234,21 +241,21 @@ class CandidateIntersectionEventsTest(unittest.TestCase):
         conn = _RecordingConnection()
 
         insert_candidate_intersection_events(
-            conn, [cluster], {5: 55}, {0: 100, 1: 101}, run_id="run-1",
+            conn, [cluster], {5: 55}, {0: 100, 1: 101}, detect_id="detect-1",
         )
 
         _, params = conn.recording_cursor.executions[0]
         self.assertEqual(
             params,
             [
-                "run-1", 55, "turn", 101, None, None, None, None,
-                "run-1", 55, "orthogonal_cross_track", None, None, None, None, None,
+                "detect-1", 55, "turn", 101, None, None, None, None,
+                "detect-1", 55, "orthogonal_cross_track", None, None, None, None, None,
             ],
         )
 
 
 class CandidateIntersectionSourcesTest(unittest.TestCase):
-    def test_sources_column_contains_data_source_ids_and_run_id(self) -> None:
+    def test_sources_column_contains_data_source_ids_and_detect_id(self) -> None:
         cluster = replace(
             _cluster(5),
             algorithm_sources=("turn", "orthogonal"),
@@ -256,11 +263,11 @@ class CandidateIntersectionSourcesTest(unittest.TestCase):
         )
         conn = _RecordingConnection()
 
-        insert_candidate_intersections(conn, [cluster], run_id="run-1")
+        insert_candidate_intersections(conn, [cluster], detect_id="detect-1")
 
         sql, params = conn.recording_cursor.executions[0]
-        self.assertIn("run_id", sql)
-        self.assertEqual(params[0], "run-1")
+        self.assertIn("detect_id", sql)
+        self.assertEqual(params[0], "detect-1")
         self.assertEqual(params[8], '["C:/input-a.csv", "project_raw_points"]')
 
 

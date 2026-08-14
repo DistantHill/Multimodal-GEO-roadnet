@@ -194,6 +194,14 @@ class IntersectReportTest(unittest.TestCase):
         self.assertEqual(d["complete_intersection_source_counts"], {})
 
 
+class IntersectConfigStageIdentityTest(unittest.TestCase):
+    def test_config_uses_clean_id_without_run_id_alias(self):
+        config = IntersectConfig(clean_id="clean-9")
+
+        self.assertEqual(config.clean_id, "clean-9")
+        self.assertFalse(hasattr(config, "run_id"))
+
+
 # ── Group by vehicle tests ─────────────────────────────────────────────
 
 
@@ -574,15 +582,15 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             window,
             table="custom_points",
             source_id="source-A",
-            run_id="run-9",
+            clean_id="clean-9",
             telemetry=None,
         )
 
         self.assertIn("FROM custom_points", conn.cursor_instance.query)
-        self.assertIn("AND run_id = %s", conn.cursor_instance.query)
+        self.assertIn("AND clean_id = %s", conn.cursor_instance.query)
         self.assertEqual(
             conn.cursor_instance.params,
-            ["source-A", -1.0, -2.0, 3.0, 4.0, -1.0, -2.0, 3.0, 4.0, "run-9"],
+            ["source-A", -1.0, -2.0, 3.0, 4.0, -1.0, -2.0, 3.0, 4.0, "clean-9"],
         )
         self.assertEqual(len(points), 1)
         point = points[0]
@@ -592,7 +600,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
         self.assertEqual(point.point_ref, PointRef("source-A", "row-7", stable=True))
         self.assertEqual(point.extra, {"tag": "kept"})
 
-    def test_query_kept_mode_joins_clean_table_and_binds_run_id_first(self):
+    def test_query_kept_mode_joins_frozen_clean_members_without_active_filter(self):
         conn = self._Connection(self._ROWS)
         window = SpatialWindow(-1.0, -2.0, 3.0, 4.0)
 
@@ -602,20 +610,21 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             table="tp",
             kept_table="ktp",
             source_id="source-A",
-            run_id="run-9",
+            clean_id="clean-9",
             telemetry=None,
         )
 
         self.assertIn("FROM ktp AS ktp", conn.cursor_instance.query)
         self.assertIn("JOIN tp AS tp ON tp.id = ktp.trajectory_point_id", conn.cursor_instance.query)
-        self.assertIn("ktp.run_id = %s", conn.cursor_instance.query)
+        self.assertIn("ktp.clean_id = %s", conn.cursor_instance.query)
+        self.assertNotIn("is_active", conn.cursor_instance.query)
         self.assertEqual(
             conn.cursor_instance.params,
-            ["run-9", -1.0, -2.0, 3.0, 4.0, -1.0, -2.0, 3.0, 4.0, "run-9"],
+            ["clean-9", -1.0, -2.0, 3.0, 4.0, -1.0, -2.0, 3.0, 4.0, "clean-9"],
         )
         self.assertEqual(len(points), 1)
 
-    def test_query_kept_mode_requires_run_id(self):
+    def test_query_kept_mode_requires_clean_id(self):
         conn = self._Connection(self._ROWS)
 
         with self.assertRaises(ValueError):
@@ -623,7 +632,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
                 conn,
                 SpatialWindow(-1.0, -2.0, 3.0, 4.0),
                 kept_table="ktp",
-                run_id=None,
+                clean_id=None,
             )
 
     def test_query_with_telemetry_records_disjoint_query_and_materialization_phases(self):

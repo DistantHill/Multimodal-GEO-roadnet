@@ -1,22 +1,21 @@
-"""Replay one persisted ``track.v2`` result back to verified source rows.
+"""Replay one persisted v2 result back to verified source rows.
 
-ZH: 该 CLI 只解析目标和数据库连接参数，并输出可序列化的回放链路 JSON。
-EN: This CLI only parses a target and connection options, then prints the
-    serializable replay trace as JSON.
-
-Usage / 用法::
-
-    python -m track.v2.cli.replay --run-id <uuid> --kind intersection --id 42
+Clean artifacts use ``--clean-id``; Detect artifacts use ``--detect-id``;
+``trajectory_point`` has no stage identifier.
 """
 
 from __future__ import annotations
 
 import argparse
 import getpass
+import uuid
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
+from ..logger import init_logger, shutdown_logger
 from ..output import error_payload, print_json
 from ..replay import (
+    CLEAN_REPLAY_KINDS,
+    DETECT_REPLAY_KINDS,
     PostgresReplayStore,
     PostgresSourceRowResolver,
     ReplayService,
@@ -24,14 +23,40 @@ from ..replay import (
 )
 
 
+def _uuid_arg(value: str) -> str:
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected a UUID") from exc
+
+
+def _target_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> ReplayTarget:
+    if args.kind == "trajectory_point":
+        if args.clean_id or args.detect_id:
+            parser.error("trajectory_point does not take a stage ID")
+        return ReplayTarget(args.kind, args.id)
+    if args.kind in CLEAN_REPLAY_KINDS:
+        if args.clean_id is None:
+            parser.error(f"{args.kind} requires --clean-id")
+        return ReplayTarget(args.kind, args.id, clean_id=args.clean_id)
+    if args.kind in DETECT_REPLAY_KINDS:
+        if args.detect_id is None:
+            parser.error(f"{args.kind} requires --detect-id")
+        return ReplayTarget(args.kind, args.id, detect_id=args.detect_id)
+    parser.error(f"unsupported replay kind: {args.kind}")
+    raise AssertionError("argparse.error always exits")
+
+
 def main() -> int:
     defaults = default_postgres_config()
     parser = argparse.ArgumentParser(
-        description="逐级回放一个落盘 v2 实体到经校验的原始行 / Replay one persisted v2 entity to verified source rows."
+        description="Replay one persisted v2 entity to verified source rows."
     )
-    parser.add_argument("--run-id", required=True, help="运行 UUID / Pipeline run UUID.")
-    parser.add_argument("--kind", required=True, help="落盘实体类型 / Persisted entity kind.")
-    parser.add_argument("--id", required=True, type=int, help="数据库主键 / Database primary key.")
+    stage_group = parser.add_mutually_exclusive_group()
+    stage_group.add_argument("--clean-id", type=_uuid_arg, help="Clean Run UUID.")
+    stage_group.add_argument("--detect-id", type=_uuid_arg, help="Detect Run UUID.")
+    parser.add_argument("--kind", required=True, help="Persisted entity kind.")
+    parser.add_argument("--id", required=True, type=int, help="Database primary key.")
     parser.add_argument("--host", default=defaults.host)
     parser.add_argument("--port", type=int, default=defaults.port)
     parser.add_argument("--database", default=defaults.database)
@@ -40,6 +65,7 @@ def main() -> int:
     parser.add_argument("--connect-timeout", type=int, default=defaults.connect_timeout)
     parser.add_argument("--sslmode", default=defaults.sslmode)
     args = parser.parse_args()
+    target = _target_from_args(parser, args)
 
     config = PostgresConfig(
         host=args.host,
@@ -50,22 +76,26 @@ def main() -> int:
         connect_timeout=args.connect_timeout,
         sslmode=args.sslmode,
     )
+    init_logger()
     try:
-        with pg_connect(config) as conn:
-            service = ReplayService(
-                PostgresReplayStore(conn),
-                source_row_resolver=PostgresSourceRowResolver(conn),
-            )
-            trace = service.replay(ReplayTarget(args.kind, args.id, args.run_id))
-    except (RuntimeError, ValueError) as exc:
-        print_json(error_payload("invalid_request", str(exc)))
-        return 2
-    except Exception as exc:
-        print_json(error_payload("unavailable", str(exc)))
-        return 1
+        try:
+            with pg_connect(config) as conn:
+                service = ReplayService(
+                    PostgresReplayStore(conn),
+                    source_row_resolver=PostgresSourceRowResolver(conn),
+                )
+                trace = service.replay(target)
+        except (RuntimeError, ValueError) as exc:
+            print_json(error_payload("invalid_request", str(exc)))
+            return 2
+        except Exception as exc:
+            print_json(error_payload("unavailable", str(exc)))
+            return 1
 
-    print_json(trace.as_dict())
-    return 0 if trace.status == "ok" else 1
+        print_json(trace.as_dict())
+        return 0 if trace.status == "ok" else 1
+    finally:
+        shutdown_logger()
 
 
 if __name__ == "__main__":

@@ -16,10 +16,12 @@ Public:
 
 from __future__ import annotations
 
+import csv
 import json
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Protocol, overload
 
 from .models import (
@@ -32,7 +34,7 @@ from .models import (
     TrackModel,
     TrajectoryPoint,
 )
-from .sources import source_row_hash
+from .sources import open_text_auto, source_row_hash
 
 
 @dataclass(frozen=True)
@@ -41,7 +43,8 @@ class ReplayTarget(TrackModel):
 
     kind: str
     id: int
-    run_id: str | None
+    clean_id: str | None = None
+    detect_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,13 +110,13 @@ class ReplayService:
         nodes: list[ReplayNode] = []
         edges: list[ReplayEdge] = []
         errors: list[ReplayError] = []
-        visited: set[tuple[str, int, str | None]] = set()
+        visited: set[tuple[str, int, str | None, str | None]] = set()
 
         def fail(code: str, message: str, failed_target: ReplayTarget) -> None:
             errors.append(ReplayError(code, message, failed_target))
 
         def visit(current: ReplayTarget, depth: int) -> None:
-            key = (current.kind, current.id, current.run_id)
+            key = (current.kind, current.id, current.clean_id, current.detect_id)
             if key in visited:
                 return
             visited.add(key)
@@ -123,24 +126,20 @@ class ReplayService:
                 return
 
             raw_row: dict[str, Any] | None = None
-            if current.kind == "trajectory_point":
+            if current.kind in {"trajectory_point", "excluded_point"}:
                 source_id = str(row.get("source_id") or "")
                 source_row_key = str(row.get("source_row_key") or "")
                 expected_hash = str(row.get("source_row_hash") or "")
-                # PG mode: trajectory_points stores source_id + source_row_key (DB PK)
-                # but may omit source_row_hash (expensive SHA-256 skipped for throughput).
-                # When provenance columns are absent OR the hash is empty, skip verification.
+                # Persisted raw provenance may omit the hash when hashing was skipped.
                 if not source_id and not source_row_key:
-                    pass  # no provenance metadata available — skip verification
-                elif not expected_hash:
-                    pass  # PG mode: stable PK, hash intentionally omitted — skip verification
+                    pass  # No provenance metadata is available for verification.
                 else:
                     try:
                         candidate = self._source_row_resolver(source_id, source_row_key)
                     except Exception as exc:
                         fail("source_row_unavailable", str(exc), current)
                     else:
-                        if source_row_hash(candidate) == expected_hash:
+                        if not expected_hash or source_row_hash(candidate) == expected_hash:
                             raw_row = candidate
                         else:
                             fail(
@@ -184,7 +183,12 @@ _ENTITY_TABLES = {
     "intersection": "intersections",
     "entry_exit_point": "entry_exit_points",
 }
-_RUN_SCOPED_KINDS = frozenset(_ENTITY_TABLES) - {"trajectory_point"}
+CLEAN_REPLAY_KINDS = frozenset({
+    "excluded_point", "kept_trajectory_point", "injected_point",
+})
+DETECT_REPLAY_KINDS = frozenset(_ENTITY_TABLES) - CLEAN_REPLAY_KINDS - {
+    "trajectory_point",
+}
 
 
 class PostgresReplayStore:
@@ -196,38 +200,59 @@ class PostgresReplayStore:
 
     def __init__(self, conn: Any) -> None:
         self._conn = conn
+        self._clean_context_cache: dict[str, tuple[str, str]] = {}
+        self._raw_context: dict[int, tuple[str, str, str]] = {}
 
     def get_entity(self, target: ReplayTarget) -> dict[str, Any] | None:
         table = _ENTITY_TABLES.get(target.kind)
         if table is None:
             raise ValueError(f"unsupported replay kind: {target.kind}")
+        raw_context = self._raw_context.get(target.id)
+        if target.kind == "trajectory_point" and raw_context is not None:
+            table = raw_context[2]
+        if not _is_safe_table_name(table):
+            raise ValueError(f"unsupported target table: {table}")
         sql = f"SELECT to_jsonb(t) FROM {table} AS t WHERE id = %s"
         params: list[Any] = [target.id]
-        if target.kind in _RUN_SCOPED_KINDS and target.run_id is not None:
-            sql += " AND run_id = %s"
-            params.append(target.run_id)
+        if target.kind in CLEAN_REPLAY_KINDS and target.clean_id is not None:
+            sql += " AND clean_id = %s"
+            params.append(target.clean_id)
+        elif target.kind in DETECT_REPLAY_KINDS and target.detect_id is not None:
+            sql += " AND detect_id = %s"
+            params.append(target.detect_id)
         with self._conn.cursor() as cur:
             cur.execute(sql, params)
             row = cur.fetchone()
         if row is None:
             return None
         value = row[0] if isinstance(row, (list, tuple)) else row
-        if isinstance(value, str):
-            return json.loads(value)
-        return dict(value)
+        result = json.loads(value) if isinstance(value, str) else dict(value)
+        if target.kind == "trajectory_point" and raw_context is not None:
+            result["source_id"] = raw_context[0]
+            result["source_row_key"] = raw_context[1]
+        return result
 
     def parent_refs(
         self,
         target: ReplayTarget,
         row: dict[str, Any],
     ) -> list[tuple[str, ReplayTarget]]:
-        run_id = target.run_id
+        clean_id = target.clean_id
+        detect_id = target.detect_id
         kind = target.kind
         parents: list[tuple[str, ReplayTarget]] = []
 
-        def add(kind_: str, entity_id: Any, relation: str, *, source: bool = False) -> None:
+        def add(kind_: str, entity_id: Any, relation: str) -> None:
             if entity_id is not None:
-                parents.append((relation, ReplayTarget(kind_, int(entity_id), None if source else run_id)))
+                parents.append((
+                    relation,
+                    ReplayTarget(
+                        kind_,
+                        int(entity_id),
+                        clean_id=clean_id if kind_ in CLEAN_REPLAY_KINDS else None,
+                        detect_id=detect_id if kind_ in DETECT_REPLAY_KINDS else None,
+                    ),
+                ))
 
         if kind == "intersection":
             add("candidate_intersection", row.get("candidate_intersection_id"), "candidate")
@@ -235,7 +260,7 @@ class PostgresReplayStore:
                 "SELECT id FROM entry_exit_points WHERE intersection_id = %s",
                 target.id,
                 "entry_exit_point",
-                run_id,
+                detect_id,
                 "entry_exit_observation",
             ))
         elif kind == "candidate_intersection":
@@ -244,7 +269,7 @@ class PostgresReplayStore:
                 "WHERE candidate_intersection_id = %s",
                 target.id,
                 "candidate_intersection_event",
-                run_id,
+                detect_id,
                 "member_event",
             ))
             parents.extend(self._children(
@@ -252,7 +277,7 @@ class PostgresReplayStore:
                 "WHERE candidate_intersection_id = %s",
                 target.id,
                 "candidate_entry_exit_point",
-                run_id,
+                detect_id,
                 "crossing",
             ))
         elif kind == "candidate_intersection_event":
@@ -261,12 +286,14 @@ class PostgresReplayStore:
             else:
                 self._add_segment_source_points(
                     parents,
+                    target,
                     row.get("from_source_id"),
                     row.get("from_source_row_key"),
                     "input_from",
                 )
                 self._add_segment_source_points(
                     parents,
+                    target,
                     row.get("to_source_id"),
                     row.get("to_source_row_key"),
                     "input_to",
@@ -279,12 +306,14 @@ class PostgresReplayStore:
             if row.get("from_source_id") and row.get("from_source_row_key"):
                 self._add_segment_source_points(
                     parents,
+                    target,
                     row.get("from_source_id"),
                     row.get("from_source_row_key"),
                     "input_from",
                 )
                 self._add_segment_source_points(
                     parents,
+                    target,
                     row.get("to_source_id"),
                     row.get("to_source_row_key"),
                     "input_to",
@@ -294,6 +323,7 @@ class PostgresReplayStore:
                 # replay their single raw point when that legacy field exists.
                 self._add_source_point(
                     parents,
+                    target,
                     row.get("tp_source_id"),
                     row.get("tp_source_row_key"),
                     "input_point",
@@ -301,31 +331,39 @@ class PostgresReplayStore:
         elif kind == "candidate_entry_exit_point":
             self._add_source_point(
                 parents,
+                target,
                 row.get("from_source_id"),
                 row.get("from_source_row_key"),
                 "segment_start",
             )
             self._add_source_point(
                 parents,
+                target,
                 row.get("to_source_id"),
                 row.get("to_source_row_key"),
                 "segment_end",
             )
         elif kind == "excluded_point":
-            self._add_source_point(
-                parents, row.get("source_id"), row.get("source_row_key"), "excluded_raw_point"
-            )
+            pass
         elif kind == "kept_trajectory_point":
-            add("trajectory_point", row.get("trajectory_point_id"), "kept_raw_point", source=True)
+            raw_target = self._raw_target(
+                target,
+                row.get("source_id"),
+                row.get("source_row_key"),
+                row.get("trajectory_point_id"),
+            )
+            parents.append(("kept_raw_point", raw_target))
         elif kind == "injected_point":
             self._add_source_point(
                 parents,
+                target,
                 row.get("from_source_id"),
                 row.get("from_source_row_key"),
                 "from_raw_point",
             )
             self._add_source_point(
                 parents,
+                target,
                 row.get("to_source_id"),
                 row.get("to_source_row_key"),
                 "to_raw_point",
@@ -333,12 +371,14 @@ class PostgresReplayStore:
         elif kind == "tracks_cross":
             self._add_segment_source_points(
                 parents,
+                target,
                 row.get("from_source_id"),
                 row.get("from_source_row_key"),
                 "from_segment",
             )
             self._add_segment_source_points(
                 parents,
+                target,
                 row.get("to_source_id"),
                 row.get("to_source_row_key"),
                 "to_segment",
@@ -350,39 +390,49 @@ class PostgresReplayStore:
         sql: str,
         parent_id: int,
         kind: str,
-        run_id: str | None,
+        detect_id: str | None,
         relation: str,
     ) -> list[tuple[str, ReplayTarget]]:
         with self._conn.cursor() as cur:
             cur.execute(sql, (parent_id,))
             rows = cur.fetchall()
         return [
-            (relation, ReplayTarget(kind, int(row[0]), run_id))
+            (relation, ReplayTarget(kind, int(row[0]), detect_id=detect_id))
             for row in rows
         ]
 
     def _add_source_point(
         self,
         parents: list[tuple[str, ReplayTarget]],
+        owner: ReplayTarget,
         source_id: Any,
         source_row_key: Any,
         relation: str,
     ) -> None:
         if not source_id or not source_row_key:
             return
-        # PG-only mode: source_row_key is the trajectory_points.id value
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT id FROM trajectory_points WHERE id = %s",
-                (int(source_row_key),),
-            )
-            row = cur.fetchone()
-        if row is not None:
-            parents.append((relation, ReplayTarget("trajectory_point", int(row[0]), None)))
+        clean_id, source_kind, _target_table = self._clean_context(owner)
+        if source_kind == "postgres_table":
+            raw_id = int(source_row_key)
+        else:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT trajectory_point_id FROM kept_trajectory_points "
+                    "WHERE clean_id = %s AND source_id = %s AND source_row_key = %s",
+                    (clean_id, str(source_id), str(source_row_key)),
+                )
+                row = cur.fetchone()
+            if row is None:
+                return
+            raw_id = int(row[0])
+        parents.append((relation, self._raw_target(
+            owner, source_id, source_row_key, raw_id,
+        )))
 
     def _add_segment_source_points(
         self,
         parents: list[tuple[str, ReplayTarget]],
+        owner: ReplayTarget,
         source_id: Any,
         source_row_keys: Any,
         relation: str,
@@ -390,16 +440,63 @@ class PostgresReplayStore:
         if not source_id or not source_row_keys:
             return
         for ordinal, key in enumerate(str(source_row_keys).split(",")):
-            self._add_source_point(parents, source_id, key, f"{relation}_{ordinal}")
+            self._add_source_point(
+                parents, owner, source_id, key, f"{relation}_{ordinal}"
+            )
+
+    def _raw_target(
+        self,
+        owner: ReplayTarget,
+        source_id: Any,
+        source_row_key: Any,
+        raw_id: Any,
+    ) -> ReplayTarget:
+        _clean_id, _source_kind, target_table = self._clean_context(owner)
+        raw_id = int(raw_id)
+        self._raw_context[raw_id] = (
+            str(source_id), str(source_row_key), target_table,
+        )
+        return ReplayTarget("trajectory_point", raw_id)
+
+    def _clean_context(self, owner: ReplayTarget) -> tuple[str, str, str]:
+        if owner.clean_id is not None:
+            clean_id = owner.clean_id
+        elif owner.detect_id is not None:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT clean_id FROM detect_runs WHERE id = %s",
+                    (owner.detect_id,),
+                )
+                clean_id = str(cur.fetchone()[0])
+        else:
+            raise ValueError("stage artifact requires a Clean or Detect Run id")
+        cached = self._clean_context_cache.get(clean_id)
+        if cached is None:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT source_kind, parameters->>'target_table' "
+                    "FROM clean_runs WHERE id = %s",
+                    (clean_id,),
+                )
+                row = cur.fetchone()
+            if row is None:
+                raise ValueError(f"unknown Clean Run: {clean_id}")
+            cached = (str(row[0]), str(row[1]))
+            self._clean_context_cache[clean_id] = cached
+        return clean_id, cached[0], cached[1]
 
 
 class PostgresSourceRowResolver:
-    """Resolve PostgreSQL-table source ids at replay time."""
+    """Resolve CSV paths or project PostgreSQL-table source ids at replay time."""
 
     def __init__(self, conn: Any) -> None:
         self._conn = conn
+        self._csv_rows: dict[Path, tuple[int, int, dict[str, dict[str, Any]]]] = {}
 
     def __call__(self, source_id: str, source_row_key: str) -> dict[str, Any]:
+        path = Path(source_id)
+        if path.is_file():
+            return self._csv_row(path, source_row_key)
         if not _is_safe_table_name(source_id):
             raise ValueError(f"unsupported source_id: {source_id}")
         with self._conn.cursor() as cur:
@@ -409,6 +506,28 @@ class PostgresSourceRowResolver:
             raise ValueError(f"source row not found: {source_id}:{source_row_key}")
         value = row[0] if isinstance(row, (list, tuple)) else row
         return json.loads(value) if isinstance(value, str) else dict(value)
+
+    def _csv_row(self, path: Path, source_row_key: str) -> dict[str, Any]:
+        row_number = int(source_row_key)
+        stat = path.stat()
+        version = (stat.st_mtime_ns, stat.st_size)
+        cached = self._csv_rows.get(path)
+        if cached is None or cached[:2] != version:
+            rows: dict[str, dict[str, Any]] = {}
+            with open_text_auto(path, newline="") as source_file:
+                reader = csv.DictReader(source_file)
+                for current_number, row in enumerate(reader, start=2):
+                    rows[str(current_number)] = {
+                        str(key): "" if value is None else str(value)
+                        for key, value in row.items()
+                    }
+            self._csv_rows[path] = (*version, rows)
+        else:
+            rows = cached[2]
+        try:
+            return rows[str(row_number)]
+        except KeyError as exc:
+            raise ValueError(f"source row not found: {path}:{source_row_key}") from exc
 
 
 def _is_safe_table_name(value: str) -> bool:

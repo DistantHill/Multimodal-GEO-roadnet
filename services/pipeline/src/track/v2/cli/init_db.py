@@ -20,9 +20,11 @@ from __future__ import annotations
 import argparse
 import getpass
 import re
+from pathlib import Path
 from typing import Any
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
+from ..db.legacy_migration import load_legacy_clean_map, migrate_legacy_pipeline_runs
 from ..logger import init_logger, shutdown_logger
 
 # ── DDL statements in pipeline dependency order ─────────────────────
@@ -30,11 +32,21 @@ from ..logger import init_logger, shutdown_logger
 # EN: Ordered by pipeline stage and FK dependency — referenced tables first.
 
 DDL_STATEMENTS: list[tuple[str, str]] = [
-    ("pipeline_runs", """
-        CREATE TABLE IF NOT EXISTS pipeline_runs (
+    ("clean_runs", """
+        CREATE TABLE IF NOT EXISTS clean_runs (
             id              UUID PRIMARY KEY,
             source_id       TEXT NOT NULL,
             source_kind     TEXT NOT NULL,
+            parameters      JSONB NOT NULL DEFAULT '{}',
+            status          TEXT NOT NULL,
+            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at     TIMESTAMPTZ
+        )
+    """),
+    ("detect_runs", """
+        CREATE TABLE IF NOT EXISTS detect_runs (
+            id              UUID PRIMARY KEY,
+            clean_id        UUID NOT NULL REFERENCES clean_runs(id),
             parameters      JSONB NOT NULL DEFAULT '{}',
             status          TEXT NOT NULL,
             started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -63,7 +75,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("excluded_points", """
         CREATE TABLE IF NOT EXISTS excluded_points (
             id              BIGSERIAL PRIMARY KEY,
-            run_id          UUID NOT NULL REFERENCES pipeline_runs(id),
+            clean_id        UUID NOT NULL REFERENCES clean_runs(id),
             source_id       TEXT NOT NULL,
             source_row_key  TEXT NOT NULL,
             reason          TEXT NOT NULL,
@@ -78,7 +90,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("kept_trajectory_points", """
         CREATE TABLE IF NOT EXISTS kept_trajectory_points (
             id                      BIGSERIAL PRIMARY KEY,
-            run_id                  UUID NOT NULL REFERENCES pipeline_runs(id),
+            clean_id                UUID NOT NULL REFERENCES clean_runs(id),
             trajectory_point_id     BIGINT NOT NULL,
             source_id               TEXT NOT NULL,
             source_row_key          TEXT NOT NULL,
@@ -91,7 +103,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("injected_points", """
         CREATE TABLE IF NOT EXISTS injected_points (
             id                  BIGSERIAL PRIMARY KEY,
-            run_id              UUID NOT NULL REFERENCES pipeline_runs(id),
+            clean_id            UUID NOT NULL REFERENCES clean_runs(id),
             vehicle_id          TEXT NOT NULL,
             timestamp           DOUBLE PRECISION NOT NULL,
             lon                 DOUBLE PRECISION NOT NULL,
@@ -116,7 +128,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("tracks_cross", """
         CREATE TABLE IF NOT EXISTS tracks_cross (
             id                  BIGSERIAL PRIMARY KEY,
-            run_id              UUID NOT NULL REFERENCES pipeline_runs(id),
+            detect_id           UUID NOT NULL REFERENCES detect_runs(id),
             vehicle_id          TEXT NOT NULL,
             timestamp           DOUBLE PRECISION NOT NULL,
             lon                 DOUBLE PRECISION NOT NULL,
@@ -142,7 +154,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
     ("turn_events", """
         CREATE TABLE IF NOT EXISTS turn_events (
             id                  BIGSERIAL PRIMARY KEY,
-            run_id              UUID NOT NULL REFERENCES pipeline_runs(id),
+            detect_id           UUID NOT NULL REFERENCES detect_runs(id),
             event_id            INTEGER NOT NULL,
             vehicle_id          TEXT NOT NULL,
             timestamp           DOUBLE PRECISION NOT NULL,
@@ -167,13 +179,14 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             origin_lon          DOUBLE PRECISION NOT NULL,
             origin_lat          DOUBLE PRECISION NOT NULL,
             g_star_z            DOUBLE PRECISION,
-            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (id, detect_id)
         )
     """),
     ("candidate_intersections", """
         CREATE TABLE IF NOT EXISTS candidate_intersections (
             id                  BIGSERIAL PRIMARY KEY,
-            run_id              UUID NOT NULL REFERENCES pipeline_runs(id),
+            detect_id           UUID NOT NULL REFERENCES detect_runs(id),
             cluster_id          INTEGER NOT NULL,
             centroid_x          DOUBLE PRECISION NOT NULL,
             centroid_y          DOUBLE PRECISION NOT NULL,
@@ -192,27 +205,32 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             total_event_count   INTEGER NOT NULL DEFAULT 0,
             origin_lon          DOUBLE PRECISION NOT NULL,
             origin_lat          DOUBLE PRECISION NOT NULL,
-            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (id, detect_id)
         )
     """),
     ("candidate_intersection_events", """
         CREATE TABLE IF NOT EXISTS candidate_intersection_events (
             id                          BIGSERIAL PRIMARY KEY,
-            run_id                      UUID NOT NULL REFERENCES pipeline_runs(id),
-            candidate_intersection_id   BIGINT NOT NULL REFERENCES candidate_intersections(id),
+            detect_id                   UUID NOT NULL REFERENCES detect_runs(id),
+            candidate_intersection_id   BIGINT NOT NULL,
             event_kind                  TEXT NOT NULL DEFAULT 'turn',
-            turn_event_id               BIGINT REFERENCES turn_events(id),
+            turn_event_id               BIGINT,
             from_source_id              TEXT,
             from_source_row_key         TEXT,
             to_source_id                TEXT,
-            to_source_row_key           TEXT
+            to_source_row_key           TEXT,
+            FOREIGN KEY (candidate_intersection_id, detect_id)
+                REFERENCES candidate_intersections(id, detect_id),
+            FOREIGN KEY (turn_event_id, detect_id)
+                REFERENCES turn_events(id, detect_id)
         )
     """),
     ("candidate_entry_exit_points", """
         CREATE TABLE IF NOT EXISTS candidate_entry_exit_points (
             id                          BIGSERIAL PRIMARY KEY,
-            run_id                      UUID NOT NULL REFERENCES pipeline_runs(id),
-            candidate_intersection_id   BIGINT NOT NULL REFERENCES candidate_intersections(id),
+            detect_id                   UUID NOT NULL REFERENCES detect_runs(id),
+            candidate_intersection_id   BIGINT NOT NULL,
             cluster_id                  INTEGER NOT NULL,
             vehicle_id                  TEXT NOT NULL,
             segment_index               INTEGER NOT NULL,
@@ -231,14 +249,17 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             from_source_row_key         TEXT,
             to_source_id                TEXT,
             to_source_row_key           TEXT,
-            created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (id, detect_id),
+            FOREIGN KEY (candidate_intersection_id, detect_id)
+                REFERENCES candidate_intersections(id, detect_id)
         )
     """),
     ("intersections", """
         CREATE TABLE IF NOT EXISTS intersections (
             id                          BIGSERIAL PRIMARY KEY,
-            run_id                      UUID NOT NULL REFERENCES pipeline_runs(id),
-            candidate_intersection_id   BIGINT NOT NULL REFERENCES candidate_intersections(id),
+            detect_id                   UUID NOT NULL REFERENCES detect_runs(id),
+            candidate_intersection_id   BIGINT NOT NULL,
             cluster_id                  INTEGER NOT NULL,
             branch_centers_deg          JSONB NOT NULL DEFAULT '[]',
             transition_counts           JSONB NOT NULL DEFAULT '{}',
@@ -247,14 +268,17 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             reason                      TEXT NOT NULL,
             clip_radius_m               DOUBLE PRECISION NOT NULL,
             geom                        geometry(Polygon, 4326),  -- app-layer: derived from candidate_intersections
-            created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (id, detect_id),
+            FOREIGN KEY (candidate_intersection_id, detect_id)
+                REFERENCES candidate_intersections(id, detect_id)
         )
     """),
     ("entry_exit_points", """
         CREATE TABLE IF NOT EXISTS entry_exit_points (
             id                  BIGSERIAL PRIMARY KEY,
-            run_id              UUID NOT NULL REFERENCES pipeline_runs(id),
-            intersection_id     BIGINT NOT NULL REFERENCES intersections(id),
+            detect_id           UUID NOT NULL REFERENCES detect_runs(id),
+            intersection_id     BIGINT NOT NULL,
             cluster_id          INTEGER NOT NULL,
             vehicle_id          TEXT NOT NULL,
             entry_branch_angle  DOUBLE PRECISION NOT NULL,
@@ -262,9 +286,15 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             inbound_bearing     DOUBLE PRECISION NOT NULL,
             outbound_bearing    DOUBLE PRECISION NOT NULL,
             turn_deg            DOUBLE PRECISION NOT NULL,
-            entry_crossing_id   BIGINT REFERENCES candidate_entry_exit_points(id),
-            exit_crossing_id    BIGINT REFERENCES candidate_entry_exit_points(id),
-            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            entry_crossing_id   BIGINT,
+            exit_crossing_id    BIGINT,
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            FOREIGN KEY (intersection_id, detect_id)
+                REFERENCES intersections(id, detect_id),
+            FOREIGN KEY (entry_crossing_id, detect_id)
+                REFERENCES candidate_entry_exit_points(id, detect_id),
+            FOREIGN KEY (exit_crossing_id, detect_id)
+                REFERENCES candidate_entry_exit_points(id, detect_id)
         )
     """),
 ]
@@ -272,6 +302,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
 # ── Index DDL (separate for cleaner error reporting) ────────────────
 
 INDEX_STATEMENTS: list[tuple[str, str]] = [
+    ("idx_clean_runs_source", "CREATE INDEX IF NOT EXISTS idx_clean_runs_source ON clean_runs(source_id, started_at DESC)"),
+    ("idx_detect_runs_clean", "CREATE INDEX IF NOT EXISTS idx_detect_runs_clean ON detect_runs(clean_id, started_at DESC)"),
     # ── trajectory_points ──
     ("idx_tp_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_tp_vehicle_ts ON trajectory_points(vehicle_id, timestamp)"),
     ("idx_tp_geom",            "CREATE INDEX IF NOT EXISTS idx_tp_geom ON trajectory_points USING GIST (geom)"),
@@ -279,42 +311,43 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     # ── excluded_points ──
     ("idx_ep_reason",          "CREATE INDEX IF NOT EXISTS idx_ep_reason ON excluded_points(reason)"),
     ("idx_ep_geom",            "CREATE INDEX IF NOT EXISTS idx_ep_geom ON excluded_points USING GIST (geom)"),
+    ("idx_ep_clean",           "CREATE INDEX IF NOT EXISTS idx_ep_clean ON excluded_points(clean_id)"),
     # ── kept_trajectory_points ──
     ("idx_ktp_tp_id",          "CREATE INDEX IF NOT EXISTS idx_ktp_tp_id ON kept_trajectory_points(trajectory_point_id)"),
-    ("idx_ktp_vehicle_sub",    "CREATE INDEX IF NOT EXISTS idx_ktp_vehicle_sub ON kept_trajectory_points(vehicle_id, subtrack_index, sequence_in_subtrack)"),
+    ("idx_ktp_vehicle_sub",    "CREATE INDEX IF NOT EXISTS idx_ktp_vehicle_sub ON kept_trajectory_points(clean_id, vehicle_id, subtrack_index, sequence_in_subtrack)"),
     # ── injected_points ──
-    ("idx_ip_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_ip_vehicle_ts ON injected_points(vehicle_id, timestamp)"),
+    ("idx_ip_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_ip_vehicle_ts ON injected_points(clean_id, vehicle_id, timestamp)"),
     ("idx_ip_geom",            "CREATE INDEX IF NOT EXISTS idx_ip_geom ON injected_points USING GIST (geom)"),
     # ── tracks_cross ──
-    ("idx_tc_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_tc_vehicle_ts ON tracks_cross(vehicle_id, timestamp)"),
+    ("idx_tc_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_tc_vehicle_ts ON tracks_cross(detect_id, vehicle_id, timestamp)"),
     ("idx_tc_geom",            "CREATE INDEX IF NOT EXISTS idx_tc_geom ON tracks_cross USING GIST (geom)"),
-    ("idx_tc_segment_pair",    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tc_segment_pair ON tracks_cross (run_id, vehicle_id, from_source_id, from_source_row_key, to_source_id, to_source_row_key)"),
+    ("idx_tc_segment_pair",    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tc_segment_pair ON tracks_cross (detect_id, vehicle_id, from_source_id, from_source_row_key, to_source_id, to_source_row_key)"),
     # ── turn_events ──
     ("idx_te_event_id",        "CREATE INDEX IF NOT EXISTS idx_te_event_id ON turn_events(event_id)"),
-    ("idx_te_vehicle_ts",      "CREATE UNIQUE INDEX IF NOT EXISTS idx_te_vehicle_ts ON turn_events(run_id, vehicle_id, timestamp)"),
+    ("idx_te_vehicle_ts",      "CREATE UNIQUE INDEX IF NOT EXISTS idx_te_vehicle_ts ON turn_events(detect_id, vehicle_id, timestamp)"),
+    ("idx_te_detect_id",       "CREATE INDEX IF NOT EXISTS idx_te_detect_id ON turn_events(detect_id)"),
     ("idx_te_source",          "CREATE INDEX IF NOT EXISTS idx_te_source ON turn_events(source)"),
     ("idx_te_xy",              "CREATE INDEX IF NOT EXISTS idx_te_xy ON turn_events(x, y)"),
     ("idx_te_geom",            "CREATE INDEX IF NOT EXISTS idx_te_geom ON turn_events USING GIST (geom)"),
     # ── candidate_intersections ──
-    ("idx_ci_cluster_id",      "CREATE INDEX IF NOT EXISTS idx_ci_cluster_id ON candidate_intersections(cluster_id)"),
+    ("idx_ci_cluster_id",      "CREATE UNIQUE INDEX IF NOT EXISTS idx_ci_cluster_id ON candidate_intersections(detect_id, cluster_id)"),
     ("idx_ci_source",          "CREATE INDEX IF NOT EXISTS idx_ci_source ON candidate_intersections(source)"),
     ("idx_ci_centroid",        "CREATE INDEX IF NOT EXISTS idx_ci_centroid ON candidate_intersections(centroid_lon, centroid_lat)"),
     ("idx_ci_geom",            "CREATE INDEX IF NOT EXISTS idx_ci_geom ON candidate_intersections USING GIST (geom)"),
     # ── candidate_intersection_events ──
-    ("idx_cie_ci",             "CREATE INDEX IF NOT EXISTS idx_cie_ci ON candidate_intersection_events(candidate_intersection_id)"),
+    ("idx_cie_ci",             "CREATE INDEX IF NOT EXISTS idx_cie_ci ON candidate_intersection_events(detect_id, candidate_intersection_id)"),
     ("idx_cie_te",             "CREATE INDEX IF NOT EXISTS idx_cie_te ON candidate_intersection_events(turn_event_id)"),
     # ── candidate_entry_exit_points ──
-    ("idx_ceep_cluster",       "CREATE INDEX IF NOT EXISTS idx_ceep_cluster ON candidate_entry_exit_points(cluster_id, vehicle_id)"),
+    ("idx_ceep_cluster",       "CREATE INDEX IF NOT EXISTS idx_ceep_cluster ON candidate_entry_exit_points(detect_id, cluster_id, vehicle_id)"),
     ("idx_ceep_type",          "CREATE INDEX IF NOT EXISTS idx_ceep_type ON candidate_entry_exit_points(crossing_type)"),
     ("idx_ceep_geom",          "CREATE INDEX IF NOT EXISTS idx_ceep_geom ON candidate_entry_exit_points USING GIST (geom)"),
     # ── intersections ──
-    ("idx_int_cluster_id",     "CREATE INDEX IF NOT EXISTS idx_int_cluster_id ON intersections(cluster_id)"),
+    ("idx_int_cluster_id",     "CREATE UNIQUE INDEX IF NOT EXISTS idx_int_cluster_id ON intersections(detect_id, cluster_id)"),
     ("idx_int_complete",       "CREATE INDEX IF NOT EXISTS idx_int_complete ON intersections(is_complete)"),
     ("idx_int_geom",           "CREATE INDEX IF NOT EXISTS idx_int_geom ON intersections USING GIST (geom)"),
     # ── entry_exit_points ──
-    ("idx_eep_cluster_vehicle","CREATE INDEX IF NOT EXISTS idx_eep_cluster_vehicle ON entry_exit_points(cluster_id, vehicle_id)"),
+    ("idx_eep_cluster_vehicle","CREATE INDEX IF NOT EXISTS idx_eep_cluster_vehicle ON entry_exit_points(detect_id, cluster_id, vehicle_id)"),
     ("idx_eep_intersection",   "CREATE INDEX IF NOT EXISTS idx_eep_intersection ON entry_exit_points(intersection_id)"),
-    ("idx_pr_source",          "CREATE INDEX IF NOT EXISTS idx_pr_source ON pipeline_runs(source_id, started_at DESC)"),
 ]
 
 
@@ -328,8 +361,7 @@ def reset_tables(config: PostgresConfig) -> int:
     """
     # ZH: 反向遍历 DDL 列表，确保引用表先被删除
     # EN: Reverse DDL order so referencing tables are dropped before their parents
-    drop_order = reversed(DDL_STATEMENTS)
-    failures = 0
+    drop_order = [*reversed(DDL_STATEMENTS), ("pipeline_runs", "")]
     tables_dropped = 0
 
     with pg_connect(config) as conn:
@@ -337,20 +369,14 @@ def reset_tables(config: PostgresConfig) -> int:
             print("\n── 重置数据表 / Resetting Tables ──")
             for name, _ in drop_order:
                 sql = f"DROP TABLE IF EXISTS {name} CASCADE"
-                try:
-                    cur.execute(sql)
-                    status = cur.statusmessage
-                    print(f"  [OK] DROP {name:40s} {status}")
-                    tables_dropped += 1
-                except Exception as exc:
-                    print(f"  [FAIL] DROP {name:40s} {exc}")
-                    failures += 1
+                cur.execute(sql)
+                status = cur.statusmessage
+                print(f"  [OK] DROP {name:40s} {status}")
+                tables_dropped += 1
         conn.commit()
 
     print(f"\n  已删除 / Dropped: {tables_dropped} 表/tables")
-    if failures:
-        print(f"  [FAIL] 失败 / Failures: {failures}")
-    return failures
+    return 0
 
 
 # ── Auto column migration helpers ────────────────────────────────────
@@ -531,7 +557,6 @@ def _auto_add_missing_columns(cur: Any, table_name: str, ddl: str) -> int:
         返回失败数（0 = 全部成功或无需变更）。
     """
     existing = _fetch_existing_columns(cur, table_name)
-    failures = 0
     for col, fragment, sql in build_auto_migrations(table_name, ddl, existing):
         if fragment is None:
             print(
@@ -539,16 +564,12 @@ def _auto_add_missing_columns(cur: Any, table_name: str, ddl: str) -> int:
                 f"generated/serial — cannot ALTER"
             )
             continue
-        try:
-            cur.execute(sql)
-            print(
-                f"  [OK] auto-add {table_name}.{col:28s} "
-                f"{cur.statusmessage}"
-            )
-        except Exception as exc:
-            print(f"  [FAIL] auto-add {table_name}.{col:28s} {exc}")
-            failures += 1
-    return failures
+        cur.execute(sql)
+        print(
+            f"  [OK] auto-add {table_name}.{col:28s} "
+            f"{cur.statusmessage}"
+        )
+    return 0
 
 
 def _run_migrations(cur: Any) -> None:
@@ -582,47 +603,43 @@ def _run_migrations(cur: Any) -> None:
         ),
     ]
     for label, sql in migrations:
-        try:
-            cur.execute(sql)
-            print(f"  [OK] migration {label:30s} {cur.statusmessage}")
-        except Exception as exc:
-            print(f"  [SKIP] migration {label:30s} {exc}")
+        cur.execute(sql)
+        print(f"  [OK] migration {label:30s} {cur.statusmessage}")
 
 
-def create_tables(config: PostgresConfig) -> int:
-    """Execute all DDL statements and return the number of failures.
+def create_tables(
+    config: PostgresConfig,
+    *,
+    legacy_clean_map: dict[str, str] | None = None,
+) -> int:
+    """Create or migrate the complete schema in one transaction.
 
-    ZH: 按序执行所有建表 + 索引 DDL，打印每步结果，返回失败数。
-    EN: Execute all table + index DDL in order, print each result, return failure count.
+    ZH: 任一步失败都向上传播，由连接上下文回滚整个事务。
+    EN: Any error propagates so the connection context rolls back every change.
     """
-    failures = 0
     tables_created = 0
-    tables_existed = 0
     indexes_created = 0
 
     with pg_connect(config) as conn:
         with conn.cursor() as cur:
+            migrate_legacy_pipeline_runs(
+                cur,
+                legacy_clean_map or {},
+                registry_ddl=dict(DDL_STATEMENTS),
+                index_statements=INDEX_STATEMENTS,
+            )
             # ── Create tables ──
             print("\n── 创建数据表 / Creating Tables ──")
             for name, ddl in DDL_STATEMENTS:
-                try:
-                    cur.execute(ddl)
-                    # Check if table was newly created or already existed
-                    status = cur.statusmessage
-                    print(f"  [OK] {name:40s} {status}")
-                    tables_created += 1
-                except Exception as exc:
-                    print(f"  [FAIL] {name:40s} {exc}")
-                    failures += 1
+                cur.execute(ddl)
+                status = cur.statusmessage
+                print(f"  [OK] {name:40s} {status}")
+                tables_created += 1
 
             # ── Auto column migrations: diff DDL vs information_schema ──
             print("\n── 自动列迁移 / Auto Column Migrations ──")
             for name, ddl in DDL_STATEMENTS:
-                try:
-                    failures += _auto_add_missing_columns(cur, name, ddl)
-                except Exception as exc:
-                    print(f"  [FAIL] auto-migrate {name:40s} {exc}")
-                    failures += 1
+                _auto_add_missing_columns(cur, name, ddl)
 
             # ── Structural migrations (DROP NOT NULL / DROP INDEX / DROP FK) ──
             print("\n── 结构性迁移 / Structural Migrations ──")
@@ -631,25 +648,18 @@ def create_tables(config: PostgresConfig) -> int:
             # ── Create indexes ──
             print("\n── 创建索引 / Creating Indexes ──")
             for name, ddl in INDEX_STATEMENTS:
-                try:
-                    cur.execute(ddl)
-                    status = cur.statusmessage
-                    print(f"  [OK] {name:40s} {status}")
-                    indexes_created += 1
-                except Exception as exc:
-                    print(f"  [FAIL] {name:40s} {exc}")
-                    failures += 1
+                cur.execute(ddl)
+                status = cur.statusmessage
+                print(f"  [OK] {name:40s} {status}")
+                indexes_created += 1
 
         conn.commit()
 
     print(f"\n── 汇总 / Summary ──")
     print(f"  表 / Tables:  {tables_created} processed")
     print(f"  索引 / Indexes: {indexes_created} processed")
-    if failures:
-        print(f"  [FAIL] 失败 / Failures: {failures}")
-    else:
-        print(f"  [OK] 全部成功 / All succeeded")
-    return failures
+    print(f"  [OK] 全部成功 / All succeeded")
+    return 0
 
 
 def main() -> int:
@@ -673,6 +683,10 @@ def main() -> int:
     parser.add_argument(
         "--reset", action="store_true",
         help="Drop all tables (CASCADE) before recreating them, clearing all data."
+    )
+    parser.add_argument(
+        "--legacy-clean-map", type=Path,
+        help="JSON object mapping ambiguous legacy Detect UUIDs to Clean UUIDs.",
     )
     args = parser.parse_args()
 
@@ -701,7 +715,12 @@ def main() -> int:
             if reset_failures > 0:
                 print("[FAIL] 重置失败，终止操作 / Reset failed, aborting.")
                 return 1
-        failures = create_tables(config)
+        legacy_clean_map = (
+            load_legacy_clean_map(args.legacy_clean_map)
+            if args.legacy_clean_map is not None
+            else {}
+        )
+        failures = create_tables(config, legacy_clean_map=legacy_clean_map)
     except RuntimeError as exc:
         print(str(exc))
         return 2

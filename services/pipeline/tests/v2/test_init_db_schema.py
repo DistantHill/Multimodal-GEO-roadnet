@@ -6,14 +6,289 @@ All tests use recording cursors — no real database connection needed.
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from track.v2.cli.init_db import (
     DDL_STATEMENTS,
+    INDEX_STATEMENTS,
     _auto_add_missing_columns,
     build_auto_migrations,
     column_to_alter_fragment,
     parse_ddl_columns,
 )
+from track.v2.db.legacy_migration import (
+    LegacyPipelineRun,
+    build_legacy_migration_plan,
+    load_legacy_clean_map,
+    migrate_legacy_pipeline_runs,
+)
+
+
+class CleanDetectSchemaContractTest(unittest.TestCase):
+    def test_schema_separates_clean_and_detect_runs_with_same_detect_domain_constraints(self) -> None:
+        ddl_by_table = {name: ddl for name, ddl in DDL_STATEMENTS}
+
+        self.assertIn("clean_runs", ddl_by_table)
+        self.assertIn("detect_runs", ddl_by_table)
+        self.assertNotIn("pipeline_runs", ddl_by_table)
+        self.assertIn(
+            "clean_id UUID NOT NULL REFERENCES clean_runs(id)",
+            " ".join(ddl_by_table["detect_runs"].split()),
+        )
+        for table in ("excluded_points", "kept_trajectory_points", "injected_points"):
+            normalized = " ".join(ddl_by_table[table].split())
+            self.assertIn("clean_id", normalized, table)
+            self.assertNotIn("run_id", normalized, table)
+        for table in (
+            "tracks_cross", "turn_events", "candidate_intersections",
+            "candidate_intersection_events", "candidate_entry_exit_points",
+            "intersections", "entry_exit_points",
+        ):
+            normalized = " ".join(ddl_by_table[table].split())
+            self.assertIn("detect_id", normalized, table)
+            self.assertNotIn("run_id", normalized, table)
+
+        nested = " ".join(
+            ddl_by_table[table]
+            for table in (
+                "candidate_intersection_events", "candidate_entry_exit_points",
+                "intersections", "entry_exit_points",
+            )
+        )
+        self.assertIn("FOREIGN KEY (candidate_intersection_id, detect_id)", nested)
+        self.assertIn("REFERENCES candidate_intersections(id, detect_id)", nested)
+        self.assertIn("FOREIGN KEY (intersection_id, detect_id)", nested)
+        self.assertIn("REFERENCES intersections(id, detect_id)", nested)
+
+        all_schema_sql = "\n".join(ddl_by_table.values()) + "\n" + "\n".join(
+            sql for _, sql in INDEX_STATEMENTS
+        )
+        self.assertNotIn("ON DELETE CASCADE", all_schema_sql.upper())
+        self.assertIn("clean_id", "\n".join(sql for _, sql in INDEX_STATEMENTS))
+        self.assertIn("detect_id", "\n".join(sql for _, sql in INDEX_STATEMENTS))
+
+
+class LegacyRunMigrationPlanTest(unittest.TestCase):
+    def test_full_run_backfills_same_uuid_into_clean_and_detect(self) -> None:
+        run = LegacyPipelineRun(
+            id="11111111-1111-1111-1111-111111111111",
+            source_id="raw_points",
+            source_kind="postgres_table",
+            parameters={"skip_clean": False, "target_table": "raw_points"},
+            status="completed",
+            started_at="start",
+            finished_at="finish",
+        )
+
+        plan = build_legacy_migration_plan([run], {})
+
+        self.assertEqual([item.id for item in plan.clean_runs], [run.id])
+        self.assertEqual([item.id for item in plan.detect_runs], [run.id])
+        self.assertEqual(plan.detect_runs[0].clean_id, run.id)
+
+    def test_ambiguous_legacy_run_fails_before_migration_without_complete_map(self) -> None:
+        clean = LegacyPipelineRun(
+            id="11111111-1111-1111-1111-111111111111",
+            source_id="raw_points", source_kind="postgres_table",
+            parameters={"skip_clean": False}, status="completed",
+            started_at="start", finished_at="finish",
+        )
+        ambiguous = LegacyPipelineRun(
+            id="22222222-2222-2222-2222-222222222222",
+            source_id="raw_points", source_kind="postgres_table",
+            parameters={"skip_clean": True}, status="completed",
+            started_at="start", finished_at="finish",
+        )
+
+        with self.assertRaisesRegex(ValueError, ambiguous.id):
+            build_legacy_migration_plan([clean, ambiguous], {})
+
+        plan = build_legacy_migration_plan(
+            [clean, ambiguous], {ambiguous.id: clean.id}
+        )
+        self.assertEqual(plan.detect_runs[1].clean_id, clean.id)
+        self.assertEqual(len(plan.clean_runs), 1)
+
+    def test_map_rejects_non_uuid_and_unavailable_parent_clean(self) -> None:
+        ambiguous = LegacyPipelineRun(
+            id="22222222-2222-2222-2222-222222222222",
+            source_id="raw_points", source_kind="postgres_table",
+            parameters={}, status="completed", started_at="start", finished_at=None,
+        )
+        with self.assertRaisesRegex(ValueError, "real legacy run"):
+            build_legacy_migration_plan(
+                [ambiguous],
+                {ambiguous.id: "33333333-3333-3333-3333-333333333333"},
+            )
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "map.json"
+            path.write_text('{"not-a-uuid": "also-bad"}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "UUID"):
+                load_legacy_clean_map(path)
+
+    def test_ambiguous_run_can_be_explicitly_declared_as_its_own_clean(self) -> None:
+        run = LegacyPipelineRun(
+            id="22222222-2222-2222-2222-222222222222",
+            source_id="raw_points", source_kind="postgres_table",
+            parameters={}, status="completed", started_at="start", finished_at=None,
+        )
+
+        plan = build_legacy_migration_plan([run], {run.id: run.id})
+
+        self.assertEqual([item.id for item in plan.clean_runs], [run.id])
+        self.assertEqual(plan.detect_runs[0].clean_id, run.id)
+
+    def test_ambiguous_run_can_parent_another_ambiguous_detect(self) -> None:
+        parent = LegacyPipelineRun(
+            id="11111111-1111-1111-1111-111111111111",
+            source_id="raw_points", source_kind="postgres_table",
+            parameters={}, status="completed", started_at="start", finished_at=None,
+        )
+        child = LegacyPipelineRun(
+            id="22222222-2222-2222-2222-222222222222",
+            source_id="raw_points", source_kind="postgres_table",
+            parameters={"skip_clean": True}, status="completed",
+            started_at="start", finished_at=None,
+        )
+
+        plan = build_legacy_migration_plan(
+            [parent, child],
+            {parent.id: parent.id, child.id: parent.id},
+        )
+
+        self.assertEqual([item.id for item in plan.clean_runs], [parent.id])
+        self.assertEqual(
+            [item.clean_id for item in plan.detect_runs],
+            [parent.id, parent.id],
+        )
+
+
+class _LegacyMigrationCursor:
+    def __init__(self, rows: list[tuple[object, ...]]) -> None:
+        self.pipeline_rows = rows
+        self.executed: list[tuple[str, tuple[object, ...]]] = []
+        self.last_sql = ""
+        self.last_params: tuple[object, ...] = ()
+        self.registry_created = False
+
+    def execute(self, sql: str, params: tuple[object, ...] = ()) -> None:
+        self.last_sql = " ".join(sql.split())
+        self.last_params = params
+        self.executed.append((self.last_sql, params))
+        if self.last_sql.startswith("CREATE TABLE"):
+            self.registry_created = True
+
+    def fetchone(self):
+        if "to_regclass('pipeline_runs')" in self.last_sql:
+            return ("pipeline_runs",)
+        if "COUNT(*), COUNT(DISTINCT id)" in self.last_sql:
+            if "FILTER" in self.last_sql:
+                return (0, 0, 0, 0)
+            return (0, 0, 0)
+        if self.last_sql == "SELECT COUNT(*) FROM clean_runs":
+            return (1,)
+        if self.last_sql == "SELECT COUNT(*) FROM detect_runs":
+            return (1,)
+        if "COUNT(*)" in self.last_sql:
+            return (0,)
+        return None
+
+    def fetchall(self):
+        if self.last_sql.startswith("SELECT id, source_id"):
+            return self.pipeline_rows
+        if "information_schema.columns" in self.last_sql:
+            return [("id",), ("run_id",)]
+        if "FROM pg_constraint" in self.last_sql:
+            return [("legacy_run_fk",)]
+        if self.last_sql.startswith("SELECT id, source_id") and "FROM clean_runs" in self.last_sql:
+            return []
+        return []
+
+
+class LegacyMigrationExecutionTest(unittest.TestCase):
+    def test_ambiguous_preflight_executes_no_mutating_statement(self) -> None:
+        detect_id = "22222222-2222-2222-2222-222222222222"
+        cur = _LegacyMigrationCursor([
+            (
+                detect_id, "raw_points", "postgres_table", {"skip_clean": True},
+                "completed", "start", "finish",
+            ),
+        ])
+
+        with self.assertRaisesRegex(ValueError, detect_id):
+            migrate_legacy_pipeline_runs(
+                cur,
+                {},
+                registry_ddl=dict(DDL_STATEMENTS),
+                index_statements=INDEX_STATEMENTS,
+            )
+
+        mutations = [
+            sql for sql, _ in cur.executed
+            if sql.startswith(("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE", "DROP"))
+        ]
+        self.assertEqual(mutations, [])
+
+        statements = [sql for sql, _ in cur.executed]
+        plan_read = next(
+            index for index, sql in enumerate(statements)
+            if sql.startswith("SELECT id, source_id")
+        )
+        expected_lock_order = [
+            "pipeline_runs", "excluded_points", "kept_trajectory_points",
+            "injected_points", "tracks_cross", "turn_events",
+            "candidate_intersections", "candidate_intersection_events",
+            "candidate_entry_exit_points", "intersections", "entry_exit_points",
+        ]
+        self.assertEqual(
+            statements[1:plan_read],
+            [
+                f"LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"
+                for table in expected_lock_order
+            ],
+        )
+
+    def test_full_run_migration_renames_in_place_validates_then_drops_registry(self) -> None:
+        run_id = "11111111-1111-1111-1111-111111111111"
+        cur = _LegacyMigrationCursor([
+            (
+                run_id, "raw_points", "postgres_table",
+                {"skip_clean": False, "target_table": "raw_points"},
+                "completed", "start", "finish",
+            ),
+        ])
+
+        migrated = migrate_legacy_pipeline_runs(
+            cur,
+            {},
+            registry_ddl=dict(DDL_STATEMENTS),
+            index_statements=INDEX_STATEMENTS,
+        )
+
+        self.assertTrue(migrated)
+        sql = "\n".join(statement for statement, _ in cur.executed)
+        self.assertIn("ALTER TABLE kept_trajectory_points RENAME COLUMN run_id TO clean_id", sql)
+        self.assertIn("ALTER TABLE intersections RENAME COLUMN run_id TO detect_id", sql)
+        self.assertIn("FOREIGN KEY (clean_id) REFERENCES clean_runs(id)", sql)
+        self.assertIn("FOREIGN KEY (detect_id) REFERENCES detect_runs(id)", sql)
+        self.assertIn("FOREIGN KEY (candidate_intersection_id, detect_id)", sql)
+        self.assertLess(sql.index("CREATE TABLE IF NOT EXISTS clean_runs"), sql.index("DROP TABLE pipeline_runs"))
+        self.assertTrue(sql.rstrip().endswith("DROP TABLE pipeline_runs"))
+
+    def test_no_pipeline_registry_is_an_idempotent_noop(self) -> None:
+        cur = _LegacyMigrationCursor([])
+        original_fetchone = cur.fetchone
+        cur.fetchone = lambda: (None,) if "to_regclass" in cur.last_sql else original_fetchone()
+
+        self.assertFalse(migrate_legacy_pipeline_runs(
+            cur,
+            {},
+            registry_ddl=dict(DDL_STATEMENTS),
+            index_statements=INDEX_STATEMENTS,
+        ))
+        self.assertEqual(len(cur.executed), 1)
 
 
 # ── Recording cursor / connection ────────────────────────────────────
@@ -289,12 +564,10 @@ class AutoAddMissingColumnsTest(unittest.TestCase):
         alter_stmts = [s for s in cur.executed if "ALTER TABLE" in s]
         self.assertEqual([], alter_stmts)
 
-    def test_raises_increments_failures(self) -> None:
+    def test_database_error_propagates_for_transaction_rollback(self) -> None:
         cur = _RaisingCursor()
-        # _RaisingCursor.fetchall returns empty → all DDL columns are "missing"
-        failures = _auto_add_missing_columns(cur, "test_table", DDL_MINIMAL)
-        # name, value, extra, created_at → 4 ALTER attempts all raise
-        self.assertEqual(4, failures)
+        with self.assertRaisesRegex(RuntimeError, "simulated DB error"):
+            _auto_add_missing_columns(cur, "test_table", DDL_MINIMAL)
 
 
 if __name__ == "__main__":

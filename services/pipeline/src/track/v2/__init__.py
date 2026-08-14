@@ -13,7 +13,7 @@ Both feed into the same topology verification (entry/exit → branch clustering)
 """
 
 from .cleaner1 import clean
-from .clip import extract_clips, extract_clips_for_run
+from .clip import extract_clips, extract_clips_for_detect
 from .fitting import fit_centerlines
 from .intersect2 import IntersectConfig, IntersectResult, detect_intersections
 from .network import build_network

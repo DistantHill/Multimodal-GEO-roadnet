@@ -582,7 +582,7 @@ class ClipInput(TrackModel):
 
     intersections: tuple[ClipIntersection, ...]
     tracks: tuple[ClipTrack, ...]
-    run_id: str | None = None
+    detect_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -635,7 +635,7 @@ class ClipReport(TrackModel):
 class ClipResult(TrackModel):
     clips: tuple[TrackClip, ...]
     report: ClipReport
-    run_id: str | None = None
+    detect_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -697,7 +697,7 @@ class FitResult(TrackModel):
     centerlines: tuple[Centerline, ...]
     issues: tuple[FitIssue, ...]
     report: FitReport
-    run_id: str | None = None
+    detect_id: str | None = None
 
 
 # ── Network output models ───────────────────────────────────────────
@@ -751,7 +751,7 @@ class NetworkResult(TrackModel):
     edges: tuple[NetworkEdge, ...]
     issues: tuple[NetworkIssue, ...]
     report: NetworkReport
-    run_id: str | None = None
+    detect_id: str | None = None
 
 
 # ── Replay output models ────────────────────────────────────────────

@@ -121,7 +121,7 @@ def main() -> None:
     fig1.suptitle(
         f"Replay Trace — Spatial View\n"
         f"intersection #{target['id']}  |  "
-        f"run {target['run_id'][:8]}…  |  "
+        f"detect {target['detect_id'][:8]}…  |  "
         f"status={trace['status']}  |  "
         f"{len(nodes)} nodes",
         fontsize=11, fontfamily="monospace",
@@ -185,7 +185,7 @@ def main() -> None:
     fig2, ax2 = plt.subplots(figsize=(20, 12))
     fig2.suptitle(
         f"Replay Trace — Provenance Flow  (depth 0 → leaf)\n"
-        f"intersection #{target['id']}  |  run {target['run_id'][:8]}…  |  "
+        f"intersection #{target['id']}  |  detect {target['detect_id'][:8]}…  |  "
         f"{len(nodes)} nodes, {len(edges)} edges  |  status={trace['status']}",
         fontsize=11, fontfamily="monospace",
     )
@@ -335,7 +335,7 @@ def main() -> None:
     fig3, ax3 = plt.subplots(figsize=(14, 6))
     fig3.suptitle(
         f"Replay Trace — Node Distribution by Depth & Kind\n"
-        f"intersection #{target['id']}  |  run {target['run_id'][:8]}…  |  "
+        f"intersection #{target['id']}  |  detect {target['detect_id'][:8]}…  |  "
         f"status={trace['status']}",
         fontsize=10, fontfamily="monospace",
     )
@@ -392,7 +392,7 @@ def main() -> None:
         fig4, (ax4a, ax4b) = plt.subplots(1, 2, figsize=(14, 5))
         fig4.suptitle(
             f"Replay Trace — Turn Angle Distributions\n"
-            f"intersection #{target['id']}  |  run {target['run_id'][:8]}…",
+            f"intersection #{target['id']}  |  detect {target['detect_id'][:8]}…",
             fontsize=10, fontfamily="monospace",
         )
 

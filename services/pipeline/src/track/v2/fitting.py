@@ -94,7 +94,7 @@ def fit_centerlines(
             skipped_clip_count=sum(issue.clip_id is not None for issue in issues),
             skipped_pair_count=skipped_pairs,
         ),
-        run_id=clips.run_id,
+        detect_id=clips.detect_id,
     )
 
 

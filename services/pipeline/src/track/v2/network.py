@@ -93,7 +93,7 @@ def build_network(
             isolated_node_count=isolated_count,
             skipped_centerline_count=len(issues),
         ),
-        run_id=fits.run_id,
+        detect_id=fits.detect_id,
     )
 
 
