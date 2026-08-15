@@ -30,6 +30,8 @@ Usage / 用法::
 #    去掉重复过滤                     预过滤，函数内无需再筛
 # 4  移除 excluded_points 写入       排除信息仅反映在 trajectory_points.is_active，
 #                                   不再单独写 excluded_points 表（表结构保留）
+# 5  insert_kept_trajectory_points   支持 start_subtrack_index 并返回下一序号，
+#    分批流式写入                    供 run.py 逐批 COPY，不再整轮累积 kept 点
 # ────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -385,23 +387,30 @@ def insert_kept_trajectory_points(
     tp_ref_to_id: dict[tuple[str, str], int],
     *,
     clean_id: str | None = None,
-) -> None:
+    start_subtrack_index: int = 1,
+) -> int:
     """Persist references for points that survived ``_exclude_stationary``.
 
     ZH: 写入保留点引用——每个子轨迹的保留点通过 trajectory_point_id 指向源数据行。
         CSV 模式：tp_ref_to_id 存 trajectory_points 自增 ID → 走 FK 映射。
         PG 模式：tp_ref_to_id 为空 → 直接用 source_row_key（即源表主键）作为 trajectory_point_id 值。
         使用 PostgreSQL COPY FROM STDIN 流式写入，避免逐批 INSERT 的网络往返开销。
+        返回下一个待分配的子轨迹序号（``start_subtrack_index`` + 写入子轨迹数），
+        供调用方分批流式写入时保持 ``subtrack_index`` 全局递增。
     EN: Persist per-point references for kept subtracks.  CSV mode uses
         ``tp_ref_to_id`` to map to ``trajectory_points`` auto-increment IDs.
         PG mode (empty map) stores the source PK (``source_row_key``) directly
         as ``trajectory_point_id``.  Uses COPY FROM STDIN for streaming write.
+        Returns the next subtrack index to assign (``start_subtrack_index`` plus
+        the number of subtracks written), so callers can stream successive
+        batches while keeping ``subtrack_index`` globally increasing.
     """
     if clean_id is None:
         raise ValueError("clean_id is required for derived v2 persistence")
     if not kept_subtracks:
-        return
+        return start_subtrack_index
 
+    st_idx = start_subtrack_index
     with conn.cursor() as cur:
         with cur.copy(
             "COPY kept_trajectory_points "
@@ -409,7 +418,7 @@ def insert_kept_trajectory_points(
             "vehicle_id, subtrack_index, sequence_in_subtrack) "
             "FROM STDIN"
         ) as copy:
-            for st_idx, subtrack in enumerate(kept_subtracks, start=1):
+            for subtrack in kept_subtracks:
                 for seq_idx, point in enumerate(subtrack):
                     key = _point_ref_key(point.point_ref)
                     tp_id = tp_ref_to_id.get(key) if tp_ref_to_id else None
@@ -425,6 +434,8 @@ def insert_kept_trajectory_points(
                         st_idx,
                         seq_idx,
                     ))
+                st_idx += 1
+    return st_idx
 
 
 def insert_injected_points(

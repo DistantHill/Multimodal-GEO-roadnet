@@ -130,9 +130,8 @@ def run_pipeline(
             total_raw = 0
             total_injected = 0
             total_excluded = 0
+            total_kept = 0
             tp_id_map: dict[tuple[str, str], int] = {}
-            all_kept_subtracks: list[list] = []
-            all_injected_points: list = []
         else:
             assert clean_id is not None
         # ── Stage 1+2: Streamed read → insert → clean (per vehicle) ──
@@ -149,12 +148,17 @@ def run_pipeline(
             total_injected = 0
             tp_id_map = {}
             total_excluded = 0
-            all_kept_subtracks = []
-            all_injected_points = []
-        # ZH: 批量累积排除点，每 N 辆车 flush 一次 UPDATE，消除逐车往返开销。
-        # EN: Batch excluded points; flush UPDATE every N vehicles to eliminate per-vehicle round-trips.
+            total_kept = 0
+        # ZH: 每 N 辆车 flush 一次全部 cleaner 产物（kept/injected/excluded），
+        #     消除逐车往返开销，同时裁剪 tp_id_map 避免整轮内存累积。
+        # EN: Flush all cleaner outputs (kept/injected/excluded) every N vehicles to
+        #     eliminate per-vehicle round-trips and trim tp_id_map to bound peak RAM.
             _pending_excluded: list = []
-            _MARK_FLUSH_EVERY_N = 200
+            _pending_kept: list = []
+            _pending_injected: list = []
+            _pending_tp_keys: list[tuple[str, str]] = []
+            _MARK_FLUSH_EVERY_N = 2000
+            subtrack_index = 1
 
             stream = StreamVehicleSource(handle)
             live_clean = LiveStatus("Parser 0 + Cleaner 1: 流式清洗 / Streaming Clean")
@@ -169,28 +173,29 @@ def run_pipeline(
                 if not is_pg_source:
                     batch_map = insert_trajectory_points(conn, vehicle_points, table=table)
                     tp_id_map.update(batch_map)
+                    _pending_tp_keys.extend(batch_map.keys())
                 vresult = clean_vehicle(vehicle_points)
                 total_injected += vresult.injected_count
                 _pending_excluded.extend(vresult.excluded)
                 total_excluded += len(vresult.excluded)
-                if len(_pending_excluded) >= 2000 or \
-                (vehicle_count %  _MARK_FLUSH_EVERY_N) == 0:
-                    # ZH: 自定义 --pg-table 的原地更新直接用 source_row_key
-                    #     （即源表自身的主键），因为 tp_id_map 此时引用的是
-                    #     trajectory_points 的 id，与源表主键不同。
-                    # EN: Custom --pg-table
-                    #     in-place updates use source_row_key directly
-                    #     (the source table's own PK), since tp_id_map
-                    #     references trajectory_points ids which differ.
-                    _mark_map = tp_id_map if table == "trajectory_points" else {}
-                    mark_excluded_points(conn, _pending_excluded, table=table, tp_id_map=_mark_map)
-                    _pending_excluded.clear()
-                all_kept_subtracks.extend(vresult.kept_subtracks)
-
-                # Collect injected points for batch insert
+                _pending_kept.extend(vresult.kept_subtracks)
                 for p in vresult.active:
                     if p.point_ref.generated_reason == "orthogonal_heading":
-                        all_injected_points.append(p)
+                        _pending_injected.append(p)
+                if len(_pending_excluded) >= 2000 or \
+                (vehicle_count %  _MARK_FLUSH_EVERY_N) == 0:
+                    subtrack_index, batch_kept = _flush_clean_batch(
+                        conn,
+                        clean_id=clean_id,
+                        table=table,
+                        tp_id_map=tp_id_map,
+                        pending_excluded=_pending_excluded,
+                        pending_kept=_pending_kept,
+                        pending_injected=_pending_injected,
+                        pending_tp_keys=_pending_tp_keys,
+                        subtrack_index=subtrack_index,
+                    )
+                    total_kept += batch_kept
 
                 now = time.perf_counter()
                 if vehicle_count == 1 or vehicle_count % 500 == 0 or (now - last_update_t) >= 2.0:
@@ -206,11 +211,19 @@ def run_pipeline(
                     last_update_t = now
 
             # Final 100% update
-            # Flush remaining pending excluded points
-            if _pending_excluded:
-                _mark_map = tp_id_map if table == "trajectory_points" else {}
-                mark_excluded_points(conn, _pending_excluded, table=table, tp_id_map=_mark_map)
-                _pending_excluded.clear()
+            # Flush any remaining pending cleaner outputs
+            subtrack_index, batch_kept = _flush_clean_batch(
+                conn,
+                clean_id=clean_id,
+                table=table,
+                tp_id_map=tp_id_map,
+                pending_excluded=_pending_excluded,
+                pending_kept=_pending_kept,
+                pending_injected=_pending_injected,
+                pending_tp_keys=_pending_tp_keys,
+                subtrack_index=subtrack_index,
+            )
+            total_kept += batch_kept
             elapsed_read = time.perf_counter() - t_read
             live_clean.update(
                 progress=1.0,
@@ -226,23 +239,15 @@ def run_pipeline(
 
             stats["trajectory_points"] = total_raw
 
-        # ── Batch-write cleaner outputs ──────────────────────────────
+        # ── Cleaner outputs (streamed to DB during the loop) ─────────
 
         print(f"  排除 / Excluded: {total_excluded:,}")
         print(f"  注入 / Injected: {total_injected:,}")
-
-        if all_kept_subtracks:
-            t0 = time.perf_counter()
-            insert_kept_trajectory_points(conn, all_kept_subtracks, tp_id_map, clean_id=clean_id)
-            kept_count = sum(len(st) for st in all_kept_subtracks)
-            stats["kept_trajectory_points"] = kept_count
-            print(f"  kept_trajectory_points: {kept_count:,} rows ({time.perf_counter() - t0:.1f}s)")
-
-        if all_injected_points:
-            t0 = time.perf_counter()
-            insert_injected_points(conn, all_injected_points, clean_id=clean_id)
+        if not reuse_clean:
+            stats["kept_trajectory_points"] = total_kept
             stats["injected_points"] = total_injected
-            print(f"  injected_points: {total_injected:,} rows ({time.perf_counter() - t0:.1f}s)")
+            print(f"  kept_trajectory_points: {total_kept:,} rows")
+            print(f"  injected_points: {total_injected:,} rows")
 
         # ZH: 即使 Intersect2 失败清洗结果也不会丢失。
         # EN: they survive an Intersect2 failure.
@@ -359,6 +364,49 @@ def run_pipeline(
     stats["_elapsed_s"] = int(elapsed)
     print(f"\n── 完成 / Done ({elapsed:.1f}s) ──")
     return stats
+
+
+def _flush_clean_batch(
+    conn,
+    *,
+    clean_id: str,
+    table: str,
+    tp_id_map: dict[tuple[str, str], int],
+    pending_excluded: list,
+    pending_kept: list,
+    pending_injected: list,
+    pending_tp_keys: list[tuple[str, str]],
+    subtrack_index: int,
+) -> tuple[int, int]:
+    """Flush one batch of Cleaner 1 outputs and trim ``tp_id_map``.
+
+    ZH: 把当前批的 kept / injected / excluded 三种产物落库，并释放本批原始点的
+        id 映射。返回 ``(下一子轨迹序号, 本批 kept 行数)``，使调用方分批流式
+        写入时 ``subtrack_index`` 仍全局递增。
+    EN: Persist one batch of kept / injected / excluded outputs and drop this
+        batch's raw-point id mappings.  Returns ``(next_subtrack_index, kept rows
+        written)`` so callers keep ``subtrack_index`` globally increasing across
+        streamed batches.
+    """
+    if pending_excluded:
+        mark_map = tp_id_map if table == "trajectory_points" else {}
+        mark_excluded_points(conn, pending_excluded, table=table, tp_id_map=mark_map)
+        pending_excluded.clear()
+    kept_count = 0
+    if pending_kept:
+        subtrack_index = insert_kept_trajectory_points(
+            conn, pending_kept, tp_id_map, clean_id=clean_id,
+            start_subtrack_index=subtrack_index,
+        )
+        kept_count = sum(len(st) for st in pending_kept)
+        pending_kept.clear()
+    if pending_injected:
+        insert_injected_points(conn, pending_injected, clean_id=clean_id)
+        pending_injected.clear()
+    for key in pending_tp_keys:
+        tp_id_map.pop(key, None)
+    pending_tp_keys.clear()
+    return subtrack_index, kept_count
 
 
 def _add_clip_stats(stats: dict[str, int | str], result: ClipResult) -> None:
