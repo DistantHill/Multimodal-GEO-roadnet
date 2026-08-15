@@ -27,9 +27,9 @@ from ._cross_track_legacy import extract_cross_track_candidates_legacy
 
 
 # Structural memory bounds owned by this module's implementation.
-_GRID_CELL_M = 1_000.0
+_GRID_CELL_M = 1_00.0
 _PAIR_BATCH_SIZE = 65_536
-_MAX_GRID_CELLS_PER_SEGMENT = 40
+_MAX_GRID_CELLS_PER_SEGMENT = 25
 
 
 @dataclass(frozen=True)
@@ -87,43 +87,49 @@ def extract_cross_track_candidates(
 
     ordered_candidates: list[tuple[tuple[int, int, int, int], CrossTrackCandidate]] = []
     started = time.perf_counter()
+    # ZH: 预计算每段的 vehicle_rank 与 AABB min 角 cell，供 owner 向量化过滤。
+    # EN: Precompute per-segment vehicle_rank and AABB min-corner cell for
+    #     vectorized owner filtering.
+    ranks = np.array([segment.vehicle_rank for segment in segments], dtype=np.int64)
+    min_cx = np.array(
+        [segment.cell_span[0] if segment.cell_span is not None else -1 for segment in segments],
+        dtype=np.int64,
+    )
+    min_cy = np.array(
+        [segment.cell_span[2] if segment.cell_span is not None else -1 for segment in segments],
+        dtype=np.int64,
+    )
     cells = sorted(grid)
     cell_iter = perf.timed_iter(cells, name="cross_track_grid_cells", total=len(cells)) if perf else cells
     for cell_x, cell_y in cell_iter:
-        by_vehicle: dict[int, list[int]] = defaultdict(list)
-        for segment_id in grid[(cell_x, cell_y)]:
-            by_vehicle[segments[segment_id].vehicle_rank].append(segment_id)
-        vehicle_ranks = sorted(by_vehicle)
-        for rank_index, vehicle_rank_a in enumerate(vehicle_ranks):
-            for vehicle_rank_b in vehicle_ranks[rank_index + 1:]:
-                for segment_ids_a, segment_ids_b in _iter_pair_batches(
-                    by_vehicle[vehicle_rank_a], by_vehicle[vehicle_rank_b],
-                ):
-                    owner_mask = np.fromiter(
-                        (
-                            max(segments[int(a_id)].cell_span[0], segments[int(b_id)].cell_span[0]) == cell_x
-                            and max(segments[int(a_id)].cell_span[2], segments[int(b_id)].cell_span[2]) == cell_y
-                            for a_id, b_id in zip(segment_ids_a, segment_ids_b)
-                        ),
-                        dtype=bool,
-                        count=len(segment_ids_a),
-                    )
-                    if not np.any(owner_mask):
-                        continue
-                    segment_ids_a = segment_ids_a[owner_mask]
-                    segment_ids_b = segment_ids_b[owner_mask]
-                    _append_pair_hits(
-                        ordered_candidates,
-                        segments,
-                        starts,
-                        ends,
-                        headings,
-                        segment_ids_a,
-                        segment_ids_b,
-                        cfg,
-                        origin_lon,
-                        origin_lat,
-                    )
+        seg_ids = np.asarray(grid[(cell_x, cell_y)], dtype=np.int64)
+        if len(seg_ids) < 2:
+            continue
+        for segment_ids_a, segment_ids_b in _iter_pair_batches(seg_ids, seg_ids):
+            ra = ranks[segment_ids_a]
+            rb = ranks[segment_ids_b]
+            # ZH: 只保留 rank_a < rank_b（去同车对 + 去逆序），并做 owner 向量化过滤。
+            # EN: Keep only rank_a < rank_b (drop same-vehicle and reversed pairs),
+            #     then apply vectorized owner filtering.
+            keep = ra < rb
+            keep &= np.maximum(min_cx[segment_ids_a], min_cx[segment_ids_b]) == cell_x
+            keep &= np.maximum(min_cy[segment_ids_a], min_cy[segment_ids_b]) == cell_y
+            segment_ids_a = segment_ids_a[keep]
+            segment_ids_b = segment_ids_b[keep]
+            if len(segment_ids_a) == 0:
+                continue
+            _append_pair_hits(
+                ordered_candidates,
+                segments,
+                starts,
+                ends,
+                headings,
+                segment_ids_a,
+                segment_ids_b,
+                cfg,
+                origin_lon,
+                origin_lat,
+            )
 
     for segment_ids_a, segment_ids_b in _iter_overflow_pair_batches(
         segments, overflow_segment_ids,
@@ -287,8 +293,8 @@ def _build_grid(
 
 
 def _iter_pair_batches(
-    segment_ids_a: list[int],
-    segment_ids_b: list[int],
+    segment_ids_a: list[int] | np.ndarray,
+    segment_ids_b: list[int] | np.ndarray,
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
     """Yield a Cartesian product in bounded index batches."""
     a_ids = np.asarray(segment_ids_a, dtype=int)

@@ -41,9 +41,8 @@ from ._geometry import (
     _to_xy,
 )
 from .exceptions import V2Error
-from .cross_track import (
-    extract_cross_track_candidates as _extract_orthogonal_cross_track_candidates,
-)
+from .cross_track import extract_cross_track_candidates
+
 from .models import (
     CrossTrackCandidate,
     CrossingPoint,
@@ -563,7 +562,7 @@ def _extract_methods_123(
     cross_candidates: list[CrossTrackCandidate] = []
     if cfg.use_orthogonal_candidates:
         ortho_candidates = _extract_orthogonal_candidates(tracks, origin_lon, origin_lat, live_status=live_status, perf=perf)
-        cross_candidates, _, _ = _extract_orthogonal_cross_track_candidates(tracks, origin_lon, origin_lat, cfg, live_status=live_status, perf=perf)
+        cross_candidates, _, _ = extract_cross_track_candidates(tracks, origin_lon, origin_lat, cfg, live_status=live_status, perf=perf)
     return turn_events, ortho_candidates, cross_candidates
 
 
@@ -761,7 +760,7 @@ def _extract_cross_track_windows(
     seen_segment_pairs: set[tuple[str, str, str, str, str]] = set()
     if not cfg.use_orthogonal_candidates:
         return candidates
-    extractor = candidate_extractor or _extract_orthogonal_cross_track_candidates
+    extractor = candidate_extractor or extract_cross_track_candidates
 
     if windows_override is None:
         windows = SpatialWindowIterator(
