@@ -160,6 +160,7 @@ def _chunked_insert_returning(
     returning_cols: list[str],
     *,
     on_conflict: str = "",
+    batch_size: int = _BATCH,
 ) -> list[tuple[Any, ...]]:
     """Multi-row INSERT with RETURNING, processed in batches.
 
@@ -176,7 +177,7 @@ def _chunked_insert_returning(
     #     _BATCH=5000 * 15列 = 75,000 > 65,535 → 需要缩批。
     # EN: PG wire protocol caps params at 65535; limit rows per batch by column count.
     _max_rows = max(1, 65535 // len(columns))
-    _effective_batch = min(_BATCH, _max_rows)
+    _effective_batch = min(batch_size, _max_rows)
     all_returned: list[tuple[Any, ...]] = []
     for start in range(0, len(rows), _effective_batch):
         batch = rows[start : start + _effective_batch]
@@ -197,7 +198,14 @@ def _chunked_insert_returning(
     return all_returned
 
 
-def _chunked_insert(cur: Any, table: str, columns: list[str], rows: list[tuple[Any, ...]]) -> None:
+def _chunked_insert(
+    cur: Any,
+    table: str,
+    columns: list[str],
+    rows: list[tuple[Any, ...]],
+    *,
+    batch_size: int = _BATCH,
+) -> None:
     """Multi-row INSERT without RETURNING, processed in batches."""
     if not rows:
         return
@@ -205,7 +213,7 @@ def _chunked_insert(cur: Any, table: str, columns: list[str], rows: list[tuple[A
     # ZH: PG 协议层参数上限 65535，按列数动态限制每批行数。
     # EN: PG wire protocol caps params at 65535; limit rows per batch by column count.
     _max_rows = max(1, 65535 // len(columns))
-    _effective_batch = min(_BATCH, _max_rows)
+    _effective_batch = min(batch_size, _max_rows)
     for start in range(0, len(rows), _effective_batch):
         batch = rows[start : start + _effective_batch]
         # Build multi-row VALUES
@@ -237,6 +245,7 @@ def insert_trajectory_points(
     points: list[TrajectoryPoint],
     *,
     table: str = "trajectory_points",
+    batch_size: int = _BATCH,
 ) -> dict[tuple[str, str], int]:
     """Insert all trajectory points and return a ``{(source_id, source_row_key): db_id}`` map.
 
@@ -266,6 +275,7 @@ def insert_trajectory_points(
     with conn.cursor() as cur:
         returned = _chunked_insert_returning(
             cur, table, columns, rows, ["id"],
+            batch_size=batch_size,
         )
     for (db_id,), p in zip(returned, points):
         mapping[(p.point_ref.source_id, p.point_ref.source_row_key)] = db_id
@@ -357,6 +367,7 @@ def insert_excluded_points(
     tp_ref_to_id: dict[tuple[str, str], int] | None = None,
     *,
     clean_id: str | None = None,
+    batch_size: int = _BATCH,
 ) -> None:
     """Insert points removed by Cleaner 1.
 
@@ -378,7 +389,7 @@ def insert_excluded_points(
 
     columns, rows = _with_stage_id(columns, rows, "clean_id", clean_id)
     with conn.cursor() as cur:
-        _chunked_insert(cur, "excluded_points", columns, rows)
+        _chunked_insert(cur, "excluded_points", columns, rows, batch_size=batch_size)
 
 
 def insert_kept_trajectory_points(
@@ -443,6 +454,7 @@ def insert_injected_points(
     active_points: list[TrajectoryPoint],
     *,
     clean_id: str | None = None,
+    batch_size: int = _BATCH,
 ) -> None:
     """Insert synthetic points injected by ``_inject_orthogonal``.
 
@@ -484,7 +496,7 @@ def insert_injected_points(
     columns, rows = _with_stage_id(columns, rows, "clean_id", clean_id)
     if rows:
         with conn.cursor() as cur:
-            _chunked_insert(cur, "injected_points", columns, rows)
+            _chunked_insert(cur, "injected_points", columns, rows, batch_size=batch_size)
 
 
 # ── Intersect2 ─────────────────────────────────────────────────────────
@@ -494,6 +506,7 @@ def insert_tracks_cross(
     candidates: list[CrossTrackCandidate],
     *,
     detect_id: str | None = None,
+    batch_size: int = _BATCH,
 ) -> int:
     """Persist deduplicated cross-track candidates and return inserted rows."""
     if not candidates:
@@ -538,6 +551,7 @@ def insert_tracks_cross(
                 "ON CONFLICT (detect_id, vehicle_id, from_source_id, from_source_row_key, "
                 "to_source_id, to_source_row_key) DO NOTHING"
             ),
+            batch_size=batch_size,
         )
     return len(inserted)
 
@@ -549,6 +563,7 @@ def insert_turn_events(
     origin_lat: float = 0.0,
     *,
     detect_id: str | None = None,
+    batch_size: int = _BATCH,
 ) -> dict[int, int]:
     """Insert turn events, return ``{event_id: db_id}`` mapping."""
     if not turn_events:
@@ -594,6 +609,7 @@ def insert_turn_events(
             on_conflict=(
                 "ON CONFLICT (detect_id, vehicle_id, timestamp) DO NOTHING"
             ),
+            batch_size=batch_size,
         )
     for db_id, event_id in returned:
         mapping[event_id] = db_id
@@ -675,6 +691,7 @@ def insert_candidate_intersection_events(
     te_id_map: dict[int, int],
     *,
     detect_id: str | None = None,
+    batch_size: int = _BATCH,
 ) -> None:
     """Persist every cluster member with its typed input source pair.
 
@@ -714,7 +731,7 @@ def insert_candidate_intersection_events(
         ]
         columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
         with conn.cursor() as cur:
-            _chunked_insert(cur, "candidate_intersection_events", columns, rows)
+            _chunked_insert(cur, "candidate_intersection_events", columns, rows, batch_size=batch_size)
 
 
 def insert_candidate_entry_exit_points(
@@ -723,6 +740,7 @@ def insert_candidate_entry_exit_points(
     ci_id_map: dict[int, int],
     *,
     detect_id: str | None = None,
+    batch_size: int = _BATCH,
 ) -> dict[tuple[int, int], int]:
     """Insert crossing points, return ``{crossing_id: db_id}`` mapping."""
     columns = [
@@ -767,6 +785,7 @@ def insert_candidate_entry_exit_points(
         with conn.cursor() as cur:
             returned = _chunked_insert_returning(
                 cur, "candidate_entry_exit_points", columns, rows, ["id"],
+                batch_size=batch_size,
             )
         for (db_id,), crossing_id in zip(returned, crossing_ids):
             mapping[crossing_id] = db_id
@@ -859,6 +878,7 @@ def insert_entry_exit_points(
     crossing_id_map: dict[tuple[int, int], int] | None = None,
     *,
     detect_id: str | None = None,
+    batch_size: int = _BATCH,
 ) -> None:
     """Insert entry/exit observations.
 
@@ -895,4 +915,4 @@ def insert_entry_exit_points(
     columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
     if rows:
         with conn.cursor() as cur:
-            _chunked_insert(cur, "entry_exit_points", columns, rows)
+            _chunked_insert(cur, "entry_exit_points", columns, rows, batch_size=batch_size)

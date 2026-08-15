@@ -121,6 +121,10 @@ class IntersectConfig(TrackModel):
     cross_track_max_angle_deg: float = 100.0
     cross_track_dbscan_eps_m: float = 100.0
     cross_track_dbscan_min_samples: int = 3
+    # Structural memory bounds owned by cross_track.py's implementation.
+    cross_track_grid_cell_m: float = 100.0
+    cross_track_pair_batch_size: int = 65_536
+    cross_track_max_grid_cells_per_segment: int = 25
 
     # ── Cluster merge ──────────────────────────────────────────────
     merge_centroid_distance_m: float = 80.0
@@ -142,6 +146,7 @@ class IntersectConfig(TrackModel):
     clean_id: str | None = None
     spatial_window_size: tuple[float, float] = (2000.0, 2000.0)
     spatial_window_overlap: float = 0.15
+    stream_batch_size: int = 100
 
     # ── Live status display (optional, set by CLI for dynamic terminal output) ──
     live_status: Any = None
@@ -686,7 +691,6 @@ def _stream_extract_methods_1_2(
     last_progress_t = t_total
     track_count = 0
     batch: dict[str, list[TrajectoryPoint]] = {}
-    BATCH_SIZE = 100
 
     for track in _stream_vehicle_tracks_from_db(
         conn,
@@ -699,7 +703,7 @@ def _stream_extract_methods_1_2(
         batch[vid] = track
         track_count += 1
 
-        if len(batch) >= BATCH_SIZE:
+        if len(batch) >= cfg.stream_batch_size:
             # ── Flush batch ──
             if cfg.use_turn_events:
                 for te in _detect_turn_events(batch, origin_lon, origin_lat, cfg, perf=perf):

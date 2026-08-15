@@ -22,7 +22,6 @@ from .models import (
 
 
 EARTH_RADIUS_M = 6_371_000.0
-EXCLUDED_SAMPLE_MAX = 50
 
 
 def clean_vehicle(
@@ -103,7 +102,7 @@ def clean(
         excluded_count=len(excluded),
         injected_count=injected_count,
         excluded_reasons=excluded_index.reason_counts(),
-        sample_excluded=[(item.point_ref, item.reason) for item in excluded[:EXCLUDED_SAMPLE_MAX]],
+        sample_excluded=[(item.point_ref, item.reason) for item in excluded[:cfg.excluded_sample_max]],
     )
     return CleanerResult(
         active=ListTrajectorySourceHandle(active, source_info=source.source_info, field_mapping=source.field_mapping),

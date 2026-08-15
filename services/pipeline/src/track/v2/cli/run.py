@@ -22,9 +22,11 @@ import getpass
 import sys
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
+from ..config.pipeline_config import load_pipeline_config
 from ..logger import init_logger, shutdown_logger, LiveStatus
 from ..db_writer import (
     create_clean_run,
@@ -44,7 +46,6 @@ from ..db_writer import (
     insert_turn_events,
 )
 from ..models import (
-    CleanerConfig,
     ClipResult,
     CsvSource,
     FitResult,
@@ -54,7 +55,7 @@ from ..models import (
 from ..clip import extract_clips_for_detect
 from ..fitting import fit_centerlines
 from ..network import build_network
-from .. import get_database, detect_intersections, IntersectConfig
+from .. import get_database, detect_intersections
 from ..cleaner import clean_vehicle
 from ..sources import StreamVehicleSource
 from ..db_writer import mark_excluded_points
@@ -69,6 +70,7 @@ def run_pipeline(
     pg_source_table: str | None = None,
     clean_id: str | None = None,
     table: str = "trajectory_points",
+    config_path: str | Path | None = None,
 ) -> dict[str, int | str]:
     """Run the full pipeline, persisting replay inputs and reporting Clip.
 
@@ -80,6 +82,8 @@ def run_pipeline(
         ``pg_source_table``, or ``clean_id`` must be provided. ``table`` specifies the target
         table name for trajectory_points.
     """
+    pc = load_pipeline_config(config_path)
+
     if sum(value is not None for value in (csv_path, pg_source_table, clean_id)) != 1:
         raise ValueError("exactly one of csv_path, pg_source_table, or clean_id is required")
 
@@ -120,7 +124,7 @@ def run_pipeline(
                 source_kind=source_kind,
                 parameters={
                     "target_table": table,
-                    "cleaner_max_gap_s": CleanerConfig().max_gap_s,
+                    "cleaner_max_gap_s": pc.cleaner.max_gap_s,
                 },
             )
             conn.commit()
@@ -137,7 +141,7 @@ def run_pipeline(
         # ── Stage 1+2: Streamed read → insert → clean (per vehicle) ──
             print("── Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean ──")
             print(f"  数据源 / Source: {source_label}")
-            handle = get_database(source)
+            handle = get_database(source, runtime=pc.runtime)
 
         # ZH: 快速统计总行数，用于行计数进度条。CSV 扫全文件，PG 走 COUNT(*)。
         # EN: Quick row count for row-based progress bar. CSV full scan, PG COUNT(*).
@@ -157,7 +161,6 @@ def run_pipeline(
             _pending_kept: list = []
             _pending_injected: list = []
             _pending_tp_keys: list[tuple[str, str]] = []
-            _MARK_FLUSH_EVERY_N = 2000
             subtrack_index = 1
 
             stream = StreamVehicleSource(handle)
@@ -171,10 +174,13 @@ def run_pipeline(
                 total_raw += len(vehicle_points)
                 vehicle_count += 1
                 if not is_pg_source:
-                    batch_map = insert_trajectory_points(conn, vehicle_points, table=table)
+                    batch_map = insert_trajectory_points(
+                        conn, vehicle_points, table=table,
+                        batch_size=pc.runtime.db_insert_batch,
+                    )
                     tp_id_map.update(batch_map)
                     _pending_tp_keys.extend(batch_map.keys())
-                vresult = clean_vehicle(vehicle_points)
+                vresult = clean_vehicle(vehicle_points, config=pc.cleaner)
                 total_injected += vresult.injected_count
                 _pending_excluded.extend(vresult.excluded)
                 total_excluded += len(vresult.excluded)
@@ -182,8 +188,8 @@ def run_pipeline(
                 for p in vresult.active:
                     if p.point_ref.generated_reason == "orthogonal_heading":
                         _pending_injected.append(p)
-                if len(_pending_excluded) >= 2000 or \
-                (vehicle_count %  _MARK_FLUSH_EVERY_N) == 0:
+                if len(_pending_excluded) >= pc.runtime.excluded_flush_threshold or \
+                (vehicle_count % pc.runtime.mark_flush_every_n) == 0:
                     subtrack_index, batch_kept = _flush_clean_batch(
                         conn,
                         clean_id=clean_id,
@@ -194,11 +200,12 @@ def run_pipeline(
                         pending_injected=_pending_injected,
                         pending_tp_keys=_pending_tp_keys,
                         subtrack_index=subtrack_index,
+                        batch_size=pc.runtime.db_insert_batch,
                     )
                     total_kept += batch_kept
 
                 now = time.perf_counter()
-                if vehicle_count == 1 or vehicle_count % 500 == 0 or (now - last_update_t) >= 2.0:
+                if vehicle_count == 1 or vehicle_count % pc.runtime.progress_interval == 0 or (now - last_update_t) >= pc.runtime.progress_time_threshold_s:
                     elapsed = now - t_read
                     rate = total_raw / elapsed if elapsed > 0 else 0
                     pct = total_raw / total_rows if total_rows > 0 else 0
@@ -222,6 +229,7 @@ def run_pipeline(
                 pending_injected=_pending_injected,
                 pending_tp_keys=_pending_tp_keys,
                 subtrack_index=subtrack_index,
+                batch_size=pc.runtime.db_insert_batch,
             )
             total_kept += batch_kept
             elapsed_read = time.perf_counter() - t_read
@@ -272,7 +280,8 @@ def run_pipeline(
         intersect_source_id = source_id
         live_intersect = LiveStatus("Intersect2: Cross-track Detection")
         live_intersect.start()
-        icfg = IntersectConfig(
+        icfg = replace(
+            pc.detect,
             query_active_from_db=True,
             db_table=table,
             kept_table="kept_trajectory_points",
@@ -289,12 +298,18 @@ def run_pipeline(
         print(f"  完整交叉口 / Complete intersections: {iresult.report.complete_intersection_count:,}")
 
         t0 = time.perf_counter()
-        tracks_cross_count = insert_tracks_cross(conn, iresult.cross_track_candidates, detect_id=detect_id)
+        tracks_cross_count = insert_tracks_cross(
+            conn, iresult.cross_track_candidates, detect_id=detect_id,
+            batch_size=pc.runtime.db_insert_batch,
+        )
         stats["tracks_cross"] = tracks_cross_count
         print(f"  tracks_cross: {tracks_cross_count:,} rows ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
-        te_id_map = insert_turn_events(conn, iresult.turn_events, detect_id=detect_id)
+        te_id_map = insert_turn_events(
+            conn, iresult.turn_events, detect_id=detect_id,
+            batch_size=pc.runtime.db_insert_batch,
+        )
         stats["turn_events"] = len(iresult.turn_events)
         print(f"  turn_events: {len(iresult.turn_events):,} rows ({time.perf_counter() - t0:.1f}s)")
 
@@ -306,6 +321,7 @@ def run_pipeline(
         t0 = time.perf_counter()
         insert_candidate_intersection_events(
             conn, iresult.clusters, ci_id_map, te_id_map, detect_id=detect_id,
+            batch_size=pc.runtime.db_insert_batch,
         )
         stats["candidate_intersection_events"] = sum(len(c.events) for c in iresult.clusters)
         print(f"  candidate_intersection_events: {stats['candidate_intersection_events']:,} rows ({time.perf_counter() - t0:.1f}s)")
@@ -313,6 +329,7 @@ def run_pipeline(
         t0 = time.perf_counter()
         ceep_id_map = insert_candidate_entry_exit_points(
             conn, iresult.clusters, ci_id_map, detect_id=detect_id,
+            batch_size=pc.runtime.db_insert_batch,
         )
         ceep_count = sum(len(c.crossing_points) for c in iresult.clusters)
         stats["candidate_entry_exit_points"] = ceep_count
@@ -329,6 +346,7 @@ def run_pipeline(
         t0 = time.perf_counter()
         insert_entry_exit_points(
             conn, iresult.observations, int_id_map, ceep_id_map, detect_id=detect_id,
+            batch_size=pc.runtime.db_insert_batch,
         )
         entry_exit_count = sum(
             1 for observation in iresult.observations
@@ -377,6 +395,7 @@ def _flush_clean_batch(
     pending_injected: list,
     pending_tp_keys: list[tuple[str, str]],
     subtrack_index: int,
+    batch_size: int,
 ) -> tuple[int, int]:
     """Flush one batch of Cleaner 1 outputs and trim ``tp_id_map``.
 
@@ -401,7 +420,7 @@ def _flush_clean_batch(
         kept_count = sum(len(st) for st in pending_kept)
         pending_kept.clear()
     if pending_injected:
-        insert_injected_points(conn, pending_injected, clean_id=clean_id)
+        insert_injected_points(conn, pending_injected, clean_id=clean_id, batch_size=batch_size)
         pending_injected.clear()
     for key in pending_tp_keys:
         tp_id_map.pop(key, None)
@@ -491,6 +510,11 @@ def main() -> int:
     parser.add_argument("--connect-timeout", type=int, default=_env.connect_timeout)
     parser.add_argument("--sslmode", default=_env.sslmode)
     parser.add_argument(
+        "--config", metavar="PATH", default=None,
+        help="pipeline 配置 TOML 路径 / pipeline config TOML path "
+             "(default: track/v2/config/pipeline.toml)."
+    )
+    parser.add_argument(
         "--table", default=None,
         help="目标表名 / Target table name for trajectory_points "
              "(default: same as --pg-table for PG mode, 'trajectory_points' for CSV mode)."
@@ -537,6 +561,7 @@ def main() -> int:
             pg_source_table=args.pg_table,
             clean_id=str(args.clean_id) if args.clean_id else None,
             table=args.table,
+            config_path=args.config,
         )
         _print_write_summary(stats)
         return 0

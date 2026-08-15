@@ -32,6 +32,7 @@ class RunCliCleanReuseTest(unittest.TestCase):
             pg_source_table=None,
             clean_id=clean_id,
             table="trajectory_points",
+            config_path=None,
         )
 
     def test_clean_id_rejects_table_override(self) -> None:

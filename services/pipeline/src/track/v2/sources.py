@@ -38,6 +38,7 @@ from .models import (
     PointRef,
     PostgresSource,
     ReadReport,
+    RuntimeConfig,
     SourceInfo,
     TrajectoryPoint,
 )
@@ -62,10 +63,13 @@ def get_database(
     *,
     field_config: str | Path | None = None,
     selector: ColumnSelector | None = None,
+    runtime: RuntimeConfig | None = None,
 ) -> "BaseTrajectorySourceHandle":
     config = load_field_config(field_config)
+    if runtime is not None and runtime.csv_max_field_size > csv.field_size_limit():
+        csv.field_size_limit(runtime.csv_max_field_size)
     if isinstance(source, CsvSource):
-        return CsvTrajectorySourceHandle(source, config, selector)
+        return CsvTrajectorySourceHandle(source, config, selector, runtime)
     if isinstance(source, PostgresSource):
         return PostgresTrajectorySourceHandle(source, config, selector)
     raise TypeError(f"unsupported source type: {type(source).__name__}")
@@ -213,10 +217,19 @@ class CsvTrajectorySourceHandle(BaseTrajectorySourceHandle):
         source: CsvSource,
         config: FieldConfig,
         selector: ColumnSelector | None,
+        runtime: RuntimeConfig | None = None,
     ) -> None:
         self._source = source
         self._path = Path(source.path)
-        self._encoding = detect_encoding(self._path, hint_encoding=source.encoding)
+        runtime = runtime or RuntimeConfig()
+        self._encoding = detect_encoding(
+            self._path,
+            hint_encoding=source.encoding,
+            sample_size=runtime.encoding_sample_size,
+            min_confidence=runtime.encoding_confidence,
+            default_encoding=runtime.default_text_encoding,
+            fallback=runtime.fallback_encodings,
+        )
         columns = _read_csv_columns(self._path, self._encoding)
         source_info = SourceInfo(
             kind="csv",
@@ -648,12 +661,14 @@ def detect_encoding(
     hint_encoding: str | None = None,
     sample_size: int = DEFAULT_ENCODING_SAMPLE_SIZE,
     min_confidence: float = DEFAULT_ENCODING_CONFIDENCE,
+    default_encoding: str = DEFAULT_TEXT_ENCODING,
+    fallback: tuple[str, ...] = _FALLBACK_ENCODINGS,
 ) -> str:
     path = Path(file_path)
     with path.open("rb") as f:
         raw = f.read(sample_size)
     if not raw:
-        return hint_encoding or DEFAULT_TEXT_ENCODING
+        return hint_encoding or default_encoding
 
     for prefix, encoding in _BOM_ENCODINGS:
         if raw.startswith(prefix):
@@ -661,8 +676,8 @@ def detect_encoding(
 
     if hint_encoding is not None and _can_decode(raw, hint_encoding):
         return hint_encoding
-    if _can_decode(raw, DEFAULT_TEXT_ENCODING):
-        return DEFAULT_TEXT_ENCODING
+    if _can_decode(raw, default_encoding):
+        return default_encoding
 
     guessed, confidence = _guess_with_chardet(raw)
     if guessed is not None and confidence >= min_confidence:
@@ -670,7 +685,7 @@ def detect_encoding(
         if _can_decode(raw, encoding):
             return encoding
 
-    for encoding in _FALLBACK_ENCODINGS:
+    for encoding in fallback:
         if _can_decode(raw, encoding):
             return encoding
 

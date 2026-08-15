@@ -290,6 +290,30 @@ class CleanerConfig(TrackModel):
     max_gap_s: float = 120.0
     min_speed_mps: float = 0.3
     max_stationary_duration_s: float = 300.0
+    excluded_sample_max: int = 50
+
+
+@dataclass(frozen=True)
+class RuntimeConfig(TrackModel):
+    """Cross-cutting runtime IO / DB / progress parameters.
+
+    ZH: 跨阶段的运行时参数（DB 写入批大小、CSV 编码探测、进度节流等），
+        不从任何单一阶段 dataclass 派生，统一由 pipeline TOML 配置驱动。
+    EN: Cross-stage runtime tuning (DB insert batch, CSV encoding probes,
+        progress throttling). Owned by the pipeline TOML, not any one stage.
+    """
+
+    db_insert_batch: int = 5000
+    import_batch_size: int = 10_000
+    csv_max_field_size: int = 10 * 1024 * 1024
+    encoding_sample_size: int = 64 * 1024
+    encoding_confidence: float = 0.5
+    default_text_encoding: str = "utf-8-sig"
+    fallback_encodings: tuple[str, ...] = ("gb18030", "gbk", "cp936", "big5")
+    mark_flush_every_n: int = 2000
+    excluded_flush_threshold: int = 2000
+    progress_interval: int = 500
+    progress_time_threshold_s: float = 2.0
 
 
 class TrajectorySourceHandle(Protocol):

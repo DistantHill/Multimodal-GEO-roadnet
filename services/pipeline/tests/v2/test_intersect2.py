@@ -22,8 +22,6 @@ from track.v2._geometry import (
 from track.v2._perf import PerfTracker
 from track.v2.cleaner1 import CleanerConfig, clean
 from track.v2.cross_track import (
-    _MAX_GRID_CELLS_PER_SEGMENT,
-    _PAIR_BATCH_SIZE,
     _build_grid as _cross_track_grid,
     extract_cross_track_candidates_legacy as _extract_orthogonal_cross_track_candidates_legacy,
     _iter_pair_batches as _iter_cross_track_pair_batches,
@@ -226,12 +224,15 @@ class PairedSegmentIntersectionTest(unittest.TestCase):
 
     def test_pair_batches_never_exceed_the_configured_limit(self):
         """Dense cells remain memory bounded before exact geometry runs."""
-        side = math.isqrt(_PAIR_BATCH_SIZE) + 1
-        batches = list(_iter_cross_track_pair_batches(list(range(side)), list(range(side))))
+        pair_batch_size = IntersectConfig().cross_track_pair_batch_size
+        side = math.isqrt(pair_batch_size) + 1
+        batches = list(_iter_cross_track_pair_batches(
+            list(range(side)), list(range(side)), pair_batch_size,
+        ))
 
         self.assertEqual(sum(len(a_ids) for a_ids, _ in batches), side * side)
         self.assertTrue(all(
-            len(a_ids) <= _PAIR_BATCH_SIZE
+            len(a_ids) <= pair_batch_size
             for a_ids, _ in batches
         ))
         self.assertEqual(batches[0][0][0], 0)
@@ -1404,11 +1405,12 @@ class OrthogonalCandidateTest(unittest.TestCase):
         segments, _ = _prepare_cross_track_segments(
             tracks, origin_lon, origin_lat, IntersectConfig(),
         )
-        grid, overflow_ids = _cross_track_grid(segments)
+        max_grid_cells = IntersectConfig().cross_track_max_grid_cells_per_segment
+        grid, overflow_ids = _cross_track_grid(segments, max_grid_cells)
         self.assertEqual(overflow_ids, [0, 1])
         self.assertLessEqual(
             sum(len(ids) for ids in grid.values()),
-            _MAX_GRID_CELLS_PER_SEGMENT,
+            max_grid_cells,
         )
 
         legacy = _extract_orthogonal_cross_track_candidates_legacy(

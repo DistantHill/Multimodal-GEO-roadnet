@@ -19,6 +19,7 @@ import getpass
 import time
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
+from ..config.pipeline_config import load_pipeline_config
 from ..logger import init_logger, shutdown_logger
 from ..models import CsvSource
 from .. import get_database
@@ -27,13 +28,12 @@ from ..db_writer import insert_trajectory_points
 
 # ── Import logic ─────────────────────────────────────────────────────
 
-BATCH_SIZE = 10_000  # 每批写入行数 / rows per batch insert
-
 
 def main() -> int:
     # ZH: 从 .env 加载默认连接参数，CLI 参数可覆盖
     # EN: Load defaults from .env; CLI args take precedence
     _env = default_postgres_config()
+    pc = load_pipeline_config()
 
     parser = argparse.ArgumentParser(
         description="Import CSV trajectory data into the trajectory_points table."
@@ -82,7 +82,7 @@ def main() -> int:
 
         # ── Parser 0: read CSV ──
         source = CsvSource(path=args.csv)
-        handle = get_database(source)
+        handle = get_database(source, runtime=pc.runtime)
 
         # ── Stream insert: 每批 BATCH_SIZE 行边读边写 / batch-insert as we read ──
         total_parsed = 0
@@ -92,7 +92,7 @@ def main() -> int:
             batch: list = []
             for point in handle.iter_points():
                 batch.append(point)
-                if len(batch) >= BATCH_SIZE:
+                if len(batch) >= pc.runtime.import_batch_size:
                     t0 = time.perf_counter()
                     tp_id_map = insert_trajectory_points(conn, batch, table=args.table)
                     written = len(tp_id_map)

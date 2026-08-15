@@ -26,12 +26,6 @@ from .models import CrossTrackCandidate, TrajectoryPoint
 from ._cross_track_legacy import extract_cross_track_candidates_legacy
 
 
-# Structural memory bounds owned by this module's implementation.
-_GRID_CELL_M = 1_00.0
-_PAIR_BATCH_SIZE = 65_536
-_MAX_GRID_CELLS_PER_SEGMENT = 25
-
-
 @dataclass(frozen=True)
 class _CrossTrackSegment:
     """One source segment plus the data needed for bounded matching."""
@@ -78,7 +72,7 @@ def extract_cross_track_candidates(
     starts = np.array([(segment.x1, segment.y1) for segment in segments], dtype=float)
     ends = np.array([(segment.x2, segment.y2) for segment in segments], dtype=float)
     headings = np.array([segment.heading for segment in segments], dtype=float)
-    grid, overflow_segment_ids = _build_grid(segments)
+    grid, overflow_segment_ids = _build_grid(segments, cfg.cross_track_max_grid_cells_per_segment)
     if telemetry is not None:
         telemetry["array_build_seconds"] = telemetry.get(
             "array_build_seconds", 0.0,
@@ -105,7 +99,7 @@ def extract_cross_track_candidates(
         seg_ids = np.asarray(grid[(cell_x, cell_y)], dtype=np.int64)
         if len(seg_ids) < 2:
             continue
-        for segment_ids_a, segment_ids_b in _iter_pair_batches(seg_ids, seg_ids):
+        for segment_ids_a, segment_ids_b in _iter_pair_batches(seg_ids, seg_ids, cfg.cross_track_pair_batch_size):
             ra = ranks[segment_ids_a]
             rb = ranks[segment_ids_b]
             # ZH: 只保留 rank_a < rank_b（去同车对 + 去逆序），并做 owner 向量化过滤。
@@ -132,7 +126,7 @@ def extract_cross_track_candidates(
             )
 
     for segment_ids_a, segment_ids_b in _iter_overflow_pair_batches(
-        segments, overflow_segment_ids,
+        segments, overflow_segment_ids, cfg.cross_track_pair_batch_size,
     ):
         _append_pair_hits(
             ordered_candidates,
@@ -215,11 +209,11 @@ def _grid_span(
     y1: float,
     x2: float,
     y2: float,
+    cell_m: float,
 ) -> tuple[int, int, int, int] | None:
     """Return a closed-cell span; non-finite segments retain miss semantics."""
     if not all(math.isfinite(value) for value in (x1, y1, x2, y2)):
         return None
-    cell_m = _GRID_CELL_M
     return (
         math.floor(min(x1, x2) / cell_m),
         math.floor(max(x1, x2) / cell_m),
@@ -267,13 +261,14 @@ def _prepare_segments(
                 y2=y2,
                 heading=start.heading,
                 timestamp=start.timestamp,
-                cell_span=_grid_span(x1, y1, x2, y2),
+                cell_span=_grid_span(x1, y1, x2, y2, cfg.cross_track_grid_cell_m),
             ))
     return segments, len(per_vehicle)
 
 
 def _build_grid(
     segments: list[_CrossTrackSegment],
+    max_cells: int,
 ) -> tuple[dict[tuple[int, int], list[int]], list[int]]:
     """Assign bounded AABBs to cells and retain long spans for exact fallback."""
     grid: dict[tuple[int, int], list[int]] = defaultdict(list)
@@ -283,7 +278,7 @@ def _build_grid(
             continue
         cell_min_x, cell_max_x, cell_min_y, cell_max_y = segment.cell_span
         cell_count = (cell_max_x - cell_min_x + 1) * (cell_max_y - cell_min_y + 1)
-        if cell_count > _MAX_GRID_CELLS_PER_SEGMENT:
+        if cell_count > max_cells:
             overflow_segment_ids.append(segment_id)
             continue
         for cell_x in range(cell_min_x, cell_max_x + 1):
@@ -295,15 +290,16 @@ def _build_grid(
 def _iter_pair_batches(
     segment_ids_a: list[int] | np.ndarray,
     segment_ids_b: list[int] | np.ndarray,
+    batch_size: int,
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
     """Yield a Cartesian product in bounded index batches."""
     a_ids = np.asarray(segment_ids_a, dtype=int)
     b_ids = np.asarray(segment_ids_b, dtype=int)
     total = len(a_ids) * len(b_ids)
-    for offset in range(0, total, _PAIR_BATCH_SIZE):
+    for offset in range(0, total, batch_size):
         flat = np.arange(
             offset,
-            min(offset + _PAIR_BATCH_SIZE, total),
+            min(offset + batch_size, total),
             dtype=np.int64,
         )
         yield a_ids[flat // len(b_ids)], b_ids[flat % len(b_ids)]
@@ -312,6 +308,7 @@ def _iter_pair_batches(
 def _iter_overflow_pair_batches(
     segments: list[_CrossTrackSegment],
     overflow_segment_ids: list[int],
+    batch_size: int,
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
     """Yield every long-AABB pair once under the standard batch bound."""
     finite_segment_ids = [
@@ -335,7 +332,7 @@ def _iter_overflow_pair_batches(
             else:
                 a_ids.append(other_id)
                 b_ids.append(overflow_id)
-            if len(a_ids) == _PAIR_BATCH_SIZE:
+            if len(a_ids) == batch_size:
                 yield np.asarray(a_ids, dtype=int), np.asarray(b_ids, dtype=int)
                 a_ids.clear()
                 b_ids.clear()
