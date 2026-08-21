@@ -14,6 +14,9 @@ CLEAN_ARTIFACT_TABLES = (
 
 # Reverse dependency order for deletion.
 DETECT_ARTIFACT_TABLES = (
+    "centerline_source_clips",
+    "centerlines",
+    "fit_runs",
     "entry_exit_points",
     "intersections",
     "candidate_entry_exit_points",
@@ -60,6 +63,7 @@ class DeleteRunService:
             cur.execute(f"SELECT id FROM clean_runs WHERE id = %s{suffix}", (clean_id,))
             if cur.fetchone() is None:
                 raise ValueError(f"unknown Clean Run: {clean_id}")
+        own_rows = self._counts(CLEAN_ARTIFACT_TABLES, "clean_id", clean_id)
         with self._conn.cursor() as cur:  # type: ignore[attr-defined]
             suffix = " FOR UPDATE" if lock else ""
             cur.execute(
@@ -147,11 +151,27 @@ class DeleteRunService:
         return True
 
     def _detect_counts(self, detect_id: str) -> DeleteImpact:
+        fit_rows = (
+            self._count_centerline_source_clips(detect_id),
+            *self._counts(("centerlines", "fit_runs"), "detect_id", detect_id),
+        )
         return DeleteImpact(
             target_kind="detect",
             target_id=detect_id,
-            own_rows=self._counts(DETECT_ARTIFACT_TABLES, "detect_id", detect_id),
+            own_rows=fit_rows + self._counts(
+                DETECT_ARTIFACT_TABLES[3:], "detect_id", detect_id,
+            ),
         )
+
+    def _count_centerline_source_clips(self, detect_id: str) -> TableCount:
+        with self._conn.cursor() as cur:  # type: ignore[attr-defined]
+            cur.execute(
+                "SELECT COUNT(*) FROM centerline_source_clips AS source_clips "
+                "JOIN centerlines AS c ON c.id = source_clips.centerline_id "
+                "WHERE c.detect_id = %s",
+                (detect_id,),
+            )
+            return TableCount("centerline_source_clips", int(cur.fetchone()[0]))
 
     def _counts(
         self,
@@ -177,8 +197,15 @@ class DeleteRunService:
                     (),
                 )
 
+    
     def _delete_detect(self, detect_id: str) -> None:
-        for table in DETECT_ARTIFACT_TABLES:
+        with self._conn.cursor() as cur:  # type: ignore[attr-defined]
+            cur.execute(
+                "DELETE FROM centerline_source_clips WHERE centerline_id IN "
+                "(SELECT id FROM centerlines WHERE detect_id = %s)",
+                (detect_id,),
+            )
+        for table in DETECT_ARTIFACT_TABLES[1:]:
             self._delete_rows(table, "detect_id", detect_id)
         self._delete_rows("detect_runs", "id", detect_id)
 

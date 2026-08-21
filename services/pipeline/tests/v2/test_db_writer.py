@@ -8,6 +8,7 @@ from dataclasses import replace
 from track.v2.db_writer import (
     create_clean_run,
     create_detect_run,
+    create_fit_run,
     finish_clean_run,
     finish_detect_run,
     insert_candidate_intersection_events,
@@ -16,9 +17,11 @@ from track.v2.db_writer import (
     insert_tracks_cross,
 )
 from track.v2.models import (
+    ClipConfig,
     CrossTrackCandidate,
     HotspotCluster,
     IntersectionTopology,
+    FittingConfig,
     PointRef,
     TurnEvent,
 )
@@ -121,6 +124,29 @@ class RunRegistryWriterTest(unittest.TestCase):
         finish_detect_run(conn, "detect-1", status="completed")
         self.assertIn("UPDATE detect_runs", conn.cursor_instance.sql)
         self.assertEqual(conn.cursor_instance.params, ("completed", "detect-1"))
+
+    def test_fit_run_requires_completed_detect_and_each_call_gets_a_new_id(self):
+        conn = self._Conn(("created",))
+
+        first = create_fit_run(
+            conn, detect_id="detect-1", clip_config=ClipConfig(),
+            fitting_config=FittingConfig(),
+        )
+        first_sql = conn.cursor_instance.sql
+        second = create_fit_run(
+            conn, detect_id="detect-1", clip_config=ClipConfig(),
+            fitting_config=FittingConfig(),
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertIn("d.status = 'completed'", first_sql)
+        self.assertEqual(conn.cursor_instance.params[-1], "detect-1")
+
+        with self.assertRaisesRegex(ValueError, "not completed"):
+            create_fit_run(
+                self._Conn(None), detect_id="running-detect",
+                clip_config=ClipConfig(), fitting_config=FittingConfig(),
+            )
 
 
 class InsertIntersectionsTest(unittest.TestCase):

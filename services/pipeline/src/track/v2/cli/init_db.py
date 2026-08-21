@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import re
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -105,6 +108,10 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             id                  BIGSERIAL PRIMARY KEY,
             clean_id            UUID NOT NULL REFERENCES clean_runs(id),
             vehicle_id          TEXT NOT NULL,
+            subtrack_index      INTEGER NOT NULL,
+            after_sequence_in_subtrack INTEGER NOT NULL,
+            source_id           TEXT NOT NULL,
+            source_row_key      TEXT NOT NULL,
             timestamp           DOUBLE PRECISION NOT NULL,
             lon                 DOUBLE PRECISION NOT NULL,
             lat                 DOUBLE PRECISION NOT NULL,
@@ -270,6 +277,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             geom                        geometry(Polygon, 4326),  -- app-layer: derived from candidate_intersections
             created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (id, detect_id),
+            UNIQUE (detect_id, cluster_id),
             FOREIGN KEY (candidate_intersection_id, detect_id)
                 REFERENCES candidate_intersections(id, detect_id)
         )
@@ -297,6 +305,65 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
                 REFERENCES candidate_entry_exit_points(id, detect_id)
         )
     """),
+    ("fit_runs", """
+        CREATE TABLE IF NOT EXISTS fit_runs (
+            id                  UUID PRIMARY KEY,
+            detect_id           UUID NOT NULL REFERENCES detect_runs(id),
+            clip_algorithm      TEXT NOT NULL,
+            clip_version        TEXT NOT NULL,
+            fitting_algorithm   TEXT NOT NULL,
+            fitting_version     TEXT NOT NULL,
+            parameters          JSONB NOT NULL DEFAULT '{}',
+            report              JSONB,
+            status              TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+            started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at         TIMESTAMPTZ,
+            UNIQUE (id, detect_id)
+        )
+    """),
+    ("centerlines", """
+        CREATE TABLE IF NOT EXISTS centerlines (
+            id                  BIGSERIAL PRIMARY KEY,
+            fit_id              UUID NOT NULL,
+            detect_id           UUID NOT NULL,
+            variant             TEXT NOT NULL CHECK (variant IN ('combined', 'directed')),
+            from_cluster_id     INTEGER NOT NULL,
+            to_cluster_id       INTEGER NOT NULL,
+            geom                geometry(LineString, 4326) NOT NULL,
+            length_m            DOUBLE PRECISION NOT NULL,
+            forward_clip_count  INTEGER NOT NULL,
+            reverse_clip_count  INTEGER NOT NULL,
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            FOREIGN KEY (fit_id, detect_id) REFERENCES fit_runs(id, detect_id),
+            FOREIGN KEY (detect_id, from_cluster_id) REFERENCES intersections(detect_id, cluster_id),
+            FOREIGN KEY (detect_id, to_cluster_id) REFERENCES intersections(detect_id, cluster_id),
+            UNIQUE (fit_id, variant, from_cluster_id, to_cluster_id),
+            CHECK (from_cluster_id <> to_cluster_id),
+            CHECK (variant <> 'combined' OR from_cluster_id < to_cluster_id)
+        )
+    """),
+    ("centerline_source_clips", """
+        CREATE TABLE IF NOT EXISTS centerline_source_clips (
+            centerline_id              BIGINT NOT NULL REFERENCES centerlines(id),
+            input_ordinal              INTEGER NOT NULL,
+            clip_id                    TEXT NOT NULL,
+            vehicle_id                 TEXT NOT NULL,
+            subtrack_index             INTEGER NOT NULL,
+            clip_ordinal_in_track      INTEGER NOT NULL,
+            start_cluster_id           INTEGER NOT NULL,
+            start_segment_index        INTEGER NOT NULL,
+            start_segment_fraction     DOUBLE PRECISION NOT NULL,
+            interior_start_index       INTEGER NOT NULL,
+            interior_end_index_exclusive INTEGER NOT NULL,
+            end_cluster_id             INTEGER NOT NULL,
+            end_segment_index          INTEGER NOT NULL,
+            end_segment_fraction       DOUBLE PRECISION NOT NULL,
+            reverse_to_centerline_direction BOOLEAN NOT NULL,
+            input_point_count          INTEGER NOT NULL,
+            PRIMARY KEY (centerline_id, input_ordinal),
+            UNIQUE (centerline_id, clip_id)
+        )
+    """),
 ]
 
 # ── Index DDL (separate for cleaner error reporting) ────────────────
@@ -304,6 +371,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
 INDEX_STATEMENTS: list[tuple[str, str]] = [
     ("idx_clean_runs_source", "CREATE INDEX IF NOT EXISTS idx_clean_runs_source ON clean_runs(source_id, started_at DESC)"),
     ("idx_detect_runs_clean", "CREATE INDEX IF NOT EXISTS idx_detect_runs_clean ON detect_runs(clean_id, started_at DESC)"),
+    ("idx_fit_runs_detect", "CREATE INDEX IF NOT EXISTS idx_fit_runs_detect ON fit_runs(detect_id, started_at DESC)"),
+    ("idx_centerlines_fit", "CREATE INDEX IF NOT EXISTS idx_centerlines_fit ON centerlines(fit_id, variant)"),
     # ── trajectory_points ──
     ("idx_tp_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_tp_vehicle_ts ON trajectory_points(vehicle_id, timestamp)"),
     ("idx_tp_geom",            "CREATE INDEX IF NOT EXISTS idx_tp_geom ON trajectory_points USING GIST (geom)"),
@@ -315,8 +384,10 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     # ── kept_trajectory_points ──
     ("idx_ktp_tp_id",          "CREATE INDEX IF NOT EXISTS idx_ktp_tp_id ON kept_trajectory_points(trajectory_point_id)"),
     ("idx_ktp_vehicle_sub",    "CREATE INDEX IF NOT EXISTS idx_ktp_vehicle_sub ON kept_trajectory_points(clean_id, vehicle_id, subtrack_index, sequence_in_subtrack)"),
+    ("idx_ktp_member_unique",  "CREATE UNIQUE INDEX IF NOT EXISTS idx_ktp_member_unique ON kept_trajectory_points(clean_id, vehicle_id, subtrack_index, sequence_in_subtrack)"),
     # ── injected_points ──
     ("idx_ip_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_ip_vehicle_ts ON injected_points(clean_id, vehicle_id, timestamp)"),
+    ("idx_ip_member_unique",   "CREATE UNIQUE INDEX IF NOT EXISTS idx_ip_member_unique ON injected_points(clean_id, vehicle_id, subtrack_index, after_sequence_in_subtrack)"),
     ("idx_ip_geom",            "CREATE INDEX IF NOT EXISTS idx_ip_geom ON injected_points USING GIST (geom)"),
     # ── tracks_cross ──
     ("idx_tc_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_tc_vehicle_ts ON tracks_cross(detect_id, vehicle_id, timestamp)"),
@@ -601,6 +672,70 @@ def _run_migrations(cur: Any) -> None:
             "EXECUTE 'ALTER TABLE kept_trajectory_points DROP CONSTRAINT ' || cname; "
             "END IF; END $$",
         ),
+        (
+            "validate_kept_membership_unique",
+            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM kept_trajectory_points "
+            "GROUP BY clean_id, vehicle_id, subtrack_index, sequence_in_subtrack "
+            "HAVING COUNT(*) > 1) THEN "
+            "RAISE EXCEPTION 'duplicate kept membership prevents migration'; "
+            "END IF; END $$",
+        ),
+        (
+            "validate_legacy_injected_parent_unique",
+            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM injected_points "
+            "WHERE subtrack_index IS NULL OR after_sequence_in_subtrack IS NULL "
+            "GROUP BY clean_id, vehicle_id, from_source_id, from_source_row_key, "
+            "to_source_id, to_source_row_key HAVING COUNT(*) > 1) THEN "
+            "RAISE EXCEPTION 'legacy injected parents are ambiguous'; "
+            "END IF; END $$",
+        ),
+        (
+            "backfill_injected_membership",
+            "UPDATE injected_points AS ip SET "
+            "source_id = ip.from_source_id, "
+            "source_row_key = CONCAT(ip.from_source_row_key, '->', "
+            "ip.to_source_row_key, ':', ip.generated_reason), "
+            "subtrack_index = left_point.subtrack_index, "
+            "after_sequence_in_subtrack = left_point.sequence_in_subtrack "
+            "FROM kept_trajectory_points AS left_point "
+            "JOIN kept_trajectory_points AS right_point "
+            "ON right_point.clean_id = left_point.clean_id "
+            "AND right_point.vehicle_id = left_point.vehicle_id "
+            "AND right_point.subtrack_index = left_point.subtrack_index "
+            "AND right_point.sequence_in_subtrack = left_point.sequence_in_subtrack + 1 "
+            "WHERE ip.clean_id = left_point.clean_id "
+            "AND ip.vehicle_id = left_point.vehicle_id "
+            "AND ip.from_source_id = left_point.source_id "
+            "AND ip.from_source_row_key = left_point.source_row_key "
+            "AND ip.to_source_id = right_point.source_id "
+            "AND ip.to_source_row_key = right_point.source_row_key "
+            "AND (ip.subtrack_index IS NULL OR ip.after_sequence_in_subtrack IS NULL "
+            "OR ip.source_id IS NULL OR ip.source_row_key IS NULL)",
+        ),
+        (
+            "validate_injected_membership",
+            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM injected_points WHERE "
+            "subtrack_index IS NULL OR after_sequence_in_subtrack IS NULL "
+            "OR source_id IS NULL OR source_row_key IS NULL) THEN "
+            "RAISE EXCEPTION 'legacy injected provenance is incomplete'; "
+            "END IF; END $$",
+        ),
+        (
+            "validate_injected_membership_unique",
+            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM injected_points "
+            "GROUP BY clean_id, vehicle_id, subtrack_index, after_sequence_in_subtrack "
+            "HAVING COUNT(*) > 1) THEN "
+            "RAISE EXCEPTION 'duplicate injected membership prevents migration'; "
+            "END IF; END $$",
+        ),
+        (
+            "require_injected_membership",
+            "ALTER TABLE injected_points "
+            "ALTER COLUMN subtrack_index SET NOT NULL, "
+            "ALTER COLUMN after_sequence_in_subtrack SET NOT NULL, "
+            "ALTER COLUMN source_id SET NOT NULL, "
+            "ALTER COLUMN source_row_key SET NOT NULL",
+        ),
     ]
     for label, sql in migrations:
         cur.execute(sql)
@@ -685,8 +820,10 @@ def main() -> int:
         help="Drop all tables (CASCADE) before recreating them, clearing all data."
     )
     parser.add_argument(
-        "--legacy-clean-map", type=Path,
-        help="JSON object mapping ambiguous legacy Detect UUIDs to Clean UUIDs.",
+        "--legacy-clean-map",
+        type=Path,
+        help=("JSON object mapping ambiguous legacy Detect UUIDs to their exact "
+              "parent Clean UUIDs. No relationship is inferred."),
     )
     args = parser.parse_args()
 

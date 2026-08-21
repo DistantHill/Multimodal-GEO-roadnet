@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from ._geometry import _to_lonlat, _to_xy
 from .models import (
     Centerline,
+    CenterlineFitBundle,
     ClipResult,
     FitIssue,
     FitReport,
@@ -96,6 +97,56 @@ def fit_centerlines(
         ),
         detect_id=clips.detect_id,
     )
+
+
+def fit_centerline_variants(
+    clips: ClipResult,
+    *,
+    config: FittingConfig | None = None,
+) -> CenterlineFitBundle:
+    """Fit the combined physical line and both observed travel directions."""
+    combined = fit_centerlines(clips, config=config)
+    a_to_b = _fit_direction(clips, reverse=False, config=config)
+    b_to_a = _fit_direction(clips, reverse=True, config=config)
+    return CenterlineFitBundle(combined=combined, a_to_b=a_to_b, b_to_a=b_to_a)
+
+
+def _fit_direction(
+    clips: ClipResult,
+    *,
+    reverse: bool,
+    config: FittingConfig | None,
+) -> FitResult:
+    selected = tuple(
+        clip
+        for clip in clips.clips
+        if clip.clip_type == "inter_intersection"
+        and clip.start.cluster_id is not None
+        and clip.end.cluster_id is not None
+        and clip.start.cluster_id != clip.end.cluster_id
+        and ((clip.start.cluster_id > clip.end.cluster_id) == reverse)
+    )
+    fitted = fit_centerlines(
+        ClipResult(clips=selected, report=clips.report, detect_id=clips.detect_id),
+        config=config,
+    )
+    centerlines = tuple(
+        replace(
+            centerline,
+            from_cluster_id=(
+                centerline.to_cluster_id if reverse else centerline.from_cluster_id
+            ),
+            to_cluster_id=(
+                centerline.from_cluster_id if reverse else centerline.to_cluster_id
+            ),
+            points=(
+                tuple(reversed(centerline.points)) if reverse else centerline.points
+            ),
+            variant="directed",
+        )
+        for centerline in fitted.centerlines
+    )
+    return replace(fitted, centerlines=centerlines)
 
 
 def _validate_config(config: FittingConfig) -> None:

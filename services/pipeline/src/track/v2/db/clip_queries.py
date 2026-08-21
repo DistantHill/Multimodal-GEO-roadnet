@@ -49,7 +49,7 @@ def fetch_intersections(conn: object, detect_id: str) -> list[ClipIntersection]:
             "SELECT i.cluster_id, ci.centroid_lon, ci.centroid_lat, i.clip_radius_m "
             "FROM intersections AS i "
             "JOIN candidate_intersections AS ci "
-            "ON ci.id = i.candidate_intersection_id "
+            "ON ci.id = i.candidate_intersection_id AND ci.detect_id = i.detect_id "
             "WHERE i.detect_id = %s AND i.is_complete IS TRUE "
             "ORDER BY i.cluster_id",
             (detect_id,),
@@ -80,34 +80,28 @@ def fetch_clean_points(
     """Load one Clean Run's frozen kept members and injected points."""
     safe_table = _quoted_identifier(table)
     sql = (
-        "SELECT vehicle_id, subtrack_index, sequence_in_subtrack, "
+        "SELECT vehicle_id, subtrack_index, anchor_sequence, "
         "source_id, source_row_key, timestamp, lon, lat, heading, speed, extra, "
         "from_source_row_key, to_source_row_key, generated_reason "
         "FROM ("
-        "  SELECT ktp.vehicle_id, ktp.subtrack_index, ktp.sequence_in_subtrack, "
+        "  SELECT ktp.vehicle_id, ktp.subtrack_index, ktp.sequence_in_subtrack AS anchor_sequence, "
         "         ktp.source_id, ktp.source_row_key, "
         "         tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, tp.extra, "
         "         NULL::text AS from_source_row_key, "
         "         NULL::text AS to_source_row_key, ''::text AS generated_reason, "
-        "         0 AS point_kind "
+        "         0 AS point_kind, ktp.id AS row_id "
         "  FROM kept_trajectory_points AS ktp "
-        f"  JOIN {safe_table} AS tp ON tp.id = ktp.trajectory_point_id "
+        f"  LEFT JOIN {safe_table} AS tp ON tp.id = ktp.trajectory_point_id "
         "  WHERE ktp.clean_id = %s "
         "  UNION ALL "
-        "  SELECT ip.vehicle_id, "
-        "         COALESCE((SELECT MIN(ktp2.subtrack_index) "
-        "                   FROM kept_trajectory_points AS ktp2 "
-        "                   WHERE ktp2.clean_id = ip.clean_id "
-        "                     AND ktp2.vehicle_id = ip.vehicle_id), 1), "
-        "         NULL::integer, ip.from_source_id, "
-        "         CONCAT(ip.from_source_row_key, '->', ip.to_source_row_key, "
-        "                ':', ip.generated_reason), "
+        "  SELECT ip.vehicle_id, ip.subtrack_index, ip.after_sequence_in_subtrack, "
+        "         ip.source_id, ip.source_row_key, "
         "         ip.timestamp, ip.lon, ip.lat, ip.heading, ip.speed, '{}'::jsonb, "
         "         ip.from_source_row_key, ip.to_source_row_key, ip.generated_reason, "
-        "         1 AS point_kind "
+        "         1 AS point_kind, ip.id AS row_id "
         "  FROM injected_points AS ip WHERE ip.clean_id = %s"
         ") AS clean_points "
-        "ORDER BY vehicle_id, subtrack_index, timestamp, point_kind, sequence_in_subtrack"
+        "ORDER BY vehicle_id, subtrack_index, anchor_sequence, point_kind, row_id"
     )
     return _group_points(conn, sql, (clean_id, clean_id), clean_id)
 
@@ -128,6 +122,11 @@ def _group_points(
             if row[3] is None or row[4] is None:
                 raise ValueError(
                     f"Clean Run {clean_id} predates persisted source references"
+                )
+            generated_reason = str(row[13])
+            if any(row[index] is None for index in range(5, 10)):
+                raise ValueError(
+                    f"Clean Run {clean_id} references a missing source row"
                 )
             generated_reason = str(row[13])
             grouped.setdefault((vehicle_id, subtrack_index), []).append(

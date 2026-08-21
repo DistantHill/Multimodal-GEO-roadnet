@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import date, datetime
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Callable, Iterator, Protocol, TextIO
+from typing import Any, Callable, Iterator, Literal, Protocol, TextIO
 
 
 ColumnSelector = Callable[[list[str]], dict[str, str]]
@@ -347,6 +347,16 @@ class CleanerResult(TrackModel):
 
 
 @dataclass(frozen=True)
+class CleanedSubtrack(TrackModel):
+    """One Cleaner subtrack with kept and derived points in deterministic order."""
+
+    vehicle_id: str
+    subtrack_index: int
+    kept: list[TrajectoryPoint]
+    active: list[TrajectoryPoint]
+
+
+@dataclass(frozen=True)
 class CleanerIncrementalResult(TrackModel):
     """Per-vehicle result from ``clean_vehicle()`` — stream-friendly.
 
@@ -358,6 +368,7 @@ class CleanerIncrementalResult(TrackModel):
     excluded: list[ExcludedPoint]       # 被排除的点
     kept_subtracks: list[list[TrajectoryPoint]]  # 保留的子轨迹
     injected_count: int                 # 注入的 orthogonal 点数量
+    subtracks: list[CleanedSubtrack] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -598,6 +609,7 @@ class ClipTrack(TrackModel):
     vehicle_id: str
     trip_id: str
     points: tuple[TrajectoryPoint, ...]
+    subtrack_index: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -639,6 +651,10 @@ class TrackClip(TrackModel):
     points: tuple[TrajectoryPoint, ...]
     distance_m: float
     point_count: int
+    subtrack_index: int = 1
+    clip_ordinal_in_track: int = 0
+    interior_start_index: int = 0
+    interior_end_index_exclusive: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -679,6 +695,9 @@ class FittingConfig(TrackModel):
     min_clips_per_pair: int = 1
 
 
+CenterlineVariant = Literal["combined", "directed"]
+
+
 @dataclass(frozen=True, slots=True)
 class Centerline(TrackModel):
     """One physical road centerline in canonical cluster-id direction."""
@@ -690,6 +709,7 @@ class Centerline(TrackModel):
     source_clip_ids: tuple[str, ...]
     forward_clip_count: int
     reverse_clip_count: int
+    variant: CenterlineVariant = "combined"
 
     @property
     def source_clip_count(self) -> int:
@@ -722,6 +742,15 @@ class FitResult(TrackModel):
     issues: tuple[FitIssue, ...]
     report: FitReport
     detect_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CenterlineFitBundle(TrackModel):
+    """Fixed combined and observed-direction fitting results."""
+
+    combined: FitResult
+    a_to_b: FitResult
+    b_to_a: FitResult
 
 
 # ── Network output models ───────────────────────────────────────────
@@ -776,6 +805,44 @@ class NetworkResult(TrackModel):
     issues: tuple[NetworkIssue, ...]
     report: NetworkReport
     detect_id: str | None = None
+
+
+# ── Centerline Replay output models ────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayFitEndpoint(TrackModel):
+    point: TrajectoryPoint
+    bracket_refs: tuple[PointRef, PointRef]
+    segment_index: int
+    segment_fraction: float
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayFitClip(TrackModel):
+    clip_id: str
+    input_ordinal: int
+    original_from_cluster_id: int
+    original_to_cluster_id: int
+    reverse_to_centerline_direction: bool
+    start: ReplayFitEndpoint
+    interior_points: tuple[TrajectoryPoint, ...]
+    end: ReplayFitEndpoint
+    points: tuple[TrajectoryPoint, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CenterlineInputReplay(TrackModel):
+    centerline_id: int
+    fit_id: str
+    detect_id: str
+    clean_id: str
+    variant: str
+    from_cluster_id: int
+    to_cluster_id: int
+    centerline_wkt: str
+    value_semantics: str
+    clips: tuple[ReplayFitClip, ...]
 
 
 # ── Replay output models ────────────────────────────────────────────

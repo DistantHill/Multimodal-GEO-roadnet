@@ -187,17 +187,25 @@ def extract_clips_for_detect(
     *,
     config: ClipConfig | None = None,
 ) -> ClipResult:
-    """Extract clips from one completed Detect Run."""
-    source = _load_clip_input_for_detect(conn, detect_id)
+    """Extract clips from one persisted detect.
+
+    Historical replay accepts completed detects only. The pipeline runner may set
+    ``allow_running`` while validating its just-written Intersect2 artifacts
+    in the same transaction, before marking that detect completed.
+    """
+    source = _load_clip_input_for_detect(conn, detect_id, allow_running=allow_running)
     return extract_clips(source, config=config)
 
 
 def _load_clip_input_for_detect(
     conn: object,
     detect_id: str,
+    *,
+    allow_running: bool,
 ) -> ClipInput:
     run_row = fetch_detect_row(conn, detect_id)
-    if run_row.status != "completed":
+    accepted_statuses = {"completed", "running"} if allow_running else {"completed"}
+    if run_row.status not in accepted_statuses:
         raise ValueError(f"Detect Run {detect_id} is not completed")
 
     params = run_row.parameters
@@ -212,6 +220,27 @@ def _load_clip_input_for_detect(
     )
 
 
+def _split_by_time_gaps(
+    grouped: dict[tuple[str, int], list[TrajectoryPoint]],
+    *,
+    max_gap_s: float,
+) -> dict[tuple[str, int], list[TrajectoryPoint]]:
+    """Split raw-point groups into subtracks wherever the time gap exceeds *max_gap_s*."""
+    result: dict[tuple[str, int], list[TrajectoryPoint]] = {}
+    for (vehicle_id, _), points in grouped.items():
+        subtrack_index = 1
+        current: list[TrajectoryPoint] = []
+        for point in points:
+            if current and point.timestamp - current[-1].timestamp > max_gap_s:
+                result[(vehicle_id, subtrack_index)] = current
+                subtrack_index += 1
+                current = []
+            current.append(point)
+        if current:
+            result[(vehicle_id, subtrack_index)] = current
+    return result
+
+
 def _build_clip_tracks(
     grouped: dict[tuple[str, int], list[TrajectoryPoint]],
 ) -> tuple[ClipTrack, ...]:
@@ -221,8 +250,9 @@ def _build_clip_tracks(
             vehicle_id=vehicle_id,
             trip_id=f"{vehicle_id}:subtrack-{subtrack_index:04d}",
             points=tuple(points),
+            subtrack_index=subtrack_index,
         )
-        for (vehicle_id, subtrack_index), points in grouped.items()
+        for (vehicle_id, subtrack_index), points in sorted(grouped.items())
     )
 
 
@@ -264,6 +294,10 @@ def _extract_track_clips(
                 points=interior,
                 distance_m=_polyline_distance_m(geometry),
                 point_count=len(interior) + 2,
+                subtrack_index=track.subtrack_index,
+                clip_ordinal_in_track=ordinal,
+                interior_start_index=interior_start,
+                interior_end_index_exclusive=interior_end,
             )
         )
 

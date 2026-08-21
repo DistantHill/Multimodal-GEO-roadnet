@@ -26,15 +26,115 @@ from typing import Any, Callable, Protocol, overload
 
 from .models import (
     CleanerResult,
+    CenterlineInputReplay,
     CrossingPoint,
     HotspotCluster,
     InOutIntersectionPoint,
     PointRef,
     ReplayCleanResult,
+    ReplayFitClip,
+    ReplayFitEndpoint,
     TrackModel,
     TrajectoryPoint,
 )
-from .sources import open_text_auto, source_row_hash
+from .sources import source_row_hash
+from .db.clip_queries import fetch_clean_points, fetch_detect_row
+
+
+def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInputReplay:
+    """Rebuild exact ordered Clip membership for one persisted centerline."""
+    with conn.cursor() as cur:  # type: ignore[attr-defined]
+        cur.execute(
+            "SELECT c.fit_id, c.detect_id, c.variant, c.from_cluster_id, "
+            "c.to_cluster_id, ST_AsText(c.geom), c.forward_clip_count, "
+            "c.reverse_clip_count "
+            "FROM centerlines AS c JOIN fit_runs AS f ON f.id = c.fit_id "
+            "AND f.detect_id = c.detect_id "
+            "WHERE c.id = %s AND f.status = 'completed'",
+            (centerline_id,),
+        )
+        centerline_row = cur.fetchone()
+    if centerline_row is None:
+        raise ValueError(f"unknown completed Centerline: {centerline_id}")
+    (fit_id, detect_id, variant, from_id, to_id, centerline_wkt,
+     forward_count, reverse_count) = centerline_row
+    detect = fetch_detect_row(conn, str(detect_id))
+    grouped = fetch_clean_points(
+        conn, str(detect.parameters["target_table"]), detect.clean_id,
+    )
+    with conn.cursor() as cur:  # type: ignore[attr-defined]
+        cur.execute(
+            "SELECT input_ordinal, clip_id, vehicle_id, subtrack_index, "
+            "start_cluster_id, start_segment_index, start_segment_fraction, "
+            "interior_start_index, interior_end_index_exclusive, end_cluster_id, "
+            "end_segment_index, end_segment_fraction, "
+            "reverse_to_centerline_direction, input_point_count "
+            "FROM centerline_source_clips WHERE centerline_id = %s "
+            "ORDER BY input_ordinal",
+            (centerline_id,),
+        )
+        manifest_rows = list(cur)
+    if len(manifest_rows) != int(forward_count) + int(reverse_count):
+        raise ValueError(f"Centerline {centerline_id} source Clip manifest is incomplete")
+    clips: list[ReplayFitClip] = []
+    for row in manifest_rows:
+        (ordinal, clip_id, vehicle_id, subtrack_index, start_cluster_id,
+         start_segment, start_fraction, interior_start, interior_end,
+         end_cluster_id, end_segment, end_fraction, reverse_direction,
+         input_point_count) = row
+        track = grouped.get((str(vehicle_id), int(subtrack_index)))
+        if track is None:
+            raise ValueError(f"Centerline {centerline_id} references a missing subtrack")
+        start = _replay_fit_endpoint(track, int(start_segment), float(start_fraction))
+        end = _replay_fit_endpoint(track, int(end_segment), float(end_fraction))
+        interior = tuple(track[int(interior_start):int(interior_end)])
+        if len(interior) + 2 != int(input_point_count):
+            raise ValueError(f"Centerline {centerline_id} Clip {clip_id} membership drifted")
+        original_points = (start.point, *interior, end.point)
+        oriented_points = (
+            tuple(reversed(original_points)) if reverse_direction else original_points
+        )
+        clips.append(ReplayFitClip(
+            clip_id=str(clip_id), input_ordinal=int(ordinal),
+            original_from_cluster_id=int(start_cluster_id),
+            original_to_cluster_id=int(end_cluster_id),
+            reverse_to_centerline_direction=bool(reverse_direction),
+            start=start, interior_points=interior, end=end, points=oriented_points,
+        ))
+    return CenterlineInputReplay(
+        centerline_id=centerline_id, fit_id=str(fit_id), detect_id=str(detect_id),
+        clean_id=detect.clean_id, variant=str(variant), from_cluster_id=int(from_id),
+        to_cluster_id=int(to_id), centerline_wkt=str(centerline_wkt),
+        value_semantics="current_kept_values_and_persisted_injected_values",
+        clips=tuple(clips),
+    )
+
+
+def _replay_fit_endpoint(
+    track: list[TrajectoryPoint], segment_index: int, fraction: float,
+) -> ReplayFitEndpoint:
+    if segment_index < 0 or segment_index + 1 >= len(track):
+        raise ValueError("Centerline endpoint segment is outside its frozen subtrack")
+    left, right = track[segment_index], track[segment_index + 1]
+    point = TrajectoryPoint(
+        point_ref=PointRef(
+            source_id=left.point_ref.source_id,
+            source_row_key=(f"{left.point_ref.source_row_key}->"
+                            f"{right.point_ref.source_row_key}:clip_endpoint:{fraction:.17g}"),
+            stable=False, from_ref=left.point_ref.source_row_key,
+            to_ref=right.point_ref.source_row_key, generated_reason="clip_endpoint",
+        ),
+        vehicle_id=left.vehicle_id,
+        timestamp=left.timestamp + fraction * (right.timestamp - left.timestamp),
+        lon=left.lon + fraction * (right.lon - left.lon),
+        lat=left.lat + fraction * (right.lat - left.lat),
+        heading=left.heading + fraction * (right.heading - left.heading),
+        speed=left.speed + fraction * (right.speed - left.speed),
+    )
+    return ReplayFitEndpoint(
+        point=point, bracket_refs=(left.point_ref, right.point_ref),
+        segment_index=segment_index, segment_fraction=fraction,
+    )
 
 
 @dataclass(frozen=True)
@@ -257,7 +357,8 @@ class PostgresReplayStore:
         if kind == "intersection":
             add("candidate_intersection", row.get("candidate_intersection_id"), "candidate")
             parents.extend(self._children(
-                "SELECT id FROM entry_exit_points WHERE intersection_id = %s",
+                "SELECT id FROM entry_exit_points WHERE intersection_id = %s "
+                "AND detect_id = %s",
                 target.id,
                 "entry_exit_point",
                 detect_id,
@@ -266,7 +367,7 @@ class PostgresReplayStore:
         elif kind == "candidate_intersection":
             parents.extend(self._children(
                 "SELECT id FROM candidate_intersection_events "
-                "WHERE candidate_intersection_id = %s",
+                "WHERE candidate_intersection_id = %s AND detect_id = %s",
                 target.id,
                 "candidate_intersection_event",
                 detect_id,
@@ -274,7 +375,7 @@ class PostgresReplayStore:
             ))
             parents.extend(self._children(
                 "SELECT id FROM candidate_entry_exit_points "
-                "WHERE candidate_intersection_id = %s",
+                "WHERE candidate_intersection_id = %s AND detect_id = %s",
                 target.id,
                 "candidate_entry_exit_point",
                 detect_id,
@@ -346,6 +447,7 @@ class PostgresReplayStore:
         elif kind == "excluded_point":
             pass
         elif kind == "kept_trajectory_point":
+            add("trajectory_point", row.get("trajectory_point_id"), "kept_raw_point")
             raw_target = self._raw_target(
                 target,
                 row.get("source_id"),
@@ -394,7 +496,7 @@ class PostgresReplayStore:
         relation: str,
     ) -> list[tuple[str, ReplayTarget]]:
         with self._conn.cursor() as cur:
-            cur.execute(sql, (parent_id,))
+            cur.execute(sql, (parent_id, detect_id))
             rows = cur.fetchall()
         return [
             (relation, ReplayTarget(kind, int(row[0]), detect_id=detect_id))
@@ -428,6 +530,15 @@ class PostgresReplayStore:
         parents.append((relation, self._raw_target(
             owner, source_id, source_row_key, raw_id,
         )))
+        # PG-only mode: source_row_key is the trajectory_points.id value
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM trajectory_points WHERE id = %s",
+                (int(source_row_key),),
+            )
+            row = cur.fetchone()
+        if row is not None:
+            parents.append((relation, ReplayTarget("trajectory_point", int(row[0]))))
 
     def _add_segment_source_points(
         self,

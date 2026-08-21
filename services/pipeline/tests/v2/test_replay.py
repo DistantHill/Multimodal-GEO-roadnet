@@ -1,4 +1,4 @@
-"""Public replay-service behaviour tests."""
+﻿"""Public replay-service behaviour tests."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from track.v2.replay import (
     PostgresSourceRowResolver,
     ReplayService,
     ReplayTarget,
+    replay_centerline_inputs,
 )
 from track.v2.sources import source_row_hash
 from track.v2.cli.replay import _target_from_args
@@ -70,10 +71,7 @@ class _LookupCursor:
             return (self.params[-1],)
         if "trajectory_points" in self.sql:
             row_id = self.params[0]
-            return {
-                1: ({"id": 1},),
-                2: ({"id": 2},),
-            }.get(row_id)
+            return {1: (1,), 2: (2,)}.get(row_id)
         return None
 
 
@@ -147,6 +145,60 @@ class ReplayServiceTest(unittest.TestCase):
 
         init_logger.assert_called_once_with()
         shutdown_logger.assert_called_once_with()
+    def test_centerline_replay_returns_grouped_current_points_and_bracket_refs(self) -> None:
+        class SequenceCursor:
+            def __init__(self, conn):
+                self.conn = conn
+                self.rows = []
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return None
+            def execute(self, sql, params):
+                self.conn.sql.append(sql)
+                self.rows = self.conn.responses.pop(0)
+            def fetchone(self):
+                return self.rows[0] if self.rows else None
+            def __iter__(self):
+                return iter(self.rows)
+        class SequenceConnection:
+            def __init__(self, responses):
+                self.responses = responses
+                self.sql = []
+            def cursor(self):
+                return SequenceCursor(self)
+
+        point_rows = [
+            ("vehicle-1", 2, index, "source", str(index), float(index),
+             100.0 + index, 30.0, 90.0, 5.0, {}, None, None, "")
+            for index in range(4)
+        ]
+        manifest = [
+            (0, "clip-1", "vehicle-1", 2, 20, 0, 0.5, 1, 3,
+             10, 2, 0.5, True, 4),
+        ]
+        conn = SequenceConnection([
+            [("fit-1", "detect-1", "directed", 10, 20,
+              "LINESTRING(0 0,1 1)", 1, 0)],
+            [("clean-1", "source", {"target_table": "trajectory_points"}, "completed")],
+            point_rows,
+            manifest,
+        ])
+
+        result = replay_centerline_inputs(conn, 7)
+
+        self.assertEqual(result.centerline_wkt, "LINESTRING(0 0,1 1)")
+        self.assertEqual(len(result.clips), 1)
+        clip = result.clips[0]
+        self.assertEqual(
+            [point.point_ref.source_row_key for point in clip.interior_points],
+            ["1", "2"],
+        )
+        self.assertEqual(
+            [ref.source_row_key for ref in clip.start.bracket_refs], ["0", "1"],
+        )
+        self.assertGreater(clip.points[0].lon, clip.points[-1].lon)
+        self.assertNotIn("is_active", conn.sql[2])
 
     def test_cli_target_uses_the_stage_id_required_by_kind(self) -> None:
         parser = MagicMock()
@@ -175,6 +227,7 @@ class ReplayServiceTest(unittest.TestCase):
         self.assertEqual(clean, ReplayTarget("kept_trajectory_point", 7, clean_id="clean-1"))
         self.assertEqual(detect, ReplayTarget("intersection", 8, detect_id="detect-1"))
         self.assertEqual(raw, ReplayTarget("trajectory_point", 9))
+        self.assertEqual(centerline, ReplayTarget("centerline", 10))
         parser.error.assert_not_called()
 
     def test_postgres_store_filters_clean_and_detect_kinds_by_named_stage_id(self) -> None:
@@ -337,6 +390,7 @@ class ReplayServiceTest(unittest.TestCase):
         candidate_parents = store.parent_refs(
             ReplayTarget("candidate_intersection", 20, detect_id="detect-1"), {},
         )
+        self.assertEqual(store._conn.cursor_.params, (20, "detect-1"))
         member_parents = store.parent_refs(
             ReplayTarget("candidate_intersection_event", 15, detect_id="detect-1"),
             {

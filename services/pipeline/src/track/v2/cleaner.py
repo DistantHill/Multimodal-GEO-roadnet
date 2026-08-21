@@ -9,6 +9,7 @@ from .models import (
     CleanReport,
     CleanerConfig,
     CleanerIncrementalResult,
+    CleanedSubtrack,
     CleanerResult,
     ExcludedIndex,
     ExcludedPoint,
@@ -39,6 +40,7 @@ def clean_vehicle(
     excluded: list[ExcludedPoint] = []
     kept_subtracks: list[list[TrajectoryPoint]] = []
     injected_count = 0
+    cleaned_subtracks: list[CleanedSubtrack] = []
 
     subtracks = _split_by_gaps(vehicle_points, cfg.max_gap_s)
     rename = len(subtracks) > 1
@@ -51,12 +53,22 @@ def clean_vehicle(
         injected_subtrack, count = _inject_orthogonal(kept, cfg)
         active.extend(injected_subtrack)
         injected_count += count
+        if kept:
+            cleaned_subtracks.append(
+                CleanedSubtrack(
+                    vehicle_id=kept[0].vehicle_id,
+                    subtrack_index=index,
+                    kept=kept,
+                    active=injected_subtrack,
+                )
+            )
 
     return CleanerIncrementalResult(
         active=active,
         excluded=excluded,
         kept_subtracks=kept_subtracks,
         injected_count=injected_count,
+        subtracks=cleaned_subtracks,
     )
 
 

@@ -107,8 +107,10 @@ def build_active_in_window_sql(
 
     ZH: 空间窗口内的 active + injected points UNION ALL 查询。
         使用 ``geom && ST_MakeEnvelope()`` 走 GiST R-tree 2D 空间索引。
-        ``kept_table`` 非空时，trajectory 分支 JOIN 清洗结果表，
+        ``kept_table`` 非空时，trajectory 分支改为 JOIN 清洗结果表
+        (``kept_table`` 存 vehicle_id/subtrack 切分，几何列取自 ``table``)，
         且 ``ktp.clean_id`` 必填，只读本次 Clean Run 的 kept 结果。
+
     EN: When ``kept_table`` is set, the trajectory branch JOINs the clean-result
         table (which carries the _seg-suffixed vehicle_id / subtrack splits)
         against ``table`` for geometry columns, filtered by ``ktp.clean_id``.
@@ -177,8 +179,11 @@ def build_stream_all_sql(
 
     ZH: 全量 active + injected points UNION ALL 查询（无空间过滤）。
         用于 server-side named cursor 逐车流式读取。
-        ``kept_table`` 非空时，trajectory 分支 JOIN 清洗结果表，
+        使用 ``is_active = TRUE`` 以匹配 partial index ``idx_tp_active``。
+        ``kept_table`` 非空时，trajectory 分支改为 JOIN 清洗结果表
+        (``kept_table`` 的 vehicle_id 带 _seg 后缀，几何列取自 ``table``)，
         并按 ``ktp.clean_id`` 只读本次 Clean Run。
+
     EN: When ``kept_table`` is set, the trajectory branch JOINs the clean-result
         table (suffixed vehicle_id) against ``table`` for geometry columns,
         filtered by ``ktp.clean_id``.

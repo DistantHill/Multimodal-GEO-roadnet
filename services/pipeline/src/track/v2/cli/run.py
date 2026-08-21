@@ -25,15 +25,19 @@ import uuid
 from dataclasses import replace
 from pathlib import Path
 
+import psycopg
+
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
 from ..config.pipeline_config import load_pipeline_config
 from ..logger import init_logger, shutdown_logger, LiveStatus
 from ..db_writer import (
     create_clean_run,
     create_detect_run,
+    create_fit_run,
     fetch_clean_run,
     finish_clean_run,
     finish_detect_run,
+    finish_fit_run,
     insert_candidate_entry_exit_points,
     insert_candidate_intersection_events,
     insert_candidate_intersections,
@@ -41,19 +45,23 @@ from ..db_writer import (
     insert_injected_points,
     insert_tracks_cross,
     insert_intersections,
+    insert_centerline_bundle,
     insert_kept_trajectory_points,
     insert_trajectory_points,
     insert_turn_events,
 )
 from ..models import (
+    CleanerConfig,
+    ClipConfig,
     ClipResult,
     CsvSource,
     FitResult,
+    FittingConfig,
     NetworkResult,
     PostgresSource,
 )
 from ..clip import extract_clips_for_detect
-from ..fitting import fit_centerlines
+from ..fitting import fit_centerline_variants
 from ..network import build_network
 from .. import get_database, detect_intersections
 from ..cleaner import clean_vehicle
@@ -87,7 +95,7 @@ def run_pipeline(
     if sum(value is not None for value in (csv_path, pg_source_table, clean_id)) != 1:
         raise ValueError("exactly one of csv_path, pg_source_table, or clean_id is required")
 
-    stats: dict[str, int | str] = {}
+    stats: dict[str, int | str | list[int]] = {}
     t_start = time.perf_counter()
     reuse_clean = clean_id is not None
     is_pg_source = pg_source_table is not None
@@ -360,19 +368,58 @@ def run_pipeline(
 
         # ── Stage 4: Clip (pure result, replayable from this Detect Run) ────────────
         print("\n── Clip: 路段切分 / Track clipping ──")
-        clip_result = extract_clips_for_detect(conn, detect_id)
+        clip_config = ClipConfig()
+        clip_result = extract_clips_for_detect(
+            conn, detect_id, config=clip_config,
+        )
         _add_clip_stats(stats, clip_result)
         _print_clip_report(clip_result)
 
         # ── Stage 5: Fitting (one centerline per connected pair) ────────────
         print("\n── Fitting: 中心线拟合 / Centerline fitting ──")
-        fit_result = fit_centerlines(clip_result)
-        _add_fit_stats(stats, fit_result)
-        fit_result.report.format_print(title="  Fitting 报告 / Fitting report")
+        fitting_config = FittingConfig()
+        fit_id = create_fit_run(
+            conn,
+            detect_id=detect_id,
+            clip_config=clip_config,
+            fitting_config=fitting_config,
+        )
+        stats["fit_id"] = fit_id
+        conn.commit()
+        try:
+            fit_bundle = fit_centerline_variants(clip_result, config=fitting_config)
+            centerline_ids = insert_centerline_bundle(
+                conn, fit_bundle, clip_result, fit_id=fit_id, detect_id=detect_id,
+            )
+            report = {
+                "combined": {
+                    "report": fit_bundle.combined.report.as_dict(),
+                    "issues": [issue.as_dict() for issue in fit_bundle.combined.issues],
+                },
+                "a_to_b": {
+                    "report": fit_bundle.a_to_b.report.as_dict(),
+                    "issues": [issue.as_dict() for issue in fit_bundle.a_to_b.issues],
+                },
+                "b_to_a": {
+                    "report": fit_bundle.b_to_a.report.as_dict(),
+                    "issues": [issue.as_dict() for issue in fit_bundle.b_to_a.issues],
+                },
+            }
+            finish_fit_run(conn, fit_id, status="completed", report=report)
+            conn.commit()
+        except (psycopg.Error, RuntimeError, ValueError):
+            conn.rollback()
+            finish_fit_run(conn, fit_id, status="failed")
+            conn.commit()
+            raise
+        stats["centerlines"] = len(centerline_ids)
+        stats["centerline_ids"] = list(centerline_ids)
+        _add_fit_stats(stats, fit_bundle.combined)
+        fit_bundle.combined.report.format_print(title="  Fitting 报告 / Fitting report")
 
         # ── Stage 6: Network (intersections as nodes, centerlines as edges) ─
         print("\n── Network: 路网组装 / Network assembly ──")
-        network_result = build_network(fit_result, iresult)
+        network_result = build_network(fit_bundle.combined, iresult)
         _add_network_stats(stats, network_result)
         network_result.report.format_print(title="  Network 报告 / Network report")
 
@@ -428,7 +475,7 @@ def _flush_clean_batch(
     return subtrack_index, kept_count
 
 
-def _add_clip_stats(stats: dict[str, int | str], result: ClipResult) -> None:
+def _add_clip_stats(stats: dict[str, int | str | list[int]], result: ClipResult) -> None:
     stats.update(
         {
             f"clip_{name}": value
@@ -442,7 +489,7 @@ def _print_clip_report(result: ClipResult) -> None:
     result.report.format_print(title="  Clip 报告 / Clip report")
 
 
-def _add_fit_stats(stats: dict[str, int | str], result: FitResult) -> None:
+def _add_fit_stats(stats: dict[str, int | str | list[int]], result: FitResult) -> None:
     stats.update(
         {
             f"fitting_{name}": value
@@ -452,7 +499,7 @@ def _add_fit_stats(stats: dict[str, int | str], result: FitResult) -> None:
     )
 
 
-def _add_network_stats(stats: dict[str, int | str], result: NetworkResult) -> None:
+def _add_network_stats(stats: dict[str, int | str | list[int]], result: NetworkResult) -> None:
     stats.update(
         {
             f"network_{name}": value
@@ -577,7 +624,7 @@ def main() -> int:
         shutdown_logger()
 
 
-def _print_write_summary(stats: dict[str, int | str]) -> None:
+def _print_write_summary(stats: dict[str, int | str | list[int]]) -> None:
     """Print model-driven Clip fields plus persisted table row counts."""
     print("\n── 写入统计 / Write Summary ──")
     for table in [

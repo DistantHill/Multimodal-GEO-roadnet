@@ -33,6 +33,8 @@ def build_network(
     seen_pairs: set[tuple[int, int]] = set()
 
     for centerline in fits.centerlines:
+        if centerline.variant != "combined":
+            raise ValueError("Network requires combined centerlines")
         pair = (centerline.from_cluster_id, centerline.to_cluster_id)
         if pair[0] >= pair[1]:
             raise ValueError(

@@ -20,6 +20,7 @@ from ..replay import (
     PostgresSourceRowResolver,
     ReplayService,
     ReplayTarget,
+    replay_centerline_inputs,
 )
 
 
@@ -31,6 +32,10 @@ def _uuid_arg(value: str) -> str:
 
 
 def _target_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> ReplayTarget:
+    if args.kind == "centerline":
+        if args.clean_id or args.detect_id:
+            parser.error("centerline does not take a stage ID")
+        return ReplayTarget(args.kind, args.id)
     if args.kind == "trajectory_point":
         if args.clean_id or args.detect_id:
             parser.error("trajectory_point does not take a stage ID")
@@ -93,7 +98,7 @@ def main() -> int:
             return 1
 
         print_json(trace.as_dict())
-        return 0 if trace.status == "ok" else 1
+        return 0 if target.kind == "centerline" or trace.status == "ok" else 1
     finally:
         shutdown_logger()
 

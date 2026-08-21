@@ -9,6 +9,7 @@ from track.v2.config import PostgresConfig
 from track.v2.db_writer import CleanRunRecord
 from track.v2.intersect2 import IntersectResult
 from track.v2.models import IntersectReport
+from track.v2.models import CenterlineFitBundle
 
 
 CLEAN_ID = "11111111-1111-1111-1111-111111111111"
@@ -49,6 +50,9 @@ class _Connection:
 
     def commit(self) -> None:
         self.events.append("commit")
+
+    def rollback(self) -> None:
+        self.events.append("rollback")
 
 
 class _EmptyHandle:
@@ -100,6 +104,21 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.stack.enter_context(patch("track.v2.cli.run._add_fit_stats"))
         self.stack.enter_context(patch("track.v2.cli.run._add_network_stats"))
         self.stack.enter_context(patch("track.v2.cli.run.fit_centerlines", return_value=MagicMock()))
+        empty_fit = MagicMock()
+        empty_fit.centerlines = ()
+        self.stack.enter_context(
+            patch(
+                "track.v2.cli.run.fit_centerline_variants",
+                return_value=CenterlineFitBundle(empty_fit, empty_fit, empty_fit),
+            )
+        )
+        self.stack.enter_context(
+            patch("track.v2.cli.run.create_fit_run", return_value="fit-1")
+        )
+        self.stack.enter_context(
+            patch("track.v2.cli.run.insert_centerline_bundle", return_value=())
+        )
+        self.stack.enter_context(patch("track.v2.cli.run.finish_fit_run"))
         self.stack.enter_context(patch("track.v2.cli.run.build_network", return_value=MagicMock()))
 
     def test_full_run_commits_clean_then_detect_before_post_processing(self) -> None:
@@ -146,6 +165,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             [
                 "create_clean", "commit", "finish_clean", "commit",
                 "create_detect", "commit", "finish_detect", "commit", "clip",
+                "commit", "commit",
             ],
         )
         create_clean.assert_called_once()
@@ -227,6 +247,32 @@ class RunPipelineLifecycleTest(unittest.TestCase):
 
         finish_detect.assert_called_once_with(self.conn, DETECT_ID, status="completed")
         self.assertEqual(self.events[-3:], ["finish_detect", "commit", "clip"])
+
+    def test_fit_write_failure_rolls_back_outputs_and_marks_fit_failed(self) -> None:
+        self.stack.enter_context(
+            patch(
+                "track.v2.cli.run.fetch_clean_run",
+                return_value=CleanRunRecord(
+                    id=CLEAN_ID, source_id="raw_points", source_kind="postgres_table",
+                    parameters={"target_table": "raw_points"}, status="completed",
+                ),
+            )
+        )
+        self.stack.enter_context(patch("track.v2.cli.run.create_detect_run", return_value=DETECT_ID))
+        self.stack.enter_context(patch("track.v2.cli.run.finish_detect_run"))
+        self.stack.enter_context(
+            patch("track.v2.cli.run.extract_clips_for_detect", return_value=MagicMock())
+        )
+        finish_fit = self.stack.enter_context(patch("track.v2.cli.run.finish_fit_run"))
+        self.stack.enter_context(
+            patch("track.v2.cli.run.insert_centerline_bundle", side_effect=RuntimeError("write failed"))
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "write failed"):
+            run_pipeline(self.config, clean_id=CLEAN_ID)
+
+        self.assertIn("rollback", self.events)
+        finish_fit.assert_called_once_with(self.conn, "fit-1", status="failed")
 
 
 if __name__ == "__main__":

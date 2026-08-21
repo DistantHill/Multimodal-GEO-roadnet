@@ -42,7 +42,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from .models import (
+    CenterlineFitBundle,
+    ClipConfig,
+    ClipResult,
     CrossTrackCandidate,
+    CleanedSubtrack,
     EntryExitObservation,
     ExcludedIndex,
     ExcludedPoint,
@@ -51,6 +55,7 @@ from .models import (
     PointRef,
     TrajectoryPoint,
     TurnEvent,
+    FittingConfig,
 )
 
 # ── Batch size for multi-row INSERT ───────────────────────────────────
@@ -101,6 +106,35 @@ def create_detect_run(
     return detect_id
 
 
+def create_fit_run(
+    conn: Any,
+    *,
+    detect_id: str,
+    clip_config: ClipConfig,
+    fitting_config: FittingConfig,
+) -> str:
+    """Create one append-only Fit Run and return its UUID."""
+    fit_id = str(uuid.uuid4())
+    parameters = {
+        "clip": clip_config.as_dict(),
+        "fitting": fitting_config.as_dict(),
+    }
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO fit_runs "
+            "(id, detect_id, clip_algorithm, clip_version, fitting_algorithm, "
+            "fitting_version, parameters, status) "
+            "SELECT %s, d.id, 'circle_segment_clip', 'v1', "
+            "'normalized_arc_coordinate_median', 'v1', %s, 'running' "
+            "FROM detect_runs AS d WHERE d.id = %s AND d.status = 'completed' "
+            "RETURNING id",
+            (fit_id, json.dumps(parameters, ensure_ascii=False), detect_id),
+        )
+        if cur.fetchone() is None:
+            raise ValueError(f"Detect Run {detect_id} is not completed")
+    return fit_id
+
+
 def finish_clean_run(conn: Any, clean_id: str, *, status: str) -> None:
     """Finish a Clean Run in the caller's transaction."""
     with conn.cursor() as cur:
@@ -117,6 +151,92 @@ def finish_detect_run(conn: Any, detect_id: str, *, status: str) -> None:
             "UPDATE detect_runs SET status = %s, finished_at = NOW() WHERE id = %s",
             (status, detect_id),
         )
+
+
+def finish_fit_run(
+    conn: Any,
+    fit_id: str,
+    *,
+    status: str,
+    report: dict[str, Any] | None = None,
+) -> None:
+    """Finish a running Fit Run exactly once."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE fit_runs SET status = %s, report = %s, finished_at = NOW() "
+            "WHERE id = %s AND status = 'running'",
+            (
+                status,
+                json.dumps(report, ensure_ascii=False) if report is not None else None,
+                fit_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise ValueError(f"Fit Run {fit_id} is not running")
+
+
+def insert_centerline_bundle(
+    conn: Any,
+    bundle: CenterlineFitBundle,
+    clips: ClipResult,
+    *,
+    fit_id: str,
+    detect_id: str,
+) -> tuple[int, ...]:
+    """Persist successful centerlines and their ordered source-clip manifests."""
+    clips_by_id = {clip.clip_id: clip for clip in clips.clips}
+    centerline_ids: list[int] = []
+    for result in (bundle.combined, bundle.a_to_b, bundle.b_to_a):
+        for centerline in result.centerlines:
+            points_wkt = ", ".join(f"{lon} {lat}" for lon, lat in centerline.points)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO centerlines "
+                    "(fit_id, detect_id, variant, from_cluster_id, to_cluster_id, geom, "
+                    "length_m, forward_clip_count, reverse_clip_count) "
+                    "VALUES (%s, %s, %s, %s, %s, ST_GeomFromText(%s, 4326), %s, %s, %s) "
+                    "RETURNING id",
+                    (
+                        fit_id, detect_id, centerline.variant,
+                        centerline.from_cluster_id, centerline.to_cluster_id,
+                        f"LINESTRING({points_wkt})", centerline.length_m,
+                        centerline.forward_clip_count, centerline.reverse_clip_count,
+                    ),
+                )
+                row = cur.fetchone()
+            centerline_id = int(row[0])
+            centerline_ids.append(centerline_id)
+            manifest_rows: list[tuple[Any, ...]] = []
+            for input_ordinal, clip_id in enumerate(centerline.source_clip_ids):
+                clip = clips_by_id[clip_id]
+                start_cluster_id = clip.start.cluster_id
+                end_cluster_id = clip.end.cluster_id
+                assert start_cluster_id is not None and end_cluster_id is not None
+                manifest_rows.append((
+                    centerline_id, input_ordinal, clip.clip_id, clip.vehicle_id,
+                    clip.subtrack_index, clip.clip_ordinal_in_track,
+                    start_cluster_id, clip.start.segment_index,
+                    clip.start.segment_fraction, clip.interior_start_index,
+                    clip.interior_end_index_exclusive, end_cluster_id,
+                    clip.end.segment_index, clip.end.segment_fraction,
+                    start_cluster_id != centerline.from_cluster_id,
+                    clip.point_count,
+                ))
+            with conn.cursor() as cur:
+                _chunked_insert(
+                    cur,
+                    "centerline_source_clips",
+                    [
+                        "centerline_id", "input_ordinal", "clip_id", "vehicle_id",
+                        "subtrack_index", "clip_ordinal_in_track", "start_cluster_id",
+                        "start_segment_index", "start_segment_fraction",
+                        "interior_start_index", "interior_end_index_exclusive",
+                        "end_cluster_id", "end_segment_index", "end_segment_fraction",
+                        "reverse_to_centerline_direction", "input_point_count",
+                    ],
+                    manifest_rows,
+                )
+    return tuple(centerline_ids)
 
 
 def fetch_clean_run(conn: Any, clean_id: str) -> CleanRunRecord:
@@ -324,7 +444,7 @@ def reset_active_points(
     ZH: 将全表的 is_active 重置为 TRUE。
     EN: Reset is_active to TRUE for all rows in the table.
 
-    Derived cleaner decisions are stored per ``clean_id``. The raw table keeps
+    Derived cleaner decisions are stored per ``clean_id``.  The raw table keeps
     a convenience active flag for DB-mode processing, so it must be restored
     to the complete source before the next run is calculated.
     """
@@ -394,7 +514,7 @@ def insert_excluded_points(
 
 def insert_kept_trajectory_points(
     conn: Any,
-    kept_subtracks: list[list[TrajectoryPoint]],
+    kept_subtracks: list[CleanedSubtrack],
     tp_ref_to_id: dict[tuple[str, str], int],
     *,
     clean_id: str | None = None,
@@ -430,7 +550,7 @@ def insert_kept_trajectory_points(
             "FROM STDIN"
         ) as copy:
             for subtrack in kept_subtracks:
-                for seq_idx, point in enumerate(subtrack):
+                for seq_idx, point in enumerate(subtrack.kept):
                     key = _point_ref_key(point.point_ref)
                     tp_id = tp_ref_to_id.get(key) if tp_ref_to_id else None
                     if tp_id is None:
@@ -442,7 +562,7 @@ def insert_kept_trajectory_points(
                         point.point_ref.source_id,
                         point.point_ref.source_row_key,
                         point.vehicle_id,
-                        st_idx,
+                        subtrack.subtrack_index,
                         seq_idx,
                     ))
                 st_idx += 1
@@ -451,7 +571,7 @@ def insert_kept_trajectory_points(
 
 def insert_injected_points(
     conn: Any,
-    active_points: list[TrajectoryPoint],
+    subtracks: list[CleanedSubtrack],
     *,
     clean_id: str | None = None,
     batch_size: int = _BATCH,
@@ -460,23 +580,30 @@ def insert_injected_points(
 
     ZH: 写入注入的合成点。调用方已按 generated_reason="orthogonal_heading" 预过滤。
     """
-    if not active_points:
+    if not subtracks:
         return
 
     columns = [
-        "vehicle_id", "timestamp", "lon", "lat", "x", "y",
+        "vehicle_id", "subtrack_index", "after_sequence_in_subtrack",
+        "source_id", "source_row_key", "timestamp", "lon", "lat", "x", "y",
         "heading", "speed",
         "from_source_id", "from_source_row_key",
         "to_source_id", "to_source_row_key",
         "generated_reason", "origin_lon", "origin_lat",
     ]
     rows: list[tuple[Any, ...]] = []
-    for p in active_points:
-        ref = p.point_ref
+    for subtrack in subtracks:
+        kept_sequence = -1
+        for p in subtrack.active:
+            if not p.point_ref.generated_reason:
+                kept_sequence += 1
+                continue
+            ref = p.point_ref
         # x/y are not stored directly on TrajectoryPoint — compute from first point as origin
         # The cleaner doesn't store x/y either, so we leave them as 0.0
-        rows.append((
-            p.vehicle_id,
+            rows.append((
+            p.vehicle_id, subtrack.subtrack_index, kept_sequence,
+            ref.source_id, ref.source_row_key,
             p.timestamp,
             p.lon,
             p.lat,
@@ -491,7 +618,7 @@ def insert_injected_points(
             ref.generated_reason,
             0.0,  # origin_lon — set on read
             0.0,  # origin_lat — set on read
-        ))
+            ))
 
     columns, rows = _with_stage_id(columns, rows, "clean_id", clean_id)
     if rows:

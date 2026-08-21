@@ -14,11 +14,12 @@ Both feed into the same topology verification (entry/exit → branch clustering)
 
 from .cleaner1 import clean
 from .clip import extract_clips, extract_clips_for_detect
-from .fitting import fit_centerlines
+from .fitting import fit_centerlines, fit_centerline_variants
 from .intersect2 import IntersectConfig, IntersectResult, detect_intersections
 from .network import build_network
 from .models import (
     Centerline,
+    CenterlineFitBundle,
     CleanerConfig,
     ClipConfig,
     ClipEndpoint,
@@ -44,5 +45,5 @@ from .models import (
     TrajectoryPoint,
 )
 from .parser0 import get_database
-from .replay import ReplayService, ReplayTarget
+from .replay import ReplayService, ReplayTarget, replay_centerline_inputs
 

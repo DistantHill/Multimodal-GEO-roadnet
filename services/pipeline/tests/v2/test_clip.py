@@ -242,7 +242,12 @@ class _ReplayConnection:
 
 class ClipDatabaseReplayTest(unittest.TestCase):
     def test_completed_detect_loads_intersections_then_parent_clean_members(self) -> None:
-        point_rows = [
+        point_rows: list[
+            tuple[
+                str, int, int, str, str, float, float, float, float, float,
+                dict[object, object], str | None, str | None, str,
+            ]
+        ] = [
             (
                 "vehicle-1", 1, index, "synthetic", str(index + 1),
                 float(index * 10), x / _METERS_PER_DEGREE, 0.0, 90.0, 5.0, {},
@@ -275,6 +280,11 @@ class ClipDatabaseReplayTest(unittest.TestCase):
         self.assertIn("injected_points", point_query)
         self.assertIn("ktp.source_id", point_query)
         self.assertNotIn("is_active", point_query)
+        self.assertIn(
+            "ORDER BY vehicle_id, subtrack_index, anchor_sequence, point_kind",
+            point_query,
+        )
+        self.assertNotIn("ORDER BY vehicle_id, subtrack_index, timestamp", point_query)
         self.assertEqual(point_params, ("clean-1", "clean-1"))
         self.assertEqual(result.clips[0].points[0].point_ref.source_id, "synthetic")
 
