@@ -15,7 +15,6 @@ from pathlib import Path
 from ..config import PostgresConfig, default_postgres_config
 from ..logger import init_logger, shutdown_logger
 from ..pipeline import PipelineInput, PipelineResult, run_pipeline as _run_pipeline
-from ..pipeline_events import EventSink
 from .pipeline_reporter import PipelineReporter
 
 
@@ -27,7 +26,6 @@ def run_pipeline(
     clean_id: str | None = None,
     table: str = "trajectory_points",
     config_path: str | Path | None = None,
-    emit: EventSink | None = None,
 ) -> dict[str, int | str | list[int]]:
     """Compatibility adapter for the historical CLI runner signature."""
     pipeline_input = PipelineInput(
@@ -38,11 +36,12 @@ def run_pipeline(
         table=table,
         config_path=config_path,
     )
-    if emit is None:
-        result: PipelineResult = _run_pipeline(pipeline_input)
-    else:
-        result = _run_pipeline(pipeline_input, emit=emit)
-    return result.stats
+    reporter = PipelineReporter()
+    try:
+        result: PipelineResult = _run_pipeline(pipeline_input, emit=reporter)
+        return result.stats
+    finally:
+        reporter.close()
 
 
 def _uuid_arg(value: str) -> uuid.UUID:
@@ -122,7 +121,6 @@ def main() -> int:
         f"clean:{args.clean_id}" if args.clean_id
         else args.csv or f"postgresql://{db_config.database}/{args.pg_table}"
     )
-    reporter = PipelineReporter()
     init_logger()
     print(f"数据源 / Source: {source_label}")
     print(f"连接目标 / Target: {db_config.safe_dsn()}")
@@ -135,7 +133,6 @@ def main() -> int:
             clean_id=str(args.clean_id) if args.clean_id else None,
             table=args.table,
             config_path=args.config,
-            emit=reporter,
         )
         _print_write_summary(stats)
         return 0
@@ -148,10 +145,7 @@ def main() -> int:
         traceback.print_exc()
         return 1
     finally:
-        try:
-            reporter.close()
-        finally:
-            shutdown_logger()
+        shutdown_logger()
 
 
 def _print_write_summary(stats: dict[str, int | str | list[int]]) -> None:
