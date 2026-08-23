@@ -4,7 +4,13 @@ import unittest
 from dataclasses import FrozenInstanceError
 
 from track.v2.cli.pipeline_reporter import PipelineReporter
-from track.v2.pipeline_events import EventSink, PipelineEvent, PipelineEventKind
+from track.v2.pipeline import _emit_report
+from track.v2.pipeline_events import (
+    EventProgressAdapter,
+    EventSink,
+    PipelineEvent,
+    PipelineEventKind,
+)
 
 
 class FakeLiveStatus:
@@ -45,6 +51,46 @@ class PipelineEventTest(unittest.TestCase):
         reporter = PipelineReporter(output=lambda _message: None)
         sink: EventSink = reporter
         sink(PipelineEvent.message_event("hello"))
+
+    def test_progress_adapter_preserves_legacy_update_shape(self) -> None:
+        events: list[PipelineEvent] = []
+        adapter = EventProgressAdapter("detect", events.append)
+
+        adapter.start()
+        adapter.update(
+            progress=0.5,
+            detail="10/20 points",
+            sub_detail="window 2",
+            elapsed=1.2,
+            throughput="8 points/s",
+            stage="cross_track",
+        )
+        adapter.stop()
+
+        self.assertEqual(
+            [event.kind for event in events],
+            [
+                PipelineEventKind.STAGE_START,
+                PipelineEventKind.STAGE_PROGRESS,
+                PipelineEventKind.STAGE_FINISH,
+            ],
+        )
+        self.assertEqual(events[1].stage, "cross_track")
+        self.assertEqual(events[1].detail, "10/20 points")
+        self.assertEqual(events[1].sub_detail, "window 2")
+
+    def test_report_messages_preserve_integer_formatting(self) -> None:
+        events: list[PipelineEvent] = []
+        _emit_report(
+            events.append,
+            "Report",
+            {"count": 1234, "enabled": True, "label": "ok"},
+        )
+
+        self.assertEqual(
+            [event.message for event in events],
+            ["Report", "  count: 1,234", "  enabled: True", "  label: ok"],
+        )
 
 
 class PipelineReporterTest(unittest.TestCase):

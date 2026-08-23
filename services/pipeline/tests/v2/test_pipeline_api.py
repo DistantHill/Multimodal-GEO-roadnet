@@ -8,6 +8,7 @@ import track.v2 as v2
 from track.v2.cli.run import run_pipeline as cli_run_pipeline
 from track.v2.config import PostgresConfig
 from track.v2.pipeline import PipelineInput, PipelineResult
+from track.v2.pipeline_events import PipelineEvent
 
 
 class PipelineApiTest(unittest.TestCase):
@@ -45,6 +46,24 @@ class PipelineApiTest(unittest.TestCase):
                 pg_source_table="raw_points",
                 table="target_points",
             )
+        )
+
+    def test_cli_adapter_forwards_explicit_event_sink(self) -> None:
+        pipeline_result = PipelineResult(stats={"detect_id": "detect-1"})
+        events: list[PipelineEvent] = []
+        with patch("track.v2.cli.run._run_pipeline", return_value=pipeline_result) as run:
+            self.assertEqual(
+                cli_run_pipeline(
+                    self.config,
+                    pg_source_table="raw_points",
+                    emit=events.append,
+                ),
+                pipeline_result.stats,
+            )
+
+        run.assert_called_once_with(
+            PipelineInput(db_config=self.config, pg_source_table="raw_points"),
+            emit=events.append,
         )
 
 

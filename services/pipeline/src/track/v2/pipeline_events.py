@@ -6,6 +6,7 @@ rendering.  A CLI adapter can render the same events for an interactive user.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -105,3 +106,44 @@ class EventSink(Protocol):
 
     def __call__(self, event: PipelineEvent, /) -> None:
         ...
+
+
+class EventProgressAdapter:
+    """Adapt the legacy live-status calls to typed pipeline events."""
+
+    def __init__(self, stage: str, emit: Callable[[PipelineEvent], None]) -> None:
+        self._stage = stage
+        self._emit = emit
+
+    def start(self) -> None:
+        """Emit the start event expected by a console reporter."""
+
+        self._emit(PipelineEvent.stage_start(self._stage))
+
+    def update(
+        self,
+        progress: float | None = None,
+        detail: str = "",
+        sub_detail: str = "",
+        elapsed: float | None = None,
+        throughput: str = "",
+        stage: str | None = None,
+    ) -> None:
+        """Preserve the ``LiveStatus.update`` call shape at the core seam."""
+
+        event_stage = stage or self._stage
+        self._emit(
+            PipelineEvent.stage_progress(
+                event_stage,
+                progress=progress,
+                detail=detail,
+                sub_detail=sub_detail,
+                elapsed=elapsed,
+                throughput=throughput,
+            )
+        )
+
+    def stop(self) -> None:
+        """Emit the stage-finish event expected by a console reporter."""
+
+        self._emit(PipelineEvent.stage_finish(self._stage))

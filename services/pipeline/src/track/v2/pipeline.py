@@ -14,33 +14,11 @@ from pathlib import Path
 import psycopg
 
 from .cleaner import clean_vehicle
-from .clip import extract_clips_for_detect
 from .config import PostgresConfig, connect as pg_connect
 from .config.pipeline_config import load_pipeline_config
-from .db_writer import (
-    create_clean_run,
-    create_detect_run,
-    create_fit_run,
-    fetch_clean_run,
-    finish_clean_run,
-    finish_detect_run,
-    finish_fit_run,
-    insert_candidate_entry_exit_points,
-    insert_candidate_intersection_events,
-    insert_candidate_intersections,
-    insert_centerline_bundle,
-    insert_entry_exit_points,
-    insert_injected_points,
-    insert_intersections,
-    insert_kept_trajectory_points,
-    insert_tracks_cross,
-    insert_trajectory_points,
-    insert_turn_events,
-    mark_excluded_points,
-)
+from .db.pipeline_store import PipelineStore, PostgresPipelineStore
 from .fitting import fit_centerline_variants
 from .intersect2 import detect_intersections
-from .logger import LiveStatus
 from .models import (
     ClipConfig,
     ClipResult,
@@ -54,6 +32,7 @@ from .models import (
 )
 from .network import build_network
 from .parser0 import get_database
+from .pipeline_events import EventProgressAdapter, EventSink, PipelineEvent
 from .sources import StreamVehicleSource
 
 
@@ -76,8 +55,17 @@ class PipelineResult:
     stats: dict[str, int | str | list[int]]
 
 
-def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
+def _noop_event_sink(_event: PipelineEvent) -> None:
+    """Default sink for non-CLI callers."""
+
+
+def run_pipeline(
+    pipeline_input: PipelineInput,
+    *,
+    emit: EventSink | None = None,
+) -> PipelineResult:
     """Run the full pipeline with its existing write and commit ordering."""
+    sink: EventSink = _noop_event_sink if emit is None else emit
     db_config = pipeline_input.db_config
     csv_path = pipeline_input.csv_path
     pg_source_table = pipeline_input.pg_source_table
@@ -112,8 +100,9 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
         source_kind = "postgres_table"
 
     with pg_connect(db_config) as conn:
+        store: PipelineStore = PostgresPipelineStore(conn)
         if reuse_clean:
-            clean_record = fetch_clean_run(conn, str(clean_id))
+            clean_record = store.get_clean_run(str(clean_id))
             if clean_record.status != "completed":
                 raise ValueError(f"Clean Run {clean_id} is not completed")
             table = str(clean_record.parameters["target_table"])
@@ -121,8 +110,7 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
             source_kind = clean_record.source_kind
             is_pg_source = source_kind == "postgres_table"
         else:
-            clean_id = create_clean_run(
-                conn,
+            clean_id = store.start_clean_run(
                 source_id=source_id,
                 source_kind=source_kind,
                 parameters={
@@ -130,7 +118,7 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
                     "cleaner_max_gap_s": pc.cleaner.max_gap_s,
                 },
             )
-            conn.commit()
+            store.commit()
         stats["clean_id"] = str(clean_id)
 
         if reuse_clean:
@@ -141,13 +129,18 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
             tp_id_map: dict[tuple[str, str], int] = {}
         else:
             assert clean_id is not None
-            print("── Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean ──")
-            print(f"  数据源 / Source: {source_label}")
+            clean_stage = "Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean"
+            live_clean = EventProgressAdapter(clean_stage, sink)
+            live_clean.start()
+            _emit_message(sink, f"  数据源 / Source: {source_label}")
             handle = get_database(source, runtime=pc.runtime)
 
             t_count = time.perf_counter()
             total_rows = handle.count_rows()
-            print(f"  总行数 / Total rows: {total_rows:,} ({time.perf_counter() - t_count:.1f}s)")
+            _emit_message(
+                sink,
+                f"  总行数 / Total rows: {total_rows:,} ({time.perf_counter() - t_count:.1f}s)",
+            )
             total_raw = 0
             total_injected = 0
             tp_id_map = {}
@@ -159,8 +152,6 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
             subtrack_index = 1
 
             stream = StreamVehicleSource(handle)
-            live_clean = LiveStatus("Parser 0 + Cleaner 1: 流式清洗 / Streaming Clean")
-            live_clean.start()
 
             t_read = time.perf_counter()
             vehicle_count = 0
@@ -169,8 +160,9 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
                 total_raw += len(vehicle_points)
                 vehicle_count += 1
                 if not is_pg_source:
-                    batch_map = insert_trajectory_points(
-                        conn, vehicle_points, table=table,
+                    batch_map = store.write_raw_points(
+                        vehicle_points,
+                        table=table,
                         batch_size=pc.runtime.db_insert_batch,
                     )
                     tp_id_map.update(batch_map)
@@ -183,7 +175,7 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
                 if len(_pending_excluded) >= pc.runtime.excluded_flush_threshold or \
                 (vehicle_count % pc.runtime.mark_flush_every_n) == 0:
                     subtrack_index, batch_kept = _flush_clean_batch(
-                        conn,
+                        store,
                         clean_id=clean_id,
                         table=table,
                         tp_id_map=tp_id_map,
@@ -209,7 +201,7 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
                     last_update_t = now
 
             subtrack_index, batch_kept = _flush_clean_batch(
-                conn,
+                store,
                 clean_id=clean_id,
                 table=table,
                 tp_id_map=tp_id_map,
@@ -230,34 +222,36 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
             live_clean.stop()
             stream.close()
             handle.close()
-            print(f"  读取&清洗 / Read&Clean: {total_raw:,} 点/points, "
-                  f"{vehicle_count:,} 车辆/vehicles ({elapsed_read:.1f}s)")
+            _emit_message(
+                sink,
+                f"  读取&清洗 / Read&Clean: {total_raw:,} 点/points, "
+                f"{vehicle_count:,} 车辆/vehicles ({elapsed_read:.1f}s)",
+            )
 
             stats["trajectory_points"] = total_raw
 
-        print(f"  排除 / Excluded: {total_excluded:,}")
-        print(f"  注入 / Injected: {total_injected:,}")
+        _emit_message(sink, f"  排除 / Excluded: {total_excluded:,}")
+        _emit_message(sink, f"  注入 / Injected: {total_injected:,}")
         if not reuse_clean:
             stats["kept_trajectory_points"] = total_kept
             stats["injected_points"] = total_injected
-            print(f"  kept_trajectory_points: {total_kept:,} rows")
-            print(f"  injected_points: {total_injected:,} rows")
+            _emit_message(sink, f"  kept_trajectory_points: {total_kept:,} rows")
+            _emit_message(sink, f"  injected_points: {total_injected:,} rows")
 
         if not reuse_clean:
-            finish_clean_run(conn, clean_id, status="completed")
-            conn.commit()
+            store.finish_clean(clean_id, status="completed")
+            store.commit()
 
-        detect_id = create_detect_run(
-            conn,
+        detect_id = store.start_detect_run(
             clean_id=clean_id,
             parameters={"target_table": table},
         )
         stats["detect_id"] = detect_id
-        conn.commit()
+        store.commit()
 
-        print("\n── Intersect2: 交叉口检测 / Intersection Detection (DB 滑窗模式) ──")
+        detect_stage = "Intersect2: 交叉口检测 / Intersection Detection (DB 滑窗模式)"
         intersect_source_id = source_id
-        live_intersect = LiveStatus("Intersect2: Cross-track Detection")
+        live_intersect = EventProgressAdapter(detect_stage, sink)
         live_intersect.start()
         icfg = replace(
             pc.detect,
@@ -268,97 +262,73 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
             clean_id=clean_id,
             live_status=live_intersect,
         )
-        iresult = detect_intersections(conn=conn, config=icfg)
+        iresult = detect_intersections(conn=store.connection, config=icfg)
         live_intersect.stop()
 
-        print(f"  转向事件 / Turn events: {iresult.report.turn_event_count:,}")
-        print(f"  热点事件 / Hotspot events: {iresult.report.hotspot_event_count:,}")
-        print(f"  候选交叉口 / Clusters: {iresult.report.cluster_count:,}")
-        print(f"  完整交叉口 / Complete intersections: {iresult.report.complete_intersection_count:,}")
+        _emit_message(sink, f"  转向事件 / Turn events: {iresult.report.turn_event_count:,}")
+        _emit_message(sink, f"  热点事件 / Hotspot events: {iresult.report.hotspot_event_count:,}")
+        _emit_message(sink, f"  候选交叉口 / Clusters: {iresult.report.cluster_count:,}")
+        _emit_message(
+            sink,
+            f"  完整交叉口 / Complete intersections: {iresult.report.complete_intersection_count:,}",
+        )
 
-        t0 = time.perf_counter()
-        tracks_cross_count = insert_tracks_cross(
-            conn, iresult.cross_track_candidates, detect_id=detect_id,
+        persisted_detect = store.persist_detect(
+            detect_id,
+            iresult,
             batch_size=pc.runtime.db_insert_batch,
         )
-        stats["tracks_cross"] = tracks_cross_count
-        print(f"  tracks_cross: {tracks_cross_count:,} rows ({time.perf_counter() - t0:.1f}s)")
-
-        t0 = time.perf_counter()
-        te_id_map = insert_turn_events(
-            conn, iresult.turn_events, detect_id=detect_id,
-            batch_size=pc.runtime.db_insert_batch,
+        stats.update(
+            {
+                "tracks_cross": persisted_detect.tracks_cross_count,
+                "turn_events": persisted_detect.turn_event_count,
+                "candidate_intersections": persisted_detect.candidate_intersection_count,
+                "candidate_intersection_events": persisted_detect.candidate_intersection_event_count,
+                "candidate_entry_exit_points": persisted_detect.candidate_entry_exit_point_count,
+                "intersections": persisted_detect.intersection_count,
+                "entry_exit_points": persisted_detect.entry_exit_point_count,
+            }
         )
-        stats["turn_events"] = len(iresult.turn_events)
-        print(f"  turn_events: {len(iresult.turn_events):,} rows ({time.perf_counter() - t0:.1f}s)")
-
-        t0 = time.perf_counter()
-        ci_id_map = insert_candidate_intersections(conn, iresult.clusters, detect_id=detect_id)
-        stats["candidate_intersections"] = len(iresult.clusters)
-        print(f"  candidate_intersections: {len(iresult.clusters):,} rows ({time.perf_counter() - t0:.1f}s)")
-
-        t0 = time.perf_counter()
-        insert_candidate_intersection_events(
-            conn, iresult.clusters, ci_id_map, te_id_map, detect_id=detect_id,
-            batch_size=pc.runtime.db_insert_batch,
+        _emit_message(sink, f"  tracks_cross: {persisted_detect.tracks_cross_count:,} rows")
+        _emit_message(sink, f"  turn_events: {persisted_detect.turn_event_count:,} rows")
+        _emit_message(sink, f"  candidate_intersections: {persisted_detect.candidate_intersection_count:,} rows")
+        _emit_message(
+            sink,
+            f"  candidate_intersection_events: {persisted_detect.candidate_intersection_event_count:,} rows",
         )
-        stats["candidate_intersection_events"] = sum(len(c.events) for c in iresult.clusters)
-        print(f"  candidate_intersection_events: {stats['candidate_intersection_events']:,} rows ({time.perf_counter() - t0:.1f}s)")
-
-        t0 = time.perf_counter()
-        ceep_id_map = insert_candidate_entry_exit_points(
-            conn, iresult.clusters, ci_id_map, detect_id=detect_id,
-            batch_size=pc.runtime.db_insert_batch,
+        _emit_message(
+            sink,
+            f"  candidate_entry_exit_points: {persisted_detect.candidate_entry_exit_point_count:,} rows",
         )
-        ceep_count = sum(len(c.crossing_points) for c in iresult.clusters)
-        stats["candidate_entry_exit_points"] = ceep_count
-        print(f"  candidate_entry_exit_points: {ceep_count:,} rows ({time.perf_counter() - t0:.1f}s)")
+        _emit_message(sink, f"  intersections: {persisted_detect.intersection_count:,} rows")
+        _emit_message(sink, f"  entry_exit_points: {persisted_detect.entry_exit_point_count:,} rows")
 
-        clusters_by_id = {c.cluster_id: c for c in iresult.clusters}
-        t0 = time.perf_counter()
-        int_id_map = insert_intersections(
-            conn, iresult.topologies, ci_id_map, clusters_by_id, detect_id=detect_id,
-        )
-        stats["intersections"] = len(int_id_map)
-        print(f"  intersections: {len(int_id_map):,} rows ({time.perf_counter() - t0:.1f}s)")
+        store.finish_detect(detect_id, status="completed")
+        store.commit()
 
-        t0 = time.perf_counter()
-        insert_entry_exit_points(
-            conn, iresult.observations, int_id_map, ceep_id_map, detect_id=detect_id,
-            batch_size=pc.runtime.db_insert_batch,
-        )
-        entry_exit_count = sum(
-            1 for observation in iresult.observations
-            if observation.cluster_id in int_id_map
-        )
-        stats["entry_exit_points"] = entry_exit_count
-        print(f"  entry_exit_points: {entry_exit_count:,} rows ({time.perf_counter() - t0:.1f}s)")
-
-        finish_detect_run(conn, detect_id, status="completed")
-        conn.commit()
-
-        print("\n── Clip: 路段切分 / Track clipping ──")
+        sink(PipelineEvent.stage_start("Clip: 路段切分 / Track clipping"))
         clip_config = ClipConfig()
-        clip_result = extract_clips_for_detect(
-            conn, detect_id, config=clip_config,
-        )
+        clip_result = store.load_clip(detect_id, config=clip_config)
         _add_clip_stats(stats, clip_result)
-        _print_clip_report(clip_result)
+        _emit_report(sink, "  Clip 报告 / Clip report", clip_result.report.as_dict())
+        sink(PipelineEvent.stage_finish("Clip: 路段切分 / Track clipping"))
 
-        print("\n── Fitting: 中心线拟合 / Centerline fitting ──")
+        sink(PipelineEvent.stage_start("Fitting: 中心线拟合 / Centerline fitting"))
         fitting_config = FittingConfig()
-        fit_id = create_fit_run(
-            conn,
+        fit_id = store.start_fit_run(
             detect_id=detect_id,
             clip_config=clip_config,
             fitting_config=fitting_config,
         )
         stats["fit_id"] = fit_id
-        conn.commit()
+        store.commit()
         try:
             fit_bundle = fit_centerline_variants(clip_result, config=fitting_config)
-            centerline_ids = insert_centerline_bundle(
-                conn, fit_bundle, clip_result, fit_id=fit_id, detect_id=detect_id,
+            centerline_ids = store.persist_fit_bundle(
+                fit_id,
+                detect_id,
+                fit_bundle,
+                clip_result,
             )
             report = {
                 "combined": {
@@ -374,33 +344,43 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
                     "issues": [issue.as_dict() for issue in fit_bundle.b_to_a.issues],
                 },
             }
-            finish_fit_run(conn, fit_id, status="completed", report=report)
-            conn.commit()
+            store.finish_fit(fit_id, status="completed", report=report)
+            store.commit()
         except (psycopg.Error, RuntimeError, ValueError):
-            conn.rollback()
-            finish_fit_run(conn, fit_id, status="failed")
-            conn.commit()
+            store.rollback()
+            store.finish_fit(fit_id, status="failed")
+            store.commit()
             raise
         stats["centerlines"] = len(centerline_ids)
         stats["centerline_ids"] = list(centerline_ids)
         _add_fit_stats(stats, fit_bundle.combined)
-        fit_bundle.combined.report.format_print(title="  Fitting 报告 / Fitting report")
+        _emit_report(
+            sink,
+            "  Fitting 报告 / Fitting report",
+            fit_bundle.combined.report.as_dict(),
+        )
+        sink(PipelineEvent.stage_finish("Fitting: 中心线拟合 / Centerline fitting"))
 
-        print("\n── Network: 路网组装 / Network assembly ──")
+        sink(PipelineEvent.stage_start("Network: 路网组装 / Network assembly"))
         network_result = build_network(fit_bundle.combined, iresult)
         _add_network_stats(stats, network_result)
-        network_result.report.format_print(title="  Network 报告 / Network report")
+        _emit_report(
+            sink,
+            "  Network 报告 / Network report",
+            network_result.report.as_dict(),
+        )
+        sink(PipelineEvent.stage_finish("Network: 路网组装 / Network assembly"))
 
-        print(f"\n  提交 / Committed.")
+        _emit_message(sink, "\n  提交 / Committed.")
 
     elapsed = time.perf_counter() - t_start
     stats["_elapsed_s"] = int(elapsed)
-    print(f"\n── 完成 / Done ({elapsed:.1f}s) ──")
+    _emit_message(sink, f"\n── 完成 / Done ({elapsed:.1f}s) ──")
     return PipelineResult(stats=stats)
 
 
 def _flush_clean_batch(
-    conn,
+    store: PipelineStore,
     *,
     clean_id: str,
     table: str,
@@ -412,33 +392,32 @@ def _flush_clean_batch(
     batch_size: int,
 ) -> tuple[int, int]:
     """Flush one batch of Cleaner 1 outputs and trim ``tp_id_map``."""
-    if pending_excluded:
-        mark_map = tp_id_map if table == "trajectory_points" else {}
-        pending_excluded.clear()
-    kept_count = 0
-    if pending_subtracks:
-        assigned_subtracks = [
-            replace(subtrack, subtrack_index=subtrack_index + offset)
-            for offset, subtrack in enumerate(pending_subtracks)
-        ]
-        insert_kept_trajectory_points(
-            conn, assigned_subtracks, tp_id_map, clean_id=clean_id,
+    result = store.persist_clean_batch(
+        clean_id,
+        table,
+        tp_id_map,
+        pending_excluded,
+        pending_subtracks,
+        pending_tp_keys,
+        subtrack_index,
+        batch_size=batch_size,
+    )
+    return result.next_subtrack_index, result.kept_count
+
+
+def _emit_message(sink: EventSink, message: str) -> None:
+    sink(PipelineEvent.message_event(message))
+
+
+def _emit_report(sink: EventSink, title: str, report: dict[str, object]) -> None:
+    _emit_message(sink, title)
+    for key, value in report.items():
+        rendered = (
+            f"{value:,}"
+            if isinstance(value, int) and not isinstance(value, bool)
+            else str(value)
         )
-        insert_injected_points(
-            conn, assigned_subtracks, clean_id=clean_id, batch_size=batch_size,
-        )
-        kept_count = sum(
-            1
-            for subtrack in assigned_subtracks
-            for point in subtrack.points
-            if not point.point_ref.generated_reason
-        )
-        subtrack_index += len(assigned_subtracks)
-        pending_subtracks.clear()
-    for key in pending_tp_keys:
-        tp_id_map.pop(key, None)
-    pending_tp_keys.clear()
-    return subtrack_index, kept_count
+        _emit_message(sink, f"  {key}: {rendered}")
 
 
 def _add_clip_stats(stats: dict[str, int | str | list[int]], result: ClipResult) -> None:
@@ -449,10 +428,6 @@ def _add_clip_stats(stats: dict[str, int | str | list[int]], result: ClipResult)
             if isinstance(value, int)
         }
     )
-
-
-def _print_clip_report(result: ClipResult) -> None:
-    result.report.format_print(title="  Clip 报告 / Clip report")
 
 
 def _add_fit_stats(stats: dict[str, int | str | list[int]], result: FitResult) -> None:
