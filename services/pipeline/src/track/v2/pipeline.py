@@ -20,11 +20,9 @@ from .db.pipeline_store import PipelineStore, PostgresPipelineStore
 from .fitting import fit_centerline_variants
 from .intersect2 import detect_intersections
 from .models import (
-    ClipConfig,
     ClipResult,
     CsvSource,
     FitResult,
-    FittingConfig,
     GeneratedReason,
     NetworkResult,
     PostgresSource,
@@ -307,14 +305,14 @@ def run_pipeline(
         store.commit()
 
         sink(PipelineEvent.stage_start("Clip: 路段切分 / Track clipping"))
-        clip_config = ClipConfig()
+        clip_config = pc.clip
         clip_result = store.load_clip(detect_id, config=clip_config)
         _add_clip_stats(stats, clip_result)
         _emit_report(sink, "  Clip 报告 / Clip report", clip_result.report.as_dict())
         sink(PipelineEvent.stage_finish("Clip: 路段切分 / Track clipping"))
 
         sink(PipelineEvent.stage_start("Fitting: 中心线拟合 / Centerline fitting"))
-        fitting_config = FittingConfig()
+        fitting_config = pc.fitting
         fit_id = store.start_fit_run(
             detect_id=detect_id,
             clip_config=clip_config,
@@ -362,7 +360,7 @@ def run_pipeline(
         sink(PipelineEvent.stage_finish("Fitting: 中心线拟合 / Centerline fitting"))
 
         sink(PipelineEvent.stage_start("Network: 路网组装 / Network assembly"))
-        network_result = build_network(fit_bundle.combined, iresult)
+        network_result = build_network(fit_bundle.combined, iresult, config=pc.network)
         _add_network_stats(stats, network_result)
         _emit_report(
             sink,
