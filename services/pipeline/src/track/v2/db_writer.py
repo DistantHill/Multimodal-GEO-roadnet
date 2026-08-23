@@ -26,12 +26,11 @@ Usage / 用法::
 # 1  _BATCH 500 → 5000               所有 INSERT 批量写入往返次数减少 10 倍
 # 2  insert_kept_trajectory_points   16M 行从 ~32,000 次 INSERT 往返变成
 #    改用 COPY FROM STDIN             一次 COPY 流式写入，走 PG 原生批量协议
-# 3  insert_injected_points          调用方 run.py 已按 orthogonal_heading
-#    去掉重复过滤                     预过滤，函数内无需再筛
+# 3  Cleaner 点按 generated_reason   kept / injected writer 消费同一批子轨迹，
+#    在 writer 内分类                 共享已分配的 subtrack_index
 # 4  移除 excluded_points 写入       排除信息仅反映在 trajectory_points.is_active，
 #                                   不再单独写 excluded_points 表（表结构保留）
-# 5  insert_kept_trajectory_points   支持 start_subtrack_index 并返回下一序号，
-#    分批流式写入                    供 run.py 逐批 COPY，不再整轮累积 kept 点
+# 5  _flush_clean_batch 统一分配     分批流式写入时保持 subtrack_index 全局递增
 # ────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -46,7 +45,8 @@ from .models import (
     ClipConfig,
     ClipResult,
     CrossTrackCandidate,
-    CleanedSubtrack,
+    GeneratedReason,
+    RefinementSubtrack,
     EntryExitObservation,
     ExcludedIndex,
     ExcludedPoint,
@@ -514,34 +514,27 @@ def insert_excluded_points(
 
 def insert_kept_trajectory_points(
     conn: Any,
-    kept_subtracks: list[CleanedSubtrack],
+    subtracks: list[RefinementSubtrack],
     tp_ref_to_id: dict[tuple[str, str], int],
     *,
     clean_id: str | None = None,
-    start_subtrack_index: int = 1,
-) -> int:
+) -> None:
     """Persist references for points that survived ``_exclude_stationary``.
 
     ZH: 写入保留点引用——每个子轨迹的保留点通过 trajectory_point_id 指向源数据行。
         CSV 模式：tp_ref_to_id 存 trajectory_points 自增 ID → 走 FK 映射。
         PG 模式：tp_ref_to_id 为空 → 直接用 source_row_key（即源表主键）作为 trajectory_point_id 值。
         使用 PostgreSQL COPY FROM STDIN 流式写入，避免逐批 INSERT 的网络往返开销。
-        返回下一个待分配的子轨迹序号（``start_subtrack_index`` + 写入子轨迹数），
-        供调用方分批流式写入时保持 ``subtrack_index`` 全局递增。
     EN: Persist per-point references for kept subtracks.  CSV mode uses
         ``tp_ref_to_id`` to map to ``trajectory_points`` auto-increment IDs.
         PG mode (empty map) stores the source PK (``source_row_key``) directly
         as ``trajectory_point_id``.  Uses COPY FROM STDIN for streaming write.
-        Returns the next subtrack index to assign (``start_subtrack_index`` plus
-        the number of subtracks written), so callers can stream successive
-        batches while keeping ``subtrack_index`` globally increasing.
     """
     if clean_id is None:
         raise ValueError("clean_id is required for derived v2 persistence")
-    if not kept_subtracks:
-        return start_subtrack_index
+    if not subtracks:
+        return
 
-    st_idx = start_subtrack_index
     with conn.cursor() as cur:
         with cur.copy(
             "COPY kept_trajectory_points "
@@ -549,8 +542,11 @@ def insert_kept_trajectory_points(
             "vehicle_id, subtrack_index, sequence_in_subtrack) "
             "FROM STDIN"
         ) as copy:
-            for subtrack in kept_subtracks:
-                for seq_idx, point in enumerate(subtrack.kept):
+            for subtrack in subtracks:
+                sequence_in_subtrack = 0
+                for point in subtrack.points:
+                    if point.point_ref.generated_reason:
+                        continue
                     key = _point_ref_key(point.point_ref)
                     tp_id = tp_ref_to_id.get(key) if tp_ref_to_id else None
                     if tp_id is None:
@@ -563,22 +559,21 @@ def insert_kept_trajectory_points(
                         point.point_ref.source_row_key,
                         point.vehicle_id,
                         subtrack.subtrack_index,
-                        seq_idx,
+                        sequence_in_subtrack,
                     ))
-                st_idx += 1
-    return st_idx
+                    sequence_in_subtrack += 1
 
 
 def insert_injected_points(
     conn: Any,
-    subtracks: list[CleanedSubtrack],
+    subtracks: list[RefinementSubtrack],
     *,
     clean_id: str | None = None,
     batch_size: int = _BATCH,
 ) -> None:
     """Insert synthetic points injected by ``_inject_orthogonal``.
 
-    ZH: 写入注入的合成点。调用方已按 generated_reason="orthogonal_heading" 预过滤。
+    ZH: 按 ``generated_reason`` 写入派生点，并以同一子轨迹内前一个 kept 点为锚点。
     """
     if not subtracks:
         return
@@ -594,30 +589,29 @@ def insert_injected_points(
     rows: list[tuple[Any, ...]] = []
     for subtrack in subtracks:
         kept_sequence = -1
-        for p in subtrack.active:
-            if not p.point_ref.generated_reason:
+        for point in subtrack.points:
+            if point.point_ref.generated_reason != GeneratedReason.HEADING_ORTHOGONAL:
                 kept_sequence += 1
                 continue
-            ref = p.point_ref
-        # x/y are not stored directly on TrajectoryPoint — compute from first point as origin
-        # The cleaner doesn't store x/y either, so we leave them as 0.0
+            ref = point.point_ref
+            # x/y are not stored directly on TrajectoryPoint, so leave them as 0.0.
             rows.append((
-            p.vehicle_id, subtrack.subtrack_index, kept_sequence,
-            ref.source_id, ref.source_row_key,
-            p.timestamp,
-            p.lon,
-            p.lat,
-            0.0,  # x — computed on read
-            0.0,  # y — computed on read
-            p.heading,
-            p.speed,
-            ref.source_id,
-            ref.from_ref or "",
-            ref.source_id,
-            ref.to_ref or "",
-            ref.generated_reason,
-            0.0,  # origin_lon — set on read
-            0.0,  # origin_lat — set on read
+                point.vehicle_id, subtrack.subtrack_index, kept_sequence,
+                ref.source_id, ref.source_row_key,
+                point.timestamp,
+                point.lon,
+                point.lat,
+                0.0,
+                0.0,
+                point.heading,
+                point.speed,
+                ref.source_id,
+                ref.from_ref or "",
+                ref.source_id,
+                ref.to_ref or "",
+                ref.generated_reason,
+                0.0,
+                0.0,
             ))
 
     columns, rows = _with_stage_id(columns, rows, "clean_id", clean_id)

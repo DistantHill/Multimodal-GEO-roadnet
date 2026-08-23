@@ -4,12 +4,19 @@ import unittest
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
-from track.v2.cli.run import run_pipeline
+from track.v2.cli.run import _flush_clean_batch, run_pipeline
 from track.v2.config import PostgresConfig
 from track.v2.db_writer import CleanRunRecord
 from track.v2.intersect2 import IntersectResult
-from track.v2.models import IntersectReport
-from track.v2.models import CenterlineFitBundle
+from track.v2.models import (
+    CenterlineFitBundle,
+    DerivedPoint,
+    GeneratedReason,
+    IntersectReport,
+    PointRef,
+    RefinementSubtrack,
+    TrajectoryPoint,
+)
 
 
 CLEAN_ID = "11111111-1111-1111-1111-111111111111"
@@ -72,6 +79,72 @@ class _EmptyStream:
 
     def close(self) -> None:
         return None
+
+
+def _point(
+    row_key: str,
+    *,
+    vehicle_id: str = "vehicle-1",
+    generated: bool = False,
+) -> TrajectoryPoint:
+    point_type = DerivedPoint if generated else TrajectoryPoint
+    return point_type(
+        point_ref=PointRef(
+            source_id="raw_points",
+            source_row_key=row_key,
+            stable=not generated,
+            from_ref="1" if generated else None,
+            to_ref="2" if generated else None,
+            generated_reason=(
+                GeneratedReason.HEADING_ORTHOGONAL if generated else ""
+            ),
+        ),
+        vehicle_id=vehicle_id,
+        timestamp=float(row_key),
+        lon=116.0,
+        lat=39.0,
+        heading=0.0,
+        speed=10.0,
+    )
+
+
+class FlushCleanBatchTest(unittest.TestCase):
+    def test_assigns_one_global_subtrack_index_for_both_writers(self) -> None:
+        pending_subtracks = [
+            RefinementSubtrack(
+                vehicle_id="vehicle-1",
+                subtrack_index=1,
+                points=[_point("1"), _point("15", generated=True), _point("2")],
+            ),
+            RefinementSubtrack(
+                vehicle_id="vehicle-2",
+                subtrack_index=1,
+                points=[_point("3", vehicle_id="vehicle-2")],
+            ),
+        ]
+
+        with (
+            patch("track.v2.cli.run.insert_kept_trajectory_points") as insert_kept,
+            patch("track.v2.cli.run.insert_injected_points") as insert_injected,
+        ):
+            next_index, kept_count = _flush_clean_batch(
+                object(),
+                clean_id=CLEAN_ID,
+                table="raw_points",
+                tp_id_map={},
+                pending_excluded=[],
+                pending_subtracks=pending_subtracks,
+                pending_tp_keys=[],
+                subtrack_index=10,
+                batch_size=5000,
+            )
+
+        kept_subtracks = insert_kept.call_args.args[1]
+        injected_subtracks = insert_injected.call_args.args[1]
+        self.assertIs(kept_subtracks, injected_subtracks)
+        self.assertEqual([subtrack.subtrack_index for subtrack in kept_subtracks], [10, 11])
+        self.assertEqual((next_index, kept_count), (12, 3))
+        self.assertEqual(pending_subtracks, [])
 
 
 class RunPipelineLifecycleTest(unittest.TestCase):

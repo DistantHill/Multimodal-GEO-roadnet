@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import math
 import time
 from collections.abc import Iterator
@@ -9,7 +10,9 @@ from .models import (
     CleanReport,
     CleanerConfig,
     CleanerIncrementalResult,
-    CleanedSubtrack,
+    DerivedPoint,
+    GeneratedReason,
+    RefinementSubtrack,
     CleanerResult,
     ExcludedIndex,
     ExcludedPoint,
@@ -36,39 +39,38 @@ def clean_vehicle(
         返回该车辆的全部清洗结果，不累积全局状态。
     """
     cfg = config or CleanerConfig()
-    active: list[TrajectoryPoint] = []
-    excluded: list[ExcludedPoint] = []
-    kept_subtracks: list[list[TrajectoryPoint]] = []
-    injected_count = 0
-    cleaned_subtracks: list[CleanedSubtrack] = []
+    kept_points: list[TrajectoryPoint] = []
+    excluded_points: list[ExcludedPoint] = []
+    derived_points: list[DerivedPoint] = []
+    derived_counts: dict[GeneratedReason, int] = defaultdict(int)
+    refinement_subtracks: list[RefinementSubtrack] = []
 
     subtracks = _split_by_gaps(vehicle_points, cfg.max_gap_s)
     rename = len(subtracks) > 1
     for index, subtrack in enumerate(subtracks, start=1):
         if rename:
             subtrack = [_with_vehicle_id(point, f"{point.vehicle_id}_seg{index:02d}") for point in subtrack]
-        kept, removed = _exclude_stationary(subtrack, cfg)
-        excluded.extend(removed)
-        kept_subtracks.append(kept)
-        injected_subtrack, count = _inject_orthogonal(kept, cfg)
-        active.extend(injected_subtrack)
-        injected_count += count
-        if kept:
-            cleaned_subtracks.append(
-                CleanedSubtrack(
-                    vehicle_id=kept[0].vehicle_id,
+        kept_points, excluded_points = _exclude_stationary(subtrack, cfg)
+        excluded_points.extend(excluded_points)
+        injected_subtrack, count, injected_points = _inject_orthogonal(kept_points, cfg)
+        derived_points.extend(injected_points)
+        derived_counts[GeneratedReason.HEADING_ORTHOGONAL] += count
+
+        if kept_points:
+            refinement_subtracks.append(
+                RefinementSubtrack(
+                    vehicle_id=kept_points[0].vehicle_id,
                     subtrack_index=index,
-                    kept=kept,
-                    active=injected_subtrack,
+                    points = injected_subtrack
                 )
             )
 
     return CleanerIncrementalResult(
-        active=active,
-        excluded=excluded,
-        kept_subtracks=kept_subtracks,
-        injected_count=injected_count,
-        subtracks=cleaned_subtracks,
+        kept=kept_points,
+        excluded=excluded_points,
+        derived=derived_points,
+        derived_counts=derived_counts,
+        subtracks=refinement_subtracks,
     )
 
 
@@ -243,27 +245,31 @@ def _exclude_stationary(
 def _inject_orthogonal(
     points: list[TrajectoryPoint],
     cfg: CleanerConfig,
-) -> tuple[list[TrajectoryPoint], int]:
+) -> tuple[list[TrajectoryPoint], int, list[DerivedPoint]]:
+    """return **injected subtrack** and **count** of injected points."""
     if len(points) < 2:
-        return list(points), 0
+        return list(points), 0, []
 
-    output: list[TrajectoryPoint] = []
+    injected_subtrack: list[TrajectoryPoint] = []
     injected_count = 0
+    injected_points: list[DerivedPoint] = []
+    
     for a, b in zip(points, points[1:]):
-        output.append(a)
-        injected = _orthogonal_candidate(a, b, cfg)
-        if injected is not None:
-            output.append(injected)
+        injected_subtrack.append(a)
+        injected_point = _orthogonal_candidate(a, b, cfg)
+        if injected_point is not None:
+            injected_subtrack.append(injected_point)
             injected_count += 1
-    output.append(points[-1])
-    return output, injected_count
+            injected_points.append(injected_point)
+    injected_subtrack.append(points[-1])
+    return injected_subtrack, injected_count, injected_points
 
 
 def _orthogonal_candidate(
     a: TrajectoryPoint,
     b: TrajectoryPoint,
     cfg: CleanerConfig,
-) -> TrajectoryPoint | None:
+) -> DerivedPoint | None:
     if a.vehicle_id != b.vehicle_id:
         return None
     delta = angle_delta_deg(a.heading, b.heading)
@@ -283,14 +289,14 @@ def _orthogonal_candidate(
         return None
 
     lon, lat = xy_m_to_lonlat(x, y, a.lon, a.lat)
-    return TrajectoryPoint(
+    return DerivedPoint(
         point_ref=PointRef(
             source_id=a.point_ref.source_id,
             source_row_key=f"{a.point_ref.source_row_key}->{b.point_ref.source_row_key}:orthogonal_heading",
             stable=False,
             from_ref=a.point_ref.source_row_key,
             to_ref=b.point_ref.source_row_key,
-            generated_reason="orthogonal_heading",
+            generated_reason=GeneratedReason.HEADING_ORTHOGONAL,
         ),
         vehicle_id=a.vehicle_id,
         timestamp=(a.timestamp + b.timestamp) / 2.0,

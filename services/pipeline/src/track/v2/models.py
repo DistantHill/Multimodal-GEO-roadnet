@@ -7,6 +7,7 @@ FieldSpec, ReadReport, etc.) are defined here per the v2 PRD §3.
 
 from __future__ import annotations
 
+from enum import StrEnum
 import json
 import sys
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -143,6 +144,20 @@ class TrajectoryPoint(TrackModel):
     speed: float
     extra: dict[str, Any] = field(default_factory=dict)
 
+
+@dataclass(frozen=True, slots=True)
+class DerivedPoint(TrajectoryPoint):
+    """派生点：orthogonal_heading / inter_segment_orthogonal
+    """
+
+    point_ref: PointRef
+    vehicle_id: str
+    timestamp: float
+    lon: float
+    lat: float
+    heading: float
+    speed: float
+    extra: dict[str, Any] = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class FieldSpec(TrackModel):
@@ -337,7 +352,11 @@ class TrajectorySourceHandle(Protocol):
 
     def __exit__(self, *args: object) -> None: ...
 
+class GeneratedReason(StrEnum):
+    HEADING_ORTHOGONAL = "heading_orthogonal"
+    INTER_SEGMENT_ORTHOGONAL = "inter_segment_orthogonal"
 
+    
 @dataclass(frozen=True)
 class CleanerResult(TrackModel):
     active: TrajectorySourceHandle
@@ -347,28 +366,21 @@ class CleanerResult(TrackModel):
 
 
 @dataclass(frozen=True)
-class CleanedSubtrack(TrackModel):
+class RefinementSubtrack(TrackModel):
     """One Cleaner subtrack with kept and derived points in deterministic order."""
 
     vehicle_id: str
     subtrack_index: int
-    kept: list[TrajectoryPoint]
-    active: list[TrajectoryPoint]
-
+    points: list[TrajectoryPoint | DerivedPoint] = field(default_factory=list)
 
 @dataclass(frozen=True)
 class CleanerIncrementalResult(TrackModel):
-    """Per-vehicle result from ``clean_vehicle()`` — stream-friendly.
-
-    ZH: 单车辆清洗结果——避免 clean() 内部累积全部车辆的数据，
-        支持逐车流式处理。
-    """
-
-    active: list[TrajectoryPoint]       # 清洗后保留 + 注入点
-    excluded: list[ExcludedPoint]       # 被排除的点
-    kept_subtracks: list[list[TrajectoryPoint]]  # 保留的子轨迹
-    injected_count: int                 # 注入的 orthogonal 点数量
-    subtracks: list[CleanedSubtrack] = field(default_factory=list)
+    """Cleaner 1 result for one incremental run. """
+    kept: list[TrajectoryPoint]
+    excluded: list[ExcludedPoint]
+    derived: list[DerivedPoint]
+    derived_counts: dict[GeneratedReason, int] = field(default_factory=dict)
+    subtracks: list[RefinementSubtrack] = field(default_factory=list) 
 
 
 @dataclass(frozen=True)

@@ -177,8 +177,6 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             geom                geometry(Point, 4326) GENERATED ALWAYS AS (
                                     ST_SetSRID(ST_MakePoint(lon, lat), 4326)
                                 ) STORED,
-            tp_source_id        TEXT,
-            tp_source_row_key   TEXT,
             from_source_id      TEXT,
             from_source_row_key TEXT,
             to_source_id        TEXT,
@@ -422,7 +420,7 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
 ]
 
 
-def reset_tables(config: PostgresConfig) -> int:
+def reset_tables(config: PostgresConfig,skip_tables: list[str]) -> int:
     """Drop all pipeline tables in reverse dependency order.
 
     ZH: 按反向依赖顺序删除所有流水线数据表（先删引用表，再删被引用表），
@@ -433,6 +431,7 @@ def reset_tables(config: PostgresConfig) -> int:
     # ZH: 反向遍历 DDL 列表，确保引用表先被删除
     # EN: Reverse DDL order so referencing tables are dropped before their parents
     drop_order = [*reversed(DDL_STATEMENTS), ("pipeline_runs", "")]
+    drop_order = [(name, ddl) for name, ddl in drop_order if name not in skip_tables]
     tables_dropped = 0
 
     with pg_connect(config) as conn:
@@ -819,6 +818,8 @@ def main() -> int:
         "--reset", action="store_true",
         help="Drop all tables (CASCADE) before recreating them, clearing all data."
     )
+    parser.add_argument("--skip-tables", nargs="*", default=[], metavar="TABLE",
+                        help="Skip creating/migrating the specified tables.")
     parser.add_argument(
         "--legacy-clean-map",
         type=Path,
@@ -848,10 +849,13 @@ def main() -> int:
 
     try:
         if args.reset:
-            reset_failures = reset_tables(config)
+            reset_failures = reset_tables(config,skip_tables=args.skip_tables)
+            print(f"--reset 已清空所有表，{', '.join(args.skip_tables)} 将被忽略 / "
+                      f"--reset cleared all tables, so {', '.join(args.skip_tables)} is ignored.")
             if reset_failures > 0:
                 print("[FAIL] 重置失败，终止操作 / Reset failed, aborting.")
                 return 1
+            
         legacy_clean_map = (
             load_legacy_clean_map(args.legacy_clean_map)
             if args.legacy_clean_map is not None

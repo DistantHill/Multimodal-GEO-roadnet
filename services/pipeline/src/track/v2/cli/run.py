@@ -57,8 +57,10 @@ from ..models import (
     CsvSource,
     FitResult,
     FittingConfig,
+    GeneratedReason,
     NetworkResult,
     PostgresSource,
+    RefinementSubtrack,
 )
 from ..clip import extract_clips_for_detect
 from ..fitting import fit_centerline_variants
@@ -166,8 +168,7 @@ def run_pipeline(
         # EN: Flush all cleaner outputs (kept/injected/excluded) every N vehicles to
         #     eliminate per-vehicle round-trips and trim tp_id_map to bound peak RAM.
             _pending_excluded: list = []
-            _pending_kept: list = []
-            _pending_injected: list = []
+            _pending_subtracks: list[RefinementSubtrack] = []
             _pending_tp_keys: list[tuple[str, str]] = []
             subtrack_index = 1
 
@@ -189,13 +190,10 @@ def run_pipeline(
                     tp_id_map.update(batch_map)
                     _pending_tp_keys.extend(batch_map.keys())
                 vresult = clean_vehicle(vehicle_points, config=pc.cleaner)
-                total_injected += vresult.injected_count
+                total_injected += vresult.derived_counts.get(GeneratedReason.HEADING_ORTHOGONAL, 0)
                 _pending_excluded.extend(vresult.excluded)
                 total_excluded += len(vresult.excluded)
-                _pending_kept.extend(vresult.kept_subtracks)
-                for p in vresult.active:
-                    if p.point_ref.generated_reason == "orthogonal_heading":
-                        _pending_injected.append(p)
+                _pending_subtracks.extend(vresult.subtracks)
                 if len(_pending_excluded) >= pc.runtime.excluded_flush_threshold or \
                 (vehicle_count % pc.runtime.mark_flush_every_n) == 0:
                     subtrack_index, batch_kept = _flush_clean_batch(
@@ -204,8 +202,7 @@ def run_pipeline(
                         table=table,
                         tp_id_map=tp_id_map,
                         pending_excluded=_pending_excluded,
-                        pending_kept=_pending_kept,
-                        pending_injected=_pending_injected,
+                        pending_subtracks=_pending_subtracks,
                         pending_tp_keys=_pending_tp_keys,
                         subtrack_index=subtrack_index,
                         batch_size=pc.runtime.db_insert_batch,
@@ -233,8 +230,7 @@ def run_pipeline(
                 table=table,
                 tp_id_map=tp_id_map,
                 pending_excluded=_pending_excluded,
-                pending_kept=_pending_kept,
-                pending_injected=_pending_injected,
+                pending_subtracks=_pending_subtracks,
                 pending_tp_keys=_pending_tp_keys,
                 subtrack_index=subtrack_index,
                 batch_size=pc.runtime.db_insert_batch,
@@ -438,37 +434,42 @@ def _flush_clean_batch(
     table: str,
     tp_id_map: dict[tuple[str, str], int],
     pending_excluded: list,
-    pending_kept: list,
-    pending_injected: list,
+    pending_subtracks: list[RefinementSubtrack],
     pending_tp_keys: list[tuple[str, str]],
     subtrack_index: int,
     batch_size: int,
 ) -> tuple[int, int]:
     """Flush one batch of Cleaner 1 outputs and trim ``tp_id_map``.
 
-    ZH: 把当前批的 kept / injected / excluded 三种产物落库，并释放本批原始点的
-        id 映射。返回 ``(下一子轨迹序号, 本批 kept 行数)``，使调用方分批流式
-        写入时 ``subtrack_index`` 仍全局递增。
-    EN: Persist one batch of kept / injected / excluded outputs and drop this
-        batch's raw-point id mappings.  Returns ``(next_subtrack_index, kept rows
-        written)`` so callers keep ``subtrack_index`` globally increasing across
-        streamed batches.
+    ZH: 为当前批子轨迹统一分配全局 ``subtrack_index``，再由两个 writer 按
+        ``generated_reason`` 分类写入 kept / injected，最后释放原始点 id 映射。
+    EN: Assign one global ``subtrack_index`` per refinement subtrack, then let
+        both writers classify points by ``generated_reason`` before dropping the
+        batch's raw-point id mappings.
     """
     if pending_excluded:
         mark_map = tp_id_map if table == "trajectory_points" else {}
-        mark_excluded_points(conn, pending_excluded, table=table, tp_id_map=mark_map)
         pending_excluded.clear()
     kept_count = 0
-    if pending_kept:
-        subtrack_index = insert_kept_trajectory_points(
-            conn, pending_kept, tp_id_map, clean_id=clean_id,
-            start_subtrack_index=subtrack_index,
+    if pending_subtracks:
+        assigned_subtracks = [
+            replace(subtrack, subtrack_index=subtrack_index + offset)
+            for offset, subtrack in enumerate(pending_subtracks)
+        ]
+        insert_kept_trajectory_points(
+            conn, assigned_subtracks, tp_id_map, clean_id=clean_id,
         )
-        kept_count = sum(len(st) for st in pending_kept)
-        pending_kept.clear()
-    if pending_injected:
-        insert_injected_points(conn, pending_injected, clean_id=clean_id, batch_size=batch_size)
-        pending_injected.clear()
+        insert_injected_points(
+            conn, assigned_subtracks, clean_id=clean_id, batch_size=batch_size,
+        )
+        kept_count = sum(
+            1
+            for subtrack in assigned_subtracks
+            for point in subtrack.points
+            if not point.point_ref.generated_reason
+        )
+        subtrack_index += len(assigned_subtracks)
+        pending_subtracks.clear()
     for key in pending_tp_keys:
         tp_id_map.pop(key, None)
     pending_tp_keys.clear()

@@ -14,15 +14,21 @@ from track.v2.db_writer import (
     insert_candidate_intersection_events,
     insert_candidate_intersections,
     insert_intersections,
+    insert_injected_points,
+    insert_kept_trajectory_points,
     insert_tracks_cross,
 )
 from track.v2.models import (
     ClipConfig,
     CrossTrackCandidate,
+    DerivedPoint,
+    GeneratedReason,
     HotspotCluster,
     IntersectionTopology,
     FittingConfig,
     PointRef,
+    RefinementSubtrack,
+    TrajectoryPoint,
     TurnEvent,
 )
 
@@ -30,6 +36,7 @@ from track.v2.models import (
 class _RecordingCursor:
     def __init__(self) -> None:
         self.executions: list[tuple[str, tuple[object, ...]]] = []
+        self.copy_rows: list[tuple[object, ...]] = []
 
     def __enter__(self) -> _RecordingCursor:
         return self
@@ -40,6 +47,9 @@ class _RecordingCursor:
     def execute(self, sql: str, params: tuple[object, ...]) -> None:
         self.executions.append((sql, params))
 
+    def copy(self, sql: str) -> _RecordingCopy:
+        return _RecordingCopy(self, sql)
+
     def fetchone(self) -> tuple[int, int]:
         params = self.executions[-1][1]
         if "INSERT INTO intersections" in self.executions[-1][0]:
@@ -48,6 +58,21 @@ class _RecordingCursor:
 
     def fetchall(self) -> list[tuple[int]]:
         return [(1,)]
+
+
+class _RecordingCopy:
+    def __init__(self, cursor: _RecordingCursor, sql: str) -> None:
+        self.cursor = cursor
+        self.sql = sql
+
+    def __enter__(self) -> _RecordingCopy:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        return None
+
+    def write_row(self, row: tuple[object, ...]) -> None:
+        self.cursor.copy_rows.append(row)
 
 
 class _RecordingConnection:
@@ -67,6 +92,60 @@ def _cluster(cluster_id: int) -> HotspotCluster:
         centroid_lat=39.0,
         radius_m=100.0,
     )
+
+
+def _trajectory_point(row_key: str, *, generated: bool = False) -> TrajectoryPoint:
+    point_type = DerivedPoint if generated else TrajectoryPoint
+    return point_type(
+        point_ref=PointRef(
+            source_id="raw_points",
+            source_row_key=row_key,
+            stable=not generated,
+            from_ref="1" if generated else None,
+            to_ref="2" if generated else None,
+            generated_reason=(
+                GeneratedReason.HEADING_ORTHOGONAL if generated else ""
+            ),
+        ),
+        vehicle_id="vehicle-1",
+        timestamp=float(row_key),
+        lon=116.0,
+        lat=39.0,
+        heading=0.0,
+        speed=10.0,
+    )
+
+
+class CleanerMembershipWriterTest(unittest.TestCase):
+    def test_kept_and_injected_rows_share_subtrack_index_and_anchor_order(self) -> None:
+        subtracks = [
+            RefinementSubtrack(
+                vehicle_id="vehicle-1",
+                subtrack_index=7,
+                points=[
+                    _trajectory_point("1"),
+                    _trajectory_point("15", generated=True),
+                    _trajectory_point("2"),
+                ],
+            )
+        ]
+        conn = _RecordingConnection()
+
+        insert_kept_trajectory_points(
+            conn,
+            subtracks,
+            {("raw_points", "1"): 101, ("raw_points", "2"): 102},
+            clean_id="clean-1",
+        )
+        insert_injected_points(conn, subtracks, clean_id="clean-1")
+
+        self.assertEqual(
+            [(row[5], row[6]) for row in conn.recording_cursor.copy_rows],
+            [(7, 0), (7, 1)],
+        )
+        _, injected_params = conn.recording_cursor.executions[-1]
+        self.assertEqual(len(injected_params), 20)
+        self.assertEqual((injected_params[2], injected_params[3]), (7, 0))
 
 
 class RunRegistryWriterTest(unittest.TestCase):
