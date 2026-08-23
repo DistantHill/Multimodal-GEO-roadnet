@@ -202,7 +202,7 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
                     pct = total_raw / total_rows if total_rows > 0 else 0
                     live_clean.update(
                         progress=pct,
-                        detail=f"{total_raw:,}/{total_rows:,} 点 / {vehicle_count:,} 车辆",
+                        detail=f"{total_raw:,}/{total_rows:,} 点, {vehicle_count:,} 车辆",
                         elapsed=elapsed,
                         throughput=f"{rate:.0f} 点/s",
                     )
@@ -223,7 +223,7 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
             elapsed_read = time.perf_counter() - t_read
             live_clean.update(
                 progress=1.0,
-                detail=f"{total_raw:,}/{total_rows:,} 点 / {vehicle_count:,} 车辆",
+                detail=f"{total_raw:,}/{total_rows:,} 点, {vehicle_count:,} 车辆",
                 elapsed=elapsed_read,
                 throughput=f"{total_raw / elapsed_read:.0f} 点/s" if elapsed_read > 0 else "",
             )
@@ -231,7 +231,7 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
             stream.close()
             handle.close()
             print(f"  读取&清洗 / Read&Clean: {total_raw:,} 点/points, "
-                  f"{vehicle_count:,} vehicles ({elapsed_read:.1f}s)")
+                  f"{vehicle_count:,} 车辆/vehicles ({elapsed_read:.1f}s)")
 
             stats["trajectory_points"] = total_raw
 
@@ -391,7 +391,7 @@ def run_pipeline(pipeline_input: PipelineInput) -> PipelineResult:
         _add_network_stats(stats, network_result)
         network_result.report.format_print(title="  Network 报告 / Network report")
 
-        print("\n  提交 / Committed.")
+        print(f"\n  提交 / Committed.")
 
     elapsed = time.perf_counter() - t_start
     stats["_elapsed_s"] = int(elapsed)
