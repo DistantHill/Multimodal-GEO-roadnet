@@ -4,7 +4,7 @@ import unittest
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
-from track.v2.cli.run import _flush_clean_batch, run_pipeline
+from track.v2.pipeline import PipelineInput, _flush_clean_batch, run_pipeline
 from track.v2.config import PostgresConfig
 from track.v2.db_writer import CleanRunRecord
 from track.v2.intersect2 import IntersectResult
@@ -124,8 +124,8 @@ class FlushCleanBatchTest(unittest.TestCase):
         ]
 
         with (
-            patch("track.v2.cli.run.insert_kept_trajectory_points") as insert_kept,
-            patch("track.v2.cli.run.insert_injected_points") as insert_injected,
+            patch("track.v2.pipeline.insert_kept_trajectory_points") as insert_kept,
+            patch("track.v2.pipeline.insert_injected_points") as insert_injected,
         ):
             next_index, kept_count = _flush_clean_batch(
                 object(),
@@ -156,79 +156,80 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.conn = _Connection(self.events)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        self.stack.enter_context(patch("track.v2.cli.run.pg_connect", return_value=self.conn))
-        self.stack.enter_context(patch("track.v2.cli.run.LiveStatus", return_value=MagicMock()))
+        self.stack.enter_context(patch("track.v2.pipeline.pg_connect", return_value=self.conn))
+        self.stack.enter_context(patch("track.v2.pipeline.LiveStatus", return_value=MagicMock()))
         self.stack.enter_context(
-            patch("track.v2.cli.run.detect_intersections", return_value=_empty_intersect_result())
+            patch("track.v2.pipeline.detect_intersections", return_value=_empty_intersect_result())
         )
-        self.stack.enter_context(patch("track.v2.cli.run.insert_tracks_cross", return_value=0))
-        self.stack.enter_context(patch("track.v2.cli.run.insert_turn_events", return_value={}))
+        self.stack.enter_context(patch("track.v2.pipeline.insert_tracks_cross", return_value=0))
+        self.stack.enter_context(patch("track.v2.pipeline.insert_turn_events", return_value={}))
         self.stack.enter_context(
-            patch("track.v2.cli.run.insert_candidate_intersections", return_value={})
+            patch("track.v2.pipeline.insert_candidate_intersections", return_value={})
         )
-        self.stack.enter_context(patch("track.v2.cli.run.insert_candidate_intersection_events"))
+        self.stack.enter_context(patch("track.v2.pipeline.insert_candidate_intersection_events"))
         self.stack.enter_context(
-            patch("track.v2.cli.run.insert_candidate_entry_exit_points", return_value={})
+            patch("track.v2.pipeline.insert_candidate_entry_exit_points", return_value={})
         )
-        self.stack.enter_context(patch("track.v2.cli.run.insert_intersections", return_value={}))
-        self.stack.enter_context(patch("track.v2.cli.run.insert_entry_exit_points"))
-        self.stack.enter_context(patch("track.v2.cli.run._add_clip_stats"))
-        self.stack.enter_context(patch("track.v2.cli.run._print_clip_report"))
-        self.stack.enter_context(patch("track.v2.cli.run._add_fit_stats"))
-        self.stack.enter_context(patch("track.v2.cli.run._add_network_stats"))
-        self.stack.enter_context(patch("track.v2.cli.run.fit_centerlines", return_value=MagicMock()))
+        self.stack.enter_context(patch("track.v2.pipeline.insert_intersections", return_value={}))
+        self.stack.enter_context(patch("track.v2.pipeline.insert_entry_exit_points"))
+        self.stack.enter_context(patch("track.v2.pipeline._add_clip_stats"))
+        self.stack.enter_context(patch("track.v2.pipeline._print_clip_report"))
+        self.stack.enter_context(patch("track.v2.pipeline._add_fit_stats"))
+        self.stack.enter_context(patch("track.v2.pipeline._add_network_stats"))
         empty_fit = MagicMock()
         empty_fit.centerlines = ()
         self.stack.enter_context(
             patch(
-                "track.v2.cli.run.fit_centerline_variants",
+                "track.v2.pipeline.fit_centerline_variants",
                 return_value=CenterlineFitBundle(empty_fit, empty_fit, empty_fit),
             )
         )
         self.stack.enter_context(
-            patch("track.v2.cli.run.create_fit_run", return_value="fit-1")
+            patch("track.v2.pipeline.create_fit_run", return_value="fit-1")
         )
         self.stack.enter_context(
-            patch("track.v2.cli.run.insert_centerline_bundle", return_value=())
+            patch("track.v2.pipeline.insert_centerline_bundle", return_value=())
         )
-        self.stack.enter_context(patch("track.v2.cli.run.finish_fit_run"))
-        self.stack.enter_context(patch("track.v2.cli.run.build_network", return_value=MagicMock()))
+        self.stack.enter_context(patch("track.v2.pipeline.finish_fit_run"))
+        self.stack.enter_context(patch("track.v2.pipeline.build_network", return_value=MagicMock()))
 
     def test_full_run_commits_clean_then_detect_before_post_processing(self) -> None:
-        self.stack.enter_context(patch("track.v2.cli.run.get_database", return_value=_EmptyHandle()))
-        self.stack.enter_context(patch("track.v2.cli.run.StreamVehicleSource", _EmptyStream))
+        self.stack.enter_context(patch("track.v2.pipeline.get_database", return_value=_EmptyHandle()))
+        self.stack.enter_context(patch("track.v2.pipeline.StreamVehicleSource", _EmptyStream))
         create_clean = self.stack.enter_context(
             patch(
-                "track.v2.cli.run.create_clean_run",
+                "track.v2.pipeline.create_clean_run",
                 side_effect=lambda *args, **kwargs: self.events.append("create_clean") or CLEAN_ID,
             )
         )
         finish_clean = self.stack.enter_context(
             patch(
-                "track.v2.cli.run.finish_clean_run",
+                "track.v2.pipeline.finish_clean_run",
                 side_effect=lambda *args, **kwargs: self.events.append("finish_clean"),
             )
         )
         create_detect = self.stack.enter_context(
             patch(
-                "track.v2.cli.run.create_detect_run",
+                "track.v2.pipeline.create_detect_run",
                 side_effect=lambda *args, **kwargs: self.events.append("create_detect") or DETECT_ID,
             )
         )
         finish_detect = self.stack.enter_context(
             patch(
-                "track.v2.cli.run.finish_detect_run",
+                "track.v2.pipeline.finish_detect_run",
                 side_effect=lambda *args, **kwargs: self.events.append("finish_detect"),
             )
         )
         self.stack.enter_context(
             patch(
-                "track.v2.cli.run.extract_clips_for_detect",
+                "track.v2.pipeline.extract_clips_for_detect",
                 side_effect=lambda *args, **kwargs: self.events.append("clip") or MagicMock(),
             )
         )
 
-        stats = run_pipeline(self.config, pg_source_table="raw_points", table="raw_points")
+        stats = run_pipeline(
+            PipelineInput(self.config, pg_source_table="raw_points", table="raw_points")
+        ).stats
 
         self.assertEqual(stats["clean_id"], CLEAN_ID)
         self.assertEqual(stats["detect_id"], DETECT_ID)
@@ -251,7 +252,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
     def test_completed_clean_can_create_multiple_detect_runs_without_cleaning_again(self) -> None:
         fetch_clean = self.stack.enter_context(
             patch(
-                "track.v2.cli.run.fetch_clean_run",
+                "track.v2.pipeline.fetch_clean_run",
                 return_value=CleanRunRecord(
                     id=CLEAN_ID,
                     source_id="raw_points",
@@ -261,21 +262,21 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 ),
             )
         )
-        create_clean = self.stack.enter_context(patch("track.v2.cli.run.create_clean_run"))
-        self.stack.enter_context(patch("track.v2.cli.run.finish_clean_run"))
+        create_clean = self.stack.enter_context(patch("track.v2.pipeline.create_clean_run"))
+        self.stack.enter_context(patch("track.v2.pipeline.finish_clean_run"))
         create_detect = self.stack.enter_context(
             patch(
-                "track.v2.cli.run.create_detect_run",
+                "track.v2.pipeline.create_detect_run",
                 side_effect=(DETECT_ID, "33333333-3333-3333-3333-333333333333"),
             )
         )
-        self.stack.enter_context(patch("track.v2.cli.run.finish_detect_run"))
+        self.stack.enter_context(patch("track.v2.pipeline.finish_detect_run"))
         self.stack.enter_context(
-            patch("track.v2.cli.run.extract_clips_for_detect", return_value=MagicMock())
+            patch("track.v2.pipeline.extract_clips_for_detect", return_value=MagicMock())
         )
 
-        first = run_pipeline(self.config, clean_id=CLEAN_ID)
-        second = run_pipeline(self.config, clean_id=CLEAN_ID)
+        first = run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID)).stats
+        second = run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID)).stats
 
         self.assertEqual((first["detect_id"], second["detect_id"]), (
             DETECT_ID, "33333333-3333-3333-3333-333333333333",
@@ -289,7 +290,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
     def test_clip_failure_does_not_undo_completed_detect(self) -> None:
         self.stack.enter_context(
             patch(
-                "track.v2.cli.run.fetch_clean_run",
+                "track.v2.pipeline.fetch_clean_run",
                 return_value=CleanRunRecord(
                     id=CLEAN_ID,
                     source_id="raw_points",
@@ -299,16 +300,16 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 ),
             )
         )
-        self.stack.enter_context(patch("track.v2.cli.run.create_detect_run", return_value=DETECT_ID))
+        self.stack.enter_context(patch("track.v2.pipeline.create_detect_run", return_value=DETECT_ID))
         finish_detect = self.stack.enter_context(
             patch(
-                "track.v2.cli.run.finish_detect_run",
+                "track.v2.pipeline.finish_detect_run",
                 side_effect=lambda *args, **kwargs: self.events.append("finish_detect"),
             )
         )
         self.stack.enter_context(
             patch(
-                "track.v2.cli.run.extract_clips_for_detect",
+                "track.v2.pipeline.extract_clips_for_detect",
                 side_effect=lambda *args, **kwargs: (
                     self.events.append("clip"), (_ for _ in ()).throw(RuntimeError("clip failed"))
                 )[1],
@@ -316,7 +317,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(RuntimeError, "clip failed"):
-            run_pipeline(self.config, clean_id=CLEAN_ID)
+            run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID))
 
         finish_detect.assert_called_once_with(self.conn, DETECT_ID, status="completed")
         self.assertEqual(self.events[-3:], ["finish_detect", "commit", "clip"])
@@ -324,25 +325,25 @@ class RunPipelineLifecycleTest(unittest.TestCase):
     def test_fit_write_failure_rolls_back_outputs_and_marks_fit_failed(self) -> None:
         self.stack.enter_context(
             patch(
-                "track.v2.cli.run.fetch_clean_run",
+                "track.v2.pipeline.fetch_clean_run",
                 return_value=CleanRunRecord(
                     id=CLEAN_ID, source_id="raw_points", source_kind="postgres_table",
                     parameters={"target_table": "raw_points"}, status="completed",
                 ),
             )
         )
-        self.stack.enter_context(patch("track.v2.cli.run.create_detect_run", return_value=DETECT_ID))
-        self.stack.enter_context(patch("track.v2.cli.run.finish_detect_run"))
+        self.stack.enter_context(patch("track.v2.pipeline.create_detect_run", return_value=DETECT_ID))
+        self.stack.enter_context(patch("track.v2.pipeline.finish_detect_run"))
         self.stack.enter_context(
-            patch("track.v2.cli.run.extract_clips_for_detect", return_value=MagicMock())
+            patch("track.v2.pipeline.extract_clips_for_detect", return_value=MagicMock())
         )
-        finish_fit = self.stack.enter_context(patch("track.v2.cli.run.finish_fit_run"))
+        finish_fit = self.stack.enter_context(patch("track.v2.pipeline.finish_fit_run"))
         self.stack.enter_context(
-            patch("track.v2.cli.run.insert_centerline_bundle", side_effect=RuntimeError("write failed"))
+            patch("track.v2.pipeline.insert_centerline_bundle", side_effect=RuntimeError("write failed"))
         )
 
         with self.assertRaisesRegex(RuntimeError, "write failed"):
-            run_pipeline(self.config, clean_id=CLEAN_ID)
+            run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID))
 
         self.assertIn("rollback", self.events)
         finish_fit.assert_called_once_with(self.conn, "fit-1", status="failed")
