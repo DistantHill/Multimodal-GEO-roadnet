@@ -24,6 +24,7 @@ from track.v2.cleaner1 import CleanerConfig, clean
 from track.v2.cross_track import (
     _build_grid as _cross_track_grid,
     extract_cross_track_candidates_legacy as _extract_orthogonal_cross_track_candidates_legacy,
+    _iter_cross_vehicle_pair_batches,
     _iter_pair_batches as _iter_cross_track_pair_batches,
     _prepare_segments as _prepare_cross_track_segments,
     extract_cross_track_candidates as _extract_orthogonal_cross_track_candidates,
@@ -238,6 +239,23 @@ class PairedSegmentIntersectionTest(unittest.TestCase):
         ))
         self.assertEqual(batches[0][0][0], 0)
         self.assertEqual(batches[-1][1][-1], side - 1)
+
+    def test_cross_vehicle_batches_never_materialize_same_vehicle_pairs(self):
+        ranks = np.asarray([0, 0, 0, 1, 1], dtype=np.int64)
+        batches = list(_iter_cross_vehicle_pair_batches(
+            np.arange(5, dtype=np.int64), ranks, batch_size=4,
+        ))
+        pairs = [
+            (int(left), int(right))
+            for left_ids, right_ids in batches
+            for left, right in zip(left_ids, right_ids)
+        ]
+
+        self.assertEqual(
+            pairs,
+            [(0, 3), (0, 4), (1, 3), (1, 4), (2, 3), (2, 4)],
+        )
+        self.assertTrue(all(len(left_ids) <= 4 for left_ids, _ in batches))
 
 
 class CompactAabbBroadPhaseTest(unittest.TestCase):

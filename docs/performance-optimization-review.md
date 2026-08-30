@@ -11,3 +11,4 @@ memory-boundary baselines exist.
 | 3 | Reuse the Clip intersection grid globally | Yes | Yes | Build one immutable grid per Clip input and carry each projected endpoint into the next segment; clip ordering and geometry are unchanged. |
 | 4 | Batch candidate/intersection INSERT RETURNING | Yes | Yes | Added parameter-limited multi-row inserts that retain PostGIS geometry construction and returned-ID mappings; candidate and verified rows now take batch-count round trips. |
 | 5 | Change high-frequency performance timing to block level | Yes | Yes | G* and both DBSCAN paths retain telemetry names but record one neighbour block per event/seed expansion, removing two timer calls per candidate. |
+| 6 | Generate only cross-vehicle segment pairs | Yes | Yes | A rank-ordered batch iterator now emits only canonical cross-vehicle pairs; same-vehicle and reverse pairs are never materialized, while owner filtering and output order remain stable. |

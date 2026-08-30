@@ -99,14 +99,14 @@ def extract_cross_track_candidates(
         seg_ids = np.asarray(grid[(cell_x, cell_y)], dtype=np.int64)
         if len(seg_ids) < 2:
             continue
-        for segment_ids_a, segment_ids_b in _iter_pair_batches(seg_ids, seg_ids, cfg.cross_track_pair_batch_size):
-            ra = ranks[segment_ids_a]
-            rb = ranks[segment_ids_b]
-            # ZH: 只保留 rank_a < rank_b（去同车对 + 去逆序），并做 owner 向量化过滤。
-            # EN: Keep only rank_a < rank_b (drop same-vehicle and reversed pairs),
-            #     then apply vectorized owner filtering.
-            keep = ra < rb
-            keep &= np.maximum(min_cx[segment_ids_a], min_cx[segment_ids_b]) == cell_x
+        for segment_ids_a, segment_ids_b in _iter_cross_vehicle_pair_batches(
+            seg_ids,
+            ranks,
+            cfg.cross_track_pair_batch_size,
+        ):
+            # Same-vehicle and reversed pairs were never materialized; this
+            # mask only assigns a multi-cell pair to its canonical owner cell.
+            keep = np.maximum(min_cx[segment_ids_a], min_cx[segment_ids_b]) == cell_x
             keep &= np.maximum(min_cy[segment_ids_a], min_cy[segment_ids_b]) == cell_y
             segment_ids_a = segment_ids_a[keep]
             segment_ids_b = segment_ids_b[keep]
@@ -303,6 +303,41 @@ def _iter_pair_batches(
             dtype=np.int64,
         )
         yield a_ids[flat // len(b_ids)], b_ids[flat % len(b_ids)]
+
+
+def _iter_cross_vehicle_pair_batches(
+    segment_ids: list[int] | np.ndarray,
+    vehicle_ranks: np.ndarray,
+    batch_size: int,
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Yield only canonical cross-vehicle pairs from rank-ordered segments."""
+    ids = np.asarray(segment_ids, dtype=np.int64)
+    if len(ids) < 2:
+        return
+    ranks = vehicle_ranks[ids]
+    if np.any(ranks[1:] < ranks[:-1]):
+        raise ValueError("cross-track segment ids must be ordered by vehicle rank")
+
+    batch_a = np.empty(batch_size, dtype=np.int64)
+    batch_b = np.empty(batch_size, dtype=np.int64)
+    pending = 0
+    for position, segment_id in enumerate(ids):
+        first_other_vehicle = int(np.searchsorted(ranks, ranks[position], side="right"))
+        candidates = ids[first_other_vehicle:]
+        candidate_offset = 0
+        while candidate_offset < len(candidates):
+            take = min(batch_size - pending, len(candidates) - candidate_offset)
+            batch_a[pending : pending + take] = segment_id
+            batch_b[pending : pending + take] = candidates[
+                candidate_offset : candidate_offset + take
+            ]
+            pending += take
+            candidate_offset += take
+            if pending == batch_size:
+                yield batch_a.copy(), batch_b.copy()
+                pending = 0
+    if pending:
+        yield batch_a[:pending].copy(), batch_b[:pending].copy()
 
 
 def _iter_overflow_pair_batches(
