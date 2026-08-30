@@ -38,7 +38,7 @@ from .models import (
     TrajectoryPoint,
 )
 from .sources import source_row_hash
-from .db.clip_queries import fetch_clean_points, fetch_detect_row
+from .db.clip_queries import fetch_clean_points_for_subtracks, fetch_detect_row
 
 
 def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInputReplay:
@@ -58,10 +58,6 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
         raise ValueError(f"unknown completed Centerline: {centerline_id}")
     (fit_id, detect_id, variant, from_id, to_id, centerline_wkt,
      forward_count, reverse_count) = centerline_row
-    detect = fetch_detect_row(conn, str(detect_id))
-    grouped = fetch_clean_points(
-        conn, str(detect.parameters["target_table"]), detect.clean_id,
-    )
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(
             "SELECT input_ordinal, clip_id, vehicle_id, subtrack_index, "
@@ -76,6 +72,17 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
         manifest_rows = list(cur)
     if len(manifest_rows) != int(forward_count) + int(reverse_count):
         raise ValueError(f"Centerline {centerline_id} source Clip manifest is incomplete")
+    detect = fetch_detect_row(conn, str(detect_id))
+    requested_subtracks = {
+        (str(row[2]), int(row[3]))
+        for row in manifest_rows
+    }
+    grouped = fetch_clean_points_for_subtracks(
+        conn,
+        str(detect.parameters["target_table"]),
+        detect.clean_id,
+        requested_subtracks,
+    )
     clips: list[ReplayFitClip] = []
     for row in manifest_rows:
         (ordinal, clip_id, vehicle_id, subtrack_index, start_cluster_id,
@@ -301,6 +308,7 @@ class PostgresReplayStore:
     def __init__(self, conn: Any) -> None:
         self._conn = conn
         self._clean_context_cache: dict[str, tuple[str, str]] = {}
+        self._detect_clean_cache: dict[str, str] = {}
         self._raw_context: dict[int, tuple[str, str, str]] = {}
 
     def get_entity(self, target: ReplayTarget) -> dict[str, Any] | None:
@@ -573,12 +581,18 @@ class PostgresReplayStore:
         if owner.clean_id is not None:
             clean_id = owner.clean_id
         elif owner.detect_id is not None:
-            with self._conn.cursor() as cur:
-                cur.execute(
-                    "SELECT clean_id FROM detect_runs WHERE id = %s",
-                    (owner.detect_id,),
-                )
-                clean_id = str(cur.fetchone()[0])
+            clean_id = self._detect_clean_cache.get(owner.detect_id)
+            if clean_id is None:
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT clean_id FROM detect_runs WHERE id = %s",
+                        (owner.detect_id,),
+                    )
+                    row = cur.fetchone()
+                if row is None:
+                    raise ValueError(f"unknown Detect Run: {owner.detect_id}")
+                clean_id = str(row[0])
+                self._detect_clean_cache[owner.detect_id] = clean_id
         else:
             raise ValueError("stage artifact requires a Clean or Detect Run id")
         cached = self._clean_context_cache.get(clean_id)

@@ -42,6 +42,7 @@ class _LookupCursor:
     def __init__(self) -> None:
         self.sql = ""
         self.params: tuple[object, ...] = ()
+        self.executions: list[tuple[str, object]] = []
 
     def __enter__(self) -> _LookupCursor:
         return self
@@ -52,6 +53,7 @@ class _LookupCursor:
     def execute(self, sql: str, params: tuple[object, ...]) -> None:
         self.sql = sql
         self.params = params
+        self.executions.append((sql, params))
 
     def fetchall(self) -> list[tuple[int]]:
         if "candidate_intersection_events" in self.sql:
@@ -180,9 +182,9 @@ class ReplayServiceTest(unittest.TestCase):
         conn = SequenceConnection([
             [("fit-1", "detect-1", "directed", 10, 20,
               "LINESTRING(0 0,1 1)", 1, 0)],
+            manifest,
             [("clean-1", "source", {"target_table": "trajectory_points"}, "completed")],
             point_rows,
-            manifest,
         ])
 
         result = replay_centerline_inputs(conn, 7)
@@ -198,7 +200,23 @@ class ReplayServiceTest(unittest.TestCase):
             [ref.source_row_key for ref in clip.start.bracket_refs], ["0", "1"],
         )
         self.assertGreater(clip.points[0].lon, clip.points[-1].lon)
-        self.assertNotIn("is_active", conn.sql[2])
+        self.assertIn("centerline_source_clips", conn.sql[1])
+        self.assertNotIn("is_active", conn.sql[3])
+        self.assertIn("JOIN requested", conn.sql[3])
+
+    def test_detect_to_clean_context_is_cached(self) -> None:
+        conn = _LookupConnection()
+        store = PostgresReplayStore(conn)
+        owner = ReplayTarget("turn_event", 1, detect_id="detect-1")
+
+        self.assertEqual(store._clean_context(owner), ("clean-1", "csv", "trajectory_points"))
+        self.assertEqual(store._clean_context(owner), ("clean-1", "csv", "trajectory_points"))
+
+        detect_queries = [
+            sql for sql, _ in conn.cursor_.executions
+            if sql.startswith("SELECT clean_id FROM detect_runs")
+        ]
+        self.assertEqual(len(detect_queries), 1)
 
     def test_cli_target_uses_the_stage_id_required_by_kind(self) -> None:
         parser = MagicMock()

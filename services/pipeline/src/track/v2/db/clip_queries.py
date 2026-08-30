@@ -106,6 +106,57 @@ def fetch_clean_points(
     return _group_points(conn, sql, (clean_id, clean_id), clean_id)
 
 
+def fetch_clean_points_for_subtracks(
+    conn: object,
+    table: str,
+    clean_id: str,
+    subtracks: set[tuple[str, int]],
+) -> dict[tuple[str, int], list[TrajectoryPoint]]:
+    """Load only the frozen Clean Run subtracks named by a replay manifest."""
+    if not subtracks:
+        return {}
+    requested = sorted(subtracks)
+    vehicle_ids = [vehicle_id for vehicle_id, _ in requested]
+    subtrack_indexes = [subtrack_index for _, subtrack_index in requested]
+    safe_table = _quoted_identifier(table)
+    sql = (
+        "WITH requested(vehicle_id, subtrack_index) AS ("
+        "  SELECT * FROM unnest(%s::text[], %s::integer[])"
+        ") "
+        "SELECT vehicle_id, subtrack_index, anchor_sequence, "
+        "source_id, source_row_key, timestamp, lon, lat, heading, speed, extra, "
+        "from_source_row_key, to_source_row_key, generated_reason "
+        "FROM ("
+        "  SELECT ktp.vehicle_id, ktp.subtrack_index, ktp.sequence_in_subtrack AS anchor_sequence, "
+        "         ktp.source_id, ktp.source_row_key, "
+        "         tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, tp.extra, "
+        "         NULL::text AS from_source_row_key, "
+        "         NULL::text AS to_source_row_key, ''::text AS generated_reason, "
+        "         0 AS point_kind, ktp.id AS row_id "
+        "  FROM kept_trajectory_points AS ktp "
+        "  JOIN requested AS r USING (vehicle_id, subtrack_index) "
+        f"  LEFT JOIN {safe_table} AS tp ON tp.id = ktp.trajectory_point_id "
+        "  WHERE ktp.clean_id = %s "
+        "  UNION ALL "
+        "  SELECT ip.vehicle_id, ip.subtrack_index, ip.after_sequence_in_subtrack, "
+        "         ip.source_id, ip.source_row_key, "
+        "         ip.timestamp, ip.lon, ip.lat, ip.heading, ip.speed, '{}'::jsonb, "
+        "         ip.from_source_row_key, ip.to_source_row_key, ip.generated_reason, "
+        "         1 AS point_kind, ip.id AS row_id "
+        "  FROM injected_points AS ip "
+        "  JOIN requested AS r USING (vehicle_id, subtrack_index) "
+        "  WHERE ip.clean_id = %s"
+        ") AS clean_points "
+        "ORDER BY vehicle_id, subtrack_index, anchor_sequence, point_kind, row_id"
+    )
+    return _group_points(
+        conn,
+        sql,
+        (vehicle_ids, subtrack_indexes, clean_id, clean_id),
+        clean_id,
+    )
+
+
 def _group_points(
     conn: object,
     sql: str,

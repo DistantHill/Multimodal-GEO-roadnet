@@ -13,3 +13,4 @@ memory-boundary baselines exist.
 | 5 | Change high-frequency performance timing to block level | Yes | Yes | G* and both DBSCAN paths retain telemetry names but record one neighbour block per event/seed expansion, removing two timer calls per candidate. |
 | 6 | Generate only cross-vehicle segment pairs | Yes | Yes | A rank-ordered batch iterator now emits only canonical cross-vehicle pairs; same-vehicle and reverse pairs are never materialized, while owner filtering and output order remain stable. |
 | 7 | Construct DB models directly from tuples | Yes | No | Already implemented in `PostgresTrajectorySourceHandle` via precomputed column indexes and `_parse_row_from_tuple`; the dict parser remains only for non-PG/general rows. |
+| 8 | Replay manifest first and query named subtracks | Yes | Yes | Centerline replay now validates its manifest before loading points, queries only referenced `(vehicle_id, subtrack_index)` pairs, and caches Detect-to-Clean resolution. |
