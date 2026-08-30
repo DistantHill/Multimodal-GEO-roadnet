@@ -9,6 +9,7 @@ EN: Shared database connection config used by all CLI modules. Defaults are
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -42,6 +43,8 @@ def load_dotenv(env_path: str | Path | None = None) -> dict[str, str]:
         if found is None:
             return {}
         env_path = found
+    elif not Path(env_path).is_file():
+        return {}
 
     result: dict[str, str] = {}
     with open(env_path, "r", encoding="utf-8") as fh:
@@ -140,26 +143,36 @@ def connect(config: PostgresConfig):
 # ── Env-based default config ───────────────────────────────────────────
 
 def default_postgres_config(env_path: str | Path | None = None) -> PostgresConfig:
-    """Build a PostgresConfig populated from .env defaults.
+    """Build a PostgresConfig from process environment and legacy .env values.
 
-    ZH: 从 .env 文件读取默认数据库连接参数。返回的 config 中密码已填充，
-        CLI 仍可通过 ``--ask-password`` 覆盖。
+    ZH: Docker/服务器环境优先读取进程环境变量，并兼容原有
+        ``TRACK_PG_*`` 命名及包内 .env 文件。CLI 仍可覆盖这些默认值。
 
-    EN: Read default DB connection parameters from .env. The returned config
-        includes the password; CLIs may still override via ``--ask-password``.
+    EN: Process variables take precedence for container deployments. Legacy
+        ``TRACK_PG_*`` names and the package-local .env file remain supported.
     """
-    env = load_dotenv(env_path)
+    file_env = load_dotenv(env_path)
+
+    def value(legacy_key: str, standard_key: str | None, default: str) -> str:
+        keys = (legacy_key, standard_key) if standard_key else (legacy_key,)
+        for source in (os.environ, file_env):
+            for key in keys:
+                if key and key in source:
+                    return source[key]
+        return default
+
     return PostgresConfig(
-        host=env.get("TRACK_PG_HOST", "127.0.0.1"),
-        port=int(env.get("TRACK_PG_PORT", "5432")),
-        database=env.get("TRACK_PG_DATABASE", "track_test"),
-        user=env.get("TRACK_PG_USER", "postgres"),
-        password=env.get("TRACK_PG_PASSWORD", "asdf"),
-        connect_timeout=int(env.get("TRACK_PG_CONNECT_TIMEOUT", "10")),
-        sslmode=env.get("TRACK_PG_SSLMODE") or None,
-        keepalives=env.get("TRACK_PG_KEEPALIVES", "1") not in ("0", "false", "no"),
-        keepalives_idle=int(env.get("TRACK_PG_KEEPALIVES_IDLE", "60")),
-        keepalives_interval=int(env.get("TRACK_PG_KEEPALIVES_INTERVAL", "10")),
-        keepalives_count=int(env.get("TRACK_PG_KEEPALIVES_COUNT", "5")),
-        tcp_user_timeout=int(env.get("TRACK_PG_TCP_USER_TIMEOUT", "30000")),
+        host=value("TRACK_PG_HOST", "POSTGRES_HOST", "127.0.0.1"),
+        port=int(value("TRACK_PG_PORT", "POSTGRES_PORT", "5432")),
+        database=value("TRACK_PG_DATABASE", "POSTGRES_DB", "track_test"),
+        user=value("TRACK_PG_USER", "POSTGRES_USER", "postgres"),
+        password=value("TRACK_PG_PASSWORD", "POSTGRES_PASSWORD", ""),
+        connect_timeout=int(value("TRACK_PG_CONNECT_TIMEOUT", None, "10")),
+        sslmode=value("TRACK_PG_SSLMODE", None, "") or None,
+        keepalives=value("TRACK_PG_KEEPALIVES", None, "1").lower()
+        not in ("0", "false", "no"),
+        keepalives_idle=int(value("TRACK_PG_KEEPALIVES_IDLE", None, "60")),
+        keepalives_interval=int(value("TRACK_PG_KEEPALIVES_INTERVAL", None, "10")),
+        keepalives_count=int(value("TRACK_PG_KEEPALIVES_COUNT", None, "5")),
+        tcp_user_timeout=int(value("TRACK_PG_TCP_USER_TIMEOUT", None, "30000")),
     )

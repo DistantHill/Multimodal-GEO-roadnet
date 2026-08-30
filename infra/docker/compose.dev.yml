@@ -1,0 +1,101 @@
+name: roadnet-dev
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-roadnet}
+      POSTGRES_USER: ${POSTGRES_USER:-roadnet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../../db/postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${POSTGRES_HOST_PORT:-15432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.6
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "${QDRANT_HOST_PORT:-16333}:6333"
+    healthcheck:
+      # The minimal Qdrant image has no curl/wget; the Backend performs the HTTP check.
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ../../apps/backend
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-roadnet}
+      POSTGRES_USER: ${POSTGRES_USER:-roadnet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      QDRANT_HOST: ${QDRANT_HOST:-qdrant}
+      QDRANT_PORT: ${QDRANT_PORT:-6333}
+    volumes:
+      - ../../apps/backend:/app
+    command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+
+  pipeline:
+    build:
+      context: ../../services/pipeline
+      dockerfile: Dockerfile
+    environment:
+      DATA_ROOT: /data
+      PARQUET_ROOT: /data/parquet
+      TRACK_LOG_PATH: ${PIPELINE_LOG_PATH:-/data/logs/pipeline.log}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-roadnet}
+      POSTGRES_USER: ${POSTGRES_USER:-roadnet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+    volumes:
+      - ../../services/pipeline:/app
+      - ${DATA_ROOT:-/data/road-network}:/data
+    command: ["python", "-m", "pipeline", "serve"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ../../apps/frontend
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      VITE_API_BASE_URL: /api
+    volumes:
+      - ../../apps/frontend:/app
+      - frontend_node_modules:/app/node_modules
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+    ports:
+      - "${FRONTEND_PORT:-5173}:5173"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  frontend_node_modules:

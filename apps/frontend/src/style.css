@@ -1,0 +1,51 @@
+:root {
+  color: #e9eef5;
+  background: #10151c;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+.shell {
+  box-sizing: border-box;
+  max-width: 760px;
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 12vh 2rem;
+}
+
+.eyebrow {
+  color: #77d8c4;
+  font-size: 0.75rem;
+  letter-spacing: 0.18em;
+}
+
+h1 {
+  max-width: 620px;
+  margin: 1rem 0;
+  font-size: clamp(2.2rem, 7vw, 4.5rem);
+  line-height: 1.05;
+}
+
+.lede {
+  color: #9eacbc;
+  font-size: 1.1rem;
+}
+
+.card {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 4rem;
+  padding: 1.25rem 1.5rem;
+  border: 1px solid #2c3947;
+  border-radius: 14px;
+  background: #171e27;
+}
+
+.label { color: #9eacbc; }
+.ok { color: #77d8c4; }
+.error { color: #ff9b88; }

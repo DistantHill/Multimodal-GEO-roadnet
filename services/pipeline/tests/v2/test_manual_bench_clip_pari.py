@@ -11,7 +11,8 @@ from pathlib import Path
 class ManualBenchClipPairImportTest(unittest.TestCase):
     def test_script_bootstraps_project_root_without_running_the_database_query(self) -> None:
         project_root = Path(__file__).resolve().parents[2]
-        script = project_root / "track/v2/manual_thin_benchmark/manual_bench_clip_pari.py"
+        source_root = project_root / "src"
+        script = source_root / "track/v2/manual_thin_benchmark/manual_bench_clip_pari.py"
         probe = f"""
 import runpy
 import sys
@@ -25,7 +26,7 @@ sys.meta_path = [
 sys.path = [
     entry
     for entry in sys.path
-    if entry and Path(entry).resolve() != Path({str(project_root)!r})
+    if entry and Path(entry).resolve() != Path({str(source_root)!r})
 ]
 runpy.run_path({str(script)!r}, run_name="manual_bench_import_probe")
 """

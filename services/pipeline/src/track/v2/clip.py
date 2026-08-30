@@ -186,6 +186,7 @@ def extract_clips_for_detect(
     detect_id: str,
     *,
     config: ClipConfig | None = None,
+    allow_running: bool = False,
 ) -> ClipResult:
     """Extract clips from one persisted detect.
 

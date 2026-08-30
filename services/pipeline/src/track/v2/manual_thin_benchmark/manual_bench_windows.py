@@ -2,7 +2,7 @@
 
 Run through uv, using the same interpreter for both children::
 
-    uv run --no-project --python D:\\H_Software\\miniforge3\\envs\\torch\\python.exe python \
+    uv run --no-project --python "$TRACK_BENCH_PYTHON" python \
       track/v2/manual_thin_benchmark/manual_bench_windows.py \
       --baseline-commit c12a06abe3262501f5bb20713c4280aa9a99f34e
 
@@ -1438,7 +1438,12 @@ def main() -> None:
     parser.add_argument(
         "--env-file",
         type=Path,
-        default=Path(r"D:\Ai_Projects\track\track\v2\.env"),
+        default=Path(
+            os.environ.get(
+                "TRACK_BENCH_ENV_FILE",
+                Path(__file__).resolve().parents[1] / ".env",
+            )
+        ),
     )
     parser.add_argument(
         "--legacy-attestation",

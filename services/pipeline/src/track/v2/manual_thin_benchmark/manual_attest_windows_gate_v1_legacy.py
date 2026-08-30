@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -183,7 +184,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Write-once legacy Windows Gate v1 attestation.")
     parser.add_argument("--manifest", type=Path, default=Path("generated/perf_windows/gate_manifest.json"))
     parser.add_argument("--restore-audit", type=Path, default=Path("generated/perf_windows/manual_restore_windows_gate_v1_apply.json"))
-    parser.add_argument("--env-file", type=Path, default=Path(r"D:\Ai_Projects\track\track\v2\.env"))
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "TRACK_BENCH_ENV_FILE",
+                Path(__file__).resolve().parents[1] / ".env",
+            )
+        ),
+    )
     parser.add_argument("--output", type=Path, default=Path("generated/perf_windows/windows_gate_v1_legacy_attestation.json"))
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args(argv)

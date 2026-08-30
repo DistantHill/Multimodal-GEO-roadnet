@@ -337,7 +337,12 @@ def _write_audit(path: Path, audit: dict[str, Any]) -> None:
 
 
 def _default_env_path() -> Path:
-    return Path(r"D:\Ai_Projects\track\track\v2\.env")
+    return Path(
+        os.environ.get(
+            "TRACK_BENCH_ENV_FILE",
+            Path(__file__).resolve().parents[1] / ".env",
+        )
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

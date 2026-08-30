@@ -1,0 +1,58 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Node / frontend build output
+node_modules/
+dist/
+build/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data and local infrastructure state
+data/
+**/data/
+*.parquet
+*.parquet-*
+*.db
+*.sqlite
+*.sqlite3
+postgres_data/
+qdrant_data/
+qdrant/storage/
+logs/
+*.log
+
+# Model weights and generated exports
+generated/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+models/
+exports/
+
+# Editors and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

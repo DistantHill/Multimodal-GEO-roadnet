@@ -20,7 +20,7 @@ from pathlib import Path
 
 
 BASELINE = "c12a06abe3262501f5bb20713c4280aa9a99f34e"
-TORCH_PYTHON = Path(r"D:\H_Software\miniforge3\envs\torch\python.exe")
+TORCH_PYTHON = Path(os.environ.get("TRACK_BENCH_PYTHON", sys.executable))
 
 
 _CHILD = r'''

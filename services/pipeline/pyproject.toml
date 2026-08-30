@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roadnet-pipeline"
+version = "0.1.0"
+description = "Independent freight trajectory road-network pipeline runtime"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "Pillow>=10.0",
+    "psycopg[binary]>=3.2",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+roadnet-pipeline = "pipeline.__main__:main"
+roadnet-pipeline-init-db = "track.v2.cli.init_db:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"track.v2.config" = ["*.toml"]
