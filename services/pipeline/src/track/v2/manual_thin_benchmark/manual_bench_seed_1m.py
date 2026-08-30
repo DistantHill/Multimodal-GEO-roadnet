@@ -111,6 +111,7 @@ def run_migration(
 
     # ── 源端：命名游标，单次 SELECT ──
     src_cur = src_conn.cursor(name=f"seed_1m_{uuid4().hex}")
+    src_cur.itersize = 10_000
     src_cur.execute(
         f"SELECT {cols} FROM day01 ORDER BY vehicle_id, timestamp LIMIT %s",
         (limit,),
