@@ -257,6 +257,21 @@ class PairedSegmentIntersectionTest(unittest.TestCase):
         )
         self.assertTrue(all(len(left_ids) <= 4 for left_ids, _ in batches))
 
+    def test_cross_track_preparation_projects_shared_endpoints_once(self):
+        track = [
+            _make_point("A", str(index), float(index), 116.0 + index * 0.001, 39.0, 0.0, 5.0)
+            for index in range(4)
+        ]
+
+        with patch("track.v2.cross_track._to_xy", wraps=_to_xy) as project:
+            segments, vehicle_count = _prepare_cross_track_segments(
+                {"A": track}, 116.0, 39.0, IntersectConfig(),
+            )
+
+        self.assertEqual(vehicle_count, 1)
+        self.assertEqual(len(segments), 3)
+        self.assertEqual(project.call_count, len(track))
+
 
 class CompactAabbBroadPhaseTest(unittest.TestCase):
     """Regression coverage for the strict window broad/exact seam."""

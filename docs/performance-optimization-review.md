@@ -15,3 +15,4 @@ memory-boundary baselines exist.
 | 7 | Construct DB models directly from tuples | Yes | No | Already implemented in `PostgresTrajectorySourceHandle` via precomputed column indexes and `_parse_row_from_tuple`; the dict parser remains only for non-PG/general rows. |
 | 8 | Replay manifest first and query named subtracks | Yes | Yes | Centerline replay now validates its manifest before loading points, queries only referenced `(vehicle_id, subtrack_index)` pairs, and caches Detect-to-Clean resolution. |
 | 9 | Add a Cleaner pending-point flush cap | Yes | Yes | Added a configurable 100k-point cap across kept/derived/excluded output; flushing remains between complete vehicle groups, so a single vehicle is never split. |
+| 10 | Cache Cross-track endpoint projections | Yes | Yes | Each accepted point index is projected at most once per vehicle, so adjacent straight segments reuse their shared endpoint without changing segment filtering. |

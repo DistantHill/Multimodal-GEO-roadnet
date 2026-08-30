@@ -233,13 +233,23 @@ def _prepare_segments(
     for vehicle_id in sorted(tracks):
         track = tracks[vehicle_id]
         raw_segments: list[tuple[int, float, float, float, float]] = []
+        projected_points: dict[int, tuple[float, float]] = {}
+
+        def point_xy(point_index: int) -> tuple[float, float]:
+            projected = projected_points.get(point_index)
+            if projected is None:
+                point = track[point_index]
+                projected = _to_xy(point.lon, point.lat, origin_lon, origin_lat)
+                projected_points[point_index] = projected
+            return projected
+
         for segment_index in range(len(track) - 1):
             start = track[segment_index]
             end = track[segment_index + 1]
             if abs(_angle_delta_deg(start.heading, end.heading)) > cfg.cross_track_straightness_deg:
                 continue
-            x1, y1 = _to_xy(start.lon, start.lat, origin_lon, origin_lat)
-            x2, y2 = _to_xy(end.lon, end.lat, origin_lon, origin_lat)
+            x1, y1 = point_xy(segment_index)
+            x2, y2 = point_xy(segment_index + 1)
             raw_segments.append((segment_index, x1, y1, x2, y2))
         if raw_segments:
             per_vehicle.append((vehicle_id, raw_segments))
