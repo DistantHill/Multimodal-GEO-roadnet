@@ -318,6 +318,37 @@ def _chunked_insert_returning(
     return all_returned
 
 
+def _chunked_insert_template_returning(
+    cur: Any,
+    table: str,
+    columns: list[str],
+    rows: list[tuple[Any, ...]],
+    value_template: str,
+    returning_cols: list[str],
+    *,
+    batch_size: int = _BATCH,
+) -> list[tuple[Any, ...]]:
+    """Batch rows whose VALUES clause contains a trusted SQL expression."""
+    if not rows:
+        return []
+    params_per_row = len(rows[0])
+    if any(len(row) != params_per_row for row in rows):
+        raise ValueError("templated insert rows must have a consistent width")
+    effective_batch = min(batch_size, max(1, 65535 // params_per_row))
+    returned: list[tuple[Any, ...]] = []
+    for start in range(0, len(rows), effective_batch):
+        batch = rows[start : start + effective_batch]
+        sql = (
+            f"INSERT INTO {table} ({', '.join(columns)}) VALUES "
+            f"{', '.join(f'({value_template})' for _ in batch)} "
+            f"RETURNING {', '.join(returning_cols)}"
+        )
+        params = [value for row in batch for value in row]
+        cur.execute(sql, params)
+        returned.extend(cur.fetchall())
+    return returned
+
+
 def _chunked_insert(
     cur: Any,
     table: str,
@@ -744,6 +775,7 @@ def insert_candidate_intersections(
     origin_lat: float = 0.0,
     *,
     detect_id: str | None = None,
+    batch_size: int = _BATCH,
 ) -> dict[int, int]:
     """Insert candidate intersections with POLYGON geometry.
 
@@ -765,43 +797,44 @@ def insert_candidate_intersections(
         "geom",  # ← must be last: _POLYGON_EXPR is appended to end of placeholders
     ]
     columns = ["detect_id", *columns]
-    mapping: dict[int, int] = {}
+    rows = [
+        (
+            detect_id,
+            c.cluster_id,
+            c.centroid_x,
+            c.centroid_y,
+            c.centroid_lon,
+            c.centroid_lat,
+            c.radius_m,
+            c.source,
+            json.dumps(list(c.source_ids), ensure_ascii=False),
+            json.dumps(c.source_counts, ensure_ascii=False),
+            json.dumps(c.source_ratios, ensure_ascii=False),
+            json.dumps(list(c.critical_sources), ensure_ascii=False),
+            len([e for e in c.events if e.source == "turn"]),
+            len([e for e in c.events if e.source == "orthogonal"]),
+            len([e for e in c.events if e.source == "orthogonal_cross_track"]),
+            len(c.events),
+            origin_lon,
+            origin_lat,
+            c.centroid_lon,
+            c.centroid_lat,
+            c.radius_m,
+        )
+        for c in clusters
+    ]
+    value_template = ", ".join(["%s"] * (len(columns) - 1) + [_POLYGON_EXPR])
     with conn.cursor() as cur:
-        for c in clusters:
-            row = (
-                c.cluster_id,
-                c.centroid_x,
-                c.centroid_y,
-                c.centroid_lon,
-                c.centroid_lat,
-                c.radius_m,
-                c.source,
-                json.dumps(list(c.source_ids), ensure_ascii=False),
-                json.dumps(c.source_counts, ensure_ascii=False),
-                json.dumps(c.source_ratios, ensure_ascii=False),
-                json.dumps(list(c.critical_sources), ensure_ascii=False),
-                len([e for e in c.events if e.source == "turn"]),
-                len([e for e in c.events if e.source == "orthogonal"]),
-                len([e for e in c.events if e.source == "orthogonal_cross_track"]),
-                len(c.events),
-                origin_lon,
-                origin_lat,
-            )
-            row = (detect_id, *row)
-            placeholders = ", ".join(["%s"] * len(columns))
-            # Replace the last placeholder (geom) with ST_Buffer expression
-            placeholders_parts = ["%s"] * len(columns)
-            placeholders_parts[-1] = _POLYGON_EXPR  # geom is last column
-            placeholders = ", ".join(placeholders_parts)
-            params = row + (c.centroid_lon, c.centroid_lat, c.radius_m)
-            sql = (
-                f"INSERT INTO candidate_intersections ({', '.join(columns)}) "
-                f"VALUES ({placeholders}) "
-                f"RETURNING id, cluster_id"
-            )
-            cur.execute(sql, params)
-            db_id, cluster_id = cur.fetchone()
-            mapping[cluster_id] = db_id
+        returned = _chunked_insert_template_returning(
+            cur,
+            "candidate_intersections",
+            columns,
+            rows,
+            value_template,
+            ["id", "cluster_id"],
+            batch_size=batch_size,
+        )
+    mapping = {cluster_id: db_id for db_id, cluster_id in returned}
     return mapping
 
 
@@ -920,6 +953,7 @@ def insert_intersections(
     clusters_by_id: dict[int, HotspotCluster],
     *,
     detect_id: str | None = None,
+    batch_size: int = _BATCH,
 ) -> dict[int, int]:
     """Insert only topology-verified intersections with POLYGON geometry.
 
@@ -940,55 +974,58 @@ def insert_intersections(
         "geom",
     ]
     columns = ["detect_id", *columns]
-    mapping: dict[int, int] = {}
+    rows: list[tuple[Any, ...]] = []
+    for topo in topologies:
+        if not topo.is_complete:
+            continue
+        ci_db_id = ci_id_map.get(topo.cluster_id)
+        if ci_db_id is None:
+            continue
+        cluster = clusters_by_id.get(topo.cluster_id)
+        clip_radius_m = topo.clip_radius_m or (
+            cluster.radius_m if cluster is not None else 0.0
+        )
+        if not clip_radius_m > 0.0:
+            raise ValueError(
+                f"complete intersection {topo.cluster_id} requires a positive clip radius"
+            )
+        rows.append((
+            detect_id,
+            ci_db_id,
+            topo.cluster_id,
+            json.dumps(topo.branch_centers_deg, ensure_ascii=False),
+            json.dumps(
+                {f"{k[0]},{k[1]}": v for k, v in topo.transition_counts.items()},
+                ensure_ascii=False,
+            ),
+            topo.observation_count,
+            topo.is_complete,
+            topo.reason,
+            clip_radius_m,
+            cluster is not None,
+            cluster.centroid_lon if cluster is not None else None,
+            cluster.centroid_lat if cluster is not None else None,
+            clip_radius_m if cluster is not None else None,
+        ))
+
+    optional_polygon = (
+        "CASE WHEN %s::boolean THEN "
+        "ST_Buffer(ST_SetSRID(ST_MakePoint(%s::double precision, "
+        "%s::double precision), 4326)::geography, %s::double precision)::geometry "
+        "ELSE NULL END"
+    )
+    value_template = ", ".join(["%s"] * (len(columns) - 1) + [optional_polygon])
     with conn.cursor() as cur:
-        for topo in topologies:
-            if not topo.is_complete:
-                continue
-            ci_db_id = ci_id_map.get(topo.cluster_id)
-            if ci_db_id is None:
-                continue
-            cluster = clusters_by_id.get(topo.cluster_id)
-            clip_radius_m = topo.clip_radius_m or (
-                cluster.radius_m if cluster is not None else 0.0
-            )
-            if not clip_radius_m > 0.0:
-                raise ValueError(
-                    f"complete intersection {topo.cluster_id} requires a positive clip radius"
-                )
-            row = (
-                ci_db_id,
-                topo.cluster_id,
-                json.dumps(topo.branch_centers_deg, ensure_ascii=False),
-                json.dumps({f"{k[0]},{k[1]}": v for k, v in topo.transition_counts.items()},
-                          ensure_ascii=False),
-                topo.observation_count,
-                topo.is_complete,
-                topo.reason,
-                clip_radius_m,
-            )
-            row = (detect_id, *row)
-            # Build geom via ST_Buffer from candidate cluster's centroid + radius
-            if cluster is not None:
-                placeholders = ", ".join("%s" for _ in row)
-                placeholders += f", {_POLYGON_EXPR}"
-                sql = (
-                    f"INSERT INTO intersections ({', '.join(columns)}) "
-                    f"VALUES ({placeholders}) "
-                    f"RETURNING id, cluster_id"
-                )
-                cur.execute(sql, row + (cluster.centroid_lon, cluster.centroid_lat, clip_radius_m))
-            else:
-                placeholders = ", ".join("%s" for _ in row)
-                placeholders += ", NULL"
-                sql = (
-                    f"INSERT INTO intersections ({', '.join(columns)}) "
-                    f"VALUES ({placeholders}) "
-                    f"RETURNING id, cluster_id"
-                )
-                cur.execute(sql, row)
-            db_id, cid = cur.fetchone()
-            mapping[cid] = db_id
+        returned = _chunked_insert_template_returning(
+            cur,
+            "intersections",
+            columns,
+            rows,
+            value_template,
+            ["id", "cluster_id"],
+            batch_size=batch_size,
+        )
+    mapping = {cluster_id: db_id for db_id, cluster_id in returned}
     return mapping
 
 

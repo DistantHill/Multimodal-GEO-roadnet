@@ -56,7 +56,22 @@ class _RecordingCursor:
             return len(self.executions), params[2]  # type: ignore[return-value]
         return len(self.executions), params[1]  # type: ignore[return-value]
 
-    def fetchall(self) -> list[tuple[int]]:
+    def fetchall(self) -> list[tuple[int, ...]]:
+        sql, params = self.executions[-1]
+        if "INSERT INTO candidate_intersections" in sql:
+            row_count = sql.count("ST_Buffer(")
+            width = len(params) // row_count
+            return [
+                (index + 1, params[index * width + 1])
+                for index in range(row_count)
+            ]
+        if "INSERT INTO intersections" in sql:
+            row_count = sql.count("CASE WHEN")
+            width = len(params) // row_count
+            return [
+                (index + 1, params[index * width + 2])
+                for index in range(row_count)
+            ]
         return [(1,)]
 
 
@@ -266,6 +281,32 @@ class InsertIntersectionsTest(unittest.TestCase):
         self.assertEqual(params[8], 145.0)
         self.assertEqual(params[-1], 145.0)
 
+    def test_complete_topologies_are_inserted_in_one_batch(self) -> None:
+        conn = _RecordingConnection()
+        topologies = [
+            IntersectionTopology(
+                cluster_id=cluster_id,
+                branch_centers_deg=[0.0, 90.0],
+                transition_counts={(0, 1): 2},
+                observation_count=4,
+                is_complete=True,
+                reason="complete",
+                clip_radius_m=100.0,
+            )
+            for cluster_id in (10, 20)
+        ]
+
+        result = insert_intersections(
+            conn,
+            topologies,
+            {10: 110, 20: 120},
+            {10: _cluster(10), 20: _cluster(20)},
+            detect_id="detect-1",
+        )
+
+        self.assertEqual(result, {10: 1, 20: 2})
+        self.assertEqual(len(conn.recording_cursor.executions), 1)
+
 
 class InsertTracksCrossTest(unittest.TestCase):
     def test_writes_deduplicated_cross_track_candidate_with_provenance(self) -> None:
@@ -374,6 +415,18 @@ class CandidateIntersectionSourcesTest(unittest.TestCase):
         self.assertIn("detect_id", sql)
         self.assertEqual(params[0], "detect-1")
         self.assertEqual(params[8], '["C:/input-a.csv", "project_raw_points"]')
+
+    def test_candidates_are_inserted_in_one_batch(self) -> None:
+        conn = _RecordingConnection()
+
+        result = insert_candidate_intersections(
+            conn,
+            [_cluster(5), _cluster(6)],
+            detect_id="detect-1",
+        )
+
+        self.assertEqual(result, {5: 1, 6: 2})
+        self.assertEqual(len(conn.recording_cursor.executions), 1)
 
 
 if __name__ == "__main__":
