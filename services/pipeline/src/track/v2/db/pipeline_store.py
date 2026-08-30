@@ -237,7 +237,7 @@ class PostgresPipelineStore:
                 replace(subtrack, subtrack_index=subtrack_index + offset)
                 for offset, subtrack in enumerate(pending_subtracks)
             ]
-            insert_kept_trajectory_points(
+            kept_count = insert_kept_trajectory_points(
                 self._conn,
                 assigned_subtracks,
                 point_id_map,
@@ -248,12 +248,6 @@ class PostgresPipelineStore:
                 assigned_subtracks,
                 clean_id=clean_id,
                 batch_size=batch_size,
-            )
-            kept_count = sum(
-                1
-                for subtrack in assigned_subtracks
-                for point in subtrack.points
-                if not point.point_ref.generated_reason
             )
             subtrack_index += len(assigned_subtracks)
             pending_subtracks.clear()

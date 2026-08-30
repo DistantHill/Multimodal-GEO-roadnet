@@ -130,8 +130,9 @@ class PipelineStoreCleanTest(unittest.TestCase):
         point_id_map = {("source", "1"): 101, ("source", "3"): 103}
         pending_point_keys = [("source", "1"), ("source", "3")]
         events: list[str] = []
-        def kept(*args: object, **kwargs: object) -> None:
+        def kept(*args: object, **kwargs: object) -> int:
             events.append("kept")
+            return 2
 
         def injected(*args: object, **kwargs: object) -> None:
             events.append("injected")

@@ -549,7 +549,7 @@ def insert_kept_trajectory_points(
     tp_ref_to_id: dict[tuple[str, str], int],
     *,
     clean_id: str | None = None,
-) -> None:
+) -> int:
     """Persist references for points that survived ``_exclude_stationary``.
 
     ZH: 写入保留点引用——每个子轨迹的保留点通过 trajectory_point_id 指向源数据行。
@@ -564,8 +564,9 @@ def insert_kept_trajectory_points(
     if clean_id is None:
         raise ValueError("clean_id is required for derived v2 persistence")
     if not subtracks:
-        return
+        return 0
 
+    kept_count = 0
     with conn.cursor() as cur:
         with cur.copy(
             "COPY kept_trajectory_points "
@@ -593,6 +594,8 @@ def insert_kept_trajectory_points(
                         sequence_in_subtrack,
                     ))
                     sequence_in_subtrack += 1
+                    kept_count += 1
+    return kept_count
 
 
 def insert_injected_points(

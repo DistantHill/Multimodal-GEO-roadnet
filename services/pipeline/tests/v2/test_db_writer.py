@@ -146,7 +146,7 @@ class CleanerMembershipWriterTest(unittest.TestCase):
         ]
         conn = _RecordingConnection()
 
-        insert_kept_trajectory_points(
+        kept_count = insert_kept_trajectory_points(
             conn,
             subtracks,
             {("raw_points", "1"): 101, ("raw_points", "2"): 102},
@@ -154,6 +154,7 @@ class CleanerMembershipWriterTest(unittest.TestCase):
         )
         insert_injected_points(conn, subtracks, clean_id="clean-1")
 
+        self.assertEqual(kept_count, 2)
         self.assertEqual(
             [(row[5], row[6]) for row in conn.recording_cursor.copy_rows],
             [(7, 0), (7, 1)],
