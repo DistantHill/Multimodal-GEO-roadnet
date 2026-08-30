@@ -174,6 +174,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             turn_deg            DOUBLE PRECISION NOT NULL,
             score               DOUBLE PRECISION NOT NULL,
             source              TEXT NOT NULL DEFAULT 'turn',
+            tp_source_id        TEXT,
+            tp_source_row_key   TEXT,
             geom                geometry(Point, 4326) GENERATED ALWAYS AS (
                                     ST_SetSRID(ST_MakePoint(lon, lat), 4326)
                                 ) STORED,
@@ -382,6 +384,7 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     # ── kept_trajectory_points ──
     ("idx_ktp_tp_id",          "CREATE INDEX IF NOT EXISTS idx_ktp_tp_id ON kept_trajectory_points(trajectory_point_id)"),
     ("idx_ktp_vehicle_sub",    "CREATE INDEX IF NOT EXISTS idx_ktp_vehicle_sub ON kept_trajectory_points(clean_id, vehicle_id, subtrack_index, sequence_in_subtrack)"),
+    ("idx_ktp_tp_clean_cover", "CREATE INDEX IF NOT EXISTS idx_ktp_tp_clean_cover ON kept_trajectory_points(trajectory_point_id, clean_id) INCLUDE (vehicle_id, source_id, source_row_key)"),
     ("idx_ktp_member_unique",  "CREATE UNIQUE INDEX IF NOT EXISTS idx_ktp_member_unique ON kept_trajectory_points(clean_id, vehicle_id, subtrack_index, sequence_in_subtrack)"),
     # ── injected_points ──
     ("idx_ip_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_ip_vehicle_ts ON injected_points(clean_id, vehicle_id, timestamp)"),
