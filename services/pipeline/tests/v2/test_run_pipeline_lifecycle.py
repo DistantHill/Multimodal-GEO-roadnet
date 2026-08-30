@@ -221,8 +221,9 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 PipelineEventKind.STAGE_FINISH,
             ],
         )
+        log_messages = [call.args[0] for call in self.log_info.call_args_list]
         self.assertEqual(
-            [call.args[0] for call in self.log_info.call_args_list],
+            [message for message in log_messages if message.startswith("[stage-start]")],
             [
                 f"[stage-start] stage=cleaner clean_id={CLEAN_ID}",
                 f"[stage-start] stage=intersect2 clean_id={CLEAN_ID} detect_id={DETECT_ID}",
@@ -231,6 +232,24 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 f"[stage-start] stage=network clean_id={CLEAN_ID} detect_id={DETECT_ID} fit_id=fit-1",
             ],
         )
+        finish_messages = [
+            message for message in log_messages if message.startswith("[stage-finish]")
+        ]
+        self.assertEqual(len(finish_messages), 5)
+        for stage, message in zip(
+            ("cleaner", "intersect2", "clip", "fitting", "network"),
+            finish_messages,
+            strict=True,
+        ):
+            self.assertIn(f"stage={stage}", message)
+            self.assertIn("status=completed", message)
+            self.assertRegex(message, r"elapsed_s=\d+\.\d{3}$")
+
+        finish_events = [
+            event for event in emitted if event.kind == PipelineEventKind.STAGE_FINISH
+        ]
+        self.assertEqual(len(finish_events), 5)
+        self.assertTrue(all(event.elapsed is not None for event in finish_events))
 
     def test_completed_clean_reuses_store_record_without_clean_stage(self) -> None:
         first = run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID)).stats

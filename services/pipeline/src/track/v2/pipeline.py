@@ -129,7 +129,7 @@ def run_pipeline(
             tp_id_map: dict[tuple[str, str], int] = {}
         else:
             assert clean_id is not None
-            log_info(f"[stage-start] stage=cleaner clean_id={clean_id}")
+            clean_started = _log_stage_start("cleaner", clean_id=clean_id)
             clean_stage = "Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean"
             live_clean = EventProgressAdapter(clean_stage, sink)
             live_clean.start()
@@ -229,7 +229,6 @@ def run_pipeline(
                 elapsed=elapsed_read,
                 throughput=f"{total_raw / elapsed_read:.0f} 点/s" if elapsed_read > 0 else "",
             )
-            live_clean.stop()
             stream.close()
             handle.close()
             _emit_message(
@@ -251,6 +250,12 @@ def run_pipeline(
         if not reuse_clean:
             store.finish_clean(clean_id, status="completed")
             store.commit()
+            clean_elapsed = _log_stage_finish(
+                "cleaner",
+                clean_started,
+                clean_id=clean_id,
+            )
+            live_clean.stop(elapsed=clean_elapsed)
 
         detect_id = store.start_detect_run(
             clean_id=clean_id,
@@ -260,8 +265,10 @@ def run_pipeline(
         store.commit()
 
         detect_stage = "Intersect2: 交叉口检测 / Intersection Detection (DB 滑窗模式)"
-        log_info(
-            f"[stage-start] stage=intersect2 clean_id={clean_id} detect_id={detect_id}"
+        intersect_started = _log_stage_start(
+            "intersect2",
+            clean_id=clean_id,
+            detect_id=detect_id,
         )
         intersect_source_id = source_id
         live_intersect = EventProgressAdapter(detect_stage, sink)
@@ -276,7 +283,6 @@ def run_pipeline(
             live_status=live_intersect,
         )
         iresult = detect_intersections(conn=store.connection, config=icfg)
-        live_intersect.stop()
 
         _emit_message(sink, f"  转向事件 / Turn events: {iresult.report.turn_event_count:,}")
         _emit_message(sink, f"  热点事件 / Hotspot events: {iresult.report.hotspot_event_count:,}")
@@ -318,14 +324,36 @@ def run_pipeline(
 
         store.finish_detect(detect_id, status="completed")
         store.commit()
+        intersect_elapsed = _log_stage_finish(
+            "intersect2",
+            intersect_started,
+            clean_id=clean_id,
+            detect_id=detect_id,
+        )
+        live_intersect.stop(elapsed=intersect_elapsed)
 
-        log_info(f"[stage-start] stage=clip clean_id={clean_id} detect_id={detect_id}")
+        clip_started = _log_stage_start(
+            "clip",
+            clean_id=clean_id,
+            detect_id=detect_id,
+        )
         sink(PipelineEvent.stage_start("Clip: 路段切分 / Track clipping"))
         clip_config = pc.clip
         clip_result = store.load_clip(detect_id, config=clip_config)
         _add_clip_stats(stats, clip_result)
         _emit_report(sink, "  Clip 报告 / Clip report", clip_result.report.as_dict())
-        sink(PipelineEvent.stage_finish("Clip: 路段切分 / Track clipping"))
+        clip_elapsed = _log_stage_finish(
+            "clip",
+            clip_started,
+            clean_id=clean_id,
+            detect_id=detect_id,
+        )
+        sink(
+            PipelineEvent.stage_finish(
+                "Clip: 路段切分 / Track clipping",
+                elapsed=clip_elapsed,
+            )
+        )
 
         fitting_config = pc.fitting
         fit_id = store.start_fit_run(
@@ -335,9 +363,11 @@ def run_pipeline(
         )
         stats["fit_id"] = fit_id
         store.commit()
-        log_info(
-            f"[stage-start] stage=fitting clean_id={clean_id} "
-            f"detect_id={detect_id} fit_id={fit_id}"
+        fitting_started = _log_stage_start(
+            "fitting",
+            clean_id=clean_id,
+            detect_id=detect_id,
+            fit_id=fit_id,
         )
         sink(PipelineEvent.stage_start("Fitting: 中心线拟合 / Centerline fitting"))
         try:
@@ -377,11 +407,25 @@ def run_pipeline(
             "  Fitting 报告 / Fitting report",
             fit_bundle.combined.report.as_dict(),
         )
-        sink(PipelineEvent.stage_finish("Fitting: 中心线拟合 / Centerline fitting"))
+        fitting_elapsed = _log_stage_finish(
+            "fitting",
+            fitting_started,
+            clean_id=clean_id,
+            detect_id=detect_id,
+            fit_id=fit_id,
+        )
+        sink(
+            PipelineEvent.stage_finish(
+                "Fitting: 中心线拟合 / Centerline fitting",
+                elapsed=fitting_elapsed,
+            )
+        )
 
-        log_info(
-            f"[stage-start] stage=network clean_id={clean_id} "
-            f"detect_id={detect_id} fit_id={fit_id}"
+        network_started = _log_stage_start(
+            "network",
+            clean_id=clean_id,
+            detect_id=detect_id,
+            fit_id=fit_id,
         )
         sink(PipelineEvent.stage_start("Network: 路网组装 / Network assembly"))
         network_result = build_network(fit_bundle.combined, iresult, config=pc.network)
@@ -391,7 +435,19 @@ def run_pipeline(
             "  Network 报告 / Network report",
             network_result.report.as_dict(),
         )
-        sink(PipelineEvent.stage_finish("Network: 路网组装 / Network assembly"))
+        network_elapsed = _log_stage_finish(
+            "network",
+            network_started,
+            clean_id=clean_id,
+            detect_id=detect_id,
+            fit_id=fit_id,
+        )
+        sink(
+            PipelineEvent.stage_finish(
+                "Network: 路网组装 / Network assembly",
+                elapsed=network_elapsed,
+            )
+        )
 
         _emit_message(sink, "\n  提交 / Committed.")
 
@@ -444,6 +500,25 @@ def _should_flush_clean_batch(
 
 def _emit_message(sink: EventSink, message: str) -> None:
     sink(PipelineEvent.message_event(message))
+
+
+def _log_stage_start(stage: str, **run_ids: object) -> float:
+    """Log one stage boundary and return its monotonic start time."""
+    started_at = time.perf_counter()
+    context = " ".join(f"{name}={value}" for name, value in run_ids.items())
+    log_info(f"[stage-start] stage={stage} {context}")
+    return started_at
+
+
+def _log_stage_finish(stage: str, started_at: float, **run_ids: object) -> float:
+    """Log a completed stage with monotonic elapsed time and return the duration."""
+    elapsed = time.perf_counter() - started_at
+    context = " ".join(f"{name}={value}" for name, value in run_ids.items())
+    log_info(
+        f"[stage-finish] stage={stage} {context} "
+        f"status=completed elapsed_s={elapsed:.3f}"
+    )
+    return elapsed
 
 
 def _emit_report(sink: EventSink, title: str, report: dict[str, object]) -> None:

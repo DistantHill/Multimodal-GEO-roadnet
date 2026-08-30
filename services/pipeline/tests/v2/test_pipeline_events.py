@@ -65,7 +65,7 @@ class PipelineEventTest(unittest.TestCase):
             throughput="8 points/s",
             stage="cross_track",
         )
-        adapter.stop()
+        adapter.stop(elapsed=2.5)
 
         self.assertEqual(
             [event.kind for event in events],
@@ -78,6 +78,7 @@ class PipelineEventTest(unittest.TestCase):
         self.assertEqual(events[1].stage, "cross_track")
         self.assertEqual(events[1].detail, "10/20 points")
         self.assertEqual(events[1].sub_detail, "window 2")
+        self.assertEqual(events[2].elapsed, 2.5)
 
     def test_report_messages_preserve_integer_formatting(self) -> None:
         events: list[PipelineEvent] = []

@@ -143,7 +143,7 @@ class EventProgressAdapter:
             )
         )
 
-    def stop(self) -> None:
+    def stop(self, *, elapsed: float | None = None) -> None:
         """Emit the stage-finish event expected by a console reporter."""
 
-        self._emit(PipelineEvent.stage_finish(self._stage))
+        self._emit(PipelineEvent.stage_finish(self._stage, elapsed=elapsed))

@@ -1,11 +1,13 @@
 """Logger module: rich-powered terminal output + timestamped log mirror + Live panels.
 
 ZH: 基于 rich 的日志模块。替换内置 print()，所有输出同时写入终端（彩色/rich 渲染）
-    和 ``generated/<timestamp>_log.txt``（纯文本 UTF-8）。提供 log_*() 结构化日志 API 和
+    和 ``generated/<timestamp>_pid-<pid>_log.txt``（纯文本 UTF-8）。提供 log_*()
+    结构化日志 API 和
     LiveStatus 实时状态面板。
 
 EN: Rich-based logger module. Replaces builtins.print() so all output is mirrored to
-    both the terminal (rich-coloured) and ``generated/<timestamp>_log.txt`` (plain UTF-8).
+    both the terminal (rich-coloured) and
+    ``generated/<timestamp>_pid-<pid>_log.txt`` (plain UTF-8).
     Provides log_*() structured logging and LiveStatus real-time status panels.
 
 Usage / 用法::
@@ -230,7 +232,7 @@ def _resolve_log_path(log_path: str | Path | None = None) -> Path:
 
     log_dir = Path(os.environ.get("TRACK_LOG_DIR") or "generated")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    return log_dir / f"{timestamp}_log.txt"
+    return log_dir / f"{timestamp}_pid-{os.getpid()}_log.txt"
 
 
 def init_logger(
@@ -246,7 +248,8 @@ def init_logger(
 
     Args:
         log_path: log 文件路径；None → 读 TRACK_LOG_PATH 环境变量 →
-                  在 TRACK_LOG_DIR（默认 generated）下生成 <timestamp>_log.txt
+                  在 TRACK_LOG_DIR（默认 generated）下生成
+                  <timestamp>_pid-<pid>_log.txt
         level: 最低日志级别
 
     Returns:
