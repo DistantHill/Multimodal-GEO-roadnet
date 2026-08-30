@@ -1654,6 +1654,7 @@ class ClusterMergeTest(unittest.TestCase):
             events=(TurnEvent(0, "v1", 1000, origin_lon, origin_lat,
                               0, 0, 0, 90, 90, 90),),
             source="turn",
+            source_point_refs={"turn": (PointRef("raw", "1", stable=True),)},
         )
         c2 = HotspotCluster(
             cluster_id=0, centroid_x=20.0, centroid_y=20.0,
@@ -1664,6 +1665,12 @@ class ClusterMergeTest(unittest.TestCase):
                     TurnEvent(2, "v3", 1002, origin_lon, origin_lat,
                               25, 25, 0, 90, 90, 90)),
             source="orthogonal",
+            source_point_refs={
+                "orthogonal": (
+                    PointRef("raw", "2", stable=True),
+                    PointRef("raw", "3", stable=True),
+                ),
+            },
         )
         merged = _merge_clusters([c1, c2], merge_distance_m=80.0,
                                  origin_lon=origin_lon, origin_lat=origin_lat)
@@ -1673,6 +1680,10 @@ class ClusterMergeTest(unittest.TestCase):
         self.assertEqual(merged[0].source_counts["turn"], 1)
         self.assertEqual(merged[0].source_counts["orthogonal"], 2)
         self.assertAlmostEqual(merged[0].source_ratios["orthogonal"], 2 / 3)
+        self.assertEqual(
+            [ref.source_row_key for ref in merged[0].source_point_refs["orthogonal"]],
+            ["2", "3"],
+        )
 
     def test_no_merge_distant_clusters(self):
         """Distant clusters are not merged."""

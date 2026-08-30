@@ -17,3 +17,4 @@ memory-boundary baselines exist.
 | 9 | Add a Cleaner pending-point flush cap | Yes | Yes | Added a configurable 100k-point cap across kept/derived/excluded output; flushing remains between complete vehicle groups, so a single vehicle is never split. |
 | 10 | Cache Cross-track endpoint projections | Yes | Yes | Each accepted point index is projected at most once per vehicle, so adjacent straight segments reuse their shared endpoint without changing segment filtering. |
 | 11 | Remove redundant indexes and add a composite index | Yes | Yes | The user-added covering index is retained; its left prefix replaces `idx_ktp_tp_id`, while the membership UNIQUE index replaces the identical `idx_ktp_vehicle_sub`. Both legacy indexes are dropped during structural migration. |
+| 12 | Accumulate cluster provenance in lists | Yes | Yes | Greedy merge now extends mutable per-source lists through all absorptions and converts to immutable tuples once at final model construction. |

@@ -261,17 +261,13 @@ def _merge_count_dicts(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
     return merged
 
 
-def _merge_ref_dicts(
-    a: dict[str, tuple[PointRef, ...]],
-    b: dict[str, tuple[PointRef, ...]],
-) -> dict[str, tuple[PointRef, ...]]:
-    merged: dict[str, list[PointRef]] = {
-        source: list(items)
-        for source, items in a.items()
-    }
-    for source, items in b.items():
+def _extend_ref_lists(
+    merged: dict[str, list[PointRef]],
+    incoming: dict[str, tuple[PointRef, ...]],
+) -> None:
+    """Append provenance in place; tuple conversion is deferred to output."""
+    for source, items in incoming.items():
         merged.setdefault(source, []).extend(items)
-    return {source: tuple(items) for source, items in merged.items()}
 
 
 def _build_candidate_clusters(
@@ -1974,7 +1970,10 @@ def _merge_clusters(
         ci = remaining.pop(0)
         merged_events = list(ci.events)
         merged_source_counts = _cluster_source_counts(ci)
-        merged_source_refs = _cluster_source_point_refs(ci)
+        merged_source_refs = {
+            source: list(items)
+            for source, items in _cluster_source_point_refs(ci).items()
+        }
         cx_sum = ci.centroid_x * len(ci.events)
         cy_sum = ci.centroid_y * len(ci.events)
         total_n = len(ci.events)
@@ -2000,7 +1999,7 @@ def _merge_clusters(
                         merged_source_counts,
                         _cluster_source_counts(cj),
                     )
-                    merged_source_refs = _merge_ref_dicts(
+                    _extend_ref_lists(
                         merged_source_refs,
                         _cluster_source_point_refs(cj),
                     )
@@ -2041,7 +2040,10 @@ def _merge_clusters(
             _with_source_provenance(
                 merged_cluster,
                 source_counts=merged_source_counts,
-                source_point_refs=merged_source_refs,
+                source_point_refs={
+                    source: tuple(items)
+                    for source, items in merged_source_refs.items()
+                },
             )
         )
 
