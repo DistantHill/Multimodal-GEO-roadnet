@@ -382,8 +382,6 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     ("idx_ep_geom",            "CREATE INDEX IF NOT EXISTS idx_ep_geom ON excluded_points USING GIST (geom)"),
     ("idx_ep_clean",           "CREATE INDEX IF NOT EXISTS idx_ep_clean ON excluded_points(clean_id)"),
     # ── kept_trajectory_points ──
-    ("idx_ktp_tp_id",          "CREATE INDEX IF NOT EXISTS idx_ktp_tp_id ON kept_trajectory_points(trajectory_point_id)"),
-    ("idx_ktp_vehicle_sub",    "CREATE INDEX IF NOT EXISTS idx_ktp_vehicle_sub ON kept_trajectory_points(clean_id, vehicle_id, subtrack_index, sequence_in_subtrack)"),
     ("idx_ktp_tp_clean_cover", "CREATE INDEX IF NOT EXISTS idx_ktp_tp_clean_cover ON kept_trajectory_points(trajectory_point_id, clean_id) INCLUDE (vehicle_id, source_id, source_row_key)"),
     ("idx_ktp_member_unique",  "CREATE UNIQUE INDEX IF NOT EXISTS idx_ktp_member_unique ON kept_trajectory_points(clean_id, vehicle_id, subtrack_index, sequence_in_subtrack)"),
     # ── injected_points ──
@@ -663,6 +661,11 @@ def _run_migrations(cur: Any) -> None:
         ),
         ("replace_cross_unique_index", "DROP INDEX IF EXISTS idx_tc_segment_pair"),
         ("replace_turn_unique_index", "DROP INDEX IF EXISTS idx_te_vehicle_ts"),
+        ("drop_redundant_ktp_tp_id", "DROP INDEX IF EXISTS idx_ktp_tp_id"),
+        (
+            "drop_redundant_ktp_vehicle_sub",
+            "DROP INDEX IF EXISTS idx_ktp_vehicle_sub",
+        ),
         (
             "ktp_drop_tp_fk",
             "DO $$ DECLARE cname text; BEGIN "
