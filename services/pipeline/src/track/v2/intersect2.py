@@ -1692,6 +1692,15 @@ def _run_dbscan(
     return labels
 
 
+def _group_cluster_items(items: list[Any], labels: list[int]) -> list[tuple[int, list[Any]]]:
+    """Group non-noise DBSCAN items once while preserving legacy ordering."""
+    grouped: dict[int, list[Any]] = defaultdict(list)
+    for index, label in enumerate(labels):
+        if label >= 0:
+            grouped[label].append(items[index])
+    return [(cluster_id, grouped[cluster_id]) for cluster_id in sorted(grouped)]
+
+
 def _cluster_dbscan(
     events: list[TurnEvent],
     origin_lon: float,
@@ -1715,8 +1724,7 @@ def _cluster_dbscan(
                           live_status=live_status, stage=source, perf=perf)
 
     clusters: list[HotspotCluster] = []
-    for cid in sorted(set(l for l in labels if l >= 0)):
-        cluster_items = [events[i] for i, l in enumerate(labels) if l == cid]
+    for cid, cluster_items in _group_cluster_items(events, labels):
         if not cluster_items:
             continue
         cx = sum(e.x for e in cluster_items) / len(cluster_items)
@@ -1765,8 +1773,7 @@ def _cluster_orthogonal_candidates(
                           live_status=live_status, stage="orthogonal", perf=perf)
 
     clusters: list[HotspotCluster] = []
-    for cid in sorted(set(l for l in labels if l >= 0)):
-        cluster_items = [candidates[i] for i, l in enumerate(labels) if l == cid]
+    for cid, cluster_items in _group_cluster_items(candidates, labels):
         if not cluster_items:
             continue
         cx = sum(c.x for c in cluster_items) / len(cluster_items)
@@ -1842,8 +1849,7 @@ def _cluster_orthogonal_cross_track_candidates(
                           live_status=live_status, stage="orthogonal_cross_track", perf=perf)
 
     clusters: list[HotspotCluster] = []
-    for cid in sorted(set(l for l in labels if l >= 0)):
-        cluster_items = [candidates[i] for i, l in enumerate(labels) if l == cid]
+    for cid, cluster_items in _group_cluster_items(candidates, labels):
         if not cluster_items:
             continue
         cx = sum(c.x for c in cluster_items) / len(cluster_items)

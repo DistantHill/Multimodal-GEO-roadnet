@@ -46,6 +46,7 @@ from track.v2.intersect2 import (
     _extract_orthogonal_candidates,
     _getis_local_counts_grid,
     _getis_local_counts_scan,
+    _group_cluster_items,
     _group_by_vehicle,
     _build_dbscan_grid,
     _merge_clusters,
@@ -1083,6 +1084,17 @@ class HotspotSelectionTest(unittest.TestCase):
 
 
 class DBSCANTest(unittest.TestCase):
+    def test_group_cluster_items_single_pass_preserves_order(self):
+        grouped = _group_cluster_items(
+            ["two-a", "noise", "zero-a", "two-b", "zero-b"],
+            [2, -1, 0, 2, 0],
+        )
+
+        self.assertEqual(
+            grouped,
+            [(0, ["zero-a", "zero-b"]), (2, ["two-a", "two-b"])],
+        )
+
     @staticmethod
     def _historical_scan_oracle(xs, ys, eps_m, min_samples):
         unvisited, noise = -99, -1
