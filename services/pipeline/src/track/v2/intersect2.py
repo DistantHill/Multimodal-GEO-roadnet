@@ -57,7 +57,7 @@ from .models import (
     TrajectoryPoint,
     TurnEvent,
 )
-from .db.query import (
+from .db.queries import (
     SpatialWindow,
     SpatialWindowIterator,
     _query_active_points_in_window,

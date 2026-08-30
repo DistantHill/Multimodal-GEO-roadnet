@@ -38,7 +38,7 @@ from .models import (
     TrajectoryPoint,
 )
 from .sources import source_row_hash
-from .db.clip_queries import fetch_clean_points_for_subtracks, fetch_detect_row
+from .db.queries import fetch_clean_points_for_subtracks, fetch_detect_row
 
 
 def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInputReplay:

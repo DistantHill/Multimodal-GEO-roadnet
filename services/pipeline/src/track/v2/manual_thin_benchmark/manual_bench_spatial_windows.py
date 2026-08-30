@@ -31,7 +31,7 @@ from track.v2.intersect2 import (
     _query_spatial_extent,
     _tracks_from_points,
 )
-from track.v2.db.query import _build_points_from_rows
+from track.v2.db.queries import _build_points_from_rows
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONFIG —— 在这里改参数

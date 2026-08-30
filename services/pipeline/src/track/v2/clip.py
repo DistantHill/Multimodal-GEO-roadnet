@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 
 from ._geometry import _distance_m, _to_xy
-from .db.clip_queries import (
+from .db.queries import (
     fetch_clean_points,
     fetch_intersections,
     fetch_detect_row,
