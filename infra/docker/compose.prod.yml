@@ -72,6 +72,33 @@ services:
       qdrant:
         condition: service_healthy
 
+  vision:
+    profiles: ["vision"]
+    build:
+      context: ../../services/vision
+      dockerfile: Dockerfile
+    image: roadnet-vision-yolov8:8.3.0-cu117
+    ipc: host
+    gpus: all
+    working_dir: /workspace
+    volumes:
+      - ${MODEL_ROOT:?MODEL_ROOT must point to an external model directory}:/models:ro
+      - ${DATA_ROOT:?DATA_ROOT must point to an external runtime data directory}:/data
+    command:
+      - yolo
+      - predict
+      - model=/models/yolo/yolov8n.pt
+      - source=/data/vision/input
+      - device=${YOLO_DEVICE:-0}
+      - imgsz=${YOLO_IMGSZ:-640}
+      - batch=${YOLO_BATCH:-1}
+      - half=${YOLO_HALF:-True}
+      - conf=${YOLO_CONF:-0.25}
+      - save=True
+      - project=/data/vision/output
+      - name=yolov8n-640
+      - exist_ok=True
+
   frontend:
     build:
       context: ../../apps/frontend

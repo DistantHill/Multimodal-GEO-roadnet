@@ -1,0 +1,18 @@
+# Ultralytics 8.3.0 BoT-SORT configuration.
+tracker_type: botsort
+
+track_high_thresh: 0.5
+track_low_thresh: 0.1
+new_track_thresh: 0.6
+track_buffer: 30
+match_thresh: 0.8
+fuse_score: true
+
+# Global motion compensation; useful for a moving camera.
+gmc_method: sparseOptFlow
+
+# ReID was not supported by the bundled Ultralytics 8.3.0 implementation.
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: false
+

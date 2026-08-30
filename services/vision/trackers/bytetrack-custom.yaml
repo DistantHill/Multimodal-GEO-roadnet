@@ -1,0 +1,21 @@
+# Ultralytics 8.3.0 ByteTrack configuration.
+tracker_type: bytetrack
+
+# First association: reliable detections.
+track_high_thresh: 0.5
+
+# Second association: recover tracks using lower-confidence detections.
+track_low_thresh: 0.1
+
+# Minimum confidence for starting a new track.
+new_track_thresh: 0.6
+
+# Keep a lost track for this many frames before deleting it.
+track_buffer: 30
+
+# Maximum association cost accepted by the matcher. Higher is more permissive.
+match_thresh: 0.8
+
+# Combine detection confidence with IoU association cost.
+fuse_score: true
+

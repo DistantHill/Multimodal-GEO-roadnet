@@ -5,6 +5,7 @@
 - `apps/frontend/` contains the standalone Node UI and production Nginx image.
 - `apps/backend/` contains the FastAPI service, with `src/backend/` and `tests/`.
 - `services/pipeline/` is the independent Pipeline runtime. Keep algorithm stages here when the original implementation is restored; do not run long jobs in Backend request handlers.
+- `services/vision/` contains the optional YOLOv8 GPU batch runtime and tracking export tools. Keep model weights under the ignored `models/` path or an external `MODEL_ROOT`.
 - `db/postgres/` and `db/qdrant/` contain only initialization, schema, migration, and collection definitions. Runtime database data belongs in Docker named volumes.
 - `infra/docker/` contains Compose files. Runtime trajectory, Parquet, exports, and model files stay outside the repository and mount through `DATA_ROOT`.
 

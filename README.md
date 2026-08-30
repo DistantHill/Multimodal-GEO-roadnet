@@ -9,10 +9,11 @@
 - `apps/frontend`：独立前端开发容器；仅负责 UI 和 Backend API 调用。
 - `apps/backend`：独立 FastAPI API 容器；当前提供健康检查和数据库/Qdrant 连通性检查骨架。
 - `services/pipeline`：Pipeline 独立运行单元，包含 Cleaner、Detect、Clip、Fitting、Network、持久化、回放和数据库初始化逻辑。Backend request process 不执行这些耗时阶段。
+- `services/vision`：可选 YOLOv8 CUDA 11.7 离线推理/跟踪运行单元，通过 Compose `vision` profile 启用。
 - `db/postgres`、`db/qdrant`：数据库定义、初始化和迁移逻辑，不保存运行时数据。
 - `infra/docker`：开发和生产 Compose 文件。
 
-Detect 中的现有视觉判别能力仍作为 Pipeline 内部逻辑；当前没有独立 GPU Runtime 或扩缩容需求，因此不创建 `services/vision`。没有稳定的跨服务共享语义时也不创建 `libs/`。
+Detect 中原有视觉判别能力仍可作为 Pipeline 内部逻辑。独立 YOLOv8 GPU Runtime 已迁入 `services/vision`，但不强制改造成网络微服务，也不由 Backend request process 执行。没有稳定的跨服务共享语义时不创建 `libs/`。
 
 ## 开发环境
 
@@ -40,6 +41,8 @@ docker compose -f infra/docker/compose.dev.yml up -d --build
 Raw trajectory、Parquet、中间文件、导出文件和模型权重属于 Runtime Data。开发/生产通过 `DATA_ROOT` 挂载到容器 `/data`，例如宿主机 `/data/road-network` 对应容器 `/data`；代码仓库不创建 `data/raw` 或 `data/parquet`。
 
 Pipeline 日志默认写入容器内 `/data/logs/pipeline.log`，即宿主机 `${DATA_ROOT}/logs/pipeline.log`。可用 `PIPELINE_LOG_PATH` 修改容器内位置，但不要指向源码目录。
+
+YOLO 模型在容器内挂载到 `/models`，输入和输出分别使用 `/data/vision/input` 与 `/data/vision/output`。本地迁移权重位于被 Git 忽略的 `models/yolo/yolov8n.pt`；生产环境必须通过外部 `MODEL_ROOT` 挂载。
 
 PostgreSQL 使用 `postgres_data:/var/lib/postgresql/data`，Qdrant 使用 `qdrant_data:/qdrant/storage`。这两个 named volume 不绑定到仓库目录。
 
@@ -73,6 +76,9 @@ make test
 make pipeline-check
 make pipeline-init-db
 make pipeline-help
+make vision-build
+make vision-check
+make vision-run
 make dev-down
 ```
 
