@@ -121,7 +121,8 @@ def main() -> int:
         f"clean:{args.clean_id}" if args.clean_id
         else args.csv or f"postgresql://{db_config.database}/{args.pg_table}"
     )
-    init_logger()
+    log_path = init_logger()
+    print(f"日志文件 / Log file: {log_path}")
     print(f"数据源 / Source: {source_label}")
     print(f"连接目标 / Target: {db_config.safe_dsn()}")
 

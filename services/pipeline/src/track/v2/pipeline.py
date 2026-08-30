@@ -19,6 +19,7 @@ from .config.pipeline_config import load_pipeline_config
 from .db.pipeline_store import PipelineStore, PostgresPipelineStore
 from .fitting import fit_centerline_variants
 from .intersect2 import detect_intersections
+from .logger import log_info
 from .models import (
     ClipResult,
     CsvSource,
@@ -128,6 +129,7 @@ def run_pipeline(
             tp_id_map: dict[tuple[str, str], int] = {}
         else:
             assert clean_id is not None
+            log_info(f"[stage-start] stage=cleaner clean_id={clean_id}")
             clean_stage = "Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean"
             live_clean = EventProgressAdapter(clean_stage, sink)
             live_clean.start()
@@ -258,6 +260,9 @@ def run_pipeline(
         store.commit()
 
         detect_stage = "Intersect2: 交叉口检测 / Intersection Detection (DB 滑窗模式)"
+        log_info(
+            f"[stage-start] stage=intersect2 clean_id={clean_id} detect_id={detect_id}"
+        )
         intersect_source_id = source_id
         live_intersect = EventProgressAdapter(detect_stage, sink)
         live_intersect.start()
@@ -314,6 +319,7 @@ def run_pipeline(
         store.finish_detect(detect_id, status="completed")
         store.commit()
 
+        log_info(f"[stage-start] stage=clip clean_id={clean_id} detect_id={detect_id}")
         sink(PipelineEvent.stage_start("Clip: 路段切分 / Track clipping"))
         clip_config = pc.clip
         clip_result = store.load_clip(detect_id, config=clip_config)
@@ -321,7 +327,6 @@ def run_pipeline(
         _emit_report(sink, "  Clip 报告 / Clip report", clip_result.report.as_dict())
         sink(PipelineEvent.stage_finish("Clip: 路段切分 / Track clipping"))
 
-        sink(PipelineEvent.stage_start("Fitting: 中心线拟合 / Centerline fitting"))
         fitting_config = pc.fitting
         fit_id = store.start_fit_run(
             detect_id=detect_id,
@@ -330,6 +335,11 @@ def run_pipeline(
         )
         stats["fit_id"] = fit_id
         store.commit()
+        log_info(
+            f"[stage-start] stage=fitting clean_id={clean_id} "
+            f"detect_id={detect_id} fit_id={fit_id}"
+        )
+        sink(PipelineEvent.stage_start("Fitting: 中心线拟合 / Centerline fitting"))
         try:
             fit_bundle = fit_centerline_variants(clip_result, config=fitting_config)
             centerline_ids = store.persist_fit_bundle(
@@ -369,6 +379,10 @@ def run_pipeline(
         )
         sink(PipelineEvent.stage_finish("Fitting: 中心线拟合 / Centerline fitting"))
 
+        log_info(
+            f"[stage-start] stage=network clean_id={clean_id} "
+            f"detect_id={detect_id} fit_id={fit_id}"
+        )
         sink(PipelineEvent.stage_start("Network: 路网组装 / Network assembly"))
         network_result = build_network(fit_bundle.combined, iresult, config=pc.network)
         _add_network_stats(stats, network_result)

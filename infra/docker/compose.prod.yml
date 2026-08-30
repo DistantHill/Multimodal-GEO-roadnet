@@ -55,7 +55,8 @@ services:
     environment:
       DATA_ROOT: /data
       PARQUET_ROOT: /data/parquet
-      TRACK_LOG_PATH: ${PIPELINE_LOG_PATH:-/data/logs/pipeline.log}
+      TRACK_LOG_PATH: ${PIPELINE_LOG_PATH:-}
+      TRACK_LOG_DIR: ${PIPELINE_LOG_DIR:-/data/logs}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-roadnet}

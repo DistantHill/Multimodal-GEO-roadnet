@@ -40,7 +40,7 @@ docker compose -f infra/docker/compose.dev.yml up -d --build
 
 Raw trajectory、Parquet、中间文件、导出文件和模型权重属于 Runtime Data。开发/生产通过 `DATA_ROOT` 挂载到容器 `/data`，例如宿主机 `/data/road-network` 对应容器 `/data`；代码仓库不创建 `data/raw` 或 `data/parquet`。
 
-Pipeline 日志默认写入容器内 `/data/logs/pipeline.log`，即宿主机 `${DATA_ROOT}/logs/pipeline.log`。可用 `PIPELINE_LOG_PATH` 修改容器内位置，但不要指向源码目录。
+Pipeline 日志默认写入容器内 `/data/logs/<timestamp>_log.txt`，即宿主机 `${DATA_ROOT}/logs/`。每个进程使用独立文件，stage 起点以 `[stage-start]` 记录并包含关联的 run ID，便于从日志时间戳统计各阶段耗时。可用 `PIPELINE_LOG_DIR` 修改目录；仅在确实需要共享固定文件时设置 `PIPELINE_LOG_PATH`，且不要指向源码目录。
 
 YOLO 模型在容器内挂载到 `/models`，输入和输出分别使用 `/data/vision/input` 与 `/data/vision/output`。本地迁移权重位于被 Git 忽略的 `models/yolo/yolov8n.pt`；生产环境必须通过外部 `MODEL_ROOT` 挂载。
 

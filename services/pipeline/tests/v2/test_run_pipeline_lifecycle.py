@@ -183,6 +183,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             patch("track.v2.pipeline.fit_centerline_variants", return_value=self.store.fit_bundle)
         )
         self.stack.enter_context(patch("track.v2.pipeline.build_network", return_value=MagicMock()))
+        self.log_info = self.stack.enter_context(patch("track.v2.pipeline.log_info"))
         self.stack.enter_context(patch("track.v2.pipeline._add_clip_stats"))
         self.stack.enter_context(patch("track.v2.pipeline._add_fit_stats"))
         self.stack.enter_context(patch("track.v2.pipeline._add_network_stats"))
@@ -218,6 +219,16 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 PipelineEventKind.STAGE_FINISH,
                 PipelineEventKind.STAGE_START,
                 PipelineEventKind.STAGE_FINISH,
+            ],
+        )
+        self.assertEqual(
+            [call.args[0] for call in self.log_info.call_args_list],
+            [
+                f"[stage-start] stage=cleaner clean_id={CLEAN_ID}",
+                f"[stage-start] stage=intersect2 clean_id={CLEAN_ID} detect_id={DETECT_ID}",
+                f"[stage-start] stage=clip clean_id={CLEAN_ID} detect_id={DETECT_ID}",
+                f"[stage-start] stage=fitting clean_id={CLEAN_ID} detect_id={DETECT_ID} fit_id=fit-1",
+                f"[stage-start] stage=network clean_id={CLEAN_ID} detect_id={DETECT_ID} fit_id=fit-1",
             ],
         )
 

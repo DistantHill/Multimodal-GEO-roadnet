@@ -1,11 +1,11 @@
-"""Logger module: rich-powered terminal output + log.txt mirror + Live status panels.
+"""Logger module: rich-powered terminal output + timestamped log mirror + Live panels.
 
 ZH: 基于 rich 的日志模块。替换内置 print()，所有输出同时写入终端（彩色/rich 渲染）
-    和 ``generated/log.txt``（纯文本 UTF-8）。提供 log_*() 结构化日志 API 和
+    和 ``generated/<timestamp>_log.txt``（纯文本 UTF-8）。提供 log_*() 结构化日志 API 和
     LiveStatus 实时状态面板。
 
 EN: Rich-based logger module. Replaces builtins.print() so all output is mirrored to
-    both the terminal (rich-coloured) and ``generated/log.txt`` (plain UTF-8).
+    both the terminal (rich-coloured) and ``generated/<timestamp>_log.txt`` (plain UTF-8).
     Provides log_*() structured logging and LiveStatus real-time status panels.
 
 Usage / 用法::
@@ -15,7 +15,7 @@ Usage / 用法::
     def main() -> int:
         init_logger()
         try:
-            print("这条同时出现在终端和 log.txt / This appears on both terminal and log.txt")
+            print("这条同时出现在终端和日志文件 / This appears in the terminal and log")
         finally:
             shutdown_logger()
 """
@@ -219,6 +219,20 @@ def set_level(level: str) -> None:
 _tee = _TeeStream()  # singleton tee instance
 
 
+def _resolve_log_path(log_path: str | Path | None = None) -> Path:
+    """Resolve an explicit path or create a process-specific timestamped path."""
+    if log_path is not None:
+        return Path(log_path)
+
+    configured_path = os.environ.get("TRACK_LOG_PATH")
+    if configured_path:
+        return Path(configured_path)
+
+    log_dir = Path(os.environ.get("TRACK_LOG_DIR") or "generated")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return log_dir / f"{timestamp}_log.txt"
+
+
 def init_logger(
     log_path: str | Path | None = None,
     *,
@@ -231,7 +245,8 @@ def init_logger(
         opens the log file. Idempotent — subsequent calls only update level/Live.
 
     Args:
-        log_path: log 文件路径；None → 读 TRACK_LOG_PATH 环境变量 → 默认 generated/log.txt
+        log_path: log 文件路径；None → 读 TRACK_LOG_PATH 环境变量 →
+                  在 TRACK_LOG_DIR（默认 generated）下生成 <timestamp>_log.txt
         level: 最低日志级别
 
     Returns:
@@ -242,12 +257,12 @@ def init_logger(
     # ── Log file (only on first init) ──
     if not _initialized:
         # Resolve path
-        if log_path is None:
-            log_path = os.environ.get("TRACK_LOG_PATH", "generated/log.txt")
-        log_path = Path(log_path)
+        log_path = _resolve_log_path(log_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        _log_file = open(str(log_path), "w", encoding="utf-8", buffering=1)
+        # Explicit paths may still be shared intentionally; append avoids
+        # truncating another process's open file on Windows.
+        _log_file = open(str(log_path), "a", encoding="utf-8", buffering=1)
 
         # ZH: 强制 stdout/stderr 走 UTF-8 编码，避免 pipe 环境（conda run 等）下
         #     退化为系统 ANSI 编码（如 CP936）导致中文乱码。
@@ -271,7 +286,9 @@ def init_logger(
     if upper in _LEVELS:
         _level = upper
 
-    return log_path if isinstance(log_path, Path) else Path(str(log_path))
+    if _log_file is None:
+        raise RuntimeError("logger initialized without a log file")
+    return Path(_log_file.name)
 
 
 def shutdown_logger() -> None:
