@@ -1023,6 +1023,8 @@ class GetisOrdGStarTest(unittest.TestCase):
         report = tracker.report()
         self.assertIn("gstar_events", report)
         self.assertIn("gstar_neighbors", report)
+        neighbor_node = tracker._root.children["gstar_events"].children["gstar_neighbors"]
+        self.assertEqual(neighbor_node.call_count, len(events) * 2)
 
     def test_negative_and_overflow_radius_preserve_historical_scan(self):
         """Negative radii use abs cells; overflowed squared radii explicitly scan."""
@@ -1089,11 +1091,26 @@ class DBSCANTest(unittest.TestCase):
             ["two-a", "noise", "zero-a", "two-b", "zero-b"],
             [2, -1, 0, 2, 0],
         )
-
         self.assertEqual(
             grouped,
             [(0, ["zero-a", "zero-b"]), (2, ["two-a", "two-b"])],
         )
+
+    def test_seed_neighbor_telemetry_is_block_level(self):
+        tracker = PerfTracker("dbscan-block-test")
+        count = 260
+
+        labels = _run_dbscan(
+            [0.0] * count,
+            [0.0] * count,
+            eps_m=1.0,
+            min_samples=2,
+            perf=tracker,
+        )
+
+        self.assertEqual(labels, [0] * count)
+        node = tracker._root.children["dbscan_points"].children["dbscan_seed_neighbors"]
+        self.assertLessEqual(node.call_count, count)
 
     @staticmethod
     def _historical_scan_oracle(xs, ys, eps_m, min_samples):

@@ -1254,12 +1254,19 @@ def _getis_local_counts_scan(
     outer_events = _perf_iter(perf, enumerate(events), name="gstar_events", total=len(events))
     for i, event in outer_events:
         count = 0.0
-        neighbors = events if perf is None else _perf_iter(perf, events, name="gstar_neighbors", total=len(events))
-        for other in neighbors:
-            dx = other.x - event.x
-            dy = other.y - event.y
-            if dx * dx + dy * dy <= radius_sq:
-                count += 1.0
+        if perf is None:
+            for other in events:
+                dx = other.x - event.x
+                dy = other.y - event.y
+                if dx * dx + dy * dy <= radius_sq:
+                    count += 1.0
+        else:
+            with perf.stage("gstar_neighbors"):
+                for other in events:
+                    dx = other.x - event.x
+                    dy = other.y - event.y
+                    if dx * dx + dy * dy <= radius_sq:
+                        count += 1.0
         local_counts.append(count)
         now = time.perf_counter()
         if (i + 1) % 500 == 0 or (now - last_t) >= 3.0:
@@ -1268,6 +1275,27 @@ def _getis_local_counts_scan(
                             stage="Intersect2: G* 热点 / Hotspot G*")
             last_t = now
     return local_counts
+
+
+def _count_getis_grid_candidates(
+    event: TurnEvent,
+    events: list[TurnEvent],
+    cells: dict[tuple[int, int], list[int]],
+    bounds: tuple[int, int, int, int],
+    radius_sq: float,
+) -> float:
+    """Count one event's exact grid candidates without per-item telemetry."""
+    min_cell_x, max_cell_x, min_cell_y, max_cell_y = bounds
+    count = 0.0
+    for neighbor_x in range(min_cell_x, max_cell_x + 1):
+        for neighbor_y in range(min_cell_y, max_cell_y + 1):
+            for other_index in cells.get((neighbor_x, neighbor_y), ()):
+                other = events[other_index]
+                dx = other.x - event.x
+                dy = other.y - event.y
+                if dx * dx + dy * dy <= radius_sq:
+                    count += 1.0
+    return count
 
 
 def _getis_local_counts_grid(
@@ -1323,23 +1351,17 @@ def _getis_local_counts_grid(
         # squared-distance predicate as the exact final filter.
         # Apply nextafter after division: applying it before division can
         # underflow back to signed zero (0 / cell_size), losing cell -1.
-        min_cell_x, max_cell_x, min_cell_y, max_cell_y = cell_bounds[i]
-        count = 0.0
-        for neighbor_x in range(min_cell_x, max_cell_x + 1):
-            for neighbor_y in range(min_cell_y, max_cell_y + 1):
-                # Keep the historical telemetry name, but its work now means
-                # exact candidate comparisons from the conservatively bounded
-                # intersecting cells, rather than a fabricated all-events scan.
-                candidate_indexes = _perf_iter(
-                    perf, cells.get((neighbor_x, neighbor_y), ()),
-                    name="gstar_neighbors",
+        if perf is None:
+            count = _count_getis_grid_candidates(
+                event, events, cells, cell_bounds[i], radius_sq,
+            )
+        else:
+            # Keep the historical telemetry name while timing one complete
+            # event-neighbour block instead of every candidate iteration.
+            with perf.stage("gstar_neighbors"):
+                count = _count_getis_grid_candidates(
+                    event, events, cells, cell_bounds[i], radius_sq,
                 )
-                for other_index in candidate_indexes:
-                    other = events[other_index]
-                    dx = other.x - event.x
-                    dy = other.y - event.y
-                    if dx * dx + dy * dy <= radius_sq:
-                        count += 1.0
         local_counts.append(count)
         now = time.perf_counter()
         if (i + 1) % 500 == 0 or (now - last_t) >= 3.0:
@@ -1610,10 +1632,17 @@ def _run_dbscan_large_dispatch(
             labels[current] = cluster_id
             cur_neighbors = neighbors_for(current)
             if len(cur_neighbors) >= min_samples:
-                for nb in _perf_iter(perf, cur_neighbors, name="dbscan_seed_neighbors"):
-                    if labels[nb] in (_UNVISITED, _NOISE) and queued_epoch[nb] != epoch:
-                        seeds.append(nb)
-                        queued_epoch[nb] = epoch
+                if perf is None:
+                    for nb in cur_neighbors:
+                        if labels[nb] in (_UNVISITED, _NOISE) and queued_epoch[nb] != epoch:
+                            seeds.append(nb)
+                            queued_epoch[nb] = epoch
+                else:
+                    with perf.stage("dbscan_seed_neighbors"):
+                        for nb in cur_neighbors:
+                            if labels[nb] in (_UNVISITED, _NOISE) and queued_epoch[nb] != epoch:
+                                seeds.append(nb)
+                                queued_epoch[nb] = epoch
         cluster_id += 1
         now = time.perf_counter()
         if i % 500 == 0 or (now - last_t) >= 3.0:
@@ -1674,9 +1703,15 @@ def _run_dbscan(
             labels[current] = cluster_id
             cur_neighbors = _neighbors_indices(xs, ys, current, eps_m)
             if len(cur_neighbors) >= min_samples:
-                for nb in _perf_iter(perf, cur_neighbors, name="dbscan_seed_neighbors"):
-                    if labels[nb] in (_UNVISITED, _NOISE) and nb not in seeds:
-                        seeds.append(nb)
+                if perf is None:
+                    for nb in cur_neighbors:
+                        if labels[nb] in (_UNVISITED, _NOISE) and nb not in seeds:
+                            seeds.append(nb)
+                else:
+                    with perf.stage("dbscan_seed_neighbors"):
+                        for nb in cur_neighbors:
+                            if labels[nb] in (_UNVISITED, _NOISE) and nb not in seeds:
+                                seeds.append(nb)
         cluster_id += 1
         now = time.perf_counter()
         if i % 500 == 0 or (now - last_t) >= 3.0:
