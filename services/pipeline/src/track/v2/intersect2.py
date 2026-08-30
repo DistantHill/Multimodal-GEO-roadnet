@@ -2293,14 +2293,10 @@ def _extract_entry_exit_observations_batch(
     ends_xy = np.asarray(ends, dtype=float)
     center_xy = np.asarray(center, dtype=float)
     radius_sq = radius_m * radius_m
-    start_inside = (
-        np.einsum("ij,ij->i", starts_xy - center_xy, starts_xy - center_xy)
-        <= radius_sq
-    )
-    end_inside = (
-        np.einsum("ij,ij->i", ends_xy - center_xy, ends_xy - center_xy)
-        <= radius_sq
-    )
+    start_delta = starts_xy - center_xy
+    end_delta = ends_xy - center_xy
+    start_inside = np.einsum("ij,ij->i", start_delta, start_delta) <= radius_sq
+    end_inside = np.einsum("ij,ij->i", end_delta, end_delta) <= radius_sq
     hit_mask, crossing_xy_np = _segment_circle_crossings_batch(
         starts_xy, ends_xy, center, radius_m
     )
@@ -2310,8 +2306,13 @@ def _extract_entry_exit_observations_batch(
     # (vehicle_id, entry_seg, entry_crossing, exit_seg, exit_crossing)
     pairs: list[tuple[str, int, tuple[float, float], int, tuple[float, float]]] = []
     pending_entry: dict[str, tuple[int, tuple[float, float]]] = {}
+    crossing_counter = 0
+    crossing_points: list[CrossingPoint] = []
+    crossing_id_by_segment: dict[tuple[str, int, bool], int] = {}
 
     for flat_idx, (vehicle_id, seg_idx) in enumerate(segment_meta):
+        if not hit_mask[flat_idx]:
+            continue
         crossing = (
             float(crossing_xy_np[flat_idx][0]),
             float(crossing_xy_np[flat_idx][1]),
@@ -2321,14 +2322,6 @@ def _extract_entry_exit_observations_batch(
         elif exit_mask[flat_idx] and vehicle_id in pending_entry:
             entry_seg, entry_crossing = pending_entry.pop(vehicle_id)
             pairs.append((vehicle_id, entry_seg, entry_crossing, seg_idx, crossing))
-
-    # ── Collect all crossing points (for replay provenance) ─────
-    crossing_counter = 0
-    crossing_points: list[CrossingPoint] = []
-    crossing_id_by_segment: dict[tuple[str, int, bool], int] = {}
-    for flat_idx, (vehicle_id, seg_idx) in enumerate(segment_meta):
-        if not hit_mask[flat_idx]:
-            continue
         seg_start_pt = track_points_lookup[vehicle_id][seg_idx]
         is_entry = bool(entry_mask[flat_idx])
         # Convert crossing xy → lon/lat
