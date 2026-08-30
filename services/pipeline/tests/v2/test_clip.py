@@ -77,6 +77,24 @@ class ClipExtractionTest(unittest.TestCase):
 
         self.assertEqual(projection_count, len(track.points))
 
+    def test_long_segment_scans_intersections_instead_of_all_aabb_cells(self) -> None:
+        grid = clip_module._IntersectionGrid((
+            ClipIntersection(10, -100 / _METERS_PER_DEGREE, 0.0, 20.0),
+            ClipIntersection(20, 100 / _METERS_PER_DEGREE, 0.0, 20.0),
+        ))
+
+        class NoCellLookup(dict):
+            def get(self, key: object, default: object = None) -> object:
+                raise AssertionError("long AABB should not scan grid cells")
+
+        grid.cells = NoCellLookup(grid.cells)
+        candidates = grid.candidates((-10_000.0, 0.0), (10_000.0, 0.0))
+
+        self.assertEqual(
+            [candidate.value.cluster_id for candidate in candidates],
+            [10, 20],
+        )
+
     def test_two_intersections_produce_one_clip_with_interpolated_endpoints(self) -> None:
         points = tuple(
             _point("vehicle-1", index, x_m)

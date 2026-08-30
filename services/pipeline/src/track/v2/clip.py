@@ -51,6 +51,7 @@ class _IntersectionGrid:
         self.origin_lat = intersections[0].lat
         self.cell_size = max(100.0, max(item.radius_m for item in intersections) * 2.0)
         self.cells: dict[tuple[int, int], list[_IndexedIntersection]] = {}
+        indexed_intersections: list[_IndexedIntersection] = []
         cluster_ids: set[int] = set()
         for intersection in intersections:
             if intersection.cluster_id in cluster_ids:
@@ -63,6 +64,7 @@ class _IntersectionGrid:
                 self.origin_lat,
             )
             indexed = _IndexedIntersection(intersection, x, y)
+            indexed_intersections.append(indexed)
             for cell in self._cells_for_bounds(
                 x - intersection.radius_m,
                 y - intersection.radius_m,
@@ -70,6 +72,7 @@ class _IntersectionGrid:
                 y + intersection.radius_m,
             ):
                 self.cells.setdefault(cell, []).append(indexed)
+        self.indexed_intersections = tuple(indexed_intersections)
 
     def point_xy(self, point: TrajectoryPoint) -> tuple[float, float]:
         return _to_xy(point.lon, point.lat, self.origin_lon, self.origin_lat)
@@ -79,12 +82,27 @@ class _IntersectionGrid:
         start: tuple[float, float],
         end: tuple[float, float],
     ) -> tuple[_IndexedIntersection, ...]:
+        min_x = min(start[0], end[0])
+        min_y = min(start[1], end[1])
+        max_x = max(start[0], end[0])
+        max_y = max(start[1], end[1])
+        min_cell_x = math.floor(min_x / self.cell_size)
+        max_cell_x = math.floor(max_x / self.cell_size)
+        min_cell_y = math.floor(min_y / self.cell_size)
+        max_cell_y = math.floor(max_y / self.cell_size)
+        cell_count = (
+            (max_cell_x - min_cell_x + 1)
+            * (max_cell_y - min_cell_y + 1)
+        )
+        if cell_count > len(self.indexed_intersections):
+            return self.indexed_intersections
+
         found: dict[int, _IndexedIntersection] = {}
         for cell in self._cells_for_bounds(
-            min(start[0], end[0]),
-            min(start[1], end[1]),
-            max(start[0], end[0]),
-            max(start[1], end[1]),
+            min_x,
+            min_y,
+            max_x,
+            max_y,
         ):
             for indexed in self.cells.get(cell, ()):
                 found[indexed.value.cluster_id] = indexed

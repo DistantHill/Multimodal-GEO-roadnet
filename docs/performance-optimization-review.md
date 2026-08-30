@@ -19,3 +19,4 @@ memory-boundary baselines exist.
 | 11 | Remove redundant indexes and add a composite index | Yes | Yes | The user-added covering index is retained; its left prefix replaces `idx_ktp_tp_id`, while the membership UNIQUE index replaces the identical `idx_ktp_vehicle_sub`. Both legacy indexes are dropped during structural migration. |
 | 12 | Accumulate cluster provenance in lists | Yes | Yes | Greedy merge now extends mutable per-source lists through all absorptions and converts to immutable tuples once at final model construction. |
 | 13 | Process Topology segment metadata once | Yes | Yes | Entry/exit pairing and crossing provenance now share one ordered metadata pass, and start/end coordinate deltas are reused for inside-circle tests. |
+| 14 | Adapt Clip scanning for long AABBs | Yes | Yes | Candidate lookup now chooses the cheaper of enumerating segment AABB cells or scanning all indexed intersections; exact circle roots still decide crossings. |
