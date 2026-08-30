@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
+
+import track.v2.clip as clip_module
 
 from track.v2 import (
     ClipConfig,
@@ -32,6 +35,48 @@ def _point(vehicle_id: str, index: int, x_m: float, y_m: float = 0.0) -> Traject
 
 
 class ClipExtractionTest(unittest.TestCase):
+    def test_intersection_grid_is_reused_across_tracks(self) -> None:
+        source = ClipInput(
+            intersections=(ClipIntersection(10, 0.0, 0.0, 20.0),),
+            tracks=tuple(
+                ClipTrack(
+                    vehicle_id,
+                    f"trip-{vehicle_id}",
+                    (_point(vehicle_id, 0, -100), _point(vehicle_id, 1, 100)),
+                )
+                for vehicle_id in ("vehicle-1", "vehicle-2")
+            ),
+        )
+
+        with patch.object(
+            clip_module,
+            "_IntersectionGrid",
+            wraps=clip_module._IntersectionGrid,
+        ) as grid_factory:
+            extract_clips(source)
+
+        self.assertEqual(grid_factory.call_count, 1)
+
+    def test_segment_endpoints_are_projected_once_per_track(self) -> None:
+        track = ClipTrack(
+            "vehicle-1",
+            "trip-1",
+            tuple(_point("vehicle-1", index, x) for index, x in enumerate((-100, 0, 100))),
+        )
+        grid = clip_module._IntersectionGrid((ClipIntersection(10, 0.0, 0.0, 20.0),))
+        original_point_xy = grid.point_xy
+        projection_count = 0
+
+        def counted_point_xy(point: TrajectoryPoint) -> tuple[float, float]:
+            nonlocal projection_count
+            projection_count += 1
+            return original_point_xy(point)
+
+        grid.point_xy = counted_point_xy  # type: ignore[method-assign]
+        clip_module._crossing_events(track, grid)
+
+        self.assertEqual(projection_count, len(track.points))
+
     def test_two_intersections_produce_one_clip_with_interpolated_endpoints(self) -> None:
         points = tuple(
             _point("vehicle-1", index, x_m)

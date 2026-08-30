@@ -118,6 +118,9 @@ def extract_clips(
     skipped_degenerate = 0
     unmatched_entries = 0
     unmatched_exits = 0
+    intersection_grid = (
+        _IntersectionGrid(source.intersections) if source.intersections else None
+    )
 
     for track in source.tracks:
         if len(track.points) < 2:
@@ -136,6 +139,7 @@ def extract_clips(
         ) = _extract_track_clips(
             track,
             source.intersections,
+            intersection_grid=intersection_grid,
             include_boundaries=cfg.include_boundary_clips,
             detect_id=source.detect_id,
         )
@@ -261,10 +265,11 @@ def _extract_track_clips(
     track: ClipTrack,
     intersections: tuple[ClipIntersection, ...],
     *,
+    intersection_grid: _IntersectionGrid | None,
     include_boundaries: bool,
     detect_id: str | None,
 ) -> tuple[list[TrackClip], int, int, int]:
-    events = _crossing_events(track, intersections)
+    events = _crossing_events(track, intersection_grid)
     clips: list[TrackClip] = []
     skipped = 0
     unmatched_entries = 0
@@ -340,14 +345,14 @@ def _extract_track_clips(
 
 def _crossing_events(
     track: ClipTrack,
-    intersections: tuple[ClipIntersection, ...],
+    grid: _IntersectionGrid | None,
 ) -> list[_CrossingEvent]:
-    if not intersections:
+    if grid is None:
         return []
-    grid = _IntersectionGrid(intersections)
     events: list[_CrossingEvent] = []
-    for segment_index, (start, end) in enumerate(zip(track.points, track.points[1:])):
-        start_xy = grid.point_xy(start)
+    start = track.points[0]
+    start_xy = grid.point_xy(start)
+    for segment_index, end in enumerate(track.points[1:]):
         end_xy = grid.point_xy(end)
         for indexed in grid.candidates(start_xy, end_xy):
             intersection = indexed.value
@@ -372,6 +377,8 @@ def _crossing_events(
                     segment_fraction=fraction,
                 )
                 events.append(_CrossingEvent(endpoint))
+        start = end
+        start_xy = end_xy
 
     events.sort(
         key=lambda event: (

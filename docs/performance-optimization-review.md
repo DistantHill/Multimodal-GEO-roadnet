@@ -8,3 +8,4 @@ memory-boundary baselines exist.
 |---|---|---|---|---|
 | 1 | Named PostgreSQL cursors use batched fetches | Yes | Yes | Core source already used `itersize=10_000`; set the same batch size on the remaining 1M seed cursor. |
 | 2 | Group DBSCAN labels in one pass at three call sites | Yes | Yes | Replaced three O(KN) rescans with one O(N) grouping pass while retaining ascending cluster IDs, point order, and noise exclusion. |
+| 3 | Reuse the Clip intersection grid globally | Yes | Yes | Build one immutable grid per Clip input and carry each projected endpoint into the next segment; clip ordering and geometry are unchanged. |
