@@ -327,6 +327,7 @@ class RuntimeConfig(TrackModel):
     fallback_encodings: tuple[str, ...] = ("gb18030", "gbk", "cp936", "big5")
     mark_flush_every_n: int = 2000
     excluded_flush_threshold: int = 2000
+    cleaner_flush_point_threshold: int = 100_000
     progress_interval: int = 500
     progress_time_threshold_s: float = 2.0
 

@@ -27,6 +27,7 @@ from .models import (
     NetworkResult,
     PostgresSource,
     RefinementSubtrack,
+    RuntimeConfig,
 )
 from .network import build_network
 from .parser0 import get_database
@@ -147,6 +148,7 @@ def run_pipeline(
             _pending_excluded: list = []
             _pending_subtracks: list[RefinementSubtrack] = []
             _pending_tp_keys: list[tuple[str, str]] = []
+            _pending_point_count = 0
             subtrack_index = 1
 
             stream = StreamVehicleSource(handle)
@@ -170,8 +172,15 @@ def run_pipeline(
                 _pending_excluded.extend(vresult.excluded)
                 total_excluded += len(vresult.excluded)
                 _pending_subtracks.extend(vresult.subtracks)
-                if len(_pending_excluded) >= pc.runtime.excluded_flush_threshold or \
-                (vehicle_count % pc.runtime.mark_flush_every_n) == 0:
+                _pending_point_count += len(vresult.excluded) + sum(
+                    len(subtrack.points) for subtrack in vresult.subtracks
+                )
+                if _should_flush_clean_batch(
+                    pending_excluded_count=len(_pending_excluded),
+                    pending_point_count=_pending_point_count,
+                    vehicle_count=vehicle_count,
+                    runtime=pc.runtime,
+                ):
                     subtrack_index, batch_kept = _flush_clean_batch(
                         store,
                         clean_id=clean_id,
@@ -184,6 +193,7 @@ def run_pipeline(
                         batch_size=pc.runtime.db_insert_batch,
                     )
                     total_kept += batch_kept
+                    _pending_point_count = 0
 
                 now = time.perf_counter()
                 if vehicle_count == 1 or vehicle_count % pc.runtime.progress_interval == 0 or (now - last_update_t) >= pc.runtime.progress_time_threshold_s:
@@ -401,6 +411,21 @@ def _flush_clean_batch(
         batch_size=batch_size,
     )
     return result.next_subtrack_index, result.kept_count
+
+
+def _should_flush_clean_batch(
+    *,
+    pending_excluded_count: int,
+    pending_point_count: int,
+    vehicle_count: int,
+    runtime: RuntimeConfig,
+) -> bool:
+    """Bound Cleaner pending output between complete vehicle groups."""
+    return (
+        pending_excluded_count >= runtime.excluded_flush_threshold
+        or pending_point_count >= runtime.cleaner_flush_point_threshold
+        or vehicle_count % runtime.mark_flush_every_n == 0
+    )
 
 
 def _emit_message(sink: EventSink, message: str) -> None:

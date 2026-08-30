@@ -14,3 +14,4 @@ memory-boundary baselines exist.
 | 6 | Generate only cross-vehicle segment pairs | Yes | Yes | A rank-ordered batch iterator now emits only canonical cross-vehicle pairs; same-vehicle and reverse pairs are never materialized, while owner filtering and output order remain stable. |
 | 7 | Construct DB models directly from tuples | Yes | No | Already implemented in `PostgresTrajectorySourceHandle` via precomputed column indexes and `_parse_row_from_tuple`; the dict parser remains only for non-PG/general rows. |
 | 8 | Replay manifest first and query named subtracks | Yes | Yes | Centerline replay now validates its manifest before loading points, queries only referenced `(vehicle_id, subtrack_index)` pairs, and caches Detect-to-Clean resolution. |
+| 9 | Add a Cleaner pending-point flush cap | Yes | Yes | Added a configurable 100k-point cap across kept/derived/excluded output; flushing remains between complete vehicle groups, so a single vehicle is never split. |

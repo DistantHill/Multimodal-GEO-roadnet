@@ -16,6 +16,7 @@ from track.v2.models import (
     NetworkConfig,
     RuntimeConfig,
 )
+from track.v2.pipeline import _should_flush_clean_batch
 
 
 class DefaultPipelineConfigTest(unittest.TestCase):
@@ -53,6 +54,26 @@ class PipelineConfigOverrideTest(unittest.TestCase):
             path.write_text('[runtime]\nfallback_encodings = ["utf-8"]\n', encoding="utf-8")
             pc = load_pipeline_config(path)
             self.assertEqual(pc.runtime.fallback_encodings, ("utf-8",))
+
+    def test_cleaner_point_threshold_flushes_before_vehicle_limit(self):
+        runtime = RuntimeConfig(
+            mark_flush_every_n=2000,
+            excluded_flush_threshold=2000,
+            cleaner_flush_point_threshold=10,
+        )
+
+        self.assertFalse(_should_flush_clean_batch(
+            pending_excluded_count=0,
+            pending_point_count=9,
+            vehicle_count=1,
+            runtime=runtime,
+        ))
+        self.assertTrue(_should_flush_clean_batch(
+            pending_excluded_count=0,
+            pending_point_count=10,
+            vehicle_count=1,
+            runtime=runtime,
+        ))
 
 
 class PipelineConfigErrorTest(unittest.TestCase):

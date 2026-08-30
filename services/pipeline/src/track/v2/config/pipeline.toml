@@ -68,5 +68,6 @@ default_text_encoding = "utf-8-sig"
 fallback_encodings = ["gb18030", "gbk", "cp936", "big5"]
 mark_flush_every_n = 2000
 excluded_flush_threshold = 2000
+cleaner_flush_point_threshold = 100000
 progress_interval = 500
 progress_time_threshold_s = 2.0
