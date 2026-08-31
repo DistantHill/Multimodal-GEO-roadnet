@@ -7,7 +7,7 @@
 ## 目录职责
 
 - `apps/frontend`：独立前端开发容器；仅负责 UI 和 Backend API 调用。
-- `apps/backend`：独立 FastAPI API 容器；当前提供健康检查和数据库/Qdrant 连通性检查骨架。
+- `apps/backend`：独立 FastAPI API 容器；提供健康检查，以及只读、限量的地图图层、Replay 和 Clip GeoJSON API。
 - `services/pipeline`：Pipeline 独立运行单元，包含 Cleaner、Detect、Clip、Fitting、Network、持久化、回放和数据库初始化逻辑。Backend request process 不执行这些耗时阶段。
 - `services/vision`：可选 YOLOv8 CUDA 11.7 离线推理/跟踪运行单元，通过 Compose `vision` profile 启用。
 - `db/postgres`、`db/qdrant`：数据库定义、初始化和迁移逻辑，不保存运行时数据。
@@ -27,12 +27,28 @@ docker compose -f infra/docker/compose.dev.yml up -d --build
 - Frontend：`http://localhost:${FRONTEND_PORT:-5173}`
 - Backend：`http://localhost:${BACKEND_PORT:-8000}/health`
 - Backend 依赖检查：`/health/dependencies`
+- 地图图层目录：`/api/v1/map/layers`
 - PostgreSQL 主机映射默认是 `15432`，容器内服务名和端口仍是 `postgres:5432`。
 - Qdrant 主机映射默认是 `16333`，容器内服务名和端口仍是 `qdrant:6333`。
 
 宿主机端口映射与容器内连接配置分开：`POSTGRES_PORT`/`QDRANT_PORT` 是容器内端口，`POSTGRES_HOST_PORT`/`QDRANT_HOST_PORT` 仅用于开发机发布端口。
 
 前端源码通过 bind mount 热更新，`frontend_node_modules` 使用 Docker named volume。Backend 和 Pipeline 也分别使用独立源码挂载和独立 Docker build context。
+
+## Web GIS 与 QGIS 插件
+
+打开 Frontend 后可在左侧图层树切换业务图层，在地图工具栏选择平移、点选或框选。Replay 接受轨迹点主键或 WGS84 框选范围；Clip 要求同一 Detect Run 中恰好两个交叉口。两者的返回值只绘制到内存 `tmp` 图层，不写数据库或中间文件。地图窗口显示 EPSG:3857，Backend GeoJSON 固定为 EPSG:4326，前端负责投影转换。
+
+QGIS 3.44 LTR 插件源码位于 `apps/qgis-plugin/roadnet_tools/`。开发机可将该目录链接到 QGIS 用户插件目录，或按 [插件说明](apps/qgis-plugin/README.md) 打包 ZIP 安装。启用 **Roadnet Tools** 后，在点图层中使用 QGIS 自带点选/框选，随后从 **Vector → Roadnet Tools** 执行 Replay 或 Clip；后端 URL 默认为 `http://localhost:8000`，可在插件设置中修改。成功响应会替换插件管理的内存图层 `tmp`，请求或解析失败会保留上一次成功结果。
+
+地图 API：
+
+- `GET /api/v1/map/layers`：图层目录及默认 Detect/Fit 上下文。
+- `GET /api/v1/map/layers/{layer_id}`：读取有上限的 EPSG:4326 GeoJSON，可传 `bbox`、`detect_id`、`fit_id` 和 `limit`。
+- `POST /api/v1/map/replay`：按 `point_ids` 或 `bbox`（二选一）回放轨迹。
+- `POST /api/v1/map/clip`：按 `detect_id` 与两个 `intersection_ids` 截取交叉口间轨迹。
+
+这些 API 使用只读 PostgreSQL 事务、语句超时和请求数量上限；不会在 Backend 请求进程中启动完整 Pipeline 作业。
 
 ## 配置与运行时数据
 
@@ -73,6 +89,8 @@ make dev-config
 make dev-up
 make dev-logs
 make test
+make frontend-test
+make qgis-plugin-test
 make pipeline-check
 make pipeline-init-db
 make pipeline-help

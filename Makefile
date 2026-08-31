@@ -2,7 +2,7 @@ COMPOSE_DEV = docker compose -f infra/docker/compose.dev.yml
 COMPOSE_PROD = docker compose -f infra/docker/compose.prod.yml
 VISION_IMAGE = roadnet-vision-yolov8:8.3.0-cu117
 
-.PHONY: dev-up dev-down dev-logs dev-config build test pipeline-check pipeline-init-db pipeline-help vision-build vision-check vision-run prod-config
+.PHONY: dev-up dev-down dev-logs dev-config build test frontend-test qgis-plugin-test pipeline-check pipeline-init-db pipeline-help vision-build vision-check vision-run prod-config
 
 dev-up:
 	$(COMPOSE_DEV) up --build
@@ -22,6 +22,13 @@ build:
 test:
 	$(COMPOSE_DEV) run --rm backend pytest
 	$(COMPOSE_DEV) run --rm pipeline pytest
+
+frontend-test:
+	cd apps/frontend && npm test && npm run build
+
+qgis-plugin-test:
+	python3 -m unittest discover -s apps/qgis-plugin/tests -v
+	python3 -m compileall -q apps/qgis-plugin/roadnet_tools
 
 pipeline-check:
 	$(COMPOSE_DEV) run --rm pipeline python -m pipeline check-config

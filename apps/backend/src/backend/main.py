@@ -7,19 +7,18 @@ import urllib.request
 import psycopg
 from fastapi import FastAPI
 
+from .database import postgres_connection_settings
+from .map_api import router as map_router
+
 
 app = FastAPI(title="Roadnet Backend", version="0.1.0")
+app.include_router(map_router)
 
 
 def _postgres_status() -> str:
     try:
         with psycopg.connect(
-            host=os.getenv("POSTGRES_HOST", "postgres"),
-            port=int(os.getenv("POSTGRES_PORT", "5432")),
-            dbname=os.getenv("POSTGRES_DB", "roadnet"),
-            user=os.getenv("POSTGRES_USER", "roadnet"),
-            password=os.getenv("POSTGRES_PASSWORD", "change-me"),
-            connect_timeout=2,
+            **{**postgres_connection_settings(), "connect_timeout": 2},
         ) as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 1")

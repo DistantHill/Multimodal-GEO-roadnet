@@ -1,0 +1,18 @@
+[general]
+name=Roadnet Tools
+qgisMinimumVersion=3.44
+qgisMaximumVersion=3.99
+description=Replay and clip Roadnet trajectories from selected QGIS point features.
+about=Calls the Roadnet map API asynchronously and renders GeoJSON responses into an in-memory layer named tmp. No trajectory result is written to disk.
+version=0.1.0
+author=Multimodal GEO Roadnet contributors
+email=
+category=Vector
+icon=icon.svg
+experimental=False
+deprecated=False
+hasProcessingProvider=False
+tags=roadnet,trajectory,geojson,replay,clip,postgis
+homepage=
+tracker=
+repository=
