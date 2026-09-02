@@ -11,7 +11,6 @@ from track.v2.db_writer import (
     create_fit_run,
     finish_clean_run,
     finish_detect_run,
-    insert_candidate_intersection_events,
     insert_candidate_intersections,
     insert_intersections,
     insert_injected_points,
@@ -338,7 +337,14 @@ class InsertTracksCrossTest(unittest.TestCase):
         )
         conn = _RecordingConnection()
 
-        written = insert_tracks_cross(conn, [candidate], detect_id="detect-1")
+        written = insert_tracks_cross(
+            conn,
+            [candidate],
+            detect_id="detect-1",
+            candidate_intersection_ids={
+                ("A|B", "table_a", "102,105", "table_b", "77,78"): 55,
+            },
+        )
 
         self.assertEqual(written, 1)
         self.assertIn("COPY tracks_cross", conn.recording_cursor.copy_statements[0])
@@ -347,7 +353,7 @@ class InsertTracksCrossTest(unittest.TestCase):
             (
                 "detect-1", "A|B", 15.0, 116.0, 39.0, 1.5, 2.5, 0.0, 12.0,
                 "table_a", "102,105", "table_b", "77,78",
-                "orthogonal_cross_track", 116.0, 39.0,
+                "orthogonal_cross_track", 116.0, 39.0, 55,
             ),
         )
 
@@ -391,48 +397,25 @@ class InsertTurnEventsTest(unittest.TestCase):
         ]
         conn = _RecordingConnection()
 
-        mapping = insert_turn_events(conn, events, detect_id="detect-1")
+        mapping = insert_turn_events(
+            conn,
+            events,
+            detect_id="detect-1",
+            candidate_intersection_ids={10: 55},
+        )
 
         self.assertIn("COPY turn_events", conn.recording_cursor.copy_statements[0])
         self.assertEqual(mapping, {10: 1, 20: 2})
+        self.assertEqual(
+            [row[-1] for row in conn.recording_cursor.copy_rows],
+            [55, None],
+        )
         self.assertEqual(
             conn.recording_cursor.executions[-1],
             (
                 "SELECT id, event_id FROM turn_events WHERE detect_id = %s",
                 ("detect-1",),
             ),
-        )
-
-
-class CandidateIntersectionEventsTest(unittest.TestCase):
-    def test_non_turn_members_do_not_collide_with_turn_event_ids(self) -> None:
-        cluster = _cluster(5)
-        turn_event = TurnEvent(
-            event_id=1, vehicle_id="turn", timestamp=1.0,
-            lon=116.0, lat=39.0, x=0.0, y=0.0,
-            in_bearing=0.0, out_bearing=90.0, turn_deg=90.0, score=90.0,
-            source="turn",
-        )
-        cross_track_event = TurnEvent(
-            event_id=0, vehicle_id="A|B", timestamp=2.0,
-            lon=116.0, lat=39.0, x=0.0, y=0.0,
-            in_bearing=0.0, out_bearing=0.0, turn_deg=0.0, score=0.0,
-            source="orthogonal_cross_track",
-        )
-        cluster = replace(cluster, events=(turn_event, cross_track_event))
-        conn = _RecordingConnection()
-
-        insert_candidate_intersection_events(
-            conn, [cluster], {5: 55}, {0: 100, 1: 101}, detect_id="detect-1",
-        )
-
-        params = conn.recording_cursor.copy_rows
-        self.assertEqual(
-            params,
-            [
-                ("detect-1", 55, "turn", 101, None, None, None, None),
-                ("detect-1", 55, "orthogonal_cross_track", None, None, None, None, None),
-            ],
         )
 
 

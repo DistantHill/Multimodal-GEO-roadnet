@@ -85,8 +85,10 @@ mapping use PostgreSQL COPY:
 
 - `tracks_cross`;
 - `turn_events` (followed by one run-scoped ID-map read);
-- `candidate_intersection_events`;
 - `entry_exit_points`.
+
+Candidate membership is stored directly on `turn_events` and `tracks_cross`
+through `candidate_intersection_id`; there is no separate membership table.
 
 Tables whose generated IDs are needed by dependent rows continue to use
 batched `INSERT ... RETURNING`. Fitting writes the complete centerline bundle

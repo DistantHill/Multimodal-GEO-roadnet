@@ -84,8 +84,8 @@ class DeleteRunServiceTest(unittest.TestCase):
     def test_clean_preview_has_clean_tables_and_each_child_detect_tree(self) -> None:
         responses = (
             [[(CLEAN_ID,)]]
-            + [[(index,)] for index, _ in enumerate(CLEAN_ARTIFACT_TABLES, start=1)]
             + [[(DETECT_ID,)]]
+            + [[(index,)] for index, _ in enumerate(CLEAN_ARTIFACT_TABLES, start=1)]
             + [[(index,)] for index, _ in enumerate(DETECT_ARTIFACT_TABLES, start=10)]
         )
         service = DeleteRunService(_Connection(responses))
@@ -99,7 +99,10 @@ class DeleteRunServiceTest(unittest.TestCase):
         self.assertEqual(impact.detects[0].target_id, DETECT_ID)
         self.assertEqual(
             [(row.table, row.count) for row in impact.detects[0].own_rows],
-            list(zip(DETECT_ARTIFACT_TABLES, range(10, 21))),
+            list(zip(
+                DETECT_ARTIFACT_TABLES,
+                range(10, 10 + len(DETECT_ARTIFACT_TABLES)),
+            )),
         )
 
     def test_detect_delete_requires_y_then_exact_uuid_and_rechecks_tree(self) -> None:
@@ -119,7 +122,14 @@ class DeleteRunServiceTest(unittest.TestCase):
         deletes = [sql for sql, _ in conn.executions if sql.startswith("DELETE")]
         self.assertEqual(
             deletes,
-            [f"DELETE FROM {table} WHERE detect_id = %s" for table in DETECT_ARTIFACT_TABLES]
+            [
+                "DELETE FROM centerline_source_clips WHERE centerline_id IN "
+                "(SELECT id FROM centerlines WHERE detect_id = %s)"
+            ]
+            + [
+                f"DELETE FROM {table} WHERE detect_id = %s"
+                for table in DETECT_ARTIFACT_TABLES[1:]
+            ]
             + ["DELETE FROM detect_runs WHERE id = %s"],
         )
         self.assertFalse(any(sql.startswith("DELETE FROM trajectory_points ") for sql in deletes))
@@ -166,8 +176,11 @@ class DeleteRunServiceTest(unittest.TestCase):
         self.assertTrue(deleted)
         deletes = [sql for sql, _ in conn.executions if sql.startswith("DELETE")]
         expected_detect = [
+            "DELETE FROM centerline_source_clips WHERE centerline_id IN "
+            "(SELECT id FROM centerlines WHERE detect_id = %s)"
+        ] + [
             f"DELETE FROM {table} WHERE detect_id = %s"
-            for table in DETECT_ARTIFACT_TABLES
+            for table in DETECT_ARTIFACT_TABLES[1:]
         ] + ["DELETE FROM detect_runs WHERE id = %s"]
         expected_clean = [
             f"DELETE FROM {table} WHERE clean_id = %s"
@@ -191,15 +204,6 @@ class DeleteRunServiceTest(unittest.TestCase):
             ))
             for sql, _ in conn.executions
         ))
-            [
-                "DELETE FROM centerline_source_clips WHERE centerline_id IN "
-                "(SELECT id FROM centerlines WHERE detect_id = %s)"
-            ]
-            + [f"DELETE FROM {table} WHERE detect_id = %s" for table in DETECT_ARTIFACT_TABLES[1:]]
-            + ["DELETE FROM detect_runs WHERE id = %s"],
-        )
-        self.assertFalse(any("trajectory_points" in sql for sql in deletes))
-
     def test_cancellation_and_wrong_uuid_do_not_delete(self) -> None:
         cancel_conn = _Connection(_detect_preview_responses())
         self.assertFalse(DeleteRunService(cancel_conn).confirm_and_delete_detect(

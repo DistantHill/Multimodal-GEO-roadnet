@@ -95,7 +95,6 @@ class _ConfigRecordingStore:
             intersection_ids={},
             turn_event_count=0,
             candidate_intersection_count=0,
-            candidate_intersection_event_count=0,
             candidate_entry_exit_point_count=0,
             intersection_count=0,
             entry_exit_point_count=0,

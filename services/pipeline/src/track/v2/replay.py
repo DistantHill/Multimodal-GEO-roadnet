@@ -285,7 +285,6 @@ _ENTITY_TABLES = {
     "tracks_cross": "tracks_cross",
     "turn_event": "turn_events",
     "candidate_intersection": "candidate_intersections",
-    "candidate_intersection_event": "candidate_intersection_events",
     "candidate_entry_exit_point": "candidate_entry_exit_points",
     "intersection": "intersections",
     "entry_exit_point": "entry_exit_points",
@@ -374,12 +373,20 @@ class PostgresReplayStore:
             ))
         elif kind == "candidate_intersection":
             parents.extend(self._children(
-                "SELECT id FROM candidate_intersection_events "
-                "WHERE candidate_intersection_id = %s AND detect_id = %s",
+                "SELECT id FROM turn_events WHERE candidate_intersection_id = %s "
+                "AND detect_id = %s",
                 target.id,
-                "candidate_intersection_event",
+                "turn_event",
                 detect_id,
-                "member_event",
+                "member_turn_event",
+            ))
+            parents.extend(self._children(
+                "SELECT id FROM tracks_cross WHERE candidate_intersection_id = %s "
+                "AND detect_id = %s",
+                target.id,
+                "tracks_cross",
+                detect_id,
+                "member_cross_event",
             ))
             parents.extend(self._children(
                 "SELECT id FROM candidate_entry_exit_points "
@@ -389,24 +396,6 @@ class PostgresReplayStore:
                 detect_id,
                 "crossing",
             ))
-        elif kind == "candidate_intersection_event":
-            if row.get("turn_event_id") is not None:
-                add("turn_event", row.get("turn_event_id"), "turn_event")
-            else:
-                self._add_segment_source_points(
-                    parents,
-                    target,
-                    row.get("from_source_id"),
-                    row.get("from_source_row_key"),
-                    "input_from",
-                )
-                self._add_segment_source_points(
-                    parents,
-                    target,
-                    row.get("to_source_id"),
-                    row.get("to_source_row_key"),
-                    "input_to",
-                )
         elif kind == "entry_exit_point":
             add("intersection", row.get("intersection_id"), "intersection")
             add("candidate_entry_exit_point", row.get("entry_crossing_id"), "entry_crossing")

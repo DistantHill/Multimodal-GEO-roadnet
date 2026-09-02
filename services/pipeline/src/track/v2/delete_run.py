@@ -20,10 +20,9 @@ DETECT_ARTIFACT_TABLES = (
     "entry_exit_points",
     "intersections",
     "candidate_entry_exit_points",
-    "candidate_intersection_events",
-    "candidate_intersections",
     "turn_events",
     "tracks_cross",
+    "candidate_intersections",
 )
 
 
@@ -63,7 +62,6 @@ class DeleteRunService:
             cur.execute(f"SELECT id FROM clean_runs WHERE id = %s{suffix}", (clean_id,))
             if cur.fetchone() is None:
                 raise ValueError(f"unknown Clean Run: {clean_id}")
-        own_rows = self._counts(CLEAN_ARTIFACT_TABLES, "clean_id", clean_id)
         with self._conn.cursor() as cur:  # type: ignore[attr-defined]
             suffix = " FOR UPDATE" if lock else ""
             cur.execute(

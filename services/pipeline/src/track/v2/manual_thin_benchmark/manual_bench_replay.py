@@ -79,7 +79,15 @@ def _seed_candidate_chain(
         cur.execute(
             "INSERT INTO trajectory_points "
             "(vehicle_id, timestamp, lon, lat) "
-            "VALUES ('bench', 0, 116.0, 39.0)",
+            "VALUES ('bench', 0, 116.0, 39.0) RETURNING id",
+        )
+        trajectory_point_id = int(cur.fetchone()[0])
+        cur.execute(
+            "INSERT INTO kept_trajectory_points "
+            "(clean_id, trajectory_point_id, source_id, source_row_key, "
+            "vehicle_id, subtrack_index, sequence_in_subtrack) "
+            "VALUES (%s, %s, %s, %s, 'bench', 1, 1)",
+            (clean_id, trajectory_point_id, source_id, source_row_key),
         )
         cur.execute(
             "INSERT INTO candidate_intersections "
@@ -89,10 +97,13 @@ def _seed_candidate_chain(
         )
         candidate_id = int(cur.fetchone()[0])
         cur.execute(
-            "INSERT INTO candidate_intersection_events "
-            "(detect_id, candidate_intersection_id, event_kind, from_source_id, from_source_row_key, to_source_id, to_source_row_key) "
-            "VALUES (%s, %s, 'benchmark', %s, %s, %s, %s)",
-            (detect_id, candidate_id, source_id, source_row_key, source_id, source_row_key),
+            "INSERT INTO turn_events "
+            "(detect_id, candidate_intersection_id, event_id, vehicle_id, timestamp, "
+            "lon, lat, x, y, in_bearing, out_bearing, turn_deg, score, "
+            "from_source_id, from_source_row_key, origin_lon, origin_lat) "
+            "VALUES (%s, %s, 1, 'bench', 0, 116.0, 39.0, 0, 0, 0, 90, 90, 90, "
+            "%s, %s, 116.0, 39.0)",
+            (detect_id, candidate_id, source_id, source_row_key),
         )
     return detect_id, candidate_id
 

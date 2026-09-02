@@ -155,7 +155,7 @@ def _print_write_summary(stats: dict[str, int | str | list[int]]) -> None:
     for table in [
         "trajectory_points", "kept_trajectory_points",
         "injected_points", "tracks_cross", "turn_events", "candidate_intersections",
-        "candidate_intersection_events", "candidate_entry_exit_points",
+        "candidate_entry_exit_points",
         "intersections", "entry_exit_points",
     ]:
         if table in stats:

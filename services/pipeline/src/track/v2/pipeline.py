@@ -306,7 +306,6 @@ def run_pipeline(
                     "tracks_cross": persisted_detect.tracks_cross_count,
                     "turn_events": persisted_detect.turn_event_count,
                     "candidate_intersections": persisted_detect.candidate_intersection_count,
-                    "candidate_intersection_events": persisted_detect.candidate_intersection_event_count,
                     "candidate_entry_exit_points": persisted_detect.candidate_entry_exit_point_count,
                     "intersections": persisted_detect.intersection_count,
                     "entry_exit_points": persisted_detect.entry_exit_point_count,
@@ -315,10 +314,6 @@ def run_pipeline(
             _emit_message(sink, f"  tracks_cross: {persisted_detect.tracks_cross_count:,} rows")
             _emit_message(sink, f"  turn_events: {persisted_detect.turn_event_count:,} rows")
             _emit_message(sink, f"  candidate_intersections: {persisted_detect.candidate_intersection_count:,} rows")
-            _emit_message(
-                sink,
-                f"  candidate_intersection_events: {persisted_detect.candidate_intersection_event_count:,} rows",
-            )
             _emit_message(
                 sink,
                 f"  candidate_entry_exit_points: {persisted_detect.candidate_entry_exit_point_count:,} rows",

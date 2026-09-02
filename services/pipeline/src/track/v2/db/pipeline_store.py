@@ -23,7 +23,6 @@ from ..db_writer import (
     finish_detect_run,
     finish_fit_run,
     insert_candidate_entry_exit_points,
-    insert_candidate_intersection_events,
     insert_candidate_intersections,
     insert_centerline_bundle,
     insert_entry_exit_points,
@@ -67,10 +66,52 @@ class DetectPersistenceResult:
     intersection_ids: dict[int, int]
     turn_event_count: int
     candidate_intersection_count: int
-    candidate_intersection_event_count: int
     candidate_entry_exit_point_count: int
     intersection_count: int
     entry_exit_point_count: int
+
+
+def _candidate_memberships(
+    clusters: list[Any],
+    candidate_intersection_ids: dict[int, int],
+) -> tuple[
+    dict[int, int],
+    dict[tuple[str, str, str, str, str], int],
+]:
+    """Build exclusive A/C child-to-candidate assignments."""
+    turn_membership: dict[int, int] = {}
+    cross_membership: dict[tuple[str, str, str, str, str], int] = {}
+
+    def assign(mapping: dict[Any, int], key: Any, candidate_id: int) -> None:
+        previous = mapping.get(key)
+        if previous is not None and previous != candidate_id:
+            raise ValueError(
+                f"event {key!r} belongs to multiple candidate intersections: "
+                f"{previous}, {candidate_id}"
+            )
+        mapping[key] = candidate_id
+
+    for cluster in clusters:
+        candidate_id = candidate_intersection_ids.get(cluster.cluster_id)
+        if candidate_id is None:
+            continue
+        for event in cluster.events:
+            if event.source == "turn":
+                assign(turn_membership, event.event_id, candidate_id)
+            elif event.source == "orthogonal_cross_track":
+                key = (
+                    event.vehicle_id,
+                    str(event.from_source_id or ""),
+                    str(event.from_source_row_key or ""),
+                    str(event.to_source_id or ""),
+                    str(event.to_source_row_key or ""),
+                )
+                assign(cross_membership, key, candidate_id)
+            # ``orthogonal`` is an in-memory Method 2 observation. It has no
+            # Detect-level A/C row on which to store reverse membership.
+            elif event.source != "orthogonal":
+                raise ValueError(f"unsupported candidate event source: {event.source}")
+    return turn_membership, cross_membership
 
 
 class PipelineStore(Protocol):
@@ -279,29 +320,27 @@ class PostgresPipelineStore:
         *,
         batch_size: int = _DEFAULT_BATCH_SIZE,
     ) -> DetectPersistenceResult:
+        candidate_intersection_ids = insert_candidate_intersections(
+            self._conn,
+            result.clusters,
+            detect_id=detect_id,
+        )
+        turn_membership, cross_membership = _candidate_memberships(
+            result.clusters,
+            candidate_intersection_ids,
+        )
         tracks_cross_count = insert_tracks_cross(
             self._conn,
             result.cross_track_candidates,
             detect_id=detect_id,
+            candidate_intersection_ids=cross_membership,
             batch_size=batch_size,
         )
         turn_event_ids = insert_turn_events(
             self._conn,
             result.turn_events,
             detect_id=detect_id,
-            batch_size=batch_size,
-        )
-        candidate_intersection_ids = insert_candidate_intersections(
-            self._conn,
-            result.clusters,
-            detect_id=detect_id,
-        )
-        insert_candidate_intersection_events(
-            self._conn,
-            result.clusters,
-            candidate_intersection_ids,
-            turn_event_ids,
-            detect_id=detect_id,
+            candidate_intersection_ids=turn_membership,
             batch_size=batch_size,
         )
         candidate_entry_exit_ids = insert_candidate_entry_exit_points(
@@ -335,9 +374,6 @@ class PostgresPipelineStore:
             intersection_ids=intersection_ids,
             turn_event_count=len(result.turn_events),
             candidate_intersection_count=len(result.clusters),
-            candidate_intersection_event_count=sum(
-                len(cluster.events) for cluster in result.clusters
-            ),
             candidate_entry_exit_point_count=sum(
                 len(cluster.crossing_points) for cluster in result.clusters
             ),

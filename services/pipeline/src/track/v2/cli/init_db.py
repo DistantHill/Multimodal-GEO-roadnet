@@ -134,6 +134,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         CREATE TABLE IF NOT EXISTS tracks_cross (
             id                  BIGSERIAL PRIMARY KEY,
             detect_id           UUID NOT NULL REFERENCES detect_runs(id),
+            candidate_intersection_id BIGINT,
             vehicle_id          TEXT NOT NULL,
             timestamp           DOUBLE PRECISION NOT NULL,
             lon                 DOUBLE PRECISION NOT NULL,
@@ -159,6 +160,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         CREATE TABLE IF NOT EXISTS turn_events (
             id                  BIGSERIAL PRIMARY KEY,
             detect_id           UUID NOT NULL REFERENCES detect_runs(id),
+            candidate_intersection_id BIGINT,
             event_id            INTEGER NOT NULL,
             vehicle_id          TEXT NOT NULL,
             timestamp           DOUBLE PRECISION NOT NULL,
@@ -211,23 +213,6 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             origin_lat          DOUBLE PRECISION NOT NULL,
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (id, detect_id)
-        )
-    """),
-    ("candidate_intersection_events", """
-        CREATE TABLE IF NOT EXISTS candidate_intersection_events (
-            id                          BIGSERIAL PRIMARY KEY,
-            detect_id                   UUID NOT NULL REFERENCES detect_runs(id),
-            candidate_intersection_id   BIGINT NOT NULL,
-            event_kind                  TEXT NOT NULL DEFAULT 'turn',
-            turn_event_id               BIGINT,
-            from_source_id              TEXT,
-            from_source_row_key         TEXT,
-            to_source_id                TEXT,
-            to_source_row_key           TEXT,
-            FOREIGN KEY (candidate_intersection_id, detect_id)
-                REFERENCES candidate_intersections(id, detect_id),
-            FOREIGN KEY (turn_event_id, detect_id)
-                REFERENCES turn_events(id, detect_id)
         )
     """),
     ("candidate_entry_exit_points", """
@@ -389,6 +374,7 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     ("idx_tc_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_tc_vehicle_ts ON tracks_cross(detect_id, vehicle_id, timestamp)"),
     ("idx_tc_geom",            "CREATE INDEX IF NOT EXISTS idx_tc_geom ON tracks_cross USING GIST (geom)"),
     ("idx_tc_segment_pair",    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tc_segment_pair ON tracks_cross (detect_id, vehicle_id, from_source_id, from_source_row_key, to_source_id, to_source_row_key)"),
+    ("idx_tc_candidate",       "CREATE INDEX IF NOT EXISTS idx_tc_candidate ON tracks_cross(detect_id, candidate_intersection_id) WHERE candidate_intersection_id IS NOT NULL"),
     # ── turn_events ──
     ("idx_te_event_id",        "CREATE INDEX IF NOT EXISTS idx_te_event_id ON turn_events(event_id)"),
     ("idx_te_vehicle_ts",      "CREATE UNIQUE INDEX IF NOT EXISTS idx_te_vehicle_ts ON turn_events(detect_id, vehicle_id, timestamp)"),
@@ -396,14 +382,12 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     ("idx_te_source",          "CREATE INDEX IF NOT EXISTS idx_te_source ON turn_events(source)"),
     ("idx_te_xy",              "CREATE INDEX IF NOT EXISTS idx_te_xy ON turn_events(x, y)"),
     ("idx_te_geom",            "CREATE INDEX IF NOT EXISTS idx_te_geom ON turn_events USING GIST (geom)"),
+    ("idx_te_candidate",       "CREATE INDEX IF NOT EXISTS idx_te_candidate ON turn_events(detect_id, candidate_intersection_id) WHERE candidate_intersection_id IS NOT NULL"),
     # ── candidate_intersections ──
     ("idx_ci_cluster_id",      "CREATE UNIQUE INDEX IF NOT EXISTS idx_ci_cluster_id ON candidate_intersections(detect_id, cluster_id)"),
     ("idx_ci_source",          "CREATE INDEX IF NOT EXISTS idx_ci_source ON candidate_intersections(source)"),
     ("idx_ci_centroid",        "CREATE INDEX IF NOT EXISTS idx_ci_centroid ON candidate_intersections(centroid_lon, centroid_lat)"),
     ("idx_ci_geom",            "CREATE INDEX IF NOT EXISTS idx_ci_geom ON candidate_intersections USING GIST (geom)"),
-    # ── candidate_intersection_events ──
-    ("idx_cie_ci",             "CREATE INDEX IF NOT EXISTS idx_cie_ci ON candidate_intersection_events(detect_id, candidate_intersection_id)"),
-    ("idx_cie_te",             "CREATE INDEX IF NOT EXISTS idx_cie_te ON candidate_intersection_events(turn_event_id)"),
     # ── candidate_entry_exit_points ──
     ("idx_ceep_cluster",       "CREATE INDEX IF NOT EXISTS idx_ceep_cluster ON candidate_entry_exit_points(detect_id, cluster_id, vehicle_id)"),
     ("idx_ceep_type",          "CREATE INDEX IF NOT EXISTS idx_ceep_type ON candidate_entry_exit_points(crossing_type)"),
@@ -428,7 +412,11 @@ def reset_tables(config: PostgresConfig,skip_tables: list[str]) -> int:
     """
     # ZH: 反向遍历 DDL 列表，确保引用表先被删除
     # EN: Reverse DDL order so referencing tables are dropped before their parents
-    drop_order = [*reversed(DDL_STATEMENTS), ("pipeline_runs", "")]
+    drop_order = [
+        ("candidate_intersection_events", ""),
+        *reversed(DDL_STATEMENTS),
+        ("pipeline_runs", ""),
+    ]
     drop_order = [(name, ddl) for name, ddl in drop_order if name not in skip_tables]
     tables_dropped = 0
 
@@ -652,9 +640,84 @@ def _run_migrations(cur: Any) -> None:
     #     Column additions are handled automatically by _auto_add_missing_columns.
     migrations: list[tuple[str, str]] = [
         (
-            "candidate_event_turn_nullable",
-            "ALTER TABLE candidate_intersection_events "
-            "ALTER COLUMN turn_event_id DROP NOT NULL",
+            "backfill_candidate_membership",
+            "DO $$ DECLARE conflict boolean; BEGIN "
+            "IF to_regclass('candidate_intersection_events') IS NOT NULL THEN "
+            "EXECUTE 'SELECT EXISTS (SELECT 1 FROM candidate_intersection_events "
+            "WHERE event_kind = ''turn'' GROUP BY detect_id, turn_event_id "
+            "HAVING COUNT(DISTINCT candidate_intersection_id) > 1)' INTO conflict; "
+            "IF conflict THEN RAISE EXCEPTION "
+            "'turn event belongs to multiple candidate intersections'; END IF; "
+            "EXECUTE 'SELECT EXISTS (SELECT 1 FROM candidate_intersection_events "
+            "WHERE event_kind = ''orthogonal_cross_track'' "
+            "GROUP BY detect_id, from_source_id, from_source_row_key, "
+            "to_source_id, to_source_row_key "
+            "HAVING COUNT(DISTINCT candidate_intersection_id) > 1)' INTO conflict; "
+            "IF conflict THEN RAISE EXCEPTION "
+            "'cross event belongs to multiple candidate intersections'; END IF; "
+            "EXECUTE 'UPDATE turn_events AS te SET candidate_intersection_id = m.candidate_id "
+            "FROM (SELECT detect_id, turn_event_id, MIN(candidate_intersection_id) AS candidate_id "
+            "FROM candidate_intersection_events WHERE event_kind = ''turn'' "
+            "GROUP BY detect_id, turn_event_id) AS m "
+            "WHERE te.detect_id = m.detect_id AND te.id = m.turn_event_id'; "
+            "EXECUTE 'UPDATE tracks_cross AS tc SET candidate_intersection_id = m.candidate_id "
+            "FROM (SELECT detect_id, from_source_id, from_source_row_key, "
+            "to_source_id, to_source_row_key, MIN(candidate_intersection_id) AS candidate_id "
+            "FROM candidate_intersection_events WHERE event_kind = ''orthogonal_cross_track'' "
+            "GROUP BY detect_id, from_source_id, from_source_row_key, "
+            "to_source_id, to_source_row_key) AS m "
+            "WHERE tc.detect_id = m.detect_id "
+            "AND tc.from_source_id = m.from_source_id "
+            "AND tc.from_source_row_key = m.from_source_row_key "
+            "AND tc.to_source_id = m.to_source_id "
+            "AND tc.to_source_row_key = m.to_source_row_key'; "
+            "EXECUTE 'SELECT EXISTS (SELECT 1 FROM candidate_intersection_events AS cie "
+            "WHERE cie.event_kind = ''turn'' AND NOT EXISTS "
+            "(SELECT 1 FROM turn_events AS te WHERE te.detect_id = cie.detect_id "
+            "AND te.id = cie.turn_event_id AND te.candidate_intersection_id = cie.candidate_intersection_id))' "
+            "INTO conflict; "
+            "IF conflict THEN RAISE EXCEPTION 'unmapped turn candidate membership'; END IF; "
+            "EXECUTE 'SELECT EXISTS (SELECT 1 FROM candidate_intersection_events AS cie "
+            "WHERE cie.event_kind = ''orthogonal_cross_track'' AND NOT EXISTS "
+            "(SELECT 1 FROM tracks_cross AS tc WHERE tc.detect_id = cie.detect_id "
+            "AND tc.from_source_id = cie.from_source_id "
+            "AND tc.from_source_row_key = cie.from_source_row_key "
+            "AND tc.to_source_id = cie.to_source_id "
+            "AND tc.to_source_row_key = cie.to_source_row_key "
+            "GROUP BY tc.detect_id HAVING COUNT(*) = 1))' INTO conflict; "
+            "IF conflict THEN RAISE EXCEPTION "
+            "'cross candidate membership is not uniquely mapped'; END IF; "
+            "EXECUTE 'SELECT EXISTS (SELECT 1 FROM candidate_intersection_events AS cie "
+            "WHERE cie.event_kind = ''orthogonal_cross_track'' AND NOT EXISTS "
+            "(SELECT 1 FROM tracks_cross AS tc WHERE tc.detect_id = cie.detect_id "
+            "AND tc.from_source_id = cie.from_source_id "
+            "AND tc.from_source_row_key = cie.from_source_row_key "
+            "AND tc.to_source_id = cie.to_source_id "
+            "AND tc.to_source_row_key = cie.to_source_row_key "
+            "AND tc.candidate_intersection_id = cie.candidate_intersection_id))' INTO conflict; "
+            "IF conflict THEN RAISE EXCEPTION 'unmapped cross candidate membership'; END IF; "
+            "END IF; END $$",
+        ),
+        (
+            "drop_candidate_intersection_events",
+            "DROP TABLE IF EXISTS candidate_intersection_events",
+        ),
+        (
+            "add_candidate_membership_fks",
+            "DO $$ BEGIN "
+            "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+            "WHERE conname = 'turn_events_candidate_intersection_fkey' "
+            "AND conrelid = 'turn_events'::regclass) THEN "
+            "ALTER TABLE turn_events ADD CONSTRAINT turn_events_candidate_intersection_fkey "
+            "FOREIGN KEY (candidate_intersection_id, detect_id) "
+            "REFERENCES candidate_intersections(id, detect_id); END IF; "
+            "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+            "WHERE conname = 'tracks_cross_candidate_intersection_fkey' "
+            "AND conrelid = 'tracks_cross'::regclass) THEN "
+            "ALTER TABLE tracks_cross ADD CONSTRAINT tracks_cross_candidate_intersection_fkey "
+            "FOREIGN KEY (candidate_intersection_id, detect_id) "
+            "REFERENCES candidate_intersections(id, detect_id); END IF; "
+            "END $$",
         ),
         ("replace_cross_unique_index", "DROP INDEX IF EXISTS idx_tc_segment_pair"),
         ("replace_turn_unique_index", "DROP INDEX IF EXISTS idx_te_vehicle_ts"),

@@ -42,7 +42,7 @@ class CleanDetectSchemaContractTest(unittest.TestCase):
             self.assertNotIn("run_id", normalized, table)
         for table in (
             "tracks_cross", "turn_events", "candidate_intersections",
-            "candidate_intersection_events", "candidate_entry_exit_points",
+            "candidate_entry_exit_points",
             "intersections", "entry_exit_points",
         ):
             normalized = " ".join(ddl_by_table[table].split())
@@ -52,10 +52,13 @@ class CleanDetectSchemaContractTest(unittest.TestCase):
         nested = " ".join(
             ddl_by_table[table]
             for table in (
-                "candidate_intersection_events", "candidate_entry_exit_points",
+                "candidate_entry_exit_points",
                 "intersections", "entry_exit_points",
             )
         )
+        self.assertNotIn("candidate_intersection_events", ddl_by_table)
+        for table in ("turn_events", "tracks_cross"):
+            self.assertIn("candidate_intersection_id", ddl_by_table[table])
         self.assertIn("FOREIGN KEY (candidate_intersection_id, detect_id)", nested)
         self.assertIn("REFERENCES candidate_intersections(id, detect_id)", nested)
         self.assertIn("FOREIGN KEY (intersection_id, detect_id)", nested)
@@ -308,7 +311,7 @@ class CleanDetectSchemaContractTest(unittest.TestCase):
             self.assertNotIn("run_id", normalized, table)
         for table in (
             "tracks_cross", "turn_events", "candidate_intersections",
-            "candidate_intersection_events", "candidate_entry_exit_points",
+            "candidate_entry_exit_points",
             "intersections", "entry_exit_points",
         ):
             normalized = " ".join(ddl_by_table[table].split())
@@ -318,10 +321,13 @@ class CleanDetectSchemaContractTest(unittest.TestCase):
         nested = " ".join(
             ddl_by_table[table]
             for table in (
-                "candidate_intersection_events", "candidate_entry_exit_points",
+                "candidate_entry_exit_points",
                 "intersections", "entry_exit_points",
             )
         )
+        self.assertNotIn("candidate_intersection_events", ddl_by_table)
+        for table in ("turn_events", "tracks_cross"):
+            self.assertIn("candidate_intersection_id", ddl_by_table[table])
         self.assertIn("FOREIGN KEY (candidate_intersection_id, detect_id)", nested)
         self.assertIn("REFERENCES candidate_intersections(id, detect_id)", nested)
         self.assertIn("FOREIGN KEY (intersection_id, detect_id)", nested)

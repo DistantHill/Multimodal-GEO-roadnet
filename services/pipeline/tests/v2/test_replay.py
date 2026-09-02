@@ -56,8 +56,10 @@ class _LookupCursor:
         self.executions.append((sql, params))
 
     def fetchall(self) -> list[tuple[int]]:
-        if "candidate_intersection_events" in self.sql:
+        if "FROM turn_events WHERE candidate_intersection_id" in self.sql:
             return [(15,)]
+        if "FROM tracks_cross WHERE candidate_intersection_id" in self.sql:
+            return [(16,)]
         if "candidate_entry_exit_points" in self.sql:
             return [(40,)]
         if "entry_exit_points" in self.sql:
@@ -438,10 +440,9 @@ class ReplayServiceTest(unittest.TestCase):
             ReplayTarget("candidate_intersection", 20, detect_id="detect-1"), {},
         )
         self.assertEqual(store._conn.cursor_.params, (20, "detect-1"))
-        member_parents = store.parent_refs(
-            ReplayTarget("candidate_intersection_event", 15, detect_id="detect-1"),
+        cross_parents = store.parent_refs(
+            ReplayTarget("tracks_cross", 16, detect_id="detect-1"),
             {
-                "turn_event_id": None,
                 "from_source_id": "csv-a",
                 "from_source_row_key": "1",
                 "to_source_id": "csv-b",
@@ -455,10 +456,14 @@ class ReplayServiceTest(unittest.TestCase):
         )
         self.assertEqual(
             {(relation, parent.kind) for relation, parent in candidate_parents},
-            {("member_event", "candidate_intersection_event"), ("crossing", "candidate_entry_exit_point")},
+            {
+                ("member_turn_event", "turn_event"),
+                ("member_cross_event", "tracks_cross"),
+                ("crossing", "candidate_entry_exit_point"),
+            },
         )
         self.assertEqual(
-            {(parent.kind, parent.id) for _, parent in member_parents},
+            {(parent.kind, parent.id) for _, parent in cross_parents},
             {("trajectory_point", 1), ("trajectory_point", 2)},
         )
 

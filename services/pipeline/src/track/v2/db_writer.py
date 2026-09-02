@@ -14,7 +14,6 @@ Usage / 用法::
         insert_injected_points,
         insert_turn_events,
         insert_candidate_intersections,
-        insert_candidate_intersection_events,
         insert_candidate_entry_exit_points,
         insert_intersections,
         insert_entry_exit_points,
@@ -38,7 +37,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from .models import (
     CenterlineFitBundle,
@@ -729,6 +728,9 @@ def insert_tracks_cross(
     candidates: list[CrossTrackCandidate],
     *,
     detect_id: str | None = None,
+    candidate_intersection_ids: Mapping[
+        tuple[str, str, str, str, str], int
+    ] | None = None,
     batch_size: int = _BATCH,
 ) -> int:
     """Persist deduplicated cross-track candidates and return inserted rows."""
@@ -741,7 +743,9 @@ def insert_tracks_cross(
         "from_source_id", "from_source_row_key",
         "to_source_id", "to_source_row_key",
         "generated_reason", "origin_lon", "origin_lat",
+        "candidate_intersection_id",
     ]
+    membership = candidate_intersection_ids or {}
     rows = [
         (
             candidate.vehicle_id,
@@ -759,6 +763,13 @@ def insert_tracks_cross(
             "orthogonal_cross_track",
             candidate.origin_lon,
             candidate.origin_lat,
+            membership.get((
+                candidate.vehicle_id,
+                candidate.from_source_id,
+                candidate.from_source_row_key,
+                candidate.to_source_id,
+                candidate.to_source_row_key,
+            )),
         )
         for candidate in candidates
     ]
@@ -775,6 +786,7 @@ def insert_turn_events(
     origin_lat: float = 0.0,
     *,
     detect_id: str | None = None,
+    candidate_intersection_ids: Mapping[int, int] | None = None,
     batch_size: int = _BATCH,
 ) -> dict[int, int]:
     """Insert turn events, return ``{event_id: db_id}`` mapping."""
@@ -786,8 +798,9 @@ def insert_turn_events(
         "x", "y", "in_bearing", "out_bearing", "turn_deg", "score",
         "source", "tp_source_id", "tp_source_row_key",
         "from_source_id", "from_source_row_key", "to_source_id", "to_source_row_key",
-        "origin_lon", "origin_lat",
+        "origin_lon", "origin_lat", "candidate_intersection_id",
     ]
+    membership = candidate_intersection_ids or {}
     rows: list[tuple[Any, ...]] = []
     for te in turn_events:
         rows.append((
@@ -811,6 +824,7 @@ def insert_turn_events(
             te.to_source_row_key,
             origin_lon,
             origin_lat,
+            membership.get(te.event_id),
         ))
 
     columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
@@ -892,56 +906,6 @@ def insert_candidate_intersections(
         )
     mapping = {cluster_id: db_id for db_id, cluster_id in returned}
     return mapping
-
-
-def insert_candidate_intersection_events(
-    conn: Any,
-    clusters: list[HotspotCluster],
-    ci_id_map: dict[int, int],
-    te_id_map: dict[int, int],
-    *,
-    detect_id: str | None = None,
-    batch_size: int = _BATCH,
-) -> None:
-    """Persist every cluster member with its typed input source pair.
-
-    ``turn_event_id`` is used only for native turn events.  Orthogonal and
-    cross-track members remain distinct rows and point directly to their
-    source pairs, so their local event ids cannot collide with turn-event ids.
-    """
-    rows: list[tuple[Any, ...]] = []
-    for c in clusters:
-        ci_db_id = ci_id_map.get(c.cluster_id)
-        if ci_db_id is None:
-            continue
-        for event in c.events:
-            turn_event_id = (
-                te_id_map.get(event.event_id) if event.source == "turn" else None
-            )
-            from_source_id = event.from_source_id
-            from_source_row_key = event.from_source_row_key
-            if from_source_id is None and event.point_ref is not None:
-                from_source_id = event.point_ref.source_id
-                from_source_row_key = event.point_ref.source_row_key
-            rows.append((
-                ci_db_id,
-                event.source,
-                turn_event_id,
-                from_source_id,
-                from_source_row_key,
-                event.to_source_id,
-                event.to_source_row_key,
-            ))
-
-    if rows:
-        columns = [
-            "candidate_intersection_id", "event_kind", "turn_event_id",
-            "from_source_id", "from_source_row_key",
-            "to_source_id", "to_source_row_key",
-        ]
-        columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
-        with conn.cursor() as cur:
-            _copy_insert(cur, "candidate_intersection_events", columns, rows)
 
 
 def insert_candidate_entry_exit_points(

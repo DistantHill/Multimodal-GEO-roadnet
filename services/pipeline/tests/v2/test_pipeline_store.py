@@ -10,6 +10,7 @@ from track.v2.db.pipeline_store import (
     CleanBatchResult,
     DetectPersistenceResult,
     PostgresPipelineStore,
+    _candidate_memberships,
 )
 from track.v2.models import (
     ClipConfig,
@@ -187,14 +188,23 @@ class PipelineStoreDetectTest(unittest.TestCase):
     def test_persist_detect_uses_fixed_foreign_key_order_and_returns_maps(self) -> None:
         conn = object()
         store = PostgresPipelineStore(conn)
+        turn_member = SimpleNamespace(source="turn", event_id=1)
+        cross_member = SimpleNamespace(
+            source="orthogonal_cross_track",
+            vehicle_id="A|B",
+            from_source_id="table_a",
+            from_source_row_key="1,2",
+            to_source_id="table_b",
+            to_source_row_key="3,4",
+        )
         cluster_a = SimpleNamespace(
             cluster_id=10,
-            events=(object(), object()),
+            events=(turn_member, cross_member),
             crossing_points=(object(),),
         )
         cluster_b = SimpleNamespace(
             cluster_id=20,
-            events=(object(),),
+            events=(),
             crossing_points=(),
         )
         result = SimpleNamespace(
@@ -231,10 +241,6 @@ class PipelineStoreDetectTest(unittest.TestCase):
                 side_effect=record("candidate_intersections", {10: 110, 20: 120}),
             ) as candidate_intersections,
             patch(
-                "track.v2.db.pipeline_store.insert_candidate_intersection_events",
-                side_effect=record("candidate_intersection_events", None),
-            ) as candidate_intersection_events,
-            patch(
                 "track.v2.db.pipeline_store.insert_candidate_entry_exit_points",
                 side_effect=record("candidate_entry_exit_points", {(10, 1): 1001}),
             ) as candidate_entry_exit_points,
@@ -252,10 +258,9 @@ class PipelineStoreDetectTest(unittest.TestCase):
         self.assertEqual(
             events,
             [
+                "candidate_intersections",
                 "tracks_cross",
                 "turn_events",
-                "candidate_intersections",
-                "candidate_intersection_events",
                 "candidate_entry_exit_points",
                 "intersections",
                 "entry_exit_points",
@@ -271,21 +276,25 @@ class PipelineStoreDetectTest(unittest.TestCase):
                 intersection_ids={10: 111},
                 turn_event_count=2,
                 candidate_intersection_count=2,
-                candidate_intersection_event_count=3,
                 candidate_entry_exit_point_count=1,
                 intersection_count=1,
                 entry_exit_point_count=1,
             ),
         )
         tracks_cross.assert_called_once_with(
-            conn, result.cross_track_candidates, detect_id="detect-1", batch_size=17,
-        )
-        candidate_intersection_events.assert_called_once_with(
             conn,
-            result.clusters,
-            {10: 110, 20: 120},
-            {1: 101},
+            result.cross_track_candidates,
             detect_id="detect-1",
+            candidate_intersection_ids={
+                ("A|B", "table_a", "1,2", "table_b", "3,4"): 110,
+            },
+            batch_size=17,
+        )
+        turn_events.assert_called_once_with(
+            conn,
+            result.turn_events,
+            detect_id="detect-1",
+            candidate_intersection_ids={1: 110},
             batch_size=17,
         )
         intersections.assert_called_once_with(
@@ -304,6 +313,14 @@ class PipelineStoreDetectTest(unittest.TestCase):
             batch_size=17,
         )
 
+    def test_orthogonal_member_without_detect_entity_is_not_assigned(self) -> None:
+        cluster = SimpleNamespace(
+            cluster_id=10,
+            events=(SimpleNamespace(source="orthogonal"),),
+        )
+
+        self.assertEqual(_candidate_memberships([cluster], {10: 110}), ({}, {}))
+
     def test_detect_writer_error_propagates_without_later_calls(self) -> None:
         conn = object()
         store = PostgresPipelineStore(conn)
@@ -315,6 +332,10 @@ class PipelineStoreDetectTest(unittest.TestCase):
             observations=[],
         )
         with (
+            patch(
+                "track.v2.db.pipeline_store.insert_candidate_intersections",
+                return_value={},
+            ),
             patch(
                 "track.v2.db.pipeline_store.insert_tracks_cross",
                 side_effect=RuntimeError("detect failed"),
