@@ -786,25 +786,29 @@ def insert_turn_events(
     origin_lat: float = 0.0,
     *,
     detect_id: str | None = None,
-    candidate_intersection_ids: Mapping[int, int] | None = None,
+    candidate_intersection_ids_by_calculate_index: Mapping[int, int] | None = None,
     batch_size: int = _BATCH,
-) -> dict[int, int]:
-    """Insert turn events, return ``{event_id: db_id}`` mapping."""
+) -> int:
+    """Insert turn events and return the inserted row count.
+
+    PostgreSQL ``turn_events.id`` is the sole persisted event identifier.  The
+    calculation index is used only to attach in-memory cluster membership
+    before COPY and is not written to the table.
+    """
     if not turn_events:
-        return {}
+        return 0
 
     columns = [
-        "event_id", "vehicle_id", "timestamp", "lon", "lat",
+        "vehicle_id", "timestamp", "lon", "lat",
         "x", "y", "in_bearing", "out_bearing", "turn_deg", "score",
         "source", "tp_source_id", "tp_source_row_key",
         "from_source_id", "from_source_row_key", "to_source_id", "to_source_row_key",
         "origin_lon", "origin_lat", "candidate_intersection_id",
     ]
-    membership = candidate_intersection_ids or {}
+    membership = candidate_intersection_ids_by_calculate_index or {}
     rows: list[tuple[Any, ...]] = []
     for te in turn_events:
         rows.append((
-            te.event_id,
             te.vehicle_id,
             te.timestamp,
             te.lon,
@@ -824,18 +828,13 @@ def insert_turn_events(
             te.to_source_row_key,
             origin_lon,
             origin_lat,
-            membership.get(te.event_id),
+            membership.get(te.event_calculate_index),
         ))
 
     columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
     with conn.cursor() as cur:
         _copy_insert(cur, "turn_events", columns, rows)
-        cur.execute(
-            "SELECT id, event_id FROM turn_events WHERE detect_id = %s",
-            (detect_id,),
-        )
-        returned = cur.fetchall()
-    return {int(event_id): int(db_id) for db_id, event_id in returned}
+    return len(rows)
 
 
 def insert_candidate_intersections(

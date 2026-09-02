@@ -716,7 +716,9 @@ def _stream_extract_methods_1_2(
             # ── Flush batch ──
             if cfg.use_turn_events:
                 for te in _detect_turn_events(batch, origin_lon, origin_lat, cfg, perf=perf):
-                    turn_events.append(replace(te, event_id=len(turn_events)))
+                    turn_events.append(replace(
+                        te, event_calculate_index=len(turn_events),
+                    ))
             if cfg.use_orthogonal_candidates:
                 ortho_candidates.extend(
                     _extract_orthogonal_candidates(batch, origin_lon, origin_lat, perf=perf)
@@ -738,7 +740,9 @@ def _stream_extract_methods_1_2(
     if batch:
         if cfg.use_turn_events:
             for te in _detect_turn_events(batch, origin_lon, origin_lat, cfg, perf=perf):
-                turn_events.append(replace(te, event_id=len(turn_events)))
+                turn_events.append(replace(
+                    te, event_calculate_index=len(turn_events),
+                ))
         if cfg.use_orthogonal_candidates:
             ortho_candidates.extend(
                 _extract_orthogonal_candidates(batch, origin_lon, origin_lat, perf=perf)
@@ -1469,7 +1473,7 @@ def _detect_turn_events(
                 p = track[i]
                 events.append(
                     TurnEvent(
-                        event_id=len(events),
+                        event_calculate_index=len(events),
                         vehicle_id=vehicle_id,
                         timestamp=p.timestamp,
                         lon=p.lon,
@@ -1510,7 +1514,7 @@ def _compute_getis_ord_g_star(
     live_status: Any = None,
     perf: PerfTracker | None = None,
 ) -> dict[int, float]:
-    """Return {event_id: z_score} for Getis-Ord G* spatial concentration.
+    """Return {event_calculate_index: z_score} for G* spatial concentration.
 
     Uses a binary intensity model: each event contributes 1.0 to local
     count if within ``radius_m``. Since TurnEvent is frozen, z-scores
@@ -1523,7 +1527,7 @@ def _compute_getis_ord_g_star(
     """
     n = len(events)
     if n < 2:
-        return {e.event_id: 0.0 for e in events}
+        return {e.event_calculate_index: 0.0 for e in events}
 
     t0 = time.perf_counter()
     last_t = t0
@@ -1544,10 +1548,10 @@ def _compute_getis_ord_g_star(
     std = math.sqrt(max(variance, 0.0))
 
     if std == 0.0:
-        return {e.event_id: 0.0 for e in events}
+        return {e.event_calculate_index: 0.0 for e in events}
 
     return {
-        e.event_id: (lc - mean) / std
+        e.event_calculate_index: (lc - mean) / std
         for e, lc in zip(events, local_counts)
     }
 
@@ -1718,7 +1722,7 @@ def _select_hotspot_events(
     result = [
         e
         for e in events
-        if z_scores.get(e.event_id, 0.0) >= cfg.g_star_min_z
+        if z_scores.get(e.event_calculate_index, 0.0) >= cfg.g_star_min_z
         and abs(e.turn_deg) >= cfg.min_turn_deg
     ]
     log_info(f"── 热点筛选: {len(result):,} 事件/events ({time.perf_counter() - t0:.1f}s)")
@@ -2236,7 +2240,7 @@ def _cluster_orthogonal_candidates(
         lon, lat = _to_lonlat(cx, cy, origin_lon, origin_lat)
         cluster_events = tuple(
             TurnEvent(
-                event_id=i,
+                event_calculate_index=i,
                 vehicle_id=c.vehicle_id,
                 timestamp=c.timestamp,
                 lon=c.lon,
@@ -2312,7 +2316,7 @@ def _cluster_orthogonal_cross_track_candidates(
         lon, lat = _to_lonlat(cx, cy, origin_lon, origin_lat)
         cluster_events = tuple(
             TurnEvent(
-                event_id=i,
+                event_calculate_index=i,
                 vehicle_id=c.vehicle_id,
                 timestamp=c.timestamp,
                 lon=c.lon,

@@ -272,6 +272,13 @@ class ReplayServiceTest(unittest.TestCase):
                 clean_id=None, detect_id=None,
             ),
         )
+        centerline = _target_from_args(
+            parser,
+            SimpleNamespace(
+                kind="centerline", id=10,
+                clean_id=None, detect_id=None,
+            ),
+        )
 
         self.assertEqual(clean, ReplayTarget("kept_trajectory_point", 7, clean_id="clean-1"))
         self.assertEqual(detect, ReplayTarget("intersection", 8, detect_id="detect-1"))
@@ -440,6 +447,19 @@ class ReplayServiceTest(unittest.TestCase):
             ReplayTarget("candidate_intersection", 20, detect_id="detect-1"), {},
         )
         self.assertEqual(store._conn.cursor_.params, (20, "detect-1"))
+        turn_event_queries = [
+            (sql, params)
+            for sql, params in store._conn.cursor_.executions
+            if "FROM turn_events WHERE candidate_intersection_id" in sql
+        ]
+        self.assertEqual(
+            turn_event_queries,
+            [(
+                "SELECT id FROM turn_events WHERE candidate_intersection_id = %s "
+                "AND detect_id = %s ORDER BY id",
+                (20, "detect-1"),
+            )],
+        )
         cross_parents = store.parent_refs(
             ReplayTarget("tracks_cross", 16, detect_id="detect-1"),
             {

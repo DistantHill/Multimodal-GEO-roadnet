@@ -409,10 +409,11 @@ class TurnEvent(TrackModel):
     """Turn event detected at one trajectory point via bearing change.
 
     v2 differs from v1: no ``scenario`` field (not present on v2 TrajectoryPoint),
-    and no mutable ``g_star`` (z-scores stored in a separate dict).
+    and no mutable ``g_star`` (z-scores stored in a separate dict).  The
+    calculation index is transient and is never persisted as an event ID.
     """
 
-    event_id: int
+    event_calculate_index: int
     vehicle_id: str
     timestamp: float
     lon: float

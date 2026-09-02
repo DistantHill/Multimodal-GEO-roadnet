@@ -89,7 +89,6 @@ class _ConfigRecordingStore:
     def persist_detect(self, *args: object, **kwargs: object) -> DetectPersistenceResult:
         return DetectPersistenceResult(
             tracks_cross_count=0,
-            turn_event_ids={},
             candidate_intersection_ids={},
             candidate_entry_exit_ids={},
             intersection_ids={},

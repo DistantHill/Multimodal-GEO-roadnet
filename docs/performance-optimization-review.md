@@ -84,8 +84,11 @@ Detect append-only artifacts that do not require immediate generated-ID
 mapping use PostgreSQL COPY:
 
 - `tracks_cross`;
-- `turn_events` (followed by one run-scoped ID-map read);
+- `turn_events`;
 - `entry_exit_points`.
+
+`turn_events.id` is the sole persisted event identifier.  Its calculation
+index exists only in memory, so COPY no longer needs a run-scoped ID-map read.
 
 Candidate membership is stored directly on `turn_events` and `tracks_cross`
 through `candidate_intersection_id`; there is no separate membership table.

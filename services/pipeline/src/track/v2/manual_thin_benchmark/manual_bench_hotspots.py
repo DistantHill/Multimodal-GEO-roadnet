@@ -23,7 +23,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from typing import Any
 
 
@@ -82,9 +82,25 @@ def _event_rows(case_id: str) -> tuple[list[list[float | int | str]], dict[str, 
     config = {"g_star_radius_m": radius, "g_star_min_z": 0.5, "min_turn_deg": 45.0}
     rows: list[list[float | int | str]] = []
 
-    def add(event_id: int, x: float, y: float, turn: float = 90.0) -> None:
-        rows.append([event_id, f"v{event_id % 97}", 1_700_000_000 + event_id,
-                     116.0, 39.0, x, y, 0.0, 90.0, 90.0 + turn, turn])
+    def add(
+        event_calculate_index: int,
+        x: float,
+        y: float,
+        turn: float = 90.0,
+    ) -> None:
+        rows.append([
+            event_calculate_index,
+            f"v{event_calculate_index % 97}",
+            1_700_000_000 + event_calculate_index,
+            116.0,
+            39.0,
+            x,
+            y,
+            0.0,
+            90.0,
+            90.0 + turn,
+            turn,
+        ])
 
     if case_id == GATE_CASE_ID:
         # 4 compact islands (4,800) plus 3,200 deliberately isolated points.
@@ -211,6 +227,18 @@ def _child(source: Path, source_commit: str, lock_digest: str, expected_python: 
     from track.v2.intersect2 import IntersectConfig, _compute_getis_ord_g_star, _select_hotspot_events
     from track.v2.models import TurnEvent
 
+    # Archived baselines use an older name for TurnEvent's first, transient
+    # calculation-index field. Resolve that field structurally, then emit the
+    # current canonical key so a rename alone cannot create a snapshot diff.
+    calculate_index_field = fields(TurnEvent)[0].name
+
+    def turn_event_record(event: TurnEvent) -> dict[str, Any]:
+        record = asdict(event)
+        return {
+            "event_calculate_index": record.pop(calculate_index_field),
+            **record,
+        }
+
     if real_snapshot is None:
         rows, cfg_values = _event_rows(case_id)
         events = [TurnEvent(*row) for row in rows]
@@ -219,7 +247,11 @@ def _child(source: Path, source_commit: str, lock_digest: str, expected_python: 
         payload = json.loads(real_snapshot.read_text(encoding="utf-8"))
         rows = payload["turn_events"]
         cfg_values = payload["config"]
-        events = [TurnEvent(**row) for row in rows]
+        events = []
+        for row in rows:
+            values = dict(row)
+            calculate_index = values.pop("event_calculate_index")
+            events.append(TurnEvent(calculate_index, **values))
         input_sha256 = _sha256_bytes(_json_bytes(rows))
     cfg = IntersectConfig(**cfg_values)
     if floor:
@@ -265,18 +297,30 @@ def _child(source: Path, source_commit: str, lock_digest: str, expected_python: 
     # A deliberately separate pure filtering pass over the same frozen
     # z-score mapping.  Do not infer it by subtracting unrelated calls.
     filter_started = time.perf_counter()
-    filtered_ids = [
-        event.event_id for event in events
-        if z_scores.get(event.event_id, 0.0) >= cfg.g_star_min_z
+    filtered_indexes = [
+        getattr(event, calculate_index_field) for event in events
+        if z_scores.get(getattr(event, calculate_index_field), 0.0) >= cfg.g_star_min_z
         and abs(event.turn_deg) >= cfg.min_turn_deg
     ]
     filter_seconds = time.perf_counter() - filter_started
-    if filtered_ids != [event.event_id for event in selected]:
+    if filtered_indexes != [
+        getattr(event, calculate_index_field) for event in selected
+    ]:
         raise AssertionError("pure filtering diverged from production selection")
     serialization_started = time.perf_counter()
-    selected_ids = [event.event_id for event in selected]
-    serialized = json.dumps({"z_scores": [[event.event_id, z_scores[event.event_id]] for event in events],
-                             "selected": selected_ids}, separators=(",", ":"))
+    selected_indexes = [
+        getattr(event, calculate_index_field) for event in selected
+    ]
+    serialized = json.dumps({
+        "z_scores": [
+            [
+                getattr(event, calculate_index_field),
+                z_scores[getattr(event, calculate_index_field)],
+            ]
+            for event in events
+        ],
+        "selected": selected_indexes,
+    }, separators=(",", ":"))
     serialization_seconds = time.perf_counter() - serialization_started
     if snapshot:
         phase_timings = phase_timings or {}
@@ -306,9 +350,15 @@ def _child(source: Path, source_commit: str, lock_digest: str, expected_python: 
         "input_sha256": input_sha256,
         "local_counts": counts,
         "count_source": count_source,
-        "turn_event_records": [asdict(event) for event in events],
-        "z_scores": [[event.event_id, z_scores[event.event_id]] for event in events],
-        "selected": selected_ids,
+        "turn_event_records": [turn_event_record(event) for event in events],
+        "z_scores": [
+            [
+                getattr(event, calculate_index_field),
+                z_scores[getattr(event, calculate_index_field)],
+            ]
+            for event in events
+        ],
+        "selected": selected_indexes,
         "wall_seconds": timings,
         "wall_batch_seconds": timing_batch_seconds,
         "timing_repetitions": repetitions,

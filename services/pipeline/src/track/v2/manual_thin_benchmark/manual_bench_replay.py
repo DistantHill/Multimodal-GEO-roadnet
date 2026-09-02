@@ -98,10 +98,10 @@ def _seed_candidate_chain(
         candidate_id = int(cur.fetchone()[0])
         cur.execute(
             "INSERT INTO turn_events "
-            "(detect_id, candidate_intersection_id, event_id, vehicle_id, timestamp, "
+            "(detect_id, candidate_intersection_id, vehicle_id, timestamp, "
             "lon, lat, x, y, in_bearing, out_bearing, turn_deg, score, "
             "from_source_id, from_source_row_key, origin_lon, origin_lat) "
-            "VALUES (%s, %s, 1, 'bench', 0, 116.0, 39.0, 0, 0, 0, 90, 90, 90, "
+            "VALUES (%s, %s, 'bench', 0, 116.0, 39.0, 0, 0, 0, 90, 90, 90, "
             "%s, %s, 116.0, 39.0)",
             (detect_id, candidate_id, source_id, source_row_key),
         )

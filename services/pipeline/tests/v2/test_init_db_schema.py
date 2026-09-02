@@ -13,6 +13,7 @@ from track.v2.cli.init_db import (
     DDL_STATEMENTS,
     INDEX_STATEMENTS,
     _auto_add_missing_columns,
+    _run_migrations,
     build_auto_migrations,
     column_to_alter_fragment,
     parse_ddl_columns,
@@ -643,6 +644,45 @@ class ParseRealDDLTest(unittest.TestCase):
                     len(cols), 2,
                     f"{name}: expected >= 2 non-generated, non-serial columns"
                 )
+
+
+class _MigrationRecordingCursor:
+    def __init__(self) -> None:
+        self.executed: list[str] = []
+
+    def execute(self, sql: str, params: tuple[object, ...] = ()) -> None:
+        self.executed.append(" ".join(sql.split()))
+
+    @property
+    def statusmessage(self) -> str:
+        return "OK"
+
+
+class TurnEventIdentitySchemaTest(unittest.TestCase):
+    def test_turn_events_has_no_persisted_calculation_index(self) -> None:
+        columns = parse_ddl_columns(dict(DDL_STATEMENTS)["turn_events"])
+        index_names = {name for name, _sql in INDEX_STATEMENTS}
+
+        self.assertNotIn("event_id", columns)
+        self.assertNotIn("idx_te_event_id", index_names)
+
+    def test_structural_migration_drops_event_index_before_event_column(self) -> None:
+        cur = _MigrationRecordingCursor()
+
+        _run_migrations(cur)
+
+        event_id_removals = [
+            sql
+            for sql in cur.executed
+            if "idx_te_event_id" in sql or "DROP COLUMN IF EXISTS event_id" in sql
+        ]
+        self.assertEqual(
+            event_id_removals,
+            [
+                "DROP INDEX IF EXISTS idx_te_event_id",
+                "ALTER TABLE turn_events DROP COLUMN IF EXISTS event_id",
+            ],
+        )
 
 
 class TurnEventProvenanceSchemaTest(unittest.TestCase):

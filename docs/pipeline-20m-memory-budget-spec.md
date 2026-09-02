@@ -200,8 +200,6 @@ M_cleaner ≈ base
 - 公共 [`clean()`](../services/pipeline/src/track/v2/cleaner.py) 会累积所有 active、
   excluded 和 subtracks，12,317,500 active points 粗估约 4.5–7 GiB，禁止用于
   20M DB Pipeline；
-- `clean_vehicle` 当前对当前 subtrack 的 `excluded_points` 执行 self-extend，
-  同时覆盖先前 subtrack exclusions，既造成瞬时 2× 引用也属于正确性问题；
 - [`PostgresPipelineStore.persist_clean_batch`](../services/pipeline/src/track/v2/db/pipeline_store.py)
   当前直接清空 `pending_excluded` 而没有持久化；1M 的 zero-exclusion 数据恰好掩盖
   了这个正确性问题；
@@ -220,7 +218,7 @@ M_cleaner ≈ base
   look-behind；
 - 超过单车硬上限的 undecided stationary run 写入外存，不允许继续扩大 Python list；
 - kept/injected/excluded 使用生成器直接 COPY，禁止构造第二份 stage-ID row list；
-- 修复 exclusion 累积并真正写入 `excluded_points`；非零 exclusion 必须有持久化
+- 真正写入 `excluded_points`；非零 exclusion 必须有持久化
   回归测试；
 - 计时外 `COUNT(*)` 必须等于 20,000,000；流结束后 `ReadReport.total_rows` 也必须
   等于 20,000,000，且 `loaded_rows + skipped_rows = total_rows`。本合同要求 Cleaner

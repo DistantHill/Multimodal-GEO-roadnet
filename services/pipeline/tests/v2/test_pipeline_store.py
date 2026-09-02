@@ -188,7 +188,7 @@ class PipelineStoreDetectTest(unittest.TestCase):
     def test_persist_detect_uses_fixed_foreign_key_order_and_returns_maps(self) -> None:
         conn = object()
         store = PostgresPipelineStore(conn)
-        turn_member = SimpleNamespace(source="turn", event_id=1)
+        turn_member = SimpleNamespace(source="turn", event_calculate_index=1)
         cross_member = SimpleNamespace(
             source="orthogonal_cross_track",
             vehicle_id="A|B",
@@ -234,7 +234,7 @@ class PipelineStoreDetectTest(unittest.TestCase):
             ) as tracks_cross,
             patch(
                 "track.v2.db.pipeline_store.insert_turn_events",
-                side_effect=record("turn_events", {1: 101}),
+                side_effect=record("turn_events", 2),
             ) as turn_events,
             patch(
                 "track.v2.db.pipeline_store.insert_candidate_intersections",
@@ -270,7 +270,6 @@ class PipelineStoreDetectTest(unittest.TestCase):
             persisted,
             DetectPersistenceResult(
                 tracks_cross_count=7,
-                turn_event_ids={1: 101},
                 candidate_intersection_ids={10: 110, 20: 120},
                 candidate_entry_exit_ids={(10, 1): 1001},
                 intersection_ids={10: 111},
@@ -294,7 +293,7 @@ class PipelineStoreDetectTest(unittest.TestCase):
             conn,
             result.turn_events,
             detect_id="detect-1",
-            candidate_intersection_ids={1: 110},
+            candidate_intersection_ids_by_calculate_index={1: 110},
             batch_size=17,
         )
         intersections.assert_called_once_with(

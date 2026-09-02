@@ -124,19 +124,19 @@ def _run_exclusive_phases(
     )
     std = math.sqrt(max(variance, 0.0))
     if std == 0.0:
-        z_scores = {event.event_id: 0.0 for event in events}
+        z_scores = {event.event_calculate_index: 0.0 for event in events}
     else:
         z_scores = {
-            event.event_id: (count - mean) / std
+            event.event_calculate_index: (count - mean) / std
             for event, count in zip(events, local_counts)
         }
     z_score_seconds = time.perf_counter() - phase_started
 
     phase_started = time.perf_counter()
-    selected_ids = [
-        event.event_id
+    selected_indexes = [
+        event.event_calculate_index
         for event in events
-        if z_scores.get(event.event_id, 0.0) >= cfg.g_star_min_z
+        if z_scores.get(event.event_calculate_index, 0.0) >= cfg.g_star_min_z
         and abs(event.turn_deg) >= cfg.min_turn_deg
     ]
     selection_seconds = time.perf_counter() - phase_started
@@ -145,9 +145,13 @@ def _run_exclusive_phases(
     serialized = json.dumps(
         {
             "z_scores": [
-                [event.event_id, z_scores[event.event_id]] for event in events
+                [
+                    event.event_calculate_index,
+                    z_scores[event.event_calculate_index],
+                ]
+                for event in events
             ],
-            "selected": selected_ids,
+            "selected": selected_indexes,
         },
         separators=(",", ":"),
     )
@@ -163,7 +167,7 @@ def _run_exclusive_phases(
     outputs = {
         "local_counts": local_counts,
         "z_scores": z_scores,
-        "selected_ids": selected_ids,
+        "selected_indexes": selected_indexes,
         "serialized_sha256": _sha256_bytes(serialized.encode()),
     }
     return timings, outputs
@@ -283,7 +287,9 @@ def _main(args: argparse.Namespace) -> int:
         raise AssertionError("diagnostic radius counts differ from production")
     if production_z_scores != last_outputs["z_scores"]:
         raise AssertionError("diagnostic z-scores differ from production")
-    if [event.event_id for event in production_selected] != last_outputs["selected_ids"]:
+    if [
+        event.event_calculate_index for event in production_selected
+    ] != last_outputs["selected_indexes"]:
         raise AssertionError("diagnostic selection differs from production")
 
     median_exclusive = {
@@ -321,9 +327,9 @@ def _main(args: argparse.Namespace) -> int:
             "exclusive_order": list(PHASES),
             "grid_index_scope": "cell-bound calculation plus cell-index construction",
             "radius_count_scope": "candidate-cell enumeration plus exact squared-distance comparisons",
-            "z_score_scope": "mean, variance, standard deviation, and event-id score mapping from precomputed counts",
+            "z_score_scope": "mean, variance, standard deviation, and calculation-index score mapping from precomputed counts",
             "selection_scope": "pure threshold and turn-angle filtering from precomputed scores",
-            "serialization_scope": "JSON construction and encoding of scores and selected ids",
+            "serialization_scope": "JSON construction and encoding of scores and selected calculation indexes",
             "excluded_overlap": "production validation reruns grid, z-score, and selection after measurement; validation_seconds is excluded from all phase and total values",
         },
         "parameters": {"warmups": 1, "runs": args.runs},
@@ -345,13 +351,16 @@ def _main(args: argparse.Namespace) -> int:
             "z_scores_sha256": _sha256_bytes(
                 _json_bytes(
                     [
-                        [event.event_id, last_outputs["z_scores"][event.event_id]]
+                        [
+                            event.event_calculate_index,
+                            last_outputs["z_scores"][event.event_calculate_index],
+                        ]
                         for event in events
                     ]
                 )
             ),
-            "selected_ids_sha256": _sha256_bytes(
-                _json_bytes(last_outputs["selected_ids"])
+            "selected_indexes_sha256": _sha256_bytes(
+                _json_bytes(last_outputs["selected_indexes"])
             ),
             "serialized_sha256": last_outputs["serialized_sha256"],
         },

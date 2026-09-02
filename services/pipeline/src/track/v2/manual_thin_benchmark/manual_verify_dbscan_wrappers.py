@@ -14,7 +14,7 @@ from pathlib import Path
 
 _CHILD = r'''
 import hashlib, json, sys
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 from track.v2.intersect2 import (_cluster_dbscan, _cluster_orthogonal_candidates,
     _cluster_orthogonal_cross_track_candidates)
@@ -35,10 +35,19 @@ cross = [CrossTrackCandidate(PointRef("a_source", str(i), stable=True), f"a|b-{i
                    3000.0+i, origin_lon, origin_lat, float(i), float(i), 0.0, 10.0,
                    "a_source", f"{i}a,{i}b", "b_source", f"{i}c,{i}d", origin_lon, origin_lat)
                    for i in range(4)]
+
+# Canonicalize the transient first field across archived/current models.
+calculate_index_field = fields(TurnEvent)[0].name
+def cluster_record(cluster):
+    record = asdict(cluster)
+    for event in record["events"]:
+        event["event_calculate_index"] = event.pop(calculate_index_field)
+    return record
+
 value = {
- "turn": [asdict(cluster) for cluster in _cluster_dbscan(turns, origin_lon, origin_lat, eps_m=100.0, min_samples=3)],
- "orthogonal": [asdict(cluster) for cluster in _cluster_orthogonal_candidates(orthogonal, origin_lon, origin_lat, eps_m=100.0, min_samples=3)],
- "cross_track": [asdict(cluster) for cluster in _cluster_orthogonal_cross_track_candidates(cross, origin_lon, origin_lat, eps_m=100.0, min_samples=3)],
+ "turn": [cluster_record(cluster) for cluster in _cluster_dbscan(turns, origin_lon, origin_lat, eps_m=100.0, min_samples=3)],
+ "orthogonal": [cluster_record(cluster) for cluster in _cluster_orthogonal_candidates(orthogonal, origin_lon, origin_lat, eps_m=100.0, min_samples=3)],
+ "cross_track": [cluster_record(cluster) for cluster in _cluster_orthogonal_cross_track_candidates(cross, origin_lon, origin_lat, eps_m=100.0, min_samples=3)],
 }
 tree=Path.cwd()
 print(json.dumps({"snapshot": value, "source_tree": str(tree),

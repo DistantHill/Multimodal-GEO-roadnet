@@ -161,7 +161,6 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             id                  BIGSERIAL PRIMARY KEY,
             detect_id           UUID NOT NULL REFERENCES detect_runs(id),
             candidate_intersection_id BIGINT,
-            event_id            INTEGER NOT NULL,
             vehicle_id          TEXT NOT NULL,
             timestamp           DOUBLE PRECISION NOT NULL,
             lon                 DOUBLE PRECISION NOT NULL,
@@ -376,7 +375,6 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     ("idx_tc_segment_pair",    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tc_segment_pair ON tracks_cross (detect_id, vehicle_id, from_source_id, from_source_row_key, to_source_id, to_source_row_key)"),
     ("idx_tc_candidate",       "CREATE INDEX IF NOT EXISTS idx_tc_candidate ON tracks_cross(detect_id, candidate_intersection_id) WHERE candidate_intersection_id IS NOT NULL"),
     # ── turn_events ──
-    ("idx_te_event_id",        "CREATE INDEX IF NOT EXISTS idx_te_event_id ON turn_events(event_id)"),
     ("idx_te_vehicle_ts",      "CREATE UNIQUE INDEX IF NOT EXISTS idx_te_vehicle_ts ON turn_events(detect_id, vehicle_id, timestamp)"),
     ("idx_te_detect_id",       "CREATE INDEX IF NOT EXISTS idx_te_detect_id ON turn_events(detect_id)"),
     ("idx_te_source",          "CREATE INDEX IF NOT EXISTS idx_te_source ON turn_events(source)"),
@@ -701,6 +699,14 @@ def _run_migrations(cur: Any) -> None:
         (
             "drop_candidate_intersection_events",
             "DROP TABLE IF EXISTS candidate_intersection_events",
+        ),
+        (
+            "drop_turn_event_event_id_index",
+            "DROP INDEX IF EXISTS idx_te_event_id",
+        ),
+        (
+            "drop_turn_event_event_id_column",
+            "ALTER TABLE turn_events DROP COLUMN IF EXISTS event_id",
         ),
         (
             "add_candidate_membership_fks",

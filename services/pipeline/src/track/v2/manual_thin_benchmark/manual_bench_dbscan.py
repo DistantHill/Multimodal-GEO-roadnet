@@ -111,7 +111,7 @@ def _gate_manifest(case: Case) -> dict[str, object]:
 
 _CHILD = r'''
 import ctypes, ctypes.wintypes, hashlib, json, os, sys, time, io, contextlib
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 from track.v2.intersect2 import _cluster_dbscan, _neighbors_indices, _run_dbscan
 try:
@@ -152,7 +152,14 @@ elif mode == "phase_diagnostic":
     start=time.perf_counter(); labels=_run_dbscan(request["xs"], request["ys"], eps_m=request["eps_m"], min_samples=request["min_samples"]); stages["dbscan_inclusive_s"]=time.perf_counter()-start
     events=[TurnEvent(i, f"bench-{i}", float(i), 116.0, 39.0, x, y, 0.0, 90.0, 90.0, 1.0, point_ref=PointRef("bench", str(i), stable=True)) for i,(x,y) in enumerate(zip(request["xs"],request["ys"]))]
     start=time.perf_counter(); clusters=_cluster_dbscan(events, 116.0, 39.0, eps_m=request["eps_m"], min_samples=request["min_samples"]); stages["wrapper_inclusive_s"]=time.perf_counter()-start
-    start=time.perf_counter(); serialized=json.dumps([asdict(c) for c in clusters], sort_keys=True, separators=(",",":")); stages["serialization_s"]=time.perf_counter()-start
+    # Canonicalize the transient first field across archived/current models.
+    calculate_index_field=fields(TurnEvent)[0].name
+    def cluster_record(cluster):
+        record=asdict(cluster)
+        for event in record["events"]:
+            event["event_calculate_index"]=event.pop(calculate_index_field)
+        return record
+    start=time.perf_counter(); serialized=json.dumps([cluster_record(c) for c in clusters], sort_keys=True, separators=(",",":")); stages["serialization_s"]=time.perf_counter()-start
     diagnostic={"verbose": "build, full neighbor sweep, DBSCAN inclusive, wrapper inclusive, serialization", "stages": stages, "neighbor_count": neighbor_count, "serialized_bytes": len(serialized), "n": len(request["xs"])}
     print("VERBOSE phase diagnostic: build, full neighbor sweep, DBSCAN inclusive, wrapper inclusive, serialization")
 else:

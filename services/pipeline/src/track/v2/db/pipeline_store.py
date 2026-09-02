@@ -60,7 +60,6 @@ class DetectPersistenceResult:
     """Counts and database-id maps needed by the rest of the runner."""
 
     tracks_cross_count: int
-    turn_event_ids: dict[int, int]
     candidate_intersection_ids: dict[int, int]
     candidate_entry_exit_ids: dict[tuple[int, int], int]
     intersection_ids: dict[int, int]
@@ -79,7 +78,7 @@ def _candidate_memberships(
     dict[tuple[str, str, str, str, str], int],
 ]:
     """Build exclusive A/C child-to-candidate assignments."""
-    turn_membership: dict[int, int] = {}
+    turn_membership_by_calculate_index: dict[int, int] = {}
     cross_membership: dict[tuple[str, str, str, str, str], int] = {}
 
     def assign(mapping: dict[Any, int], key: Any, candidate_id: int) -> None:
@@ -97,7 +96,11 @@ def _candidate_memberships(
             continue
         for event in cluster.events:
             if event.source == "turn":
-                assign(turn_membership, event.event_id, candidate_id)
+                assign(
+                    turn_membership_by_calculate_index,
+                    event.event_calculate_index,
+                    candidate_id,
+                )
             elif event.source == "orthogonal_cross_track":
                 key = (
                     event.vehicle_id,
@@ -111,7 +114,7 @@ def _candidate_memberships(
             # Detect-level A/C row on which to store reverse membership.
             elif event.source != "orthogonal":
                 raise ValueError(f"unsupported candidate event source: {event.source}")
-    return turn_membership, cross_membership
+    return turn_membership_by_calculate_index, cross_membership
 
 
 class PipelineStore(Protocol):
@@ -325,7 +328,7 @@ class PostgresPipelineStore:
             result.clusters,
             detect_id=detect_id,
         )
-        turn_membership, cross_membership = _candidate_memberships(
+        turn_membership_by_calculate_index, cross_membership = _candidate_memberships(
             result.clusters,
             candidate_intersection_ids,
         )
@@ -336,11 +339,13 @@ class PostgresPipelineStore:
             candidate_intersection_ids=cross_membership,
             batch_size=batch_size,
         )
-        turn_event_ids = insert_turn_events(
+        turn_event_count = insert_turn_events(
             self._conn,
             result.turn_events,
             detect_id=detect_id,
-            candidate_intersection_ids=turn_membership,
+            candidate_intersection_ids_by_calculate_index=(
+                turn_membership_by_calculate_index
+            ),
             batch_size=batch_size,
         )
         candidate_entry_exit_ids = insert_candidate_entry_exit_points(
@@ -368,11 +373,10 @@ class PostgresPipelineStore:
         )
         return DetectPersistenceResult(
             tracks_cross_count=tracks_cross_count,
-            turn_event_ids=turn_event_ids,
             candidate_intersection_ids=candidate_intersection_ids,
             candidate_entry_exit_ids=candidate_entry_exit_ids,
             intersection_ids=intersection_ids,
-            turn_event_count=len(result.turn_events),
+            turn_event_count=turn_event_count,
             candidate_intersection_count=len(result.clusters),
             candidate_entry_exit_point_count=sum(
                 len(cluster.crossing_points) for cluster in result.clusters

@@ -37,7 +37,7 @@ from .models import (
     TrackModel,
     TrajectoryPoint,
 )
-from .sources import source_row_hash
+from .sources import open_text_auto, source_row_hash
 from .db.queries import fetch_clean_points_for_subtracks, fetch_detect_row
 
 
@@ -372,9 +372,11 @@ class PostgresReplayStore:
                 "entry_exit_observation",
             ))
         elif kind == "candidate_intersection":
+            # Database IDs define deterministic replay order.  If a caller
+            # needs a calculation ordinal, it can enumerate this ordered set.
             parents.extend(self._children(
                 "SELECT id FROM turn_events WHERE candidate_intersection_id = %s "
-                "AND detect_id = %s",
+                "AND detect_id = %s ORDER BY id",
                 target.id,
                 "turn_event",
                 detect_id,

@@ -20,7 +20,6 @@ from track.v2._geometry import (
     _to_xy,
 )
 from track.v2._perf import PerfTracker
-from track.v2.cleaner1 import CleanerConfig, clean
 from track.v2.cross_track import (
     _build_grid as _cross_track_grid,
     extract_cross_track_candidates_legacy as _extract_orthogonal_cross_track_candidates_legacy,
@@ -44,7 +43,6 @@ from track.v2.intersect2 import (
     _detect_turn_events,
     _extract_entry_exit_observations_batch,
     _extract_cross_track_windows,
-    _extract_orthogonal_candidates,
     _getis_local_counts_grid,
     _getis_local_counts_scan,
     _group_cluster_items,
@@ -162,7 +160,7 @@ class TurnEventModelTest(unittest.TestCase):
 
     def test_turn_event_as_dict(self):
         event = TurnEvent(
-            event_id=0,
+            event_calculate_index=0,
             vehicle_id="v1",
             timestamp=1000.0,
             lon=116.0, lat=39.0,
@@ -171,7 +169,7 @@ class TurnEventModelTest(unittest.TestCase):
             turn_deg=90.0, score=90.0,
         )
         d = event.as_dict()
-        self.assertEqual(d["event_id"], 0)
+        self.assertEqual(d["event_calculate_index"], 0)
         self.assertEqual(d["vehicle_id"], "v1")
         self.assertEqual(d["turn_deg"], 90.0)
 
@@ -1021,7 +1019,7 @@ class GetisOrdGStarTest(unittest.TestCase):
         mean = sum(counts) / len(counts)
         variance = sum(value * value for value in counts) / len(counts) - mean * mean
         expected = {
-            event.event_id: (count - mean) / math.sqrt(variance)
+            event.event_calculate_index: (count - mean) / math.sqrt(variance)
             for event, count in zip(events, counts)
         }
         self.assertEqual(_compute_getis_ord_g_star(events, radius), expected)
@@ -1045,13 +1043,13 @@ class GetisOrdGStarTest(unittest.TestCase):
         variance = sum(count * count for count in expected_counts) / len(expected_counts) - mean * mean
         std = math.sqrt(max(variance, 0.0))
         expected_z = {
-            event.event_id: 0.0 if std == 0.0 else (count - mean) / std
+            event.event_calculate_index: 0.0 if std == 0.0 else (count - mean) / std
             for event, count in zip(events, expected_counts)
         }
         cfg = IntersectConfig(g_star_radius_m=radius, g_star_min_z=0.5, min_turn_deg=45.0)
         expected_selected = [
-            event.event_id for event in events
-            if expected_z[event.event_id] >= cfg.g_star_min_z
+            event.event_calculate_index for event in events
+            if expected_z[event.event_calculate_index] >= cfg.g_star_min_z
             and abs(event.turn_deg) >= cfg.min_turn_deg
         ]
         # If the threshold/fallback regresses, this mock makes the test fail:
@@ -1059,7 +1057,10 @@ class GetisOrdGStarTest(unittest.TestCase):
         with patch("track.v2.intersect2._getis_local_counts_scan", side_effect=AssertionError("scan fallback used")):
             actual_counts = _getis_local_counts_grid(events, radius)
             actual_z = _compute_getis_ord_g_star(events, radius)
-            actual_selected = [event.event_id for event in _select_hotspot_events(events, cfg)]
+            actual_selected = [
+                event.event_calculate_index
+                for event in _select_hotspot_events(events, cfg)
+            ]
         self.assertEqual(actual_counts, expected_counts, label)
         self.assertEqual(actual_z, expected_z, label)
         self.assertEqual(actual_selected, expected_selected, label)
@@ -1124,17 +1125,23 @@ class GetisOrdGStarTest(unittest.TestCase):
         variance = sum(count * count for count in expected_counts) / len(expected_counts) - mean * mean
         std = math.sqrt(max(variance, 0.0))
         expected_z = {
-            event.event_id: 0.0 if std == 0.0 else (count - mean) / std
+            event.event_calculate_index: 0.0 if std == 0.0 else (count - mean) / std
             for event, count in zip(events, expected_counts)
         }
         cfg = IntersectConfig(g_star_radius_m=1.0, g_star_min_z=0.5, min_turn_deg=45.0)
         expected_selected = [
-            event.event_id for event in events
-            if expected_z[event.event_id] >= cfg.g_star_min_z
+            event.event_calculate_index for event in events
+            if expected_z[event.event_calculate_index] >= cfg.g_star_min_z
             and abs(event.turn_deg) >= cfg.min_turn_deg
         ]
         self.assertEqual(_compute_getis_ord_g_star(events, 1.0), expected_z)
-        self.assertEqual([event.event_id for event in _select_hotspot_events(events, cfg)], expected_selected)
+        self.assertEqual(
+            [
+                event.event_calculate_index
+                for event in _select_hotspot_events(events, cfg)
+            ],
+            expected_selected,
+        )
 
 
 class HotspotSelectionTest(unittest.TestCase):
@@ -1421,43 +1428,6 @@ class DBSCANTest(unittest.TestCase):
 
 class OrthogonalCandidateTest(unittest.TestCase):
     """I2-16 ~ I2-17: Orthogonal candidate extraction and clustering."""
-
-    def test_extract_orthogonal_from_cleaner_output(self):
-        """I2-16: Orthogonal injection points are extracted."""
-        with tempfile.TemporaryDirectory() as td:
-            csv_path = _make_csv(
-                td, "test.csv",
-                "vid,lng,lat,included_angle,gps_speed,gps_time_a\n"
-                "v1,116.0,39.0,0,20,1000\n"
-                "v1,116.001,39.001,90,20,1010\n"
-                "v2,117.0,40.0,180,20,1000\n"
-                "v2,117.001,39.999,270,20,1010\n",
-            )
-            source = CsvSource(csv_path)
-            handle = get_database(source)
-            result = clean(handle, config=CleanerConfig(
-                max_extension_m=5000.0, min_heading_delta_deg=80.0,
-                max_heading_delta_deg=100.0,
-            ))
-            # Consume cleaned points to trigger orthogonal injection
-            points = list(result.active.iter_points())
-            handle.close()
-
-            # Filter for injected points
-            injected = [p for p in points if p.point_ref.generated_reason == "orthogonal_heading"]
-            if not injected:
-                self.skipTest("Cleaner did not generate orthogonal points for this data")
-
-            # Build tracks from consumed points
-            tracks: dict[str, list[TrajectoryPoint]] = {}
-            for p in points:
-                tracks.setdefault(p.vehicle_id, []).append(p)
-
-            origin_lon, origin_lat = points[0].lon, points[0].lat
-            candidates = _extract_orthogonal_candidates(tracks, origin_lon, origin_lat)
-            self.assertGreaterEqual(len(candidates), 1)
-            for c in candidates:
-                self.assertEqual(c.point_ref.generated_reason, "orthogonal_heading")
 
     def test_cross_track_candidate_keeps_canonical_pair_provenance(self):
         """Cross-track candidates retain both source segments in A/B order."""

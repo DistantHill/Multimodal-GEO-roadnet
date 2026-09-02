@@ -25,7 +25,7 @@ TORCH_PYTHON = Path(os.environ.get("TRACK_BENCH_PYTHON", sys.executable))
 
 _CHILD = r'''
 import contextlib, io, json, time
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from track.v2.intersect2 import (
     _NOISE, _UNVISITED, _cluster_dbscan, _distance_m, _neighbors_indices,
     _run_dbscan, _to_lonlat, _with_source_provenance,
@@ -42,6 +42,14 @@ eps_m, min_samples = request["eps_m"], request["min_samples"]
 events = [TurnEvent(i, f"phase-{i}", float(i), 116.0, 39.0, x, y, 0.0,
                     90.0, 90.0, 1.0, point_ref=PointRef("phase", str(i), stable=True))
           for i, (x, y) in enumerate(zip(xs, ys))]
+# Canonicalize the transient first field across archived/current models.
+calculate_index_field = fields(TurnEvent)[0].name
+
+def cluster_record(cluster):
+    record = asdict(cluster)
+    for event in record["events"]:
+        event["event_calculate_index"] = event.pop(calculate_index_field)
+    return record
 
 def instrumented_historical_state_machine():
     """Historical state machine with the source tree's actual neighbor path."""
@@ -144,7 +152,7 @@ wrapper_start = time.perf_counter()
 clusters = assemble_wrapper_from_labels(labels)
 wrapper_s = time.perf_counter() - wrapper_start
 serialization_start = time.perf_counter()
-serialized = json.dumps([asdict(cluster) for cluster in clusters], sort_keys=True, separators=(",", ":"))
+serialized = json.dumps([cluster_record(cluster) for cluster in clusters], sort_keys=True, separators=(",", ":"))
 serialization_s = time.perf_counter() - serialization_start
 
 # Equivalence checks are deliberately outside phase timers, so recorded phases
@@ -152,7 +160,7 @@ serialization_s = time.perf_counter() - serialization_start
 with contextlib.redirect_stdout(io.StringIO()):
     reference_labels = _run_dbscan(xs, ys, eps_m=eps_m, min_samples=min_samples)
     reference_clusters = _cluster_dbscan(events, 116.0, 39.0, eps_m=eps_m, min_samples=min_samples)
-reference_serialized = json.dumps([asdict(cluster) for cluster in reference_clusters], sort_keys=True, separators=(",", ":"))
+reference_serialized = json.dumps([cluster_record(cluster) for cluster in reference_clusters], sort_keys=True, separators=(",", ":"))
 print(json.dumps({"labels_equivalent": labels == reference_labels,
                   "wrapper_equivalent": serialized == reference_serialized,
                   "phase_timing": {**dbscan,

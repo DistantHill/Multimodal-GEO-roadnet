@@ -50,18 +50,19 @@ def clean_vehicle(
     for index, subtrack in enumerate(subtracks, start=1):
         if rename:
             subtrack = [_with_vehicle_id(point, f"{point.vehicle_id}_seg{index:02d}") for point in subtrack]
-        kept_points, excluded_points = _exclude_stationary(subtrack, cfg)
-        excluded_points.extend(excluded_points)
-        injected_subtrack, count, injected_points = _inject_orthogonal(kept_points, cfg)
+        kept, removed = _exclude_stationary(subtrack, cfg)
+        kept_points.extend(kept)
+        excluded_points.extend(removed)
+        injected_subtrack, count, injected_points = _inject_orthogonal(kept, cfg)
         derived_points.extend(injected_points)
         derived_counts[GeneratedReason.HEADING_ORTHOGONAL] += count
 
-        if kept_points:
+        if kept:
             refinement_subtracks.append(
                 RefinementSubtrack(
-                    vehicle_id=kept_points[0].vehicle_id,
+                    vehicle_id=kept[0].vehicle_id,
                     subtrack_index=index,
-                    points = injected_subtrack
+                    points=injected_subtrack,
                 )
             )
 
@@ -97,10 +98,12 @@ def clean(
 
     for vehicle_points in _group_by_vehicle(source.iter_points()):
         result = clean_vehicle(vehicle_points, config=cfg)
-        active.extend(result.active)
         excluded.extend(result.excluded)
-        kept_subtracks.extend(result.kept_subtracks)
-        injected_count += result.injected_count
+        for subtrack in result.subtracks:
+            points = list(subtrack.points)
+            active.extend(points)
+            kept_subtracks.append(points)
+        injected_count += sum(result.derived_counts.values())
 
         group_count += 1
         now = time.perf_counter()

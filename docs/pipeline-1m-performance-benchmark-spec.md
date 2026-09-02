@@ -272,11 +272,12 @@ Pipeline cgroup 精确峰值为 1,232.7 MiB。Pipeline 抽样峰值时 PostgreSQ
   与往返；历史运行还因 Schema 缺列在最后落库阶段整体回滚。
 - 改动：`tracks_cross`、`turn_events` 和 `entry_exit_points` 改为 PostgreSQL
   COPY。确实需要生成 ID 的父表仍使用批量
-  `INSERT ... RETURNING`；turn events COPY 后按 Detect Run 一次读取 ID map。
+  `INSERT ... RETURNING`；`turn_events.id` 是唯一持久化事件 ID，运行时计算索引
+  不写入数据库，因此 COPY 后不再读取 ID map。
   实现见 [`db_writer.py`](../services/pipeline/src/track/v2/db_writer.py)。
 - 效果：本次 191,520 条主要 append-only Detect 行成功持久化，完整 Detect
   Stage 为 63.667s。四个 PerfTracker 子阶段之外的 13.716s 还包含 extent 查询、
-  阶段间逻辑、ID 映射、其他父子表写入、报告和 commit，因此只能作为持久化耗时
+  阶段间逻辑、其他父子表写入、报告和 commit，因此只能作为持久化耗时
   上限，不能与历史失败的约 9.1s 直接计算加速比。
 - 内存：COPY 协议逐行写入，协议缓冲近似常量；调用方仍保留事件和 row tuple，
   额外转换列表大致为低十几到数十 MiB。COPY 不负责降低 Detect 主工作区内存。

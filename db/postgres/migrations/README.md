@@ -11,7 +11,9 @@
 
 这里的 *legacy* 只指确实存在旧 `pipeline_runs` 表的数据库，不是当前 Pipeline 运行模式。当前 lineage 是 `clean_runs → detect_runs → fit_runs`。如果旧 Detect 与父 Clean 的关系无法从历史参数确定，迁移会在任何写操作前失败，必须使用 `--legacy-clean-map` 提供完整、精确的 Detect UUID → Clean UUID 映射；迁移成功并校验产物后会删除 `pipeline_runs`。
 
-自动补列会为已有 `turn_events` 补齐 `tp_source_id` 和 `tp_source_row_key`。Generated/SERIAL 列不会走通用自动补列；没有默认值的新 `NOT NULL` 列会先按 nullable 加入，复杂约束必须写成显式结构迁移。普通升级不要使用会清空业务数据的 `--reset`。
+自动补列会为已有 `turn_events` 补齐 `tp_source_id` 和 `tp_source_row_key`；显式结构迁移会删除不再持久化的 `event_id` 列和 `idx_te_event_id`。Generated/SERIAL 列不会走通用自动补列；没有默认值的新 `NOT NULL` 列会先按 nullable 加入，复杂约束必须写成显式结构迁移。普通升级不要使用会清空业务数据的 `--reset`。
+
+这次删列不支持新旧 writer 滚动混跑：迁移前新 writer 无法满足旧列的 `NOT NULL`，迁移后旧 writer 会引用已删除列。已有数据库必须先停止 Pipeline 写入，执行 `make pipeline-init-db`，再启动新版本。
 
 ## Versioned SQL
 

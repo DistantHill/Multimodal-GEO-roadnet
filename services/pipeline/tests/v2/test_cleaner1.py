@@ -1,27 +1,24 @@
-"""Cleaner 1 tests — PRD §10.2 (10 items)."""
+"""Cleaner 1 tests."""
 
 from __future__ import annotations
 
-import math
 import tempfile
 import unittest
 from pathlib import Path
 
+from track.v2.cleaner import clean_vehicle
 from track.v2.cleaner1 import (
     CleanerConfig,
     CleanerResult,
     clean,
     _split_by_gaps,
     _exclude_stationary,
-    _inject_orthogonal,
     _ray_intersection,
 )
-from track.v2.exceptions import ConfigError, FieldSelectionRequired
 from track.v2.models import (
     CleanReport,
     PointRef,
     TrajectoryPoint,
-    TrackModel,
 )
 from track.v2.parser0 import CsvSource, get_database
 
@@ -78,67 +75,13 @@ class ActiveExcludedSeparationTest(unittest.TestCase):
             handle = get_database(source)
             result = clean(handle)
             self.assertIsInstance(result, CleanerResult)
-            self.assertIsNotNone(result.active)
-            self.assertIsNotNone(result.excluded)
-            self.assertIsNotNone(result.report)
+            active = list(result.active.iter_points())
+            self.assertEqual(len(active), 2)
+            self.assertEqual(result.report.active_count, 2)
+            self.assertEqual(result.report.excluded_count, 0)
+            self.assertEqual(result.report.injected_count, 0)
+            self.assertEqual(len(result.kept_subtracks), 1)
             handle.close()
-
-
-class OrthogonalHeadingInjectionTest(unittest.TestCase):
-    """C1-02: Orthogonal heading (80-100°) injects derived point."""
-
-    def test_orthogonal_heading_injection(self):
-        # A at (116.01, 39.0) heading east (90°) → reverse west
-        # B at (116.0, 39.01) heading north (0°) → reverse south
-        # Both reverse rays should intersect
-        a = _make_point("v1", "1", 1000.0, 116.01, 39.0, 90.0, 10.0)
-        b = _make_point("v1", "2", 1030.0, 116.0, 39.01, 0.0, 10.0)
-        cfg = CleanerConfig(max_extension_m=5000.0)
-        result, injected = _inject_orthogonal([a, b], cfg, 116.0, 39.0)
-        # a + derived + b
-        self.assertGreaterEqual(len(result), 3)
-        self.assertEqual(injected, 1)
-        derived = [p for p in result if p.point_ref.generated_reason == "orthogonal_heading"]
-        self.assertEqual(len(derived), 1)
-        self.assertFalse(derived[0].point_ref.stable)
-        self.assertEqual(derived[0].point_ref.from_ref, "1")
-        self.assertEqual(derived[0].point_ref.to_ref, "2")
-
-    def test_non_orthogonal_no_injection(self):
-        """C1-03: Heading delta outside [80,100] → no injection."""
-        a = _make_point("v1", "1", 1000.0, 116.0, 39.0, 90.0, 10.0)
-        b = _make_point("v1", "2", 1030.0, 116.002, 39.000, 120.0, 10.0)  # 30° delta
-        cfg = CleanerConfig()
-        result, injected = _inject_orthogonal([a, b], cfg, 116.0, 39.0)
-        self.assertEqual(injected, 0)
-        self.assertEqual(len(result), 2)
-
-
-class MaxExtensionTest(unittest.TestCase):
-    """C1-04: Intersection at distance > max_extension_m → no injection."""
-
-    def test_too_far_no_injection(self):
-        # Two far-apart points with orthogonal headings
-        a = _make_point("v1", "1", 1000.0, 116.0, 39.0, 90.0, 10.0)
-        b = _make_point("v1", "2", 1030.0, 120.0, 42.000, 0.0, 10.0)  # ~400km away
-        cfg = CleanerConfig(max_extension_m=80.0)
-        result, injected = _inject_orthogonal([a, b], cfg, 116.0, 39.0)
-        self.assertEqual(injected, 0)
-
-
-class DerivedPointRefTest(unittest.TestCase):
-    """C1-05: Derived PointRef has from_ref, to_ref, stable=False."""
-
-    def test_derived_point_ref_traceability(self):
-        a = _make_point("v1", "10", 1000.0, 116.01, 39.0, 90.0, 10.0)
-        b = _make_point("v1", "20", 1030.0, 116.0, 39.01, 0.0, 10.0)
-        cfg = CleanerConfig(max_extension_m=5000.0)
-        result, _ = _inject_orthogonal([a, b], cfg, 116.0, 39.0)
-        derived = [p for p in result if p.point_ref.generated_reason == "orthogonal_heading"]
-        self.assertTrue(derived)
-        self.assertEqual(derived[0].point_ref.from_ref, "10")
-        self.assertEqual(derived[0].point_ref.to_ref, "20")
-        self.assertFalse(derived[0].point_ref.stable)
 
 
 class GapSplittingTest(unittest.TestCase):
@@ -164,6 +107,64 @@ class GapSplittingTest(unittest.TestCase):
         ]
         sub_tracks = _split_by_gaps(points, max_gap_s=120.0)
         self.assertEqual(len(sub_tracks), 1)
+
+
+class CleanVehicleAggregationTest(unittest.TestCase):
+    """Cleaner retains every split subtrack and each exclusion exactly once."""
+
+    def test_accumulates_kept_points_across_gap_subtracks(self):
+        points = [
+            _make_point("v1", "1", 1000.0, 116.0, 39.0, 90.0, 10.0),
+            _make_point("v1", "2", 1030.0, 116.0, 39.1, 90.0, 10.0),
+            _make_point("v1", "3", 1230.0, 116.0, 39.2, 90.0, 10.0),
+            _make_point("v1", "4", 1260.0, 116.0, 39.3, 90.0, 10.0),
+        ]
+
+        result = clean_vehicle(points, config=CleanerConfig(max_gap_s=120.0))
+
+        self.assertEqual(
+            [point.point_ref.source_row_key for point in result.kept],
+            ["1", "2", "3", "4"],
+        )
+        self.assertEqual(len(result.subtracks), 2)
+        self.assertEqual(
+            [
+                [point.point_ref.source_row_key for point in subtrack.points]
+                for subtrack in result.subtracks
+            ],
+            [["1", "2"], ["3", "4"]],
+        )
+        self.assertEqual(
+            [subtrack.vehicle_id for subtrack in result.subtracks],
+            ["v1_seg01", "v1_seg02"],
+        )
+
+    def test_accumulates_stationary_exclusions_once_across_gap_subtracks(self):
+        points = [
+            _make_point("v1", "1", 1000.0, 116.0, 39.0, 90.0, 0.1),
+            _make_point("v1", "2", 1005.0, 116.0, 39.0, 90.0, 0.1),
+            _make_point("v1", "3", 1015.0, 116.0, 39.0, 90.0, 0.1),
+            _make_point("v1", "4", 1100.0, 116.1, 39.0, 90.0, 0.1),
+            _make_point("v1", "5", 1105.0, 116.1, 39.0, 90.0, 0.1),
+            _make_point("v1", "6", 1115.0, 116.1, 39.0, 90.0, 0.1),
+        ]
+        cfg = CleanerConfig(
+            max_gap_s=50.0,
+            min_speed_mps=0.3,
+            max_stationary_duration_s=10.0,
+        )
+
+        result = clean_vehicle(points, config=cfg)
+
+        self.assertEqual(
+            [point.point_ref.source_row_key for point in result.kept],
+            ["1", "3", "4", "6"],
+        )
+        self.assertEqual(
+            [item.point_ref.source_row_key for item in result.excluded],
+            ["2", "5"],
+        )
+        self.assertEqual(len(result.subtracks), 2)
 
 
 class StationaryExclusionTest(unittest.TestCase):

@@ -59,11 +59,6 @@ class _RecordingCursor:
 
     def fetchall(self) -> list[tuple[int, ...]]:
         sql, params = self.executions[-1]
-        if "SELECT id, event_id FROM turn_events" in sql:
-            return [
-                (index + 1, int(row[1]))
-                for index, row in enumerate(self.copy_rows)
-            ]
         if "INSERT INTO candidate_intersections" in sql:
             row_count = sql.count("ST_Buffer(")
             width = len(params) // row_count
@@ -378,12 +373,12 @@ class InsertTracksCrossTest(unittest.TestCase):
 
 
 class InsertTurnEventsTest(unittest.TestCase):
-    def test_copy_then_loads_run_scoped_generated_id_mapping(self) -> None:
+    def test_copy_omits_calculate_index_and_returns_inserted_count(self) -> None:
         events = [
             TurnEvent(
-                event_id=event_id,
-                vehicle_id=f"vehicle-{event_id}",
-                timestamp=float(event_id),
+                event_calculate_index=calculate_index,
+                vehicle_id=f"vehicle-{calculate_index}",
+                timestamp=float(calculate_index),
                 lon=116.0,
                 lat=39.0,
                 x=0.0,
@@ -393,30 +388,27 @@ class InsertTurnEventsTest(unittest.TestCase):
                 turn_deg=90.0,
                 score=90.0,
             )
-            for event_id in (10, 20)
+            for calculate_index in (10, 20)
         ]
         conn = _RecordingConnection()
 
-        mapping = insert_turn_events(
+        inserted_count = insert_turn_events(
             conn,
             events,
             detect_id="detect-1",
-            candidate_intersection_ids={10: 55},
+            candidate_intersection_ids_by_calculate_index={10: 55},
         )
 
-        self.assertIn("COPY turn_events", conn.recording_cursor.copy_statements[0])
-        self.assertEqual(mapping, {10: 1, 20: 2})
+        copy_sql = conn.recording_cursor.copy_statements[0]
+        self.assertIn("COPY turn_events", copy_sql)
+        self.assertNotIn("event_id", copy_sql)
+        self.assertNotIn("event_calculate_index", copy_sql)
+        self.assertEqual(inserted_count, 2)
         self.assertEqual(
             [row[-1] for row in conn.recording_cursor.copy_rows],
             [55, None],
         )
-        self.assertEqual(
-            conn.recording_cursor.executions[-1],
-            (
-                "SELECT id, event_id FROM turn_events WHERE detect_id = %s",
-                ("detect-1",),
-            ),
-        )
+        self.assertEqual(conn.recording_cursor.executions, [])
 
 
 class CandidateIntersectionSourcesTest(unittest.TestCase):

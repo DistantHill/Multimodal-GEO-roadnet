@@ -74,7 +74,9 @@ Pipeline 的数据库配置优先读取进程中的来源兼容变量 `TRACK_PG_
 make pipeline-init-db
 ```
 
-非 `--reset` 初始化在一个事务内处理当前建表、自动补列、显式结构迁移和索引同步；已有 named volume 升级代码后也必须执行。它会为旧表补齐 `turn_events.tp_source_id` 和 `turn_events.tp_source_row_key`。只有数据库仍存在早期单表 Run 注册表 `pipeline_runs` 且 Clean 父子关系无法确定时，才需要通过 `--legacy-clean-map` 提供精确的 Detect UUID → Clean UUID 映射。`--reset` 会删除全部 Pipeline 业务数据，不能用于普通升级。
+非 `--reset` 初始化在一个事务内处理当前建表、自动补列、显式结构迁移和索引同步；已有 named volume 升级代码后也必须执行。它会为旧表补齐 `turn_events.tp_source_id` 和 `turn_events.tp_source_row_key`，并删除旧的 `turn_events.event_id` 及其索引；事件唯一使用数据库 `id`，算法顺序不持久化。只有数据库仍存在早期单表 Run 注册表 `pipeline_runs` 且 Clean 父子关系无法确定时，才需要通过 `--legacy-clean-map` 提供精确的 Detect UUID → Clean UUID 映射。`--reset` 会删除全部 Pipeline 业务数据，不能用于普通升级。
+
+删除 `turn_events.event_id` 的版本不支持新旧 writer 滚动混跑。升级已有数据库时，先停止 Pipeline 写入，执行 `make pipeline-init-db`，再启动新版本 Pipeline。
 
 查看完整参数或从外部数据目录运行 CSV：
 
