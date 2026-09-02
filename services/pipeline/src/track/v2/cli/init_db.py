@@ -30,9 +30,6 @@ from ..config import PostgresConfig, connect as pg_connect, default_postgres_con
 from ..db.legacy_migration import load_legacy_clean_map, migrate_legacy_pipeline_runs
 from ..logger import init_logger, shutdown_logger
 
-# ── DDL statements in pipeline dependency order ─────────────────────
-# ZH: 按流水线阶段顺序排列，先创建被引用表，再创建引用表。
-# EN: Ordered by pipeline stage and FK dependency — referenced tables first.
 
 DDL_STATEMENTS: list[tuple[str, str]] = [
     ("clean_runs", """
@@ -132,6 +129,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """),
+    # ── Detect ──
     ("tracks_cross", """
         CREATE TABLE IF NOT EXISTS tracks_cross (
             id                  BIGSERIAL PRIMARY KEY,
@@ -157,7 +155,6 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """),
-    # ── Intersect2 ──
     ("turn_events", """
         CREATE TABLE IF NOT EXISTS turn_events (
             id                  BIGSERIAL PRIMARY KEY,

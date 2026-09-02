@@ -91,6 +91,7 @@ class _RecordingStore:
             getattr(self.fit_bundle, variant).issues = ()
         self.fit_bundle_error: RuntimeError | None = None
         self.clip_error: RuntimeError | None = None
+        self.persist_detect_error: RuntimeError | None = None
 
     def commit(self) -> None:
         self.events.append("commit")
@@ -123,6 +124,8 @@ class _RecordingStore:
 
     def persist_detect(self, *args: object, **kwargs: object) -> DetectPersistenceResult:
         self.events.append("persist_detect")
+        if self.persist_detect_error is not None:
+            raise self.persist_detect_error
         return DetectPersistenceResult(
             tracks_cross_count=0,
             turn_event_ids={},
@@ -251,6 +254,26 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertEqual(len(finish_events), 5)
         self.assertTrue(all(event.elapsed is not None for event in finish_events))
 
+        fitting_phases = [
+            event for event in emitted
+            if event.kind == PipelineEventKind.STAGE_PROGRESS
+            and event.stage == "Fitting: 中心线拟合 / Centerline fitting"
+        ]
+        self.assertEqual(
+            [event.detail for event in fitting_phases],
+            ["fit_compute", "fit_persist"],
+        )
+        self.assertTrue(all(event.elapsed is not None for event in fitting_phases))
+        phase_messages = [
+            message for message in log_messages if message.startswith("[stage-phase]")
+        ]
+        self.assertEqual(len(phase_messages), 2)
+        for phase, message in zip(
+            ("fit_compute", "fit_persist"), phase_messages, strict=True,
+        ):
+            self.assertIn(f"stage=fitting phase={phase}", message)
+            self.assertRegex(message, r"elapsed_s=\d+\.\d{3}$")
+
     def test_completed_clean_reuses_store_record_without_clean_stage(self) -> None:
         first = run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID)).stats
         second = run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID)).stats
@@ -272,6 +295,17 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             "persist_detect", "finish_detect:completed", "commit", "load_clip",
         ])
         self.assertNotIn("rollback", self.events)
+
+    def test_detect_persistence_failure_rolls_back_and_marks_detect_failed(self) -> None:
+        self.store.persist_detect_error = RuntimeError("detect write failed")
+
+        with self.assertRaisesRegex(RuntimeError, "detect write failed"):
+            run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID))
+
+        self.assertEqual(self.events[-5:], [
+            "commit", "persist_detect", "rollback", "finish_detect:failed", "commit",
+        ])
+        self.assertNotIn("finish_detect:completed", self.events)
 
     def test_fit_expected_failure_rolls_back_and_marks_fit_failed(self) -> None:
         self.store.fit_bundle_error = RuntimeError("write failed")

@@ -50,9 +50,12 @@ from track.v2.intersect2 import (
     _group_cluster_items,
     _group_by_vehicle,
     _build_dbscan_grid,
+    _build_topology_point_index,
+    _build_topologies_from_tracks,
     _merge_clusters,
     _nearest_angle_id,
     _run_dbscan,
+    _topology_point_windows,
     _query_active_points_in_window,
     _select_hotspot_events,
     detect_intersections,
@@ -1325,6 +1328,86 @@ class DBSCANTest(unittest.TestCase):
             actual = _run_dbscan(xs, ys, eps_m=1.0, min_samples=1)
         self.assertEqual(actual, expected)
 
+    def test_large_frontier_matches_historical_labels_on_seeded_shapes(self):
+        """Active-frontier expansion retains legacy border and cluster order."""
+        for seed in range(6):
+            rng = random.Random(seed)
+            xs = [rng.randrange(-12, 13) * 0.25 for _ in range(300)]
+            ys = [rng.randrange(-12, 13) * 0.25 for _ in range(300)]
+            for eps_m, min_samples in ((0.25, 1), (0.5, 3), (0.9, 5)):
+                with self.subTest(seed=seed, eps_m=eps_m, min_samples=min_samples):
+                    expected = self._historical_scan_oracle(
+                        xs, ys, eps_m, min_samples,
+                    )
+                    self.assertEqual(
+                        _run_dbscan(
+                            xs, ys, eps_m=eps_m, min_samples=min_samples,
+                        ),
+                        expected,
+                    )
+
+    def test_dense_grid_enqueues_each_point_at_most_once(self):
+        """Dense clusters do not re-materialise N neighbours for every core."""
+        from track.v2.intersect2 import _take_grid_frontier_neighbors
+
+        taken = 0
+
+        def observe(*args):
+            nonlocal taken
+            result = _take_grid_frontier_neighbors(*args)
+            taken += len(result)
+            return result
+
+        count = 2_000
+        with patch(
+            "track.v2.intersect2._take_grid_frontier_neighbors",
+            side_effect=observe,
+        ):
+            labels = _run_dbscan(
+                [0.0] * count,
+                [0.0] * count,
+                eps_m=1.0,
+                min_samples=3,
+            )
+
+        self.assertEqual(labels, [0] * count)
+        self.assertLessEqual(taken, count)
+
+    def test_low_index_noise_is_later_absorbed_as_border(self):
+        """A point marked noise before its adjacent core remains available."""
+        xs = [0.0, 0.9, 1.7, 1.5, 1.5]
+        ys = [0.0, 0.0, 0.0, 0.6, -0.6]
+        xs.extend(100.0 + index * 10.0 for index in range(252))
+        ys.extend([100.0] * 252)
+
+        expected = self._historical_scan_oracle(xs, ys, 1.0, 4)
+        actual = _run_dbscan(xs, ys, eps_m=1.0, min_samples=4)
+
+        self.assertEqual(expected[0], 0)
+        self.assertEqual(actual, expected)
+
+    def test_shared_border_keeps_first_discovered_component(self):
+        """A border shared by two core components keeps legacy first reach."""
+        xs = [
+            0.0,
+            0.9, 1.7, 1.5, 1.5,
+            -0.9, -1.7, -1.5, -1.5,
+        ]
+        ys = [
+            0.0,
+            0.0, 0.0, 0.6, -0.6,
+            0.0, 0.0, 0.6, -0.6,
+        ]
+        xs.extend(100.0 + index * 10.0 for index in range(248))
+        ys.extend([100.0] * 248)
+
+        expected = self._historical_scan_oracle(xs, ys, 1.0, 4)
+        actual = _run_dbscan(xs, ys, eps_m=1.0, min_samples=4)
+
+        self.assertEqual(expected[0], expected[1])
+        self.assertNotEqual(expected[0], expected[5])
+        self.assertEqual(actual, expected)
+
     def test_large_finite_coordinates_fall_back_before_unbounded_cell_range(self):
         xs = [1e308, math.nextafter(1e308, -math.inf)] + [float(i * 10) for i in range(255)]
         ys = [0.0] * len(xs)
@@ -1655,6 +1738,97 @@ class TopologyExtractionTest(unittest.TestCase):
         self.assertGreaterEqual(len(observations), 1,
                                 "Vehicle passing through circle should create observation")
 
+    def test_global_tracks_are_routed_to_legacy_topology_query_boxes(self):
+        """One track scan reproduces each former per-cluster bbox result."""
+        cfg = IntersectConfig(
+            min_intersection_radius_m=100.0,
+            topology_radius_padding_m=0.0,
+        )
+        clusters = [
+            HotspotCluster(
+                cluster_id=index,
+                centroid_x=0.0,
+                centroid_y=0.0,
+                centroid_lon=lon,
+                centroid_lat=0.0,
+                radius_m=1.0,
+                events=(),
+                source="turn",
+            )
+            for index, lon in enumerate((0.0, 0.01))
+        ]
+        lons = (-0.002, -0.001, 0.0, 0.001, 0.0085, 0.01, 0.012)
+        track = [
+            _make_point("v1", str(index), float(index), lon, 0.0, 0.0, 5.0)
+            for index, lon in enumerate(lons)
+        ]
+
+        windows = _topology_point_windows(clusters, cfg)
+        point_index = _build_topology_point_index({"v1": track})
+        routed = [point_index.tracks_in(window) for window in windows]
+
+        self.assertEqual(len(point_index.points), len(track))
+        self.assertEqual(len(point_index.coordinates), len(track))
+        self.assertEqual(
+            [point.point_ref.source_row_key for point in routed[0]["v1"]],
+            ["1", "2", "3"],
+        )
+        self.assertEqual(
+            [point.point_ref.source_row_key for point in routed[1]["v1"]],
+            ["4", "5"],
+        )
+
+        tie_track = [
+            _make_point("tie", "stream-first", 1.0, 0.001, 0.0, 0.0, 5.0),
+            _make_point("tie", "stream-second", 1.0, -0.001, 0.0, 0.0, 5.0),
+        ]
+        tie_index = _build_topology_point_index({"tie": tie_track})
+        self.assertEqual(
+            [
+                point.point_ref.source_row_key
+                for point in tie_index.tracks_in(windows[0])["tie"]
+            ],
+            ["stream-first", "stream-second"],
+        )
+
+    def test_topology_from_tracks_extracts_only_routed_points(self):
+        cfg = IntersectConfig(
+            min_intersection_radius_m=100.0,
+            topology_radius_padding_m=0.0,
+        )
+        cluster = HotspotCluster(
+            cluster_id=0,
+            centroid_x=0.0,
+            centroid_y=0.0,
+            centroid_lon=0.0,
+            centroid_lat=0.0,
+            radius_m=1.0,
+            events=(),
+            source="turn",
+        )
+        track = [
+            _make_point("v1", "outside", 0.0, -0.01, 0.0, 0.0, 5.0),
+            _make_point("v1", "inside-a", 1.0, -0.001, 0.0, 0.0, 5.0),
+            _make_point("v1", "inside-b", 2.0, 0.001, 0.0, 0.0, 5.0),
+        ]
+
+        with patch(
+            "track.v2.intersect2._extract_entry_exit_observations_batch",
+            return_value=([], []),
+        ) as extract:
+            topologies, annotated, observations = _build_topologies_from_tracks(
+                [cluster], {"v1": track}, cfg, 0.0, 0.0,
+            )
+
+        routed_track = extract.call_args.args[0]["v1"]
+        self.assertEqual(
+            [point.point_ref.source_row_key for point in routed_track],
+            ["inside-a", "inside-b"],
+        )
+        self.assertEqual(len(topologies), 1)
+        self.assertEqual(len(annotated), 1)
+        self.assertEqual(observations, [])
+
     def test_branch_clustering(self):
         """I2-19: 4 cardinal directions cluster to 4 branches."""
         angles = [0.0, 90.0, 180.0, 270.0,
@@ -1684,6 +1858,59 @@ class TopologyExtractionTest(unittest.TestCase):
         self.assertEqual(_nearest_angle_id(88.0, centers), 1)   # nearest to 90°
         self.assertEqual(_nearest_angle_id(179.0, centers), 2)  # nearest to 180°
         self.assertEqual(_nearest_angle_id(272.0, centers), 3)  # nearest to 270°
+
+    def test_db_mode_reuses_streamed_tracks_for_topology(self):
+        """DB Detect passes its one workspace to topology without N+1 queries."""
+        point = _make_point("v1", "1", 1.0, 116.0, 39.0, 0.0, 5.0)
+        tracks = {"v1": [point]}
+        cluster = HotspotCluster(
+            cluster_id=0,
+            centroid_x=0.0,
+            centroid_y=0.0,
+            centroid_lon=116.0,
+            centroid_lat=39.0,
+            radius_m=1.0,
+            events=(),
+            source="turn",
+        )
+        topology = IntersectionTopology(
+            cluster_id=0,
+            branch_centers_deg=[],
+            transition_counts={},
+            observation_count=0,
+            is_complete=False,
+            reason="test",
+        )
+
+        with (
+            patch(
+                "track.v2.intersect2._query_spatial_extent",
+                return_value=(115.0, 38.0, 117.0, 40.0),
+            ),
+            patch(
+                "track.v2.intersect2._stream_extract_methods_1_2",
+                return_value=([], [], tracks),
+            ),
+            patch(
+                "track.v2.intersect2._extract_cross_track_db_workspace",
+                return_value=[],
+            ),
+            patch(
+                "track.v2.intersect2._cluster_pipeline",
+                return_value=([], [cluster]),
+            ),
+            patch(
+                "track.v2.intersect2._build_topologies_from_tracks",
+                return_value=([topology], [cluster], []),
+            ) as build_topologies,
+        ):
+            result = detect_intersections(
+                conn=object(),
+                config=IntersectConfig(query_active_from_db=True),
+            )
+
+        self.assertIs(build_topologies.call_args.args[1], tracks)
+        self.assertEqual(result.topologies, [topology])
 
 
 # ── Cluster merge tests ────────────────────────────────────────────────

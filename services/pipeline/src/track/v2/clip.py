@@ -25,6 +25,8 @@ from .models import (
 
 
 _EPS = 1e-9
+_GRID_CELL_SIZE_M = 100.0
+_MAX_GRID_CELLS_PER_INTERSECTION = 4_096
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,9 +51,15 @@ class _IntersectionGrid:
     def __init__(self, intersections: tuple[ClipIntersection, ...]) -> None:
         self.origin_lon = intersections[0].lon
         self.origin_lat = intersections[0].lat
-        self.cell_size = max(100.0, max(item.radius_m for item in intersections) * 2.0)
+        # A single large-radius intersection must not coarsen the index for every
+        # other intersection.  Indexing that outlier into more fixed-size cells is
+        # cheap (there are normally only hundreds of intersections), while using
+        # its diameter as the global cell size makes almost every trajectory
+        # segment test a large fraction of all circles.
+        self.cell_size = _GRID_CELL_SIZE_M
         self.cells: dict[tuple[int, int], list[_IndexedIntersection]] = {}
         indexed_intersections: list[_IndexedIntersection] = []
+        overflow_intersections: list[_IndexedIntersection] = []
         cluster_ids: set[int] = set()
         for intersection in intersections:
             if intersection.cluster_id in cluster_ids:
@@ -65,6 +73,15 @@ class _IntersectionGrid:
             )
             indexed = _IndexedIntersection(intersection, x, y)
             indexed_intersections.append(indexed)
+            cell_count = self._cell_count_for_bounds(
+                x - intersection.radius_m,
+                y - intersection.radius_m,
+                x + intersection.radius_m,
+                y + intersection.radius_m,
+            )
+            if cell_count > _MAX_GRID_CELLS_PER_INTERSECTION:
+                overflow_intersections.append(indexed)
+                continue
             for cell in self._cells_for_bounds(
                 x - intersection.radius_m,
                 y - intersection.radius_m,
@@ -73,6 +90,7 @@ class _IntersectionGrid:
             ):
                 self.cells.setdefault(cell, []).append(indexed)
         self.indexed_intersections = tuple(indexed_intersections)
+        self.overflow_intersections = tuple(overflow_intersections)
 
     def point_xy(self, point: TrajectoryPoint) -> tuple[float, float]:
         return _to_xy(point.lon, point.lat, self.origin_lon, self.origin_lat)
@@ -97,7 +115,16 @@ class _IntersectionGrid:
         if cell_count > len(self.indexed_intersections):
             return self.indexed_intersections
 
-        found: dict[int, _IndexedIntersection] = {}
+        found: dict[int, _IndexedIntersection] = {
+            indexed.value.cluster_id: indexed
+            for indexed in self.overflow_intersections
+            if (
+                indexed.x + indexed.value.radius_m >= min_x
+                and indexed.x - indexed.value.radius_m <= max_x
+                and indexed.y + indexed.value.radius_m >= min_y
+                and indexed.y - indexed.value.radius_m <= max_y
+            )
+        }
         for cell in self._cells_for_bounds(
             min_x,
             min_y,
@@ -107,6 +134,22 @@ class _IntersectionGrid:
             for indexed in self.cells.get(cell, ()):
                 found[indexed.value.cluster_id] = indexed
         return tuple(found.values())
+
+    def _cell_count_for_bounds(
+        self,
+        min_x: float,
+        min_y: float,
+        max_x: float,
+        max_y: float,
+    ) -> int:
+        min_cell_x = math.floor(min_x / self.cell_size)
+        max_cell_x = math.floor(max_x / self.cell_size)
+        min_cell_y = math.floor(min_y / self.cell_size)
+        max_cell_y = math.floor(max_y / self.cell_size)
+        return (
+            (max_cell_x - min_cell_x + 1)
+            * (max_cell_y - min_cell_y + 1)
+        )
 
     def _cells_for_bounds(
         self,

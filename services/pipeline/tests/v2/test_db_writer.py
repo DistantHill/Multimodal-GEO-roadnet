@@ -17,6 +17,7 @@ from track.v2.db_writer import (
     insert_injected_points,
     insert_kept_trajectory_points,
     insert_tracks_cross,
+    insert_turn_events,
 )
 from track.v2.models import (
     ClipConfig,
@@ -37,6 +38,7 @@ class _RecordingCursor:
     def __init__(self) -> None:
         self.executions: list[tuple[str, tuple[object, ...]]] = []
         self.copy_rows: list[tuple[object, ...]] = []
+        self.copy_statements: list[str] = []
 
     def __enter__(self) -> _RecordingCursor:
         return self
@@ -58,6 +60,11 @@ class _RecordingCursor:
 
     def fetchall(self) -> list[tuple[int, ...]]:
         sql, params = self.executions[-1]
+        if "SELECT id, event_id FROM turn_events" in sql:
+            return [
+                (index + 1, int(row[1]))
+                for index, row in enumerate(self.copy_rows)
+            ]
         if "INSERT INTO candidate_intersections" in sql:
             row_count = sql.count("ST_Buffer(")
             width = len(params) // row_count
@@ -81,6 +88,7 @@ class _RecordingCopy:
         self.sql = sql
 
     def __enter__(self) -> _RecordingCopy:
+        self.cursor.copy_statements.append(self.sql)
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
@@ -333,20 +341,14 @@ class InsertTracksCrossTest(unittest.TestCase):
         written = insert_tracks_cross(conn, [candidate], detect_id="detect-1")
 
         self.assertEqual(written, 1)
-        sql, params = conn.recording_cursor.executions[0]
-        self.assertIn("INSERT INTO tracks_cross", sql)
-        self.assertIn(
-            "ON CONFLICT (detect_id, vehicle_id, from_source_id, from_source_row_key, "
-            "to_source_id, to_source_row_key) DO NOTHING",
-            sql,
-        )
+        self.assertIn("COPY tracks_cross", conn.recording_cursor.copy_statements[0])
         self.assertEqual(
-            params,
-            [
+            conn.recording_cursor.copy_rows[0],
+            (
                 "detect-1", "A|B", 15.0, 116.0, 39.0, 1.5, 2.5, 0.0, 12.0,
                 "table_a", "102,105", "table_b", "77,78",
                 "orthogonal_cross_track", 116.0, 39.0,
-            ],
+            ),
         )
 
     def test_identical_derived_candidate_is_persisted_independently_per_run(self) -> None:
@@ -364,8 +366,41 @@ class InsertTracksCrossTest(unittest.TestCase):
         insert_tracks_cross(conn, [candidate], detect_id="detect-2")
 
         self.assertEqual(
-            [params[0] for _, params in conn.recording_cursor.executions],
+            [row[0] for row in conn.recording_cursor.copy_rows],
             ["detect-1", "detect-2"],
+        )
+
+
+class InsertTurnEventsTest(unittest.TestCase):
+    def test_copy_then_loads_run_scoped_generated_id_mapping(self) -> None:
+        events = [
+            TurnEvent(
+                event_id=event_id,
+                vehicle_id=f"vehicle-{event_id}",
+                timestamp=float(event_id),
+                lon=116.0,
+                lat=39.0,
+                x=0.0,
+                y=0.0,
+                in_bearing=0.0,
+                out_bearing=90.0,
+                turn_deg=90.0,
+                score=90.0,
+            )
+            for event_id in (10, 20)
+        ]
+        conn = _RecordingConnection()
+
+        mapping = insert_turn_events(conn, events, detect_id="detect-1")
+
+        self.assertIn("COPY turn_events", conn.recording_cursor.copy_statements[0])
+        self.assertEqual(mapping, {10: 1, 20: 2})
+        self.assertEqual(
+            conn.recording_cursor.executions[-1],
+            (
+                "SELECT id, event_id FROM turn_events WHERE detect_id = %s",
+                ("detect-1",),
+            ),
         )
 
 
@@ -391,12 +426,12 @@ class CandidateIntersectionEventsTest(unittest.TestCase):
             conn, [cluster], {5: 55}, {0: 100, 1: 101}, detect_id="detect-1",
         )
 
-        _, params = conn.recording_cursor.executions[0]
+        params = conn.recording_cursor.copy_rows
         self.assertEqual(
             params,
             [
-                "detect-1", 55, "turn", 101, None, None, None, None,
-                "detect-1", 55, "orthogonal_cross_track", None, None, None, None, None,
+                ("detect-1", 55, "turn", 101, None, None, None, None),
+                ("detect-1", 55, "orthogonal_cross_track", None, None, None, None, None),
             ],
         )
 

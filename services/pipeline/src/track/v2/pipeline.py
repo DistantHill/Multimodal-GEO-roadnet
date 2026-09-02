@@ -264,7 +264,10 @@ def run_pipeline(
         stats["detect_id"] = detect_id
         store.commit()
 
-        detect_stage = "Intersect2: 交叉口检测 / Intersection Detection (DB 滑窗模式)"
+        detect_stage = (
+            "Intersect2: 交叉口检测 / Intersection Detection "
+            "(单次加载 + 全局索引 / Shared workspace + global index)"
+        )
         intersect_started = _log_stage_start(
             "intersect2",
             clean_id=clean_id,
@@ -282,48 +285,54 @@ def run_pipeline(
             clean_id=clean_id,
             live_status=live_intersect,
         )
-        iresult = detect_intersections(conn=store.connection, config=icfg)
+        try:
+            iresult = detect_intersections(conn=store.connection, config=icfg)
 
-        _emit_message(sink, f"  转向事件 / Turn events: {iresult.report.turn_event_count:,}")
-        _emit_message(sink, f"  热点事件 / Hotspot events: {iresult.report.hotspot_event_count:,}")
-        _emit_message(sink, f"  候选交叉口 / Clusters: {iresult.report.cluster_count:,}")
-        _emit_message(
-            sink,
-            f"  完整交叉口 / Complete intersections: {iresult.report.complete_intersection_count:,}",
-        )
+            _emit_message(sink, f"  转向事件 / Turn events: {iresult.report.turn_event_count:,}")
+            _emit_message(sink, f"  热点事件 / Hotspot events: {iresult.report.hotspot_event_count:,}")
+            _emit_message(sink, f"  候选交叉口 / Clusters: {iresult.report.cluster_count:,}")
+            _emit_message(
+                sink,
+                f"  完整交叉口 / Complete intersections: {iresult.report.complete_intersection_count:,}",
+            )
 
-        persisted_detect = store.persist_detect(
-            detect_id,
-            iresult,
-            batch_size=pc.runtime.db_insert_batch,
-        )
-        stats.update(
-            {
-                "tracks_cross": persisted_detect.tracks_cross_count,
-                "turn_events": persisted_detect.turn_event_count,
-                "candidate_intersections": persisted_detect.candidate_intersection_count,
-                "candidate_intersection_events": persisted_detect.candidate_intersection_event_count,
-                "candidate_entry_exit_points": persisted_detect.candidate_entry_exit_point_count,
-                "intersections": persisted_detect.intersection_count,
-                "entry_exit_points": persisted_detect.entry_exit_point_count,
-            }
-        )
-        _emit_message(sink, f"  tracks_cross: {persisted_detect.tracks_cross_count:,} rows")
-        _emit_message(sink, f"  turn_events: {persisted_detect.turn_event_count:,} rows")
-        _emit_message(sink, f"  candidate_intersections: {persisted_detect.candidate_intersection_count:,} rows")
-        _emit_message(
-            sink,
-            f"  candidate_intersection_events: {persisted_detect.candidate_intersection_event_count:,} rows",
-        )
-        _emit_message(
-            sink,
-            f"  candidate_entry_exit_points: {persisted_detect.candidate_entry_exit_point_count:,} rows",
-        )
-        _emit_message(sink, f"  intersections: {persisted_detect.intersection_count:,} rows")
-        _emit_message(sink, f"  entry_exit_points: {persisted_detect.entry_exit_point_count:,} rows")
+            persisted_detect = store.persist_detect(
+                detect_id,
+                iresult,
+                batch_size=pc.runtime.db_insert_batch,
+            )
+            stats.update(
+                {
+                    "tracks_cross": persisted_detect.tracks_cross_count,
+                    "turn_events": persisted_detect.turn_event_count,
+                    "candidate_intersections": persisted_detect.candidate_intersection_count,
+                    "candidate_intersection_events": persisted_detect.candidate_intersection_event_count,
+                    "candidate_entry_exit_points": persisted_detect.candidate_entry_exit_point_count,
+                    "intersections": persisted_detect.intersection_count,
+                    "entry_exit_points": persisted_detect.entry_exit_point_count,
+                }
+            )
+            _emit_message(sink, f"  tracks_cross: {persisted_detect.tracks_cross_count:,} rows")
+            _emit_message(sink, f"  turn_events: {persisted_detect.turn_event_count:,} rows")
+            _emit_message(sink, f"  candidate_intersections: {persisted_detect.candidate_intersection_count:,} rows")
+            _emit_message(
+                sink,
+                f"  candidate_intersection_events: {persisted_detect.candidate_intersection_event_count:,} rows",
+            )
+            _emit_message(
+                sink,
+                f"  candidate_entry_exit_points: {persisted_detect.candidate_entry_exit_point_count:,} rows",
+            )
+            _emit_message(sink, f"  intersections: {persisted_detect.intersection_count:,} rows")
+            _emit_message(sink, f"  entry_exit_points: {persisted_detect.entry_exit_point_count:,} rows")
 
-        store.finish_detect(detect_id, status="completed")
-        store.commit()
+            store.finish_detect(detect_id, status="completed")
+            store.commit()
+        except Exception:
+            store.rollback()
+            store.finish_detect(detect_id, status="failed")
+            store.commit()
+            raise
         intersect_elapsed = _log_stage_finish(
             "intersect2",
             intersect_started,
@@ -369,15 +378,39 @@ def run_pipeline(
             detect_id=detect_id,
             fit_id=fit_id,
         )
-        sink(PipelineEvent.stage_start("Fitting: 中心线拟合 / Centerline fitting"))
+        fitting_stage = "Fitting: 中心线拟合 / Centerline fitting"
+        sink(PipelineEvent.stage_start(fitting_stage))
         try:
+            fit_compute_started = time.perf_counter()
             fit_bundle = fit_centerline_variants(clip_result, config=fitting_config)
+            fit_compute_elapsed = time.perf_counter() - fit_compute_started
+            log_info(
+                "[stage-phase] stage=fitting phase=fit_compute "
+                f"elapsed_s={fit_compute_elapsed:.3f}"
+            )
+            sink(PipelineEvent.stage_progress(
+                fitting_stage,
+                detail="fit_compute",
+                elapsed=fit_compute_elapsed,
+            ))
+
+            fit_persist_started = time.perf_counter()
             centerline_ids = store.persist_fit_bundle(
                 fit_id,
                 detect_id,
                 fit_bundle,
                 clip_result,
             )
+            fit_persist_elapsed = time.perf_counter() - fit_persist_started
+            log_info(
+                "[stage-phase] stage=fitting phase=fit_persist "
+                f"elapsed_s={fit_persist_elapsed:.3f}"
+            )
+            sink(PipelineEvent.stage_progress(
+                fitting_stage,
+                detail="fit_persist",
+                elapsed=fit_persist_elapsed,
+            ))
             report = {
                 "combined": {
                     "report": fit_bundle.combined.report.as_dict(),
@@ -416,7 +449,7 @@ def run_pipeline(
         )
         sink(
             PipelineEvent.stage_finish(
-                "Fitting: 中心线拟合 / Centerline fitting",
+                fitting_stage,
                 elapsed=fitting_elapsed,
             )
         )

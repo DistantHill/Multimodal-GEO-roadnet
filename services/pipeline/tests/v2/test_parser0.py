@@ -35,6 +35,7 @@ from track.v2.parser0 import (
     _parse_timestamp,
     get_database,
 )
+from track.v2.sources import PostgresTrajectorySourceHandle
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -267,6 +268,26 @@ class FakePostgresCursorTest(unittest.TestCase):
             except Exception:
                 # Expected — mock cursor may not support full iteration
                 pass
+
+    def test_schema_qualified_source_id_resolves_row_estimate(self) -> None:
+        session_cursor = MagicMock()
+        count_cursor = MagicMock()
+        count_cursor.fetchone.return_value = (1_000_000,)
+        conn = MagicMock()
+        conn.cursor.side_effect = [session_cursor, count_cursor]
+        source = PostgresSource(
+            config=MagicMock(),
+            query="SELECT * FROM public.day01 ORDER BY vehicle_id, timestamp",
+            source_id="public.day01",
+            connection_factory=lambda _config: conn,
+        )
+        handle = object.__new__(PostgresTrajectorySourceHandle)
+        handle._source = source
+
+        self.assertEqual(handle.count_rows(), 1_000_000)
+        count_sql, count_params = count_cursor.execute.call_args.args
+        self.assertIn("c.oid = to_regclass(%s)", count_sql)
+        self.assertEqual(count_params, ("public.day01",))
 
 
 class PostgresNoPKTest(unittest.TestCase):

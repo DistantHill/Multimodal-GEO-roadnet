@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import time
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, TYPE_CHECKING
@@ -41,7 +42,7 @@ from ._geometry import (
     _to_xy,
 )
 from .exceptions import V2Error
-from .cross_track import extract_cross_track_candidates
+from .cross_track import CrossTrackCapacityError, extract_cross_track_candidates
 
 from .models import (
     CrossTrackCandidate,
@@ -61,12 +62,15 @@ from .db.queries import (
     SpatialWindow,
     SpatialWindowIterator,
     _query_active_points_in_window,
-    _query_active_points_near_cluster,
     _query_spatial_extent,
     _stream_vehicle_tracks_from_db,
     _tracks_from_points,
 )
 from .parser0 import TrajectorySourceHandle
+
+
+_DB_GLOBAL_GRID_MEMBERSHIP_LIMIT = 8_000_000
+_DB_GLOBAL_OVERFLOW_PAIR_LIMIT = 20_000_000
 
 
 def _perf_iter(perf, iterable, *, name, total=None, track=True):
@@ -584,9 +588,9 @@ def detect_intersections(
       - **Handle mode**: ``source`` is a ``TrajectorySourceHandle``.
         All points are read into memory and grouped by vehicle_id.
       - **DB mode**: ``conn`` is a psycopg connection and
-        ``config.query_active_from_db`` is True.  Points are queried from
-        the database in spatial sliding windows, dramatically reducing
-        in-memory footprint for large datasets.
+        ``config.query_active_from_db`` is True.  Tracks are loaded once and
+        shared by candidate extraction and topology verification; Method 3
+        uses a capacity-guarded global spatial index.
     """
     cfg = config or IntersectConfig()
 
@@ -673,13 +677,20 @@ def _stream_extract_methods_1_2(
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
-) -> tuple[list[TurnEvent], list[OrthogonalCandidate]]:
-    """Stream per-vehicle from DB, batch 100 vehicles per Method 1/2 call.
+) -> tuple[
+    list[TurnEvent],
+    list[OrthogonalCandidate],
+    dict[str, list[TrajectoryPoint]],
+]:
+    """Load each DB track once and batch Method 1/2 calculations.
 
     ZH: 外层 ``for track in _stream_vehicle_tracks_from_db(...)`` 是生成器流，
         逐迭代计时噪声大，整体由调用方 ``tracker.stage("stream_m1_m2")`` 计时。
+        返回的 ``tracks`` workspace 会由 Method 3 和拓扑验证复用，避免各阶段
+        重新扫描数据库。
     EN: The outer per-track generator stream is timed as a whole by the caller's
         ``tracker.stage("stream_m1_m2")`` — per-iteration timing would be noisy.
+        The returned workspace is reused by Method 3 and topology verification.
     """
     turn_events: list[TurnEvent] = []
     ortho_candidates: list[OrthogonalCandidate] = []
@@ -687,6 +698,7 @@ def _stream_extract_methods_1_2(
     last_progress_t = t_total
     track_count = 0
     batch: dict[str, list[TrajectoryPoint]] = {}
+    tracks: dict[str, list[TrajectoryPoint]] = {}
 
     for track in _stream_vehicle_tracks_from_db(
         conn,
@@ -696,6 +708,7 @@ def _stream_extract_methods_1_2(
         clean_id=cfg.clean_id,
     ):
         vid = track[0].vehicle_id
+        tracks[vid] = track
         batch[vid] = track
         track_count += 1
 
@@ -735,7 +748,201 @@ def _stream_extract_methods_1_2(
              f"{len(turn_events):,} 转向事件/turn events, "
              f"{len(ortho_candidates):,} 正交候选/ortho candidates "
              f"({time.perf_counter() - t_total:.1f}s)")
-    return turn_events, ortho_candidates
+    return turn_events, ortho_candidates, tracks
+
+
+def _db_global_grid_cell_cap(cfg: IntersectConfig) -> int:
+    """Choose a bounded cap that covers segments fitting the former DB window."""
+    if cfg.cross_track_grid_cell_m <= 0.0:
+        return cfg.cross_track_max_grid_cells_per_segment
+    padded_width = cfg.spatial_window_size[0] * (
+        1.0 + 2.0 * max(0.0, cfg.spatial_window_overlap)
+    )
+    padded_height = cfg.spatial_window_size[1] * (
+        1.0 + 2.0 * max(0.0, cfg.spatial_window_overlap)
+    )
+    cells_x = math.ceil(padded_width / cfg.cross_track_grid_cell_m) + 1
+    cells_y = math.ceil(padded_height / cfg.cross_track_grid_cell_m) + 1
+    return max(cfg.cross_track_max_grid_cells_per_segment, cells_x * cells_y)
+
+
+def _point_window_indexes(
+    value: float,
+    *,
+    extent_min: float,
+    step: float,
+    count: int,
+    overlap: float,
+) -> range:
+    """Return a small conservative index range; callers apply exact bounds."""
+    if count <= 0 or not math.isfinite(value) or step <= 0.0:
+        return range(0)
+    base = min(count - 1, max(0, math.floor((value - extent_min) / step)))
+    radius = math.ceil(max(0.0, overlap)) + 1
+    return range(max(0, base - radius), min(count, base + radius + 1))
+
+
+def _extract_cross_track_memory_windows(
+    tracks: dict[str, list[TrajectoryPoint]],
+    cfg: IntersectConfig,
+    extent: tuple[float, float, float, float],
+    origin_lon: float,
+    origin_lat: float,
+    *,
+    live_status: Any = None,
+    perf: PerfTracker | None = None,
+) -> list[CrossTrackCandidate]:
+    """Run the former window semantics from the shared in-memory workspace.
+
+    Points are routed to every exact overlapping window once.  Only populated
+    windows are then processed, so this fallback performs no per-window SQL and
+    retains the historical clipping/deduplication behaviour.
+    """
+    if not cfg.use_orthogonal_candidates:
+        return []
+    iterator = SpatialWindowIterator(
+        extent,
+        size=cfg.spatial_window_size,
+        overlap=cfg.spatial_window_overlap,
+    )
+    windows = list(iterator.iter_windows())
+    if not windows:
+        return []
+    lon_count, lat_count = iterator.window_shape()
+    buckets: dict[int, dict[str, list[TrajectoryPoint]]] = {}
+    assigned_points = 0
+    for vehicle_id, track in tracks.items():
+        for point in track:
+            lon_indexes = _point_window_indexes(
+                point.lon,
+                extent_min=extent[0],
+                step=iterator._step_lon,
+                count=lon_count,
+                overlap=cfg.spatial_window_overlap,
+            )
+            lat_indexes = _point_window_indexes(
+                point.lat,
+                extent_min=extent[1],
+                step=iterator._step_lat,
+                count=lat_count,
+                overlap=cfg.spatial_window_overlap,
+            )
+            for lon_index in lon_indexes:
+                for lat_index in lat_indexes:
+                    window_index = lon_index * lat_count + lat_index
+                    window = windows[window_index]
+                    if (
+                        window.x_min <= point.lon <= window.x_max
+                        and window.y_min <= point.lat <= window.y_max
+                    ):
+                        buckets.setdefault(window_index, {}).setdefault(
+                            vehicle_id, []
+                        ).append(point)
+                        assigned_points += 1
+
+    candidates: list[CrossTrackCandidate] = []
+    seen_segment_pairs: set[tuple[str, str, str, str, str]] = set()
+    populated = sorted(buckets)
+    for processed, window_index in enumerate(
+        _perf_iter(
+            perf,
+            populated,
+            name="spatial_windows_memory",
+            total=len(populated),
+        ),
+        start=1,
+    ):
+        if live_status is not None:
+            live_status.update(
+                progress=processed / len(populated),
+                detail=(
+                    "内存窗口/In-memory windows:\t"
+                    f"{processed:,}/{len(populated):,} populated"
+                ),
+                stage="Intersect2: 内存分窗 / In-memory Windows",
+            )
+        window_candidates, _, _ = extract_cross_track_candidates(
+            buckets[window_index],
+            origin_lon,
+            origin_lat,
+            cfg,
+            live_status=live_status,
+            sub_detail=True,
+            perf=perf,
+        )
+        for candidate in window_candidates:
+            key = _cross_track_candidate_key(candidate)
+            if key not in seen_segment_pairs:
+                seen_segment_pairs.add(key)
+                candidates.append(candidate)
+
+    log_info(
+        "    内存分窗 / In-memory windows: "
+        f"{len(populated):,}/{len(windows):,} 非空/populated, "
+        f"{assigned_points:,} 点引用/point refs → "
+        f"{len(candidates):,} 候选/candidates"
+    )
+    return candidates
+
+
+def _extract_cross_track_db_workspace(
+    tracks: dict[str, list[TrajectoryPoint]],
+    cfg: IntersectConfig,
+    extent: tuple[float, float, float, float],
+    origin_lon: float,
+    origin_lat: float,
+    *,
+    live_status: Any = None,
+    perf: PerfTracker | None = None,
+) -> list[CrossTrackCandidate]:
+    """Prefer one global broad phase, with a no-SQL memory-window fallback."""
+    if not cfg.use_orthogonal_candidates:
+        return []
+    global_cfg = replace(
+        cfg,
+        cross_track_max_grid_cells_per_segment=_db_global_grid_cell_cap(cfg),
+    )
+    telemetry: dict[str, int | float] = {}
+    fallback_reason: str | None = None
+    try:
+        candidates, _, _ = extract_cross_track_candidates(
+            tracks,
+            origin_lon,
+            origin_lat,
+            global_cfg,
+            live_status=live_status,
+            perf=perf,
+            telemetry=telemetry,
+            max_grid_memberships=_DB_GLOBAL_GRID_MEMBERSHIP_LIMIT,
+            max_overflow_pair_space=_DB_GLOBAL_OVERFLOW_PAIR_LIMIT,
+        )
+    except CrossTrackCapacityError as exc:
+        fallback_reason = str(exc)
+
+    if fallback_reason is not None:
+        log_info(
+            "    全局空间索引超出预算，切换内存分窗 / "
+            "Global index over budget; using memory windows: "
+            f"{fallback_reason}"
+        )
+        return _extract_cross_track_memory_windows(
+            tracks,
+            cfg,
+            extent,
+            origin_lon,
+            origin_lat,
+            live_status=live_status,
+            perf=perf,
+        )
+
+    log_info(
+        "    全局空间索引 / Global spatial index: "
+        f"cap={global_cfg.cross_track_max_grid_cells_per_segment:,}, "
+        f"memberships={int(telemetry.get('grid_memberships_estimate', 0)):,}, "
+        f"overflow={int(telemetry.get('overflow_segments', 0)):,}, "
+        f"{len(candidates):,} 候选/candidates"
+    )
+    return candidates
 
 
 def _extract_cross_track_windows(
@@ -891,9 +1098,111 @@ def _cross_track_candidate_key(
     )
 
 
-def _build_topologies_from_db(
-    conn: Any,
+def _topology_point_windows(
     clusters: list[HotspotCluster],
+    cfg: IntersectConfig,
+) -> list[SpatialWindow]:
+    """Return the exact point-query boxes used by DB topology verification."""
+    windows: list[SpatialWindow] = []
+    for cluster in clusters:
+        topology_radius_m = max(
+            cfg.min_intersection_radius_m,
+            cluster.radius_m + cfg.topology_radius_padding_m,
+        )
+        # Keep parity with the former per-cluster query, which deliberately
+        # fetched a 2x-radius point halo before testing the exact circle.
+        query_radius_deg = topology_radius_m * 2.0 / 111320.0
+        windows.append(SpatialWindow(
+            x_min=cluster.centroid_lon - query_radius_deg,
+            y_min=cluster.centroid_lat - query_radius_deg,
+            x_max=cluster.centroid_lon + query_radius_deg,
+            y_max=cluster.centroid_lat + query_radius_deg,
+        ))
+    return windows
+
+
+@dataclass
+class _TopologyPointIndex:
+    """Memory-bounded one-dimensional spatial index over trajectory points."""
+
+    axis: str
+    coordinates: list[float]
+    points: list[TrajectoryPoint]
+    tracks: dict[str, list[TrajectoryPoint]]
+
+    def tracks_in(self, window: SpatialWindow) -> dict[str, list[TrajectoryPoint]]:
+        """Materialise one window only, ordered as the former SQL result."""
+        if self.axis == "lon":
+            lower, upper = window.x_min, window.x_max
+        else:
+            lower, upper = window.y_min, window.y_max
+        start = bisect_left(self.coordinates, lower)
+        stop = bisect_right(self.coordinates, upper)
+
+        grouped: dict[str, list[TrajectoryPoint]] = defaultdict(list)
+        for point_index in range(start, stop):
+            point = self.points[point_index]
+            if (window.x_min <= point.lon <= window.x_max
+                    and window.y_min <= point.lat <= window.y_max):
+                grouped[point.vehicle_id].append(point)
+
+        ordered: dict[str, list[TrajectoryPoint]] = {}
+        for vehicle_id in sorted(grouped):
+            points = grouped[vehicle_id]
+            timestamps = {point.timestamp for point in points}
+            if len(timestamps) == len(points):
+                points.sort(key=lambda point: point.timestamp)
+                ordered[vehicle_id] = points
+                continue
+            # Equal timestamps have no total SQL ordering.  Retain the exact
+            # order of the shared stream instead of allowing the spatial sort
+            # axis to invent a different adjacent segment.
+            selected_ids = {id(point) for point in points}
+            ordered[vehicle_id] = [
+                point
+                for point in self.tracks[vehicle_id]
+                if id(point) in selected_ids
+            ]
+        return ordered
+
+
+def _build_topology_point_index(
+    tracks: dict[str, list[TrajectoryPoint]],
+) -> _TopologyPointIndex:
+    """Index the global track stream once for transient per-window lookup.
+
+    The wider dataset axis is sorted once.  Each query uses binary search on
+    that axis and an exact predicate on the other, avoiding both an N+1 DB scan
+    and the per-cell object overhead of a Python grid.  The retained index is
+    two pointer arrays of length N; one former SQL result is materialised and
+    released at a time.
+    """
+    points: list[TrajectoryPoint] = []
+    for track in tracks.values():
+        points.extend(track)
+    if not points:
+        return _TopologyPointIndex(
+            axis="lon", coordinates=[], points=[], tracks=tracks,
+        )
+    axis = (
+        "lon"
+        if (max(point.lon for point in points) - min(point.lon for point in points)
+            >= max(point.lat for point in points) - min(point.lat for point in points))
+        else "lat"
+    )
+    points.sort(key=(lambda point: point.lon) if axis == "lon" else (lambda point: point.lat))
+    coordinates = [
+        point.lon if axis == "lon" else point.lat
+        for point in points
+    ]
+    return _TopologyPointIndex(
+        axis=axis, coordinates=coordinates, points=points, tracks=tracks,
+    )
+
+
+def _build_topologies_from_tracks(
+    clusters: list[HotspotCluster],
+    tracks: dict[str, list[TrajectoryPoint]],
     cfg: IntersectConfig,
     origin_lon: float,
     origin_lat: float,
@@ -901,36 +1210,44 @@ def _build_topologies_from_db(
     live_status: Any = None,
     perf: PerfTracker | None = None,
 ) -> tuple[list[IntersectionTopology], list[HotspotCluster], list[EntryExitObservation]]:
-    """Topology verification by querying nearby points from DB per cluster."""
+    """Verify DB-mode topologies from the already-streamed global tracks.
+
+    The old architecture issued and sorted one spatial SQL query per cluster.
+    This path routes the single ordered stream through all equivalent query
+    boxes once, then reuses the existing exact circle-crossing implementation.
+    """
+    total_clusters = len(clusters)
+    log_info(f"── 拓扑验证 / Topology verification ({total_clusters:,} 簇/clusters) ...")
+    t0 = time.perf_counter()
+    windows = _topology_point_windows(clusters, cfg)
+    if perf is None:
+        point_index = _build_topology_point_index(tracks)
+    else:
+        with perf.stage("topology_index_points"):
+            point_index = _build_topology_point_index(tracks)
+
     topologies: list[IntersectionTopology] = []
     annotated_clusters: list[HotspotCluster] = []
     all_observations: list[EntryExitObservation] = []
-    total_clusters = len(clusters)
-
-    log_info(f"── 拓扑验证 / Topology verification ({total_clusters:,} 簇/clusters) ...")
-    t0 = time.perf_counter()
-    cluster_idx = 0
-    for cluster in _perf_iter(perf, clusters, name="topo_clusters", total=total_clusters):
-        cluster_idx += 1
+    for cluster_index, cluster in enumerate(
+        _perf_iter(perf, clusters, name="topo_clusters", total=total_clusters)
+    ):
         _route_progress(
             live_status,
-            detail=f"簇/Cluster:\t{cluster_idx:,}/{total_clusters:,}",
-            progress=cluster_idx / total_clusters,
+            detail=f"簇/Cluster:\t{cluster_index + 1:,}/{total_clusters:,}",
+            progress=(cluster_index + 1) / total_clusters,
             elapsed=time.perf_counter() - t0,
             stage="Intersect2: 拓扑验证 / Topology",
         )
-        radius = max(cfg.min_intersection_radius_m,
-                     cluster.radius_m + cfg.topology_radius_padding_m)
-        nearby_points = _query_active_points_near_cluster(
-            conn,
-            cluster,
-            radius * 2.0,
-            table=cfg.db_table,
-            kept_table=cfg.kept_table,
-            source_id=cfg.source_id,
-            clean_id=cfg.clean_id,
+        radius = max(
+            cfg.min_intersection_radius_m,
+            cluster.radius_m + cfg.topology_radius_padding_m,
         )
-        nearby_tracks = _tracks_from_points(nearby_points)
+        if perf is None:
+            nearby_tracks = point_index.tracks_in(windows[cluster_index])
+        else:
+            with perf.stage("topology_route_window"):
+                nearby_tracks = point_index.tracks_in(windows[cluster_index])
         observations, crossing_points = _extract_entry_exit_observations_batch(
             nearby_tracks,
             cluster=cluster,
@@ -940,12 +1257,17 @@ def _build_topologies_from_db(
             bearing_window=cfg.bearing_window,
         )
         cluster = replace(cluster, crossing_points=tuple(crossing_points))
-        topology, annotated, cluster_obs = _build_topology_for_cluster(
+        topology, annotated, cluster_observations = _build_topology_for_cluster(
             cluster, observations, origin_lon, origin_lat, cfg,
         )
         topologies.append(topology)
         annotated_clusters.append(annotated)
-        all_observations.extend(cluster_obs)
+        all_observations.extend(cluster_observations)
+
+    log_info(
+        f"── 拓扑验证: {len(topologies):,} 拓扑/topologies "
+        f"({time.perf_counter() - t0:.1f}s)"
+    )
     return topologies, annotated_clusters, all_observations
 
 
@@ -953,8 +1275,8 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
     """DB-mode intersection detection.
 
     ZH: DB 模式交叉口检测。
-        - Method 1+2: 全局流式逐车处理（单车操作，无需空间窗）
-        - Method 3: 空间滑窗内跨车段求交
+        - Method 1+2: 一次加载全局逐车处理（单车操作，无需空间窗）
+        - Method 3: 复用同一 tracks workspace 的全局空间索引
         - 共享 _cluster_pipeline + _build_intersect_report
     """
     # ── Spatial extent ──────────────────────────────────────────────
@@ -981,7 +1303,7 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
                     detail="Method 1+2: Turn events + ortho candidates...")
     t_stage = time.perf_counter()
     with tracker.stage("stream_m1_m2"):
-        turn_events, ortho_candidates = _stream_extract_methods_1_2(
+        turn_events, ortho_candidates, tracks = _stream_extract_methods_1_2(
             conn, cfg, origin_lon, origin_lat,
             live_status=live, perf=tracker,
         )
@@ -991,11 +1313,17 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
             elapsed=time.perf_counter() - t_stage,
         )
 
-    # ── Method 3: spatial windows (DB-specific) ─────────────────────
+    # ── Method 3: one global in-memory broad phase (DB-specific) ────
     t_stage = time.perf_counter()
-    with tracker.stage("cross_track_windows"):
-        cross_candidates = _extract_cross_track_windows(
-            conn, cfg, extent, origin_lon, origin_lat, live_status=live, perf=tracker,
+    with tracker.stage("cross_track_global"):
+        cross_candidates = _extract_cross_track_db_workspace(
+            tracks,
+            cfg,
+            extent,
+            origin_lon,
+            origin_lat,
+            live_status=live,
+            perf=tracker,
         )
 
     # ── Shared: cluster pipeline (G* + DBSCAN + merge + ablation) ───
@@ -1015,14 +1343,14 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
             elapsed=time.perf_counter() - t_stage,
         )
 
-    # ── DB-mode topology (per-cluster DB queries) ───────────────────
+    # ── DB-mode topology: reuse the single-pass tracks workspace ────
     if live is not None:
         live.update(stage="Intersect2: 拓扑验证 / Topology",
-                    detail="Topology verification (per-cluster DB queries)...")
+                    detail="Topology verification (single-pass workspace)...")
     t_stage = time.perf_counter()
-    with tracker.stage("topology_db"):
-        topologies, annotated_clusters, observations = _build_topologies_from_db(
-            conn, annotated_clusters, cfg, origin_lon, origin_lat,
+    with tracker.stage("topology_index"):
+        topologies, annotated_clusters, observations = _build_topologies_from_tracks(
+            annotated_clusters, tracks, cfg, origin_lon, origin_lat,
             live_status=live, perf=tracker,
         )
     if live is not None:
@@ -1043,7 +1371,7 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
         report=_build_intersect_report(
             annotated_clusters, topologies,
             turn_events, hotspot_events, ortho_candidates, cross_candidates,
-            track_count=0,
+            track_count=len(tracks),
         ),
     )
 
@@ -1570,6 +1898,80 @@ def _grid_neighbors_indices(
     return result
 
 
+def _grid_has_min_neighbors(
+    xs: list[float],
+    ys: list[float],
+    index: int,
+    eps_m: float,
+    min_samples: int,
+    grid: dict[tuple[int, int], list[int]],
+) -> bool:
+    """Return whether ``index`` is core without materialising its neighbours.
+
+    DBSCAN only needs the complete neighbour list when expanding a frontier.
+    Core classification needs a count up to ``min_samples`` and can stop as
+    soon as that threshold is reached.  This distinction is important for
+    cross-track candidates: a dense intersection can contain tens of thousands
+    of points, while the configured threshold is normally three.
+    """
+    if min_samples <= 0:
+        return True
+    base_x, base_y = xs[index], ys[index]
+    eps_sq = eps_m * eps_m
+    x_bounds = _dbscan_grid_axis_bounds(base_x, eps_m)
+    y_bounds = _dbscan_grid_axis_bounds(base_y, eps_m)
+    if x_bounds is None or y_bounds is None:
+        raise RuntimeError("DBSCAN grid invariant violated after construction")
+    count = 0
+    for grid_x in range(x_bounds[0], x_bounds[1] + 1):
+        for grid_y in range(y_bounds[0], y_bounds[1] + 1):
+            for candidate in grid.get((grid_x, grid_y), ()):
+                dx = xs[candidate] - base_x
+                dy = ys[candidate] - base_y
+                if dx * dx + dy * dy <= eps_sq:
+                    count += 1
+                    if count >= min_samples:
+                        return True
+    return False
+
+
+def _take_grid_frontier_neighbors(
+    xs: list[float],
+    ys: list[float],
+    index: int,
+    eps_m: float,
+    grid: dict[tuple[int, int], list[int]],
+    available: dict[tuple[int, int], set[int]],
+    point_cells: list[tuple[int, int]],
+) -> list[int]:
+    """Take exact, not-yet-queued neighbours in historical index order.
+
+    Removing a point from ``available`` when it enters the current expansion
+    queue is equivalent to the old per-cluster ``queued_epoch`` check.  The
+    difference is that later core points inspect only the shrinking frontier,
+    rather than repeatedly walking every already-labelled member of a dense
+    cluster.
+    """
+    base_x, base_y = xs[index], ys[index]
+    eps_sq = eps_m * eps_m
+    x_bounds = _dbscan_grid_axis_bounds(base_x, eps_m)
+    y_bounds = _dbscan_grid_axis_bounds(base_y, eps_m)
+    if x_bounds is None or y_bounds is None:
+        raise RuntimeError("DBSCAN grid invariant violated after construction")
+    result: list[int] = []
+    for grid_x in range(x_bounds[0], x_bounds[1] + 1):
+        for grid_y in range(y_bounds[0], y_bounds[1] + 1):
+            for candidate in available.get((grid_x, grid_y), ()):
+                dx = xs[candidate] - base_x
+                dy = ys[candidate] - base_y
+                if dx * dx + dy * dy <= eps_sq:
+                    result.append(candidate)
+    result.sort()
+    for candidate in result:
+        available[point_cells[candidate]].remove(candidate)
+    return result
+
+
 def _run_dbscan_large_dispatch(
     xs: list[float],
     ys: list[float],
@@ -1589,41 +1991,43 @@ def _run_dbscan_large_dispatch(
     if n == 0:
         return []
 
-    labels = [_UNVISITED] * n
-    # The scan has lower constant overhead on tiny inputs (the mandatory
-    # boundary/wrapper cases), while the grid is reserved for the large
-    # workload it was introduced to accelerate.
     grid = _build_dbscan_grid(xs, ys, eps_m)
+    if grid is None:
+        # Preserve private boundary behaviour for invalid/non-finite inputs.
+        # These cases cannot be represented safely by the spatial index.
+        return _run_dbscan_scan(
+            xs, ys, eps_m=eps_m, min_samples=min_samples,
+            live_status=live_status, stage=stage, perf=perf,
+        )
 
-    def neighbors_for(index: int) -> list[int]:
-        if grid is None:
-            return _neighbors_indices(xs, ys, index, eps_m)
-        return _grid_neighbors_indices(xs, ys, index, eps_m, grid)
-
+    labels = [_UNVISITED] * n
     cluster_id = 0
-    # One allocation for the complete run.  An epoch marker is equivalent to a
-    # per-cluster ``queued`` boolean but avoids O(cluster_count * n) clearing.
-    queued_epoch = [0] * n
+    core_flags: list[bool | None] = [None] * n
+    point_cells: list[tuple[int, int]] = [(0, 0)] * n
+    available: dict[tuple[int, int], set[int]] = {}
+    for cell, indexes in grid.items():
+        available[cell] = set(indexes)
+        for index in indexes:
+            point_cells[index] = cell
     t0 = time.perf_counter()
     last_t = t0
 
     for i in _perf_iter(perf, range(n), name="dbscan_points", total=n):
         if labels[i] != _UNVISITED:
             continue
-        neighbors = neighbors_for(i)
-        if len(neighbors) < min_samples:
+        is_core = _grid_has_min_neighbors(
+            xs, ys, i, eps_m, min_samples, grid,
+        )
+        core_flags[i] = is_core
+        if not is_core:
             labels[i] = _NOISE
             continue
 
         labels[i] = cluster_id
-        seeds = [nb for nb in neighbors if nb != i]
-        epoch = cluster_id + 1
-        for seed in seeds:
-            queued_epoch[seed] = epoch
-        # ZH: while 循环不是可迭代对象，跳过逐迭代计时（仅 seed 展开阶段的
-        #     内层 for 循环被计时）。
-        # EN: ``while`` is not an iterable — no per-iteration timing here;
-        #     only the inner seed-expansion for loop is timed.
+        available[point_cells[i]].remove(i)
+        seeds = _take_grid_frontier_neighbors(
+            xs, ys, i, eps_m, grid, available, point_cells,
+        )
         while seeds:
             current = seeds.pop()
             if labels[current] == _NOISE:
@@ -1631,19 +2035,22 @@ def _run_dbscan_large_dispatch(
             if labels[current] != _UNVISITED:
                 continue
             labels[current] = cluster_id
-            cur_neighbors = neighbors_for(current)
-            if len(cur_neighbors) >= min_samples:
+            is_core = core_flags[current]
+            if is_core is None:
+                is_core = _grid_has_min_neighbors(
+                    xs, ys, current, eps_m, min_samples, grid,
+                )
+                core_flags[current] = is_core
+            if is_core:
                 if perf is None:
-                    for nb in cur_neighbors:
-                        if labels[nb] in (_UNVISITED, _NOISE) and queued_epoch[nb] != epoch:
-                            seeds.append(nb)
-                            queued_epoch[nb] = epoch
+                    seeds.extend(_take_grid_frontier_neighbors(
+                        xs, ys, current, eps_m, grid, available, point_cells,
+                    ))
                 else:
                     with perf.stage("dbscan_seed_neighbors"):
-                        for nb in cur_neighbors:
-                            if labels[nb] in (_UNVISITED, _NOISE) and queued_epoch[nb] != epoch:
-                                seeds.append(nb)
-                                queued_epoch[nb] = epoch
+                        seeds.extend(_take_grid_frontier_neighbors(
+                            xs, ys, current, eps_m, grid, available, point_cells,
+                        ))
         cluster_id += 1
         now = time.perf_counter()
         if i % 500 == 0 or (now - last_t) >= 3.0:
@@ -1660,7 +2067,7 @@ def _run_dbscan_large_dispatch(
     return labels
 
 
-def _run_dbscan(
+def _run_dbscan_scan(
     xs: list[float],
     ys: list[float],
     *,
@@ -1670,18 +2077,8 @@ def _run_dbscan(
     stage: str = "DBSCAN",
     perf: PerfTracker | None = None,
 ) -> list[int]:
-    """Run the compact historical scan for small inputs and grid path otherwise."""
+    """Historical full-scan DBSCAN for tiny or non-indexable inputs."""
     n = len(xs)
-    if n == 0:
-        return []
-    if n > 256:
-        return _run_dbscan_large_dispatch(
-            xs, ys, eps_m=eps_m, min_samples=min_samples,
-            live_status=live_status, stage=stage, perf=perf,
-        )
-
-    # Keep this frame intentionally close to c12.  The large-path locals
-    # (grid, closure and epoch queue) must not inflate boundary microcases.
     labels = [_UNVISITED] * n
     cluster_id = 0
     t0 = time.perf_counter()
@@ -1726,6 +2123,32 @@ def _run_dbscan(
             last_t = now
     log_info(f"    DBSCAN: {n:,} 点/points → {cluster_id:,} 簇/clusters ({time.perf_counter() - t0:.1f}s)")
     return labels
+
+
+def _run_dbscan(
+    xs: list[float],
+    ys: list[float],
+    *,
+    eps_m: float,
+    min_samples: int,
+    live_status: Any = None,
+    stage: str = "DBSCAN",
+    perf: PerfTracker | None = None,
+) -> list[int]:
+    """Run the compact historical scan for small inputs and grid path otherwise."""
+    n = len(xs)
+    if n == 0:
+        return []
+    if n > 256:
+        return _run_dbscan_large_dispatch(
+            xs, ys, eps_m=eps_m, min_samples=min_samples,
+            live_status=live_status, stage=stage, perf=perf,
+        )
+
+    return _run_dbscan_scan(
+        xs, ys, eps_m=eps_m, min_samples=min_samples,
+        live_status=live_status, stage=stage, perf=perf,
+    )
 
 
 def _group_cluster_items(items: list[Any], labels: list[int]) -> list[tuple[int, list[Any]]]:

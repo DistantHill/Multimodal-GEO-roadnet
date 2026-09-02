@@ -10,10 +10,10 @@ Only committed files were used. Uncommitted changes present in the host source
 working tree on August 30, 2026 were intentionally excluded. The package name
 `track.v2` is preserved to avoid algorithm-level import rewrites.
 
-Migration-only adaptations are limited to:
+At the initial import, migration-only adaptations were limited to:
 
 - standard Compose `POSTGRES_*` environment variable support while preserving
-  legacy `TRACK_PG_*` variables;
+  source-compatible `TRACK_PG_*` aliases;
 - removal of the insecure fallback database password;
 - the documented empty result for an explicitly missing `.env` file;
 - a default `allow_running=False` argument for Clip replay, fixing the source
@@ -22,3 +22,26 @@ Migration-only adaptations are limited to:
   host-specific Windows paths;
 - the `python -m pipeline` container wrapper for `run`, `init-db`, `serve`, and
   `check-config` commands.
+
+## Post-import evolution
+
+The list above records provenance and import-time adaptations only. It is not
+an exhaustive description of the current implementation and is not a promise
+of output, ordering, persistence, or replay equivalence with the source branch.
+
+After the import, the repository adopted explicit
+`clean_runs → detect_runs → fit_runs` lineage, a shared Detect track workspace,
+a capacity-guarded global cross-track index, indexed DBSCAN and topology
+verification, COPY/batched persistence, bounded Clip indexing, phase-level
+Fitting telemetry, Detect failure-state handling, schema auto-migration, and
+schema-qualified PostgreSQL sources. See the current
+[performance and runtime architecture review](../../docs/performance-optimization-review.md)
+for the active design, measured results, and accepted trade-offs.
+
+The word *legacy* is local context, not a single repository-wide execution
+mode. `track.v2.db.legacy_migration` refers to the old `pipeline_runs` registry;
+`TRACK_PG_*` names are live compatibility aliases; replay/progress adapters may
+still serve compatible data or callers. `_cross_track_legacy.py` specifically
+is a frozen comparison oracle, not the production Detect implementation or a
+runtime fallback. Other uses must be interpreted from their component contract
+rather than assumed to be inactive.

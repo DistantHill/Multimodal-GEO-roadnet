@@ -395,8 +395,10 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
 
     def count_rows(self) -> int:
         """ZH: 从 pg_class 读取估算行数——纯元数据查询，毫秒级。
+            通过 to_regclass 解析 source_id，兼容 schema-qualified 表名。
             用于进度条百分比，不必精确到个位数。
         EN: Read estimated row count from pg_class — pure metadata query, sub-ms.
+            Resolve source_id with to_regclass so schema-qualified table names work.
             Used for progress bar percentage; exact precision is unnecessary."""
         conn = self._connect()
         cur = None
@@ -406,8 +408,7 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
             table = self._source.source_id or "trajectory_points"
             cur.execute(
                 "SELECT c.reltuples::bigint FROM pg_class c "
-                "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE c.relname = %s AND n.nspname = current_schema()",
+                "WHERE c.oid = to_regclass(%s)",
                 (table,),
             )
             result = cur.fetchone()

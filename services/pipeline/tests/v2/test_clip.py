@@ -95,6 +95,52 @@ class ClipExtractionTest(unittest.TestCase):
             [10, 20],
         )
 
+    def test_large_radius_outlier_does_not_coarsen_nearby_candidate_cells(self) -> None:
+        intersections = (
+            ClipIntersection(1, 50_000 / _METERS_PER_DEGREE, 0.0, 1_300.0),
+            ClipIntersection(2, 0.0, 0.0, 20.0),
+            ClipIntersection(3, 500 / _METERS_PER_DEGREE, 0.0, 20.0),
+            ClipIntersection(4, 1_000 / _METERS_PER_DEGREE, 0.0, 20.0),
+        )
+        grid = clip_module._IntersectionGrid(intersections)
+        target = next(
+            indexed for indexed in grid.indexed_intersections
+            if indexed.value.cluster_id == 2
+        )
+
+        candidates = grid.candidates(
+            (target.x - 10.0, target.y),
+            (target.x + 10.0, target.y),
+        )
+
+        self.assertEqual([candidate.value.cluster_id for candidate in candidates], [2])
+
+    def test_extreme_radius_uses_bounded_overflow_index(self) -> None:
+        intersections = (
+            ClipIntersection(1, 0.0, 0.0, 1_000_000.0),
+            ClipIntersection(2, 20_000 / _METERS_PER_DEGREE, 0.0, 20.0),
+        )
+
+        grid = clip_module._IntersectionGrid(intersections)
+        small = next(
+            indexed for indexed in grid.indexed_intersections
+            if indexed.value.cluster_id == 2
+        )
+        candidates = grid.candidates(
+            (small.x - 10.0, small.y),
+            (small.x + 10.0, small.y),
+        )
+
+        self.assertEqual(
+            [indexed.value.cluster_id for indexed in grid.overflow_intersections],
+            [1],
+        )
+        self.assertLessEqual(len(grid.cells), 4)
+        self.assertEqual(
+            {candidate.value.cluster_id for candidate in candidates},
+            {1, 2},
+        )
+
     def test_two_intersections_produce_one_clip_with_interpolated_endpoints(self) -> None:
         points = tuple(
             _point("vehicle-1", index, x_m)
@@ -308,23 +354,26 @@ class ClipDatabaseReplayTest(unittest.TestCase):
         point_rows: list[
             tuple[
                 str, int, int, str, str, float, float, float, float, float,
-                dict[object, object], str | None, str | None, str,
+                dict[object, object], str | None, str | None, str, int, int,
             ]
         ] = [
             (
                 "vehicle-1", 1, index, "synthetic", str(index + 1),
                 float(index * 10), x / _METERS_PER_DEGREE, 0.0, 90.0, 5.0, {},
-                None, None, "",
+                None, None, "", 0, index + 1,
             )
             for index, x in enumerate(range(-300, 301, 50))
         ]
         point_rows.append(
             (
-                "vehicle-1", 1, 99, "synthetic", "6->7:orthogonal_heading",
+                "vehicle-1", 1, 5, "synthetic", "6->7:orthogonal_heading",
                 55.0, 0.0, 0.0, 45.0, 0.0, {}, "6", "7", "orthogonal_heading",
+                1, 99,
             )
         )
-        point_rows.sort(key=lambda row: float(row[5]))
+        # The production query intentionally has no global ORDER BY.  Replay a
+        # worst-case row order to verify per-subtrack ordering in the loader.
+        point_rows.sort(key=lambda row: float(row[5]), reverse=True)
         conn = _ReplayConnection([
             [("clean-1", "synthetic", {"target_table": "trajectory_points"}, "completed")],
             [
@@ -343,11 +392,8 @@ class ClipDatabaseReplayTest(unittest.TestCase):
         self.assertIn("injected_points", point_query)
         self.assertIn("ktp.source_id", point_query)
         self.assertNotIn("is_active", point_query)
-        self.assertIn(
-            "ORDER BY vehicle_id, subtrack_index, anchor_sequence, point_kind",
-            point_query,
-        )
-        self.assertNotIn("ORDER BY vehicle_id, subtrack_index, timestamp", point_query)
+        self.assertIn("point_kind, row_id", point_query)
+        self.assertNotIn("ORDER BY", point_query)
         self.assertEqual(point_params, ("clean-1", "clean-1"))
         self.assertEqual(result.clips[0].points[0].point_ref.source_id, "synthetic")
 

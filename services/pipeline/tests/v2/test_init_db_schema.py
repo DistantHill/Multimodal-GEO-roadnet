@@ -12,14 +12,10 @@ from tempfile import TemporaryDirectory
 from track.v2.cli.init_db import (
     DDL_STATEMENTS,
     INDEX_STATEMENTS,
-    LegacyPipelineRun,
     _auto_add_missing_columns,
-    build_legacy_migration_plan,
     build_auto_migrations,
     column_to_alter_fragment,
     parse_ddl_columns,
-    load_legacy_clean_map,
-    migrate_legacy_pipeline_runs,
 )
 from track.v2.db.legacy_migration import (
     LegacyPipelineRun,
@@ -397,7 +393,7 @@ class LegacyRunMigrationPlanTest(unittest.TestCase):
             source_id="raw_points", source_kind="postgres_table",
             parameters={}, status="completed", started_at="start", finished_at=None,
         )
-        with self.assertRaisesRegex(ValueError, "available Clean Run"):
+        with self.assertRaisesRegex(ValueError, "real legacy run"):
             build_legacy_migration_plan(
                 [ambiguous],
                 {ambiguous.id: "33333333-3333-3333-3333-333333333333"},
@@ -463,7 +459,12 @@ class LegacyMigrationExecutionTest(unittest.TestCase):
         ])
 
         with self.assertRaisesRegex(ValueError, detect_id):
-            migrate_legacy_pipeline_runs(cur, {})
+            migrate_legacy_pipeline_runs(
+                cur,
+                {},
+                registry_ddl=dict(DDL_STATEMENTS),
+                index_statements=INDEX_STATEMENTS,
+            )
 
         mutations = [
             sql for sql, _ in cur.executed
@@ -481,7 +482,12 @@ class LegacyMigrationExecutionTest(unittest.TestCase):
             ),
         ])
 
-        migrated = migrate_legacy_pipeline_runs(cur, {})
+        migrated = migrate_legacy_pipeline_runs(
+            cur,
+            {},
+            registry_ddl=dict(DDL_STATEMENTS),
+            index_statements=INDEX_STATEMENTS,
+        )
 
         self.assertTrue(migrated)
         sql = "\n".join(statement for statement, _ in cur.executed)
@@ -498,7 +504,12 @@ class LegacyMigrationExecutionTest(unittest.TestCase):
         original_fetchone = cur.fetchone
         cur.fetchone = lambda: (None,) if "to_regclass" in cur.last_sql else original_fetchone()
 
-        self.assertFalse(migrate_legacy_pipeline_runs(cur, {}))
+        self.assertFalse(migrate_legacy_pipeline_runs(
+            cur,
+            {},
+            registry_ddl=dict(DDL_STATEMENTS),
+            index_statements=INDEX_STATEMENTS,
+        ))
         self.assertEqual(len(cur.executed), 1)
 
 
@@ -626,6 +637,31 @@ class ParseRealDDLTest(unittest.TestCase):
                     len(cols), 2,
                     f"{name}: expected >= 2 non-generated, non-serial columns"
                 )
+
+
+class TurnEventProvenanceSchemaTest(unittest.TestCase):
+    def test_new_and_existing_turn_event_tables_get_point_provenance_columns(self) -> None:
+        turn_events_ddl = dict(DDL_STATEMENTS)["turn_events"]
+        columns = parse_ddl_columns(turn_events_ddl)
+
+        self.assertEqual(columns["tp_source_id"], "TEXT")
+        self.assertEqual(columns["tp_source_row_key"], "TEXT")
+
+        existing = set(columns) - {"tp_source_id", "tp_source_row_key"}
+        migrations = build_auto_migrations("turn_events", turn_events_ddl, existing)
+        self.assertEqual(
+            [(column, sql) for column, _fragment, sql in migrations],
+            [
+                (
+                    "tp_source_id",
+                    "ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS tp_source_id TEXT",
+                ),
+                (
+                    "tp_source_row_key",
+                    "ALTER TABLE turn_events ADD COLUMN IF NOT EXISTS tp_source_row_key TEXT",
+                ),
+            ],
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -2,18 +2,20 @@
 
 ## 当前状态
 
-当前仓库采用单 Repository、多 Docker Service 的结构。轨迹重建 Pipeline 已从宿主机源码仓库的 `codex/pipe-06a-integration@75fa562` 迁入 `services/pipeline/src/track/v2/`；迁移保留原包名、阶段顺序、lineage/run ID 和数据库业务语义。来源与迁移边界见 `services/pipeline/SOURCE.md`。
+当前仓库采用单 Repository、多 Docker Service 的结构。轨迹重建 Pipeline 最初从宿主机源码仓库的 `codex/pipe-06a-integration@75fa562` 迁入 `services/pipeline/src/track/v2/`；初始迁入保留了包名、阶段顺序和 lineage 意图。当前实现已在此基线上重构 Detect、Clip、持久化和 Run 生命周期，不承诺与来源版本逐行输出、顺序或失败重放完全等价。
+
+源码 provenance 与初始迁入边界见 [`services/pipeline/SOURCE.md`](services/pipeline/SOURCE.md)，当前执行架构和取舍见 [`docs/performance-optimization-review.md`](docs/performance-optimization-review.md)，2026-09-01 的完整 100 万行基准、逐项优化收益和内存口径见 [`docs/pipeline-1m-performance-benchmark-spec.md`](docs/pipeline-1m-performance-benchmark-spec.md)。2,000 万行输入的规模推演、全量物化审计、3 GB 内存合同和外存化改造门槛见 [`docs/pipeline-20m-memory-budget-spec.md`](docs/pipeline-20m-memory-budget-spec.md)；当前实现尚未通过该合同。
 
 ## 目录职责
 
 - `apps/frontend`：独立前端开发容器；仅负责 UI 和 Backend API 调用。
 - `apps/backend`：独立 FastAPI API 容器；提供健康检查，以及只读、限量的地图图层、Replay 和 Clip GeoJSON API。
-- `services/pipeline`：Pipeline 独立运行单元，包含 Cleaner、Detect、Clip、Fitting、Network、持久化、回放和数据库初始化逻辑。Backend request process 不执行这些耗时阶段。
+- `services/pipeline`：Pipeline 独立运行单元，包含 Cleaner、Detect、Clip、Fitting、Network、持久化、回放和数据库初始化逻辑。Detect 的 DB 模式只构建一次 Clean 轨迹 workspace，并由转向/正交检测、跨车求交和拓扑验证共享；Backend request process 不执行这些耗时阶段。
 - `services/vision`：可选 YOLOv8 CUDA 11.7 离线推理/跟踪运行单元，通过 Compose `vision` profile 启用。
 - `db/postgres`、`db/qdrant`：数据库定义、初始化和迁移逻辑，不保存运行时数据。
 - `infra/docker`：开发和生产 Compose 文件。
 
-Detect 中原有视觉判别能力仍可作为 Pipeline 内部逻辑。独立 YOLOv8 GPU Runtime 已迁入 `services/vision`，但不强制改造成网络微服务，也不由 Backend request process 执行。没有稳定的跨服务共享语义时不创建 `libs/`。
+Detect 内部的视觉判别能力仍可作为 Pipeline 内部逻辑。独立 YOLOv8 GPU Runtime 已迁入 `services/vision`，但不强制改造成网络微服务，也不由 Backend request process 执行。没有稳定的跨服务共享语义时不创建 `libs/`。
 
 ## 开发环境
 
@@ -56,21 +58,23 @@ QGIS 3.44 LTR 插件源码位于 `apps/qgis-plugin/roadnet_tools/`。开发机�
 
 Raw trajectory、Parquet、中间文件、导出文件和模型权重属于 Runtime Data。开发/生产通过 `DATA_ROOT` 挂载到容器 `/data`，例如宿主机 `/data/road-network` 对应容器 `/data`；代码仓库不创建 `data/raw` 或 `data/parquet`。
 
-Pipeline 日志默认写入容器内 `/data/logs/<timestamp>_pid-<pid>_log.txt`，即宿主机 `${DATA_ROOT}/logs/`。每个进程使用独立文件；每个 stage 都记录带关联 run ID 的 `[stage-start]` 和 `[stage-finish]`，结束记录中的 `elapsed_s` 是单调时钟测得的阶段耗时。可用 `PIPELINE_LOG_DIR` 修改目录；仅在确实需要共享固定文件时设置 `PIPELINE_LOG_PATH`，且不要指向源码目录。
+Pipeline 日志默认写入容器内 `/data/logs/<timestamp>_pid-<pid>_log.txt`，即宿主机 `${DATA_ROOT}/logs/`。每个进程使用独立文件；每个 stage 都记录带关联 run ID 的 `[stage-start]` 和 `[stage-finish]`，结束记录中的 `elapsed_s` 是单调时钟测得的阶段耗时。Fitting 另记录 `phase=fit_compute` 与 `phase=fit_persist` 的 `[stage-phase]`；Detect 会记录全局空间索引的 membership、overflow 和候选数量，用于区分计算、持久化和资源回退耗时。可用 `PIPELINE_LOG_DIR` 修改目录；仅在确实需要共享固定文件时设置 `PIPELINE_LOG_PATH`，且不要指向源码目录。
 
 YOLO 模型在容器内挂载到 `/models`，输入和输出分别使用 `/data/vision/input` 与 `/data/vision/output`。本地迁移权重位于被 Git 忽略的 `models/yolo/yolov8n.pt`；生产环境必须通过外部 `MODEL_ROOT` 挂载。
 
 PostgreSQL 使用 `postgres_data:/var/lib/postgresql/data`，Qdrant 使用 `qdrant_data:/qdrant/storage`。这两个 named volume 不绑定到仓库目录。
 
-Pipeline 的数据库配置优先读取进程中的 `TRACK_PG_*`（兼容旧项目），其次读取标准 Compose 变量 `POSTGRES_HOST`、`POSTGRES_PORT`、`POSTGRES_DB`、`POSTGRES_USER`、`POSTGRES_PASSWORD`。代码不再提供默认数据库密码。
+Pipeline 的数据库配置优先读取进程中的来源兼容变量 `TRACK_PG_*`，其次读取标准 Compose 变量 `POSTGRES_HOST`、`POSTGRES_PORT`、`POSTGRES_DB`、`POSTGRES_USER`、`POSTGRES_PASSWORD`。这只是环境变量别名兼容，不代表旧执行架构仍受支持；代码不再提供默认数据库密码。
 
 ## Pipeline 运行
 
-首次创建或更新业务表结构时执行原有 Python 初始化/迁移入口：
+首次创建或更新业务表结构时执行当前权威 Python 初始化/迁移入口：
 
 ```sh
 make pipeline-init-db
 ```
+
+非 `--reset` 初始化在一个事务内处理当前建表、自动补列、显式结构迁移和索引同步；已有 named volume 升级代码后也必须执行。它会为旧表补齐 `turn_events.tp_source_id` 和 `turn_events.tp_source_row_key`。只有数据库仍存在早期单表 Run 注册表 `pipeline_runs` 且 Clean 父子关系无法确定时，才需要通过 `--legacy-clean-map` 提供精确的 Detect UUID → Clean UUID 映射。`--reset` 会删除全部 Pipeline 业务数据，不能用于普通升级。
 
 查看完整参数或从外部数据目录运行 CSV：
 
@@ -80,7 +84,9 @@ docker compose -f infra/docker/compose.dev.yml run --rm pipeline \
   python -m pipeline run --csv /data/parquet-or-csv/input.csv
 ```
 
-也可使用 `--pg-table TABLE` 从 PostgreSQL 读取，或用 `--clean-id UUID` 复用已完成的 Clean Run。Pipeline 是独立批处理进程，不经由 Backend API request process 启动。
+输入使用 `--csv`、`--pg-table` 或 `--clean-id` 三选一。`--pg-table` 接受 `public.day01` 这类 schema-qualified 名称；进度总行数通过 `to_regclass` 解析 `pg_class.reltuples`，因此是估算值。`--clean-id UUID` 只复用已完成的 Clean Run，并始终创建新的 Detect Run；Detect 完成后再创建新的 Fit Run。Clip 没有独立 Run 注册表，Network 当前也不单独持久化。Pipeline 是独立批处理进程，不经由 Backend API request process 启动。
+
+当前 Run lineage 为 `clean_runs → detect_runs → fit_runs`，早期的 `pipeline_runs` 只属于一次性数据库迁移输入，不是当前执行模型。Detect 的 append-only 派生产物使用 PostgreSQL COPY，并假定写入新建的 Run ID；同一 Detect/Fit Run 的重复落库不保证幂等，重新计算应创建新 Run。普通 Detect 异常会回滚派生产物，并把 Run 标为 `failed`；进程被强制终止时仍可能需要运维侧清理长期 `running` 记录。
 
 ## 常用命令
 
@@ -100,4 +106,4 @@ make vision-run
 make dev-down
 ```
 
-`make test` 会运行 Backend 与 Pipeline 的 pytest 套件。源项目的历史测试基线并非全绿，迁移报告中会区分既有失败与迁移新增回归。
+`make test` 会运行 Backend 与 Pipeline 的 pytest 套件。提交或性能报告必须列出实际执行的验证命令和结果，并逐项说明已知失败；不要用来源仓库或“legacy 基线”笼统替代当前验证状态。

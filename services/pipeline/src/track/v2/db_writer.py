@@ -183,59 +183,105 @@ def insert_centerline_bundle(
     fit_id: str,
     detect_id: str,
 ) -> tuple[int, ...]:
-    """Persist successful centerlines and their ordered source-clip manifests."""
+    """Persist successful centerlines and their ordered source-clip manifests.
+
+    Centerlines and manifests are intentionally batched across the complete
+    three-variant bundle.  A real run commonly produces hundreds of lines;
+    issuing one ``INSERT RETURNING`` plus one manifest ``INSERT`` for every
+    line turns local database latency into the dominant Fitting cost.
+    """
     clips_by_id = {clip.clip_id: clip for clip in clips.clips}
-    centerline_ids: list[int] = []
-    for result in (bundle.combined, bundle.a_to_b, bundle.b_to_a):
-        for centerline in result.centerlines:
-            points_wkt = ", ".join(f"{lon} {lat}" for lon, lat in centerline.points)
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO centerlines "
-                    "(fit_id, detect_id, variant, from_cluster_id, to_cluster_id, geom, "
-                    "length_m, forward_clip_count, reverse_clip_count) "
-                    "VALUES (%s, %s, %s, %s, %s, ST_GeomFromText(%s, 4326), %s, %s, %s) "
-                    "RETURNING id",
-                    (
-                        fit_id, detect_id, centerline.variant,
-                        centerline.from_cluster_id, centerline.to_cluster_id,
-                        f"LINESTRING({points_wkt})", centerline.length_m,
-                        centerline.forward_clip_count, centerline.reverse_clip_count,
-                    ),
-                )
-                row = cur.fetchone()
-            centerline_id = int(row[0])
-            centerline_ids.append(centerline_id)
-            manifest_rows: list[tuple[Any, ...]] = []
-            for input_ordinal, clip_id in enumerate(centerline.source_clip_ids):
-                clip = clips_by_id[clip_id]
-                start_cluster_id = clip.start.cluster_id
-                end_cluster_id = clip.end.cluster_id
-                assert start_cluster_id is not None and end_cluster_id is not None
-                manifest_rows.append((
-                    centerline_id, input_ordinal, clip.clip_id, clip.vehicle_id,
-                    clip.subtrack_index, clip.clip_ordinal_in_track,
-                    start_cluster_id, clip.start.segment_index,
-                    clip.start.segment_fraction, clip.interior_start_index,
-                    clip.interior_end_index_exclusive, end_cluster_id,
-                    clip.end.segment_index, clip.end.segment_fraction,
-                    start_cluster_id != centerline.from_cluster_id,
-                    clip.point_count,
-                ))
-            with conn.cursor() as cur:
-                _chunked_insert(
-                    cur,
-                    "centerline_source_clips",
-                    [
-                        "centerline_id", "input_ordinal", "clip_id", "vehicle_id",
-                        "subtrack_index", "clip_ordinal_in_track", "start_cluster_id",
-                        "start_segment_index", "start_segment_fraction",
-                        "interior_start_index", "interior_end_index_exclusive",
-                        "end_cluster_id", "end_segment_index", "end_segment_fraction",
-                        "reverse_to_centerline_direction", "input_point_count",
-                    ],
-                    manifest_rows,
-                )
+    ordered_centerlines = [
+        centerline
+        for result in (bundle.combined, bundle.a_to_b, bundle.b_to_a)
+        for centerline in result.centerlines
+    ]
+    if not ordered_centerlines:
+        return ()
+
+    centerline_columns = [
+        "fit_id", "detect_id", "variant", "from_cluster_id", "to_cluster_id",
+        "geom", "length_m", "forward_clip_count", "reverse_clip_count",
+    ]
+    centerline_rows: list[tuple[Any, ...]] = []
+    for centerline in ordered_centerlines:
+        points_wkt = ", ".join(f"{lon} {lat}" for lon, lat in centerline.points)
+        centerline_rows.append((
+            fit_id,
+            detect_id,
+            centerline.variant,
+            centerline.from_cluster_id,
+            centerline.to_cluster_id,
+            f"LINESTRING({points_wkt})",
+            centerline.length_m,
+            centerline.forward_clip_count,
+            centerline.reverse_clip_count,
+        ))
+
+    value_template = ", ".join(
+        ["%s"] * 5 + ["ST_GeomFromText(%s, 4326)"] + ["%s"] * 3
+    )
+    with conn.cursor() as cur:
+        returned = _chunked_insert_template_returning(
+            cur,
+            "centerlines",
+            centerline_columns,
+            centerline_rows,
+            value_template,
+            ["id", "variant", "from_cluster_id", "to_cluster_id"],
+        )
+
+    id_by_key = {
+        (str(variant), int(from_cluster_id), int(to_cluster_id)): int(centerline_id)
+        for centerline_id, variant, from_cluster_id, to_cluster_id in returned
+    }
+    ordered_keys = [
+        (
+            centerline.variant,
+            centerline.from_cluster_id,
+            centerline.to_cluster_id,
+        )
+        for centerline in ordered_centerlines
+    ]
+    if len(id_by_key) != len(ordered_centerlines) or any(
+        key not in id_by_key for key in ordered_keys
+    ):
+        raise RuntimeError("centerline batch INSERT returned an incomplete id mapping")
+    centerline_ids = [id_by_key[key] for key in ordered_keys]
+
+    manifest_rows: list[tuple[Any, ...]] = []
+    for centerline_id, centerline in zip(centerline_ids, ordered_centerlines):
+        for input_ordinal, clip_id in enumerate(centerline.source_clip_ids):
+            clip = clips_by_id[clip_id]
+            start_cluster_id = clip.start.cluster_id
+            end_cluster_id = clip.end.cluster_id
+            assert start_cluster_id is not None and end_cluster_id is not None
+            manifest_rows.append((
+                centerline_id, input_ordinal, clip.clip_id, clip.vehicle_id,
+                clip.subtrack_index, clip.clip_ordinal_in_track,
+                start_cluster_id, clip.start.segment_index,
+                clip.start.segment_fraction, clip.interior_start_index,
+                clip.interior_end_index_exclusive, end_cluster_id,
+                clip.end.segment_index, clip.end.segment_fraction,
+                start_cluster_id != centerline.from_cluster_id,
+                clip.point_count,
+            ))
+
+    manifest_columns = [
+        "centerline_id", "input_ordinal", "clip_id", "vehicle_id",
+        "subtrack_index", "clip_ordinal_in_track", "start_cluster_id",
+        "start_segment_index", "start_segment_fraction",
+        "interior_start_index", "interior_end_index_exclusive",
+        "end_cluster_id", "end_segment_index", "end_segment_fraction",
+        "reverse_to_centerline_direction", "input_point_count",
+    ]
+    with conn.cursor() as cur:
+        _copy_insert(
+            cur,
+            "centerline_source_clips",
+            manifest_columns,
+            manifest_rows,
+        )
     return tuple(centerline_ids)
 
 
@@ -375,6 +421,28 @@ def _chunked_insert(
             params.extend(row)
         sql = f"INSERT INTO {table} ({col_list}) VALUES {', '.join(batch_strs)}"
         cur.execute(sql, params)
+
+
+def _copy_insert(
+    cur: Any,
+    table: str,
+    columns: list[str],
+    rows: list[tuple[Any, ...]],
+) -> None:
+    """Stream append-only stage artifacts with PostgreSQL COPY.
+
+    Detect and Fitting artifacts belong to freshly-created run ids and are
+    written in one transaction.  COPY avoids constructing and parsing very
+    large VALUES statements; callers that need generated ids query their
+    run-scoped rows once after the copy.
+    """
+    if not rows:
+        return
+    with cur.copy(
+        f"COPY {table} ({', '.join(columns)}) FROM STDIN"
+    ) as copy:
+        for row in rows:
+            copy.write_row(row)
 
 
 def _with_stage_id(
@@ -696,19 +764,8 @@ def insert_tracks_cross(
     ]
     columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
     with conn.cursor() as cur:
-        inserted = _chunked_insert_returning(
-            cur,
-            "tracks_cross",
-            columns,
-            rows,
-            ["id"],
-            on_conflict=(
-                "ON CONFLICT (detect_id, vehicle_id, from_source_id, from_source_row_key, "
-                "to_source_id, to_source_row_key) DO NOTHING"
-            ),
-            batch_size=batch_size,
-        )
-    return len(inserted)
+        _copy_insert(cur, "tracks_cross", columns, rows)
+    return len(rows)
 
 
 def insert_turn_events(
@@ -757,18 +814,14 @@ def insert_turn_events(
         ))
 
     columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
-    mapping: dict[int, int] = {}
     with conn.cursor() as cur:
-        returned = _chunked_insert_returning(
-            cur, "turn_events", columns, rows, ["id", "event_id"],
-            on_conflict=(
-                "ON CONFLICT (detect_id, vehicle_id, timestamp) DO NOTHING"
-            ),
-            batch_size=batch_size,
+        _copy_insert(cur, "turn_events", columns, rows)
+        cur.execute(
+            "SELECT id, event_id FROM turn_events WHERE detect_id = %s",
+            (detect_id,),
         )
-    for db_id, event_id in returned:
-        mapping[event_id] = db_id
-    return mapping
+        returned = cur.fetchall()
+    return {int(event_id): int(db_id) for db_id, event_id in returned}
 
 
 def insert_candidate_intersections(
@@ -888,7 +941,7 @@ def insert_candidate_intersection_events(
         ]
         columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
         with conn.cursor() as cur:
-            _chunked_insert(cur, "candidate_intersection_events", columns, rows, batch_size=batch_size)
+            _copy_insert(cur, "candidate_intersection_events", columns, rows)
 
 
 def insert_candidate_entry_exit_points(
@@ -1076,4 +1129,4 @@ def insert_entry_exit_points(
     columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
     if rows:
         with conn.cursor() as cur:
-            _chunked_insert(cur, "entry_exit_points", columns, rows, batch_size=batch_size)
+            _copy_insert(cur, "entry_exit_points", columns, rows)

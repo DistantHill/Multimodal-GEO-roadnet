@@ -26,6 +26,10 @@ from .models import CrossTrackCandidate, TrajectoryPoint
 from ._cross_track_legacy import extract_cross_track_candidates_legacy
 
 
+class CrossTrackCapacityError(RuntimeError):
+    """The requested global broad-phase would exceed its memory/work budget."""
+
+
 @dataclass(frozen=True)
 class _CrossTrackSegment:
     """One source segment plus the data needed for bounded matching."""
@@ -54,8 +58,15 @@ def extract_cross_track_candidates(
     sub_detail: bool = False,
     perf: PerfTracker | None = None,
     telemetry: dict[str, int | float] | None = None,
+    max_grid_memberships: int | None = None,
+    max_overflow_pair_space: int | None = None,
 ) -> tuple[list[CrossTrackCandidate], int, int]:
-    """Return cross-track candidates in stable vehicle/segment order."""
+    """Return cross-track candidates in stable vehicle/segment order.
+
+    The optional budgets are used by DB mode before building a global index.
+    They deliberately default to ``None`` so handle mode and the historical
+    bounded-overflow behaviour remain unchanged.
+    """
     extraction_started = time.perf_counter() if telemetry is not None else 0.0
     segment_started = time.perf_counter() if telemetry is not None else 0.0
     segments, vehicle_count = _prepare_segments(tracks, origin_lon, origin_lat, cfg)
@@ -68,6 +79,34 @@ def extract_cross_track_candidates(
         return [], 0, 0
 
     total_pairs = vehicle_count * (vehicle_count - 1) // 2
+    if max_grid_memberships is not None or max_overflow_pair_space is not None:
+        indexed_memberships, overflow_count = _estimate_grid_capacity(
+            segments,
+            cfg.cross_track_max_grid_cells_per_segment,
+        )
+        overflow_pair_space = overflow_count * len(segments)
+        if telemetry is not None:
+            telemetry["grid_memberships_estimate"] = indexed_memberships
+            telemetry["overflow_segments"] = overflow_count
+            telemetry["overflow_pair_space_estimate"] = overflow_pair_space
+        if (
+            max_grid_memberships is not None
+            and indexed_memberships > max_grid_memberships
+        ):
+            raise CrossTrackCapacityError(
+                "global cross-track grid requires "
+                f"{indexed_memberships:,} memberships; "
+                f"budget is {max_grid_memberships:,}"
+            )
+        if (
+            max_overflow_pair_space is not None
+            and overflow_pair_space > max_overflow_pair_space
+        ):
+            raise CrossTrackCapacityError(
+                "global cross-track overflow fallback spans "
+                f"{overflow_pair_space:,} segment pairs; "
+                f"budget is {max_overflow_pair_space:,}"
+            )
     array_started = time.perf_counter() if telemetry is not None else 0.0
     starts = np.array([(segment.x1, segment.y1) for segment in segments], dtype=float)
     ends = np.array([(segment.x2, segment.y2) for segment in segments], dtype=float)
@@ -159,6 +198,25 @@ def extract_cross_track_candidates(
         ) + (time.perf_counter() - extraction_started)
         telemetry["output_candidates"] = telemetry.get("output_candidates", 0) + len(candidates)
     return candidates, total_pairs, total_pairs
+
+
+def _estimate_grid_capacity(
+    segments: list[_CrossTrackSegment],
+    max_cells: int,
+) -> tuple[int, int]:
+    """Return indexed memberships and overflow count without allocating a grid."""
+    memberships = 0
+    overflow_count = 0
+    for segment in segments:
+        if segment.cell_span is None:
+            continue
+        cell_min_x, cell_max_x, cell_min_y, cell_max_y = segment.cell_span
+        cell_count = (cell_max_x - cell_min_x + 1) * (cell_max_y - cell_min_y + 1)
+        if cell_count > max_cells:
+            overflow_count += 1
+        else:
+            memberships += cell_count
+    return memberships, overflow_count
 
 
 def _append_pair_hits(

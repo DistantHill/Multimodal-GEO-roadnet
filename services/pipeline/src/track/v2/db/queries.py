@@ -272,25 +272,46 @@ class SpatialWindowIterator:
 
     def iter_windows(self) -> Iterator[SpatialWindow]:
         """Yield overlapping spatial windows covering the full extent."""
-        lon = self._lon_min
-        while lon < self._lon_max:
-            lat = self._lat_min
-            while lat < self._lat_max:
+        lon_count, lat_count = self.window_shape()
+        for lon_index in range(lon_count):
+            lon = self._lon_min + lon_index * self._step_lon
+            for lat_index in range(lat_count):
+                lat = self._lat_min + lat_index * self._step_lat
                 yield SpatialWindow(
                     x_min=max(self._lon_min, lon - self._pad_lon),
                     y_min=max(self._lat_min, lat - self._pad_lat),
-                    x_max=min(self._lon_max, lon + self._step_lon + self._pad_lon),
-                    y_max=min(self._lat_max, lat + self._step_lat + self._pad_lat),
+                    x_max=min(
+                        self._lon_max,
+                        self._lon_min + (lon_index + 1) * self._step_lon + self._pad_lon,
+                    ),
+                    y_max=min(
+                        self._lat_max,
+                        self._lat_min + (lat_index + 1) * self._step_lat + self._pad_lat,
+                    ),
                 )
-                lat += self._step_lat
-            lon += self._step_lon
+
+    def window_shape(self) -> tuple[int, int]:
+        """Return deterministic ``(longitude_count, latitude_count)``."""
+        if self._lon_max <= self._lon_min or self._lat_max <= self._lat_min:
+            return 0, 0
+        return (
+            self._axis_count(self._lon_min, self._lon_max, self._step_lon),
+            self._axis_count(self._lat_min, self._lat_max, self._step_lat),
+        )
+
+    @staticmethod
+    def _axis_count(axis_min: float, axis_max: float, step: float) -> int:
+        """Return the smallest count whose indexed cells cover ``axis_max``."""
+        count = max(1, math.ceil((axis_max - axis_min) / step))
+        while count > 1 and axis_min + (count - 1) * step >= axis_max:
+            count -= 1
+        while axis_min + count * step < axis_max:
+            count += 1
+        return count
 
     def count_windows(self) -> int:
         """Return the number of windows that :meth:`iter_windows` will yield."""
-        if self._lon_max <= self._lon_min or self._lat_max <= self._lat_min:
-            return 0
-        lon_count = math.ceil((self._lon_max - self._lon_min) / self._step_lon)
-        lat_count = math.ceil((self._lat_max - self._lat_min) / self._step_lat)
+        lon_count, lat_count = self.window_shape()
         return lon_count * lat_count
 
 
@@ -589,7 +610,7 @@ def fetch_clean_points(
     sql = (
         "SELECT vehicle_id, subtrack_index, anchor_sequence, "
         "source_id, source_row_key, timestamp, lon, lat, heading, speed, extra, "
-        "from_source_row_key, to_source_row_key, generated_reason "
+        "from_source_row_key, to_source_row_key, generated_reason, point_kind, row_id "
         "FROM ("
         "  SELECT ktp.vehicle_id, ktp.subtrack_index, ktp.sequence_in_subtrack AS anchor_sequence, "
         "         ktp.source_id, ktp.source_row_key, "
@@ -607,8 +628,7 @@ def fetch_clean_points(
         "         ip.from_source_row_key, ip.to_source_row_key, ip.generated_reason, "
         "         1 AS point_kind, ip.id AS row_id "
         "  FROM injected_points AS ip WHERE ip.clean_id = %s"
-        ") AS clean_points "
-        "ORDER BY vehicle_id, subtrack_index, anchor_sequence, point_kind, row_id"
+        ") AS clean_points"
     )
     return _group_points(conn, sql, (clean_id, clean_id), clean_id)
 
@@ -632,7 +652,7 @@ def fetch_clean_points_for_subtracks(
         ") "
         "SELECT vehicle_id, subtrack_index, anchor_sequence, "
         "source_id, source_row_key, timestamp, lon, lat, heading, speed, extra, "
-        "from_source_row_key, to_source_row_key, generated_reason "
+        "from_source_row_key, to_source_row_key, generated_reason, point_kind, row_id "
         "FROM ("
         "  SELECT ktp.vehicle_id, ktp.subtrack_index, ktp.sequence_in_subtrack AS anchor_sequence, "
         "         ktp.source_id, ktp.source_row_key, "
@@ -653,8 +673,7 @@ def fetch_clean_points_for_subtracks(
         "  FROM injected_points AS ip "
         "  JOIN requested AS r USING (vehicle_id, subtrack_index) "
         "  WHERE ip.clean_id = %s"
-        ") AS clean_points "
-        "ORDER BY vehicle_id, subtrack_index, anchor_sequence, point_kind, row_id"
+        ") AS clean_points"
     )
     return _group_points(
         conn,
@@ -670,8 +689,17 @@ def _group_points(
     params: tuple[object, ...],
     clean_id: str,
 ) -> dict[tuple[str, int], list[TrajectoryPoint]]:
-    """Execute *sql* and group rows by ``(vehicle_id, subtrack_index)``."""
-    grouped: dict[tuple[str, int], list[TrajectoryPoint]] = {}
+    """Execute *sql* and locally order points within each subtrack.
+
+    Avoiding a global PostgreSQL sort is material for large Clean runs: the join
+    rows are wide and routinely spill hundreds of megabytes to temporary files.
+    Subtracks are small, so ordering their members independently in Python has
+    the same semantics with much lower sort pressure.
+    """
+    grouped_rows: dict[
+        tuple[str, int],
+        list[tuple[int, int, int, TrajectoryPoint]],
+    ] = {}
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(sql, params)
         for row in cur:
@@ -681,32 +709,35 @@ def _group_points(
                 raise ValueError(
                     f"Clean Run {clean_id} predates persisted source references"
                 )
-            generated_reason = str(row[13])
             if any(row[index] is None for index in range(5, 10)):
                 raise ValueError(
                     f"Clean Run {clean_id} references a missing source row"
                 )
             generated_reason = str(row[13])
-            grouped.setdefault((vehicle_id, subtrack_index), []).append(
-                TrajectoryPoint(
-                    point_ref=PointRef(
-                        str(row[3]),
-                        str(row[4]),
-                        stable=not generated_reason,
-                        from_ref=str(row[11]) if row[11] is not None else None,
-                        to_ref=str(row[12]) if row[12] is not None else None,
-                        generated_reason=generated_reason,
-                    ),
-                    vehicle_id=vehicle_id,
-                    timestamp=float(row[5]),
-                    lon=float(row[6]),
-                    lat=float(row[7]),
-                    heading=float(row[8]),
-                    speed=float(row[9]),
-                    extra=row[10] if isinstance(row[10], dict) else {},
-                )
+            point = TrajectoryPoint(
+                point_ref=PointRef(
+                    str(row[3]),
+                    str(row[4]),
+                    stable=not generated_reason,
+                    from_ref=str(row[11]) if row[11] is not None else None,
+                    to_ref=str(row[12]) if row[12] is not None else None,
+                    generated_reason=generated_reason,
+                ),
+                vehicle_id=vehicle_id,
+                timestamp=float(row[5]),
+                lon=float(row[6]),
+                lat=float(row[7]),
+                heading=float(row[8]),
+                speed=float(row[9]),
+                extra=row[10] if isinstance(row[10], dict) else {},
             )
-    return grouped
+            grouped_rows.setdefault((vehicle_id, subtrack_index), []).append(
+                (int(row[2]), int(row[14]), int(row[15]), point)
+            )
+    return {
+        key: [item[3] for item in sorted(rows, key=lambda item: item[:3])]
+        for key, rows in grouped_rows.items()
+    }
 
 
 def _decode_json_object(value: object) -> dict[str, object]:

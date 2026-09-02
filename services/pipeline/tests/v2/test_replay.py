@@ -172,7 +172,7 @@ class ReplayServiceTest(unittest.TestCase):
 
         point_rows = [
             ("vehicle-1", 2, index, "source", str(index), float(index),
-             100.0 + index, 30.0, 90.0, 5.0, {}, None, None, "")
+             100.0 + index, 30.0, 90.0, 5.0, {}, None, None, "", 0, index)
             for index in range(4)
         ]
         manifest = [
