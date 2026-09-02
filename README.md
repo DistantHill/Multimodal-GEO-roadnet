@@ -61,10 +61,13 @@ make pipeline-init-db
 ```sh
 make pipeline-help
 docker compose -f infra/docker/compose.dev.yml run --rm pipeline \
-  python -m pipeline run --csv /data/parquet-or-csv/input.csv
+  python -m pipeline run --csv /data/parquet-or-csv/input.csv \
+  --processing-srid 32650
 ```
 
-也可使用 `--pg-table TABLE` 从 PostgreSQL 读取，或用 `--clean-id UUID` 复用已完成的 Clean Run。Pipeline 是独立批处理进程，不经由 Backend API request process 启动。
+`32650` 仅是北京所在 UTM 分区的命令示例，不是项目默认值。新 Clean Run 必须按完整数据范围明确选择米制投影；也可在自定义 `pipeline.toml` 的 `[projection]` 中配置。使用 `--clean-id UUID` 时会继承原 Run 的投影，不能覆盖。选择与迁移规则见 [Run 级投影上下文](docs/run-projection-context.md)。
+
+也可使用 `--pg-table TABLE` 从 PostgreSQL 读取。Pipeline 是独立批处理进程，不经由 Backend API request process 启动。
 
 ## 常用命令
 

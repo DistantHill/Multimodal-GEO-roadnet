@@ -28,8 +28,8 @@ Usage / 用法::
 #    改用 COPY FROM STDIN             一次 COPY 流式写入，走 PG 原生批量协议
 # 3  Cleaner 点按 generated_reason   kept / injected writer 消费同一批子轨迹，
 #    在 writer 内分类                 共享已分配的 subtrack_index
-# 4  移除 excluded_points 写入       排除信息仅反映在 trajectory_points.is_active，
-#                                   不再单独写 excluded_points 表（表结构保留）
+# 4  恢复 excluded_points 写入       4326 Geometry 作为逐点审计真值，与
+#                                   trajectory_points.is_active 状态同时保留
 # 5  _flush_clean_batch 统一分配     分批流式写入时保持 subtrack_index 全局递增
 # ────────────────────────────────────────────────────────────────────────
 
@@ -53,10 +53,12 @@ from .models import (
     HotspotCluster,
     IntersectionTopology,
     PointRef,
+    SpatialContext,
     TrajectoryPoint,
     TurnEvent,
     FittingConfig,
 )
+from .projection import CoordinateTransformer, spatial_context_from_values
 
 # ── Batch size for multi-row INSERT ───────────────────────────────────
 _BATCH = 5000
@@ -69,6 +71,7 @@ class CleanRunRecord:
     source_kind: str
     parameters: dict[str, Any]
     status: str
+    spatial_context: SpatialContext
 
 
 def create_clean_run(
@@ -77,14 +80,28 @@ def create_clean_run(
     source_id: str,
     source_kind: str,
     parameters: dict[str, Any],
+    spatial_context: SpatialContext,
 ) -> str:
     """Create one append-only Clean Run and return its UUID."""
+    # Keep the persistence boundary fail-closed even when called outside the
+    # normal pipeline configuration path.
+    CoordinateTransformer(spatial_context)
     clean_id = str(uuid.uuid4())
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO clean_runs (id, source_id, source_kind, parameters, status) "
-            "VALUES (%s, %s, %s, %s, 'running')",
-            (clean_id, source_id, source_kind, json.dumps(parameters, ensure_ascii=False)),
+            "INSERT INTO clean_runs "
+            "(id, source_id, source_kind, source_srid, processing_srid, "
+            "projection_config, parameters, status) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, 'running')",
+            (
+                clean_id,
+                source_id,
+                source_kind,
+                spatial_context.source_srid,
+                spatial_context.processing_srid,
+                json.dumps(spatial_context.projection_config, ensure_ascii=False),
+                json.dumps(parameters, ensure_ascii=False),
+            ),
         )
     return clean_id
 
@@ -95,14 +112,22 @@ def create_detect_run(
     clean_id: str,
     parameters: dict[str, Any],
 ) -> str:
-    """Create one Detect Run owned by a Clean Run."""
+    """Create one Detect Run only from a completed fixed-CRS Clean Run."""
     detect_id = str(uuid.uuid4())
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO detect_runs (id, clean_id, parameters, status) "
-            "VALUES (%s, %s, %s, 'running')",
-            (detect_id, clean_id, json.dumps(parameters, ensure_ascii=False)),
+            "SELECT %s, c.id, %s, 'running' FROM clean_runs AS c "
+            "WHERE c.id = %s AND c.status = 'completed' "
+            "AND c.processing_srid IS NOT NULL "
+            "AND c.projection_config->>'coordinate_semantics_version' = '2' "
+            "RETURNING id",
+            (detect_id, json.dumps(parameters, ensure_ascii=False), clean_id),
         )
+        if cur.fetchone() is None:
+            raise ValueError(
+                f"Clean Run {clean_id} is not completed with fixed-CRS coordinates"
+            )
     return detect_id
 
 
@@ -124,9 +149,13 @@ def create_fit_run(
             "INSERT INTO fit_runs "
             "(id, detect_id, clip_algorithm, clip_version, fitting_algorithm, "
             "fitting_version, parameters, status) "
-            "SELECT %s, d.id, 'circle_segment_clip', 'v1', "
-            "'normalized_arc_coordinate_median', 'v1', %s, 'running' "
-            "FROM detect_runs AS d WHERE d.id = %s AND d.status = 'completed' "
+            "SELECT %s, d.id, 'circle_segment_clip', 'v2', "
+            "'normalized_arc_coordinate_median', 'v2', %s, 'running' "
+            "FROM detect_runs AS d "
+            "JOIN clean_runs AS c ON c.id = d.clean_id "
+            "WHERE d.id = %s AND d.status = 'completed' "
+            "AND c.processing_srid IS NOT NULL "
+            "AND c.projection_config->>'coordinate_semantics_version' = '2' "
             "RETURNING id",
             (fit_id, json.dumps(parameters, ensure_ascii=False), detect_id),
         )
@@ -184,6 +213,13 @@ def insert_centerline_bundle(
     detect_id: str,
 ) -> tuple[int, ...]:
     """Persist successful centerlines and their ordered source-clip manifests."""
+    if clips.detect_id is not None and clips.detect_id != detect_id:
+        raise ValueError("ClipResult belongs to a different Detect Run")
+    for result in (bundle.combined, bundle.a_to_b, bundle.b_to_a):
+        if result.spatial_context != clips.spatial_context:
+            raise ValueError("FitResult and ClipResult SpatialContext must match")
+        if result.detect_id is not None and result.detect_id != detect_id:
+            raise ValueError("FitResult belongs to a different Detect Run")
     clips_by_id = {clip.clip_id: clip for clip in clips.clips}
     centerline_ids: list[int] = []
     for result in (bundle.combined, bundle.a_to_b, bundle.b_to_a):
@@ -243,7 +279,8 @@ def fetch_clean_run(conn: Any, clean_id: str) -> CleanRunRecord:
     """Load one Clean Run for explicit Detect reuse."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, source_id, source_kind, parameters, status "
+            "SELECT id, source_id, source_kind, parameters, status, "
+            "source_srid, processing_srid, projection_config "
             "FROM clean_runs WHERE id = %s",
             (clean_id,),
         )
@@ -259,17 +296,25 @@ def fetch_clean_run(conn: Any, clean_id: str) -> CleanRunRecord:
         source_kind=str(row[2]),
         parameters=parameters,
         status=str(row[4]),
+        spatial_context=spatial_context_from_values(row[5], row[6], row[7]),
     )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
 _POLYGON_EXPR = (
-    "ST_Buffer("
-    "ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, "
-    "%s"
-    ")::geometry"
+    "ST_Transform("
+    "ST_Buffer(ST_SetSRID(ST_MakePoint(%s, %s), %s::integer), %s), "
+    "4326)"
 )
+
+
+def _project_lonlat(
+    spatial_context: SpatialContext,
+    values: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Project 4326 truth coordinates with the owning Clean Run context."""
+    return CoordinateTransformer(spatial_context).forward_many(values)
 
 
 def _chunked_insert_returning(
@@ -603,6 +648,7 @@ def insert_injected_points(
     subtracks: list[RefinementSubtrack],
     *,
     clean_id: str | None = None,
+    spatial_context: SpatialContext,
     batch_size: int = _BATCH,
 ) -> None:
     """Insert synthetic points injected by ``_inject_orthogonal``.
@@ -618,35 +664,40 @@ def insert_injected_points(
         "heading", "speed",
         "from_source_id", "from_source_row_key",
         "to_source_id", "to_source_row_key",
-        "generated_reason", "origin_lon", "origin_lat",
+        "generated_reason",
     ]
-    rows: list[tuple[Any, ...]] = []
+    injected: list[tuple[RefinementSubtrack, int, TrajectoryPoint]] = []
     for subtrack in subtracks:
         kept_sequence = -1
         for point in subtrack.points:
             if point.point_ref.generated_reason != GeneratedReason.HEADING_ORTHOGONAL:
                 kept_sequence += 1
                 continue
-            ref = point.point_ref
-            # x/y are not stored directly on TrajectoryPoint, so leave them as 0.0.
-            rows.append((
-                point.vehicle_id, subtrack.subtrack_index, kept_sequence,
-                ref.source_id, ref.source_row_key,
-                point.timestamp,
-                point.lon,
-                point.lat,
-                0.0,
-                0.0,
-                point.heading,
-                point.speed,
-                ref.source_id,
-                ref.from_ref or "",
-                ref.source_id,
-                ref.to_ref or "",
-                ref.generated_reason,
-                0.0,
-                0.0,
-            ))
+            injected.append((subtrack, kept_sequence, point))
+
+    projected = _project_lonlat(
+        spatial_context,
+        [(point.lon, point.lat) for _, _, point in injected],
+    )
+    rows: list[tuple[Any, ...]] = []
+    for (subtrack, kept_sequence, point), (x, y) in zip(injected, projected):
+        ref = point.point_ref
+        rows.append((
+            point.vehicle_id, subtrack.subtrack_index, kept_sequence,
+            ref.source_id, ref.source_row_key,
+            point.timestamp,
+            point.lon,
+            point.lat,
+            x,
+            y,
+            point.heading,
+            point.speed,
+            ref.source_id,
+            ref.from_ref or "",
+            ref.source_id,
+            ref.to_ref or "",
+            ref.generated_reason,
+        ))
 
     columns, rows = _with_stage_id(columns, rows, "clean_id", clean_id)
     if rows:
@@ -661,6 +712,7 @@ def insert_tracks_cross(
     candidates: list[CrossTrackCandidate],
     *,
     detect_id: str | None = None,
+    spatial_context: SpatialContext,
     batch_size: int = _BATCH,
 ) -> int:
     """Persist deduplicated cross-track candidates and return inserted rows."""
@@ -672,16 +724,20 @@ def insert_tracks_cross(
         "heading", "speed",
         "from_source_id", "from_source_row_key",
         "to_source_id", "to_source_row_key",
-        "generated_reason", "origin_lon", "origin_lat",
+        "generated_reason",
     ]
+    projected = _project_lonlat(
+        spatial_context,
+        [(candidate.lon, candidate.lat) for candidate in candidates],
+    )
     rows = [
         (
             candidate.vehicle_id,
             candidate.timestamp,
             candidate.lon,
             candidate.lat,
-            candidate.x,
-            candidate.y,
+            x,
+            y,
             candidate.heading,
             candidate.speed,
             candidate.from_source_id,
@@ -689,10 +745,8 @@ def insert_tracks_cross(
             candidate.to_source_id,
             candidate.to_source_row_key,
             "orthogonal_cross_track",
-            candidate.origin_lon,
-            candidate.origin_lat,
         )
-        for candidate in candidates
+        for candidate, (x, y) in zip(candidates, projected)
     ]
     columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
     with conn.cursor() as cur:
@@ -714,10 +768,9 @@ def insert_tracks_cross(
 def insert_turn_events(
     conn: Any,
     turn_events: list[TurnEvent],
-    origin_lon: float = 0.0,
-    origin_lat: float = 0.0,
     *,
     detect_id: str | None = None,
+    spatial_context: SpatialContext,
     batch_size: int = _BATCH,
 ) -> dict[int, int]:
     """Insert turn events, return ``{event_id: db_id}`` mapping."""
@@ -729,18 +782,21 @@ def insert_turn_events(
         "x", "y", "in_bearing", "out_bearing", "turn_deg", "score",
         "source", "tp_source_id", "tp_source_row_key",
         "from_source_id", "from_source_row_key", "to_source_id", "to_source_row_key",
-        "origin_lon", "origin_lat",
     ]
+    projected = _project_lonlat(
+        spatial_context,
+        [(event.lon, event.lat) for event in turn_events],
+    )
     rows: list[tuple[Any, ...]] = []
-    for te in turn_events:
+    for te, (x, y) in zip(turn_events, projected):
         rows.append((
             te.event_id,
             te.vehicle_id,
             te.timestamp,
             te.lon,
             te.lat,
-            te.x,
-            te.y,
+            x,
+            y,
             te.in_bearing,
             te.out_bearing,
             te.turn_deg,
@@ -752,8 +808,6 @@ def insert_turn_events(
             te.from_source_row_key,
             te.to_source_id,
             te.to_source_row_key,
-            origin_lon,
-            origin_lat,
         ))
 
     columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
@@ -774,10 +828,9 @@ def insert_turn_events(
 def insert_candidate_intersections(
     conn: Any,
     clusters: list[HotspotCluster],
-    origin_lon: float = 0.0,
-    origin_lat: float = 0.0,
     *,
     detect_id: str | None = None,
+    spatial_context: SpatialContext,
     batch_size: int = _BATCH,
 ) -> dict[int, int]:
     """Insert candidate intersections with POLYGON geometry.
@@ -796,16 +849,19 @@ def insert_candidate_intersections(
         "source", "sources", "source_counts", "source_ratios",
         "critical_sources",
         "turn_event_count", "orthogonal_count", "cross_track_count", "total_event_count",
-        "origin_lon", "origin_lat",
         "geom",  # ← must be last: _POLYGON_EXPR is appended to end of placeholders
     ]
     columns = ["detect_id", *columns]
+    projected = _project_lonlat(
+        spatial_context,
+        [(cluster.centroid_lon, cluster.centroid_lat) for cluster in clusters],
+    )
     rows = [
         (
             detect_id,
             c.cluster_id,
-            c.centroid_x,
-            c.centroid_y,
+            x,
+            y,
             c.centroid_lon,
             c.centroid_lat,
             c.radius_m,
@@ -818,13 +874,12 @@ def insert_candidate_intersections(
             len([e for e in c.events if e.source == "orthogonal"]),
             len([e for e in c.events if e.source == "orthogonal_cross_track"]),
             len(c.events),
-            origin_lon,
-            origin_lat,
-            c.centroid_lon,
-            c.centroid_lat,
+            x,
+            y,
+            spatial_context.processing_srid,
             c.radius_m,
         )
-        for c in clusters
+        for c, (x, y) in zip(clusters, projected)
     ]
     value_template = ", ".join(["%s"] * (len(columns) - 1) + [_POLYGON_EXPR])
     with conn.cursor() as cur:
@@ -897,6 +952,7 @@ def insert_candidate_entry_exit_points(
     ci_id_map: dict[int, int],
     *,
     detect_id: str | None = None,
+    spatial_context: SpatialContext,
     batch_size: int = _BATCH,
 ) -> dict[tuple[int, int], int]:
     """Insert crossing points, return ``{crossing_id: db_id}`` mapping."""
@@ -904,37 +960,46 @@ def insert_candidate_entry_exit_points(
         "candidate_intersection_id", "cluster_id", "vehicle_id",
         "segment_index", "crossing_type",
         "crossing_x", "crossing_y", "crossing_lon", "crossing_lat",
-        "branch_angle_deg", "origin_lon", "origin_lat",
+        "branch_angle_deg",
         "from_source_id", "from_source_row_key",
         "to_source_id", "to_source_row_key",
     ]
-    rows: list[tuple[Any, ...]] = []
-    crossing_ids: list[tuple[int, int]] = []  # (cluster_id, crossing_id), parallel to rows
-    for c in clusters:
-        ci_db_id = ci_id_map.get(c.cluster_id)
+    pending: list[tuple[HotspotCluster, int, Any]] = []
+    for cluster in clusters:
+        ci_db_id = ci_id_map.get(cluster.cluster_id)
         if ci_db_id is None:
             continue
-        for cp in c.crossing_points:
-            cp_any: Any = cp  # HotspotCluster.crossing_points typed as tuple[()]
-            rows.append((
-                ci_db_id,
-                c.cluster_id,
-                cp_any.vehicle_id,
-                cp_any.segment_index,
-                "entry" if cp_any.is_entry else "exit",
-                getattr(cp_any, "crossing_x", 0.0),
-                getattr(cp_any, "crossing_y", 0.0),
-                cp_any.crossing_lon,
-                cp_any.crossing_lat,
-                getattr(cp_any, "branch_angle_deg", None),
-                getattr(cp_any, "origin_lon", 0.0),
-                getattr(cp_any, "origin_lat", 0.0),
-                cp_any.point_ref.source_id,
-                cp_any.point_ref.source_row_key,
-                cp_any.end_point_ref.source_id if cp_any.end_point_ref else None,
-                cp_any.end_point_ref.source_row_key if cp_any.end_point_ref else None,
-            ))
-            crossing_ids.append((c.cluster_id, cp_any.crossing_id))
+        pending.extend(
+            (cluster, ci_db_id, crossing_point)
+            for crossing_point in cluster.crossing_points
+        )
+    projected = _project_lonlat(
+        spatial_context,
+        [
+            (float(crossing.crossing_lon), float(crossing.crossing_lat))
+            for _, _, crossing in pending
+        ],
+    )
+    rows: list[tuple[Any, ...]] = []
+    crossing_ids: list[tuple[int, int]] = []  # (cluster_id, crossing_id), parallel to rows
+    for (cluster, ci_db_id, crossing), (x, y) in zip(pending, projected):
+        rows.append((
+            ci_db_id,
+            cluster.cluster_id,
+            crossing.vehicle_id,
+            crossing.segment_index,
+            "entry" if crossing.is_entry else "exit",
+            x,
+            y,
+            crossing.crossing_lon,
+            crossing.crossing_lat,
+            getattr(crossing, "branch_angle_deg", None),
+            crossing.point_ref.source_id,
+            crossing.point_ref.source_row_key,
+            crossing.end_point_ref.source_id if crossing.end_point_ref else None,
+            crossing.end_point_ref.source_row_key if crossing.end_point_ref else None,
+        ))
+        crossing_ids.append((cluster.cluster_id, crossing.crossing_id))
 
     columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
     mapping: dict[tuple[int, int], int] = {}
@@ -956,6 +1021,7 @@ def insert_intersections(
     clusters_by_id: dict[int, HotspotCluster],
     *,
     detect_id: str | None = None,
+    spatial_context: SpatialContext,
     batch_size: int = _BATCH,
 ) -> dict[int, int]:
     """Insert only topology-verified intersections with POLYGON geometry.
@@ -977,6 +1043,19 @@ def insert_intersections(
         "geom",
     ]
     columns = ["detect_id", *columns]
+    projected_by_cluster_id = {
+        cluster.cluster_id: projected
+        for cluster, projected in zip(
+            clusters_by_id.values(),
+            _project_lonlat(
+                spatial_context,
+                [
+                    (cluster.centroid_lon, cluster.centroid_lat)
+                    for cluster in clusters_by_id.values()
+                ],
+            ),
+        )
+    }
     rows: list[tuple[Any, ...]] = []
     for topo in topologies:
         if not topo.is_complete:
@@ -1006,15 +1085,16 @@ def insert_intersections(
             topo.reason,
             clip_radius_m,
             cluster is not None,
-            cluster.centroid_lon if cluster is not None else None,
-            cluster.centroid_lat if cluster is not None else None,
+            projected_by_cluster_id[cluster.cluster_id][0] if cluster is not None else None,
+            projected_by_cluster_id[cluster.cluster_id][1] if cluster is not None else None,
+            spatial_context.processing_srid if cluster is not None else None,
             clip_radius_m if cluster is not None else None,
         ))
 
     optional_polygon = (
         "CASE WHEN %s::boolean THEN "
-        "ST_Buffer(ST_SetSRID(ST_MakePoint(%s::double precision, "
-        "%s::double precision), 4326)::geography, %s::double precision)::geometry "
+        "ST_Transform(ST_Buffer(ST_SetSRID(ST_MakePoint(%s::double precision, "
+        "%s::double precision), %s::integer), %s::double precision), 4326) "
         "ELSE NULL END"
     )
     value_template = ", ".join(["%s"] * (len(columns) - 1) + [optional_polygon])

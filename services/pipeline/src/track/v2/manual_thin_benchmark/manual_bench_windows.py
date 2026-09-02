@@ -4,7 +4,8 @@ Run through uv, using the same interpreter for both children::
 
     uv run --no-project --python "$TRACK_BENCH_PYTHON" python \
       track/v2/manual_thin_benchmark/manual_bench_windows.py \
-      --baseline-commit c12a06abe3262501f5bb20713c4280aa9a99f34e
+      --baseline-commit c12a06abe3262501f5bb20713c4280aa9a99f34e \
+      --processing-srid 32650
 
 The parent creates a temporary ``git archive`` for baseline execution.  Each
 child imports from exactly one source tree and returns a complete ordered
@@ -615,12 +616,71 @@ def _dense_tracks() -> dict[str, list[Any]]:
     return tracks
 
 
+def _projection_context_for_source(
+    intersect2: Any,
+) -> tuple[Any, Any] | None:
+    """Build the explicit fixed CRS only for sources exposing the v2 API.
+
+    The archived benchmark side predates Run-level projection and continues to
+    receive its historical, explicitly supplied legacy origin. The current
+    source must never infer or default its processing CRS.
+    """
+    if "spatial_context" not in inspect.signature(
+        intersect2._extract_cross_track_windows
+    ).parameters:
+        return None
+    parameters = json.loads(os.environ["PERF_WINDOWS_PARAMETERS"])
+    processing_srid = parameters.get("processing_srid")
+    if processing_srid is None:
+        raise RuntimeError("benchmark parameters require processing_srid")
+    from track.v2.models import ProjectionConfig
+    from track.v2.projection import CoordinateTransformer, create_spatial_context
+
+    spatial_context = create_spatial_context(
+        ProjectionConfig(processing_srid=int(processing_srid))
+    )
+    return spatial_context, CoordinateTransformer(spatial_context)
+
+
+def _extractor_name(intersect2: Any) -> str:
+    """Return the candidate-extractor global used by this source version."""
+    if hasattr(intersect2, "extract_cross_track_candidates"):
+        return "extract_cross_track_candidates"
+    return "_extract_orthogonal_cross_track_candidates"
+
+
+def _call_spatial_window_extraction(
+    intersect2: Any,
+    conn: Any,
+    cfg: Any,
+    extent: tuple[float, float, float, float],
+    projection: tuple[Any, Any] | None,
+    **kwargs: Any,
+) -> list[Any]:
+    function = intersect2._extract_cross_track_windows
+    if "spatial_context" in inspect.signature(function).parameters:
+        if projection is None:
+            raise RuntimeError("current benchmark source requires processing_srid")
+        spatial_context, transformer = projection
+        return function(
+            conn,
+            cfg,
+            extent,
+            spatial_context,
+            transformer,
+            **kwargs,
+        )
+    # Archived baseline only: preserve its explicit historical benchmark seam.
+    return function(conn, cfg, extent, extent[0], extent[1], **kwargs)
+
+
 def _capture_real_windows(
     intersect2: Any,
     conn: Any,
     cfg: Any,
     extent: tuple[float, float, float, float],
     telemetry: dict[str, int | float] | None,
+    projection: tuple[Any, Any] | None,
 ) -> tuple[list[Any], list[dict[str, Any]], list[dict[str, Any]]]:
     """Capture complete per-window semantics in a non-gating child.
 
@@ -632,7 +692,8 @@ def _capture_real_windows(
     raw_records: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
     original_query = intersect2._query_active_points_in_window
-    original_extract = intersect2._extract_orthogonal_cross_track_candidates
+    extractor_name = _extractor_name(intersect2)
+    original_extract = getattr(intersect2, extractor_name)
 
     def query(*args: Any, **kwargs: Any) -> list[Any]:
         nonlocal current
@@ -659,7 +720,7 @@ def _capture_real_windows(
         return candidates, pair_count, total_pairs
 
     intersect2._query_active_points_in_window = query
-    intersect2._extract_orthogonal_cross_track_candidates = extract
+    setattr(intersect2, extractor_name, extract)
     recorder = _ProgressRecorder()
     try:
         kwargs: dict[str, Any] = {"live_status": recorder}
@@ -667,12 +728,17 @@ def _capture_real_windows(
             intersect2._extract_cross_track_windows
         ).parameters:
             kwargs["telemetry"] = telemetry
-        candidates = intersect2._extract_cross_track_windows(
-            conn, cfg, extent, extent[0], extent[1], **kwargs
+        candidates = _call_spatial_window_extraction(
+            intersect2,
+            conn,
+            cfg,
+            extent,
+            projection,
+            **kwargs,
         )
     finally:
         intersect2._query_active_points_in_window = original_query
-        intersect2._extract_orthogonal_cross_track_candidates = original_extract
+        setattr(intersect2, extractor_name, original_extract)
 
     records: list[dict[str, Any]] = []
     seen: set[tuple[str, ...]] = set()
@@ -723,11 +789,13 @@ def _measure_real_windows(
     cfg: Any,
     extent: tuple[float, float, float, float],
     telemetry: dict[str, int | float] | None,
+    projection: tuple[Any, Any] | None,
 ) -> tuple[list[Any], int, int]:
     """Run the real pipeline while retaining only aggregate pair semantics."""
     pair_count = 0
     total_pairs = 0
-    original_extract = intersect2._extract_orthogonal_cross_track_candidates
+    extractor_name = _extractor_name(intersect2)
+    original_extract = getattr(intersect2, extractor_name)
 
     def extract(*args: Any, **kwargs: Any) -> tuple[list[Any], int, int]:
         nonlocal pair_count, total_pairs
@@ -736,18 +804,23 @@ def _measure_real_windows(
         total_pairs += window_total
         return candidates, window_pairs, window_total
 
-    intersect2._extract_orthogonal_cross_track_candidates = extract
+    setattr(intersect2, extractor_name, extract)
     try:
         kwargs: dict[str, Any] = {"live_status": _NullProgress()}
         if telemetry is not None and "telemetry" in inspect.signature(
             intersect2._extract_cross_track_windows
         ).parameters:
             kwargs["telemetry"] = telemetry
-        candidates = intersect2._extract_cross_track_windows(
-            conn, cfg, extent, extent[0], extent[1], **kwargs
+        candidates = _call_spatial_window_extraction(
+            intersect2,
+            conn,
+            cfg,
+            extent,
+            projection,
+            **kwargs,
         )
     finally:
-        intersect2._extract_orthogonal_cross_track_candidates = original_extract
+        setattr(intersect2, extractor_name, original_extract)
     return candidates, pair_count, total_pairs
 
 
@@ -813,17 +886,17 @@ def _child_provenance(intersect2: Any) -> dict[str, Any]:
 def _child(case: str, run_kind: str) -> dict[str, Any]:
     from track.v2.intersect2 import (
         IntersectConfig,
-        _extract_cross_track_windows,
-        _extract_orthogonal_cross_track_candidates,
         _query_spatial_extent,
     )
     import track.v2.intersect2 as intersect2
+    extractor = getattr(intersect2, _extractor_name(intersect2))
+    projection = _projection_context_for_source(intersect2)
     if run_kind not in {"measurement", "semantic", "phase"}:
         raise ValueError(f"unsupported child run kind: {run_kind}")
     collect_phase = run_kind == "phase"
     telemetry: dict[str, int | float] | None = {} if collect_phase else None
     native_telemetry = "telemetry" in inspect.signature(
-        _extract_orthogonal_cross_track_candidates
+        extractor
     ).parameters
     phase_context = (
         nullcontext()
@@ -840,9 +913,16 @@ def _child(case: str, run_kind: str) -> dict[str, Any]:
             if collect_phase and native_telemetry:
                 kwargs["telemetry"] = telemetry
             start = time.perf_counter()
-            candidates, pair_count, total_pairs = _extract_orthogonal_cross_track_candidates(
-                tracks, 116.0, 39.0, IntersectConfig(), **kwargs,
-            )
+            if "transformer" in inspect.signature(extractor).parameters:
+                if projection is None:
+                    raise RuntimeError("current benchmark source requires processing_srid")
+                candidates, pair_count, total_pairs = extractor(
+                    tracks, projection[1], IntersectConfig(), **kwargs,
+                )
+            else:
+                candidates, pair_count, total_pairs = extractor(
+                    tracks, 116.0, 39.0, IntersectConfig(), **kwargs,
+                )
             elapsed = time.perf_counter() - start
             peak_working_set = _peak_working_set()
             if telemetry is not None:
@@ -903,7 +983,14 @@ def _child(case: str, run_kind: str) -> dict[str, Any]:
                     use_orthogonal_candidates=True,
                     db_table=frozen_real["table"],
                 )
-                extent = _query_spatial_extent(conn, table=cfg.db_table)
+                extent_kwargs: dict[str, Any] = {"table": cfg.db_table}
+                if "spatial_context" in inspect.signature(
+                    _query_spatial_extent
+                ).parameters:
+                    if projection is None:
+                        raise RuntimeError("current benchmark source requires processing_srid")
+                    extent_kwargs["spatial_context"] = projection[0]
+                extent = _query_spatial_extent(conn, **extent_kwargs)
                 if extent is None:
                     raise RuntimeError("real DB has no active-point extent")
                 with conn.cursor() as cursor:
@@ -921,13 +1008,13 @@ def _child(case: str, run_kind: str) -> dict[str, Any]:
                 start = time.perf_counter()
                 if run_kind == "semantic":
                     candidates, window_records, progress_events = _capture_real_windows(
-                        intersect2, conn, cfg, extent, telemetry
+                        intersect2, conn, cfg, extent, telemetry, projection
                     )
                     pair_count = sum(record["pair_count"] for record in window_records)
                     total_pairs = sum(record["total_pairs"] for record in window_records)
                 else:
                     candidates, pair_count, total_pairs = _measure_real_windows(
-                        intersect2, conn, cfg, extent, telemetry
+                        intersect2, conn, cfg, extent, telemetry, projection
                     )
                 elapsed = time.perf_counter() - start
                 peak_working_set = _peak_working_set()
@@ -1451,11 +1538,18 @@ def main() -> None:
         default=Path("generated/perf_windows/windows_gate_v1_legacy_attestation.json"),
     )
     parser.add_argument("--legacy-attestation-sha256")
+    parser.add_argument(
+        "--processing-srid",
+        type=int,
+        help="Projected metre-based EPSG code valid for the complete benchmark data region.",
+    )
     parser.add_argument("--resume", action="store_true", help="resume only an exact real R7 ledger")
     args = parser.parse_args()
     if args.child:
         print(json.dumps(_child(args.case, args.run_kind), sort_keys=True))
         return
+    if args.processing_srid is None:
+        parser.error("--processing-srid is required")
 
     worktree = Path.cwd().resolve()
     runner = Path(__file__).resolve()
@@ -1522,6 +1616,7 @@ def main() -> None:
         "rss_policy_version": RSS_POLICY_VERSION,
         "spatial_window_size": [2000.0, 2000.0],
         "spatial_window_overlap": 0.15,
+        "processing_srid": args.processing_srid,
     }
     static_header = {
         "interpreter": {

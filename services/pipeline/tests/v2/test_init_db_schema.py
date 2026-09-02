@@ -12,14 +12,11 @@ from tempfile import TemporaryDirectory
 from track.v2.cli.init_db import (
     DDL_STATEMENTS,
     INDEX_STATEMENTS,
-    LegacyPipelineRun,
     _auto_add_missing_columns,
-    build_legacy_migration_plan,
+    _run_migrations,
     build_auto_migrations,
     column_to_alter_fragment,
     parse_ddl_columns,
-    load_legacy_clean_map,
-    migrate_legacy_pipeline_runs,
 )
 from track.v2.db.legacy_migration import (
     LegacyPipelineRun,
@@ -29,7 +26,7 @@ from track.v2.db.legacy_migration import (
 )
 
 
-class CleanDetectSchemaContractTest(unittest.TestCase):
+class CleanDetectProjectionSchemaContractTest(unittest.TestCase):
     def test_schema_separates_clean_and_detect_runs_with_same_detect_domain_constraints(self) -> None:
         ddl_by_table = {name: ddl for name, ddl in DDL_STATEMENTS}
 
@@ -71,6 +68,71 @@ class CleanDetectSchemaContractTest(unittest.TestCase):
         self.assertNotIn("ON DELETE CASCADE", all_schema_sql.upper())
         self.assertIn("clean_id", "\n".join(sql for _, sql in INDEX_STATEMENTS))
         self.assertIn("detect_id", "\n".join(sql for _, sql in INDEX_STATEMENTS))
+
+        clean_sql = " ".join(ddl_by_table["clean_runs"].split())
+        self.assertIn("source_srid INTEGER NOT NULL DEFAULT 4326", clean_sql)
+        self.assertIn("processing_srid INTEGER", clean_sql)
+        self.assertIn("projection_config JSONB NOT NULL DEFAULT '{}'", clean_sql)
+        self.assertIn("clean_runs_fixed_crs_complete CHECK", clean_sql)
+        self.assertIn("source_srid = 4326", clean_sql)
+        self.assertIn("jsonb_typeof(projection_config) = 'object'", clean_sql)
+        self.assertIn("processing_srid <> 4326", clean_sql)
+        self.assertIn('"coordinate_semantics_version": 2', clean_sql)
+
+        for table in (
+            "injected_points",
+            "tracks_cross",
+            "turn_events",
+            "candidate_intersections",
+            "candidate_entry_exit_points",
+        ):
+            columns = parse_ddl_columns(ddl_by_table[table])
+            self.assertNotIn("NOT NULL", columns["origin_lon"], table)
+            self.assertNotIn("NOT NULL", columns["origin_lat"], table)
+
+        self.assertNotIn("geom_projected", all_schema_sql)
+        self.assertIn(
+            "ON turn_events(detect_id, x, y)",
+            "\n".join(sql for _, sql in INDEX_STATEMENTS),
+        )
+
+    def test_structural_migration_makes_legacy_origin_columns_nullable(self) -> None:
+        class Cursor:
+            statusmessage = "OK"
+
+            def __init__(self) -> None:
+                self.executed: list[str] = []
+
+            def execute(self, sql: str) -> None:
+                self.executed.append(" ".join(sql.split()))
+
+        cursor = Cursor()
+
+        _run_migrations(cursor)
+
+        migration_sql = "\n".join(cursor.executed)
+        self.assertIn("clean_runs_fixed_crs_complete", migration_sql)
+        self.assertIn("coordinate_semantics_version", migration_sql)
+        self.assertIn("conrelid = 'clean_runs'::regclass", migration_sql)
+        self.assertIn("contype = 'c'", migration_sql)
+        self.assertIn("reject_v2_clean_run_context_update", migration_sql)
+        self.assertIn("trg_clean_run_context_immutable", migration_sql)
+        self.assertIn(
+            "UPDATE injected_points SET generated_reason = 'orthogonal_heading'",
+            migration_sql,
+        )
+        for table in (
+            "injected_points",
+            "tracks_cross",
+            "turn_events",
+            "candidate_intersections",
+            "candidate_entry_exit_points",
+        ):
+            self.assertIn(
+                f"ALTER TABLE {table} ALTER COLUMN origin_lon DROP NOT NULL, "
+                "ALTER COLUMN origin_lat DROP NOT NULL",
+                migration_sql,
+            )
 
 
 class LegacyRunMigrationPlanTest(unittest.TestCase):
@@ -397,7 +459,7 @@ class LegacyRunMigrationPlanTest(unittest.TestCase):
             source_id="raw_points", source_kind="postgres_table",
             parameters={}, status="completed", started_at="start", finished_at=None,
         )
-        with self.assertRaisesRegex(ValueError, "available Clean Run"):
+        with self.assertRaisesRegex(ValueError, "real legacy run"):
             build_legacy_migration_plan(
                 [ambiguous],
                 {ambiguous.id: "33333333-3333-3333-3333-333333333333"},
@@ -463,7 +525,12 @@ class LegacyMigrationExecutionTest(unittest.TestCase):
         ])
 
         with self.assertRaisesRegex(ValueError, detect_id):
-            migrate_legacy_pipeline_runs(cur, {})
+            migrate_legacy_pipeline_runs(
+                cur,
+                {},
+                registry_ddl=dict(DDL_STATEMENTS),
+                index_statements=INDEX_STATEMENTS,
+            )
 
         mutations = [
             sql for sql, _ in cur.executed
@@ -481,7 +548,12 @@ class LegacyMigrationExecutionTest(unittest.TestCase):
             ),
         ])
 
-        migrated = migrate_legacy_pipeline_runs(cur, {})
+        migrated = migrate_legacy_pipeline_runs(
+            cur,
+            {},
+            registry_ddl=dict(DDL_STATEMENTS),
+            index_statements=INDEX_STATEMENTS,
+        )
 
         self.assertTrue(migrated)
         sql = "\n".join(statement for statement, _ in cur.executed)
@@ -498,7 +570,12 @@ class LegacyMigrationExecutionTest(unittest.TestCase):
         original_fetchone = cur.fetchone
         cur.fetchone = lambda: (None,) if "to_regclass" in cur.last_sql else original_fetchone()
 
-        self.assertFalse(migrate_legacy_pipeline_runs(cur, {}))
+        self.assertFalse(migrate_legacy_pipeline_runs(
+            cur,
+            {},
+            registry_ddl=dict(DDL_STATEMENTS),
+            index_statements=INDEX_STATEMENTS,
+        ))
         self.assertEqual(len(cur.executed), 1)
 
 

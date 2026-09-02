@@ -29,10 +29,12 @@ from .models import (
     PostgresSource,
     RefinementSubtrack,
     RuntimeConfig,
+    SpatialContext,
 )
 from .network import build_network
 from .parser0 import get_database
 from .pipeline_events import EventProgressAdapter, EventSink, PipelineEvent
+from .projection import CoordinateTransformer, create_spatial_context
 from .sources import StreamVehicleSource
 
 
@@ -46,6 +48,7 @@ class PipelineInput:
     clean_id: str | None = None
     table: str = "trajectory_points"
     config_path: str | Path | None = None
+    processing_srid: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +80,8 @@ def run_pipeline(
 
     if sum(value is not None for value in (csv_path, pg_source_table, clean_id)) != 1:
         raise ValueError("exactly one of csv_path, pg_source_table, or clean_id is required")
+    if clean_id is not None and pipeline_input.processing_srid is not None:
+        raise ValueError("a reused Clean Run inherits processing_srid and cannot override it")
 
     stats: dict[str, int | str | list[int]] = {}
     t_start = time.perf_counter()
@@ -109,7 +114,12 @@ def run_pipeline(
             source_id = clean_record.source_id
             source_kind = clean_record.source_kind
             is_pg_source = source_kind == "postgres_table"
+            spatial_context = clean_record.spatial_context
         else:
+            spatial_context = create_spatial_context(
+                pc.projection,
+                processing_srid=pipeline_input.processing_srid,
+            )
             clean_id = store.start_clean_run(
                 source_id=source_id,
                 source_kind=source_kind,
@@ -117,9 +127,12 @@ def run_pipeline(
                     "target_table": table,
                     "cleaner_max_gap_s": pc.cleaner.max_gap_s,
                 },
+                spatial_context=spatial_context,
             )
             store.commit()
         stats["clean_id"] = str(clean_id)
+        stats["source_srid"] = spatial_context.source_srid
+        stats["processing_srid"] = spatial_context.processing_srid
 
         if reuse_clean:
             total_raw = 0
@@ -129,60 +142,115 @@ def run_pipeline(
             tp_id_map: dict[tuple[str, str], int] = {}
         else:
             assert clean_id is not None
-            clean_started = _log_stage_start("cleaner", clean_id=clean_id)
-            clean_stage = "Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean"
-            live_clean = EventProgressAdapter(clean_stage, sink)
-            live_clean.start()
-            _emit_message(sink, f"  数据源 / Source: {source_label}")
-            handle = get_database(source, runtime=pc.runtime)
-
-            t_count = time.perf_counter()
-            total_rows = handle.count_rows()
-            _emit_message(
-                sink,
-                f"  总行数 / Total rows: {total_rows:,} ({time.perf_counter() - t_count:.1f}s)",
-            )
-            total_raw = 0
-            total_injected = 0
-            tp_id_map = {}
-            total_excluded = 0
-            total_kept = 0
-            _pending_excluded: list = []
-            _pending_subtracks: list[RefinementSubtrack] = []
-            _pending_tp_keys: list[tuple[str, str]] = []
-            _pending_point_count = 0
-            subtrack_index = 1
-
-            stream = StreamVehicleSource(handle)
-
-            t_read = time.perf_counter()
-            vehicle_count = 0
-            last_update_t = t_read
-            for vehicle_points in stream.iter_vehicle_tracks():
-                total_raw += len(vehicle_points)
-                vehicle_count += 1
-                if not is_pg_source:
-                    batch_map = store.write_raw_points(
-                        vehicle_points,
-                        table=table,
-                        batch_size=pc.runtime.db_insert_batch,
+            handle = None
+            stream = None
+            try:
+                clean_started = _log_stage_start("cleaner", clean_id=clean_id)
+                clean_stage = "Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean"
+                live_clean = EventProgressAdapter(clean_stage, sink)
+                live_clean.start()
+                _emit_message(sink, f"  数据源 / Source: {source_label}")
+                handle = get_database(source, runtime=pc.runtime)
+                try:
+                    t_count = time.perf_counter()
+                    total_rows = handle.count_rows()
+                    _emit_message(
+                        sink,
+                        f"  总行数 / Total rows: {total_rows:,} ({time.perf_counter() - t_count:.1f}s)",
                     )
-                    tp_id_map.update(batch_map)
-                    _pending_tp_keys.extend(batch_map.keys())
-                vresult = clean_vehicle(vehicle_points, config=pc.cleaner)
-                total_injected += vresult.derived_counts.get(GeneratedReason.HEADING_ORTHOGONAL, 0)
-                _pending_excluded.extend(vresult.excluded)
-                total_excluded += len(vresult.excluded)
-                _pending_subtracks.extend(vresult.subtracks)
-                _pending_point_count += len(vresult.excluded) + sum(
-                    len(subtrack.points) for subtrack in vresult.subtracks
-                )
-                if _should_flush_clean_batch(
-                    pending_excluded_count=len(_pending_excluded),
-                    pending_point_count=_pending_point_count,
-                    vehicle_count=vehicle_count,
-                    runtime=pc.runtime,
-                ):
+                    total_raw = 0
+                    total_injected = 0
+                    tp_id_map = {}
+                    total_excluded = 0
+                    total_kept = 0
+                    _pending_excluded: list = []
+                    _pending_subtracks: list[RefinementSubtrack] = []
+                    _pending_tp_keys: list[tuple[str, str]] = []
+                    _pending_point_count = 0
+                    subtrack_index = 1
+
+                    stream = StreamVehicleSource(handle)
+                    run_transformer = CoordinateTransformer(spatial_context)
+                    run_bounds: tuple[float, float, float, float] | None = None
+
+                    t_read = time.perf_counter()
+                    vehicle_count = 0
+                    last_update_t = t_read
+                    for vehicle_points in stream.iter_vehicle_tracks():
+                        if vehicle_points:
+                            lons = [point.lon for point in vehicle_points]
+                            lats = [point.lat for point in vehicle_points]
+                            vehicle_bounds = (min(lons), min(lats), max(lons), max(lats))
+                            run_bounds = (
+                                vehicle_bounds
+                                if run_bounds is None
+                                else (
+                                    min(run_bounds[0], vehicle_bounds[0]),
+                                    min(run_bounds[1], vehicle_bounds[1]),
+                                    max(run_bounds[2], vehicle_bounds[2]),
+                                    max(run_bounds[3], vehicle_bounds[3]),
+                                )
+                            )
+                        total_raw += len(vehicle_points)
+                        vehicle_count += 1
+                        if not is_pg_source:
+                            batch_map = store.write_raw_points(
+                                vehicle_points,
+                                table=table,
+                                batch_size=pc.runtime.db_insert_batch,
+                            )
+                            tp_id_map.update(batch_map)
+                            _pending_tp_keys.extend(batch_map.keys())
+                        vresult = clean_vehicle(
+                            vehicle_points,
+                            config=pc.cleaner,
+                            spatial_context=spatial_context,
+                            _transformer=run_transformer,
+                        )
+                        total_injected += vresult.derived_counts.get(GeneratedReason.HEADING_ORTHOGONAL, 0)
+                        _pending_excluded.extend(vresult.excluded)
+                        total_excluded += len(vresult.excluded)
+                        _pending_subtracks.extend(vresult.subtracks)
+                        _pending_point_count += len(vresult.excluded) + sum(
+                            len(subtrack.points) for subtrack in vresult.subtracks
+                        )
+                        if _should_flush_clean_batch(
+                            pending_excluded_count=len(_pending_excluded),
+                            pending_point_count=_pending_point_count,
+                            vehicle_count=vehicle_count,
+                            runtime=pc.runtime,
+                        ):
+                            subtrack_index, batch_kept = _flush_clean_batch(
+                                store,
+                                clean_id=clean_id,
+                                table=table,
+                                tp_id_map=tp_id_map,
+                                pending_excluded=_pending_excluded,
+                                pending_subtracks=_pending_subtracks,
+                                pending_tp_keys=_pending_tp_keys,
+                                subtrack_index=subtrack_index,
+                                batch_size=pc.runtime.db_insert_batch,
+                                spatial_context=spatial_context,
+                            )
+                            total_kept += batch_kept
+                            _pending_point_count = 0
+
+                        now = time.perf_counter()
+                        if vehicle_count == 1 or vehicle_count % pc.runtime.progress_interval == 0 or (now - last_update_t) >= pc.runtime.progress_time_threshold_s:
+                            elapsed = now - t_read
+                            rate = total_raw / elapsed if elapsed > 0 else 0
+                            pct = total_raw / total_rows if total_rows > 0 else 0
+                            live_clean.update(
+                                progress=pct,
+                                detail=f"{total_raw:,}/{total_rows:,} 点, {vehicle_count:,} 车辆",
+                                elapsed=elapsed,
+                                throughput=f"{rate:.0f} 点/s",
+                            )
+                            last_update_t = now
+
+                    if run_bounds is not None:
+                        run_transformer.validate_bounds(run_bounds)
+
                     subtrack_index, batch_kept = _flush_clean_batch(
                         store,
                         clean_id=clean_id,
@@ -193,69 +261,52 @@ def run_pipeline(
                         pending_tp_keys=_pending_tp_keys,
                         subtrack_index=subtrack_index,
                         batch_size=pc.runtime.db_insert_batch,
+                        spatial_context=spatial_context,
                     )
                     total_kept += batch_kept
-                    _pending_point_count = 0
-
-                now = time.perf_counter()
-                if vehicle_count == 1 or vehicle_count % pc.runtime.progress_interval == 0 or (now - last_update_t) >= pc.runtime.progress_time_threshold_s:
-                    elapsed = now - t_read
-                    rate = total_raw / elapsed if elapsed > 0 else 0
-                    pct = total_raw / total_rows if total_rows > 0 else 0
+                    elapsed_read = time.perf_counter() - t_read
                     live_clean.update(
-                        progress=pct,
+                        progress=1.0,
                         detail=f"{total_raw:,}/{total_rows:,} 点, {vehicle_count:,} 车辆",
-                        elapsed=elapsed,
-                        throughput=f"{rate:.0f} 点/s",
+                        elapsed=elapsed_read,
+                        throughput=f"{total_raw / elapsed_read:.0f} 点/s" if elapsed_read > 0 else "",
                     )
-                    last_update_t = now
+                finally:
+                    if stream is not None:
+                        stream.close()
+                    elif handle is not None:
+                        handle.close()
 
-            subtrack_index, batch_kept = _flush_clean_batch(
-                store,
-                clean_id=clean_id,
-                table=table,
-                tp_id_map=tp_id_map,
-                pending_excluded=_pending_excluded,
-                pending_subtracks=_pending_subtracks,
-                pending_tp_keys=_pending_tp_keys,
-                subtrack_index=subtrack_index,
-                batch_size=pc.runtime.db_insert_batch,
-            )
-            total_kept += batch_kept
-            elapsed_read = time.perf_counter() - t_read
-            live_clean.update(
-                progress=1.0,
-                detail=f"{total_raw:,}/{total_rows:,} 点, {vehicle_count:,} 车辆",
-                elapsed=elapsed_read,
-                throughput=f"{total_raw / elapsed_read:.0f} 点/s" if elapsed_read > 0 else "",
-            )
-            stream.close()
-            handle.close()
-            _emit_message(
-                sink,
-                f"  读取&清洗 / Read&Clean: {total_raw:,} 点/points, "
-                f"{vehicle_count:,} 车辆/vehicles ({elapsed_read:.1f}s)",
-            )
+                _emit_message(
+                    sink,
+                    f"  读取&清洗 / Read&Clean: {total_raw:,} 点/points, "
+                    f"{vehicle_count:,} 车辆/vehicles ({elapsed_read:.1f}s)",
+                )
+                stats["trajectory_points"] = total_raw
+                _emit_message(sink, f"  排除 / Excluded: {total_excluded:,}")
+                _emit_message(sink, f"  注入 / Injected: {total_injected:,}")
+                stats["kept_trajectory_points"] = total_kept
+                stats["injected_points"] = total_injected
+                _emit_message(sink, f"  kept_trajectory_points: {total_kept:,} rows")
+                _emit_message(sink, f"  injected_points: {total_injected:,} rows")
+                store.finish_clean(clean_id, status="completed")
+                store.commit()
+            except Exception:
+                store.rollback()
+                store.finish_clean(clean_id, status="failed")
+                store.commit()
+                raise
 
-            stats["trajectory_points"] = total_raw
-
-        _emit_message(sink, f"  排除 / Excluded: {total_excluded:,}")
-        _emit_message(sink, f"  注入 / Injected: {total_injected:,}")
-        if not reuse_clean:
-            stats["kept_trajectory_points"] = total_kept
-            stats["injected_points"] = total_injected
-            _emit_message(sink, f"  kept_trajectory_points: {total_kept:,} rows")
-            _emit_message(sink, f"  injected_points: {total_injected:,} rows")
-
-        if not reuse_clean:
-            store.finish_clean(clean_id, status="completed")
-            store.commit()
             clean_elapsed = _log_stage_finish(
                 "cleaner",
                 clean_started,
                 clean_id=clean_id,
             )
             live_clean.stop(elapsed=clean_elapsed)
+
+        if reuse_clean:
+            _emit_message(sink, f"  排除 / Excluded: {total_excluded:,}")
+            _emit_message(sink, f"  注入 / Injected: {total_injected:,}")
 
         detect_id = store.start_detect_run(
             clean_id=clean_id,
@@ -282,7 +333,11 @@ def run_pipeline(
             clean_id=clean_id,
             live_status=live_intersect,
         )
-        iresult = detect_intersections(conn=store.connection, config=icfg)
+        iresult = detect_intersections(
+            conn=store.connection,
+            config=icfg,
+            spatial_context=spatial_context,
+        )
 
         _emit_message(sink, f"  转向事件 / Turn events: {iresult.report.turn_event_count:,}")
         _emit_message(sink, f"  热点事件 / Hotspot events: {iresult.report.hotspot_event_count:,}")
@@ -468,6 +523,7 @@ def _flush_clean_batch(
     pending_tp_keys: list[tuple[str, str]],
     subtrack_index: int,
     batch_size: int,
+    spatial_context: SpatialContext,
 ) -> tuple[int, int]:
     """Flush one batch of Cleaner 1 outputs and trim ``tp_id_map``."""
     result = store.persist_clean_batch(
@@ -479,6 +535,7 @@ def _flush_clean_batch(
         pending_tp_keys,
         subtrack_index,
         batch_size=batch_size,
+        spatial_context=spatial_context,
     )
     return result.next_subtrack_index, result.kept_count
 

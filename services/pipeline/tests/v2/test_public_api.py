@@ -8,6 +8,11 @@ import track.v2 as v2
 from track.v2.errors import DataSourceCorrupted
 
 
+_SPATIAL_CONTEXT = v2.create_spatial_context(
+    v2.ProjectionConfig(processing_srid=32650)
+)
+
+
 def _make_csv(tmpdir: str, content: str) -> Path:
     path = Path(tmpdir) / "points.csv"
     path.write_text(content, encoding="utf-8")
@@ -117,7 +122,11 @@ class CleanerContractTest(unittest.TestCase):
             )
             handle = v2.get_database(v2.CsvSource(csv_path))
             try:
-                result = v2.clean(handle, config=v2.CleanerConfig(max_gap_s=120.0))
+                result = v2.clean(
+                    handle,
+                    config=v2.CleanerConfig(max_gap_s=120.0),
+                    spatial_context=_SPATIAL_CONTEXT,
+                )
                 vehicle_ids = [point.vehicle_id for point in result.active.iter_points()]
             finally:
                 handle.close()

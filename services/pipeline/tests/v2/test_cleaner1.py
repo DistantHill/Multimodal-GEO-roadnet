@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from track.v2.cleaner1 import (
@@ -16,10 +17,12 @@ from track.v2.cleaner1 import (
     _inject_orthogonal,
     _ray_intersection,
 )
+from track.v2.cleaner import clean_vehicle
 from track.v2.exceptions import ConfigError, FieldSelectionRequired
 from track.v2.models import (
     CleanReport,
     PointRef,
+    SpatialContext,
     TrajectoryPoint,
     TrackModel,
 )
@@ -27,6 +30,12 @@ from track.v2.parser0 import CsvSource, get_database
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
+
+_SPATIAL_CONTEXT = SpatialContext(
+    source_srid=4326,
+    processing_srid=32650,
+    projection_config={"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": 0.01},
+)
 
 
 def _make_csv(tmpdir: str, filename: str, content: str, encoding: str = "utf-8") -> Path:
@@ -76,12 +85,39 @@ class ActiveExcludedSeparationTest(unittest.TestCase):
             )
             source = CsvSource(csv_path)
             handle = get_database(source)
-            result = clean(handle)
+            result = clean(handle, spatial_context=_SPATIAL_CONTEXT)
             self.assertIsInstance(result, CleanerResult)
             self.assertIsNotNone(result.active)
             self.assertIsNotNone(result.excluded)
             self.assertIsNotNone(result.report)
+            self.assertEqual(result.spatial_context, _SPATIAL_CONTEXT)
+            self.assertEqual(result.active.spatial_context, _SPATIAL_CONTEXT)
+            self.assertTrue(
+                all(
+                    point.x is not None and point.y is not None
+                    for point in result.active.iter_points()
+                )
+            )
             handle.close()
+
+    def test_clean_vehicle_reprojects_unscoped_kept_xy_and_carries_context(self):
+        points = [
+            replace(
+                _make_point("v1", "1", 1000.0, 116.0, 39.0, 90.0, 10.0),
+                x=1.0,
+                y=2.0,
+            ),
+            replace(
+                _make_point("v1", "2", 1030.0, 116.001, 39.0, 90.0, 10.0),
+                x=3.0,
+                y=4.0,
+            ),
+        ]
+
+        result = clean_vehicle(points, spatial_context=_SPATIAL_CONTEXT)
+
+        self.assertEqual(result.spatial_context, _SPATIAL_CONTEXT)
+        self.assertNotEqual((result.kept[0].x, result.kept[0].y), (1.0, 2.0))
 
 
 class OrthogonalHeadingInjectionTest(unittest.TestCase):
@@ -94,7 +130,9 @@ class OrthogonalHeadingInjectionTest(unittest.TestCase):
         a = _make_point("v1", "1", 1000.0, 116.01, 39.0, 90.0, 10.0)
         b = _make_point("v1", "2", 1030.0, 116.0, 39.01, 0.0, 10.0)
         cfg = CleanerConfig(max_extension_m=5000.0)
-        result, injected = _inject_orthogonal([a, b], cfg, 116.0, 39.0)
+        result, injected = _inject_orthogonal(
+            [a, b], cfg, spatial_context=_SPATIAL_CONTEXT
+        )
         # a + derived + b
         self.assertGreaterEqual(len(result), 3)
         self.assertEqual(injected, 1)
@@ -109,7 +147,9 @@ class OrthogonalHeadingInjectionTest(unittest.TestCase):
         a = _make_point("v1", "1", 1000.0, 116.0, 39.0, 90.0, 10.0)
         b = _make_point("v1", "2", 1030.0, 116.002, 39.000, 120.0, 10.0)  # 30° delta
         cfg = CleanerConfig()
-        result, injected = _inject_orthogonal([a, b], cfg, 116.0, 39.0)
+        result, injected = _inject_orthogonal(
+            [a, b], cfg, spatial_context=_SPATIAL_CONTEXT
+        )
         self.assertEqual(injected, 0)
         self.assertEqual(len(result), 2)
 
@@ -122,7 +162,9 @@ class MaxExtensionTest(unittest.TestCase):
         a = _make_point("v1", "1", 1000.0, 116.0, 39.0, 90.0, 10.0)
         b = _make_point("v1", "2", 1030.0, 120.0, 42.000, 0.0, 10.0)  # ~400km away
         cfg = CleanerConfig(max_extension_m=80.0)
-        result, injected = _inject_orthogonal([a, b], cfg, 116.0, 39.0)
+        result, injected = _inject_orthogonal(
+            [a, b], cfg, spatial_context=_SPATIAL_CONTEXT
+        )
         self.assertEqual(injected, 0)
 
 
@@ -133,7 +175,9 @@ class DerivedPointRefTest(unittest.TestCase):
         a = _make_point("v1", "10", 1000.0, 116.01, 39.0, 90.0, 10.0)
         b = _make_point("v1", "20", 1030.0, 116.0, 39.01, 0.0, 10.0)
         cfg = CleanerConfig(max_extension_m=5000.0)
-        result, _ = _inject_orthogonal([a, b], cfg, 116.0, 39.0)
+        result, _ = _inject_orthogonal(
+            [a, b], cfg, spatial_context=_SPATIAL_CONTEXT
+        )
         derived = [p for p in result if p.point_ref.generated_reason == "orthogonal_heading"]
         self.assertTrue(derived)
         self.assertEqual(derived[0].point_ref.from_ref, "10")
@@ -236,7 +280,7 @@ class NoSourceModificationTest(unittest.TestCase):
             original = csv_path.read_text(encoding="utf-8")
             source = CsvSource(csv_path)
             handle = get_database(source)
-            result = clean(handle)
+            result = clean(handle, spatial_context=_SPATIAL_CONTEXT)
             # Consume active points
             list(result.active.iter_points())
             # Source file unchanged

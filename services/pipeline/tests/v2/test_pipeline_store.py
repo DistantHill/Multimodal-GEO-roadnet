@@ -14,11 +14,21 @@ from track.v2.db.pipeline_store import (
 from track.v2.models import (
     ClipConfig,
     DerivedPoint,
+    ExcludedIndex,
+    ExcludedPoint,
     FittingConfig,
     GeneratedReason,
     PointRef,
     RefinementSubtrack,
+    SpatialContext,
     TrajectoryPoint,
+)
+
+
+_SPATIAL_CONTEXT = SpatialContext(
+    source_srid=4326,
+    processing_srid=32650,
+    projection_config={"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": 0.01},
 )
 
 
@@ -93,6 +103,7 @@ class PipelineStoreCleanTest(unittest.TestCase):
                     source_id="source",
                     source_kind="csv",
                     parameters={"target_table": "trajectory_points"},
+                    spatial_context=_SPATIAL_CONTEXT,
                 ),
                 "clean-1",
             )
@@ -110,6 +121,7 @@ class PipelineStoreCleanTest(unittest.TestCase):
             source_id="source",
             source_kind="csv",
             parameters={"target_table": "trajectory_points"},
+            spatial_context=_SPATIAL_CONTEXT,
         )
         finish.assert_called_once_with(conn, "clean-1", status="completed")
         write.assert_called_once_with(
@@ -126,10 +138,19 @@ class PipelineStoreCleanTest(unittest.TestCase):
                 points=[_point("1"), _point("2", generated=True), _point("3")],
             )
         ]
-        pending_excluded = [object()]
+        excluded = ExcludedPoint(
+            point_ref=PointRef("source", "excluded", stable=True),
+            reason="stationary",
+            lon=116.0,
+            lat=39.0,
+        )
+        pending_excluded = [excluded]
         point_id_map = {("source", "1"): 101, ("source", "3"): 103}
         pending_point_keys = [("source", "1"), ("source", "3")]
         events: list[str] = []
+        def audit(*args: object, **kwargs: object) -> None:
+            events.append("excluded")
+
         def kept(*args: object, **kwargs: object) -> int:
             events.append("kept")
             return 2
@@ -138,6 +159,16 @@ class PipelineStoreCleanTest(unittest.TestCase):
             events.append("injected")
 
         with (
+            patch(
+                "track.v2.db.pipeline_store.fetch_clean_run",
+                return_value=SimpleNamespace(
+                    status="running", spatial_context=_SPATIAL_CONTEXT
+                ),
+            ),
+            patch(
+                "track.v2.db.pipeline_store.insert_excluded_points",
+                side_effect=audit,
+            ) as audit_mock,
             patch("track.v2.db.pipeline_store.insert_kept_trajectory_points", side_effect=kept) as kept_mock,
             patch("track.v2.db.pipeline_store.insert_injected_points", side_effect=injected) as injected_mock,
         ):
@@ -149,10 +180,11 @@ class PipelineStoreCleanTest(unittest.TestCase):
                 subtracks,
                 pending_point_keys,
                 10,
+                spatial_context=_SPATIAL_CONTEXT,
                 batch_size=17,
             )
 
-        self.assertEqual(events, ["kept", "injected"])
+        self.assertEqual(events, ["excluded", "kept", "injected"])
         self.assertEqual(
             result,
             CleanBatchResult(next_subtrack_index=11, kept_count=2),
@@ -161,9 +193,19 @@ class PipelineStoreCleanTest(unittest.TestCase):
         self.assertEqual(pending_excluded, [])
         self.assertEqual(subtracks, [])
         self.assertEqual(pending_point_keys, [])
+        audit_mock.assert_called_once_with(
+            conn,
+            ExcludedIndex(items=[excluded]),
+            clean_id="clean-1",
+            batch_size=17,
+        )
         assigned = kept_mock.call_args.args[1]
         self.assertEqual([item.subtrack_index for item in assigned], [10])
         self.assertIs(assigned, injected_mock.call_args.args[1])
+        self.assertEqual(
+            injected_mock.call_args.kwargs["spatial_context"],
+            _SPATIAL_CONTEXT,
+        )
 
     def test_clean_batch_writer_error_is_not_swallowed(self) -> None:
         conn = object()
@@ -173,14 +215,82 @@ class PipelineStoreCleanTest(unittest.TestCase):
                 vehicle_id="vehicle-1", subtrack_index=1, points=[_point("1")],
             )
         ]
-        with patch(
-            "track.v2.db.pipeline_store.insert_kept_trajectory_points",
-            side_effect=ValueError("kept failed"),
+        with (
+            patch(
+                "track.v2.db.pipeline_store.fetch_clean_run",
+                return_value=SimpleNamespace(
+                    status="running", spatial_context=_SPATIAL_CONTEXT
+                ),
+            ),
+            patch(
+                "track.v2.db.pipeline_store.insert_kept_trajectory_points",
+                side_effect=ValueError("kept failed"),
+            ),
         ):
             with self.assertRaisesRegex(ValueError, "kept failed"):
                 store.persist_clean_batch(
                     "clean-1", "trajectory_points", {}, [], subtracks, [], 1,
+                    spatial_context=_SPATIAL_CONTEXT,
                 )
+
+    def test_excluded_audit_writer_error_preserves_pending_items(self) -> None:
+        store = PostgresPipelineStore(object())
+        excluded = ExcludedPoint(
+            point_ref=PointRef("source", "9", stable=True),
+            reason="stationary",
+            lon=116.0,
+            lat=39.0,
+        )
+        pending = [excluded]
+        with (
+            patch(
+                "track.v2.db.pipeline_store.fetch_clean_run",
+                return_value=SimpleNamespace(
+                    status="running", spatial_context=_SPATIAL_CONTEXT
+                ),
+            ),
+            patch(
+                "track.v2.db.pipeline_store.insert_excluded_points",
+                side_effect=RuntimeError("audit failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "audit failed"):
+                store.persist_clean_batch(
+                    "clean-1",
+                    "trajectory_points",
+                    {},
+                    pending,
+                    [],
+                    [],
+                    1,
+                    spatial_context=_SPATIAL_CONTEXT,
+                )
+
+        self.assertEqual(pending, [excluded])
+
+    def test_clean_batch_context_mismatch_fails_before_writes(self) -> None:
+        store = PostgresPipelineStore(object())
+        with (
+            patch(
+                "track.v2.db.pipeline_store.fetch_clean_run",
+                return_value=SimpleNamespace(
+                    status="running", spatial_context=_SPATIAL_CONTEXT
+                ),
+            ),
+            patch("track.v2.db.pipeline_store.insert_excluded_points") as writer,
+            self.assertRaisesRegex(ValueError, "does not match the batch"),
+        ):
+            store.persist_clean_batch(
+                "clean-1",
+                "trajectory_points",
+                {},
+                [],
+                [],
+                [],
+                1,
+                spatial_context=SimpleNamespace(),
+            )
+        writer.assert_not_called()
 
 
 class PipelineStoreDetectTest(unittest.TestCase):
@@ -198,6 +308,7 @@ class PipelineStoreDetectTest(unittest.TestCase):
             crossing_points=(),
         )
         result = SimpleNamespace(
+            spatial_context=_SPATIAL_CONTEXT,
             cross_track_candidates=[object()],
             turn_events=[object(), object()],
             clusters=[cluster_a, cluster_b],
@@ -218,6 +329,12 @@ class PipelineStoreDetectTest(unittest.TestCase):
             return call
 
         with (
+            patch(
+                "track.v2.db.pipeline_store.fetch_detect_row",
+                return_value=SimpleNamespace(
+                    status="running", spatial_context=_SPATIAL_CONTEXT
+                ),
+            ),
             patch(
                 "track.v2.db.pipeline_store.insert_tracks_cross",
                 side_effect=record("tracks_cross", 7),
@@ -278,7 +395,24 @@ class PipelineStoreDetectTest(unittest.TestCase):
             ),
         )
         tracks_cross.assert_called_once_with(
-            conn, result.cross_track_candidates, detect_id="detect-1", batch_size=17,
+            conn,
+            result.cross_track_candidates,
+            detect_id="detect-1",
+            spatial_context=_SPATIAL_CONTEXT,
+            batch_size=17,
+        )
+        turn_events.assert_called_once_with(
+            conn,
+            result.turn_events,
+            detect_id="detect-1",
+            spatial_context=_SPATIAL_CONTEXT,
+            batch_size=17,
+        )
+        candidate_intersections.assert_called_once_with(
+            conn,
+            result.clusters,
+            detect_id="detect-1",
+            spatial_context=_SPATIAL_CONTEXT,
         )
         candidate_intersection_events.assert_called_once_with(
             conn,
@@ -294,6 +428,7 @@ class PipelineStoreDetectTest(unittest.TestCase):
             {10: 110, 20: 120},
             {10: cluster_a, 20: cluster_b},
             detect_id="detect-1",
+            spatial_context=_SPATIAL_CONTEXT,
         )
         entry_exit_points.assert_called_once_with(
             conn,
@@ -308,6 +443,7 @@ class PipelineStoreDetectTest(unittest.TestCase):
         conn = object()
         store = PostgresPipelineStore(conn)
         result = SimpleNamespace(
+            spatial_context=_SPATIAL_CONTEXT,
             cross_track_candidates=[],
             turn_events=[],
             clusters=[],
@@ -315,6 +451,12 @@ class PipelineStoreDetectTest(unittest.TestCase):
             observations=[],
         )
         with (
+            patch(
+                "track.v2.db.pipeline_store.fetch_detect_row",
+                return_value=SimpleNamespace(
+                    status="running", spatial_context=_SPATIAL_CONTEXT
+                ),
+            ),
             patch(
                 "track.v2.db.pipeline_store.insert_tracks_cross",
                 side_effect=RuntimeError("detect failed"),
@@ -325,6 +467,22 @@ class PipelineStoreDetectTest(unittest.TestCase):
                 store.persist_detect("detect-1", result)
         turn_events.assert_not_called()
 
+    def test_detect_context_mismatch_fails_before_writes(self) -> None:
+        store = PostgresPipelineStore(object())
+        result = SimpleNamespace(spatial_context=object())
+        with (
+            patch(
+                "track.v2.db.pipeline_store.fetch_detect_row",
+                return_value=SimpleNamespace(
+                    status="running", spatial_context=_SPATIAL_CONTEXT
+                ),
+            ),
+            patch("track.v2.db.pipeline_store.insert_tracks_cross") as writer,
+            self.assertRaisesRegex(ValueError, "does not match its Clean Run"),
+        ):
+            store.persist_detect("detect-1", result)
+        writer.assert_not_called()
+
 
 class PipelineStoreClipFitTest(unittest.TestCase):
     def test_clip_and_fit_operations_delegate_and_return_values(self) -> None:
@@ -332,9 +490,26 @@ class PipelineStoreClipFitTest(unittest.TestCase):
         store = PostgresPipelineStore(conn)
         clip_config = ClipConfig()
         fitting_config = FittingConfig()
-        clips = object()
-        bundle = object()
+        clips = SimpleNamespace(
+            spatial_context=_SPATIAL_CONTEXT,
+            detect_id="detect-1",
+        )
+        fit_result = SimpleNamespace(
+            spatial_context=_SPATIAL_CONTEXT,
+            detect_id="detect-1",
+        )
+        bundle = SimpleNamespace(
+            combined=fit_result,
+            a_to_b=fit_result,
+            b_to_a=fit_result,
+        )
         with (
+            patch(
+                "track.v2.db.pipeline_store.fetch_detect_row",
+                return_value=SimpleNamespace(
+                    status="completed", spatial_context=_SPATIAL_CONTEXT
+                ),
+            ),
             patch(
                 "track.v2.db.pipeline_store.extract_clips_for_detect",
                 return_value=clips,
@@ -398,12 +573,49 @@ class PipelineStoreClipFitTest(unittest.TestCase):
 
     def test_fit_writer_error_propagates(self) -> None:
         store = PostgresPipelineStore(object())
-        with patch(
-            "track.v2.db.pipeline_store.insert_centerline_bundle",
-            side_effect=RuntimeError("fit failed"),
+        clips = SimpleNamespace(
+            spatial_context=_SPATIAL_CONTEXT,
+            detect_id="detect-1",
+        )
+        fit_result = SimpleNamespace(
+            spatial_context=_SPATIAL_CONTEXT,
+            detect_id="detect-1",
+        )
+        bundle = SimpleNamespace(
+            combined=fit_result,
+            a_to_b=fit_result,
+            b_to_a=fit_result,
+        )
+        with (
+            patch(
+                "track.v2.db.pipeline_store.fetch_detect_row",
+                return_value=SimpleNamespace(
+                    status="completed", spatial_context=_SPATIAL_CONTEXT
+                ),
+            ),
+            patch(
+                "track.v2.db.pipeline_store.insert_centerline_bundle",
+                side_effect=RuntimeError("fit failed"),
+            ),
         ):
             with self.assertRaisesRegex(RuntimeError, "fit failed"):
-                store.persist_fit_bundle("fit-1", "detect-1", object(), object())
+                store.persist_fit_bundle("fit-1", "detect-1", bundle, clips)
+
+    def test_fit_context_mismatch_fails_before_write(self) -> None:
+        store = PostgresPipelineStore(object())
+        clips = SimpleNamespace(spatial_context=object(), detect_id="detect-1")
+        with (
+            patch(
+                "track.v2.db.pipeline_store.fetch_detect_row",
+                return_value=SimpleNamespace(
+                    status="completed", spatial_context=_SPATIAL_CONTEXT
+                ),
+            ),
+            patch("track.v2.db.pipeline_store.insert_centerline_bundle") as writer,
+            self.assertRaisesRegex(ValueError, "ClipResult SpatialContext"),
+        ):
+            store.persist_fit_bundle("fit-1", "detect-1", object(), clips)
+        writer.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 import track.v2.clip as clip_module
@@ -17,26 +19,51 @@ from track.v2 import (
     extract_clips,
     extract_clips_for_detect,
 )
+from track.v2.models import SpatialContext
+from track.v2.projection import CoordinateTransformer
 
 
-_METERS_PER_DEGREE = 111_194.92664455874
+_METERS_PER_DEGREE = 111_319.49079327358
+_SPATIAL_CONTEXT = SpatialContext(
+    source_srid=4326,
+    processing_srid=3857,
+    projection_config={"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": 0.01},
+)
+_TRANSFORMER = CoordinateTransformer(_SPATIAL_CONTEXT)
 
 
 def _point(vehicle_id: str, index: int, x_m: float, y_m: float = 0.0) -> TrajectoryPoint:
+    lon, lat = _TRANSFORMER.inverse(x_m, y_m)
     return TrajectoryPoint(
         point_ref=PointRef("synthetic", str(index), stable=True),
         vehicle_id=vehicle_id,
         timestamp=float(index * 10),
-        lon=x_m / _METERS_PER_DEGREE,
-        lat=y_m / _METERS_PER_DEGREE,
+        lon=lon,
+        lat=lat,
         heading=90.0,
         speed=5.0,
+        x=x_m,
+        y=y_m,
+    )
+
+
+def _clip_input(
+    *,
+    intersections: tuple[ClipIntersection, ...],
+    tracks: tuple[ClipTrack, ...],
+    detect_id: str | None = None,
+) -> ClipInput:
+    return ClipInput(
+        intersections=intersections,
+        tracks=tracks,
+        spatial_context=_SPATIAL_CONTEXT,
+        detect_id=detect_id,
     )
 
 
 class ClipExtractionTest(unittest.TestCase):
     def test_intersection_grid_is_reused_across_tracks(self) -> None:
-        source = ClipInput(
+        source = _clip_input(
             intersections=(ClipIntersection(10, 0.0, 0.0, 20.0),),
             tracks=tuple(
                 ClipTrack(
@@ -63,25 +90,59 @@ class ClipExtractionTest(unittest.TestCase):
             "trip-1",
             tuple(_point("vehicle-1", index, x) for index, x in enumerate((-100, 0, 100))),
         )
-        grid = clip_module._IntersectionGrid((ClipIntersection(10, 0.0, 0.0, 20.0),))
-        original_point_xy = grid.point_xy
+        grid = clip_module._IntersectionGrid(
+            (ClipIntersection(10, 0.0, 0.0, 20.0),),
+            _TRANSFORMER,
+        )
+        original_points_xy = grid.points_xy
         projection_count = 0
 
-        def counted_point_xy(point: TrajectoryPoint) -> tuple[float, float]:
+        def counted_points_xy(
+            points: tuple[TrajectoryPoint, ...],
+        ) -> tuple[tuple[float, float], ...]:
             nonlocal projection_count
-            projection_count += 1
-            return original_point_xy(point)
+            projection_count += len(points)
+            return original_points_xy(points)
 
-        grid.point_xy = counted_point_xy  # type: ignore[method-assign]
+        grid.points_xy = counted_points_xy  # type: ignore[method-assign]
         clip_module._crossing_events(track, grid)
 
         self.assertEqual(projection_count, len(track.points))
+
+    def test_public_clip_input_does_not_trust_unscoped_existing_xy(self) -> None:
+        points = tuple(
+            _point("vehicle-1", index, x)
+            for index, x in enumerate((-200.0, 200.0))
+        )
+        stale_points = tuple(
+            replace(point, x=9_000_000.0 + index, y=-9_000_000.0)
+            for index, point in enumerate(points)
+        )
+        intersections = (
+            ClipIntersection(10, -100.0 / _METERS_PER_DEGREE, 0.0, 20.0),
+            ClipIntersection(20, 100.0 / _METERS_PER_DEGREE, 0.0, 20.0),
+        )
+
+        expected = extract_clips(
+            _clip_input(
+                intersections=intersections,
+                tracks=(ClipTrack("vehicle-1", "trip-1", points),),
+            )
+        )
+        actual = extract_clips(
+            _clip_input(
+                intersections=intersections,
+                tracks=(ClipTrack("vehicle-1", "trip-1", stale_points),),
+            )
+        )
+
+        self.assertEqual(actual, expected)
 
     def test_long_segment_scans_intersections_instead_of_all_aabb_cells(self) -> None:
         grid = clip_module._IntersectionGrid((
             ClipIntersection(10, -100 / _METERS_PER_DEGREE, 0.0, 20.0),
             ClipIntersection(20, 100 / _METERS_PER_DEGREE, 0.0, 20.0),
-        ))
+        ), _TRANSFORMER)
 
         class NoCellLookup(dict):
             def get(self, key: object, default: object = None) -> object:
@@ -100,7 +161,7 @@ class ClipExtractionTest(unittest.TestCase):
             _point("vehicle-1", index, x_m)
             for index, x_m in enumerate(range(-300, 301, 50))
         )
-        source = ClipInput(
+        source = _clip_input(
             detect_id="detect-1",
             intersections=(
                 ClipIntersection(cluster_id=10, lon=-100 / _METERS_PER_DEGREE, lat=0.0, radius_m=20.0),
@@ -125,7 +186,7 @@ class ClipExtractionTest(unittest.TestCase):
 
     def test_track_without_intersections_is_one_full_boundary_clip(self) -> None:
         points = tuple(_point("vehicle-1", index, x_m) for index, x_m in enumerate((-50, 0, 50)))
-        source = ClipInput(
+        source = _clip_input(
             detect_id="detect-1",
             intersections=(),
             tracks=(ClipTrack(vehicle_id="vehicle-1", trip_id="trip-1", points=points),),
@@ -138,9 +199,76 @@ class ClipExtractionTest(unittest.TestCase):
         self.assertEqual(result.clips[0].clip_type, "full_track")
         self.assertEqual(result.clips[0].start.kind, "trip_start")
         self.assertEqual(result.clips[0].end.kind, "trip_end")
+        self.assertAlmostEqual(result.clips[0].distance_m, 100.0, places=6)
+
+    def test_fixed_crs_is_independent_of_intersection_order(self) -> None:
+        context = SpatialContext(
+            source_srid=4326,
+            processing_srid=32650,
+            projection_config={"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": 0.01},
+        )
+        transformer = CoordinateTransformer(context)
+        centre_x, centre_y = transformer.forward(116.4, 39.9)
+        first_xy = (centre_x - 10_000.0, centre_y - 50_000.0)
+        second_xy = (centre_x + 10_000.0, centre_y + 50_000.0)
+        length = math.hypot(
+            second_xy[0] - first_xy[0],
+            second_xy[1] - first_xy[1],
+        )
+        unit_x = (second_xy[0] - first_xy[0]) / length
+        unit_y = (second_xy[1] - first_xy[1]) / length
+
+        def point(index: int, x: float, y: float) -> TrajectoryPoint:
+            lon, lat = transformer.inverse(x, y)
+            return TrajectoryPoint(
+                PointRef("fixed-crs", str(index), True),
+                "vehicle-fixed",
+                float(index * 10),
+                lon,
+                lat,
+                0.0,
+                10.0,
+                x=x,
+                y=y,
+            )
+
+        first_lonlat = transformer.inverse(*first_xy)
+        second_lonlat = transformer.inverse(*second_xy)
+        intersections = (
+            ClipIntersection(10, *first_lonlat, 20.0),
+            ClipIntersection(20, *second_lonlat, 20.0),
+        )
+        track = ClipTrack(
+            "vehicle-fixed",
+            "trip-fixed",
+            (
+                point(0, first_xy[0] - 100.0 * unit_x, first_xy[1] - 100.0 * unit_y),
+                point(1, second_xy[0] + 100.0 * unit_x, second_xy[1] + 100.0 * unit_y),
+            ),
+        )
+
+        forward = extract_clips(ClipInput(intersections, (track,), context))
+        reversed_order = extract_clips(
+            ClipInput(tuple(reversed(intersections)), (track,), context)
+        )
+
+        self.assertEqual(forward, reversed_order)
+        middle = next(
+            clip for clip in forward.clips if clip.clip_type == "inter_intersection"
+        )
+        for endpoint, centre in (
+            (middle.start, first_xy),
+            (middle.end, second_xy),
+        ):
+            endpoint_xy = transformer.forward(endpoint.lon, endpoint.lat)
+            self.assertAlmostEqual(
+                math.hypot(endpoint_xy[0] - centre[0], endpoint_xy[1] - centre[1]),
+                20.0,
+                places=6,
+            )
 
     def test_track_entirely_inside_an_intersection_produces_no_road_clip(self) -> None:
-        source = ClipInput(
+        source = _clip_input(
             intersections=(ClipIntersection(10, 0.0, 0.0, 20.0),),
             tracks=(
                 ClipTrack(
@@ -156,7 +284,7 @@ class ClipExtractionTest(unittest.TestCase):
         self.assertEqual(result.clips, ())
 
     def test_outside_track_reversing_at_boundary_is_not_split(self) -> None:
-        source = ClipInput(
+        source = _clip_input(
             intersections=(ClipIntersection(10, 0.0, 0.0, 20.0),),
             tracks=(
                 ClipTrack(
@@ -177,7 +305,7 @@ class ClipExtractionTest(unittest.TestCase):
 
     def test_one_long_segment_can_enter_and_exit_the_same_intersection(self) -> None:
         points = (_point("vehicle-1", 0, -200), _point("vehicle-1", 1, 200))
-        source = ClipInput(
+        source = _clip_input(
             intersections=(ClipIntersection(cluster_id=10, lon=0.0, lat=0.0, radius_m=20.0),),
             tracks=(ClipTrack(vehicle_id="vehicle-1", trip_id="trip-1", points=points),),
         )
@@ -193,7 +321,7 @@ class ClipExtractionTest(unittest.TestCase):
             _point("vehicle-1", index, x_m)
             for index, x_m in enumerate(range(-300, 301, 50))
         )
-        source = ClipInput(
+        source = _clip_input(
             intersections=(
                 ClipIntersection(cluster_id=10, lon=-100 / _METERS_PER_DEGREE, lat=0.0, radius_m=20.0),
                 ClipIntersection(cluster_id=20, lon=100 / _METERS_PER_DEGREE, lat=0.0, radius_m=20.0),
@@ -208,7 +336,7 @@ class ClipExtractionTest(unittest.TestCase):
 
     def test_same_intersection_reentry_does_not_leave_a_stale_exit(self) -> None:
         points = tuple(_point("vehicle-1", index, x_m) for index, x_m in enumerate((0, 100, 0)))
-        source = ClipInput(
+        source = _clip_input(
             intersections=(ClipIntersection(cluster_id=10, lon=0.0, lat=0.0, radius_m=20.0),),
             tracks=(ClipTrack(vehicle_id="vehicle-1", trip_id="trip-1", points=points),),
         )
@@ -220,7 +348,7 @@ class ClipExtractionTest(unittest.TestCase):
 
     def test_multiple_intersections_on_one_segment_are_ordered_by_fraction(self) -> None:
         points = (_point("vehicle-1", 0, -300), _point("vehicle-1", 1, 300))
-        source = ClipInput(
+        source = _clip_input(
             intersections=(
                 ClipIntersection(cluster_id=10, lon=-100 / _METERS_PER_DEGREE, lat=0.0, radius_m=20.0),
                 ClipIntersection(cluster_id=20, lon=100 / _METERS_PER_DEGREE, lat=0.0, radius_m=20.0),
@@ -236,7 +364,7 @@ class ClipExtractionTest(unittest.TestCase):
 
     def test_tangent_contact_does_not_count_as_entering_an_intersection(self) -> None:
         points = (_point("vehicle-1", 0, -100, 20), _point("vehicle-1", 1, 100, 20))
-        source = ClipInput(
+        source = _clip_input(
             intersections=(ClipIntersection(cluster_id=10, lon=0.0, lat=0.0, radius_m=20.0),),
             tracks=(ClipTrack(vehicle_id="vehicle-1", trip_id="trip-1", points=points),),
         )
@@ -248,7 +376,7 @@ class ClipExtractionTest(unittest.TestCase):
     def test_unordered_track_is_rejected_at_the_public_interface(self) -> None:
         first = _point("vehicle-1", 2, -50)
         second = _point("vehicle-1", 1, 50)
-        source = ClipInput(
+        source = _clip_input(
             intersections=(),
             tracks=(ClipTrack(vehicle_id="vehicle-1", trip_id="trip-1", points=(first, second)),),
         )
@@ -257,7 +385,7 @@ class ClipExtractionTest(unittest.TestCase):
             extract_clips(source)
 
     def test_invalid_intersection_radius_is_rejected_at_the_public_interface(self) -> None:
-        source = ClipInput(
+        source = _clip_input(
             intersections=(ClipIntersection(1, 0.0, 0.0, 0.0),),
             tracks=(
                 ClipTrack(
@@ -308,13 +436,13 @@ class ClipDatabaseReplayTest(unittest.TestCase):
         point_rows: list[
             tuple[
                 str, int, int, str, str, float, float, float, float, float,
-                dict[object, object], str | None, str | None, str,
+                dict[object, object], str | None, str | None, str, float, float,
             ]
         ] = [
             (
                 "vehicle-1", 1, index, "synthetic", str(index + 1),
                 float(index * 10), x / _METERS_PER_DEGREE, 0.0, 90.0, 5.0, {},
-                None, None, "",
+                None, None, "", float(x), 0.0,
             )
             for index, x in enumerate(range(-300, 301, 50))
         ]
@@ -322,11 +450,15 @@ class ClipDatabaseReplayTest(unittest.TestCase):
             (
                 "vehicle-1", 1, 99, "synthetic", "6->7:orthogonal_heading",
                 55.0, 0.0, 0.0, 45.0, 0.0, {}, "6", "7", "orthogonal_heading",
+                0.0, 0.0,
             )
         )
         point_rows.sort(key=lambda row: float(row[5]))
         conn = _ReplayConnection([
-            [("clean-1", "synthetic", {"target_table": "trajectory_points"}, "completed")],
+            [(
+                "clean-1", "synthetic", {"target_table": "trajectory_points"},
+                "completed", 4326, 3857, _SPATIAL_CONTEXT.projection_config,
+            )],
             [
                 (10, -100 / _METERS_PER_DEGREE, 0.0, 20.0),
                 (20, 100 / _METERS_PER_DEGREE, 0.0, 20.0),
@@ -353,7 +485,10 @@ class ClipDatabaseReplayTest(unittest.TestCase):
 
     def test_incomplete_run_is_rejected_before_loading_artifacts(self) -> None:
         conn = _ReplayConnection([
-            [("clean-1", "synthetic", {"target_table": "trajectory_points"}, "running")],
+            [(
+                "clean-1", "synthetic", {"target_table": "trajectory_points"},
+                "running", 4326, 3857, _SPATIAL_CONTEXT.projection_config,
+            )],
         ])
 
         with self.assertRaisesRegex(ValueError, "is not completed"):
@@ -363,7 +498,10 @@ class ClipDatabaseReplayTest(unittest.TestCase):
 
     def test_run_without_persisted_clip_radius_is_rejected(self) -> None:
         conn = _ReplayConnection([
-            [("clean-1", "synthetic", {"target_table": "trajectory_points"}, "completed")],
+            [(
+                "clean-1", "synthetic", {"target_table": "trajectory_points"},
+                "completed", 4326, 3857, _SPATIAL_CONTEXT.projection_config,
+            )],
             [(10, 0.0, 0.0, None)],
         ])
 

@@ -1,9 +1,9 @@
 """薄壳脚本：测试 SpatialWindow 滑窗循环各环节耗时。
 
 用法：
-    python manual_bench_spatial_windows.py
+    python manual_bench_spatial_windows.py --processing-srid 32650
 
-    VSCode: 右键 → "Run Python File" 或 F5。
+    VSCode: 请在 launch args 中显式设置 --processing-srid。
     可以改下面的 CONFIG 区域来调整参数。
 
 依赖：PostgreSQL 已运行且 trajectory_points/injected_points 表有数据。
@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
@@ -26,12 +27,16 @@ from track.v2.manual_thin_benchmark._thin_bench_helpers import connect_test_db, 
 from track.v2.intersect2 import (
     IntersectConfig,
     SpatialWindowIterator,
-    _extract_orthogonal_cross_track_candidates,
     _query_active_points_in_window,
     _query_spatial_extent,
     _tracks_from_points,
 )
+from track.v2.cross_track import (
+    extract_cross_track_candidates as _extract_orthogonal_cross_track_candidates,
+)
 from track.v2.db.queries import _build_points_from_rows
+from track.v2.models import ProjectionConfig
+from track.v2.projection import CoordinateTransformer, create_spatial_context
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONFIG —— 在这里改参数
@@ -55,6 +60,18 @@ VERBOSE_WINDOWS: bool = True
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--processing-srid",
+        type=int,
+        required=True,
+        help="Projected metre-based EPSG code valid for the complete benchmark data region.",
+    )
+    args = parser.parse_args()
+    spatial_context = create_spatial_context(
+        ProjectionConfig(processing_srid=args.processing_srid)
+    )
+    transformer = CoordinateTransformer(spatial_context)
     cfg = IntersectConfig(**CONFIG_OVERRIDES)
 
     print("=" * 60)
@@ -70,15 +87,17 @@ def main() -> None:
         extent = MANUAL_EXTENT
         print(f"\n  Extent (manual): {extent}")
     else:
-        extent = _query_spatial_extent(conn, table=cfg.db_table)
+        extent = _query_spatial_extent(
+            conn,
+            table=cfg.db_table,
+            spatial_context=spatial_context,
+        )
         if extent is None:
             print("  ERROR: No active points found in DB!")
             conn.close()
             return
-        print(f"\n  Extent (auto): lon=[{extent[0]:.6f}, {extent[2]:.6f}], "
-              f"lat=[{extent[1]:.6f}, {extent[3]:.6f}]")
-
-    origin_lon, origin_lat = extent[0], extent[1]
+        print(f"\n  Extent (auto): x=[{extent[0]:.3f}, {extent[2]:.3f}]m, "
+              f"y=[{extent[1]:.3f}, {extent[3]:.3f}]m")
 
     windows = SpatialWindowIterator(
         extent,
@@ -112,7 +131,12 @@ def main() -> None:
 
         # ── Step 1: DB query ──
         t1 = time.perf_counter()
-        points = _query_active_points_in_window(conn, window, table=cfg.db_table)
+        points = _query_active_points_in_window(
+            conn,
+            window,
+            table=cfg.db_table,
+            spatial_context=spatial_context,
+        )
         t_query += time.perf_counter() - t1
 
         if not points:
@@ -132,7 +156,7 @@ def main() -> None:
         # ── Step 3: extract candidates ──
         t3 = time.perf_counter()
         candidates, _, _ = _extract_orthogonal_cross_track_candidates(
-            window_tracks, origin_lon, origin_lat, cfg,
+            window_tracks, transformer, cfg,
         )
         t_extract += time.perf_counter() - t3
         total_candidates += len(candidates)

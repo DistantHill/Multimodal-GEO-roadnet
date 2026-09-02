@@ -14,6 +14,7 @@ from track.v2.models import (
     ClipConfig,
     FittingConfig,
     NetworkConfig,
+    ProjectionConfig,
     RuntimeConfig,
 )
 from track.v2.pipeline import _should_flush_clean_batch
@@ -23,6 +24,7 @@ class DefaultPipelineConfigTest(unittest.TestCase):
     def test_builtin_toml_matches_dataclass_defaults(self):
         """The checked-in TOML must reproduce every dataclass default exactly."""
         pc = load_pipeline_config()
+        self.assertEqual(pc.projection, ProjectionConfig())
         self.assertEqual(pc.cleaner, CleanerConfig())
         self.assertEqual(pc.detect, IntersectConfig())
         self.assertEqual(pc.clip, ClipConfig())
@@ -54,6 +56,13 @@ class PipelineConfigOverrideTest(unittest.TestCase):
             path.write_text('[runtime]\nfallback_encodings = ["utf-8"]\n', encoding="utf-8")
             pc = load_pipeline_config(path)
             self.assertEqual(pc.runtime.fallback_encodings, ("utf-8",))
+
+    def test_processing_srid_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pipeline.toml"
+            path.write_text("[projection]\nprocessing_srid = 32650\n", encoding="utf-8")
+            pc = load_pipeline_config(path)
+            self.assertEqual(pc.projection.processing_srid, 32650)
 
     def test_cleaner_point_threshold_flushes_before_vehicle_limit(self):
         runtime = RuntimeConfig(
@@ -96,6 +105,11 @@ class PipelineConfigErrorTest(unittest.TestCase):
 
     def test_wrong_type_raises(self):
         path = self._write("[runtime]\ndb_insert_batch = \"not-an-int\"\n")
+        with self.assertRaises(ConfigError):
+            load_pipeline_config(path)
+
+    def test_processing_srid_wrong_type_raises(self):
+        path = self._write('[projection]\nprocessing_srid = "32650"\n')
         with self.assertRaises(ConfigError):
             load_pipeline_config(path)
 

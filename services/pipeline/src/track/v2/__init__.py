@@ -41,10 +41,12 @@ from .models import (
     NetworkResult,
     PointRef,
     PostgresSource,
+    ProjectionConfig,
+    SpatialContext,
     TrackClip,
     TrajectoryPoint,
 )
 from .parser0 import get_database
+from .projection import ProjectionError, create_spatial_context
 from .replay import ReplayService, ReplayTarget, replay_centerline_inputs
 from .pipeline import PipelineInput, PipelineResult
-

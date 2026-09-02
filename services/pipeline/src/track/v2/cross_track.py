@@ -18,11 +18,10 @@ import numpy as np
 from ._geometry import (
     _angle_delta_deg,
     _paired_segment_intersections,
-    _to_lonlat,
-    _to_xy,
 )
 from ._perf import PerfTracker
 from .models import CrossTrackCandidate, TrajectoryPoint
+from .projection import CoordinateTransformer
 from ._cross_track_legacy import extract_cross_track_candidates_legacy
 
 
@@ -46,8 +45,7 @@ class _CrossTrackSegment:
 
 def extract_cross_track_candidates(
     tracks: dict[str, list[TrajectoryPoint]],
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     cfg: Any,
     live_status: Any = None,
     *,
@@ -58,7 +56,7 @@ def extract_cross_track_candidates(
     """Return cross-track candidates in stable vehicle/segment order."""
     extraction_started = time.perf_counter() if telemetry is not None else 0.0
     segment_started = time.perf_counter() if telemetry is not None else 0.0
-    segments, vehicle_count = _prepare_segments(tracks, origin_lon, origin_lat, cfg)
+    segments, vehicle_count = _prepare_segments(tracks, transformer, cfg)
     if telemetry is not None:
         telemetry["segment_build_seconds"] = telemetry.get(
             "segment_build_seconds", 0.0,
@@ -121,8 +119,7 @@ def extract_cross_track_candidates(
                 segment_ids_a,
                 segment_ids_b,
                 cfg,
-                origin_lon,
-                origin_lat,
+                transformer,
             )
 
     for segment_ids_a, segment_ids_b in _iter_overflow_pair_batches(
@@ -137,8 +134,7 @@ def extract_cross_track_candidates(
             segment_ids_a,
             segment_ids_b,
             cfg,
-            origin_lon,
-            origin_lat,
+            transformer,
         )
 
     ordered_candidates.sort(key=lambda item: item[0])
@@ -170,8 +166,7 @@ def _append_pair_hits(
     segment_ids_a: np.ndarray,
     segment_ids_b: np.ndarray,
     cfg: Any,
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
 ) -> None:
     xs, ys, hit_indices = _paired_segment_intersections(
         starts[segment_ids_a],
@@ -198,8 +193,7 @@ def _append_pair_hits(
                 segment_b,
                 float(x),
                 float(y),
-                origin_lon,
-                origin_lat,
+                transformer,
             ),
         ))
 
@@ -224,8 +218,7 @@ def _grid_span(
 
 def _prepare_segments(
     tracks: dict[str, list[TrajectoryPoint]],
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     cfg: Any,
 ) -> tuple[list[_CrossTrackSegment], int]:
     """Preserve straight-segment filtering in stable vehicle order."""
@@ -239,7 +232,13 @@ def _prepare_segments(
             projected = projected_points.get(point_index)
             if projected is None:
                 point = track[point_index]
-                projected = _to_xy(point.lon, point.lat, origin_lon, origin_lat)
+                if (point.x is None) != (point.y is None):
+                    raise ValueError("trajectory point must provide both processing x and y")
+                projected = (
+                    (float(point.x), float(point.y))
+                    if point.x is not None
+                    else transformer.forward(point.lon, point.lat)
+                )
                 projected_points[point_index] = projected
             return projected
 
@@ -390,11 +389,10 @@ def _candidate_from_segments(
     segment_b: _CrossTrackSegment,
     x: float,
     y: float,
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
 ) -> CrossTrackCandidate:
     """Build the public candidate payload from one canonical hit."""
-    lon, lat = _to_lonlat(x, y, origin_lon, origin_lat)
+    lon, lat = transformer.inverse(x, y)
     return CrossTrackCandidate(
         point_ref=segment_a.start.point_ref,
         vehicle_id=f"{segment_a.vehicle_id}|{segment_b.vehicle_id}",
@@ -413,8 +411,6 @@ def _candidate_from_segments(
         to_source_row_key=(
             f"{segment_b.start.point_ref.source_row_key},{segment_b.end.point_ref.source_row_key}"
         ),
-        origin_lon=origin_lon,
-        origin_lat=origin_lat,
     )
 
 

@@ -5,7 +5,8 @@ ZH: 对 run_pipeline() 中 Parser 0 + Cleaner 1 的逐车迭代循环做分步�
     各自占比，定位 1.2w 点/s 的性能瓶颈。
 
 用法：
-    python -m track.v2.manual_thin_benchmark.manual_bench_read_clean
+    TRACK_BENCH_PROCESSING_SRID=32650 \
+      python -m track.v2.manual_thin_benchmark.manual_bench_read_clean
 
     VSCode: 右键 → "Run Python File" 或 F5。
     可以改下面的 CONFIG 区域来调整参数。
@@ -33,8 +34,9 @@ if _PROJECT_ROOT not in sys.path:
 from track.v2.manual_thin_benchmark._thin_bench_helpers import connect_test_db, TEST_DB_NAME
 from track.v2.models import PostgresSource
 from track.v2 import get_database
-from track.v2.models import CleanerConfig
+from track.v2.models import CleanerConfig, ProjectionConfig
 from track.v2.cleaner import _split_by_gaps, _exclude_stationary, _inject_orthogonal
+from track.v2.projection import create_spatial_context
 from track.v2.sources import StreamVehicleSource
 from track.v2.db_writer import insert_trajectory_points, mark_excluded_points
 
@@ -56,8 +58,20 @@ MAX_VEHICLES: int = int(os.environ.get("TRACK_BENCH_MAX_VEHICLES", "100000"))
 # 是否打印每辆车的详情（车辆多时关闭以减少输出）
 VERBOSE: bool = os.environ.get("TRACK_BENCH_VERBOSE", "1") == "1"
 
+PROCESSING_SRID: int | None = (
+    int(value) if (value := os.environ.get("TRACK_BENCH_PROCESSING_SRID")) else None
+)
+
 
 def main() -> None:
+    if PROCESSING_SRID is None:
+        raise SystemExit(
+            "TRACK_BENCH_PROCESSING_SRID is required; choose the projected "
+            "metre CRS for the complete benchmark region"
+        )
+    spatial_context = create_spatial_context(
+        ProjectionConfig(processing_srid=PROCESSING_SRID)
+    )
     source_table = SOURCE_TABLE
     target_table = TARGET_TABLE or source_table
     is_inplace = (target_table == source_table)
@@ -160,7 +174,11 @@ def main() -> None:
             active: list = []
             injected_count = 0
             for subtrack in kept_subtracks:
-                inj_subtrack, count = _inject_orthogonal(subtrack, cfg)
+                inj_subtrack, count, _derived = _inject_orthogonal(
+                    subtrack,
+                    cfg,
+                    spatial_context=spatial_context,
+                )
                 active.extend(inj_subtrack)
                 injected_count += count
             t_clean_inject += time.perf_counter() - t1

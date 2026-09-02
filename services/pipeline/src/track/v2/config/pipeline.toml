@@ -4,6 +4,13 @@
 # Keys mirror the stage dataclass fields; defaults match the in-code dataclass
 # defaults exactly (no behavior change).
 
+# processing_srid is intentionally not defaulted here. Supply it in a regional
+# config (or with --processing-srid) after validating the full data coverage.
+[projection]
+source_srid = 4326
+enforce_area_of_use = true
+max_scale_error = 0.01
+
 [cleaner]
 max_extension_m = 80.0
 min_heading_delta_deg = 80.0

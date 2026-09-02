@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from ..clip import extract_clips_for_detect
+from .queries import fetch_detect_row
 from ..db_writer import (
     CleanRunRecord,
     create_clean_run,
@@ -27,6 +28,7 @@ from ..db_writer import (
     insert_candidate_intersections,
     insert_centerline_bundle,
     insert_entry_exit_points,
+    insert_excluded_points,
     insert_injected_points,
     insert_intersections,
     insert_kept_trajectory_points,
@@ -39,8 +41,11 @@ from ..models import (
     CenterlineFitBundle,
     ClipConfig,
     ClipResult,
+    ExcludedIndex,
+    ExcludedPoint,
     FittingConfig,
     RefinementSubtrack,
+    SpatialContext,
     TrajectoryPoint,
 )
 
@@ -92,6 +97,7 @@ class PipelineStore(Protocol):
         source_id: str,
         source_kind: str,
         parameters: dict[str, Any],
+        spatial_context: SpatialContext,
     ) -> str: ...
 
     def finish_clean(self, clean_id: str, *, status: str) -> None: ...
@@ -109,11 +115,12 @@ class PipelineStore(Protocol):
         clean_id: str,
         table: str,
         point_id_map: dict[tuple[str, str], int],
-        pending_excluded: list[Any],
+        pending_excluded: list[ExcludedPoint],
         pending_subtracks: list[RefinementSubtrack],
         pending_point_keys: list[tuple[str, str]],
         subtrack_index: int,
         *,
+        spatial_context: SpatialContext,
         batch_size: int = _DEFAULT_BATCH_SIZE,
     ) -> CleanBatchResult: ...
 
@@ -191,12 +198,14 @@ class PostgresPipelineStore:
         source_id: str,
         source_kind: str,
         parameters: dict[str, Any],
+        spatial_context: SpatialContext,
     ) -> str:
         return create_clean_run(
             self._conn,
             source_id=source_id,
             source_kind=source_kind,
             parameters=parameters,
+            spatial_context=spatial_context,
         )
 
     def finish_clean(self, clean_id: str, *, status: str) -> None:
@@ -221,14 +230,28 @@ class PostgresPipelineStore:
         clean_id: str,
         table: str,
         point_id_map: dict[tuple[str, str], int],
-        pending_excluded: list[Any],
+        pending_excluded: list[ExcludedPoint],
         pending_subtracks: list[RefinementSubtrack],
         pending_point_keys: list[tuple[str, str]],
         subtrack_index: int,
         *,
+        spatial_context: SpatialContext,
         batch_size: int = _DEFAULT_BATCH_SIZE,
     ) -> CleanBatchResult:
+        run_row = fetch_clean_run(self._conn, clean_id)
+        if run_row.status != "running":
+            raise ValueError(f"Clean Run {clean_id} is not running")
+        if run_row.spatial_context != spatial_context:
+            raise ValueError(
+                f"Clean Run {clean_id} SpatialContext does not match the batch"
+            )
         if pending_excluded:
+            insert_excluded_points(
+                self._conn,
+                ExcludedIndex(items=list(pending_excluded)),
+                clean_id=clean_id,
+                batch_size=batch_size,
+            )
             pending_excluded.clear()
 
         kept_count = 0
@@ -247,6 +270,7 @@ class PostgresPipelineStore:
                 self._conn,
                 assigned_subtracks,
                 clean_id=clean_id,
+                spatial_context=spatial_context,
                 batch_size=batch_size,
             )
             subtrack_index += len(assigned_subtracks)
@@ -279,22 +303,33 @@ class PostgresPipelineStore:
         *,
         batch_size: int = _DEFAULT_BATCH_SIZE,
     ) -> DetectPersistenceResult:
+        spatial_context = result.spatial_context
+        run_row = fetch_detect_row(self._conn, detect_id)
+        if run_row.status != "running":
+            raise ValueError(f"Detect Run {detect_id} is not running")
+        if run_row.spatial_context != spatial_context:
+            raise ValueError(
+                f"Detect Run {detect_id} SpatialContext does not match its Clean Run"
+            )
         tracks_cross_count = insert_tracks_cross(
             self._conn,
             result.cross_track_candidates,
             detect_id=detect_id,
+            spatial_context=spatial_context,
             batch_size=batch_size,
         )
         turn_event_ids = insert_turn_events(
             self._conn,
             result.turn_events,
             detect_id=detect_id,
+            spatial_context=spatial_context,
             batch_size=batch_size,
         )
         candidate_intersection_ids = insert_candidate_intersections(
             self._conn,
             result.clusters,
             detect_id=detect_id,
+            spatial_context=spatial_context,
         )
         insert_candidate_intersection_events(
             self._conn,
@@ -309,6 +344,7 @@ class PostgresPipelineStore:
             result.clusters,
             candidate_intersection_ids,
             detect_id=detect_id,
+            spatial_context=spatial_context,
             batch_size=batch_size,
         )
         clusters_by_id = {cluster.cluster_id: cluster for cluster in result.clusters}
@@ -318,6 +354,7 @@ class PostgresPipelineStore:
             candidate_intersection_ids,
             clusters_by_id,
             detect_id=detect_id,
+            spatial_context=spatial_context,
         )
         insert_entry_exit_points(
             self._conn,
@@ -381,6 +418,22 @@ class PostgresPipelineStore:
         bundle: CenterlineFitBundle,
         clips: ClipResult,
     ) -> tuple[int, ...]:
+        run_row = fetch_detect_row(self._conn, detect_id)
+        if run_row.status != "completed":
+            raise ValueError(f"Detect Run {detect_id} is not completed")
+        if clips.spatial_context != run_row.spatial_context:
+            raise ValueError(
+                f"ClipResult SpatialContext does not match Detect Run {detect_id}"
+            )
+        if clips.detect_id is not None and clips.detect_id != detect_id:
+            raise ValueError("ClipResult belongs to a different Detect Run")
+        for result in (bundle.combined, bundle.a_to_b, bundle.b_to_a):
+            if result.spatial_context != run_row.spatial_context:
+                raise ValueError(
+                    f"FitResult SpatialContext does not match Detect Run {detect_id}"
+                )
+            if result.detect_id is not None and result.detect_id != detect_id:
+                raise ValueError("FitResult belongs to a different Detect Run")
         return insert_centerline_bundle(
             self._conn,
             bundle,

@@ -22,8 +22,13 @@ def _angle_delta_deg(start: float, end: float) -> float:
     return angle_delta_deg(start, end)
 
 
-def _inject_orthogonal(points, cfg, *_origin):
-    return _inject_orthogonal_new(points, cfg)
+def _inject_orthogonal(points, cfg, *, spatial_context):
+    injected_subtrack, injected_count, _injected_points = _inject_orthogonal_new(
+        points,
+        cfg,
+        spatial_context=spatial_context,
+    )
+    return injected_subtrack, injected_count
 
 
 def _ray_intersection(a_xy, a_heading_deg, b_xy, b_heading_deg):

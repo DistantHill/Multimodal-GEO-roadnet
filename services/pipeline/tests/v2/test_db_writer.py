@@ -9,17 +9,21 @@ from track.v2.db_writer import (
     create_clean_run,
     create_detect_run,
     create_fit_run,
+    fetch_clean_run,
     finish_clean_run,
     finish_detect_run,
+    insert_candidate_entry_exit_points,
     insert_candidate_intersection_events,
     insert_candidate_intersections,
     insert_intersections,
     insert_injected_points,
     insert_kept_trajectory_points,
     insert_tracks_cross,
+    insert_turn_events,
 )
 from track.v2.models import (
     ClipConfig,
+    CrossingPoint,
     CrossTrackCandidate,
     DerivedPoint,
     GeneratedReason,
@@ -28,9 +32,24 @@ from track.v2.models import (
     FittingConfig,
     PointRef,
     RefinementSubtrack,
+    SpatialContext,
     TrajectoryPoint,
     TurnEvent,
 )
+from track.v2.projection import ProjectionError
+
+
+_SPATIAL_CONTEXT = SpatialContext(
+    source_srid=4326,
+    processing_srid=32650,
+    projection_config={
+        "coordinate_semantics_version": 2,
+        "enforce_area_of_use": True,
+        "max_scale_error": 0.01,
+    },
+)
+_EXPECTED_X = 413407.3219726745
+_EXPECTED_Y = 4317252.16462973
 
 
 class _RecordingCursor:
@@ -72,6 +91,8 @@ class _RecordingCursor:
                 (index + 1, params[index * width + 2])
                 for index in range(row_count)
             ]
+        if "INSERT INTO turn_events" in sql:
+            return [(1, params[1])]
         return [(1,)]
 
 
@@ -152,7 +173,12 @@ class CleanerMembershipWriterTest(unittest.TestCase):
             {("raw_points", "1"): 101, ("raw_points", "2"): 102},
             clean_id="clean-1",
         )
-        insert_injected_points(conn, subtracks, clean_id="clean-1")
+        insert_injected_points(
+            conn,
+            subtracks,
+            clean_id="clean-1",
+            spatial_context=_SPATIAL_CONTEXT,
+        )
 
         self.assertEqual(kept_count, 2)
         self.assertEqual(
@@ -160,8 +186,11 @@ class CleanerMembershipWriterTest(unittest.TestCase):
             [(7, 0), (7, 1)],
         )
         _, injected_params = conn.recording_cursor.executions[-1]
-        self.assertEqual(len(injected_params), 20)
+        self.assertEqual(len(injected_params), 18)
         self.assertEqual((injected_params[2], injected_params[3]), (7, 0))
+        self.assertAlmostEqual(injected_params[9], _EXPECTED_X)
+        self.assertAlmostEqual(injected_params[10], _EXPECTED_Y)
+        self.assertNotIn("origin_lon", conn.recording_cursor.executions[-1][0])
 
 
 class RunRegistryWriterTest(unittest.TestCase):
@@ -192,11 +221,12 @@ class RunRegistryWriterTest(unittest.TestCase):
             return self.cursor_instance
 
     def test_clean_and_detect_runs_have_distinct_ids_and_explicit_parent(self):
-        conn = self._Conn(None)
+        conn = self._Conn(("created",))
 
         clean_id = create_clean_run(
             conn, source_id="table_x", source_kind="postgres_table",
             parameters={"target_table": "table_x"},
+            spatial_context=_SPATIAL_CONTEXT,
         )
         clean_sql = conn.cursor_instance.sql
         clean_params = conn.cursor_instance.params
@@ -207,8 +237,51 @@ class RunRegistryWriterTest(unittest.TestCase):
         self.assertNotEqual(clean_id, detect_id)
         self.assertIn("INSERT INTO clean_runs", clean_sql)
         self.assertEqual(clean_params[0], clean_id)
+        self.assertEqual(clean_params[3:5], (4326, 32650))
+        self.assertEqual(
+            clean_params[5],
+            '{"coordinate_semantics_version": 2, "enforce_area_of_use": true, '
+            '"max_scale_error": 0.01}',
+        )
         self.assertIn("INSERT INTO detect_runs", conn.cursor_instance.sql)
-        self.assertEqual(conn.cursor_instance.params[:2], (detect_id, clean_id))
+        self.assertIn("c.status = 'completed'", conn.cursor_instance.sql)
+        self.assertIn("coordinate_semantics_version", conn.cursor_instance.sql)
+        self.assertEqual(conn.cursor_instance.params[0], detect_id)
+        self.assertEqual(conn.cursor_instance.params[-1], clean_id)
+
+    def test_detect_run_rejects_incomplete_or_unmigrated_clean(self):
+        with self.assertRaisesRegex(ValueError, "fixed-CRS coordinates"):
+            create_detect_run(
+                self._Conn(None),
+                clean_id="legacy-clean",
+                parameters={},
+            )
+
+    def test_fetch_clean_run_materializes_its_spatial_context(self):
+        conn = self._Conn((
+            "clean-1",
+            "table_x",
+            "postgres_table",
+            {"target_table": "table_x"},
+            "completed",
+            4326,
+            32650,
+            _SPATIAL_CONTEXT.projection_config,
+        ))
+
+        record = fetch_clean_run(conn, "clean-1")
+
+        self.assertEqual(record.spatial_context, _SPATIAL_CONTEXT)
+        self.assertIn("source_srid, processing_srid, projection_config", conn.cursor_instance.sql)
+
+    def test_fetch_clean_run_rejects_legacy_null_processing_srid(self):
+        conn = self._Conn((
+            "clean-legacy", "table_x", "postgres_table", {}, "completed",
+            4326, None, {},
+        ))
+
+        with self.assertRaisesRegex(ProjectionError, "no processing_srid"):
+            fetch_clean_run(conn, "clean-legacy")
 
     def test_stage_completion_updates_only_its_registry(self):
         conn = self._Conn(None)
@@ -235,6 +308,8 @@ class RunRegistryWriterTest(unittest.TestCase):
 
         self.assertNotEqual(first, second)
         self.assertIn("d.status = 'completed'", first_sql)
+        self.assertIn("coordinate_semantics_version", first_sql)
+        self.assertEqual(first_sql.count("'v2'"), 2)
         self.assertEqual(conn.cursor_instance.params[-1], "detect-1")
 
         with self.assertRaisesRegex(ValueError, "not completed"):
@@ -271,6 +346,7 @@ class InsertIntersectionsTest(unittest.TestCase):
             {10: 110, 20: 120},
             {10: _cluster(10), 20: _cluster(20)},
             detect_id="detect-1",
+            spatial_context=_SPATIAL_CONTEXT,
         )
 
         self.assertEqual(result, {20: 1})
@@ -280,7 +356,11 @@ class InsertIntersectionsTest(unittest.TestCase):
         self.assertEqual(params[2], 20)
         self.assertIs(params[6], True)
         self.assertEqual(params[8], 145.0)
+        self.assertAlmostEqual(params[10], _EXPECTED_X)
+        self.assertAlmostEqual(params[11], _EXPECTED_Y)
+        self.assertEqual(params[12], 32650)
         self.assertEqual(params[-1], 145.0)
+        self.assertIn("ST_Transform(ST_Buffer", sql)
 
     def test_complete_topologies_are_inserted_in_one_batch(self) -> None:
         conn = _RecordingConnection()
@@ -303,6 +383,7 @@ class InsertIntersectionsTest(unittest.TestCase):
             {10: 110, 20: 120},
             {10: _cluster(10), 20: _cluster(20)},
             detect_id="detect-1",
+            spatial_context=_SPATIAL_CONTEXT,
         )
 
         self.assertEqual(result, {10: 1, 20: 2})
@@ -325,12 +406,15 @@ class InsertTracksCrossTest(unittest.TestCase):
             from_source_row_key="102,105",
             to_source_id="table_b",
             to_source_row_key="77,78",
-            origin_lon=116.0,
-            origin_lat=39.0,
         )
         conn = _RecordingConnection()
 
-        written = insert_tracks_cross(conn, [candidate], detect_id="detect-1")
+        written = insert_tracks_cross(
+            conn,
+            [candidate],
+            detect_id="detect-1",
+            spatial_context=_SPATIAL_CONTEXT,
+        )
 
         self.assertEqual(written, 1)
         sql, params = conn.recording_cursor.executions[0]
@@ -343,11 +427,13 @@ class InsertTracksCrossTest(unittest.TestCase):
         self.assertEqual(
             params,
             [
-                "detect-1", "A|B", 15.0, 116.0, 39.0, 1.5, 2.5, 0.0, 12.0,
+                "detect-1", "A|B", 15.0, 116.0, 39.0,
+                _EXPECTED_X, _EXPECTED_Y, 0.0, 12.0,
                 "table_a", "102,105", "table_b", "77,78",
-                "orthogonal_cross_track", 116.0, 39.0,
+                "orthogonal_cross_track",
             ],
         )
+        self.assertNotIn("origin_lon", sql)
 
     def test_identical_derived_candidate_is_persisted_independently_per_run(self) -> None:
         candidate = CrossTrackCandidate(
@@ -356,12 +442,17 @@ class InsertTracksCrossTest(unittest.TestCase):
             x=1.5, y=2.5, heading=0.0, speed=12.0,
             from_source_id="table_a", from_source_row_key="102",
             to_source_id="table_b", to_source_row_key="77",
-            origin_lon=116.0, origin_lat=39.0,
         )
         conn = _RecordingConnection()
 
-        insert_tracks_cross(conn, [candidate], detect_id="detect-1")
-        insert_tracks_cross(conn, [candidate], detect_id="detect-2")
+        insert_tracks_cross(
+            conn, [candidate], detect_id="detect-1",
+            spatial_context=_SPATIAL_CONTEXT,
+        )
+        insert_tracks_cross(
+            conn, [candidate], detect_id="detect-2",
+            spatial_context=_SPATIAL_CONTEXT,
+        )
 
         self.assertEqual(
             [params[0] for _, params in conn.recording_cursor.executions],
@@ -410,12 +501,20 @@ class CandidateIntersectionSourcesTest(unittest.TestCase):
         )
         conn = _RecordingConnection()
 
-        insert_candidate_intersections(conn, [cluster], detect_id="detect-1")
+        insert_candidate_intersections(
+            conn, [cluster], detect_id="detect-1",
+            spatial_context=_SPATIAL_CONTEXT,
+        )
 
         sql, params = conn.recording_cursor.executions[0]
         self.assertIn("detect_id", sql)
         self.assertEqual(params[0], "detect-1")
         self.assertEqual(params[8], '["C:/input-a.csv", "project_raw_points"]')
+        self.assertAlmostEqual(params[2], _EXPECTED_X)
+        self.assertAlmostEqual(params[3], _EXPECTED_Y)
+        self.assertEqual(params[-2], 32650)
+        self.assertIn("ST_Transform(ST_Buffer", sql)
+        self.assertNotIn("origin_lon", sql)
 
     def test_candidates_are_inserted_in_one_batch(self) -> None:
         conn = _RecordingConnection()
@@ -424,10 +523,73 @@ class CandidateIntersectionSourcesTest(unittest.TestCase):
             conn,
             [_cluster(5), _cluster(6)],
             detect_id="detect-1",
+            spatial_context=_SPATIAL_CONTEXT,
         )
 
         self.assertEqual(result, {5: 1, 6: 2})
         self.assertEqual(len(conn.recording_cursor.executions), 1)
+
+
+class ProjectedEventWriterTest(unittest.TestCase):
+    def test_turn_event_reprojects_geographic_truth_and_omits_origin(self) -> None:
+        event = TurnEvent(
+            event_id=7,
+            vehicle_id="vehicle-1",
+            timestamp=10.0,
+            lon=116.0,
+            lat=39.0,
+            x=-1.0,
+            y=-2.0,
+            in_bearing=0.0,
+            out_bearing=90.0,
+            turn_deg=90.0,
+            score=90.0,
+        )
+        conn = _RecordingConnection()
+
+        mapping = insert_turn_events(
+            conn,
+            [event],
+            detect_id="detect-1",
+            spatial_context=_SPATIAL_CONTEXT,
+        )
+
+        self.assertEqual(mapping, {7: 1})
+        sql, params = conn.recording_cursor.executions[0]
+        self.assertAlmostEqual(params[6], _EXPECTED_X)
+        self.assertAlmostEqual(params[7], _EXPECTED_Y)
+        self.assertNotIn("origin_lon", sql)
+
+    def test_crossing_reprojects_geographic_truth_and_omits_origin(self) -> None:
+        crossing = CrossingPoint(
+            crossing_id=9,
+            cluster_ref="cluster-5",
+            vehicle_id="vehicle-1",
+            point_ref=PointRef("raw_points", "1", stable=True),
+            segment_index=3,
+            crossing_x=-1.0,
+            crossing_y=-2.0,
+            crossing_lon=116.0,
+            crossing_lat=39.0,
+            is_entry=True,
+            end_point_ref=PointRef("raw_points", "2", stable=True),
+        )
+        cluster = replace(_cluster(5), crossing_points=(crossing,))
+        conn = _RecordingConnection()
+
+        mapping = insert_candidate_entry_exit_points(
+            conn,
+            [cluster],
+            {5: 55},
+            detect_id="detect-1",
+            spatial_context=_SPATIAL_CONTEXT,
+        )
+
+        self.assertEqual(mapping, {(5, 9): 1})
+        sql, params = conn.recording_cursor.executions[0]
+        self.assertAlmostEqual(params[6], _EXPECTED_X)
+        self.assertAlmostEqual(params[7], _EXPECTED_Y)
+        self.assertNotIn("origin_lon", sql)
 
 
 if __name__ == "__main__":

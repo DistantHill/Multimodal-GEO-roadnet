@@ -25,6 +25,7 @@ from ..models import (
     ClipConfig,
     FittingConfig,
     NetworkConfig,
+    ProjectionConfig,
     RuntimeConfig,
 )
 
@@ -33,13 +34,16 @@ DEFAULT_PIPELINE_CONFIG_PATH = Path(__file__).resolve().parent / "pipeline.toml"
 
 # ZH: 顶层 TOML 节名白名单，防止 section 名打错字被静默忽略。
 # EN: Top-level section whitelist, so a typo'd section name is not silently ignored.
-_SECTIONS = ("cleaner", "detect", "clip", "fitting", "network", "runtime")
+_SECTIONS = (
+    "projection", "cleaner", "detect", "clip", "fitting", "network", "runtime",
+)
 
 
 @dataclass(frozen=True)
 class PipelineConfig:
     """Composite of all per-stage configs plus the cross-cutting runtime config."""
 
+    projection: ProjectionConfig
     cleaner: CleanerConfig
     detect: IntersectConfig
     clip: ClipConfig
@@ -85,6 +89,12 @@ def _build_section(base: Any, section: Any) -> Any:
     overrides: dict[str, Any] = {}
     for field in dataclasses.fields(base):
         if field.name in section:
+            if field.name == "processing_srid":
+                value = section[field.name]
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ConfigError(f"{cls}.processing_srid must be an integer")
+                overrides[field.name] = value
+                continue
             overrides[field.name] = _coerce(
                 section[field.name], getattr(base, field.name), f"{cls}.{field.name}"
             )
@@ -117,6 +127,7 @@ def load_pipeline_config(path: str | Path | None = None) -> PipelineConfig:
         raise ConfigError(f"unknown pipeline config sections: {', '.join(sorted(unknown_top))}")
 
     return PipelineConfig(
+        projection=_build_section(ProjectionConfig(), payload.get("projection", {})),
         cleaner=_build_section(CleanerConfig(), payload.get("cleaner", {})),
         detect=_build_section(IntersectConfig(), payload.get("detect", {})),
         clip=_build_section(ClipConfig(), payload.get("clip", {})),
