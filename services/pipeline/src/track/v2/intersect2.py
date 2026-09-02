@@ -1106,7 +1106,12 @@ def _detect_turn_events(
     track_count = 0
     log_info(f"── 转向事件检测 / Turn event detection ({total_tracks:,} 轨迹/tracks) ...")
 
-    for vehicle_id, track in _perf_iter(perf, tracks.items(), name="tracks_turn"):
+    for vehicle_id, active_track in _perf_iter(perf, tracks.items(), name="tracks_turn"):
+        # Cleaner-injected points are Method 2 inputs.  Letting them participate
+        # here would both create duplicate turn candidates and change the
+        # neighbouring bearing windows, so Method 1 operates on source points
+        # only.  Keep the caller-owned track intact for the later methods.
+        track = [point for point in active_track if point.point_ref.stable]
         if len(track) < 2 * w + 1:
             continue
 

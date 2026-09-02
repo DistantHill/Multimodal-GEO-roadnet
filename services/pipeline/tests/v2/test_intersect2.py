@@ -872,6 +872,54 @@ class TurnDetectionTest(unittest.TestCase):
         events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg)
         self.assertEqual(len(events), 0)
 
+    def test_injected_points_do_not_participate_in_turn_detection(self):
+        """Method 1 ignores Cleaner-derived points and preserves source windows."""
+        origin_lon, origin_lat = 116.391, 39.907
+        source_track = _build_track_through_intersection(
+            "v1", origin_lon, origin_lat, approach_bearing=0.0, exit_bearing=90.0
+        )
+        cfg = IntersectConfig(
+            turn_window=2,
+            min_turn_deg=45.0,
+            max_turn_deg=170.0,
+            min_leg_m=20.0,
+            min_movement_speed_mps=1.0,
+        )
+        expected = _detect_turn_events(
+            {"v1": source_track}, origin_lon, origin_lat, cfg
+        )
+
+        left = source_track[3]
+        right = source_track[4]
+        injected = TrajectoryPoint(
+            point_ref=PointRef(
+                source_id="test",
+                source_row_key="a3->e0:orthogonal_heading",
+                stable=False,
+                from_ref="a3",
+                to_ref="e0",
+                generated_reason="orthogonal_heading",
+            ),
+            vehicle_id="v1",
+            timestamp=(left.timestamp + right.timestamp) / 2.0,
+            lon=(left.lon + right.lon) / 2.0,
+            lat=(left.lat + right.lat) / 2.0,
+            heading=315.0,
+            speed=0.0,
+        )
+        active_track = [*source_track[:4], injected, *source_track[4:]]
+
+        actual = _detect_turn_events(
+            {"v1": active_track}, origin_lon, origin_lat, cfg
+        )
+
+        self.assertEqual(actual, expected)
+        self.assertTrue(actual, "source track should still produce a turn event")
+        self.assertNotIn(
+            injected.point_ref.source_row_key,
+            {event.from_source_row_key for event in actual},
+        )
+
     def test_min_turn_deg_filter(self):
         """I2-06: Turns below min_turn_deg are filtered out."""
         origin_lon, origin_lat = 116.391, 39.907
