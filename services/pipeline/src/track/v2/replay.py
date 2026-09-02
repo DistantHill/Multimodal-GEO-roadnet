@@ -464,20 +464,10 @@ class PostgresReplayStore:
             )
             parents.append(("kept_raw_point", raw_target))
         elif kind == "injected_point":
-            self._add_source_point(
-                parents,
-                target,
-                row.get("from_source_id"),
-                row.get("from_source_row_key"),
-                "from_raw_point",
-            )
-            self._add_source_point(
-                parents,
-                target,
-                row.get("to_source_id"),
-                row.get("to_source_row_key"),
-                "to_raw_point",
-            )
+            # Injected points are terminal Clean-stage artifacts.  Replay keeps
+            # their stored provenance fields as data, but does not expand them
+            # into the two raw source points.
+            pass
         elif kind == "tracks_cross":
             self._add_segment_source_points(
                 parents,
@@ -522,6 +512,16 @@ class PostgresReplayStore:
         if not source_id or not source_row_key:
             return
         clean_id, source_kind, _target_table = self._clean_context(owner)
+        if str(source_id) == "injected_points":
+            parents.append((
+                relation,
+                ReplayTarget(
+                    "injected_point",
+                    int(source_row_key),
+                    clean_id=clean_id,
+                ),
+            ))
+            return
         if source_kind == "postgres_table":
             raw_id = int(source_row_key)
         else:

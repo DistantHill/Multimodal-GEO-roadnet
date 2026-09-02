@@ -55,6 +55,7 @@ from track.v2.intersect2 import (
     _merge_clusters,
     _nearest_angle_id,
     _run_dbscan,
+    _stream_vehicle_tracks_from_db,
     _topology_point_windows,
     _query_active_points_in_window,
     _select_hotspot_events,
@@ -608,7 +609,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
         def __init__(self, rows):
             self.cursor_instance = ActivePointsWindowQueryTelemetryTest._Cursor(rows)
 
-        def cursor(self):
+        def cursor(self, **_kwargs):
             return self.cursor_instance
 
     def test_query_without_telemetry_returns_points_and_preserves_query_contract(self):
@@ -628,7 +629,10 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
         self.assertIn("AND clean_id = %s", conn.cursor_instance.query)
         self.assertEqual(
             conn.cursor_instance.params,
-            ["source-A", -1.0, -2.0, 3.0, 4.0, -1.0, -2.0, 3.0, 4.0, "clean-9"],
+            [
+                "source-A", -1.0, -2.0, 3.0, 4.0,
+                "injected_points", -1.0, -2.0, 3.0, 4.0, "clean-9",
+            ],
         )
         self.assertEqual(len(points), 1)
         point = points[0]
@@ -658,7 +662,10 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
         self.assertNotIn("is_active", conn.cursor_instance.query)
         self.assertEqual(
             conn.cursor_instance.params,
-            ["clean-9", -1.0, -2.0, 3.0, 4.0, -1.0, -2.0, 3.0, 4.0, "clean-9"],
+            [
+                "clean-9", -1.0, -2.0, 3.0, 4.0,
+                "injected_points", -1.0, -2.0, 3.0, 4.0, "clean-9",
+            ],
         )
         self.assertEqual(len(points), 1)
 
@@ -672,6 +679,39 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
                 kept_table="ktp",
                 clean_id=None,
             )
+
+    def test_stream_uses_injected_table_and_id_as_point_identity(self):
+        rows = [(
+            "vehicle-1", 123.5, 116.1, 39.2, 90.0, 0.0,
+            "injected_points", "282", {}, "21022680", "21022681",
+            "heading_orthogonal",
+        )]
+        conn = self._Connection(rows)
+
+        tracks = list(_stream_vehicle_tracks_from_db(
+            conn,
+            table="tp",
+            kept_table="ktp",
+            clean_id="clean-9",
+        ))
+
+        self.assertEqual(
+            conn.cursor_instance.params,
+            ["clean-9", "injected_points", "clean-9"],
+        )
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(len(tracks[0]), 1)
+        self.assertEqual(
+            tracks[0][0].point_ref,
+            PointRef(
+                "injected_points",
+                "282",
+                stable=False,
+                from_ref="21022680",
+                to_ref="21022681",
+                generated_reason="heading_orthogonal",
+            ),
+        )
 
     def test_query_with_telemetry_records_disjoint_query_and_materialization_phases(self):
         conn = self._Connection(self._ROWS)
@@ -874,54 +914,6 @@ class TurnDetectionTest(unittest.TestCase):
         cfg = IntersectConfig()
         events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg)
         self.assertEqual(len(events), 0)
-
-    def test_injected_points_do_not_participate_in_turn_detection(self):
-        """Method 1 ignores Cleaner-derived points and preserves source windows."""
-        origin_lon, origin_lat = 116.391, 39.907
-        source_track = _build_track_through_intersection(
-            "v1", origin_lon, origin_lat, approach_bearing=0.0, exit_bearing=90.0
-        )
-        cfg = IntersectConfig(
-            turn_window=2,
-            min_turn_deg=45.0,
-            max_turn_deg=170.0,
-            min_leg_m=20.0,
-            min_movement_speed_mps=1.0,
-        )
-        expected = _detect_turn_events(
-            {"v1": source_track}, origin_lon, origin_lat, cfg
-        )
-
-        left = source_track[3]
-        right = source_track[4]
-        injected = TrajectoryPoint(
-            point_ref=PointRef(
-                source_id="test",
-                source_row_key="a3->e0:orthogonal_heading",
-                stable=False,
-                from_ref="a3",
-                to_ref="e0",
-                generated_reason="orthogonal_heading",
-            ),
-            vehicle_id="v1",
-            timestamp=(left.timestamp + right.timestamp) / 2.0,
-            lon=(left.lon + right.lon) / 2.0,
-            lat=(left.lat + right.lat) / 2.0,
-            heading=315.0,
-            speed=0.0,
-        )
-        active_track = [*source_track[:4], injected, *source_track[4:]]
-
-        actual = _detect_turn_events(
-            {"v1": active_track}, origin_lon, origin_lat, cfg
-        )
-
-        self.assertEqual(actual, expected)
-        self.assertTrue(actual, "source track should still produce a turn event")
-        self.assertNotIn(
-            injected.point_ref.source_row_key,
-            {event.from_source_row_key for event in actual},
-        )
 
     def test_min_turn_deg_filter(self):
         """I2-06: Turns below min_turn_deg are filtered out."""

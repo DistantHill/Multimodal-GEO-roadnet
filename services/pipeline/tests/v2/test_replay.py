@@ -218,6 +218,35 @@ class ReplayServiceTest(unittest.TestCase):
         ]
         self.assertEqual(len(detect_queries), 1)
 
+    def test_turn_event_replays_injected_point_table_identity(self) -> None:
+        store = PostgresReplayStore(_LookupConnection())
+        target = ReplayTarget("turn_event", 10, detect_id="detect-1")
+
+        parents = store.parent_refs(target, {
+            "from_source_id": "injected_points",
+            "from_source_row_key": "282",
+            "to_source_id": None,
+            "to_source_row_key": None,
+        })
+
+        self.assertEqual(parents, [(
+            "input_from_0",
+            ReplayTarget("injected_point", 282, clean_id="clean-1"),
+        )])
+
+    def test_injected_point_is_terminal_clean_artifact(self) -> None:
+        store = PostgresReplayStore(_LookupConnection())
+        target = ReplayTarget("injected_point", 282, clean_id="clean-1")
+
+        parents = store.parent_refs(target, {
+            "from_source_id": "public.day01",
+            "from_source_row_key": "21022680",
+            "to_source_id": "public.day01",
+            "to_source_row_key": "21022681",
+        })
+
+        self.assertEqual(parents, [])
+
     def test_cli_target_uses_the_stage_id_required_by_kind(self) -> None:
         parser = MagicMock()
         clean = _target_from_args(

@@ -41,11 +41,13 @@ _TP_UNIFIED_COLS = (
 
 _IP_UNIFIED_COLS = (
     "vehicle_id, timestamp, lon, lat, heading, speed, "
-    "from_source_id AS source_id, "
-    "from_source_row_key AS source_row_key, "
+    "%s::text AS source_id, "
+    "id::text AS source_row_key, "
     "'{}'::jsonb AS extra, "
     "from_source_row_key, to_source_row_key, generated_reason"
 )
+
+_INJECTED_SOURCE_ID = "injected_points"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -127,13 +129,15 @@ def build_active_in_window_sql(
         Raw mode (``kept_table`` is None):
             1.  %s::text                         — source_id literal
             2-5. ST_MakeEnvelope (traj. bbox)    — x_min, y_min, x_max, y_max
-            6-9. ST_MakeEnvelope (inj. bbox)     — x_min, y_min, x_max, y_max
-            10.  clean_id (optional, only when ``has_clean_id=True``)
+            6.  %s::text                         — injected_points table name
+            7-10. ST_MakeEnvelope (inj. bbox)    — x_min, y_min, x_max, y_max
+            11. clean_id (optional, only when ``has_clean_id=True``)
         Kept mode (``kept_table`` set):
             1.  %s                              — ktp.clean_id
             2-5. ST_MakeEnvelope (kept traj.)   — x_min, y_min, x_max, y_max
-            6-9. ST_MakeEnvelope (inj. bbox)    — x_min, y_min, x_max, y_max
-            10.  %s                              — injected_points.clean_id
+            6.  %s::text                        — injected_points table name
+            7-10. ST_MakeEnvelope (inj. bbox)   — x_min, y_min, x_max, y_max
+            11. %s                              — injected_points.clean_id
     """
     injected_clean_clause = " AND clean_id = %s" if (has_clean_id or kept_table is not None) else ""
     if kept_table is not None:
@@ -199,10 +203,12 @@ def build_stream_all_sql(
     Parameter placeholders (in order, caller must bind):
         Raw mode (``kept_table`` is None):
             1.  %s::text          — source_id literal
-            2.  clean_id (optional) — only when ``has_clean_id=True``
+            2.  %s::text          — injected_points table name
+            3.  clean_id (optional) — only when ``has_clean_id=True``
         Kept mode (``kept_table`` set):
             1.  %s               — ktp.clean_id
-            2.  %s               — injected_points.clean_id
+            2.  %s::text         — injected_points table name
+            3.  %s               — injected_points.clean_id
     """
     injected_clean_clause = " WHERE clean_id = %s" if (has_clean_id or kept_table is not None) else ""
     if kept_table is not None:
@@ -368,11 +374,13 @@ def _query_active_points_in_window(
     if kept_table is not None:
         params: list[Any] = [clean_id]
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
+        params.append(_INJECTED_SOURCE_ID)
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
         params.append(clean_id)
     else:
         params = [source_id or ""]
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
+        params.append(_INJECTED_SOURCE_ID)
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
         if has_clean_id:
             params.append(clean_id)
@@ -420,9 +428,9 @@ def _stream_vehicle_tracks_from_db(
     if kept_table is not None and clean_id is None:
         raise ValueError("kept_table requires clean_id")
     if kept_table is not None:
-        params: list[Any] = [clean_id, clean_id]
+        params: list[Any] = [clean_id, _INJECTED_SOURCE_ID, clean_id]
     else:
-        params = [source_id or ""]
+        params = [source_id or "", _INJECTED_SOURCE_ID]
         if has_clean_id:
             params.append(clean_id)
     # ZH: 服务器端命名游标 — PG 按需 FETCH，避免全量物化到 portal。
