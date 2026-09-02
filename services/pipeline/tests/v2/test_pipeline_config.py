@@ -103,6 +103,19 @@ class PipelineConfigErrorTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load_pipeline_config(path)
 
+    def test_removed_method_2_keys_report_migration(self):
+        path = self._write(
+            "[detect]\n"
+            "use_orthogonal_candidates = true\n"
+            "dbscan_eps_m_ortho = 100.0\n"
+        )
+        with self.assertRaisesRegex(
+            ConfigError,
+            "rename use_orthogonal_candidates to use_cross_track_candidates",
+        ) as raised:
+            load_pipeline_config(path)
+        self.assertIn("remove dbscan_eps_m_ortho", str(raised.exception))
+
     def test_wrong_type_raises(self):
         path = self._write("[runtime]\ndb_insert_batch = \"not-an-int\"\n")
         with self.assertRaises(ConfigError):

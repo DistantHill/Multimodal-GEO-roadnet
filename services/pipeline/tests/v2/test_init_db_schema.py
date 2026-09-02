@@ -763,6 +763,10 @@ class CandidateIntersectionIdentitySchemaTest(unittest.TestCase):
         for table, column in legacy_columns.items():
             with self.subTest(table=table, column=column):
                 self.assertNotIn(column, parse_ddl_columns(ddl_by_table[table]))
+        self.assertNotIn(
+            "orthogonal_count",
+            parse_ddl_columns(ddl_by_table["candidate_intersections"]),
+        )
         self.assertNotIn("to_cluster_id", parse_ddl_columns(ddl_by_table["centerlines"]))
         self.assertNotIn(
             "end_cluster_id",
@@ -857,6 +861,7 @@ class CandidateIntersectionIdentitySchemaTest(unittest.TestCase):
             "ALTER TABLE intersections DROP COLUMN IF EXISTS cluster_id",
             "ALTER TABLE candidate_entry_exit_points DROP COLUMN IF EXISTS cluster_id",
             "ALTER TABLE candidate_intersections DROP COLUMN IF EXISTS cluster_id",
+            "ALTER TABLE candidate_intersections DROP COLUMN IF EXISTS orthogonal_count",
         ]
         removals = [
             statement for statement in sql

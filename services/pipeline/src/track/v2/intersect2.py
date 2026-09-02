@@ -1,10 +1,10 @@
-"""Intersect2 — Dual-mode intersection candidate detection and topology extraction.
+"""Intersect2 — Intersection candidate detection and topology extraction.
 
 detect_intersections(source, *, config=None, spatial_context=...) → IntersectResult
 
 Two complementary methods feed into the same topology verification:
-  Method 1 (turn events):   Bearing-change detection → Getis-Ord G* → DBSCAN
-  Method 2 (orthogonal):    Orthogonal injection points from Cleaner 1 → DBSCAN
+  Method 1 (turn events): Bearing-change detection → Getis-Ord G* → DBSCAN
+  Method 3 (cross-track): Cross-track intersections → DBSCAN
 
 Both produce HotspotCluster candidates that are merged, deduplicated, and
 verified via entry/exit circle-crossing analysis + branch-angle clustering.
@@ -50,7 +50,6 @@ from .models import (
     InOutIntersectionPoint,
     IntersectReport,
     IntersectionTopology,
-    OrthogonalCandidate,
     PointRef,
     SpatialContext,
     TrackModel,
@@ -93,14 +92,14 @@ def _perf_iter(perf, iterable, *, name, total=None, track=True):
 
 @dataclass(frozen=True)
 class IntersectConfig(TrackModel):
-    """Intersect2 configuration — dual-mode intersection detection.
+    """Intersect2 configuration for turn and cross-track detection.
 
     PRD v2 Intersect2 §7
     """
 
     # ── Mode toggles ───────────────────────────────────────────────
     use_turn_events: bool = True
-    use_orthogonal_candidates: bool = True
+    use_cross_track_candidates: bool = True
 
     # ── Turn event detection (Method 1) ────────────────────────────
     turn_window: int = 2
@@ -116,8 +115,6 @@ class IntersectConfig(TrackModel):
     # ── DBSCAN (per method) ────────────────────────────────────────
     dbscan_eps_m_turn: float = 140.0
     dbscan_min_samples_turn: int = 4
-    dbscan_eps_m_ortho: float = 100.0
-    dbscan_min_samples_ortho: int = 3
 
     # ── Cross-track orthogonal detection (Method 3) ──────────────────
     cross_track_straightness_deg: float = 15.0
@@ -168,8 +165,7 @@ class IntersectResult(TrackModel):
 
     turn_events: list[TurnEvent]
     hotspot_events: list[TurnEvent]
-    orthogonal_candidates: list[OrthogonalCandidate]
-    clusters: list[HotspotCluster]  # merged from both methods
+    clusters: list[HotspotCluster]
     topologies: list[IntersectionTopology]
     report: IntersectReport
     spatial_context: SpatialContext
@@ -277,7 +273,7 @@ def _extend_ref_lists(
 
 def _build_candidate_clusters(
     hotspot_events: list[TurnEvent],
-    orthogonal_candidates: list[OrthogonalCandidate],
+    cross_track_candidates: list[CrossTrackCandidate],
     cfg: IntersectConfig,
     transformer: CoordinateTransformer,
     *,
@@ -297,13 +293,13 @@ def _build_candidate_clusters(
                 perf=perf,
             )
         )
-    if "orthogonal" not in disabled and orthogonal_candidates:
+    if "orthogonal_cross_track" not in disabled and cross_track_candidates:
         clusters.extend(
-            _cluster_orthogonal_candidates(
-                orthogonal_candidates,
+            _cluster_orthogonal_cross_track_candidates(
+                cross_track_candidates,
                 transformer,
-                eps_m=cfg.dbscan_eps_m_ortho,
-                min_samples=cfg.dbscan_min_samples_ortho,
+                eps_m=cfg.cross_track_dbscan_eps_m,
+                min_samples=cfg.cross_track_dbscan_min_samples,
                 perf=perf,
             )
         )
@@ -330,7 +326,7 @@ def _is_cluster_rediscovered(
 def _annotate_source_ablation(
     clusters: list[HotspotCluster],
     hotspot_events: list[TurnEvent],
-    orthogonal_candidates: list[OrthogonalCandidate],
+    cross_track_candidates: list[CrossTrackCandidate],
     cfg: IntersectConfig,
     transformer: CoordinateTransformer,
     *,
@@ -352,7 +348,7 @@ def _annotate_source_ablation(
             t1 = time.perf_counter()
         reclustered_without[source] = _build_candidate_clusters(
             hotspot_events,
-            orthogonal_candidates,
+            cross_track_candidates,
             cfg,
             transformer,
             disabled_sources={source},
@@ -498,12 +494,12 @@ def _route_progress(
 def _empty_intersect_result(spatial_context: SpatialContext) -> IntersectResult:
     """Common empty result for both modes when no data is available."""
     return IntersectResult(
-        turn_events=[], hotspot_events=[], orthogonal_candidates=[],
+        turn_events=[], hotspot_events=[],
         clusters=[], topologies=[],
         report=IntersectReport(
             track_count=0, turn_event_count=0, hotspot_event_count=0,
-            orthogonal_candidate_count=0, cross_track_candidate_count=0,
-            cluster_count=0, cluster_count_turn=0, cluster_count_ortho=0,
+            cross_track_candidate_count=0,
+            cluster_count=0, cluster_count_turn=0,
             cluster_count_cross_track=0, complete_intersection_count=0,
         ),
         spatial_context=spatial_context,
@@ -516,24 +512,20 @@ def _build_intersect_report(
     topologies: list[IntersectionTopology],
     turn_events: list[TurnEvent],
     hotspot_events: list[TurnEvent],
-    ortho_candidates: list[OrthogonalCandidate],
     cross_candidates: list[CrossTrackCandidate],
     track_count: int,
 ) -> IntersectReport:
     """Shared report construction for both modes."""
     turn_clusters = sum(1 for c in annotated_clusters if "turn" in _cluster_sources(c))
-    ortho_clusters = sum(1 for c in annotated_clusters if "orthogonal" in _cluster_sources(c))
     cross_clusters = sum(1 for c in annotated_clusters if "orthogonal_cross_track" in _cluster_sources(c))
     source_report = _complete_source_report(annotated_clusters, topologies)
     return IntersectReport(
         track_count=track_count,
         turn_event_count=len(turn_events),
         hotspot_event_count=len(hotspot_events),
-        orthogonal_candidate_count=len(ortho_candidates),
         cross_track_candidate_count=len(cross_candidates),
         cluster_count=len(annotated_clusters),
         cluster_count_turn=turn_clusters,
-        cluster_count_ortho=ortho_clusters,
         cluster_count_cross_track=cross_clusters,
         complete_intersection_count=sum(1 for t in topologies if t.is_complete),
         complete_intersection_source_counts=source_report["source_counts"],
@@ -545,7 +537,6 @@ def _build_intersect_report(
 
 def _cluster_pipeline(
     turn_events: list[TurnEvent],
-    ortho_candidates: list[OrthogonalCandidate],
     cross_candidates: list[CrossTrackCandidate],
     transformer: CoordinateTransformer,
     cfg: IntersectConfig,
@@ -553,7 +544,7 @@ def _cluster_pipeline(
     live_status: Any = None,
     perf: PerfTracker | None = None,
 ) -> tuple[list[TurnEvent], list[HotspotCluster]]:
-    """Shared G* + DBSCAN ×3 + merge + reindex + ablation for both modes."""
+    """Shared G* + DBSCAN, merge, reindex, and ablation for both modes."""
     all_clusters: list[HotspotCluster] = []
     hotspot_events: list[TurnEvent] = []
 
@@ -570,18 +561,11 @@ def _cluster_pipeline(
                 perf=perf,
             ))
 
-    # ── Method 2: Orthogonal → DBSCAN ──────────────────────────────
-    if cfg.use_orthogonal_candidates and ortho_candidates:
-        all_clusters.extend(_cluster_orthogonal_candidates(
-            ortho_candidates, transformer,
-            eps_m=cfg.dbscan_eps_m_ortho,
-            min_samples=cfg.dbscan_min_samples_ortho,
-            live_status=live_status,
-            perf=perf,
-        ))
+    # Cleaner-injected points participate in Method 1 through the ordered
+    # trajectory only; they are never promoted directly into DBSCAN here.
 
     # ── Method 3: Cross-track → DBSCAN ─────────────────────────────
-    if cfg.use_orthogonal_candidates and cross_candidates:
+    if cfg.use_cross_track_candidates and cross_candidates:
         all_clusters.extend(_cluster_orthogonal_cross_track_candidates(
             cross_candidates, transformer,
             eps_m=cfg.cross_track_dbscan_eps_m,
@@ -599,7 +583,7 @@ def _cluster_pipeline(
         for index, cluster in enumerate(merged)
     ]
     annotated = _annotate_source_ablation(
-        merged, hotspot_events, ortho_candidates,
+        merged, hotspot_events, cross_candidates,
         cfg, transformer,
         live_status=live_status,
         perf=perf,
@@ -607,28 +591,24 @@ def _cluster_pipeline(
     return hotspot_events, annotated
 
 
-def _extract_methods_123(
+def _extract_methods_1_3(
     tracks: dict[str, list[TrajectoryPoint]],
     cfg: IntersectConfig,
     transformer: CoordinateTransformer,
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
-) -> tuple[list[TurnEvent], list[OrthogonalCandidate], list[CrossTrackCandidate]]:
-    """Run all three candidate extraction methods on a tracks dict (handle mode)."""
+) -> tuple[list[TurnEvent], list[CrossTrackCandidate]]:
+    """Run turn and cross-track extraction on a tracks dict (handle mode)."""
     turn_events = _detect_turn_events(
         tracks, cfg, live_status=live_status, perf=perf
     ) if cfg.use_turn_events else []
-    ortho_candidates: list[OrthogonalCandidate] = []
     cross_candidates: list[CrossTrackCandidate] = []
-    if cfg.use_orthogonal_candidates:
-        ortho_candidates = _extract_orthogonal_candidates(
-            tracks, live_status=live_status, perf=perf
-        )
+    if cfg.use_cross_track_candidates:
         cross_candidates, _, _ = extract_cross_track_candidates(
             tracks, transformer, cfg, live_status=live_status, perf=perf
         )
-    return turn_events, ortho_candidates, cross_candidates
+    return turn_events, cross_candidates
 
 
 # ── Public entry point ─────────────────────────────────────────────────
@@ -641,7 +621,7 @@ def detect_intersections(
     conn: Any = None,
     spatial_context: SpatialContext | None = None,
 ) -> IntersectResult:
-    """Run dual-mode intersection detection and topology extraction.
+    """Run intersection detection and topology extraction.
 
     PRD v2 Intersect2 §2
 
@@ -701,15 +681,15 @@ def _detect_intersections_handle(
             live = None
     tracker = PerfTracker("intersect2_handle")
     try:
-        with tracker.stage("extract_methods_123"):
-            turn_events, ortho_candidates, cross_candidates = _extract_methods_123(
+        with tracker.stage("extract_methods_1_3"):
+            turn_events, cross_candidates = _extract_methods_1_3(
                 tracks, cfg, transformer,
                 live_status=live, perf=tracker,
             )
 
         with tracker.stage("cluster_pipeline"):
             hotspot_events, annotated_clusters = _cluster_pipeline(
-                turn_events, ortho_candidates, cross_candidates,
+                turn_events, cross_candidates,
                 transformer, cfg,
                 live_status=live, perf=tracker,
             )
@@ -724,14 +704,13 @@ def _detect_intersections_handle(
         return IntersectResult(
             turn_events=turn_events,
             hotspot_events=hotspot_events,
-            orthogonal_candidates=ortho_candidates,
             clusters=annotated_clusters,
             topologies=topologies,
             observations=observations,
             cross_track_candidates=cross_candidates,
             report=_build_intersect_report(
                 annotated_clusters, topologies,
-                turn_events, hotspot_events, ortho_candidates, cross_candidates,
+                turn_events, hotspot_events, cross_candidates,
                 track_count=len(tracks),
             ),
             spatial_context=spatial_context,
@@ -746,7 +725,7 @@ def _detect_intersections_handle(
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def _stream_extract_methods_1_2(
+def _stream_extract_method_1(
     conn: Any, cfg: IntersectConfig,
     spatial_context: SpatialContext,
     transformer: CoordinateTransformer,
@@ -755,21 +734,19 @@ def _stream_extract_methods_1_2(
     perf: PerfTracker | None = None,
 ) -> tuple[
     list[TurnEvent],
-    list[OrthogonalCandidate],
     dict[str, list[TrajectoryPoint]],
 ]:
-    """Load each DB track once and batch Method 1/2 calculations.
+    """Load each DB track once and batch Method 1 calculations.
 
     ZH: 外层 ``for track in _stream_vehicle_tracks_from_db(...)`` 是生成器流，
-        逐迭代计时噪声大，整体由调用方 ``tracker.stage("stream_m1_m2")`` 计时。
+        逐迭代计时噪声大，整体由调用方 ``tracker.stage("stream_m1")`` 计时。
         返回的 ``tracks`` workspace 会由 Method 3 和拓扑验证复用，避免各阶段
         重新扫描数据库。
     EN: The outer per-track generator stream is timed as a whole by the caller's
-        ``tracker.stage("stream_m1_m2")`` — per-iteration timing would be noisy.
+        ``tracker.stage("stream_m1")`` — per-iteration timing would be noisy.
         The returned workspace is reused by Method 3 and topology verification.
     """
     turn_events: list[TurnEvent] = []
-    ortho_candidates: list[OrthogonalCandidate] = []
     t_total = time.perf_counter()
     last_progress_t = t_total
     track_count = 0
@@ -801,10 +778,6 @@ def _stream_extract_methods_1_2(
                     turn_events.append(replace(
                         te, event_calculate_index=len(turn_events),
                     ))
-            if cfg.use_orthogonal_candidates:
-                ortho_candidates.extend(
-                    _extract_orthogonal_candidates(batch, perf=perf)
-                )
             batch.clear()
 
             now = time.perf_counter()
@@ -812,9 +785,9 @@ def _stream_extract_methods_1_2(
                 if live_status is not None:
                     live_status.update(
                         detail=f"流式/Streaming:\t{track_count:,}\t轨迹/tracks,\t"
-                               f"{len(turn_events):,}\t转向/turn,\t{len(ortho_candidates):,}\t正交/ortho",
+                               f"{len(turn_events):,}\t转向/turn",
                         elapsed=now - t_total,
-                        stage="Intersect2: 流式 / Stream M1+M2",
+                        stage="Intersect2: 流式 / Stream M1",
                     )
                 last_progress_t = now
 
@@ -825,16 +798,10 @@ def _stream_extract_methods_1_2(
                 turn_events.append(replace(
                     te, event_calculate_index=len(turn_events),
                 ))
-        if cfg.use_orthogonal_candidates:
-            ortho_candidates.extend(
-                _extract_orthogonal_candidates(batch, perf=perf)
-            )
-
     log_info(f"── 流式处理: {track_count:,} 轨迹/tracks → "
-             f"{len(turn_events):,} 转向事件/turn events, "
-             f"{len(ortho_candidates):,} 正交候选/ortho candidates "
+             f"{len(turn_events):,} 转向事件/turn events "
              f"({time.perf_counter() - t_total:.1f}s)")
-    return turn_events, ortho_candidates, tracks
+    return turn_events, tracks
 
 
 def _db_global_grid_cell_cap(cfg: IntersectConfig) -> int:
@@ -883,7 +850,7 @@ def _extract_cross_track_memory_windows(
     windows are then processed, so this fallback performs no per-window SQL and
     retains the historical clipping/deduplication behaviour.
     """
-    if not cfg.use_orthogonal_candidates:
+    if not cfg.use_cross_track_candidates:
         return []
     iterator = SpatialWindowIterator(
         extent,
@@ -980,7 +947,7 @@ def _extract_cross_track_db_workspace(
     perf: PerfTracker | None = None,
 ) -> list[CrossTrackCandidate]:
     """Prefer one global broad phase, with a no-SQL memory-window fallback."""
-    if not cfg.use_orthogonal_candidates:
+    if not cfg.use_cross_track_candidates:
         return []
     global_cfg = replace(
         cfg,
@@ -1049,7 +1016,7 @@ def _extract_cross_track_windows(
     """
     candidates: list[CrossTrackCandidate] = []
     seen_segment_pairs: set[tuple[str, str, str, str, str]] = set()
-    if not cfg.use_orthogonal_candidates:
+    if not cfg.use_cross_track_candidates:
         return candidates
     if candidate_extractor is not None and legacy_origin is None:
         raise V2Error(
@@ -1381,7 +1348,7 @@ def _detect_intersections_db(
     """DB-mode intersection detection.
 
     ZH: DB 模式交叉口检测。
-        - Method 1+2: 一次加载全局逐车处理（单车操作，无需空间窗）
+        - Method 1: 一次加载全局逐车处理（单车操作，无需空间窗）
         - Method 3: 复用同一 tracks workspace 的全局空间索引
         - 共享 _cluster_pipeline + _build_intersect_report
     """
@@ -1403,19 +1370,19 @@ def _detect_intersections_db(
 
     tracker = PerfTracker("intersect2_db")
 
-    # ── Methods 1 & 2: stream per-vehicle (DB-specific) ─────────────
+    # ── Method 1: stream per-vehicle (DB-specific) ──────────────────
     if live is not None:
-        live.update(stage="Intersect2: 流式 / Stream M1+M2",
-                    detail="Method 1+2: Turn events + ortho candidates...")
+        live.update(stage="Intersect2: 流式 / Stream M1",
+                    detail="Method 1: turn events...")
     t_stage = time.perf_counter()
-    with tracker.stage("stream_m1_m2"):
-        turn_events, ortho_candidates, tracks = _stream_extract_methods_1_2(
+    with tracker.stage("stream_m1"):
+        turn_events, tracks = _stream_extract_method_1(
             conn, cfg, spatial_context, transformer,
             live_status=live, perf=tracker,
         )
     if live is not None:
         live.update(
-            detail=f"Turn events: {len(turn_events):,}, Ortho: {len(ortho_candidates):,}",
+            detail=f"Turn events: {len(turn_events):,}",
             elapsed=time.perf_counter() - t_stage,
         )
 
@@ -1438,7 +1405,7 @@ def _detect_intersections_db(
     t_stage = time.perf_counter()
     with tracker.stage("cluster_pipeline"):
         hotspot_events, annotated_clusters = _cluster_pipeline(
-            turn_events, ortho_candidates, cross_candidates,
+            turn_events, cross_candidates,
             transformer, cfg,
             live_status=live, perf=tracker,
         )
@@ -1468,14 +1435,13 @@ def _detect_intersections_db(
     return IntersectResult(
         turn_events=turn_events,
         hotspot_events=hotspot_events,
-        orthogonal_candidates=ortho_candidates,
         clusters=annotated_clusters,
         topologies=topologies,
         observations=observations,
         cross_track_candidates=cross_candidates,
         report=_build_intersect_report(
             annotated_clusters, topologies,
-            turn_events, hotspot_events, ortho_candidates, cross_candidates,
+            turn_events, hotspot_events, cross_candidates,
             track_count=len(tracks),
         ),
         spatial_context=spatial_context,
@@ -1818,63 +1784,11 @@ def _select_hotspot_events(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Method 2: Orthogonal intersection candidate extraction
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def _extract_orthogonal_candidates(
-    tracks: dict[str, list[TrajectoryPoint]],
-    *,
-    live_status: Any = None,
-    perf: PerfTracker | None = None,
-) -> list[OrthogonalCandidate]:
-    """Extract Cleaner 1 orthogonal injection points as candidates.
-
-    These are synthetic TrajectoryPoints with
-    ``point_ref.generated_reason == "orthogonal_heading"``. They mark
-    locations where two consecutive GPS headings are ~90° apart,
-    suggesting a road intersection.
-    """
-    candidates: list[OrthogonalCandidate] = []
-    total_tracks = len(tracks)
-    t0 = time.perf_counter()
-    last_t = t0
-    track_count = 0
-
-    for track in _perf_iter(perf, tracks.values(), name="tracks_ortho", total=total_tracks):
-        for tp in track:
-            if tp.point_ref.generated_reason == "orthogonal_heading":
-                x, y = _point_xy(tp)
-                candidates.append(
-                    OrthogonalCandidate(
-                        point_ref=tp.point_ref,
-                        vehicle_id=tp.vehicle_id,
-                        timestamp=tp.timestamp,
-                        lon=tp.lon,
-                        lat=tp.lat,
-                        x=x,
-                        y=y,
-                    )
-                )
-
-        track_count += 1
-        now = time.perf_counter()
-        if track_count % 10000 == 0 or (now - last_t) >= 3.0:
-            _route_progress(
-                live_status,
-                detail=f"正交候选/Ortho:\t{track_count:,}/{total_tracks:,}\t轨迹/tracks,\t{len(candidates):,}\t候选",
-                progress=track_count / total_tracks,
-                elapsed=now - t0,
-                stage="Intersect2: 正交候选 / Ortho Candidates",
-            )
-            last_t = now
-
-    log_info(f"── 正交候选 / Ortho candidates: {len(candidates):,} 候选 ({time.perf_counter() - t0:.1f}s)")
-    return candidates
-
-
 # ═══════════════════════════════════════════════════════════════════════
-# DBSCAN clustering (shared by both methods with different parameters)
+# DBSCAN clustering (shared by turn and cross-track methods)
 # ═══════════════════════════════════════════════════════════════════════
 
 _UNVISITED = -99
@@ -2297,77 +2211,6 @@ def _cluster_dbscan(
     return clusters
 
 
-def _cluster_orthogonal_candidates(
-    candidates: list[OrthogonalCandidate],
-    transformer: CoordinateTransformer,
-    *,
-    eps_m: float,
-    min_samples: int,
-    live_status: Any = None,
-    perf: PerfTracker | None = None,
-) -> list[HotspotCluster]:
-    """DBSCAN-cluster OrthogonalCandidates, wrapping them as TurnEvents."""
-    n = len(candidates)
-    if n == 0:
-        return []
-
-    xs = [c.x for c in candidates]
-    ys = [c.y for c in candidates]
-    log_info(f"    DBSCAN 聚类 (orthogonal) / DBSCAN clustering ({n:,} 点/points) ...")
-    labels = _run_dbscan(xs, ys, eps_m=eps_m, min_samples=min_samples,
-                          live_status=live_status, stage="orthogonal", perf=perf)
-
-    clusters: list[HotspotCluster] = []
-    for cid, cluster_items in _group_cluster_items(candidates, labels):
-        if not cluster_items:
-            continue
-        cx = sum(c.x for c in cluster_items) / len(cluster_items)
-        cy = sum(c.y for c in cluster_items) / len(cluster_items)
-        radius = max(_distance_m((cx, cy), (c.x, c.y)) for c in cluster_items)
-        lon, lat = transformer.inverse(cx, cy)
-        cluster_events = tuple(
-            TurnEvent(
-                event_calculate_index=i,
-                vehicle_id=c.vehicle_id,
-                timestamp=c.timestamp,
-                lon=c.lon,
-                lat=c.lat,
-                x=c.x,
-                y=c.y,
-                in_bearing=0.0,
-                out_bearing=0.0,
-                turn_deg=0.0,
-                score=0.0,
-                source="orthogonal",
-                point_ref=c.point_ref,
-                source_ids=(c.point_ref.source_id,),
-                from_source_id=c.point_ref.source_id,
-                from_source_row_key=c.point_ref.from_ref,
-                to_source_id=c.point_ref.source_id,
-                to_source_row_key=c.point_ref.to_ref,
-            )
-            for i, c in enumerate(cluster_items)
-        )
-        cluster = HotspotCluster(
-            cluster_calculate_index=cid,
-            centroid_x=cx,
-            centroid_y=cy,
-            centroid_lon=lon,
-            centroid_lat=lat,
-            radius_m=radius,
-            cluster_ref=f"cluster_orthogonal_{cid}",
-            events=cluster_events,
-            source="orthogonal",
-        )
-        clusters.append(
-            _with_source_provenance(
-                cluster,
-                source_counts={"orthogonal": len(cluster_items)},
-            )
-        )
-    return clusters
-
-
 def _cluster_orthogonal_cross_track_candidates(
     candidates: list[CrossTrackCandidate],
     transformer: CoordinateTransformer,
@@ -2380,7 +2223,7 @@ def _cluster_orthogonal_cross_track_candidates(
     """DBSCAN-cluster orthogonal_cross_track candidates, wrapping as TurnEvents.
 
     ZH: 将多车正交候选点包装为 ``TurnEvent(source="orthogonal_cross_track")``
-        后 DBSCAN 聚类。结构与 ``_cluster_orthogonal_candidates`` 一致。
+        后 DBSCAN 聚类。
     """
     n = len(candidates)
     if n == 0:
@@ -2444,7 +2287,7 @@ def _cluster_orthogonal_cross_track_candidates(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Cluster merge (deduplicate overlapping clusters from both methods)
+# Cluster merge (deduplicate overlapping turn and cross-track clusters)
 # ═══════════════════════════════════════════════════════════════════════
 
 

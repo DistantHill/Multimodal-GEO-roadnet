@@ -16,9 +16,10 @@ _CHILD = r'''
 import hashlib, inspect, json, os, sys
 from dataclasses import asdict, fields
 from pathlib import Path
-from track.v2.intersect2 import (_cluster_dbscan, _cluster_orthogonal_candidates,
-    _cluster_orthogonal_cross_track_candidates)
-from track.v2.models import CrossTrackCandidate, OrthogonalCandidate, PointRef, TurnEvent
+from track.v2.intersect2 import (
+    _cluster_dbscan, _cluster_orthogonal_cross_track_candidates,
+)
+from track.v2.models import CrossTrackCandidate, PointRef, TurnEvent
 
 origin_lon, origin_lat = 116.0, 39.0
 fixed_crs = "transformer" in inspect.signature(_cluster_dbscan).parameters
@@ -40,7 +41,7 @@ def coordinates(index):
     lon, lat = transformer.inverse(x, y)
     return lon, lat, x, y
 
-turns, orthogonal, cross = [], [], []
+turns, cross = [], []
 calculate_index_field = fields(TurnEvent)[0].name
 cross_fields = {field.name for field in fields(CrossTrackCandidate)}
 for i in range(4):
@@ -56,12 +57,6 @@ for i in range(4):
     )
     turn_kwargs[calculate_index_field] = i
     turns.append(TurnEvent(**turn_kwargs))
-    orthogonal.append(OrthogonalCandidate(
-        point_ref=PointRef("ortho_source", str(i), stable=False,
-            generated_reason="orthogonal_heading", from_ref=f"{i}a", to_ref=f"{i}b"),
-        vehicle_id=f"ortho-{i}", timestamp=2000.0+i,
-        lon=lon, lat=lat, x=x, y=y,
-    ))
     cross_kwargs = dict(
         point_ref=PointRef("a_source", str(i), stable=True),
         vehicle_id=f"a|b-{i}", timestamp=3000.0+i,
@@ -88,7 +83,6 @@ def cluster_record(cluster):
 
 value = {
  "turn": [cluster_record(item) for item in cluster(_cluster_dbscan, turns, eps_m=100.0, min_samples=3)],
- "orthogonal": [cluster_record(item) for item in cluster(_cluster_orthogonal_candidates, orthogonal, eps_m=100.0, min_samples=3)],
  "cross_track": [cluster_record(item) for item in cluster(_cluster_orthogonal_cross_track_candidates, cross, eps_m=100.0, min_samples=3)],
 }
 tree=Path(os.environ["BENCH_TREE"])

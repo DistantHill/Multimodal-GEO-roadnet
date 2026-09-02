@@ -23,5 +23,5 @@
 `turn_events` 和 `tracks_cross`。脚本先验证并回填旧
 `candidate_intersection_events` 数据，建立同 Detect Run 的复合外键与索引，
 最后删除旧成员表。发现 A/C 事件跨候选重复归属或旧 A/C 成员无法映射时会中止
-并回滚。仅存在于内存中的 Method 2 `orthogonal` 没有 Detect 级 A/C 记录，因而
-不会写入反向成员关系。
+并回滚。历史版本仅存在于内存中的 Method 2 `orthogonal` 本就没有 Detect 级
+A/C 记录；新版本已删除该直接候选路径，迁移不会为历史内存结果制造反向成员关系。

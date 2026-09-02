@@ -980,7 +980,7 @@ def _child(case: str, run_kind: str) -> dict[str, Any]:
             )
             try:
                 cfg = IntersectConfig(
-                    use_orthogonal_candidates=True,
+                    use_cross_track_candidates=True,
                     db_table=frozen_real["table"],
                 )
                 extent_kwargs: dict[str, Any] = {"table": cfg.db_table}

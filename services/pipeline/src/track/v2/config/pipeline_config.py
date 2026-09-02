@@ -37,6 +37,11 @@ DEFAULT_PIPELINE_CONFIG_PATH = Path(__file__).resolve().parent / "pipeline.toml"
 _SECTIONS = (
     "projection", "cleaner", "detect", "clip", "fitting", "network", "runtime",
 )
+_REMOVED_DETECT_KEYS = {
+    "use_orthogonal_candidates": "use_cross_track_candidates",
+    "dbscan_eps_m_ortho": None,
+    "dbscan_min_samples_ortho": None,
+}
 
 
 @dataclass(frozen=True)
@@ -84,6 +89,17 @@ def _build_section(base: Any, section: Any) -> Any:
     known = {field.name for field in dataclasses.fields(base)}
     unknown = set(section) - known
     if unknown:
+        if isinstance(base, IntersectConfig) and unknown & _REMOVED_DETECT_KEYS.keys():
+            migrations = []
+            for key in sorted(unknown & _REMOVED_DETECT_KEYS.keys()):
+                replacement = _REMOVED_DETECT_KEYS[key]
+                if replacement is None:
+                    migrations.append(f"remove {key}")
+                else:
+                    migrations.append(f"rename {key} to {replacement}")
+            raise ConfigError(
+                f"[{cls}] removed Method 2 keys: {', '.join(migrations)}"
+            )
         raise ConfigError(f"[{cls}] unknown keys: {', '.join(sorted(unknown))}")
 
     overrides: dict[str, Any] = {}

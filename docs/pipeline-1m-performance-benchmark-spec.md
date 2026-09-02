@@ -205,10 +205,10 @@ Pipeline cgroup 精确峰值为 1,232.7 MiB。Pipeline 抽样峰值时 PostgreSQ
 
 ### PERF-01：Detect 共享轨迹工作区
 
-- 原因：旧 DB 路径在 Method 1/2、跨车候选和拓扑验证之间重复读取轨迹，且后续
+- 原因：旧 DB 路径在转向检测、跨车候选和拓扑验证之间重复读取轨迹，且后续
   逻辑依赖大量按窗口数据库查询；数据库往返和重复对象构建成为主耗时。
-- 改动：`_stream_extract_methods_1_2` 在流式检测时构建一次
-  `dict[vehicle_id, list[TrajectoryPoint]]`，由转向/正交检测、全局跨车计算和拓扑
+- 改动：`_stream_extract_method_1` 在流式检测时构建一次
+  `dict[vehicle_id, list[TrajectoryPoint]]`，由转向检测、全局跨车计算和拓扑
   验证共享。实现见
   [`intersect2.py`](../services/pipeline/src/track/v2/intersect2.py)。
 - 效果：它是 PERF-02 和 PERF-04 的架构前提。组合后 Detect 计算由 633.628s

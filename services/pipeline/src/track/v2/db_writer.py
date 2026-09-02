@@ -1020,7 +1020,7 @@ def insert_candidate_intersections(
         "centroid_lon", "centroid_lat", "radius_m",
         "source", "sources", "source_counts", "source_ratios",
         "critical_sources",
-        "turn_event_count", "orthogonal_count", "cross_track_count", "total_event_count",
+        "turn_event_count", "cross_track_count", "total_event_count",
         "geom",  # ← must be last: _POLYGON_EXPR is appended to end of placeholders
     ]
     columns = ["detect_id", *columns]
@@ -1052,7 +1052,6 @@ def insert_candidate_intersections(
                 json.dumps(cluster.source_ratios, ensure_ascii=False),
                 json.dumps(list(cluster.critical_sources), ensure_ascii=False),
                 len([event for event in cluster.events if event.source == "turn"]),
-                len([event for event in cluster.events if event.source == "orthogonal"]),
                 len([
                     event
                     for event in cluster.events

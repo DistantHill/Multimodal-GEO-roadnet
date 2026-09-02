@@ -1,4 +1,4 @@
-"""Intersect2 tests — dual-mode intersection detection and topology verification."""
+"""Intersect2 turn/cross-track detection and topology verification tests."""
 
 from __future__ import annotations
 
@@ -36,7 +36,8 @@ from track.v2.intersect2 import (
     SpatialWindow,
     _cluster_angles_greedy,
     _cluster_dbscan,
-    _cluster_orthogonal_candidates,
+    _cluster_pipeline,
+    _cluster_orthogonal_cross_track_candidates,
     _annotate_source_ablation,
     _compute_getis_ord_g_star,
     _detect_turn_events,
@@ -53,6 +54,7 @@ from track.v2.intersect2 import (
     _nearest_angle_id,
     _project_tracks,
     _run_dbscan,
+    _stream_extract_method_1,
     _stream_vehicle_tracks_from_db,
     _topology_point_windows,
     _query_active_points_in_window,
@@ -60,11 +62,12 @@ from track.v2.intersect2 import (
     detect_intersections,
 )
 from track.v2.models import (
+    CrossTrackCandidate,
     EntryExitObservation,
+    GeneratedReason,
     HotspotCluster,
     IntersectReport,
     IntersectionTopology,
-    OrthogonalCandidate,
     PointRef,
     SpatialContext,
     TrajectoryPoint,
@@ -211,11 +214,9 @@ class IntersectReportTest(unittest.TestCase):
             track_count=10,
             turn_event_count=100,
             hotspot_event_count=50,
-            orthogonal_candidate_count=20,
             cross_track_candidate_count=5,
             cluster_count=5,
             cluster_count_turn=3,
-            cluster_count_ortho=2,
             cluster_count_cross_track=1,
             complete_intersection_count=3,
         )
@@ -1070,6 +1071,122 @@ class TurnDetectionTest(unittest.TestCase):
         for e in events:
             self.assertGreaterEqual(abs(e.turn_deg), cfg.min_turn_deg)
 
+    def test_injected_point_participates_in_method_1_with_provenance(self):
+        origin_lon, origin_lat = 116.391, 39.907
+        track = _build_track_through_intersection(
+            "v1", origin_lon, origin_lat,
+            approach_bearing=0.0, exit_bearing=90.0,
+        )
+        track[4] = replace(
+            track[4],
+            point_ref=PointRef(
+                "public.injected_points",
+                "282",
+                stable=False,
+                from_ref="21022680",
+                to_ref="21022681",
+                generated_reason=GeneratedReason.HEADING_ORTHOGONAL,
+            ),
+        )
+        cfg = IntersectConfig(
+            use_cross_track_candidates=False,
+            turn_window=2,
+            min_turn_deg=45.0,
+            max_turn_deg=170.0,
+            min_leg_m=20.0,
+            min_movement_speed_mps=1.0,
+            g_star_min_z=-10.0,
+            dbscan_min_samples_turn=1,
+        )
+
+        projected = _with_processing_xy({"v1": track})
+        events = _detect_turn_events(projected, cfg)
+        injected_events = [
+            event for event in events
+            if event.point_ref == track[4].point_ref
+        ]
+        self.assertEqual(len(injected_events), 1)
+        self.assertEqual(injected_events[0].source, "turn")
+        self.assertEqual(injected_events[0].from_source_id, "public.injected_points")
+        self.assertEqual(injected_events[0].from_source_row_key, "282")
+
+        hotspots, clusters = _cluster_pipeline(
+            events, [], _TEST_TRANSFORMER, cfg,
+        )
+        self.assertIn(injected_events[0], hotspots)
+        self.assertTrue(clusters)
+        self.assertEqual(
+            {source for cluster in clusters for source in cluster.algorithm_sources},
+            {"turn"},
+        )
+
+    def test_injected_point_is_not_promoted_when_turn_checks_fail(self):
+        origin_lon, origin_lat = 116.391, 39.907
+        track = [
+            _make_point(
+                "v1", str(index), float(index), origin_lon,
+                origin_lat + index * 0.0002, 0.0, 10.0,
+            )
+            for index in range(8)
+        ]
+        track[4] = replace(
+            track[4],
+            point_ref=PointRef(
+                "public.injected_points", "282", stable=False,
+                from_ref="3", to_ref="4",
+                generated_reason=GeneratedReason.HEADING_ORTHOGONAL,
+            ),
+        )
+        cfg = IntersectConfig(
+            use_cross_track_candidates=False,
+            min_leg_m=20.0,
+            min_movement_speed_mps=1.0,
+            g_star_min_z=-10.0,
+            dbscan_min_samples_turn=1,
+        )
+
+        events = _detect_turn_events(_with_processing_xy({"v1": track}), cfg)
+        hotspots, clusters = _cluster_pipeline(
+            events, [], _TEST_TRANSFORMER, cfg,
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(hotspots, [])
+        self.assertEqual(clusters, [])
+
+    def test_db_stream_and_in_memory_turn_detection_match(self):
+        origin_lon, origin_lat = 116.391, 39.907
+        track = _build_track_through_intersection(
+            "v1", origin_lon, origin_lat,
+            approach_bearing=0.0, exit_bearing=90.0,
+        )
+        track[4] = replace(
+            track[4],
+            point_ref=PointRef(
+                "public.injected_points", "282", stable=False,
+                from_ref="21022680", to_ref="21022681",
+                generated_reason=GeneratedReason.HEADING_ORTHOGONAL,
+            ),
+        )
+        cfg = IntersectConfig(
+            use_cross_track_candidates=False,
+            min_leg_m=20.0,
+            min_movement_speed_mps=1.0,
+        )
+        projected = _with_processing_xy({"v1": track})
+        expected = _detect_turn_events(projected, cfg)
+
+        with patch(
+            "track.v2.intersect2._stream_vehicle_tracks_from_db",
+            return_value=iter([track]),
+        ):
+            actual, workspace = _stream_extract_method_1(
+                object(), cfg, _TEST_SPATIAL_CONTEXT, _TEST_TRANSFORMER,
+            )
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(workspace["v1"], projected["v1"])
+
     def test_straight_line_no_turns(self):
         """I2-05: A vehicle on a straight line generates 0 turn events."""
         origin_lon, origin_lat = 116.391, 39.907
@@ -1597,11 +1714,11 @@ class DBSCANTest(unittest.TestCase):
         self.assertEqual(actual, expected)
 
 
-# ── Orthogonal candidate tests (Method 2) ──────────────────────────────
+# ── Cross-track candidate tests (Method 3) ───────────────────────────────
 
 
-class OrthogonalCandidateTest(unittest.TestCase):
-    """I2-16 ~ I2-17: Orthogonal candidate extraction and clustering."""
+class CrossTrackCandidateTest(unittest.TestCase):
+    """Method 3 cross-track candidate extraction and clustering."""
 
     def test_cross_track_candidate_keeps_canonical_pair_provenance(self):
         """Cross-track candidates retain both source segments in A/B order."""
@@ -1787,34 +1904,6 @@ class OrthogonalCandidateTest(unittest.TestCase):
                 )
                 self.assertAlmostEqual(candidate.x, expected_x, places=6)
                 self.assertAlmostEqual(candidate.y, expected_y, places=6)
-
-    def test_cluster_orthogonal_candidates(self):
-        """I2-17: Orthogonal candidates can be clustered."""
-        origin_lon, origin_lat = 116.0, 39.0
-        # Create candidates at two distinct locations
-        candidates = []
-        for i in range(4):
-            candidates.append(
-                OrthogonalCandidate(
-                    point_ref=PointRef("test", str(i), stable=False,
-                                       generated_reason="orthogonal_heading"),
-                    vehicle_id=f"v{i}",
-                    timestamp=1000.0 + i,
-                    lon=116.0 + i * 0.0001,
-                    lat=39.0 + i * 0.0001,
-                    x=i * 3,
-                    y=i * 3,
-                )
-            )
-        clusters = _cluster_orthogonal_candidates(
-            candidates, _TEST_TRANSFORMER, eps_m=100.0, min_samples=3
-        )
-        self.assertEqual(len(clusters), 1)
-        self.assertEqual(clusters[0].source, "orthogonal")
-        self.assertEqual(clusters[0].sources, ("orthogonal",))
-        self.assertEqual(clusters[0].source_counts["orthogonal"], 4)
-        self.assertEqual(len(clusters[0].source_point_refs["orthogonal"]), 4)
-
 
 # ── Topology extraction tests ──────────────────────────────────────────
 
@@ -2012,8 +2101,8 @@ class TopologyExtractionTest(unittest.TestCase):
                 return_value=(115.0, 38.0, 117.0, 40.0),
             ),
             patch(
-                "track.v2.intersect2._stream_extract_methods_1_2",
-                return_value=([], [], tracks),
+                "track.v2.intersect2._stream_extract_method_1",
+                return_value=([], tracks),
             ),
             patch(
                 "track.v2.intersect2._extract_cross_track_db_workspace",
@@ -2064,9 +2153,9 @@ class ClusterMergeTest(unittest.TestCase):
                               20, 20, 0, 90, 90, 90),
                     TurnEvent(2, "v3", 1002, origin_lon, origin_lat,
                               25, 25, 0, 90, 90, 90)),
-            source="orthogonal",
+            source="orthogonal_cross_track",
             source_point_refs={
-                "orthogonal": (
+                "orthogonal_cross_track": (
                     PointRef("raw", "2", stable=True),
                     PointRef("raw", "3", stable=True),
                 ),
@@ -2077,12 +2166,12 @@ class ClusterMergeTest(unittest.TestCase):
         )
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0].source, "merged")
-        self.assertEqual(merged[0].sources, ("orthogonal", "turn"))
+        self.assertEqual(merged[0].sources, ("orthogonal_cross_track", "turn"))
         self.assertEqual(merged[0].source_counts["turn"], 1)
-        self.assertEqual(merged[0].source_counts["orthogonal"], 2)
-        self.assertAlmostEqual(merged[0].source_ratios["orthogonal"], 2 / 3)
+        self.assertEqual(merged[0].source_counts["orthogonal_cross_track"], 2)
+        self.assertAlmostEqual(merged[0].source_ratios["orthogonal_cross_track"], 2 / 3)
         self.assertEqual(
-            [ref.source_row_key for ref in merged[0].source_point_refs["orthogonal"]],
+            [ref.source_row_key for ref in merged[0].source_point_refs["orthogonal_cross_track"]],
             ["2", "3"],
         )
 
@@ -2097,7 +2186,7 @@ class ClusterMergeTest(unittest.TestCase):
         c2 = HotspotCluster(
             cluster_calculate_index=1, centroid_x=5000.0, centroid_y=5000.0,
             centroid_lon=117.0, centroid_lat=40.0,
-            radius_m=50.0, events=(), source="orthogonal",
+            radius_m=50.0, events=(), source="orthogonal_cross_track",
         )
         merged = _merge_clusters(
             [c1, c2], merge_distance_m=80.0, transformer=_TEST_TRANSFORMER
@@ -2137,6 +2226,49 @@ class SourceAblationTest(unittest.TestCase):
         self.assertEqual(annotated[0].sources, ("turn",))
         self.assertEqual(annotated[0].critical_sources, ("turn",))
 
+    def test_cross_track_source_is_reclustered_for_ablation(self):
+        origin_lon, origin_lat = 116.0, 39.0
+        base_x, base_y = _TEST_TRANSFORMER.forward(origin_lon, origin_lat)
+        candidates: list[CrossTrackCandidate] = []
+        for index in range(3):
+            x = base_x + index
+            y = base_y + index
+            lon, lat = _TEST_TRANSFORMER.inverse(x, y)
+            candidates.append(CrossTrackCandidate(
+                point_ref=PointRef("public.day01", str(index), stable=True),
+                vehicle_id=f"A|B-{index}",
+                timestamp=float(index),
+                lon=lon,
+                lat=lat,
+                x=x,
+                y=y,
+                heading=0.0,
+                speed=10.0,
+                from_source_id="public.day01",
+                from_source_row_key=f"a{index},a{index + 1}",
+                to_source_id="public.day02",
+                to_source_row_key=f"b{index},b{index + 1}",
+            ))
+        cfg = IntersectConfig(
+            cross_track_dbscan_eps_m=100.0,
+            cross_track_dbscan_min_samples=2,
+        )
+        clusters = _cluster_orthogonal_cross_track_candidates(
+            candidates,
+            _TEST_TRANSFORMER,
+            eps_m=cfg.cross_track_dbscan_eps_m,
+            min_samples=cfg.cross_track_dbscan_min_samples,
+        )
+
+        annotated = _annotate_source_ablation(
+            clusters, [], candidates, cfg, _TEST_TRANSFORMER,
+        )
+
+        self.assertEqual(len(annotated), 1)
+        self.assertEqual(annotated[0].algorithm_sources, ("orthogonal_cross_track",))
+        self.assertEqual(annotated[0].critical_sources, ("orthogonal_cross_track",))
+        self.assertEqual(set(annotated[0].source_ratios), {"orthogonal_cross_track"})
+
 
 class EndToEndTest(unittest.TestCase):
     """I2-23 ~ I2-25: Full pipeline integration."""
@@ -2171,7 +2303,7 @@ class EndToEndTest(unittest.TestCase):
             handle = get_database(source)
             result = detect_intersections(handle, config=IntersectConfig(
                 use_turn_events=True,
-                use_orthogonal_candidates=False,  # Only Method 1 for this test
+                use_cross_track_candidates=False,  # Only Method 1 for this test
                 turn_window=2,
                 min_turn_deg=45.0, max_turn_deg=170.0,
                 min_leg_m=20.0, min_movement_speed_mps=1.0,

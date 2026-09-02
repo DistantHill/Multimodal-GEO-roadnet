@@ -219,7 +219,6 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             source_ratios       JSONB NOT NULL DEFAULT '{}',
             critical_sources    JSONB NOT NULL DEFAULT '[]',
             turn_event_count    INTEGER NOT NULL DEFAULT 0,
-            orthogonal_count    INTEGER NOT NULL DEFAULT 0,
             cross_track_count   INTEGER NOT NULL DEFAULT 0,
             total_event_count   INTEGER NOT NULL DEFAULT 0,
             origin_lon          DOUBLE PRECISION,
@@ -1237,6 +1236,11 @@ def _run_migrations(cur: Any) -> None:
         (
             "drop_candidate_cluster_column",
             "ALTER TABLE candidate_intersections DROP COLUMN IF EXISTS cluster_id",
+        ),
+        (
+            "drop_candidate_orthogonal_count_column",
+            "ALTER TABLE candidate_intersections "
+            "DROP COLUMN IF EXISTS orthogonal_count",
         ),
         (
             "add_candidate_membership_fks",

@@ -443,13 +443,14 @@ class PipelineStoreDetectTest(unittest.TestCase):
             batch_size=17,
         )
 
-    def test_orthogonal_member_without_detect_entity_is_not_assigned(self) -> None:
+    def test_removed_method_2_source_is_rejected(self) -> None:
         cluster = SimpleNamespace(
             cluster_calculate_index=10,
             events=(SimpleNamespace(source="orthogonal"),),
         )
 
-        self.assertEqual(_candidate_memberships([cluster], {10: 110}), ({}, {}))
+        with self.assertRaisesRegex(ValueError, "unsupported candidate event source"):
+            _candidate_memberships([cluster], {10: 110})
 
     def test_detect_writer_error_propagates_without_later_calls(self) -> None:
         conn = object()

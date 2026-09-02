@@ -746,7 +746,7 @@ def replay_cluster(
             seen.add(key)
             result.append(pt)
 
-    # From source_point_refs (turn events + orthogonal candidates)
+    # From source_point_refs (turn events + cross-track candidates)
     for _source, refs in cluster.source_point_refs.items():
         for ref in refs:
             pt = _resolve_point("", ref, index, tracks)  # vehicle_id unknown from ref alone

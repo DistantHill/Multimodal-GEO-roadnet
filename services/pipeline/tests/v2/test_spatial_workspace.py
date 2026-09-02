@@ -168,8 +168,8 @@ def test_db_workspace_capacity_failure_uses_memory_not_sql() -> None:
     )
 
 
-def test_db_workspace_respects_disabled_orthogonal_method() -> None:
-    cfg = IntersectConfig(use_orthogonal_candidates=False)
+def test_db_workspace_respects_disabled_cross_track_method() -> None:
+    cfg = IntersectConfig(use_cross_track_candidates=False)
 
     with patch(
         "track.v2.intersect2.extract_cross_track_candidates",

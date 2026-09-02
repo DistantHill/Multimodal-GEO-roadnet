@@ -46,7 +46,7 @@ from track.v2.projection import CoordinateTransformer, create_spatial_context
 MANUAL_EXTENT: tuple[float, float, float, float] | None = None
 
 CONFIG_OVERRIDES: dict = {
-    "use_orthogonal_candidates": True,
+    "use_cross_track_candidates": True,
     "db_table": "trajectory_points",
     "spatial_window_size": (2000.0, 2000.0),   # 窗大小（米）
     "spatial_window_overlap": 0.15,             # 每侧重叠比
