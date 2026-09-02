@@ -14,12 +14,16 @@ from track.v2.models import (
     FittingConfig,
     IntersectReport,
     NetworkConfig,
+    ProjectionConfig,
     RuntimeConfig,
 )
 from track.v2.pipeline import PipelineInput, run_pipeline
+from track.v2.projection import create_spatial_context
 
 
 CLEAN_ID = "11111111-1111-1111-1111-111111111111"
+_PROJECTION_CONFIG = ProjectionConfig(processing_srid=3857)
+_SPATIAL_CONTEXT = create_spatial_context(_PROJECTION_CONFIG)
 
 
 def _empty_intersect_result() -> IntersectResult:
@@ -43,6 +47,7 @@ def _empty_intersect_result() -> IntersectResult:
             cluster_count_cross_track=0,
             complete_intersection_count=0,
         ),
+        spatial_context=_SPATIAL_CONTEXT,
     )
 
 
@@ -63,6 +68,7 @@ class _ConfigRecordingStore:
             source_kind="postgres_table",
             parameters={"target_table": "raw_points"},
             status="completed",
+            spatial_context=_SPATIAL_CONTEXT,
         )
         self.clip_result = MagicMock()
         self.clip_result.report.as_dict.return_value = {}
@@ -130,6 +136,7 @@ class PipelineConfigWiringTest(unittest.TestCase):
         fitting_config = FittingConfig(point_spacing_m=17.0)
         network_config = NetworkConfig(include_isolated_nodes=False)
         pipeline_config = PipelineConfig(
+            projection=_PROJECTION_CONFIG,
             cleaner=CleanerConfig(),
             detect=IntersectConfig(),
             clip=clip_config,

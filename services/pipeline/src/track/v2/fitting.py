@@ -7,7 +7,6 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from ._geometry import _to_lonlat, _to_xy
 from .models import (
     Centerline,
     CenterlineFitBundle,
@@ -18,6 +17,7 @@ from .models import (
     FittingConfig,
     TrackClip,
 )
+from .projection import CoordinateTransformer
 
 
 _EPS = 1e-9
@@ -27,7 +27,7 @@ _BOUNDARY_CLIP_TYPES = {"boundary_start", "boundary_end", "full_track"}
 @dataclass(frozen=True, slots=True)
 class _OrientedClip:
     value: TrackClip
-    points_lonlat: tuple[tuple[float, float], ...]
+    points_xy: tuple[tuple[float, float], ...]
     was_reversed: bool
 
 
@@ -44,6 +44,7 @@ def fit_centerlines(
     """
     cfg = config or FittingConfig()
     _validate_config(cfg)
+    transformer = CoordinateTransformer(clips.spatial_context)
     grouped: dict[tuple[int, int], list[_OrientedClip]] = {}
     issues: list[FitIssue] = []
     eligible_count = 0
@@ -61,7 +62,7 @@ def fit_centerlines(
         if start_id is not None and end_id is not None and start_id != end_id:
             pair = (min(start_id, end_id), max(start_id, end_id))
             grouped.setdefault(pair, [])
-        oriented, issue = _orient_clip(clip)
+        oriented, issue = _orient_clip(clip, transformer)
         if issue is not None:
             issues.append(issue)
             continue
@@ -77,7 +78,7 @@ def fit_centerlines(
             skipped_pairs += 1
             issues.append(FitIssue(pair[0], pair[1], "insufficient_clips"))
             continue
-        centerline = _fit_pair(pair, pair_clips, cfg)
+        centerline = _fit_pair(pair, pair_clips, cfg, transformer)
         if centerline is None:
             skipped_pairs += 1
             issues.append(FitIssue(pair[0], pair[1], "degenerate_centerline"))
@@ -95,6 +96,7 @@ def fit_centerlines(
             skipped_clip_count=sum(issue.clip_id is not None for issue in issues),
             skipped_pair_count=skipped_pairs,
         ),
+        spatial_context=clips.spatial_context,
         detect_id=clips.detect_id,
     )
 
@@ -127,12 +129,7 @@ def _fit_direction(
         and ((clip.start.intersection_id > clip.end.intersection_id) == reverse)
     )
     fitted = fit_centerlines(
-        ClipResult(
-            clips=selected,
-            report=clips.report,
-            detect_id=clips.detect_id,
-            intersections=clips.intersections,
-        ),
+        replace(clips, clips=selected),
         config=config,
     )
     centerlines = tuple(
@@ -167,7 +164,10 @@ def _validate_config(config: FittingConfig) -> None:
         raise ValueError("FittingConfig.min_clips_per_pair must be at least 1")
 
 
-def _orient_clip(clip: TrackClip) -> tuple[_OrientedClip | None, FitIssue | None]:
+def _orient_clip(
+    clip: TrackClip,
+    transformer: CoordinateTransformer,
+) -> tuple[_OrientedClip | None, FitIssue | None]:
     start_id = clip.start.intersection_id
     end_id = clip.end.intersection_id
     if start_id is None or end_id is None:
@@ -184,23 +184,19 @@ def _orient_clip(clip: TrackClip) -> tuple[_OrientedClip | None, FitIssue | None
     was_reversed = start_id > end_id
     if was_reversed:
         points.reverse()
-    if _lonlat_polyline_length_m(points) <= _EPS:
+    points_xy = tuple(transformer.forward_many(points))
+    if _xy_polyline_length(np.asarray(points_xy)) <= _EPS:
         return None, FitIssue(min(start_id, end_id), max(start_id, end_id), "zero_length_geometry", clip.clip_id)
-    return _OrientedClip(clip, tuple(points), was_reversed), None
+    return _OrientedClip(clip, points_xy, was_reversed), None
 
 
 def _fit_pair(
     pair: tuple[int, int],
     clips: list[_OrientedClip],
     config: FittingConfig,
+    transformer: CoordinateTransformer,
 ) -> Centerline | None:
-    all_points = [point for clip in clips for point in clip.points_lonlat]
-    origin_lon = float(np.median([point[0] for point in all_points]))
-    origin_lat = float(np.median([point[1] for point in all_points]))
-    tracks_xy = [
-        np.asarray([_to_xy(lon, lat, origin_lon, origin_lat) for lon, lat in clip.points_lonlat])
-        for clip in clips
-    ]
+    tracks_xy = [np.asarray(clip.points_xy) for clip in clips]
     lengths = [_xy_polyline_length(track) for track in tracks_xy]
     median_length = float(np.median(lengths))
     if median_length <= _EPS:
@@ -216,7 +212,7 @@ def _fit_pair(
     if len(spaced_xy) < 2:
         return None
     points = tuple(
-        _to_lonlat(float(x), float(y), origin_lon, origin_lat)
+        transformer.inverse(float(x), float(y))
         for x, y in spaced_xy
     )
     return Centerline(
@@ -272,9 +268,3 @@ def _xy_polyline_length(points: np.ndarray) -> float:
     if len(points) < 2:
         return 0.0
     return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
-
-
-def _lonlat_polyline_length_m(points: list[tuple[float, float]]) -> float:
-    origin_lon, origin_lat = points[0]
-    xy = np.asarray([_to_xy(lon, lat, origin_lon, origin_lat) for lon, lat in points])
-    return _xy_polyline_length(xy)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from track.v2.cleaner import clean_vehicle
@@ -18,12 +19,19 @@ from track.v2.cleaner1 import (
 from track.v2.models import (
     CleanReport,
     PointRef,
+    SpatialContext,
     TrajectoryPoint,
 )
 from track.v2.parser0 import CsvSource, get_database
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
+
+_SPATIAL_CONTEXT = SpatialContext(
+    source_srid=4326,
+    processing_srid=32650,
+    projection_config={"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": 0.01},
+)
 
 
 def _make_csv(tmpdir: str, filename: str, content: str, encoding: str = "utf-8") -> Path:
@@ -73,7 +81,7 @@ class ActiveExcludedSeparationTest(unittest.TestCase):
             )
             source = CsvSource(csv_path)
             handle = get_database(source)
-            result = clean(handle)
+            result = clean(handle, spatial_context=_SPATIAL_CONTEXT)
             self.assertIsInstance(result, CleanerResult)
             active = list(result.active.iter_points())
             self.assertEqual(len(active), 2)
@@ -81,8 +89,37 @@ class ActiveExcludedSeparationTest(unittest.TestCase):
             self.assertEqual(result.report.excluded_count, 0)
             self.assertEqual(result.report.injected_count, 0)
             self.assertEqual(len(result.kept_subtracks), 1)
+            self.assertIsNotNone(result.active)
+            self.assertIsNotNone(result.excluded)
+            self.assertIsNotNone(result.report)
+            self.assertEqual(result.spatial_context, _SPATIAL_CONTEXT)
+            self.assertEqual(result.active.spatial_context, _SPATIAL_CONTEXT)
+            self.assertTrue(
+                all(
+                    point.x is not None and point.y is not None
+                    for point in active
+                )
+            )
             handle.close()
 
+    def test_clean_vehicle_reprojects_unscoped_kept_xy_and_carries_context(self):
+        points = [
+            replace(
+                _make_point("v1", "1", 1000.0, 116.0, 39.0, 90.0, 10.0),
+                x=1.0,
+                y=2.0,
+            ),
+            replace(
+                _make_point("v1", "2", 1030.0, 116.001, 39.0, 90.0, 10.0),
+                x=3.0,
+                y=4.0,
+            ),
+        ]
+
+        result = clean_vehicle(points, spatial_context=_SPATIAL_CONTEXT)
+
+        self.assertEqual(result.spatial_context, _SPATIAL_CONTEXT)
+        self.assertNotEqual((result.kept[0].x, result.kept[0].y), (1.0, 2.0))
 
 class GapSplittingTest(unittest.TestCase):
     """C1-06: Temporal gap > max_gap_s creates independent sub-tracks."""
@@ -120,7 +157,11 @@ class CleanVehicleAggregationTest(unittest.TestCase):
             _make_point("v1", "4", 1260.0, 116.0, 39.3, 90.0, 10.0),
         ]
 
-        result = clean_vehicle(points, config=CleanerConfig(max_gap_s=120.0))
+        result = clean_vehicle(
+            points,
+            config=CleanerConfig(max_gap_s=120.0),
+            spatial_context=_SPATIAL_CONTEXT,
+        )
 
         self.assertEqual(
             [point.point_ref.source_row_key for point in result.kept],
@@ -154,7 +195,7 @@ class CleanVehicleAggregationTest(unittest.TestCase):
             max_stationary_duration_s=10.0,
         )
 
-        result = clean_vehicle(points, config=cfg)
+        result = clean_vehicle(points, config=cfg, spatial_context=_SPATIAL_CONTEXT)
 
         self.assertEqual(
             [point.point_ref.source_row_key for point in result.kept],
@@ -237,7 +278,7 @@ class NoSourceModificationTest(unittest.TestCase):
             original = csv_path.read_text(encoding="utf-8")
             source = CsvSource(csv_path)
             handle = get_database(source)
-            result = clean(handle)
+            result = clean(handle, spatial_context=_SPATIAL_CONTEXT)
             # Consume active points
             list(result.active.iter_points())
             # Source file unchanged

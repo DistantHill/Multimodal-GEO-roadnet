@@ -39,6 +39,7 @@ from .models import (
 )
 from .sources import open_text_auto, source_row_hash
 from .db.queries import fetch_clean_points_for_subtracks, fetch_detect_row
+from .projection import CoordinateTransformer
 
 
 def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInputReplay:
@@ -73,6 +74,7 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
     if len(manifest_rows) != int(forward_count) + int(reverse_count):
         raise ValueError(f"Centerline {centerline_id} source Clip manifest is incomplete")
     detect = fetch_detect_row(conn, str(detect_id))
+    transformer = CoordinateTransformer(detect.spatial_context)
     requested_subtracks = {
         (str(row[2]), int(row[3]))
         for row in manifest_rows
@@ -82,6 +84,7 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
         str(detect.parameters["target_table"]),
         detect.clean_id,
         requested_subtracks,
+        spatial_context=detect.spatial_context,
     )
     clips: list[ReplayFitClip] = []
     for row in manifest_rows:
@@ -92,8 +95,18 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
         track = grouped.get((str(vehicle_id), int(subtrack_index)))
         if track is None:
             raise ValueError(f"Centerline {centerline_id} references a missing subtrack")
-        start = _replay_fit_endpoint(track, int(start_segment), float(start_fraction))
-        end = _replay_fit_endpoint(track, int(end_segment), float(end_fraction))
+        start = _replay_fit_endpoint(
+            track,
+            int(start_segment),
+            float(start_fraction),
+            transformer,
+        )
+        end = _replay_fit_endpoint(
+            track,
+            int(end_segment),
+            float(end_fraction),
+            transformer,
+        )
         interior = tuple(track[int(interior_start):int(interior_end)])
         if len(interior) + 2 != int(input_point_count):
             raise ValueError(f"Centerline {centerline_id} Clip {clip_id} membership drifted")
@@ -119,11 +132,21 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
 
 
 def _replay_fit_endpoint(
-    track: list[TrajectoryPoint], segment_index: int, fraction: float,
+    track: list[TrajectoryPoint],
+    segment_index: int,
+    fraction: float,
+    transformer: CoordinateTransformer,
 ) -> ReplayFitEndpoint:
     if segment_index < 0 or segment_index + 1 >= len(track):
         raise ValueError("Centerline endpoint segment is outside its frozen subtrack")
     left, right = track[segment_index], track[segment_index + 1]
+    (left_x, left_y), (right_x, right_y) = transformer.forward_many((
+        (left.lon, left.lat),
+        (right.lon, right.lat),
+    ))
+    x = left_x + fraction * (right_x - left_x)
+    y = left_y + fraction * (right_y - left_y)
+    lon, lat = transformer.inverse(x, y)
     point = TrajectoryPoint(
         point_ref=PointRef(
             source_id=left.point_ref.source_id,
@@ -134,15 +157,23 @@ def _replay_fit_endpoint(
         ),
         vehicle_id=left.vehicle_id,
         timestamp=left.timestamp + fraction * (right.timestamp - left.timestamp),
-        lon=left.lon + fraction * (right.lon - left.lon),
-        lat=left.lat + fraction * (right.lat - left.lat),
-        heading=left.heading + fraction * (right.heading - left.heading),
+        lon=lon,
+        lat=lat,
+        heading=_interpolate_heading(left.heading, right.heading, fraction),
         speed=left.speed + fraction * (right.speed - left.speed),
+        x=x,
+        y=y,
     )
     return ReplayFitEndpoint(
         point=point, bracket_refs=(left.point_ref, right.point_ref),
         segment_index=segment_index, segment_fraction=fraction,
     )
+
+
+def _interpolate_heading(start: float, end: float, fraction: float) -> float:
+    """Interpolate true-north headings over the shortest circular arc."""
+    delta = (end - start + 180.0) % 360.0 - 180.0
+    return (start + fraction * delta) % 360.0
 
 
 @dataclass(frozen=True)

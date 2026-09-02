@@ -26,6 +26,7 @@ def run_pipeline(
     clean_id: str | None = None,
     table: str = "trajectory_points",
     config_path: str | Path | None = None,
+    processing_srid: int | None = None,
 ) -> dict[str, int | str | list[int]]:
     """Compatibility adapter for the historical CLI runner signature."""
     pipeline_input = PipelineInput(
@@ -35,6 +36,7 @@ def run_pipeline(
         clean_id=clean_id,
         table=table,
         config_path=config_path,
+        processing_srid=processing_srid,
     )
     reporter = PipelineReporter()
     try:
@@ -90,6 +92,10 @@ def main() -> int:
              "(default: track/v2/config/pipeline.toml)."
     )
     parser.add_argument(
+        "--processing-srid", type=int, default=None, metavar="EPSG",
+        help="本次新 Clean Run 的固定米制投影 EPSG / projected metre CRS for a new Clean Run.",
+    )
+    parser.add_argument(
         "--table", default=None,
         help="目标表名 / Target table name for trajectory_points "
              "(default: same as --pg-table for PG mode, 'trajectory_points' for CSV mode)."
@@ -98,6 +104,11 @@ def main() -> int:
 
     if args.clean_id and args.table is not None:
         parser.error("--clean-id 不可覆盖 --table / cannot override --table")
+    if args.clean_id and args.processing_srid is not None:
+        parser.error(
+            "--clean-id 继承已有投影，不可覆盖 --processing-srid / "
+            "a reused Clean Run inherits its projection"
+        )
 
     if args.table is None:
         args.table = args.pg_table or "trajectory_points"
@@ -134,6 +145,7 @@ def main() -> int:
             clean_id=str(args.clean_id) if args.clean_id else None,
             table=args.table,
             config_path=args.config,
+            processing_srid=args.processing_srid,
         )
         _print_write_summary(stats)
         return 0

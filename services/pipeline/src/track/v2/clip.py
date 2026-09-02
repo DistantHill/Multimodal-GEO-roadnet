@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from ._geometry import _distance_m, _to_xy
+from ._geometry import _distance_m
 from .db.queries import (
     fetch_clean_points,
     fetch_intersections,
@@ -22,6 +22,7 @@ from .models import (
     TrackClip,
     TrajectoryPoint,
 )
+from .projection import CoordinateTransformer
 
 
 _EPS = 1e-9
@@ -48,9 +49,12 @@ class _IndexedIntersection:
 class _IntersectionGrid:
     """Private uniform-grid index for candidate circle lookup per segment."""
 
-    def __init__(self, intersections: tuple[ClipIntersection, ...]) -> None:
-        self.origin_lon = intersections[0].lon
-        self.origin_lat = intersections[0].lat
+    def __init__(
+        self,
+        intersections: tuple[ClipIntersection, ...],
+        transformer: CoordinateTransformer,
+    ) -> None:
+        self.transformer = transformer
         # A single large-radius intersection must not coarsen the index for every
         # other intersection.  Indexing that outlier into more fixed-size cells is
         # cheap (there are normally only hundreds of intersections), while using
@@ -61,19 +65,16 @@ class _IntersectionGrid:
         indexed_intersections: list[_IndexedIntersection] = []
         overflow_intersections: list[_IndexedIntersection] = []
         intersection_ids: set[int] = set()
-        for intersection in intersections:
+        projected = transformer.forward_many(
+            (intersection.lon, intersection.lat) for intersection in intersections
+        )
+        for intersection, (x, y) in zip(intersections, projected):
             if intersection.intersection_id in intersection_ids:
                 raise ValueError(
                     "duplicate ClipIntersection intersection_id: "
                     f"{intersection.intersection_id}"
                 )
             intersection_ids.add(intersection.intersection_id)
-            x, y = _to_xy(
-                intersection.lon,
-                intersection.lat,
-                self.origin_lon,
-                self.origin_lat,
-            )
             indexed = _IndexedIntersection(intersection, x, y)
             indexed_intersections.append(indexed)
             cell_count = self._cell_count_for_bounds(
@@ -96,7 +97,24 @@ class _IntersectionGrid:
         self.overflow_intersections = tuple(overflow_intersections)
 
     def point_xy(self, point: TrajectoryPoint) -> tuple[float, float]:
-        return _to_xy(point.lon, point.lat, self.origin_lon, self.origin_lat)
+        """Project from 4326 truth; generic ClipInput x/y has no CRS provenance."""
+        return self.transformer.forward(point.lon, point.lat)
+
+    def points_xy(
+        self,
+        points: tuple[TrajectoryPoint, ...],
+    ) -> tuple[tuple[float, float], ...]:
+        return tuple(
+            self.transformer.forward_many((point.lon, point.lat) for point in points)
+        )
+
+    def contains(self, point: TrajectoryPoint) -> bool:
+        point_x, point_y = self.point_xy(point)
+        return any(
+            math.hypot(point_x - indexed.x, point_y - indexed.y)
+            < indexed.value.radius_m - _EPS
+            for indexed in self.indexed_intersections
+        )
 
     def candidates(
         self,
@@ -178,12 +196,15 @@ def extract_clips(
     """Extract all clips through the storage-independent Clip interface."""
     cfg = config or ClipConfig()
     _validate_input(source)
+    transformer = CoordinateTransformer(source.spatial_context)
     clips: list[TrackClip] = []
     skipped_degenerate = 0
     unmatched_entries = 0
     unmatched_exits = 0
     intersection_grid = (
-        _IntersectionGrid(source.intersections) if source.intersections else None
+        _IntersectionGrid(source.intersections, transformer)
+        if source.intersections
+        else None
     )
 
     for track in source.tracks:
@@ -202,8 +223,8 @@ def extract_clips(
             track_unmatched_exits,
         ) = _extract_track_clips(
             track,
-            source.intersections,
             intersection_grid=intersection_grid,
+            transformer=transformer,
             include_boundaries=cfg.include_boundary_clips,
             detect_id=source.detect_id,
         )
@@ -226,6 +247,7 @@ def extract_clips(
             unmatched_exit_count=unmatched_exits,
             skipped_degenerate_count=skipped_degenerate,
         ),
+        spatial_context=source.spatial_context,
         detect_id=source.detect_id,
         intersections=source.intersections,
     )
@@ -244,11 +266,20 @@ def _validate_input(source: ClipInput) -> None:
             raise ValueError(
                 f"ClipIntersection {intersection.intersection_id} requires a positive radius"
             )
+        if not (math.isfinite(intersection.lon) and math.isfinite(intersection.lat)):
+            raise ValueError(
+                f"ClipIntersection {intersection.intersection_id} has invalid coordinates"
+            )
     for track in source.tracks:
         if any(point.vehicle_id != track.vehicle_id for point in track.points):
             raise ValueError(
                 f"ClipTrack {track.trip_id!r} contains a point from another vehicle"
             )
+        if any(
+            not (math.isfinite(point.lon) and math.isfinite(point.lat))
+            for point in track.points
+        ):
+            raise ValueError(f"ClipTrack {track.trip_id!r} has invalid coordinates")
 
 
 def extract_clips_for_detect(
@@ -282,11 +313,17 @@ def _load_clip_input_for_detect(
     params = run_row.parameters
     table = str(params.get("target_table", "trajectory_points"))
     intersections = fetch_intersections(conn, detect_id)
-    grouped = fetch_clean_points(conn, table, run_row.clean_id)
+    grouped = fetch_clean_points(
+        conn,
+        table,
+        run_row.clean_id,
+        spatial_context=run_row.spatial_context,
+    )
 
     return ClipInput(
         intersections=tuple(intersections),
         tracks=_build_clip_tracks(grouped),
+        spatial_context=run_row.spatial_context,
         detect_id=detect_id,
     )
 
@@ -329,9 +366,9 @@ def _build_clip_tracks(
 
 def _extract_track_clips(
     track: ClipTrack,
-    intersections: tuple[ClipIntersection, ...],
     *,
     intersection_grid: _IntersectionGrid | None,
+    transformer: CoordinateTransformer,
     include_boundaries: bool,
     detect_id: str | None,
 ) -> tuple[list[TrackClip], int, int, int]:
@@ -364,7 +401,7 @@ def _extract_track_clips(
                 start=start,
                 end=end,
                 points=interior,
-                distance_m=_polyline_distance_m(geometry),
+                distance_m=_polyline_distance_m(geometry, transformer),
                 point_count=len(interior) + 2,
                 subtrack_index=track.subtrack_index,
                 clip_ordinal_in_track=ordinal,
@@ -377,7 +414,7 @@ def _extract_track_clips(
     trip_end = _trip_endpoint(track, start=False)
     if not events:
         if include_boundaries and not _inside_any_intersection(
-            track.points[0], intersections
+            track.points[0], intersection_grid
         ):
             append_clip(trip_start, trip_end, "full_track")
         return clips, skipped, unmatched_entries, unmatched_exits
@@ -417,9 +454,11 @@ def _crossing_events(
         return []
     events: list[_CrossingEvent] = []
     start = track.points[0]
-    start_xy = grid.point_xy(start)
-    for segment_index, end in enumerate(track.points[1:]):
-        end_xy = grid.point_xy(end)
+    track_xy = grid.points_xy(track.points)
+    start_xy = track_xy[0]
+    for segment_index, (end, end_xy) in enumerate(
+        zip(track.points[1:], track_xy[1:])
+    ):
         for indexed in grid.candidates(start_xy, end_xy):
             intersection = indexed.value
             a = (start_xy[0] - indexed.x, start_xy[1] - indexed.y)
@@ -433,10 +472,16 @@ def _crossing_events(
                 if abs(radial_velocity) <= _EPS:
                     continue
                 kind = "entry" if radial_velocity < 0.0 else "exit"
+                crossing_x = start_xy[0] + fraction * (end_xy[0] - start_xy[0])
+                crossing_y = start_xy[1] + fraction * (end_xy[1] - start_xy[1])
+                crossing_lon, crossing_lat = grid.transformer.inverse(
+                    crossing_x,
+                    crossing_y,
+                )
                 endpoint = ClipEndpoint(
                     kind=kind,
-                    lon=start.lon + fraction * (end.lon - start.lon),
-                    lat=start.lat + fraction * (end.lat - start.lat),
+                    lon=crossing_lon,
+                    lat=crossing_lat,
                     timestamp=start.timestamp + fraction * (end.timestamp - start.timestamp),
                     intersection_id=intersection.intersection_id,
                     segment_index=segment_index,
@@ -476,13 +521,9 @@ def _crossing_events(
 
 def _inside_any_intersection(
     point: TrajectoryPoint,
-    intersections: tuple[ClipIntersection, ...],
+    grid: _IntersectionGrid | None,
 ) -> bool:
-    for intersection in intersections:
-        x, y = _to_xy(point.lon, point.lat, intersection.lon, intersection.lat)
-        if math.hypot(x, y) < intersection.radius_m - _EPS:
-            return True
-    return False
+    return grid is not None and grid.contains(point)
 
 
 def _circle_crossing_fractions(
@@ -529,9 +570,11 @@ def _progress(endpoint: ClipEndpoint) -> float:
     return endpoint.segment_index + endpoint.segment_fraction
 
 
-def _polyline_distance_m(points: list[tuple[float, float]]) -> float:
+def _polyline_distance_m(
+    points: list[tuple[float, float]],
+    transformer: CoordinateTransformer,
+) -> float:
     if len(points) < 2:
         return 0.0
-    origin_lon, origin_lat = points[0]
-    xy = [_to_xy(lon, lat, origin_lon, origin_lat) for lon, lat in points]
+    xy = transformer.forward_many(points)
     return sum(_distance_m(left, right) for left, right in zip(xy, xy[1:]))

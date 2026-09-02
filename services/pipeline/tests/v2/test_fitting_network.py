@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 from dataclasses import replace
 
@@ -15,14 +16,20 @@ from track.v2 import (
     fit_centerline_variants,
     build_network,
 )
-from track.v2.models import FittingConfig
+from track.v2.models import (
+    FittingConfig,
+    ProjectionConfig,
+)
+from track.v2.projection import CoordinateTransformer, create_spatial_context
 
 
-_METERS_PER_DEGREE = 111_194.92664455874
+_METERS_PER_DEGREE = 111_319.49079327358
+_SPATIAL_CONTEXT = create_spatial_context(ProjectionConfig(processing_srid=3857))
+_TRANSFORMER = CoordinateTransformer(_SPATIAL_CONTEXT)
 
 
 def _lon(x_m: float) -> float:
-    return x_m / _METERS_PER_DEGREE
+    return _TRANSFORMER.inverse(x_m, 0.0)[0]
 
 
 def _endpoint(
@@ -31,10 +38,15 @@ def _endpoint(
     x_m: float,
     y_m: float,
 ) -> ClipEndpoint:
+    lon, lat = (
+        _TRANSFORMER.inverse(x_m, y_m)
+        if math.isfinite(x_m) and math.isfinite(y_m)
+        else (x_m, y_m)
+    )
     return ClipEndpoint(
         kind=kind,
-        lon=_lon(x_m),
-        lat=_lon(y_m),
+        lon=lon,
+        lat=lat,
         timestamp=x_m,
         intersection_id=intersection_id,
         segment_index=0,
@@ -43,14 +55,17 @@ def _endpoint(
 
 
 def _point(vehicle_id: str, row_key: str, x_m: float, y_m: float) -> TrajectoryPoint:
+    lon, lat = _TRANSFORMER.inverse(x_m, y_m)
     return TrajectoryPoint(
         point_ref=PointRef("fit-test", row_key, stable=True),
         vehicle_id=vehicle_id,
         timestamp=x_m,
-        lon=_lon(x_m),
-        lat=_lon(y_m),
+        lon=lon,
+        lat=lat,
         heading=90.0,
         speed=10.0,
+        x=x_m,
+        y=y_m,
     )
 
 
@@ -89,6 +104,7 @@ def _clip_result(*clips: TrackClip) -> ClipResult:
             boundary_clips=0,
             total_points_in_clips=sum(clip.point_count for clip in clips),
         ),
+        spatial_context=_SPATIAL_CONTEXT,
         detect_id="detect-fit-test",
     )
 
@@ -107,6 +123,9 @@ class FittingStageTest(unittest.TestCase):
         self.assertEqual(bundle.b_to_a.centerlines[0].variant, "directed")
         self.assertEqual(bundle.a_to_b.centerlines[0].source_clip_ids, ("forward",))
         self.assertEqual(bundle.b_to_a.centerlines[0].source_clip_ids, ("reverse",))
+        self.assertEqual(bundle.combined.spatial_context, _SPATIAL_CONTEXT)
+        self.assertEqual(bundle.a_to_b.spatial_context, _SPATIAL_CONTEXT)
+        self.assertEqual(bundle.b_to_a.spatial_context, _SPATIAL_CONTEXT)
         self.assertEqual(
             (
                 bundle.b_to_a.centerlines[0].from_intersection_id,

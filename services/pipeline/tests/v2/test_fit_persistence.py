@@ -9,8 +9,16 @@ from track.v2.models import (
     ClipReport,
     ClipResult,
     PointRef,
+    SpatialContext,
     TrackClip,
     TrajectoryPoint,
+)
+
+
+_SPATIAL_CONTEXT = SpatialContext(
+    source_srid=4326,
+    processing_srid=3857,
+    projection_config={"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": 0.01},
 )
 
 
@@ -128,6 +136,7 @@ class FitPersistenceTest(unittest.TestCase):
                 _clip("reverse", 20, 10, True),
             ),
             report=ClipReport(2, 2, 2, 0, 6),
+            spatial_context=_SPATIAL_CONTEXT,
             detect_id="detect-1",
         )
         bundle = fit_centerline_variants(clips)
@@ -181,6 +190,7 @@ class FitPersistenceTest(unittest.TestCase):
                 _clip("reverse", 20, 10, True),
             ),
             report=ClipReport(2, 2, 2, 0, 6),
+            spatial_context=_SPATIAL_CONTEXT,
             detect_id="detect-1",
         )
         conn = _Connection(reverse_returned=True)
@@ -200,6 +210,7 @@ class FitPersistenceTest(unittest.TestCase):
         clips = ClipResult(
             clips=(_clip("forward", 10, 20, False),),
             report=ClipReport(1, 1, 1, 0, 3),
+            spatial_context=_SPATIAL_CONTEXT,
             detect_id="detect-1",
         )
         conn = _Connection(drop_last_returned=True)

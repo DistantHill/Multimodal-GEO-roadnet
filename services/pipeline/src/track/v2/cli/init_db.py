@@ -37,10 +37,25 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             id              UUID PRIMARY KEY,
             source_id       TEXT NOT NULL,
             source_kind     TEXT NOT NULL,
+            source_srid     INTEGER NOT NULL DEFAULT 4326,
+            processing_srid INTEGER,
+            projection_config JSONB NOT NULL DEFAULT '{}',
             parameters      JSONB NOT NULL DEFAULT '{}',
             status          TEXT NOT NULL,
             started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            finished_at     TIMESTAMPTZ
+            finished_at     TIMESTAMPTZ,
+            CONSTRAINT clean_runs_fixed_crs_complete CHECK (
+                source_srid = 4326
+                AND jsonb_typeof(projection_config) = 'object'
+                AND (
+                    processing_srid IS NULL OR (
+                        processing_srid > 0
+                        AND processing_srid <> 4326
+                        AND projection_config @>
+                            '{"coordinate_semantics_version": 2}'::jsonb
+                    )
+                )
+            )
         )
     """),
     ("detect_runs", """
@@ -124,8 +139,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             to_source_id        TEXT NOT NULL,
             to_source_row_key   TEXT NOT NULL,
             generated_reason    TEXT NOT NULL DEFAULT 'orthogonal_heading',
-            origin_lon          DOUBLE PRECISION NOT NULL,
-            origin_lat          DOUBLE PRECISION NOT NULL,
+            origin_lon          DOUBLE PRECISION,
+            origin_lat          DOUBLE PRECISION,
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """),
@@ -151,8 +166,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             to_source_id        TEXT NOT NULL,
             to_source_row_key   TEXT NOT NULL,
             generated_reason    TEXT NOT NULL DEFAULT 'orthogonal_cross_track',
-            origin_lon          DOUBLE PRECISION NOT NULL,
-            origin_lat          DOUBLE PRECISION NOT NULL,
+            origin_lon          DOUBLE PRECISION,
+            origin_lat          DOUBLE PRECISION,
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """),
@@ -181,8 +196,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             from_source_row_key TEXT,
             to_source_id        TEXT,
             to_source_row_key   TEXT,
-            origin_lon          DOUBLE PRECISION NOT NULL,
-            origin_lat          DOUBLE PRECISION NOT NULL,
+            origin_lon          DOUBLE PRECISION,
+            origin_lat          DOUBLE PRECISION,
             g_star_z            DOUBLE PRECISION,
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (id, detect_id)
@@ -197,7 +212,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             centroid_lon        DOUBLE PRECISION NOT NULL,
             centroid_lat        DOUBLE PRECISION NOT NULL,
             radius_m            DOUBLE PRECISION NOT NULL,
-            geom                geometry(Polygon, 4326),  -- app-layer: ST_Buffer(geography, radius_m)
+            geom                geometry(Polygon, 4326),  -- fixed-CRS metre buffer transformed to 4326
             source              TEXT NOT NULL DEFAULT 'turn',
             sources             JSONB NOT NULL DEFAULT '[]',
             source_counts       JSONB NOT NULL DEFAULT '{}',
@@ -207,8 +222,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             orthogonal_count    INTEGER NOT NULL DEFAULT 0,
             cross_track_count   INTEGER NOT NULL DEFAULT 0,
             total_event_count   INTEGER NOT NULL DEFAULT 0,
-            origin_lon          DOUBLE PRECISION NOT NULL,
-            origin_lat          DOUBLE PRECISION NOT NULL,
+            origin_lon          DOUBLE PRECISION,
+            origin_lat          DOUBLE PRECISION,
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (id, detect_id)
         )
@@ -229,8 +244,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
                                             ST_SetSRID(ST_MakePoint(crossing_lon, crossing_lat), 4326)
                                         ) STORED,
             branch_angle_deg            DOUBLE PRECISION,
-            origin_lon                  DOUBLE PRECISION NOT NULL,
-            origin_lat                  DOUBLE PRECISION NOT NULL,
+            origin_lon                  DOUBLE PRECISION,
+            origin_lat                  DOUBLE PRECISION,
             from_source_id              TEXT,
             from_source_row_key         TEXT,
             to_source_id                TEXT,
@@ -386,7 +401,7 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     ("idx_te_vehicle_ts",      "CREATE UNIQUE INDEX IF NOT EXISTS idx_te_vehicle_ts ON turn_events(detect_id, vehicle_id, timestamp)"),
     ("idx_te_detect_id",       "CREATE INDEX IF NOT EXISTS idx_te_detect_id ON turn_events(detect_id)"),
     ("idx_te_source",          "CREATE INDEX IF NOT EXISTS idx_te_source ON turn_events(source)"),
-    ("idx_te_xy",              "CREATE INDEX IF NOT EXISTS idx_te_xy ON turn_events(x, y)"),
+    ("idx_te_xy",              "CREATE INDEX IF NOT EXISTS idx_te_xy ON turn_events(detect_id, x, y)"),
     ("idx_te_geom",            "CREATE INDEX IF NOT EXISTS idx_te_geom ON turn_events USING GIST (geom)"),
     ("idx_te_candidate",       "CREATE INDEX IF NOT EXISTS idx_te_candidate ON turn_events(detect_id, candidate_intersection_id) WHERE candidate_intersection_id IS NOT NULL"),
     # ── candidate_intersections ──
@@ -1050,6 +1065,42 @@ def _run_migrations(cur: Any) -> None:
     #     Column additions are handled automatically by _auto_add_missing_columns.
     migrations: list[tuple[str, str]] = [
         (
+            "clean_run_fixed_crs_complete",
+            "DO $$ BEGIN IF NOT EXISTS ("
+            "SELECT 1 FROM pg_constraint "
+            "WHERE conname = 'clean_runs_fixed_crs_complete' "
+            "AND conrelid = 'clean_runs'::regclass AND contype = 'c'"
+            ") THEN ALTER TABLE clean_runs ADD CONSTRAINT "
+            "clean_runs_fixed_crs_complete CHECK (source_srid = 4326 AND "
+            "jsonb_typeof(projection_config) = 'object' AND "
+            "(processing_srid IS NULL OR (processing_srid > 0 AND "
+            "processing_srid <> 4326 AND projection_config @> "
+            "'{\"coordinate_semantics_version\": 2}'::jsonb))); "
+            "END IF; END $$",
+        ),
+        (
+            "clean_run_context_immutable_function",
+            "CREATE OR REPLACE FUNCTION reject_v2_clean_run_context_update() "
+            "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+            "IF OLD.projection_config @> "
+            "'{\"coordinate_semantics_version\": 2}'::jsonb AND "
+            "ROW(NEW.source_srid, NEW.processing_srid, NEW.projection_config) "
+            "IS DISTINCT FROM "
+            "ROW(OLD.source_srid, OLD.processing_srid, OLD.projection_config) "
+            "THEN RAISE EXCEPTION 'fixed-CRS Clean Run context is immutable'; "
+            "END IF; RETURN NEW; END $$",
+        ),
+        (
+            "clean_run_context_immutable_trigger",
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_trigger "
+            "WHERE tgname = 'trg_clean_run_context_immutable' "
+            "AND tgrelid = 'clean_runs'::regclass AND NOT tgisinternal) "
+            "THEN CREATE TRIGGER trg_clean_run_context_immutable "
+            "BEFORE UPDATE OF source_srid, processing_srid, projection_config "
+            "ON clean_runs FOR EACH ROW EXECUTE FUNCTION "
+            "reject_v2_clean_run_context_update(); END IF; END $$",
+        ),
+        (
             "backfill_candidate_membership",
             "DO $$ DECLARE conflict boolean; BEGIN "
             "IF to_regclass('candidate_intersection_events') IS NOT NULL THEN "
@@ -1204,8 +1255,45 @@ def _run_migrations(cur: Any) -> None:
             "REFERENCES candidate_intersections(id, detect_id); END IF; "
             "END $$",
         ),
+        (
+            "injected_origin_nullable",
+            "ALTER TABLE injected_points "
+            "ALTER COLUMN origin_lon DROP NOT NULL, "
+            "ALTER COLUMN origin_lat DROP NOT NULL",
+        ),
+        (
+            "tracks_cross_origin_nullable",
+            "ALTER TABLE tracks_cross "
+            "ALTER COLUMN origin_lon DROP NOT NULL, "
+            "ALTER COLUMN origin_lat DROP NOT NULL",
+        ),
+        (
+            "turn_event_origin_nullable",
+            "ALTER TABLE turn_events "
+            "ALTER COLUMN origin_lon DROP NOT NULL, "
+            "ALTER COLUMN origin_lat DROP NOT NULL",
+        ),
+        (
+            "candidate_intersection_origin_nullable",
+            "ALTER TABLE candidate_intersections "
+            "ALTER COLUMN origin_lon DROP NOT NULL, "
+            "ALTER COLUMN origin_lat DROP NOT NULL",
+        ),
+        (
+            "candidate_entry_exit_origin_nullable",
+            "ALTER TABLE candidate_entry_exit_points "
+            "ALTER COLUMN origin_lon DROP NOT NULL, "
+            "ALTER COLUMN origin_lat DROP NOT NULL",
+        ),
         ("replace_cross_unique_index", "DROP INDEX IF EXISTS idx_tc_segment_pair"),
         ("replace_turn_unique_index", "DROP INDEX IF EXISTS idx_te_vehicle_ts"),
+        (
+            "replace_turn_xy_index",
+            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_indexes "
+            "WHERE schemaname = current_schema() AND indexname = 'idx_te_xy' "
+            "AND indexdef NOT LIKE '%(detect_id, x, y)%') "
+            "THEN DROP INDEX idx_te_xy; END IF; END $$",
+        ),
         ("drop_redundant_ktp_tp_id", "DROP INDEX IF EXISTS idx_ktp_tp_id"),
         (
             "drop_redundant_ktp_vehicle_sub",

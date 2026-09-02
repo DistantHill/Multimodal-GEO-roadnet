@@ -6,17 +6,17 @@ import math
 import random
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 
-from track.v2._geometry import _paired_segment_intersections, _to_lonlat, _to_xy
-import numpy as np
-
 from track.v2._geometry import (
     _batch_segment_intersections,
     _iter_bounded_segment_intersections,
+    _paired_segment_intersections,
+    _to_lonlat,
     _to_xy,
 )
 from track.v2._perf import PerfTracker
@@ -36,7 +36,6 @@ from track.v2.intersect2 import (
     SpatialWindow,
     _cluster_angles_greedy,
     _cluster_dbscan,
-    _cluster_orthogonal_cross_track_candidates,
     _cluster_orthogonal_candidates,
     _annotate_source_ablation,
     _compute_getis_ord_g_star,
@@ -52,6 +51,7 @@ from track.v2.intersect2 import (
     _build_topologies_from_tracks,
     _merge_clusters,
     _nearest_angle_id,
+    _project_tracks,
     _run_dbscan,
     _stream_vehicle_tracks_from_db,
     _topology_point_windows,
@@ -66,13 +66,42 @@ from track.v2.models import (
     IntersectionTopology,
     OrthogonalCandidate,
     PointRef,
+    SpatialContext,
     TrajectoryPoint,
     TurnEvent,
 )
 from track.v2.parser0 import CsvSource, get_database
+from track.v2.projection import CoordinateTransformer, ProjectionError
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
+
+
+_TEST_SPATIAL_CONTEXT = SpatialContext(
+    source_srid=4326,
+    processing_srid=3857,
+    projection_config={"coordinate_semantics_version": 2, "enforce_area_of_use": False, "max_scale_error": 1.0},
+)
+_TEST_TRANSFORMER = CoordinateTransformer(_TEST_SPATIAL_CONTEXT)
+
+
+def _with_processing_xy(
+    tracks: dict[str, list[TrajectoryPoint]],
+) -> dict[str, list[TrajectoryPoint]]:
+    return _project_tracks(tracks, _TEST_TRANSFORMER)
+
+
+def _candidate_keys(candidates):
+    return [
+        (
+            candidate.vehicle_id,
+            candidate.from_source_id,
+            candidate.from_source_row_key,
+            candidate.to_source_id,
+            candidate.to_source_row_key,
+        )
+        for candidate in candidates
+    ]
 
 
 def _make_csv(tmpdir: str, filename: str, content: str, encoding: str = "utf-8") -> Path:
@@ -265,9 +294,11 @@ class PairedSegmentIntersectionTest(unittest.TestCase):
             for index in range(4)
         ]
 
-        with patch("track.v2.cross_track._to_xy", wraps=_to_xy) as project:
+        with patch.object(
+            _TEST_TRANSFORMER, "forward", wraps=_TEST_TRANSFORMER.forward
+        ) as project:
             segments, vehicle_count = _prepare_cross_track_segments(
-                {"A": track}, 116.0, 39.0, IntersectConfig(),
+                {"A": track}, _TEST_TRANSFORMER, IntersectConfig(),
             )
 
         self.assertEqual(vehicle_count, 1)
@@ -432,8 +463,6 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
             candidate.from_source_row_key,
             candidate.to_source_id,
             candidate.to_source_row_key,
-            candidate.origin_lon,
-            candidate.origin_lat,
         )
 
     def _historical_oracle(self, tracks, origin_lon=116.0, origin_lat=39.0):
@@ -582,6 +611,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
     _ROWS = [(
         "vehicle-1", 123.5, 116.1, 39.2, 90.0, 8.0,
         "source-A", "row-7", {"tag": "kept"}, None, None, "",
+        12_934_999.25, 4_748_000.5,
     )]
 
     class _Cursor:
@@ -619,24 +649,31 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             window,
             table="custom_points",
             source_id="source-A",
-            clean_id="clean-9",
+            spatial_context=_TEST_SPATIAL_CONTEXT,
             telemetry=None,
         )
 
         self.assertIn("FROM custom_points", conn.cursor_instance.query)
-        self.assertIn("AND clean_id = %s", conn.cursor_instance.query)
+        self.assertNotIn("injected_points", conn.cursor_instance.query)
+        self.assertIn(
+            "geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)",
+            conn.cursor_instance.query,
+        )
+        self.assertIn(
+            "ST_Transform(geom, 3857) && ST_MakeEnvelope(%s, %s, %s, %s, 3857)",
+            conn.cursor_instance.query,
+        )
+        source_bounds = _TEST_TRANSFORMER.inverse_bounds((-1.0, -2.0, 3.0, 4.0))
         self.assertEqual(
             conn.cursor_instance.params,
-            [
-                "source-A", -1.0, -2.0, 3.0, 4.0,
-                "public.injected_points", -1.0, -2.0, 3.0, 4.0, "clean-9",
-            ],
+            ["source-A", *source_bounds, -1.0, -2.0, 3.0, 4.0],
         )
         self.assertEqual(len(points), 1)
         point = points[0]
         self.assertEqual(point.vehicle_id, "vehicle-1")
         self.assertEqual(point.timestamp, 123.5)
         self.assertEqual((point.lon, point.lat), (116.1, 39.2))
+        self.assertEqual((point.x, point.y), (12_934_999.25, 4_748_000.5))
         self.assertEqual(point.point_ref, PointRef("source-A", "row-7", stable=True))
         self.assertEqual(point.extra, {"tag": "kept"})
 
@@ -651,6 +688,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             kept_table="ktp",
             source_id="source-A",
             clean_id="clean-9",
+            spatial_context=_TEST_SPATIAL_CONTEXT,
             telemetry=None,
         )
 
@@ -658,11 +696,28 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
         self.assertIn("JOIN tp AS tp ON tp.id = ktp.trajectory_point_id", conn.cursor_instance.query)
         self.assertIn("ktp.clean_id = %s", conn.cursor_instance.query)
         self.assertNotIn("is_active", conn.cursor_instance.query)
+        self.assertIn(
+            "FROM injected_points   WHERE geom && "
+            "ST_MakeEnvelope(%s, %s, %s, %s, 4326)",
+            conn.cursor_instance.query,
+        )
+        source_bounds = _TEST_TRANSFORMER.inverse_bounds((-1.0, -2.0, 3.0, 4.0))
         self.assertEqual(
             conn.cursor_instance.params,
             [
-                "clean-9", -1.0, -2.0, 3.0, 4.0,
-                "public.injected_points", -1.0, -2.0, 3.0, 4.0, "clean-9",
+                "clean-9",
+                *source_bounds,
+                -1.0,
+                -2.0,
+                3.0,
+                4.0,
+                "public.injected_points",
+                *source_bounds,
+                -1.0,
+                -2.0,
+                3.0,
+                4.0,
+                "clean-9",
             ],
         )
         self.assertEqual(len(points), 1)
@@ -676,13 +731,14 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
                 SpatialWindow(-1.0, -2.0, 3.0, 4.0),
                 kept_table="ktp",
                 clean_id=None,
+                spatial_context=_TEST_SPATIAL_CONTEXT,
             )
 
-    def test_window_preserves_injected_point_database_identity_and_provenance(self):
+    def test_window_preserves_injected_database_identity_provenance_and_xy(self):
         rows = [(
             "vehicle-1", 123.5, 116.1, 39.2, 90.0, 0.0,
             "public.injected_points", "282", {}, "21022680", "21022681",
-            "orthogonal_heading",
+            "orthogonal_heading", 12_946_000.25, 4_762_000.5,
         )]
         conn = self._Connection(rows)
 
@@ -691,9 +747,16 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             SpatialWindow(-1.0, -2.0, 3.0, 4.0),
             table="tp",
             kept_table="ktp",
+            source_id="source-A",
             clean_id="clean-9",
+            spatial_context=_TEST_SPATIAL_CONTEXT,
         )
 
+        outer_select, _separator, _branches = conn.cursor_instance.query.partition("FROM (")
+        self.assertIn("from_source_row_key", outer_select)
+        self.assertIn("to_source_row_key", outer_select)
+        self.assertIn("generated_reason", outer_select)
+        self.assertIn("x, y", outer_select)
         self.assertEqual(
             points[0].point_ref,
             PointRef(
@@ -705,12 +768,13 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
                 generated_reason="orthogonal_heading",
             ),
         )
+        self.assertEqual((points[0].x, points[0].y), (12_946_000.25, 4_762_000.5))
 
     def test_stream_uses_injected_table_and_id_as_point_identity(self):
         rows = [(
             "vehicle-1", 123.5, 116.1, 39.2, 90.0, 0.0,
             "public.injected_points", "282", {}, "21022680", "21022681",
-            "heading_orthogonal",
+            "heading_orthogonal", 12_946_000.25, 4_762_000.5,
         )]
         conn = self._Connection(rows)
 
@@ -719,6 +783,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             table="tp",
             kept_table="ktp",
             clean_id="clean-9",
+            spatial_context=_TEST_SPATIAL_CONTEXT,
         ))
 
         self.assertEqual(
@@ -738,6 +803,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
                 generated_reason="heading_orthogonal",
             ),
         )
+        self.assertEqual((tracks[0][0].x, tracks[0][0].y), (12_946_000.25, 4_762_000.5))
 
     def test_query_with_telemetry_records_disjoint_query_and_materialization_phases(self):
         conn = self._Connection(self._ROWS)
@@ -750,6 +816,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             points = _query_active_points_in_window(
                 conn,
                 SpatialWindow(-1.0, -2.0, 3.0, 4.0),
+                spatial_context=_TEST_SPATIAL_CONTEXT,
                 telemetry=telemetry,
             )
 
@@ -825,8 +892,9 @@ class CrossTrackWindowProgressTest(unittest.TestCase):
              patch("builtins.print") as print_mock:
             _extract_cross_track_windows(
                 object(), cfg,
-                extent=(0.0, 0.0, 0.02, 0.02),
-                origin_lon=0.01, origin_lat=0.01,
+                extent=(0.0, 0.0, 2_500.0, 2_500.0),
+                spatial_context=_TEST_SPATIAL_CONTEXT,
+                transformer=_TEST_TRANSFORMER,
             )
 
         output = "\n".join(str(call.args[0]) for call in print_mock.call_args_list)
@@ -847,40 +915,21 @@ class CrossTrackWindowProgressTest(unittest.TestCase):
         )
         with patch("track.v2.intersect2._query_active_points_in_window", return_value=points), \
               patch("builtins.print"):
-            legacy_candidates = _extract_cross_track_windows(
-                object(), cfg,
-                extent=(116.0, 39.0, 116.02, 39.02),
-                origin_lon=origin_lon, origin_lat=origin_lat,
-                candidate_extractor=_extract_orthogonal_cross_track_candidates_legacy,
-            )
+            centre_x, centre_y = _TEST_TRANSFORMER.forward(origin_lon, origin_lat)
             candidates = _extract_cross_track_windows(
                 object(), cfg,
-                extent=(116.0, 39.0, 116.02, 39.02),
-                origin_lon=origin_lon, origin_lat=origin_lat,
+                extent=(centre_x - 1_000.0, centre_y - 1_000.0,
+                        centre_x + 1_000.0, centre_y + 1_000.0),
+                spatial_context=_TEST_SPATIAL_CONTEXT,
+                transformer=_TEST_TRANSFORMER,
             )
 
-        self.assertEqual(
-            [candidate.as_dict() for candidate in candidates],
-            [candidate.as_dict() for candidate in legacy_candidates],
-        )
-        self.assertEqual(
-            [cluster.as_dict() for cluster in _cluster_orthogonal_cross_track_candidates(
-                candidates, origin_lon, origin_lat,
-                eps_m=cfg.cross_track_dbscan_eps_m,
-                min_samples=cfg.cross_track_dbscan_min_samples,
-            )],
-            [cluster.as_dict() for cluster in _cluster_orthogonal_cross_track_candidates(
-                legacy_candidates, origin_lon, origin_lat,
-                eps_m=cfg.cross_track_dbscan_eps_m,
-                min_samples=cfg.cross_track_dbscan_min_samples,
-            )],
-        )
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].vehicle_id, "A|B")
 
 
 class GroupByVehicleTest(unittest.TestCase):
-    """I2-03: Groups by vehicle_id, returns correct origin."""
+    """I2-03: Grouping is independent of source row order and CRS choice."""
 
     def test_group_by_vehicle(self):
         with tempfile.TemporaryDirectory() as td:
@@ -893,14 +942,111 @@ class GroupByVehicleTest(unittest.TestCase):
             )
             source = CsvSource(csv_path)
             handle = get_database(source)
-            tracks, origin_lon, origin_lat = _group_by_vehicle(handle)
+            tracks = _group_by_vehicle(handle)
             self.assertEqual(len(tracks), 2)
             self.assertIn("v1", tracks)
             self.assertIn("v2", tracks)
             self.assertEqual(len(tracks["v1"]), 2)
             self.assertEqual(len(tracks["v2"]), 1)
-            self.assertAlmostEqual(origin_lon, 116.0)
             handle.close()
+
+
+class ProjectionContextContractTest(unittest.TestCase):
+    """Detect uses one explicit Run projection regardless of input ordering."""
+
+    class _Handle:
+        def __init__(self, points=(), spatial_context=None):
+            self._points = tuple(points)
+            self.spatial_context = spatial_context
+
+        def iter_points(self):
+            yield from self._points
+
+    def test_detect_requires_explicit_run_spatial_context(self):
+        with self.assertRaisesRegex(V2Error, "requires.*SpatialContext"):
+            detect_intersections(self._Handle())
+
+    def test_empty_result_carries_parent_run_spatial_context(self):
+        result = detect_intersections(
+            self._Handle(), spatial_context=_TEST_SPATIAL_CONTEXT
+        )
+
+        self.assertEqual(result.spatial_context, _TEST_SPATIAL_CONTEXT)
+
+    def test_cleaner_handle_context_must_match_detect_context(self):
+        with self.assertRaisesRegex(V2Error, "does not match"):
+            detect_intersections(
+                self._Handle(spatial_context=object()),
+                spatial_context=_TEST_SPATIAL_CONTEXT,
+            )
+
+    def test_projection_is_independent_of_which_source_point_arrives_first(self):
+        points = [
+            _make_point("v1", "west", 1.0, 115.9, 38.9, 90.0, 8.0),
+            _make_point("v1", "east", 2.0, 116.1, 39.1, 90.0, 8.0),
+        ]
+
+        forward = _project_tracks({"v1": points}, _TEST_TRANSFORMER)
+        reversed_input = _project_tracks(
+            {"v1": list(reversed(points))}, _TEST_TRANSFORMER
+        )
+        forward_by_ref = {
+            point.point_ref.source_row_key: (point.x, point.y)
+            for point in forward["v1"]
+        }
+        reversed_by_ref = {
+            point.point_ref.source_row_key: (point.x, point.y)
+            for point in reversed_input["v1"]
+        }
+
+        self.assertEqual(forward_by_ref, reversed_by_ref)
+        for point in points:
+            expected = _TEST_TRANSFORMER.forward(point.lon, point.lat)
+            actual = forward_by_ref[point.point_ref.source_row_key]
+            self.assertAlmostEqual(actual[0], expected[0], places=7)
+            self.assertAlmostEqual(actual[1], expected[1], places=7)
+
+    def test_in_memory_handle_does_not_trust_unscoped_existing_xy(self):
+        point = replace(
+            _make_point("v1", "legacy", 1.0, 116.0, 39.0, 90.0, 8.0),
+            x=12.0,
+            y=34.0,
+        )
+
+        projected = _project_tracks({"v1": [point]}, _TEST_TRANSFORMER)["v1"][0]
+
+        self.assertEqual(
+            (projected.x, projected.y),
+            _TEST_TRANSFORMER.forward(point.lon, point.lat),
+        )
+
+    def test_db_projected_xy_is_preserved_without_reprojection(self):
+        point = replace(
+            _make_point("v1", "db-row", 1.0, 116.0, 39.0, 0.0, 8.0),
+            x=12_345.25,
+            y=-98_765.5,
+        )
+
+        with patch.object(_TEST_TRANSFORMER, "forward_many") as transform:
+            projected = _project_tracks(
+                {"v1": [point]}, _TEST_TRANSFORMER, trust_existing=True
+            )
+
+        transform.assert_not_called()
+        self.assertIs(projected["v1"][0], point)
+        self.assertEqual(
+            (projected["v1"][0].x, projected["v1"][0].y),
+            (12_345.25, -98_765.5),
+        )
+
+    def test_half_populated_projected_coordinate_is_rejected(self):
+        point = replace(
+            _make_point("v1", "bad-row", 1.0, 116.0, 39.0, 0.0, 8.0),
+            x=12_345.25,
+        )
+
+        with self.assertRaisesRegex(V2Error, "both processing x and y"):
+            _project_tracks({"v1": [point]}, _TEST_TRANSFORMER)
 
 
 # ── Turn detection tests (Method 1) ───────────────────────────────────
@@ -918,7 +1064,7 @@ class TurnDetectionTest(unittest.TestCase):
         tracks = {"v1": track}
         cfg = IntersectConfig(turn_window=2, min_turn_deg=45.0, max_turn_deg=170.0,
                               min_leg_m=20.0, min_movement_speed_mps=1.0)
-        events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg)
+        events = _detect_turn_events(_with_processing_xy(tracks), cfg)
         self.assertGreaterEqual(len(events), 1, "Should detect at least one turn event")
         # The turn should be near 90°
         for e in events:
@@ -936,9 +1082,9 @@ class TurnDetectionTest(unittest.TestCase):
                 _make_point("v1", str(i), ts, origin_lon, lat, 0.0, 10.0)
             )
             ts += 10.0
-        tracks = {"v1": points}
+        tracks = _with_processing_xy({"v1": points})
         cfg = IntersectConfig()
-        events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg)
+        events = _detect_turn_events(tracks, cfg)
         self.assertEqual(len(events), 0)
 
     def test_min_turn_deg_filter(self):
@@ -950,7 +1096,7 @@ class TurnDetectionTest(unittest.TestCase):
         )
         tracks = {"v1": track}
         cfg = IntersectConfig(min_turn_deg=45.0, min_leg_m=20.0, min_movement_speed_mps=1.0)
-        events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg)
+        events = _detect_turn_events(_with_processing_xy(tracks), cfg)
         self.assertEqual(len(events), 0, "30° turn should be filtered by min_turn_deg=45")
 
     def test_max_turn_deg_filter(self):
@@ -962,7 +1108,7 @@ class TurnDetectionTest(unittest.TestCase):
         )
         tracks = {"v1": track}
         cfg = IntersectConfig(max_turn_deg=170.0, min_leg_m=20.0, min_movement_speed_mps=1.0)
-        events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg)
+        events = _detect_turn_events(_with_processing_xy(tracks), cfg)
         # U-turn of 180° should NOT be detected (above max_turn_deg)
         for e in events:
             self.assertNotAlmostEqual(abs(e.turn_deg), 180.0, delta=1.0)
@@ -980,9 +1126,9 @@ class TurnDetectionTest(unittest.TestCase):
                 _make_point("v1", str(i), ts, origin_lon, lat, heading, 10.0)
             )
             ts += 10.0
-        tracks = {"v1": points}
+        tracks = _with_processing_xy({"v1": points})
         cfg = IntersectConfig(min_leg_m=35.0, min_turn_deg=45.0, min_movement_speed_mps=0.5)
-        events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg)
+        events = _detect_turn_events(tracks, cfg)
         self.assertEqual(len(events), 0, "Short legs should be filtered")
 
 
@@ -1278,7 +1424,7 @@ class DBSCANTest(unittest.TestCase):
                       300 + i, 300 + i, 0, 90, 90, 90)
             for i in range(4)
         ]
-        clusters = _cluster_dbscan(events, origin_lon, origin_lat,
+        clusters = _cluster_dbscan(events, _TEST_TRANSFORMER,
                                    eps_m=100.0, min_samples=3)
         self.assertEqual(len(clusters), 2, f"Expected 2 clusters, got {len(clusters)}")
         self.assertEqual(clusters[0].sources, ("turn",))
@@ -1292,7 +1438,7 @@ class DBSCANTest(unittest.TestCase):
             TurnEvent(0, "v1", 1000, 116, 39, 0, 0, 0, 90, 90, 90),
             TurnEvent(1, "v2", 1001, 116, 39, 5000, 5000, 0, 90, 90, 90),
         ]
-        clusters = _cluster_dbscan(events, origin_lon, origin_lat,
+        clusters = _cluster_dbscan(events, _TEST_TRANSFORMER,
                                    eps_m=100.0, min_samples=3)
         self.assertEqual(len(clusters), 0, "Isolated events should be noise")
 
@@ -1303,7 +1449,7 @@ class DBSCANTest(unittest.TestCase):
             TurnEvent(i, f"v{i}", 1000 + i, 116, 39, i * 5, i * 5, 0, 90, 90, 90)
             for i in range(5)
         ]
-        clusters = _cluster_dbscan(events, origin_lon, origin_lat,
+        clusters = _cluster_dbscan(events, _TEST_TRANSFORMER,
                                    eps_m=200.0, min_samples=3)
         self.assertEqual(len(clusters), 1)
 
@@ -1472,7 +1618,7 @@ class OrthogonalCandidateTest(unittest.TestCase):
         }
 
         candidates, pair_count, total_pairs = _extract_orthogonal_cross_track_candidates(
-            tracks, origin_lon, origin_lat, IntersectConfig(),
+            tracks, _TEST_TRANSFORMER, IntersectConfig(),
         )
 
         self.assertEqual(len(candidates), 1)
@@ -1507,7 +1653,7 @@ class OrthogonalCandidateTest(unittest.TestCase):
         }
 
         candidates, pair_count, total_pairs = _extract_orthogonal_cross_track_candidates(
-            tracks, origin_lon, origin_lat, IntersectConfig(),
+            tracks, _TEST_TRANSFORMER, IntersectConfig(),
         )
 
         self.assertEqual((pair_count, total_pairs), (3, 3))
@@ -1534,15 +1680,15 @@ class OrthogonalCandidateTest(unittest.TestCase):
         }
 
         candidates, _, _ = _extract_orthogonal_cross_track_candidates(
-            tracks, origin_lon, origin_lat, IntersectConfig(),
+            tracks, _TEST_TRANSFORMER, IntersectConfig(),
         )
 
         self.assertEqual(len(candidates), 1)
-        self.assertAlmostEqual(candidates[0].x, 0.0, places=9)
-        self.assertAlmostEqual(candidates[0].y, 0.0, places=9)
+        self.assertAlmostEqual(candidates[0].lon, origin_lon, places=9)
+        self.assertAlmostEqual(candidates[0].lat, origin_lat, places=9)
 
-    def test_nonfinite_coordinates_match_legacy_miss_semantics(self):
-        """NaN/Inf coordinates must not make grid preparation fail early."""
+    def test_nonfinite_coordinates_fail_projection_before_geometry(self):
+        """A fixed Run projection rejects invalid 4326 coordinates explicitly."""
         origin_lon, origin_lat = 116.0, 39.0
         for nonfinite in (float("nan"), float("inf")):
             tracks = {
@@ -1559,18 +1705,10 @@ class OrthogonalCandidateTest(unittest.TestCase):
                     _make_point("C", "c1", 20.0, origin_lon + 0.001, origin_lat, 90.0, 8.0),
                 ],
             }
-            with np.errstate(all="ignore"):
-                legacy = _extract_orthogonal_cross_track_candidates_legacy(
-                    tracks, origin_lon, origin_lat, IntersectConfig(),
+            with self.assertRaises(ProjectionError):
+                _extract_orthogonal_cross_track_candidates(
+                    tracks, _TEST_TRANSFORMER, IntersectConfig(),
                 )
-                bounded = _extract_orthogonal_cross_track_candidates(
-                    tracks, origin_lon, origin_lat, IntersectConfig(),
-                )
-            self.assertEqual(legacy[1:], bounded[1:])
-            self.assertEqual(
-                [candidate.as_dict() for candidate in legacy[0]],
-                [candidate.as_dict() for candidate in bounded[0]],
-            )
 
     def test_oversized_aabb_uses_bounded_fallback_without_losing_hit(self):
         """A long segment is not expanded into more than the private cell cap."""
@@ -1586,7 +1724,7 @@ class OrthogonalCandidateTest(unittest.TestCase):
             ],
         }
         segments, _ = _prepare_cross_track_segments(
-            tracks, origin_lon, origin_lat, IntersectConfig(),
+            tracks, _TEST_TRANSFORMER, IntersectConfig(),
         )
         max_grid_cells = IntersectConfig().cross_track_max_grid_cells_per_segment
         grid, overflow_ids = _cross_track_grid(segments, max_grid_cells)
@@ -1600,16 +1738,13 @@ class OrthogonalCandidateTest(unittest.TestCase):
             tracks, origin_lon, origin_lat, IntersectConfig(),
         )
         bounded = _extract_orthogonal_cross_track_candidates(
-            tracks, origin_lon, origin_lat, IntersectConfig(),
+            tracks, _TEST_TRANSFORMER, IntersectConfig(),
         )
         self.assertEqual(legacy[1:], bounded[1:])
-        self.assertEqual(
-            [candidate.as_dict() for candidate in legacy[0]],
-            [candidate.as_dict() for candidate in bounded[0]],
-        )
+        self.assertEqual(_candidate_keys(legacy[0]), _candidate_keys(bounded[0]))
 
-    def test_seeded_cross_track_differential_preserves_candidates_and_clusters(self):
-        """Grid ownership matches the legacy oracle across adversarial small tracks."""
+    def test_seeded_cross_track_differential_preserves_candidate_provenance(self):
+        """Fixed-CRS broad phase preserves legacy segment-pair ownership."""
         origin_lon, origin_lat = 116.0, 39.0
         cfg = IntersectConfig(cross_track_dbscan_min_samples=1)
 
@@ -1642,27 +1777,16 @@ class OrthogonalCandidateTest(unittest.TestCase):
                     tracks, origin_lon, origin_lat, cfg,
                 )
                 bounded = _extract_orthogonal_cross_track_candidates(
-                    tracks, origin_lon, origin_lat, cfg,
+                    tracks, _TEST_TRANSFORMER, cfg,
                 )
             self.assertEqual(legacy[1:], bounded[1:], f"seed={seed}")
-            self.assertEqual(
-                [candidate.as_dict() for candidate in legacy[0]],
-                [candidate.as_dict() for candidate in bounded[0]],
-                f"seed={seed}",
-            )
-            self.assertEqual(
-                [cluster.as_dict() for cluster in _cluster_orthogonal_cross_track_candidates(
-                    legacy[0], origin_lon, origin_lat,
-                    eps_m=cfg.cross_track_dbscan_eps_m,
-                    min_samples=cfg.cross_track_dbscan_min_samples,
-                )],
-                [cluster.as_dict() for cluster in _cluster_orthogonal_cross_track_candidates(
-                    bounded[0], origin_lon, origin_lat,
-                    eps_m=cfg.cross_track_dbscan_eps_m,
-                    min_samples=cfg.cross_track_dbscan_min_samples,
-                )],
-                f"seed={seed}",
-            )
+            self.assertEqual(_candidate_keys(legacy[0]), _candidate_keys(bounded[0]), f"seed={seed}")
+            for candidate in bounded[0]:
+                expected_x, expected_y = _TEST_TRANSFORMER.forward(
+                    candidate.lon, candidate.lat
+                )
+                self.assertAlmostEqual(candidate.x, expected_x, places=6)
+                self.assertAlmostEqual(candidate.y, expected_y, places=6)
 
     def test_cluster_orthogonal_candidates(self):
         """I2-17: Orthogonal candidates can be clustered."""
@@ -1683,7 +1807,7 @@ class OrthogonalCandidateTest(unittest.TestCase):
                 )
             )
         clusters = _cluster_orthogonal_candidates(
-            candidates, origin_lon, origin_lat, eps_m=100.0, min_samples=3
+            candidates, _TEST_TRANSFORMER, eps_m=100.0, min_samples=3
         )
         self.assertEqual(len(clusters), 1)
         self.assertEqual(clusters[0].source, "orthogonal")
@@ -1710,26 +1834,34 @@ class TopologyExtractionTest(unittest.TestCase):
                 _make_point("v1", str(i), ts, origin_lon, lat, 0.0, 10.0)
             )
             ts += 10.0
-        tracks = {"v1": points}
+        tracks = _with_processing_xy({"v1": points})
+        center_x, center_y = _TEST_TRANSFORMER.forward(origin_lon, origin_lat)
 
         cluster = HotspotCluster(
             cluster_calculate_index=0,
-            centroid_x=0.0, centroid_y=0.0,
+            centroid_x=center_x, centroid_y=center_y,
             centroid_lon=origin_lon, centroid_lat=origin_lat,
             radius_m=50.0,
             events=(),
             source="turn",
         )
-        observations = _extract_entry_exit_observations_batch(
+        observations, crossing_points = _extract_entry_exit_observations_batch(
             tracks, cluster=cluster,
-            origin_lon=origin_lon, origin_lat=origin_lat,
+            transformer=_TEST_TRANSFORMER,
             radius_m=150.0, bearing_window=2,
         )
         self.assertGreaterEqual(len(observations), 1,
                                 "Vehicle passing through circle should create observation")
+        self.assertTrue(crossing_points)
+        for point in crossing_points:
+            roundtrip_x, roundtrip_y = _TEST_TRANSFORMER.forward(
+                point.crossing_lon, point.crossing_lat
+            )
+            self.assertAlmostEqual(point.crossing_x, roundtrip_x, places=6)
+            self.assertAlmostEqual(point.crossing_y, roundtrip_y, places=6)
 
-    def test_global_tracks_are_routed_to_legacy_topology_query_boxes(self):
-        """One track scan reproduces each former per-cluster bbox result."""
+    def test_global_tracks_are_routed_to_projected_topology_query_boxes(self):
+        """One projected track scan reproduces each former per-cluster result."""
         cfg = IntersectConfig(
             min_intersection_radius_m=100.0,
             topology_radius_padding_m=0.0,
@@ -1737,8 +1869,8 @@ class TopologyExtractionTest(unittest.TestCase):
         clusters = [
             HotspotCluster(
                 cluster_calculate_index=index,
-                centroid_x=0.0,
-                centroid_y=0.0,
+                centroid_x=_TEST_TRANSFORMER.forward(lon, 0.0)[0],
+                centroid_y=_TEST_TRANSFORMER.forward(lon, 0.0)[1],
                 centroid_lon=lon,
                 centroid_lat=0.0,
                 radius_m=1.0,
@@ -1748,10 +1880,10 @@ class TopologyExtractionTest(unittest.TestCase):
             for index, lon in enumerate((0.0, 0.01))
         ]
         lons = (-0.002, -0.001, 0.0, 0.001, 0.0085, 0.01, 0.012)
-        track = [
+        track = _with_processing_xy({"v1": [
             _make_point("v1", str(index), float(index), lon, 0.0, 0.0, 5.0)
             for index, lon in enumerate(lons)
-        ]
+        ]})["v1"]
 
         windows = _topology_point_windows(clusters, cfg)
         point_index = _build_topology_point_index({"v1": track})
@@ -1768,10 +1900,10 @@ class TopologyExtractionTest(unittest.TestCase):
             ["4", "5"],
         )
 
-        tie_track = [
+        tie_track = _with_processing_xy({"tie": [
             _make_point("tie", "stream-first", 1.0, 0.001, 0.0, 0.0, 5.0),
             _make_point("tie", "stream-second", 1.0, -0.001, 0.0, 0.0, 5.0),
-        ]
+        ]})["tie"]
         tie_index = _build_topology_point_index({"tie": tie_track})
         self.assertEqual(
             [
@@ -1796,18 +1928,18 @@ class TopologyExtractionTest(unittest.TestCase):
             events=(),
             source="turn",
         )
-        track = [
+        track = _with_processing_xy({"v1": [
             _make_point("v1", "outside", 0.0, -0.01, 0.0, 0.0, 5.0),
             _make_point("v1", "inside-a", 1.0, -0.001, 0.0, 0.0, 5.0),
             _make_point("v1", "inside-b", 2.0, 0.001, 0.0, 0.0, 5.0),
-        ]
+        ]})["v1"]
 
         with patch(
             "track.v2.intersect2._extract_entry_exit_observations_batch",
             return_value=([], []),
         ) as extract:
             topologies, annotated, observations = _build_topologies_from_tracks(
-                [cluster], {"v1": track}, cfg, 0.0, 0.0,
+                [cluster], {"v1": track}, cfg, _TEST_TRANSFORMER,
             )
 
         routed_track = extract.call_args.args[0]["v1"]
@@ -1851,12 +1983,14 @@ class TopologyExtractionTest(unittest.TestCase):
 
     def test_db_mode_reuses_streamed_tracks_for_topology(self):
         """DB Detect passes its one workspace to topology without N+1 queries."""
-        point = _make_point("v1", "1", 1.0, 116.0, 39.0, 0.0, 5.0)
+        point = _with_processing_xy({
+            "v1": [_make_point("v1", "1", 1.0, 116.0, 39.0, 0.0, 5.0)]
+        })["v1"][0]
         tracks = {"v1": [point]}
         cluster = HotspotCluster(
             cluster_calculate_index=0,
-            centroid_x=0.0,
-            centroid_y=0.0,
+            centroid_x=point.x,
+            centroid_y=point.y,
             centroid_lon=116.0,
             centroid_lat=39.0,
             radius_m=1.0,
@@ -1897,6 +2031,7 @@ class TopologyExtractionTest(unittest.TestCase):
             result = detect_intersections(
                 conn=object(),
                 config=IntersectConfig(query_active_from_db=True),
+                spatial_context=_TEST_SPATIAL_CONTEXT,
             )
 
         self.assertIs(build_topologies.call_args.args[1], tracks)
@@ -1937,8 +2072,9 @@ class ClusterMergeTest(unittest.TestCase):
                 ),
             },
         )
-        merged = _merge_clusters([c1, c2], merge_distance_m=80.0,
-                                 origin_lon=origin_lon, origin_lat=origin_lat)
+        merged = _merge_clusters(
+            [c1, c2], merge_distance_m=80.0, transformer=_TEST_TRANSFORMER
+        )
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0].source, "merged")
         self.assertEqual(merged[0].sources, ("orthogonal", "turn"))
@@ -1963,8 +2099,9 @@ class ClusterMergeTest(unittest.TestCase):
             centroid_lon=117.0, centroid_lat=40.0,
             radius_m=50.0, events=(), source="orthogonal",
         )
-        merged = _merge_clusters([c1, c2], merge_distance_m=80.0,
-                                 origin_lon=origin_lon, origin_lat=origin_lat)
+        merged = _merge_clusters(
+            [c1, c2], merge_distance_m=80.0, transformer=_TEST_TRANSFORMER
+        )
         self.assertEqual(len(merged), 2)
 
 
@@ -1983,8 +2120,7 @@ class SourceAblationTest(unittest.TestCase):
         cfg = IntersectConfig(dbscan_eps_m_turn=100.0, dbscan_min_samples_turn=3)
         clusters = _cluster_dbscan(
             events,
-            origin_lon,
-            origin_lat,
+            _TEST_TRANSFORMER,
             eps_m=cfg.dbscan_eps_m_turn,
             min_samples=cfg.dbscan_min_samples_turn,
         )
@@ -1994,8 +2130,7 @@ class SourceAblationTest(unittest.TestCase):
             events,
             [],
             cfg,
-            origin_lon,
-            origin_lat,
+            _TEST_TRANSFORMER,
         )
 
         self.assertEqual(len(annotated), 1)
@@ -2043,7 +2178,7 @@ class EndToEndTest(unittest.TestCase):
                 g_star_radius_m=500.0, g_star_min_z=-1.0,  # lenient to catch all
                 dbscan_eps_m_turn=500.0, dbscan_min_samples_turn=2,
                 min_branches=2, min_observations=2, min_directed_transitions=2,
-            ))
+            ), spatial_context=_TEST_SPATIAL_CONTEXT)
             handle.close()
 
             self.assertGreaterEqual(len(result.turn_events), 4,
@@ -2066,7 +2201,9 @@ class EndToEndTest(unittest.TestCase):
 
             source = CsvSource(csv_path)
             handle = get_database(source)
-            result = detect_intersections(handle)
+            result = detect_intersections(
+                handle, spatial_context=_TEST_SPATIAL_CONTEXT
+            )
             handle.close()
 
             self.assertEqual(len(result.turn_events), 0,
@@ -2091,6 +2228,7 @@ class EndToEndTest(unittest.TestCase):
                     use_turn_events=False,
                     cross_track_dbscan_min_samples=1,
                 ),
+                spatial_context=_TEST_SPATIAL_CONTEXT,
             )
             handle.close()
 
@@ -2107,7 +2245,9 @@ class EndToEndTest(unittest.TestCase):
         source = CsvSource(hfm_path)
         handle = get_database(source)
         # Run with default config
-        result = detect_intersections(handle)
+        result = detect_intersections(
+            handle, spatial_context=_TEST_SPATIAL_CONTEXT
+        )
         handle.close()
 
         # Just verify no crashes and some output

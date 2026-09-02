@@ -442,26 +442,43 @@ def _manifest(result_dir: Path, *, allow_create: bool = False) -> Path:
     return path
 
 
-def _freeze_real_snapshot(root: Path, csv_path: Path, sidecar: Path) -> dict[str, Any]:
+def _freeze_real_snapshot(
+    root: Path,
+    csv_path: Path,
+    sidecar: Path,
+    *,
+    processing_srid: int,
+) -> dict[str, Any]:
     """Freeze real TurnEvents through the project CSV source entrypoint."""
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
-    from track.v2.intersect2 import IntersectConfig, _detect_turn_events, _group_by_vehicle
+    from track.v2.intersect2 import (
+        IntersectConfig,
+        _detect_turn_events,
+        _group_by_vehicle,
+        _project_tracks,
+    )
+    from track.v2.models import ProjectionConfig
     from track.v2.parser0 import CsvSource, get_database
+    from track.v2.projection import CoordinateTransformer, create_spatial_context
 
     raw = csv_path.read_bytes()
     cfg = IntersectConfig()
+    spatial_context = create_spatial_context(
+        ProjectionConfig(processing_srid=processing_srid)
+    )
+    transformer = CoordinateTransformer(spatial_context)
     handle = get_database(CsvSource(csv_path))
     try:
-        tracks, origin_lon, origin_lat = _group_by_vehicle(handle)
+        tracks = _project_tracks(_group_by_vehicle(handle), transformer)
     finally:
         handle.close()
-    events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg)
+    events = _detect_turn_events(tracks, cfg)
     payload = {
-        "schema": "hotspots_real_turn_event_snapshot_v1",
+        "schema": "hotspots_real_turn_event_snapshot_v2_fixed_crs",
         "source": {"path": str(csv_path), "size_bytes": len(raw), "sha256": _sha256_bytes(raw),
-                   "entrypoint": "CsvSource -> get_database -> _group_by_vehicle -> _detect_turn_events"},
-        "origin": {"lon": origin_lon, "lat": origin_lat},
+                   "entrypoint": "CsvSource -> get_database -> _group_by_vehicle -> fixed CRS -> _detect_turn_events"},
+        "spatial_context": asdict(spatial_context),
         "track_count": len(tracks), "point_count": sum(len(track) for track in tracks.values()),
         "turn_event_count": len(events), "config": asdict(cfg),
         "turn_events": [asdict(event) for event in events],
@@ -473,7 +490,8 @@ def _freeze_real_snapshot(root: Path, csv_path: Path, sidecar: Path) -> dict[str
     sidecar.write_text(encoded, encoding="utf-8")
     return {"path": str(sidecar), "sha256": _sha256_bytes(encoded.encode()), **payload["source"],
             "track_count": payload["track_count"], "point_count": payload["point_count"],
-            "turn_event_count": payload["turn_event_count"], "origin": payload["origin"]}
+            "turn_event_count": payload["turn_event_count"],
+            "spatial_context": payload["spatial_context"]}
 
 
 def _write_scipy_evidence(result_dir: Path) -> Path:
@@ -528,7 +546,16 @@ def _main(args: argparse.Namespace) -> int:
     if args.freeze_real_snapshot:
         if args.real_csv is None:
             raise RuntimeError("--freeze-real-snapshot requires --real-csv")
-        metadata = _freeze_real_snapshot(root, args.real_csv.resolve(), real_snapshot or result_dir / "real_turn_events_snapshot.json")
+        if args.processing_srid is None:
+            raise RuntimeError(
+                "--freeze-real-snapshot requires an explicit --processing-srid"
+            )
+        metadata = _freeze_real_snapshot(
+            root,
+            args.real_csv.resolve(),
+            real_snapshot or result_dir / "real_turn_events_snapshot.json",
+            processing_srid=args.processing_srid,
+        )
         print(json.dumps(metadata, sort_keys=True))
         return 0
     if args.manifest_only:
@@ -679,6 +706,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--real-csv", type=Path)
     parser.add_argument("--real-snapshot", type=Path)
     parser.add_argument("--freeze-real-snapshot", action="store_true")
+    parser.add_argument(
+        "--processing-srid",
+        type=int,
+        help="Explicit projected metre CRS for --freeze-real-snapshot.",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--verbose", action="store_true")

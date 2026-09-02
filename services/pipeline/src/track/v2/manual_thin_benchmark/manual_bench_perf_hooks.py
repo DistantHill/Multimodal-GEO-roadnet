@@ -18,7 +18,8 @@ Test dimensions / 测试维度:
 
 用法 / Usage::
 
-    uv run python track/v2/manual_thin_benchmark/manual_bench_perf_hooks.py
+    uv run python track/v2/manual_thin_benchmark/manual_bench_perf_hooks.py \
+      --processing-srid 32650
     uv run python ... --quiet                 # 关闭逐窗 VERBOSE 打印
     uv run python ... --iterations 200000     # 覆盖开销测试的迭代数
     uv run python ... --data path/to.csv      # E2E 数据源（缺省自动探测
@@ -56,8 +57,9 @@ if _PROJECT_ROOT not in sys.path:
 
 from track.v2._perf import PerfTracker, _DEFAULT_MAX_ITER_DEPTH
 from track.v2.intersect2 import IntersectConfig, detect_intersections
-from track.v2.models import IntersectReport, PointRef, TrajectoryPoint
+from track.v2.models import IntersectReport, PointRef, ProjectionConfig, TrajectoryPoint
 from track.v2.parser0 import CsvSource, get_database
+from track.v2.projection import create_spatial_context
 
 VERBOSE = True
 
@@ -429,7 +431,7 @@ def _build_cross_csv(tmpdir: Path) -> Path:
     return path
 
 
-def _e2e_run(csv_path: Path, source_label: str) -> dict:
+def _e2e_run(csv_path: Path, source_label: str, processing_srid: int) -> dict:
     cfg = IntersectConfig(
         use_turn_events=True,
         use_orthogonal_candidates=False,  # 只用 Method 1 (与 test_intersect2 I2-23 一致)
@@ -447,10 +449,17 @@ def _e2e_run(csv_path: Path, source_label: str) -> dict:
         min_directed_transitions=2,
     )
     report_lines: list[str] = []
+    spatial_context = create_spatial_context(
+        ProjectionConfig(processing_srid=processing_srid)
+    )
     # _detect_intersections_handle 内部调用 log_info(tracker.report()) —— 捕获它
     with patch("track.v2.intersect2.log_info") as mock_log:
         handle = get_database(CsvSource(csv_path))
-        result = detect_intersections(handle, config=cfg)
+        result = detect_intersections(
+            handle,
+            config=cfg,
+            spatial_context=spatial_context,
+        )
         handle.close()
         for call in mock_log.call_args_list:
             arg = call.args[0] if call.args else ""
@@ -493,19 +502,23 @@ def _e2e_run(csv_path: Path, source_label: str) -> dict:
     }
 
 
-def test_with_intersect2(data_path: str | None) -> dict:
+def test_with_intersect2(data_path: str | None, processing_srid: int) -> dict:
     """E2E: 真实流水线跑通 + 捕获内部 PerfTracker 报告."""
     if data_path:
         csv_path = Path(data_path)
         assert csv_path.exists(), f"--data file not found: {csv_path}"
-        return _e2e_run(csv_path, str(csv_path))
+        return _e2e_run(csv_path, str(csv_path), processing_srid)
 
     hfm = Path(_PROJECT_ROOT) / "track" / "data" / "Hfm_130pts.csv"
     if hfm.exists():
-        return _e2e_run(hfm, f"{hfm} (real data)")
+        return _e2e_run(hfm, f"{hfm} (real data)", processing_srid)
     with tempfile.TemporaryDirectory() as td:
         csv_path = _build_cross_csv(Path(td))
-        return _e2e_run(csv_path, f"{csv_path} (generated synthetic cross-intersection)")
+        return _e2e_run(
+            csv_path,
+            f"{csv_path} (generated synthetic cross-intersection)",
+            processing_srid,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -522,6 +535,12 @@ def main() -> int:
     parser.add_argument(
         "--data", type=str, default="",
         help="E2E CSV source (default: auto-detect Hfm_130pts.csv, else generate synthetic)",
+    )
+    parser.add_argument(
+        "--processing-srid",
+        type=int,
+        required=True,
+        help="explicit projected metre EPSG for the complete benchmark dataset",
     )
     args = parser.parse_args()
 
@@ -550,7 +569,14 @@ def main() -> int:
         ("early_break", test_early_break, {}),
         ("report_parseable", test_report_parseable, {}),
         ("overhead", test_overhead, {"N": args.iterations}),
-        ("e2e_intersect2", test_with_intersect2, {"data_path": args.data or None}),
+        (
+            "e2e_intersect2",
+            test_with_intersect2,
+            {
+                "data_path": args.data or None,
+                "processing_srid": args.processing_srid,
+            },
+        ),
     ]
 
     wall0 = time.perf_counter()

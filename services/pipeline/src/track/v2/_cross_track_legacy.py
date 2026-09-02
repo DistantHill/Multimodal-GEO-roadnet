@@ -163,8 +163,6 @@ def extract_cross_track_candidates_legacy(
                         to_source_row_key=(
                             f"{start_b.point_ref.source_row_key},{end_b.point_ref.source_row_key}"
                         ),
-                        origin_lon=origin_lon,
-                        origin_lat=origin_lat,
                     ))
                 if telemetry is not None:
                     telemetry["payload_seconds"] = telemetry.get("payload_seconds", 0.0) + (

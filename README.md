@@ -85,12 +85,15 @@ make pipeline-init-db
 ```sh
 make pipeline-help
 docker compose -f infra/docker/compose.dev.yml run --rm pipeline \
-  python -m pipeline run --csv /data/parquet-or-csv/input.csv
+  python -m pipeline run --csv /data/parquet-or-csv/input.csv \
+  --processing-srid 32650
 ```
 
 输入使用 `--csv`、`--pg-table` 或 `--clean-id` 三选一。`--pg-table` 接受 `public.day01` 这类 schema-qualified 名称；进度总行数通过 `to_regclass` 解析 `pg_class.reltuples`，因此是估算值。`--clean-id UUID` 只复用已完成的 Clean Run，并始终创建新的 Detect Run；Detect 完成后再创建新的 Fit Run。Clip 没有独立 Run 注册表，Network 当前也不单独持久化。Pipeline 是独立批处理进程，不经由 Backend API request process 启动。
 
 当前 Run lineage 为 `clean_runs → detect_runs → fit_runs`，早期的 `pipeline_runs` 只属于一次性数据库迁移输入，不是当前执行模型。Detect 的 append-only 派生产物使用 PostgreSQL COPY，并假定写入新建的 Run ID；同一 Detect/Fit Run 的重复落库不保证幂等，重新计算应创建新 Run。普通 Detect 异常会回滚派生产物，并把 Run 标为 `failed`；进程被强制终止时仍可能需要运维侧清理长期 `running` 记录。
+
+`32650` 仅是北京所在 UTM 分区的命令示例，不是项目默认值。新 Clean Run 必须按完整数据范围明确选择米制投影；也可在自定义 `pipeline.toml` 的 `[projection]` 中配置。使用 `--clean-id UUID` 时会继承原 Run 的投影，不能覆盖。选择与迁移规则见 [Run 级投影上下文](docs/run-projection-context.md)。
 
 ## 常用命令
 

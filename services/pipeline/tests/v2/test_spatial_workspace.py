@@ -16,8 +16,22 @@ from track.v2.intersect2 import (
     _extract_cross_track_db_workspace,
     _extract_cross_track_memory_windows,
     _extract_cross_track_windows,
+    _project_tracks,
 )
-from track.v2.models import PointRef, TrajectoryPoint
+from track.v2.models import PointRef, SpatialContext, TrajectoryPoint
+from track.v2.projection import CoordinateTransformer
+
+
+_SPATIAL_CONTEXT = SpatialContext(
+    source_srid=4326,
+    processing_srid=32650,
+    projection_config={
+        "coordinate_semantics_version": 2,
+        "enforce_area_of_use": True,
+        "max_scale_error": 0.01,
+    },
+)
+_TRANSFORMER = CoordinateTransformer(_SPATIAL_CONTEXT)
 
 
 class _QuietStatus:
@@ -52,7 +66,7 @@ def _crossing_tracks(
     a1 = _to_lonlat(0.0, 300.0, origin_lon, origin_lat)
     b0 = _to_lonlat(-300.0, 0.0, origin_lon, origin_lat)
     b1 = _to_lonlat(300.0, 0.0, origin_lon, origin_lat)
-    return {
+    tracks = {
         "A": [
             _point("A", "a0", 0.0, *a0, 0.0),
             _point("A", "a1", 1.0, *a1, 0.0),
@@ -62,6 +76,26 @@ def _crossing_tracks(
             _point("B", "b1", 1.0, *b1, 90.0),
         ],
     }
+    return _project_tracks(tracks, _TRANSFORMER)
+
+
+def _projected_bounds(
+    lon_min: float,
+    lat_min: float,
+    lon_max: float,
+    lat_max: float,
+) -> tuple[float, float, float, float]:
+    corners = _TRANSFORMER.forward_many(
+        (
+            (lon_min, lat_min),
+            (lon_min, lat_max),
+            (lon_max, lat_min),
+            (lon_max, lat_max),
+        )
+    )
+    xs = [point[0] for point in corners]
+    ys = [point[1] for point in corners]
+    return min(xs), min(ys), max(xs), max(ys)
 
 
 def test_capacity_guard_runs_before_grid_allocation() -> None:
@@ -75,8 +109,7 @@ def test_capacity_guard_runs_before_grid_allocation() -> None:
         with pytest.raises(CrossTrackCapacityError, match="overflow fallback"):
             extract_cross_track_candidates(
                 tracks,
-                116.0,
-                39.0,
+                _TRANSFORMER,
                 cfg,
                 max_overflow_pair_space=1,
             )
@@ -85,7 +118,7 @@ def test_capacity_guard_runs_before_grid_allocation() -> None:
 def test_db_workspace_prefers_capacity_guarded_global_index() -> None:
     cfg = IntersectConfig()
     tracks = _crossing_tracks()
-    extent = (115.99, 38.99, 116.01, 39.01)
+    extent = _projected_bounds(115.99, 38.99, 116.01, 39.01)
 
     with patch(
         "track.v2.intersect2.extract_cross_track_candidates",
@@ -95,11 +128,12 @@ def test_db_workspace_prefers_capacity_guarded_global_index() -> None:
         side_effect=AssertionError("fallback must not run"),
     ):
         assert _extract_cross_track_db_workspace(
-            tracks, cfg, extent, 116.0, 39.0,
+            tracks, cfg, extent, _TRANSFORMER,
         ) == []
 
     call = global_extract.call_args
-    global_cfg = call.args[3]
+    assert call.args[1] is _TRANSFORMER
+    global_cfg = call.args[2]
     assert global_cfg.cross_track_max_grid_cells_per_segment > (
         cfg.cross_track_max_grid_cells_per_segment
     )
@@ -110,7 +144,7 @@ def test_db_workspace_prefers_capacity_guarded_global_index() -> None:
 def test_db_workspace_capacity_failure_uses_memory_not_sql() -> None:
     cfg = IntersectConfig()
     tracks = _crossing_tracks()
-    extent = (115.99, 38.99, 116.01, 39.01)
+    extent = _projected_bounds(115.99, 38.99, 116.01, 39.01)
     sentinel = [object()]
 
     with patch(
@@ -121,15 +155,14 @@ def test_db_workspace_capacity_failure_uses_memory_not_sql() -> None:
         return_value=sentinel,
     ) as fallback:
         assert _extract_cross_track_db_workspace(
-            tracks, cfg, extent, 116.0, 39.0,
+            tracks, cfg, extent, _TRANSFORMER,
         ) is sentinel
 
     fallback.assert_called_once_with(
         tracks,
         cfg,
         extent,
-        116.0,
-        39.0,
+        _TRANSFORMER,
         live_status=None,
         perf=None,
     )
@@ -145,9 +178,8 @@ def test_db_workspace_respects_disabled_orthogonal_method() -> None:
         assert _extract_cross_track_db_workspace(
             _crossing_tracks(),
             cfg,
-            (115.99, 38.99, 116.01, 39.01),
-            116.0,
-            39.0,
+            _projected_bounds(115.99, 38.99, 116.01, 39.01),
+            _TRANSFORMER,
         ) == []
 
 
@@ -156,7 +188,7 @@ def test_memory_windows_match_legacy_window_queries() -> None:
     tracks = _crossing_tracks(origin_lon, origin_lat)
     all_points = [point for track in tracks.values() for point in track]
     all_points.sort(key=lambda point: (point.vehicle_id, point.timestamp))
-    extent = (115.98, 38.98, 116.02, 39.02)
+    extent = _projected_bounds(115.98, 38.98, 116.02, 39.02)
     cfg = IntersectConfig(
         spatial_window_size=(1_000.0, 1_000.0),
         spatial_window_overlap=0.15,
@@ -166,8 +198,10 @@ def test_memory_windows_match_legacy_window_queries() -> None:
         return [
             point
             for point in all_points
-            if window.x_min <= point.lon <= window.x_max
-            and window.y_min <= point.lat <= window.y_max
+            if point.x is not None
+            and point.y is not None
+            and window.x_min <= point.x <= window.x_max
+            and window.y_min <= point.y <= window.y_max
         ]
 
     with patch("track.v2.intersect2._query_active_points_in_window", side_effect=query):
@@ -175,16 +209,15 @@ def test_memory_windows_match_legacy_window_queries() -> None:
             object(),
             cfg,
             extent,
-            origin_lon,
-            origin_lat,
+            _SPATIAL_CONTEXT,
+            _TRANSFORMER,
             live_status=_QuietStatus(),
         )
     memory = _extract_cross_track_memory_windows(
         tracks,
         cfg,
         extent,
-        origin_lon,
-        origin_lat,
+        _TRANSFORMER,
         live_status=_QuietStatus(),
     )
 
@@ -194,7 +227,7 @@ def test_memory_windows_match_legacy_window_queries() -> None:
 
 
 def test_window_shape_exact_multiple_has_no_phantom_column() -> None:
-    step = 1_000.0 / 111_320.0
+    step = 1_000.0
     windows = SpatialWindowIterator(
         (0.0, 0.0, 7.0 * step, 3.0 * step),
         size=(1_000.0, 1_000.0),
@@ -207,7 +240,7 @@ def test_window_shape_exact_multiple_has_no_phantom_column() -> None:
 
 
 def test_window_iterator_count_always_matches_materialized_windows() -> None:
-    step = 2_000.0 / 111_320.0
+    step = 2_000.0
     for ulps, expected_lon_count in ((-1, 7), (0, 7), (1, 8)):
         edge = 7.0 * step
         if ulps < 0:

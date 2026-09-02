@@ -1,6 +1,6 @@
 """Intersect2 — Dual-mode intersection candidate detection and topology extraction.
 
-detect_intersections(source, *, config=None) → IntersectResult
+detect_intersections(source, *, config=None, spatial_context=...) → IntersectResult
 
 Two complementary methods feed into the same topology verification:
   Method 1 (turn events):   Bearing-change detection → Getis-Ord G* → DBSCAN
@@ -38,8 +38,6 @@ from ._geometry import (
     _segment_bearings,
     _segment_circle_crossing,
     _segment_circle_crossings_batch,
-    _to_lonlat,
-    _to_xy,
 )
 from .exceptions import V2Error
 from .cross_track import CrossTrackCapacityError, extract_cross_track_candidates
@@ -54,10 +52,12 @@ from .models import (
     IntersectionTopology,
     OrthogonalCandidate,
     PointRef,
+    SpatialContext,
     TrackModel,
     TrajectoryPoint,
     TurnEvent,
 )
+from .projection import CoordinateTransformer
 from .db.queries import (
     SpatialWindow,
     SpatialWindowIterator,
@@ -172,6 +172,7 @@ class IntersectResult(TrackModel):
     clusters: list[HotspotCluster]  # merged from both methods
     topologies: list[IntersectionTopology]
     report: IntersectReport
+    spatial_context: SpatialContext
     observations: list[EntryExitObservation] = field(default_factory=list)
     cross_track_candidates: list[CrossTrackCandidate] = field(default_factory=list)
 
@@ -278,8 +279,7 @@ def _build_candidate_clusters(
     hotspot_events: list[TurnEvent],
     orthogonal_candidates: list[OrthogonalCandidate],
     cfg: IntersectConfig,
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     *,
     disabled_sources: set[str] | None = None,
     perf: PerfTracker | None = None,
@@ -290,8 +290,7 @@ def _build_candidate_clusters(
         clusters.extend(
             _cluster_dbscan(
                 hotspot_events,
-                origin_lon,
-                origin_lat,
+                transformer,
                 eps_m=cfg.dbscan_eps_m_turn,
                 min_samples=cfg.dbscan_min_samples_turn,
                 source="turn",
@@ -302,14 +301,15 @@ def _build_candidate_clusters(
         clusters.extend(
             _cluster_orthogonal_candidates(
                 orthogonal_candidates,
-                origin_lon,
-                origin_lat,
+                transformer,
                 eps_m=cfg.dbscan_eps_m_ortho,
                 min_samples=cfg.dbscan_min_samples_ortho,
                 perf=perf,
             )
         )
-    return _merge_clusters(clusters, cfg.merge_centroid_distance_m, origin_lon, origin_lat, perf=perf)
+    return _merge_clusters(
+        clusters, cfg.merge_centroid_distance_m, transformer, perf=perf
+    )
 
 
 def _is_cluster_rediscovered(
@@ -332,8 +332,7 @@ def _annotate_source_ablation(
     hotspot_events: list[TurnEvent],
     orthogonal_candidates: list[OrthogonalCandidate],
     cfg: IntersectConfig,
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
@@ -355,8 +354,7 @@ def _annotate_source_ablation(
             hotspot_events,
             orthogonal_candidates,
             cfg,
-            origin_lon,
-            origin_lat,
+            transformer,
             disabled_sources={source},
             perf=perf,
         )
@@ -429,6 +427,51 @@ def _complete_source_report(
 # ── Shared pipeline helpers (used by both handle and DB modes) ──────────
 
 
+def _point_xy(point: TrajectoryPoint) -> tuple[float, float]:
+    """Return one point's Run-scoped processing coordinates."""
+    if point.x is None or point.y is None:
+        raise V2Error(
+            "trajectory point is missing processing-CRS x/y; project the track "
+            "with the Run SpatialContext before running Detect"
+        )
+    return float(point.x), float(point.y)
+
+
+def _project_tracks(
+    tracks: dict[str, list[TrajectoryPoint]],
+    transformer: CoordinateTransformer,
+    *,
+    trust_existing: bool = False,
+) -> dict[str, list[TrajectoryPoint]]:
+    """Attach Run-scoped x/y, trusting only coordinates produced by our DB query.
+
+    A generic in-memory handle may carry legacy local-origin x/y with no CRS
+    metadata, so those values are deliberately recomputed from 4326 truth.
+    """
+    projected_tracks: dict[str, list[TrajectoryPoint]] = {}
+    for vehicle_id, track in tracks.items():
+        pending: list[TrajectoryPoint] = []
+        for point in track:
+            if (point.x is None) != (point.y is None):
+                raise V2Error("trajectory point must provide both processing x and y")
+            if not trust_existing or point.x is None:
+                pending.append(point)
+        generated = iter(
+            transformer.forward_many((point.lon, point.lat) for point in pending)
+            if pending
+            else ()
+        )
+        projected: list[TrajectoryPoint] = []
+        for point in track:
+            if not trust_existing or point.x is None:
+                x, y = next(generated)
+                projected.append(replace(point, x=x, y=y))
+            else:
+                projected.append(point)
+        projected_tracks[vehicle_id] = projected
+    return projected_tracks
+
+
 def _route_progress(
     live_status: Any,
     *,
@@ -452,7 +495,7 @@ def _route_progress(
         print(f"    ... {detail} ({elapsed:.1f}s)")
 
 
-def _empty_intersect_result() -> IntersectResult:
+def _empty_intersect_result(spatial_context: SpatialContext) -> IntersectResult:
     """Common empty result for both modes when no data is available."""
     return IntersectResult(
         turn_events=[], hotspot_events=[], orthogonal_candidates=[],
@@ -463,6 +506,7 @@ def _empty_intersect_result() -> IntersectResult:
             cluster_count=0, cluster_count_turn=0, cluster_count_ortho=0,
             cluster_count_cross_track=0, complete_intersection_count=0,
         ),
+        spatial_context=spatial_context,
         cross_track_candidates=[],
     )
 
@@ -503,8 +547,7 @@ def _cluster_pipeline(
     turn_events: list[TurnEvent],
     ortho_candidates: list[OrthogonalCandidate],
     cross_candidates: list[CrossTrackCandidate],
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     cfg: IntersectConfig,
     *,
     live_status: Any = None,
@@ -519,7 +562,7 @@ def _cluster_pipeline(
         hotspot_events = _select_hotspot_events(turn_events, cfg, live_status=live_status, perf=perf)
         if hotspot_events:
             all_clusters.extend(_cluster_dbscan(
-                hotspot_events, origin_lon, origin_lat,
+                hotspot_events, transformer,
                 eps_m=cfg.dbscan_eps_m_turn,
                 min_samples=cfg.dbscan_min_samples_turn,
                 source="turn",
@@ -530,7 +573,7 @@ def _cluster_pipeline(
     # ── Method 2: Orthogonal → DBSCAN ──────────────────────────────
     if cfg.use_orthogonal_candidates and ortho_candidates:
         all_clusters.extend(_cluster_orthogonal_candidates(
-            ortho_candidates, origin_lon, origin_lat,
+            ortho_candidates, transformer,
             eps_m=cfg.dbscan_eps_m_ortho,
             min_samples=cfg.dbscan_min_samples_ortho,
             live_status=live_status,
@@ -540,7 +583,7 @@ def _cluster_pipeline(
     # ── Method 3: Cross-track → DBSCAN ─────────────────────────────
     if cfg.use_orthogonal_candidates and cross_candidates:
         all_clusters.extend(_cluster_orthogonal_cross_track_candidates(
-            cross_candidates, origin_lon, origin_lat,
+            cross_candidates, transformer,
             eps_m=cfg.cross_track_dbscan_eps_m,
             min_samples=cfg.cross_track_dbscan_min_samples,
             live_status=live_status,
@@ -548,15 +591,16 @@ def _cluster_pipeline(
         ))
 
     # ── Merge + reindex + ablation ─────────────────────────────────
-    merged = _merge_clusters(all_clusters, cfg.merge_centroid_distance_m,
-                              origin_lon, origin_lat, perf=perf)
+    merged = _merge_clusters(
+        all_clusters, cfg.merge_centroid_distance_m, transformer, perf=perf
+    )
     merged = [
-        replace(c, cluster_calculate_index=i)
-        for i, c in enumerate(merged)
+        replace(cluster, cluster_calculate_index=index)
+        for index, cluster in enumerate(merged)
     ]
     annotated = _annotate_source_ablation(
         merged, hotspot_events, ortho_candidates,
-        cfg, origin_lon, origin_lat,
+        cfg, transformer,
         live_status=live_status,
         perf=perf,
     )
@@ -565,20 +609,25 @@ def _cluster_pipeline(
 
 def _extract_methods_123(
     tracks: dict[str, list[TrajectoryPoint]],
-    origin_lon: float,
-    origin_lat: float,
     cfg: IntersectConfig,
+    transformer: CoordinateTransformer,
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
 ) -> tuple[list[TurnEvent], list[OrthogonalCandidate], list[CrossTrackCandidate]]:
     """Run all three candidate extraction methods on a tracks dict (handle mode)."""
-    turn_events = _detect_turn_events(tracks, origin_lon, origin_lat, cfg, live_status=live_status, perf=perf) if cfg.use_turn_events else []
+    turn_events = _detect_turn_events(
+        tracks, cfg, live_status=live_status, perf=perf
+    ) if cfg.use_turn_events else []
     ortho_candidates: list[OrthogonalCandidate] = []
     cross_candidates: list[CrossTrackCandidate] = []
     if cfg.use_orthogonal_candidates:
-        ortho_candidates = _extract_orthogonal_candidates(tracks, origin_lon, origin_lat, live_status=live_status, perf=perf)
-        cross_candidates, _, _ = extract_cross_track_candidates(tracks, origin_lon, origin_lat, cfg, live_status=live_status, perf=perf)
+        ortho_candidates = _extract_orthogonal_candidates(
+            tracks, live_status=live_status, perf=perf
+        )
+        cross_candidates, _, _ = extract_cross_track_candidates(
+            tracks, transformer, cfg, live_status=live_status, perf=perf
+        )
     return turn_events, ortho_candidates, cross_candidates
 
 
@@ -590,6 +639,7 @@ def detect_intersections(
     *,
     config: IntersectConfig | None = None,
     conn: Any = None,
+    spatial_context: SpatialContext | None = None,
 ) -> IntersectResult:
     """Run dual-mode intersection detection and topology extraction.
 
@@ -604,11 +654,16 @@ def detect_intersections(
         uses a capacity-guarded global spatial index.
     """
     cfg = config or IntersectConfig()
+    if spatial_context is None:
+        raise V2Error(
+            "detect_intersections requires the parent Clean Run SpatialContext; "
+            "a first-point or extent-centre projection is not a safe fallback"
+        )
 
     if conn is not None and cfg.query_active_from_db:
-        return _detect_intersections_db(conn, cfg)
+        return _detect_intersections_db(conn, cfg, spatial_context)
     elif source is not None:
-        return _detect_intersections_handle(source, cfg)
+        return _detect_intersections_handle(source, cfg, spatial_context)
     else:
         raise V2Error(
             "detect_intersections: provide either 'source' (handle mode) "
@@ -619,10 +674,18 @@ def detect_intersections(
 def _detect_intersections_handle(
     source: TrajectorySourceHandle,
     cfg: IntersectConfig,
+    spatial_context: SpatialContext,
 ) -> IntersectResult:
-    tracks, origin_lon, origin_lat = _group_by_vehicle(source)
+    source_context = getattr(source, "spatial_context", None)
+    if source_context is not None and source_context != spatial_context:
+        raise V2Error(
+            "trajectory source SpatialContext does not match Detect SpatialContext"
+        )
+    tracks = _group_by_vehicle(source)
     if not tracks:
-        return _empty_intersect_result()
+        return _empty_intersect_result(spatial_context)
+    transformer = CoordinateTransformer(spatial_context)
+    tracks = _project_tracks(tracks, transformer)
 
     live = cfg.live_status
     own_live = False
@@ -640,20 +703,20 @@ def _detect_intersections_handle(
     try:
         with tracker.stage("extract_methods_123"):
             turn_events, ortho_candidates, cross_candidates = _extract_methods_123(
-                tracks, origin_lon, origin_lat, cfg,
+                tracks, cfg, transformer,
                 live_status=live, perf=tracker,
             )
 
         with tracker.stage("cluster_pipeline"):
             hotspot_events, annotated_clusters = _cluster_pipeline(
                 turn_events, ortho_candidates, cross_candidates,
-                origin_lon, origin_lat, cfg,
+                transformer, cfg,
                 live_status=live, perf=tracker,
             )
 
         with tracker.stage("topology"):
             topologies, annotated_clusters, observations = _build_intersection_topologies(
-                annotated_clusters, tracks, origin_lon, origin_lat, cfg,
+                annotated_clusters, tracks, transformer, cfg,
                 live_status=live, perf=tracker,
             )
 
@@ -671,6 +734,7 @@ def _detect_intersections_handle(
                 turn_events, hotspot_events, ortho_candidates, cross_candidates,
                 track_count=len(tracks),
             ),
+            spatial_context=spatial_context,
         )
     finally:
         if own_live and live is not None:
@@ -684,7 +748,8 @@ def _detect_intersections_handle(
 
 def _stream_extract_methods_1_2(
     conn: Any, cfg: IntersectConfig,
-    origin_lon: float, origin_lat: float,
+    spatial_context: SpatialContext,
+    transformer: CoordinateTransformer,
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
@@ -717,7 +782,13 @@ def _stream_extract_methods_1_2(
         kept_table=cfg.kept_table,
         source_id=cfg.source_id,
         clean_id=cfg.clean_id,
+        spatial_context=spatial_context,
     ):
+        track = _project_tracks(
+            {track[0].vehicle_id: track}, transformer, trust_existing=True
+        )[
+            track[0].vehicle_id
+        ]
         vid = track[0].vehicle_id
         tracks[vid] = track
         batch[vid] = track
@@ -726,13 +797,13 @@ def _stream_extract_methods_1_2(
         if len(batch) >= cfg.stream_batch_size:
             # ── Flush batch ──
             if cfg.use_turn_events:
-                for te in _detect_turn_events(batch, origin_lon, origin_lat, cfg, perf=perf):
+                for te in _detect_turn_events(batch, cfg, perf=perf):
                     turn_events.append(replace(
                         te, event_calculate_index=len(turn_events),
                     ))
             if cfg.use_orthogonal_candidates:
                 ortho_candidates.extend(
-                    _extract_orthogonal_candidates(batch, origin_lon, origin_lat, perf=perf)
+                    _extract_orthogonal_candidates(batch, perf=perf)
                 )
             batch.clear()
 
@@ -750,13 +821,13 @@ def _stream_extract_methods_1_2(
     # ── Flush remaining ──
     if batch:
         if cfg.use_turn_events:
-            for te in _detect_turn_events(batch, origin_lon, origin_lat, cfg, perf=perf):
+            for te in _detect_turn_events(batch, cfg, perf=perf):
                 turn_events.append(replace(
                     te, event_calculate_index=len(turn_events),
                 ))
         if cfg.use_orthogonal_candidates:
             ortho_candidates.extend(
-                _extract_orthogonal_candidates(batch, origin_lon, origin_lat, perf=perf)
+                _extract_orthogonal_candidates(batch, perf=perf)
             )
 
     log_info(f"── 流式处理: {track_count:,} 轨迹/tracks → "
@@ -801,8 +872,7 @@ def _extract_cross_track_memory_windows(
     tracks: dict[str, list[TrajectoryPoint]],
     cfg: IntersectConfig,
     extent: tuple[float, float, float, float],
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
@@ -823,32 +893,33 @@ def _extract_cross_track_memory_windows(
     windows = list(iterator.iter_windows())
     if not windows:
         return []
-    lon_count, lat_count = iterator.window_shape()
+    x_count, y_count = iterator.window_shape()
     buckets: dict[int, dict[str, list[TrajectoryPoint]]] = {}
     assigned_points = 0
     for vehicle_id, track in tracks.items():
         for point in track:
-            lon_indexes = _point_window_indexes(
-                point.lon,
+            point_x, point_y = _point_xy(point)
+            x_indexes = _point_window_indexes(
+                point_x,
                 extent_min=extent[0],
-                step=iterator._step_lon,
-                count=lon_count,
+                step=iterator._step_x,
+                count=x_count,
                 overlap=cfg.spatial_window_overlap,
             )
-            lat_indexes = _point_window_indexes(
-                point.lat,
+            y_indexes = _point_window_indexes(
+                point_y,
                 extent_min=extent[1],
-                step=iterator._step_lat,
-                count=lat_count,
+                step=iterator._step_y,
+                count=y_count,
                 overlap=cfg.spatial_window_overlap,
             )
-            for lon_index in lon_indexes:
-                for lat_index in lat_indexes:
-                    window_index = lon_index * lat_count + lat_index
+            for x_index in x_indexes:
+                for y_index in y_indexes:
+                    window_index = x_index * y_count + y_index
                     window = windows[window_index]
                     if (
-                        window.x_min <= point.lon <= window.x_max
-                        and window.y_min <= point.lat <= window.y_max
+                        window.x_min <= point_x <= window.x_max
+                        and window.y_min <= point_y <= window.y_max
                     ):
                         buckets.setdefault(window_index, {}).setdefault(
                             vehicle_id, []
@@ -878,8 +949,7 @@ def _extract_cross_track_memory_windows(
             )
         window_candidates, _, _ = extract_cross_track_candidates(
             buckets[window_index],
-            origin_lon,
-            origin_lat,
+            transformer,
             cfg,
             live_status=live_status,
             sub_detail=True,
@@ -904,8 +974,7 @@ def _extract_cross_track_db_workspace(
     tracks: dict[str, list[TrajectoryPoint]],
     cfg: IntersectConfig,
     extent: tuple[float, float, float, float],
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
@@ -922,8 +991,7 @@ def _extract_cross_track_db_workspace(
     try:
         candidates, _, _ = extract_cross_track_candidates(
             tracks,
-            origin_lon,
-            origin_lat,
+            transformer,
             global_cfg,
             live_status=live_status,
             perf=perf,
@@ -944,8 +1012,7 @@ def _extract_cross_track_db_workspace(
             tracks,
             cfg,
             extent,
-            origin_lon,
-            origin_lat,
+            transformer,
             live_status=live_status,
             perf=perf,
         )
@@ -963,25 +1030,32 @@ def _extract_cross_track_db_workspace(
 def _extract_cross_track_windows(
     conn: Any, cfg: IntersectConfig,
     extent: tuple[float, float, float, float],
-    origin_lon: float, origin_lat: float,
+    spatial_context: SpatialContext,
+    transformer: CoordinateTransformer,
     live_status: Any = None,
     candidate_extractor: Callable[..., tuple[list[CrossTrackCandidate], int, int]] | None = None,
+    legacy_origin: tuple[float, float] | None = None,
     windows_override: list[SpatialWindow] | None = None,
     perf: PerfTracker | None = None,
     telemetry: dict[str, int | float] | None = None,
-    **kwargs,
 ) -> list[CrossTrackCandidate]:
     """Method 3: spatial sliding windows for cross-track segment intersection.
 
     Keyword-only benchmark seams never alter production results:
-    ``candidate_extractor`` selects the legacy oracle and ``windows_override``
-    pins the window set; ``telemetry`` accumulates per-step timing/counts for
-    the manual benchmark. ``perf`` feeds the hierarchical stage tracker.
+    ``candidate_extractor`` selects the legacy oracle, whose local origin must
+    be supplied explicitly via ``legacy_origin``. ``windows_override`` pins the
+    window set; ``telemetry`` accumulates per-step timing/counts for the manual
+    benchmark. ``perf`` feeds the hierarchical stage tracker.
     """
     candidates: list[CrossTrackCandidate] = []
     seen_segment_pairs: set[tuple[str, str, str, str, str]] = set()
     if not cfg.use_orthogonal_candidates:
         return candidates
+    if candidate_extractor is not None and legacy_origin is None:
+        raise V2Error(
+            "the legacy cross-track benchmark oracle requires an explicit "
+            "legacy_origin; Detect production never derives one"
+        )
     extractor = candidate_extractor or extract_cross_track_candidates
 
     if windows_override is None:
@@ -1034,7 +1108,9 @@ def _extract_cross_track_windows(
             kept_table=cfg.kept_table,
             source_id=cfg.source_id,
             clean_id=cfg.clean_id,
+            spatial_context=spatial_context,
             telemetry=telemetry,
+            _transformer=transformer,
         )
         if telemetry is not None:
             telemetry["windows"] = telemetry.get("windows", 0) + 1
@@ -1047,6 +1123,9 @@ def _extract_cross_track_windows(
         total_points += len(points)
         group_started = time.perf_counter() if telemetry is not None else 0.0
         window_tracks = _tracks_from_points(points)
+        window_tracks = _project_tracks(
+            window_tracks, transformer, trust_existing=True
+        )
         if telemetry is not None:
             telemetry["group_sort_seconds"] = telemetry.get(
                 "group_sort_seconds", 0.0
@@ -1058,9 +1137,17 @@ def _extract_cross_track_windows(
         }
         if candidate_extractor is None:
             extractor_kwargs.update(perf=perf, telemetry=telemetry)
-        win_cands, w_pairs, w_total = extractor(
-            window_tracks, origin_lon, origin_lat, cfg, **extractor_kwargs,
-        )
+        if candidate_extractor is None:
+            win_cands, w_pairs, w_total = extractor(
+                window_tracks, transformer, cfg, **extractor_kwargs,
+            )
+        else:
+            # Explicit benchmark seam for the legacy local-origin oracle only.
+            assert legacy_origin is not None
+            win_cands, w_pairs, w_total = extractor(
+                window_tracks, legacy_origin[0], legacy_origin[1], cfg,
+                **extractor_kwargs,
+            )
         if telemetry is not None:
             telemetry["candidate_extraction_seconds"] = telemetry.get(
                 "candidate_extraction_seconds", 0.0
@@ -1117,7 +1204,7 @@ def _topology_point_windows(
     clusters: list[HotspotCluster],
     cfg: IntersectConfig,
 ) -> list[SpatialWindow]:
-    """Return the exact point-query boxes used by DB topology verification."""
+    """Return processing-CRS query boxes for in-memory topology routing."""
     windows: list[SpatialWindow] = []
     for cluster in clusters:
         topology_radius_m = max(
@@ -1126,12 +1213,12 @@ def _topology_point_windows(
         )
         # Keep parity with the former per-cluster query, which deliberately
         # fetched a 2x-radius point halo before testing the exact circle.
-        query_radius_deg = topology_radius_m * 2.0 / 111320.0
+        query_radius_m = topology_radius_m * 2.0
         windows.append(SpatialWindow(
-            x_min=cluster.centroid_lon - query_radius_deg,
-            y_min=cluster.centroid_lat - query_radius_deg,
-            x_max=cluster.centroid_lon + query_radius_deg,
-            y_max=cluster.centroid_lat + query_radius_deg,
+            x_min=cluster.centroid_x - query_radius_m,
+            y_min=cluster.centroid_y - query_radius_m,
+            x_max=cluster.centroid_x + query_radius_m,
+            y_max=cluster.centroid_y + query_radius_m,
         ))
     return windows
 
@@ -1147,7 +1234,7 @@ class _TopologyPointIndex:
 
     def tracks_in(self, window: SpatialWindow) -> dict[str, list[TrajectoryPoint]]:
         """Materialise one window only, ordered as the former SQL result."""
-        if self.axis == "lon":
+        if self.axis == "x":
             lower, upper = window.x_min, window.x_max
         else:
             lower, upper = window.y_min, window.y_max
@@ -1157,8 +1244,9 @@ class _TopologyPointIndex:
         grouped: dict[str, list[TrajectoryPoint]] = defaultdict(list)
         for point_index in range(start, stop):
             point = self.points[point_index]
-            if (window.x_min <= point.lon <= window.x_max
-                    and window.y_min <= point.lat <= window.y_max):
+            point_x, point_y = _point_xy(point)
+            if (window.x_min <= point_x <= window.x_max
+                    and window.y_min <= point_y <= window.y_max):
                 grouped[point.vehicle_id].append(point)
 
         ordered: dict[str, list[TrajectoryPoint]] = {}
@@ -1197,17 +1285,18 @@ def _build_topology_point_index(
         points.extend(track)
     if not points:
         return _TopologyPointIndex(
-            axis="lon", coordinates=[], points=[], tracks=tracks,
+            axis="x", coordinates=[], points=[], tracks=tracks,
         )
+    point_coordinates = [_point_xy(point) for point in points]
     axis = (
-        "lon"
-        if (max(point.lon for point in points) - min(point.lon for point in points)
-            >= max(point.lat for point in points) - min(point.lat for point in points))
-        else "lat"
+        "x"
+        if (max(x for x, _ in point_coordinates) - min(x for x, _ in point_coordinates)
+            >= max(y for _, y in point_coordinates) - min(y for _, y in point_coordinates))
+        else "y"
     )
-    points.sort(key=(lambda point: point.lon) if axis == "lon" else (lambda point: point.lat))
+    points.sort(key=lambda point: _point_xy(point)[0 if axis == "x" else 1])
     coordinates = [
-        point.lon if axis == "lon" else point.lat
+        _point_xy(point)[0 if axis == "x" else 1]
         for point in points
     ]
     return _TopologyPointIndex(
@@ -1219,8 +1308,7 @@ def _build_topologies_from_tracks(
     clusters: list[HotspotCluster],
     tracks: dict[str, list[TrajectoryPoint]],
     cfg: IntersectConfig,
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
@@ -1266,14 +1354,13 @@ def _build_topologies_from_tracks(
         observations, crossing_points = _extract_entry_exit_observations_batch(
             nearby_tracks,
             cluster=cluster,
-            origin_lon=origin_lon,
-            origin_lat=origin_lat,
+            transformer=transformer,
             radius_m=radius,
             bearing_window=cfg.bearing_window,
         )
         cluster = replace(cluster, crossing_points=tuple(crossing_points))
         topology, annotated, cluster_observations = _build_topology_for_cluster(
-            cluster, observations, origin_lon, origin_lat, cfg,
+            cluster, observations, cfg,
         )
         topologies.append(topology)
         annotated_clusters.append(annotated)
@@ -1286,7 +1373,11 @@ def _build_topologies_from_tracks(
     return topologies, annotated_clusters, all_observations
 
 
-def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult:
+def _detect_intersections_db(
+    conn: Any,
+    cfg: IntersectConfig,
+    spatial_context: SpatialContext,
+) -> IntersectResult:
     """DB-mode intersection detection.
 
     ZH: DB 模式交叉口检测。
@@ -1301,12 +1392,12 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
         kept_table=cfg.kept_table,
         source_id=cfg.source_id,
         clean_id=cfg.clean_id,
+        spatial_context=spatial_context,
     )
     if extent is None:
-        return _empty_intersect_result()
+        return _empty_intersect_result(spatial_context)
 
-    origin_lon = (extent[0] + extent[2]) / 2.0
-    origin_lat = (extent[1] + extent[3]) / 2.0
+    transformer = CoordinateTransformer(spatial_context)
 
     live = cfg.live_status
 
@@ -1319,7 +1410,7 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
     t_stage = time.perf_counter()
     with tracker.stage("stream_m1_m2"):
         turn_events, ortho_candidates, tracks = _stream_extract_methods_1_2(
-            conn, cfg, origin_lon, origin_lat,
+            conn, cfg, spatial_context, transformer,
             live_status=live, perf=tracker,
         )
     if live is not None:
@@ -1335,8 +1426,7 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
             tracks,
             cfg,
             extent,
-            origin_lon,
-            origin_lat,
+            transformer,
             live_status=live,
             perf=tracker,
         )
@@ -1349,7 +1439,7 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
     with tracker.stage("cluster_pipeline"):
         hotspot_events, annotated_clusters = _cluster_pipeline(
             turn_events, ortho_candidates, cross_candidates,
-            origin_lon, origin_lat, cfg,
+            transformer, cfg,
             live_status=live, perf=tracker,
         )
     if live is not None:
@@ -1365,7 +1455,7 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
     t_stage = time.perf_counter()
     with tracker.stage("topology_index"):
         topologies, annotated_clusters, observations = _build_topologies_from_tracks(
-            annotated_clusters, tracks, cfg, origin_lon, origin_lat,
+            annotated_clusters, tracks, cfg, transformer,
             live_status=live, perf=tracker,
         )
     if live is not None:
@@ -1388,6 +1478,7 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
             turn_events, hotspot_events, ortho_candidates, cross_candidates,
             track_count=len(tracks),
         ),
+        spatial_context=spatial_context,
     )
 
 
@@ -1396,28 +1487,16 @@ def _detect_intersections_db(conn: Any, cfg: IntersectConfig) -> IntersectResult
 
 def _group_by_vehicle(
     handle: TrajectorySourceHandle,
-) -> tuple[dict[str, list[TrajectoryPoint]], float, float]:
-    """Consume full stream, group points by vehicle_id.
-
-    Returns (tracks, origin_lon, origin_lat). Origin is set from the
-    first point encountered in the stream.
-    """
+) -> dict[str, list[TrajectoryPoint]]:
+    """Consume the full stream and group points without choosing a CRS origin."""
     tracks: dict[str, list[TrajectoryPoint]] = {}
-    origin_lon: float | None = None
-    origin_lat: float | None = None
 
     for tp in handle.iter_points():
-        if origin_lon is None:
-            origin_lon = tp.lon
-            origin_lat = tp.lat
         if tp.vehicle_id not in tracks:
             tracks[tp.vehicle_id] = []
         tracks[tp.vehicle_id].append(tp)
 
-    if origin_lon is None:
-        raise V2Error("No points in source — cannot detect intersections")
-
-    return tracks, origin_lon, origin_lat
+    return tracks
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1427,8 +1506,6 @@ def _group_by_vehicle(
 
 def _detect_turn_events(
     tracks: dict[str, list[TrajectoryPoint]],
-    origin_lon: float,
-    origin_lat: float,
     cfg: IntersectConfig,
     *,
     live_status: Any = None,
@@ -1453,7 +1530,7 @@ def _detect_turn_events(
         if len(track) < 2 * w + 1:
             continue
 
-        xy = [_to_xy(p.lon, p.lat, origin_lon, origin_lat) for p in track]
+        xy = [_point_xy(p) for p in track]
         # 直接使用 GPS heading 作为逐段方位角，避免 O(w*(n-2w)) 次 atan2
         headings = [p.heading for p in track]
 
@@ -1747,8 +1824,6 @@ def _select_hotspot_events(
 
 def _extract_orthogonal_candidates(
     tracks: dict[str, list[TrajectoryPoint]],
-    origin_lon: float,
-    origin_lat: float,
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
@@ -1769,7 +1844,7 @@ def _extract_orthogonal_candidates(
     for track in _perf_iter(perf, tracks.values(), name="tracks_ortho", total=total_tracks):
         for tp in track:
             if tp.point_ref.generated_reason == "orthogonal_heading":
-                x, y = _to_xy(tp.lon, tp.lat, origin_lon, origin_lat)
+                x, y = _point_xy(tp)
                 candidates.append(
                     OrthogonalCandidate(
                         point_ref=tp.point_ref,
@@ -2175,8 +2250,7 @@ def _group_cluster_items(items: list[Any], labels: list[int]) -> list[tuple[int,
 
 def _cluster_dbscan(
     events: list[TurnEvent],
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     *,
     eps_m: float,
     min_samples: int,
@@ -2202,7 +2276,7 @@ def _cluster_dbscan(
         cx = sum(e.x for e in cluster_items) / len(cluster_items)
         cy = sum(e.y for e in cluster_items) / len(cluster_items)
         radius = max(_distance_m((cx, cy), (e.x, e.y)) for e in cluster_items)
-        lon, lat = _to_lonlat(cx, cy, origin_lon, origin_lat)
+        lon, lat = transformer.inverse(cx, cy)
         cluster = HotspotCluster(
             cluster_calculate_index=cid,
             centroid_x=cx,
@@ -2225,8 +2299,7 @@ def _cluster_dbscan(
 
 def _cluster_orthogonal_candidates(
     candidates: list[OrthogonalCandidate],
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     *,
     eps_m: float,
     min_samples: int,
@@ -2251,7 +2324,7 @@ def _cluster_orthogonal_candidates(
         cx = sum(c.x for c in cluster_items) / len(cluster_items)
         cy = sum(c.y for c in cluster_items) / len(cluster_items)
         radius = max(_distance_m((cx, cy), (c.x, c.y)) for c in cluster_items)
-        lon, lat = _to_lonlat(cx, cy, origin_lon, origin_lat)
+        lon, lat = transformer.inverse(cx, cy)
         cluster_events = tuple(
             TurnEvent(
                 event_calculate_index=i,
@@ -2297,8 +2370,7 @@ def _cluster_orthogonal_candidates(
 
 def _cluster_orthogonal_cross_track_candidates(
     candidates: list[CrossTrackCandidate],
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     *,
     eps_m: float,
     min_samples: int,
@@ -2327,7 +2399,7 @@ def _cluster_orthogonal_cross_track_candidates(
         cx = sum(c.x for c in cluster_items) / len(cluster_items)
         cy = sum(c.y for c in cluster_items) / len(cluster_items)
         radius = max(_distance_m((cx, cy), (c.x, c.y)) for c in cluster_items)
-        lon, lat = _to_lonlat(cx, cy, origin_lon, origin_lat)
+        lon, lat = transformer.inverse(cx, cy)
         cluster_events = tuple(
             TurnEvent(
                 event_calculate_index=i,
@@ -2379,8 +2451,7 @@ def _cluster_orthogonal_cross_track_candidates(
 def _merge_clusters(
     clusters: list[HotspotCluster],
     merge_distance_m: float,
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     *,
     perf: PerfTracker | None = None,
 ) -> list[HotspotCluster]:
@@ -2465,7 +2536,7 @@ def _merge_clusters(
             new_cy = ci.centroid_y
             merged_radius = ci.radius_m
 
-        new_lon, new_lat = _to_lonlat(new_cx, new_cy, origin_lon, origin_lat)
+        new_lon, new_lat = transformer.inverse(new_cx, new_cy)
         merged_cluster = HotspotCluster(
             cluster_calculate_index=ci.cluster_calculate_index,
             centroid_x=new_cx,
@@ -2571,8 +2642,6 @@ def _make_observation(
 def _build_topology_for_cluster(
     cluster: HotspotCluster,
     observations: list[EntryExitObservation],
-    origin_lon: float,
-    origin_lat: float,
     cfg: IntersectConfig,
 ) -> tuple[IntersectionTopology, HotspotCluster, list[EntryExitObservation]]:
     """Build topology for a single cluster from pre-computed observations.
@@ -2635,8 +2704,7 @@ def _build_topology_for_cluster(
 def _build_intersection_topologies(
     clusters: list[HotspotCluster],
     tracks: dict[str, list[TrajectoryPoint]],
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     cfg: IntersectConfig,
     *,
     live_status: Any = None,
@@ -2673,8 +2741,7 @@ def _build_intersection_topologies(
         observations, crossing_points = _extract_entry_exit_observations_batch(
             tracks,
             cluster=cluster,
-            origin_lon=origin_lon,
-            origin_lat=origin_lat,
+            transformer=transformer,
             radius_m=radius,
             bearing_window=cfg.bearing_window,
         )
@@ -2682,7 +2749,7 @@ def _build_intersection_topologies(
         cluster = replace(cluster, crossing_points=tuple(crossing_points))
 
         topology, annotated, cluster_obs = _build_topology_for_cluster(
-            cluster, observations, origin_lon, origin_lat, cfg,
+            cluster, observations, cfg,
         )
         topologies.append(topology)
         annotated_clusters.append(annotated)
@@ -2696,8 +2763,7 @@ def _extract_entry_exit_observations_batch(
     tracks: dict[str, list[TrajectoryPoint]],
     *,
     cluster: HotspotCluster,
-    origin_lon: float,
-    origin_lat: float,
+    transformer: CoordinateTransformer,
     radius_m: float,
     bearing_window: int = 2,
 ) -> tuple[list[EntryExitObservation], list[CrossingPoint]]:
@@ -2719,7 +2785,7 @@ def _extract_entry_exit_observations_batch(
     for vehicle_id, track in tracks.items():
         if len(track) < 2:
             continue
-        xy_points = [_to_xy(p.lon, p.lat, origin_lon, origin_lat) for p in track]
+        xy_points = [_point_xy(p) for p in track]
         track_points_lookup[vehicle_id] = track
         xy_points_lookup[vehicle_id] = xy_points
         for seg_idx in range(len(xy_points) - 1):
@@ -2767,7 +2833,7 @@ def _extract_entry_exit_observations_batch(
         is_entry = bool(entry_mask[flat_idx])
         # Convert crossing xy → lon/lat
         cx_m, cy_m = float(crossing_xy_np[flat_idx][0]), float(crossing_xy_np[flat_idx][1])
-        clon, clat = _to_lonlat(cx_m, cy_m, origin_lon, origin_lat)
+        clon, clat = transformer.inverse(cx_m, cy_m)
         crossing_points.append(
             CrossingPoint(
                 crossing_id=crossing_counter,
@@ -2775,6 +2841,8 @@ def _extract_entry_exit_observations_batch(
                 vehicle_id=vehicle_id,
                 point_ref=seg_start_pt.point_ref,
                 segment_index=seg_idx,
+                crossing_x=cx_m,
+                crossing_y=cy_m,
                 crossing_lon=clon,
                 crossing_lat=clat,
                 is_entry=is_entry,

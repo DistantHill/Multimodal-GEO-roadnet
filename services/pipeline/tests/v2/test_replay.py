@@ -16,10 +16,22 @@ from track.v2.replay import (
     PostgresSourceRowResolver,
     ReplayService,
     ReplayTarget,
+    _interpolate_heading,
+    _replay_fit_endpoint,
     replay_centerline_inputs,
 )
+from track.v2.models import PointRef, SpatialContext, TrajectoryPoint
+from track.v2.projection import CoordinateTransformer
 from track.v2.sources import source_row_hash
 from track.v2.cli.replay import _target_from_args
+
+
+_REPLAY_CONTEXT = SpatialContext(
+    source_srid=4326,
+    processing_srid=3857,
+    projection_config={"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": 0.2},
+)
+_REPLAY_TRANSFORMER = CoordinateTransformer(_REPLAY_CONTEXT)
 
 
 class _MemoryStore:
@@ -88,6 +100,47 @@ class _LookupConnection:
 
 
 class ReplayServiceTest(unittest.TestCase):
+    def test_heading_interpolation_uses_shortest_circular_arc(self) -> None:
+        self.assertAlmostEqual(_interpolate_heading(350.0, 10.0, 0.5), 0.0)
+        self.assertAlmostEqual(_interpolate_heading(10.0, 350.0, 0.5), 0.0)
+
+    def test_fit_endpoint_reprojects_lonlat_and_ignores_untrusted_xy(self) -> None:
+        context = SpatialContext(
+            source_srid=4326,
+            processing_srid=32650,
+            projection_config={"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": 0.01},
+        )
+        transformer = CoordinateTransformer(context)
+        first_xy = transformer.forward(116.4, 39.9)
+        second_xy = (first_xy[0] + 1_000.0, first_xy[1] + 400.0)
+
+        def point(index: int, xy: tuple[float, float]) -> TrajectoryPoint:
+            lon, lat = transformer.inverse(*xy)
+            return TrajectoryPoint(
+                PointRef("replay", str(index), True),
+                "vehicle-1",
+                float(index * 10),
+                lon,
+                lat,
+                90.0,
+                10.0,
+                x=xy[0] + 50_000.0,
+                y=xy[1] - 50_000.0,
+            )
+
+        endpoint = _replay_fit_endpoint(
+            [point(0, first_xy), point(1, second_xy)],
+            0,
+            0.25,
+            transformer,
+        )
+
+        self.assertAlmostEqual(endpoint.point.x, first_xy[0] + 250.0, places=7)
+        self.assertAlmostEqual(endpoint.point.y, first_xy[1] + 100.0, places=7)
+        projected = transformer.forward(endpoint.point.lon, endpoint.point.lat)
+        self.assertAlmostEqual(projected[0], endpoint.point.x, places=6)
+        self.assertAlmostEqual(projected[1], endpoint.point.y, places=6)
+
     def test_csv_excluded_point_resolves_source_row_without_kept_membership(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "source.csv"
@@ -172,11 +225,15 @@ class ReplayServiceTest(unittest.TestCase):
             def cursor(self):
                 return SequenceCursor(self)
 
-        point_rows = [
-            ("vehicle-1", 2, index, "source", str(index), float(index),
-             100.0 + index, 30.0, 90.0, 5.0, {}, None, None, "", 0, index)
-            for index in range(4)
-        ]
+        point_rows = []
+        for index in range(4):
+            lon = 100.0 + index
+            lat = 30.0
+            x, y = _REPLAY_TRANSFORMER.forward(lon, lat)
+            point_rows.append((
+                "vehicle-1", 2, index, "source", str(index), float(index),
+                lon, lat, 90.0, 5.0, {}, None, None, "", x, y, 0, index,
+            ))
         manifest = [
             (0, "clip-1", "vehicle-1", 2, 20, 0, 0.5, 1, 3,
              10, 2, 0.5, True, 4),
@@ -185,7 +242,10 @@ class ReplayServiceTest(unittest.TestCase):
             [("fit-1", "detect-1", "directed", 10, 20,
               "LINESTRING(0 0,1 1)", 1, 0)],
             manifest,
-            [("clean-1", "source", {"target_table": "trajectory_points"}, "completed")],
+            [(
+                "clean-1", "source", {"target_table": "trajectory_points"},
+                "completed", 4326, 3857, _REPLAY_CONTEXT.projection_config,
+            )],
             point_rows,
         ])
 

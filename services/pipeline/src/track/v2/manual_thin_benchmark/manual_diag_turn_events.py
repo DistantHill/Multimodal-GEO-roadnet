@@ -6,7 +6,8 @@ ZH: 当你跑 ``python -m track.v2.cli.run --pg-table ...`` 发现
     if-continue 处埋计数器。
 
 用法：
-    python track/v2/manual_thin_benchmark/manual_diag_turn_events.py
+    python track/v2/manual_thin_benchmark/manual_diag_turn_events.py \
+        --processing-srid 32650
 
     默认连接 track_test。临时切到其他库：``TRACK_BENCH_DB=postgres ...``
 
@@ -14,6 +15,7 @@ ZH: 当你跑 ``python -m track.v2.cli.run --pg-table ...`` 发现
     --max-tracks 最多检查 N 辆车（默认 500，-1 = 全部）
     --verbose    打印被拦截的样本轨迹详情
     --source-id  按 source_id 过滤（可选）
+    --processing-srid 整张表适用的米制投影 EPSG（必填）
 
 依赖：PostgreSQL 已运行且表中有 active 数据。
 """
@@ -39,35 +41,45 @@ from track.v2._geometry import (
     _angle_delta_deg,
     _circular_mean_deg,
     _distance_m,
-    _to_xy,
 )
+from track.v2.models import ProjectionConfig
+from track.v2.projection import create_spatial_context
 
 
 def diagnose_turn_events(
     *,
     table: str = "trajectory_points",
     source_id: str | None = None,
+    processing_srid: int,
     max_tracks: int = 500,
     verbose: bool = False,
 ) -> dict:
     """ZH: 逐车统计转向事件过滤条件，返回汇总 dict。"""
     cfg = IntersectConfig(use_orthogonal_candidates=False, use_turn_events=True)
+    spatial_context = create_spatial_context(
+        ProjectionConfig(processing_srid=processing_srid)
+    )
 
     conn = connect_test_db()
     print(f"Connected: {conn.info.host}:{conn.info.port}/{conn.info.dbname}")
     print(f"Table: {table}, Source ID filter: {source_id or '(none)'}")
 
-    # 获取空间范围以确定原点
-    extent = _query_spatial_extent(conn, table=table, source_id=source_id)
+    extent = _query_spatial_extent(
+        conn,
+        table=table,
+        source_id=source_id,
+        spatial_context=spatial_context,
+    )
     if extent is None:
         print("ERROR: No active points found in DB!")
         conn.close()
         return {}
 
-    origin_lon = (extent[0] + extent[2]) / 2.0
-    origin_lat = (extent[1] + extent[3]) / 2.0
-    print(f"Extent: lon=[{extent[0]:.6f}, {extent[2]:.6f}], lat=[{extent[1]:.6f}, {extent[3]:.6f}]")
-    print(f"Origin: ({origin_lon:.6f}, {origin_lat:.6f})")
+    print(
+        f"Extent: x=[{extent[0]:.3f}, {extent[2]:.3f}]m, "
+        f"y=[{extent[1]:.3f}, {extent[3]:.3f}]m"
+    )
+    print(f"Processing CRS: EPSG:{spatial_context.processing_srid}")
 
     # ── 配置参数 ──
     w = cfg.turn_window
@@ -103,7 +115,10 @@ def diagnose_turn_events(
 
     t_start = time.perf_counter()
     track_iter = _stream_vehicle_tracks_from_db(
-        conn, table=table, source_id=source_id,
+        conn,
+        table=table,
+        source_id=source_id,
+        spatial_context=spatial_context,
     )
 
     for track in track_iter:
@@ -122,8 +137,10 @@ def diagnose_turn_events(
                       f"need>={2*w+1}")
             continue
 
-        # ── 坐标转换 ──
-        xy = [_to_xy(p.lon, p.lat, origin_lon, origin_lat) for p in track]
+        # DB query materializes every point in the Run's fixed processing CRS.
+        if any(point.x is None or point.y is None for point in track):
+            raise RuntimeError("DB stream returned a point without processing-CRS x/y")
+        xy = [(float(point.x), float(point.y)) for point in track]
         headings = [p.heading for p in track]
 
         track_has_event = False
@@ -358,6 +375,12 @@ def main() -> int:
                         help="Print sample rejected candidates.")
     parser.add_argument("--source-id",
                         help="Filter by source_id column (optional).")
+    parser.add_argument(
+        "--processing-srid",
+        type=int,
+        required=True,
+        help="Projected metre-based EPSG code valid for the complete table extent.",
+    )
     args = parser.parse_args()
 
     print(f"Target DB: {TEST_DB_NAME}")
@@ -367,6 +390,7 @@ def main() -> int:
     result = diagnose_turn_events(
         table=args.table,
         source_id=args.source_id,
+        processing_srid=args.processing_srid,
         max_tracks=args.max_tracks if args.max_tracks > 0 else 2**31,
         verbose=args.verbose,
     )

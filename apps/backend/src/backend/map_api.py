@@ -8,6 +8,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pyproj import CRS, Proj, Transformer
 
 from .database import get_read_connection
 from .map_schemas import BBox, ClipRequest, FeatureCollection, ReplayRequest, parse_bbox
@@ -22,8 +23,8 @@ _CRS = {
 _LAYER_LIMIT_DEFAULT = 1_000
 _LAYER_LIMIT_MAX = 5_000
 _CLIP_FEATURE_LIMIT = 1_000
-_EARTH_RADIUS_M = 6_371_008.8
 _EPS = 1e-9
+_COORDINATE_SEMANTICS_VERSION = 2
 
 
 class MapNotFoundError(Exception):
@@ -56,7 +57,206 @@ class MapStore(Protocol):
 class _DetectContext:
     detect_id: str
     clean_id: str
-    target_table: str = "trajectory_points"
+    target_table: str
+    source_srid: int | None
+    processing_srid: int | None
+    projection_config: dict[str, Any]
+
+
+class _CoordinateTransformer:
+    """Backend-local fixed-CRS adapter.
+
+    Backend is built as a standalone image, so it cannot import Pipeline's
+    projection module. Keep this validation boundary small and fail closed on
+    legacy Detect Runs whose x/y semantics were never pinned to one CRS.
+    """
+
+    def __init__(self, context: _DetectContext) -> None:
+        if context.source_srid != 4326:
+            raise MapDataError(
+                f"Detect Run {context.detect_id} does not use EPSG:4326 source geometry"
+            )
+        if context.processing_srid is None:
+            raise MapDataError(
+                f"Detect Run {context.detect_id} has no fixed processing CRS"
+            )
+        if (
+            context.projection_config.get("coordinate_semantics_version")
+            != _COORDINATE_SEMANTICS_VERSION
+        ):
+            raise MapDataError(
+                f"Detect Run {context.detect_id} has legacy coordinate semantics"
+            )
+        try:
+            source = CRS.from_epsg(context.source_srid)
+            processing = CRS.from_epsg(context.processing_srid)
+        except Exception as exc:
+            raise MapDataError(
+                f"Detect Run {context.detect_id} has an invalid projection context"
+            ) from exc
+        if not source.is_geographic or not processing.is_projected:
+            raise MapDataError(
+                f"Detect Run {context.detect_id} requires a projected processing CRS"
+            )
+        axes = processing.axis_info[:2]
+        if len(axes) < 2 or any(
+            str(axis.unit_name).lower() not in {"metre", "meter"}
+            or not math.isclose(
+                float(axis.unit_conversion_factor),
+                1.0,
+                abs_tol=1e-12,
+            )
+            for axis in axes
+        ):
+            raise MapDataError(
+                f"Detect Run {context.detect_id} processing CRS must use metres"
+            )
+        if {str(axis.direction).lower() for axis in axes} != {"east", "north"}:
+            raise MapDataError(
+                f"Detect Run {context.detect_id} processing CRS axes must be east/north"
+            )
+        try:
+            max_scale_error = float(
+                context.projection_config.get("max_scale_error", 0.01)
+            )
+        except (TypeError, ValueError) as exc:
+            raise MapDataError(
+                f"Detect Run {context.detect_id} has an invalid max_scale_error"
+            ) from exc
+        if not math.isfinite(max_scale_error) or max_scale_error < 0.0:
+            raise MapDataError(
+                f"Detect Run {context.detect_id} has an invalid max_scale_error"
+            )
+        try:
+            projection = Proj(processing)
+            forward = Transformer.from_crs(source, processing, always_xy=True)
+            inverse = Transformer.from_crs(processing, source, always_xy=True)
+        except Exception as exc:
+            raise MapDataError(
+                f"Detect Run {context.detect_id} has an invalid projection context"
+            ) from exc
+        self._context = context
+        self._processing = processing
+        self._processing_srid = context.processing_srid
+        self._projection = projection
+        self._forward = forward
+        self._inverse = inverse
+        self._enforce_area_of_use = bool(
+            context.projection_config.get("enforce_area_of_use", True)
+        )
+        self._max_scale_error = max_scale_error
+
+    def forward_many(
+        self,
+        coordinates: list[tuple[float, float]],
+    ) -> list[tuple[float, float]]:
+        if not coordinates:
+            return []
+        if any(
+            not (math.isfinite(lon) and math.isfinite(lat))
+            or not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0)
+            for lon, lat in coordinates
+        ):
+            raise MapDataError("clip input contains invalid EPSG:4326 coordinates")
+        lons = [coordinate[0] for coordinate in coordinates]
+        lats = [coordinate[1] for coordinate in coordinates]
+        self._validate_bounds((min(lons), min(lats), max(lons), max(lats)))
+        try:
+            xs, ys = self._forward.transform(
+                lons,
+                lats,
+                errcheck=True,
+            )
+        except Exception as exc:
+            raise MapDataError("clip input could not be projected") from exc
+        projected = [(float(x), float(y)) for x, y in zip(xs, ys, strict=True)]
+        if any(not (math.isfinite(x) and math.isfinite(y)) for x, y in projected):
+            raise MapDataError("clip input could not be projected")
+        return projected
+
+    def _validate_bounds(
+        self,
+        bounds: tuple[float, float, float, float],
+    ) -> None:
+        """Apply the Pipeline's area-of-use and scale-distortion contract."""
+        lon_min, lat_min, lon_max, lat_max = bounds
+        area = self._processing.area_of_use
+        if self._enforce_area_of_use and area is not None:
+            if (
+                not _longitude_bounds_within_area(
+                    lon_min,
+                    lon_max,
+                    west=float(area.west),
+                    east=float(area.east),
+                )
+                or lat_min < float(area.south)
+                or lat_max > float(area.north)
+            ):
+                raise MapDataError(
+                    f"clip input falls outside EPSG:{self._processing_srid} "
+                    f"area of use ({area.west}, {area.south}, "
+                    f"{area.east}, {area.north})"
+                )
+
+        centre_lon = (lon_min + lon_max) / 2.0
+        centre_lat = (lat_min + lat_max) / 2.0
+        samples = {
+            (lon_min, lat_min),
+            (lon_min, lat_max),
+            (lon_max, lat_min),
+            (lon_max, lat_max),
+            (centre_lon, centre_lat),
+        }
+        for lon, lat in samples:
+            try:
+                factors = self._projection.get_factors(lon, lat)
+                scales = (
+                    float(factors.meridional_scale),
+                    float(factors.parallel_scale),
+                    float(factors.tissot_semimajor),
+                    float(factors.tissot_semiminor),
+                )
+            except Exception as exc:
+                raise MapDataError(
+                    "clip input scale distortion could not be evaluated"
+                ) from exc
+            if any(
+                not math.isfinite(scale)
+                or abs(scale - 1.0) > self._max_scale_error
+                for scale in scales
+            ):
+                raise MapDataError(
+                    f"EPSG:{self._processing_srid} scale distortion exceeds "
+                    f"configured max_scale_error={self._max_scale_error:g} "
+                    f"at ({lon}, {lat})"
+                )
+
+    def inverse(self, x: float, y: float) -> tuple[float, float]:
+        try:
+            lon, lat = self._inverse.transform(x, y, errcheck=True)
+        except Exception as exc:
+            raise MapDataError("clip endpoint could not be transformed to EPSG:4326") from exc
+        result = float(lon), float(lat)
+        if not all(math.isfinite(value) for value in result):
+            raise MapDataError("clip endpoint could not be transformed to EPSG:4326")
+        return result
+
+
+def _longitude_bounds_within_area(
+    lon_min: float,
+    lon_max: float,
+    *,
+    west: float,
+    east: float,
+) -> bool:
+    """Check an ordered longitude interval against an EPSG area-of-use bbox."""
+    if west <= east:
+        return west <= lon_min and lon_max <= east
+    return (
+        west <= lon_min and lon_max <= 180.0
+    ) or (
+        -180.0 <= lon_min and lon_max <= east
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +475,7 @@ class PostgresMapStore:
 
     def clip(self, request: ClipRequest) -> dict[str, Any]:
         context = self._resolve_detect(str(request.detect_id))
+        transformer = _CoordinateTransformer(context)
         requested_ids = [int(value) for value in request.intersection_ids]
         intersections = self._fetch_intersections(context.detect_id, requested_ids)
         if len(intersections) != 2:
@@ -306,7 +507,13 @@ class PostgresMapStore:
         response_point_count = 0
         clips_truncated = False
         for key, points in grouped.items():
-            for feature in _clip_track(key, points, intersections, context.detect_id):
+            for feature in _clip_track(
+                key,
+                points,
+                intersections,
+                context.detect_id,
+                transformer,
+            ):
                 if len(features) >= _CLIP_FEATURE_LIMIT:
                     clips_truncated = True
                     break
@@ -334,7 +541,8 @@ class PostgresMapStore:
         with self.connection.cursor() as cursor:
             cursor.execute(
                 "SELECT d.id::text, d.clean_id::text, "
-                "COALESCE(c.parameters->>'target_table', 'trajectory_points') "
+                "COALESCE(c.parameters->>'target_table', 'trajectory_points'), "
+                "c.source_srid, c.processing_srid, c.projection_config "
                 "FROM detect_runs AS d JOIN clean_runs AS c ON c.id = d.clean_id WHERE "
                 + clauses + order + " LIMIT 1",
                 params,
@@ -346,7 +554,14 @@ class PostgresMapStore:
             raise MapNotFoundError("no completed Detect Run is available")
         target_table = str(row[2])
         _quoted_identifier(target_table)
-        return _DetectContext(str(row[0]), str(row[1]), target_table)
+        return _DetectContext(
+            detect_id=str(row[0]),
+            clean_id=str(row[1]),
+            target_table=target_table,
+            source_srid=int(row[3]) if row[3] is not None else None,
+            processing_srid=int(row[4]) if row[4] is not None else None,
+            projection_config=_projection_config(row[5], str(row[0])),
+        )
 
     def _resolve_fit(self, fit_id: str | None) -> tuple[str, str]:
         clauses = "f.id = %s AND f.status = 'completed'" if fit_id else "f.status = 'completed'"
@@ -765,6 +980,22 @@ def _json_value(value: Any, default: Any) -> Any:
     return default
 
 
+def _projection_config(value: Any, detect_id: str) -> dict[str, Any]:
+    """Decode persisted projection metadata without accepting malformed JSON."""
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise MapDataError(
+                f"Detect Run {detect_id} has invalid projection_config"
+            ) from exc
+        if isinstance(decoded, dict):
+            return decoded
+    raise MapDataError(f"Detect Run {detect_id} has invalid projection_config")
+
+
 def _rows_to_grouped(rows: list[Any]) -> dict[tuple[str, int], list[_TrackPoint]]:
     grouped: dict[tuple[str, int], list[_TrackPoint]] = {}
     for row in rows:
@@ -832,11 +1063,12 @@ def _clip_track(
     points: list[_TrackPoint],
     intersections: list[_Intersection],
     detect_id: str,
+    transformer: _CoordinateTransformer,
 ) -> list[dict[str, Any]]:
     if len(points) < 2:
         return []
     requested = {item.intersection_id for item in intersections}
-    events = _crossings(points, intersections)
+    events = _crossings(points, intersections, transformer)
     pending_exit: _Crossing | None = None
     features: list[dict[str, Any]] = []
     for event in events:
@@ -866,7 +1098,7 @@ def _clip_track(
                         to_intersection_id=event.intersection_id,
                         start_timestamp=pending_exit.timestamp,
                         end_timestamp=event.timestamp,
-                        distance_m=_polyline_distance(coordinates),
+                        distance_m=_polyline_distance(coordinates, transformer),
                         point_count=len(coordinates),
                     )
                 )
@@ -877,19 +1109,36 @@ def _clip_track(
 def _crossings(
     points: list[_TrackPoint],
     intersections: list[_Intersection],
+    transformer: _CoordinateTransformer,
 ) -> list[_Crossing]:
     events: list[_Crossing] = []
+    point_coordinates = transformer.forward_many(
+        [(point.lon, point.lat) for point in points]
+    )
+    intersection_coordinates = transformer.forward_many(
+        [(intersection.lon, intersection.lat) for intersection in intersections]
+    )
     for segment_index, (start, end) in enumerate(zip(points, points[1:])):
-        for intersection in intersections:
-            start_xy = _relative_xy(start.lon, start.lat, intersection.lon, intersection.lat)
-            end_xy = _relative_xy(end.lon, end.lat, intersection.lon, intersection.lat)
-            dx = end_xy[0] - start_xy[0]
-            dy = end_xy[1] - start_xy[1]
+        start_x, start_y = point_coordinates[segment_index]
+        end_x, end_y = point_coordinates[segment_index + 1]
+        for intersection, (center_x, center_y) in zip(
+            intersections,
+            intersection_coordinates,
+            strict=True,
+        ):
+            relative_start_x = start_x - center_x
+            relative_start_y = start_y - center_y
+            dx = end_x - start_x
+            dy = end_y - start_y
             qa = dx * dx + dy * dy
             if qa <= _EPS:
                 continue
-            qb = 2.0 * (start_xy[0] * dx + start_xy[1] * dy)
-            qc = start_xy[0] ** 2 + start_xy[1] ** 2 - intersection.radius_m ** 2
+            qb = 2.0 * (relative_start_x * dx + relative_start_y * dy)
+            qc = (
+                relative_start_x * relative_start_x
+                + relative_start_y * relative_start_y
+                - intersection.radius_m * intersection.radius_m
+            )
             discriminant = qb * qb - 4.0 * qa * qc
             if discriminant <= _EPS:
                 continue
@@ -900,11 +1149,17 @@ def _crossings(
                     continue
                 fraction = min(1.0, max(0.0, raw_fraction))
                 radial_velocity = (
-                    (start_xy[0] + fraction * dx) * dx
-                    + (start_xy[1] + fraction * dy) * dy
+                    (relative_start_x + fraction * dx) * dx
+                    + (relative_start_y + fraction * dy) * dy
                 )
                 if abs(radial_velocity) <= _EPS:
                     continue
+                crossing_x = start_x + fraction * dx
+                crossing_y = start_y + fraction * dy
+                crossing_lon, crossing_lat = transformer.inverse(
+                    crossing_x,
+                    crossing_y,
+                )
                 events.append(
                     _Crossing(
                         progress=segment_index + fraction,
@@ -912,8 +1167,8 @@ def _crossings(
                         intersection_id=intersection.intersection_id,
                         segment_index=segment_index,
                         fraction=fraction,
-                        lon=start.lon + fraction * (end.lon - start.lon),
-                        lat=start.lat + fraction * (end.lat - start.lat),
+                        lon=crossing_lon,
+                        lat=crossing_lat,
                         timestamp=start.timestamp + fraction * (end.timestamp - start.timestamp),
                     )
                 )
@@ -933,23 +1188,14 @@ def _crossings(
     return deduplicated
 
 
-def _relative_xy(lon: float, lat: float, origin_lon: float, origin_lat: float) -> tuple[float, float]:
-    return (
-        math.radians(lon - origin_lon) * _EARTH_RADIUS_M * math.cos(math.radians(origin_lat)),
-        math.radians(lat - origin_lat) * _EARTH_RADIUS_M,
+def _polyline_distance(
+    coordinates: list[list[float]],
+    transformer: _CoordinateTransformer,
+) -> float:
+    projected = transformer.forward_many(
+        [(coordinate[0], coordinate[1]) for coordinate in coordinates]
     )
-
-
-def _polyline_distance(coordinates: list[list[float]]) -> float:
-    distance = 0.0
-    for left, right in zip(coordinates, coordinates[1:]):
-        lat1 = math.radians(left[1])
-        lat2 = math.radians(right[1])
-        delta_lat = lat2 - lat1
-        delta_lon = math.radians(right[0] - left[0])
-        value = (
-            math.sin(delta_lat / 2.0) ** 2
-            + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2.0) ** 2
-        )
-        distance += 2.0 * _EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(value)))
-    return distance
+    return sum(
+        math.hypot(right[0] - left[0], right[1] - left[1])
+        for left, right in zip(projected, projected[1:])
+    )

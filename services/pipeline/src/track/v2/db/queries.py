@@ -19,44 +19,53 @@ from ..models import (
     ClipIntersection,
     HotspotCluster,
     PointRef,
+    SpatialContext,
     TrajectoryPoint,
 )
+from ..projection import CoordinateTransformer, spatial_context_from_values
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # Column select fragments
 # ═══════════════════════════════════════════════════════════════════════
 # trajectory_points and injected_points have different column names;
-# these fragments alias them into a shared 11-column result:
+# these fragments alias them into a shared 14-column result:
 #   (vehicle_id, timestamp, lon, lat, heading, speed,
 #    source_id, source_row_key, extra, from_source_row_key,
-#    to_source_row_key, generated_reason)
-
-_TP_UNIFIED_COLS = (
-    "vehicle_id, timestamp, lon, lat, heading, speed, "
-    "%s::text AS source_id, id::text AS source_row_key, extra, "
-    "NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
-    "''::text AS generated_reason"
-)
+#    to_source_row_key, generated_reason, x, y)
 
 _IP_UNIFIED_COLS = (
     "vehicle_id, timestamp, lon, lat, heading, speed, "
     "%s::text AS source_id, "
     "id::text AS source_row_key, "
     "'{}'::jsonb AS extra, "
-    "from_source_row_key, to_source_row_key, generated_reason"
+    "from_source_row_key, to_source_row_key, generated_reason, x, y"
 )
 
 _INJECTED_SOURCE_ID = "public.injected_points"
+
+
+def _tp_unified_cols(processing_srid: int, *, alias: str = "") -> str:
+    """Return raw-point columns plus fixed processing-CRS metre coordinates."""
+    prefix = f"{alias}." if alias else ""
+    projected = f"ST_Transform({prefix}geom, {int(processing_srid)})"
+    return (
+        f"{prefix}vehicle_id, {prefix}timestamp, {prefix}lon, {prefix}lat, "
+        f"{prefix}heading, {prefix}speed, %s::text AS source_id, "
+        f"{prefix}id::text AS source_row_key, {prefix}extra, "
+        "NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
+        f"''::text AS generated_reason, ST_X({projected}) AS x, "
+        f"ST_Y({projected}) AS y"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # Row mapping helper
 # ═══════════════════════════════════════════════════════════════════════
 def row_to_dict(row: Any) -> dict[str, Any]:
-    """Convert a DB cursor row (unified 11-column format) to a dict.
+    """Convert a DB cursor row (unified 14-column format) to a dict.
 
-    ZH: 将统一 11 列格式的 DB 游标行转为 dict。
+    ZH: 将统一 14 列格式的 DB 游标行转为 dict。
         替代 intersect2.py 中重复的 ``rows.append({...})``。
     """
     return {
@@ -72,6 +81,8 @@ def row_to_dict(row: Any) -> dict[str, Any]:
         "from_source_row_key": row[9],
         "to_source_row_key": row[10],
         "generated_reason": row[11],
+        "x": float(row[12]),
+        "y": float(row[13]),
     }
 
 
@@ -81,9 +92,11 @@ def row_to_dict(row: Any) -> dict[str, Any]:
 def build_spatial_extent_sql(
     table: str = "trajectory_points",
     *,
+    has_clean_id: bool = False,
     kept_table: str | None = None,
+    spatial_context: SpatialContext,
 ) -> str:
-    """MIN/MAX lon/lat of active points.
+    """MIN/MAX processing-CRS x/y of active points.
 
     ZH: 查询 active points 的空间范围 (lon_min, lat_min, lon_max, lat_max)。
         ``kept_table`` 非空时 JOIN 清洗结果表（几何列取自 ``table``），
@@ -92,19 +105,34 @@ def build_spatial_extent_sql(
         ``table`` for the geometry columns, filtered by ``ktp.clean_id``.
 
     Parameter placeholders (in order, caller must bind):
-        Kept mode only: 1. %s — ktp.clean_id
+        Kept mode only:
+            1. %s — ktp.clean_id
+            2. %s — injected_points.clean_id
     """
+    if has_clean_id and kept_table is None:
+        raise ValueError("clean_id requires kept_table for complete Run isolation")
+    processing_srid = int(spatial_context.processing_srid)
     if kept_table is not None:
         return (
-            f"SELECT MIN(tp.lon), MAX(tp.lon), MIN(tp.lat), MAX(tp.lat) "
-            f"FROM {kept_table} AS ktp "
-            f"JOIN {table} AS tp ON tp.id = ktp.trajectory_point_id "
-            f"WHERE ktp.clean_id = %s"
+            "SELECT MIN(x), MAX(x), MIN(y), MAX(y) FROM ("
+            f"  SELECT ST_X(ST_Transform(tp.geom, {processing_srid})) AS x, "
+            f"         ST_Y(ST_Transform(tp.geom, {processing_srid})) AS y "
+            f"  FROM {kept_table} AS ktp "
+            f"  JOIN {table} AS tp ON tp.id = ktp.trajectory_point_id "
+            f"  WHERE ktp.clean_id = %s "
+            "  UNION ALL "
+            "  SELECT ip.x, ip.y FROM injected_points AS ip "
+            "  WHERE ip.clean_id = %s"
+            ") AS projected_points"
         )
-    return (
-        f"SELECT MIN(lon), MAX(lon), MIN(lat), MAX(lat) "
+    raw_extent = (
+        f"SELECT MIN(ST_X(ST_Transform(geom, {processing_srid}))), "
+        f"MAX(ST_X(ST_Transform(geom, {processing_srid}))), "
+        f"MIN(ST_Y(ST_Transform(geom, {processing_srid}))), "
+        f"MAX(ST_Y(ST_Transform(geom, {processing_srid}))) "
         f"FROM {table} WHERE is_active = TRUE"
     )
+    return raw_extent
 
 
 def build_active_in_window_sql(
@@ -112,11 +140,14 @@ def build_active_in_window_sql(
     *,
     has_clean_id: bool = False,
     kept_table: str | None = None,
+    spatial_context: SpatialContext,
 ) -> str:
     """UNION ALL query for active + injected points inside a spatial bbox.
 
     ZH: 空间窗口内的 active + injected points UNION ALL 查询。
-        使用 ``geom && ST_MakeEnvelope()`` 走 GiST R-tree 2D 空间索引。
+        原始 Point 先以 4326 ``geom`` bbox 使用现有 GiST 粗筛，再以
+        ``ST_Transform(geom, processing_srid)`` 做精确窗口判断；
+        若该查询成为热点，可为同一固定转换建立匹配的函数 GiST 索引。
         ``kept_table`` 非空时，trajectory 分支改为 JOIN 清洗结果表
         (``kept_table`` 存 vehicle_id/subtrack 切分，几何列取自 ``table``)，
         且 ``ktp.clean_id`` 必填，只读本次 Clean Run 的 kept 结果。
@@ -126,55 +157,61 @@ def build_active_in_window_sql(
         against ``table`` for geometry columns, filtered by ``ktp.clean_id``.
 
     Parameter placeholders (in order, caller must bind):
-        Raw mode (``kept_table`` is None):
+        Raw mode without ``clean_id``:
             1.  %s::text                         — source_id literal
-            2-5. ST_MakeEnvelope (traj. bbox)    — x_min, y_min, x_max, y_max
-            6.  %s::text                         — injected_points table name
-            7-10. ST_MakeEnvelope (inj. bbox)    — x_min, y_min, x_max, y_max
-            11. clean_id (optional, only when ``has_clean_id=True``)
+            2-5. source ST_MakeEnvelope          — lon_min, lat_min, lon_max, lat_max
+            6-9. processing ST_MakeEnvelope      — x_min, y_min, x_max, y_max
+            injected_points are deliberately excluded because their x/y CRS
+            cannot be identified without the owning Clean Run.
         Kept mode (``kept_table`` set):
             1.  %s                              — ktp.clean_id
-            2-5. ST_MakeEnvelope (kept traj.)   — x_min, y_min, x_max, y_max
-            6.  %s::text                        — injected_points table name
-            7-10. ST_MakeEnvelope (inj. bbox)   — x_min, y_min, x_max, y_max
-            11. %s                              — injected_points.clean_id
+            2-5. raw source ST_MakeEnvelope      — lon_min, lat_min, lon_max, lat_max
+            6-9. raw processing ST_MakeEnvelope  — x_min, y_min, x_max, y_max
+            10. %s::text                         — canonical injected source ID
+            11-14. injected source envelope      — lon_min, lat_min, lon_max, lat_max
+            15-18. injected x/y bounds           — x_min, y_min, x_max, y_max
+            19. %s                               — injected_points.clean_id
     """
-    injected_clean_clause = " AND clean_id = %s" if (has_clean_id or kept_table is not None) else ""
+    if has_clean_id and kept_table is None:
+        raise ValueError("clean_id requires kept_table for complete Run isolation")
+    processing_srid = int(spatial_context.processing_srid)
+    source_envelope = "ST_MakeEnvelope(%s, %s, %s, %s, 4326)"
+    projected_envelope = (
+        f"ST_MakeEnvelope(%s, %s, %s, %s, {processing_srid})"
+    )
+    projected_tp = f"ST_Transform(tp.geom, {processing_srid})"
+    injected_window = "x >= %s AND y >= %s AND x <= %s AND y <= %s"
     if kept_table is not None:
         return (
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
             f"       source_id, source_row_key, extra, "
-            f"       from_source_row_key, to_source_row_key, generated_reason "
+            f"       from_source_row_key, to_source_row_key, "
+            f"       generated_reason, x, y "
             f"FROM ("
             f"  SELECT ktp.vehicle_id, tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, "
             f"         ktp.source_id, ktp.source_row_key, tp.extra, "
             f"         NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
-            f"         ''::text AS generated_reason "
+            f"         ''::text AS generated_reason, "
+            f"         ST_X({projected_tp}) AS x, ST_Y({projected_tp}) AS y "
             f"  FROM {kept_table} AS ktp "
             f"  JOIN {table} AS tp ON tp.id = ktp.trajectory_point_id "
             f"  WHERE ktp.clean_id = %s "
-            f"    AND tp.geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326) "
+            f"    AND tp.geom && {source_envelope} "
+            f"    AND {projected_tp} && {projected_envelope} "
             f"  UNION ALL "
             f"  SELECT {_IP_UNIFIED_COLS} "
             f"  FROM injected_points "
-            f"  WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326){injected_clean_clause} "
+            f"  WHERE geom && {source_envelope} "
+            f"    AND {injected_window} AND clean_id = %s "
             f") AS combined "
             f"ORDER BY vehicle_id, timestamp"
         )
     return (
-        f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-        f"       source_id, source_row_key, extra, "
-        f"       from_source_row_key, to_source_row_key, generated_reason "
-        f"FROM ("
-        f"  SELECT {_TP_UNIFIED_COLS} "
-        f"  FROM {table} "
-        f"  WHERE is_active = TRUE "
-        f"    AND geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326) "
-        f"  UNION ALL "
-        f"  SELECT {_IP_UNIFIED_COLS} "
-        f"  FROM injected_points "
-        f"  WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326){injected_clean_clause} "
-        f") AS combined "
+        f"SELECT {_tp_unified_cols(processing_srid)} "
+        f"FROM {table} "
+        f"WHERE is_active = TRUE "
+        f"  AND geom && {source_envelope} "
+        f"  AND ST_Transform(geom, {processing_srid}) && {projected_envelope} "
         f"ORDER BY vehicle_id, timestamp"
     )
 
@@ -184,12 +221,15 @@ def build_stream_all_sql(
     *,
     has_clean_id: bool = False,
     kept_table: str | None = None,
+    spatial_context: SpatialContext,
 ) -> str:
     """UNION ALL query to stream all active + injected points (no spatial filter).
 
     ZH: 全量 active + injected points UNION ALL 查询（无空间过滤）。
         用于 server-side named cursor 逐车流式读取。
         使用 ``is_active = TRUE`` 以匹配 partial index ``idx_tp_active``。
+        未提供 ``clean_id`` 时不读取 injected_points，避免混入其它 Run 或
+        legacy local-origin x/y。
         ``kept_table`` 非空时，trajectory 分支改为 JOIN 清洗结果表
         (``kept_table`` 的 vehicle_id 带 _seg 后缀，几何列取自 ``table``)，
         并按 ``ktp.clean_id`` 只读本次 Clean Run。
@@ -201,35 +241,34 @@ def build_stream_all_sql(
     Parameter placeholders (in order, caller must bind):
         Raw mode (``kept_table`` is None):
             1.  %s::text          — source_id literal
-            2.  %s::text          — injected_points table name
-            3.  clean_id (optional) — only when ``has_clean_id=True``
         Kept mode (``kept_table`` set):
             1.  %s               — ktp.clean_id
             2.  %s::text         — injected_points table name
             3.  %s               — injected_points.clean_id
     """
-    injected_clean_clause = " WHERE clean_id = %s" if (has_clean_id or kept_table is not None) else ""
+    if has_clean_id and kept_table is None:
+        raise ValueError("clean_id requires kept_table for complete Run isolation")
+    processing_srid = int(spatial_context.processing_srid)
+    projected_tp = f"ST_Transform(tp.geom, {processing_srid})"
     if kept_table is not None:
         return (
             f"SELECT ktp.vehicle_id, tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, "
             f"       ktp.source_id, ktp.source_row_key, tp.extra, "
             f"       NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
-            f"       ''::text AS generated_reason "
+            f"       ''::text AS generated_reason, "
+            f"       ST_X({projected_tp}) AS x, ST_Y({projected_tp}) AS y "
             f"FROM {kept_table} AS ktp "
             f"JOIN {table} AS tp ON tp.id = ktp.trajectory_point_id "
             f"WHERE ktp.clean_id = %s "
             f"UNION ALL "
             f"SELECT {_IP_UNIFIED_COLS} "
-            f"FROM injected_points{injected_clean_clause} "
+            f"FROM injected_points WHERE clean_id = %s "
             f"ORDER BY vehicle_id, timestamp"
         )
     return (
-        f"SELECT {_TP_UNIFIED_COLS} "
+        f"SELECT {_tp_unified_cols(processing_srid)} "
         f"FROM {table} "
         f"WHERE is_active = TRUE "
-        f"UNION ALL "
-        f"SELECT {_IP_UNIFIED_COLS} "
-        f"FROM injected_points{injected_clean_clause} "
         f"ORDER BY vehicle_id, timestamp"
     )
 
@@ -246,14 +285,14 @@ class SpatialWindow:
 class SpatialWindowIterator:
     """Divide a spatial extent into overlapping windows.
 
-    ZH: 将 lon/lat 范围划分为重叠的空间滑窗。overlap 是四向扩展比例
+    ZH: 将 processing CRS 米制范围划分为重叠的空间滑窗。overlap 是四向扩展比例
         （每侧扩展 overlap%），相邻窗口间实际重叠 = 2 × overlap。
     Parameters
     ----------
-    extent : (lon_min, lat_min, lon_max, lat_max)
-        Full spatial extent of the data.
+    extent : (x_min, y_min, x_max, y_max)
+        Full processing-CRS spatial extent in metres.
     size : (width_m, height_m)
-        Window size in meters (approximate, converted to degrees).
+        Window size in processing-CRS metres.
     overlap : float
         Per-side expansion ratio (default 0.15 = 15% each side).
     """
@@ -264,43 +303,42 @@ class SpatialWindowIterator:
         size: tuple[float, float] = (2000.0, 2000.0),
         overlap: float = 0.15,
     ) -> None:
-        self._lon_min, self._lat_min, self._lon_max, self._lat_max = extent
+        self._x_min, self._y_min, self._x_max, self._y_max = extent
         self._width_m, self._height_m = size
         self._overlap = overlap
 
-        # Approximate metres → degrees (1° ≈ 111,320 m at equator)
-        self._step_lon = self._width_m / 111320.0
-        self._step_lat = self._height_m / 111320.0
-        self._pad_lon = self._step_lon * overlap
-        self._pad_lat = self._step_lat * overlap
+        self._step_x = self._width_m
+        self._step_y = self._height_m
+        self._pad_x = self._step_x * overlap
+        self._pad_y = self._step_y * overlap
 
     def iter_windows(self) -> Iterator[SpatialWindow]:
         """Yield overlapping spatial windows covering the full extent."""
-        lon_count, lat_count = self.window_shape()
-        for lon_index in range(lon_count):
-            lon = self._lon_min + lon_index * self._step_lon
-            for lat_index in range(lat_count):
-                lat = self._lat_min + lat_index * self._step_lat
+        x_count, y_count = self.window_shape()
+        for x_index in range(x_count):
+            x = self._x_min + x_index * self._step_x
+            for y_index in range(y_count):
+                y = self._y_min + y_index * self._step_y
                 yield SpatialWindow(
-                    x_min=max(self._lon_min, lon - self._pad_lon),
-                    y_min=max(self._lat_min, lat - self._pad_lat),
+                    x_min=max(self._x_min, x - self._pad_x),
+                    y_min=max(self._y_min, y - self._pad_y),
                     x_max=min(
-                        self._lon_max,
-                        self._lon_min + (lon_index + 1) * self._step_lon + self._pad_lon,
+                        self._x_max,
+                        self._x_min + (x_index + 1) * self._step_x + self._pad_x,
                     ),
                     y_max=min(
-                        self._lat_max,
-                        self._lat_min + (lat_index + 1) * self._step_lat + self._pad_lat,
+                        self._y_max,
+                        self._y_min + (y_index + 1) * self._step_y + self._pad_y,
                     ),
                 )
 
     def window_shape(self) -> tuple[int, int]:
-        """Return deterministic ``(longitude_count, latitude_count)``."""
-        if self._lon_max <= self._lon_min or self._lat_max <= self._lat_min:
+        """Return deterministic ``(x_count, y_count)``."""
+        if self._x_max <= self._x_min or self._y_max <= self._y_min:
             return 0, 0
         return (
-            self._axis_count(self._lon_min, self._lon_max, self._step_lon),
-            self._axis_count(self._lat_min, self._lat_max, self._step_lat),
+            self._axis_count(self._x_min, self._x_max, self._step_x),
+            self._axis_count(self._y_min, self._y_max, self._step_y),
         )
 
     @staticmethod
@@ -315,8 +353,8 @@ class SpatialWindowIterator:
 
     def count_windows(self) -> int:
         """Return the number of windows that :meth:`iter_windows` will yield."""
-        lon_count, lat_count = self.window_shape()
-        return lon_count * lat_count
+        x_count, y_count = self.window_shape()
+        return x_count * y_count
 
 
 def _query_spatial_extent(
@@ -326,25 +364,33 @@ def _query_spatial_extent(
     kept_table: str | None = None,
     source_id: str | None = None,
     clean_id: str | None = None,
+    spatial_context: SpatialContext,
 ) -> tuple[float, float, float, float] | None:
-    """Query MIN/MAX lon/lat of active trajectory points.
+    """Query MIN/MAX processing-CRS x/y of active trajectory points.
 
     ZH: kept 模式 (``kept_table`` 非空) 时 JOIN 清洗结果表并绑定
         ``ktp.clean_id``。
-    Returns ``(lon_min, lat_min, lon_max, lat_max)`` compatible with
+    Returns ``(x_min, y_min, x_max, y_max)`` compatible with
     ``SpatialWindowIterator``.
     """
     if kept_table is not None and clean_id is None:
         raise ValueError("kept_table requires clean_id")
-    sql = build_spatial_extent_sql(table, kept_table=kept_table)
-    params: tuple[Any, ...] = (clean_id,) if kept_table is not None else ()
+    sql = build_spatial_extent_sql(
+        table,
+        has_clean_id=clean_id is not None,
+        kept_table=kept_table,
+        spatial_context=spatial_context,
+    )
+    if kept_table is not None:
+        params: tuple[Any, ...] = (clean_id, clean_id)
+    else:
+        params = ()
     with conn.cursor() as cur:
         cur.execute(sql, params)
         row = cur.fetchone()
     if row is None or row[0] is None:
         return None
-    # SQL returns (min_lon, max_lon, min_lat, max_lat)
-    # SpatialWindowIterator expects (lon_min, lat_min, lon_max, lat_max)
+    # SQL returns (min_x, max_x, min_y, max_y).
     return float(row[0]), float(row[2]), float(row[1]), float(row[3])
 
 
@@ -356,12 +402,16 @@ def _query_active_points_in_window(
     kept_table: str | None = None,
     source_id: str | None = None,
     clean_id: str | None = None,
+    spatial_context: SpatialContext,
     telemetry: dict[str, int | float] | None = None,
+    _transformer: CoordinateTransformer | None = None,
 ) -> list[TrajectoryPoint]:
     """Query active trajectory points + injected points in a spatial window.
 
-    ZH: 使用 PostGIS GiST 空间索引 (geom && ST_MakeEnvelope) 替代
-        lon/lat BETWEEN，走 R-tree 2D 索引扫描。UNION ALL 合并两表一次往返。
+    ZH: 先以反投影并加密边界的 4326 bbox 使用原始 Geometry GiST 粗筛，
+        再在 processing CRS 中对 Point 执行精确窗口判断，并以 UNION ALL
+        合并两表、一次往返。只有性能分析确认热点后，才应为完全相同的
+        ST_Transform 表达式建立函数索引。
         kept 模式 (``kept_table`` 非空) 时 trajectory 分支 JOIN 清洗结果表，
         首参绑定 ``ktp.clean_id``（而非 raw 模式的 source_id）。
     """
@@ -369,23 +419,33 @@ def _query_active_points_in_window(
     has_clean_id = clean_id is not None
     if kept_table is not None and clean_id is None:
         raise ValueError("kept_table requires clean_id")
+    if kept_table is None and clean_id is not None:
+        raise ValueError("clean_id requires kept_table for complete Run isolation")
+    transformer = _transformer or CoordinateTransformer(spatial_context)
+    source_bounds = transformer.inverse_bounds(
+        (window.x_min, window.y_min, window.x_max, window.y_max)
+    )
     if kept_table is not None:
         params: list[Any] = [clean_id]
+        params.extend(source_bounds)
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
         params.append(_INJECTED_SOURCE_ID)
+        params.extend(source_bounds)
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
         params.append(clean_id)
     else:
         params = [source_id or ""]
+        params.extend(source_bounds)
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
-        params.append(_INJECTED_SOURCE_ID)
-        params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
-        if has_clean_id:
-            params.append(clean_id)
     query_started = time.perf_counter() if telemetry is not None else 0.0
     with conn.cursor() as cur:
         cur.execute(
-            build_active_in_window_sql(table, has_clean_id=has_clean_id, kept_table=kept_table),
+            build_active_in_window_sql(
+                table,
+                has_clean_id=has_clean_id,
+                kept_table=kept_table,
+                spatial_context=spatial_context,
+            ),
             params,
         )
         for row in cur:
@@ -413,6 +473,7 @@ def _stream_vehicle_tracks_from_db(
     kept_table: str | None = None,
     source_id: str | None = None,
     clean_id: str | None = None,
+    spatial_context: SpatialContext,
 ) -> Iterator[list[TrajectoryPoint]]:
     """Stream tracks one vehicle at a time from DB (global, no spatial filter).
 
@@ -425,19 +486,24 @@ def _stream_vehicle_tracks_from_db(
     has_clean_id = clean_id is not None
     if kept_table is not None and clean_id is None:
         raise ValueError("kept_table requires clean_id")
+    if kept_table is None and clean_id is not None:
+        raise ValueError("clean_id requires kept_table for complete Run isolation")
     if kept_table is not None:
         params: list[Any] = [clean_id, _INJECTED_SOURCE_ID, clean_id]
     else:
-        params = [source_id or "", _INJECTED_SOURCE_ID]
-        if has_clean_id:
-            params.append(clean_id)
+        params = [source_id or ""]
     # ZH: 服务器端命名游标 — PG 按需 FETCH，避免全量物化到 portal。
     # EN: Server-side named cursor — FETCHes on demand, no full portal materialization.
     with conn.cursor(
         name=f"stream_tracks_{uuid.uuid4().hex}",
     ) as cur:
         cur.execute(
-            build_stream_all_sql(table, has_clean_id=has_clean_id, kept_table=kept_table),
+            build_stream_all_sql(
+                table,
+                has_clean_id=has_clean_id,
+                kept_table=kept_table,
+                spatial_context=spatial_context,
+            ),
             params,
         )
         current_vid: str | None = None
@@ -464,6 +530,8 @@ def _stream_vehicle_tracks_from_db(
                 heading=float(row[4]),
                 speed=float(row[5]),
                 extra=row[8] if isinstance(row[8], dict) else {},
+                x=float(row[12]),
+                y=float(row[13]),
             ))
         if current_track:
             yield current_track
@@ -478,21 +546,19 @@ def _query_active_points_near_cluster(
     kept_table: str | None = None,
     source_id: str | None = None,
     clean_id: str | None = None,
+    spatial_context: SpatialContext,
 ) -> list[TrajectoryPoint]:
     """Query active points within *radius_m* of a cluster centroid.
 
     ZH: 委托 ``_query_active_points_in_window``，将 cluster centroid + radius_m
-        转换为 SpatialWindow 后走 GiST 空间索引查询。自动获得 UNION ALL 一次往返、
-        DB 侧 ORDER BY（无需 Python 排序），且 telemetry 可选跟踪。
+        转换为 SpatialWindow 后在 processing CRS 中查询。自动获得 UNION ALL
+        一次往返、DB 侧 ORDER BY（无需 Python 排序），且 telemetry 可选跟踪。
     """
-    radius_deg = radius_m / 111320.0
-    # Window x/y are *lon/lat* degrees (not meters) — SpatialWindow stores
-    # the coordinate system of the extent it was built from.
     window = SpatialWindow(
-        x_min=cluster.centroid_lon - radius_deg,
-        y_min=cluster.centroid_lat - radius_deg,
-        x_max=cluster.centroid_lon + radius_deg,
-        y_max=cluster.centroid_lat + radius_deg,
+        x_min=cluster.centroid_x - radius_m,
+        y_min=cluster.centroid_y - radius_m,
+        x_max=cluster.centroid_x + radius_m,
+        y_max=cluster.centroid_y + radius_m,
     )
     return _query_active_points_in_window(
         conn,
@@ -501,6 +567,7 @@ def _query_active_points_near_cluster(
         kept_table=kept_table,
         source_id=source_id,
         clean_id=clean_id,
+        spatial_context=spatial_context,
     )
 
 
@@ -530,6 +597,8 @@ def _build_points_from_rows(rows: list[dict[str, Any]]) -> list[TrajectoryPoint]
             heading=r["heading"],
             speed=r["speed"],
             extra=r["extra"],
+            x=r["x"],
+            y=r["y"],
         ))
     return points
 
@@ -552,13 +621,15 @@ class _RunRow:
     source_id: str
     parameters: dict[str, object]
     status: str
+    spatial_context: SpatialContext
 
 
 def fetch_detect_row(conn: object, detect_id: str) -> _RunRow:
     """Fetch a Detect Run and the source metadata of its parent Clean Run."""
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(
-            "SELECT d.clean_id, c.source_id, c.parameters, d.status "
+            "SELECT d.clean_id, c.source_id, c.parameters, d.status, "
+            "c.source_srid, c.processing_srid, c.projection_config "
             "FROM detect_runs AS d JOIN clean_runs AS c ON c.id = d.clean_id "
             "WHERE d.id = %s",
             (detect_id,),
@@ -566,12 +637,17 @@ def fetch_detect_row(conn: object, detect_id: str) -> _RunRow:
         row = cur.fetchone()
     if row is None:
         raise ValueError(f"unknown Detect Run: {detect_id}")
-    clean_id, source_id, raw_parameters, status = row
+    clean_id, source_id, raw_parameters, status, source_srid, processing_srid, projection_config = row
     return _RunRow(
         clean_id=str(clean_id),
         source_id=str(source_id),
         parameters=_decode_json_object(raw_parameters),
         status=str(status),
+        spatial_context=spatial_context_from_values(
+            source_srid,
+            processing_srid,
+            projection_config,
+        ),
     )
 
 
@@ -610,19 +686,25 @@ def fetch_clean_points(
     conn: object,
     table: str,
     clean_id: str,
+    *,
+    spatial_context: SpatialContext,
 ) -> dict[tuple[str, int], list[TrajectoryPoint]]:
     """Load one Clean Run's frozen kept members and injected points."""
     safe_table = _quoted_identifier(table)
+    processing_srid = int(spatial_context.processing_srid)
     sql = (
         "SELECT vehicle_id, subtrack_index, anchor_sequence, "
         "source_id, source_row_key, timestamp, lon, lat, heading, speed, extra, "
-        "from_source_row_key, to_source_row_key, generated_reason, point_kind, row_id "
+        "from_source_row_key, to_source_row_key, generated_reason, x, y, "
+        "point_kind, row_id "
         "FROM ("
         "  SELECT ktp.vehicle_id, ktp.subtrack_index, ktp.sequence_in_subtrack AS anchor_sequence, "
         "         ktp.source_id, ktp.source_row_key, "
         "         tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, tp.extra, "
         "         NULL::text AS from_source_row_key, "
         "         NULL::text AS to_source_row_key, ''::text AS generated_reason, "
+        f"         ST_X(ST_Transform(tp.geom, {processing_srid})) AS x, "
+        f"         ST_Y(ST_Transform(tp.geom, {processing_srid})) AS y, "
         "         0 AS point_kind, ktp.id AS row_id "
         "  FROM kept_trajectory_points AS ktp "
         f"  LEFT JOIN {safe_table} AS tp ON tp.id = ktp.trajectory_point_id "
@@ -632,6 +714,7 @@ def fetch_clean_points(
         "         %s::text AS source_id, ip.id::text AS source_row_key, "
         "         ip.timestamp, ip.lon, ip.lat, ip.heading, ip.speed, '{}'::jsonb, "
         "         ip.from_source_row_key, ip.to_source_row_key, ip.generated_reason, "
+        "         ip.x, ip.y, "
         "         1 AS point_kind, ip.id AS row_id "
         "  FROM injected_points AS ip WHERE ip.clean_id = %s"
         ") AS clean_points"
@@ -649,6 +732,8 @@ def fetch_clean_points_for_subtracks(
     table: str,
     clean_id: str,
     subtracks: set[tuple[str, int]],
+    *,
+    spatial_context: SpatialContext,
 ) -> dict[tuple[str, int], list[TrajectoryPoint]]:
     """Load only the frozen Clean Run subtracks named by a replay manifest."""
     if not subtracks:
@@ -657,19 +742,23 @@ def fetch_clean_points_for_subtracks(
     vehicle_ids = [vehicle_id for vehicle_id, _ in requested]
     subtrack_indexes = [subtrack_index for _, subtrack_index in requested]
     safe_table = _quoted_identifier(table)
+    processing_srid = int(spatial_context.processing_srid)
     sql = (
         "WITH requested(vehicle_id, subtrack_index) AS ("
         "  SELECT * FROM unnest(%s::text[], %s::integer[])"
         ") "
         "SELECT vehicle_id, subtrack_index, anchor_sequence, "
         "source_id, source_row_key, timestamp, lon, lat, heading, speed, extra, "
-        "from_source_row_key, to_source_row_key, generated_reason, point_kind, row_id "
+        "from_source_row_key, to_source_row_key, generated_reason, x, y, "
+        "point_kind, row_id "
         "FROM ("
         "  SELECT ktp.vehicle_id, ktp.subtrack_index, ktp.sequence_in_subtrack AS anchor_sequence, "
         "         ktp.source_id, ktp.source_row_key, "
         "         tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, tp.extra, "
         "         NULL::text AS from_source_row_key, "
         "         NULL::text AS to_source_row_key, ''::text AS generated_reason, "
+        f"         ST_X(ST_Transform(tp.geom, {processing_srid})) AS x, "
+        f"         ST_Y(ST_Transform(tp.geom, {processing_srid})) AS y, "
         "         0 AS point_kind, ktp.id AS row_id "
         "  FROM kept_trajectory_points AS ktp "
         "  JOIN requested AS r USING (vehicle_id, subtrack_index) "
@@ -680,6 +769,7 @@ def fetch_clean_points_for_subtracks(
         "         %s::text AS source_id, ip.id::text AS source_row_key, "
         "         ip.timestamp, ip.lon, ip.lat, ip.heading, ip.speed, '{}'::jsonb, "
         "         ip.from_source_row_key, ip.to_source_row_key, ip.generated_reason, "
+        "         ip.x, ip.y, "
         "         1 AS point_kind, ip.id AS row_id "
         "  FROM injected_points AS ip "
         "  JOIN requested AS r USING (vehicle_id, subtrack_index) "
@@ -747,9 +837,11 @@ def _group_points(
                 heading=float(row[8]),
                 speed=float(row[9]),
                 extra=row[10] if isinstance(row[10], dict) else {},
+                x=float(row[14]),
+                y=float(row[15]),
             )
             grouped_rows.setdefault((vehicle_id, subtrack_index), []).append(
-                (int(row[2]), int(row[14]), int(row[15]), point)
+                (int(row[2]), int(row[16]), int(row[17]), point)
             )
     return {
         key: [item[3] for item in sorted(rows, key=lambda item: item[:3])]

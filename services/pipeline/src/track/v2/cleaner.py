@@ -20,18 +20,19 @@ from .models import (
     PointRef,
     ReadReport,
     SourceInfo,
+    SpatialContext,
     TrajectoryPoint,
     TrajectorySourceHandle,
 )
-
-
-EARTH_RADIUS_M = 6_371_000.0
+from .projection import CoordinateTransformer
 
 
 def clean_vehicle(
     vehicle_points: list[TrajectoryPoint],
     *,
+    spatial_context: SpatialContext,
     config: CleanerConfig | None = None,
+    _transformer: CoordinateTransformer | None = None,
 ) -> CleanerIncrementalResult:
     """Clean one vehicle's trajectory points.
 
@@ -44,23 +45,36 @@ def clean_vehicle(
     derived_points: list[DerivedPoint] = []
     derived_counts: dict[GeneratedReason, int] = defaultdict(int)
     refinement_subtracks: list[RefinementSubtrack] = []
+    transformer = _transformer or CoordinateTransformer(spatial_context)
 
     subtracks = _split_by_gaps(vehicle_points, cfg.max_gap_s)
     rename = len(subtracks) > 1
     for index, subtrack in enumerate(subtracks, start=1):
         if rename:
             subtrack = [_with_vehicle_id(point, f"{point.vehicle_id}_seg{index:02d}") for point in subtrack]
-        kept, removed = _exclude_stationary(subtrack, cfg)
-        kept_points.extend(kept)
-        excluded_points.extend(removed)
-        injected_subtrack, count, injected_points = _inject_orthogonal(kept, cfg)
+        subtrack_kept, subtrack_excluded = _exclude_stationary(subtrack, cfg)
+        kept_xy = transformer.forward_many(
+            (point.lon, point.lat) for point in subtrack_kept
+        )
+        subtrack_kept = [
+            replace(point, x=x, y=y)
+            for point, (x, y) in zip(subtrack_kept, kept_xy)
+        ]
+        kept_points.extend(subtrack_kept)
+        excluded_points.extend(subtrack_excluded)
+        injected_subtrack, count, injected_points = _inject_orthogonal(
+            subtrack_kept,
+            cfg,
+            spatial_context=spatial_context,
+            _transformer=transformer,
+        )
         derived_points.extend(injected_points)
         derived_counts[GeneratedReason.HEADING_ORTHOGONAL] += count
 
-        if kept:
+        if subtrack_kept:
             refinement_subtracks.append(
                 RefinementSubtrack(
-                    vehicle_id=kept[0].vehicle_id,
+                    vehicle_id=subtrack_kept[0].vehicle_id,
                     subtrack_index=index,
                     points=injected_subtrack,
                 )
@@ -70,6 +84,7 @@ def clean_vehicle(
         kept=kept_points,
         excluded=excluded_points,
         derived=derived_points,
+        spatial_context=spatial_context,
         derived_counts=derived_counts,
         subtracks=refinement_subtracks,
     )
@@ -78,6 +93,7 @@ def clean_vehicle(
 def clean(
     source: TrajectorySourceHandle,
     *,
+    spatial_context: SpatialContext,
     config: CleanerConfig | None = None,
 ) -> CleanerResult:
     """Clean all trajectories from a source handle.
@@ -95,14 +111,19 @@ def clean(
     last_t = t0
     group_count = 0
     print("  ── 清洗 / Cleaning ...")
+    transformer = CoordinateTransformer(spatial_context)
 
     for vehicle_points in _group_by_vehicle(source.iter_points()):
-        result = clean_vehicle(vehicle_points, config=cfg)
-        excluded.extend(result.excluded)
+        result = clean_vehicle(
+            vehicle_points,
+            config=cfg,
+            spatial_context=spatial_context,
+            _transformer=transformer,
+        )
         for subtrack in result.subtracks:
-            points = list(subtrack.points)
-            active.extend(points)
-            kept_subtracks.append(points)
+            active.extend(subtrack.points)
+        excluded.extend(result.excluded)
+        kept_subtracks.extend([list(subtrack.points) for subtrack in result.subtracks])
         injected_count += sum(result.derived_counts.values())
 
         group_count += 1
@@ -122,9 +143,15 @@ def clean(
         sample_excluded=[(item.point_ref, item.reason) for item in excluded[:cfg.excluded_sample_max]],
     )
     return CleanerResult(
-        active=ListTrajectorySourceHandle(active, source_info=source.source_info, field_mapping=source.field_mapping),
+        active=ListTrajectorySourceHandle(
+            active,
+            source_info=source.source_info,
+            field_mapping=source.field_mapping,
+            spatial_context=spatial_context,
+        ),
         excluded=excluded_index,
         report=report,
+        spatial_context=spatial_context,
         kept_subtracks=kept_subtracks,
     )
 
@@ -136,10 +163,12 @@ class ListTrajectorySourceHandle:
         *,
         source_info: SourceInfo,
         field_mapping: FieldMapping,
+        spatial_context: SpatialContext | None = None,
     ) -> None:
         self._points = list(points)
         self._source_info = source_info
         self._field_mapping = field_mapping
+        self._spatial_context = spatial_context
         self._closed = False
         self._report = ReadReport(
             source_info=source_info,
@@ -160,6 +189,10 @@ class ListTrajectorySourceHandle:
     @property
     def field_mapping(self) -> FieldMapping:
         return self._field_mapping
+
+    @property
+    def spatial_context(self) -> SpatialContext | None:
+        return self._spatial_context
 
     @property
     def report(self) -> ReadReport:
@@ -248,6 +281,9 @@ def _exclude_stationary(
 def _inject_orthogonal(
     points: list[TrajectoryPoint],
     cfg: CleanerConfig,
+    *,
+    spatial_context: SpatialContext,
+    _transformer: CoordinateTransformer | None = None,
 ) -> tuple[list[TrajectoryPoint], int, list[DerivedPoint]]:
     """return **injected subtrack** and **count** of injected points."""
     if len(points) < 2:
@@ -256,10 +292,17 @@ def _inject_orthogonal(
     injected_subtrack: list[TrajectoryPoint] = []
     injected_count = 0
     injected_points: list[DerivedPoint] = []
-    
+    transformer = _transformer or CoordinateTransformer(spatial_context)
+
     for a, b in zip(points, points[1:]):
         injected_subtrack.append(a)
-        injected_point = _orthogonal_candidate(a, b, cfg)
+        injected_point = _orthogonal_candidate(
+            a,
+            b,
+            cfg,
+            spatial_context=spatial_context,
+            _transformer=transformer,
+        )
         if injected_point is not None:
             injected_subtrack.append(injected_point)
             injected_count += 1
@@ -272,6 +315,9 @@ def _orthogonal_candidate(
     a: TrajectoryPoint,
     b: TrajectoryPoint,
     cfg: CleanerConfig,
+    *,
+    spatial_context: SpatialContext,
+    _transformer: CoordinateTransformer | None = None,
 ) -> DerivedPoint | None:
     if a.vehicle_id != b.vehicle_id:
         return None
@@ -279,10 +325,19 @@ def _orthogonal_candidate(
     if not cfg.min_heading_delta_deg <= abs(delta) <= cfg.max_heading_delta_deg:
         return None
 
-    b_xy = lonlat_to_xy_m(b.lon, b.lat, a.lon, a.lat)
-    ray_a = heading_vector((a.heading + 180.0) % 360.0)
-    ray_b = heading_vector((b.heading + 180.0) % 360.0)
-    hit = ray_intersection((0.0, 0.0), ray_a, b_xy, ray_b)
+    transformer = _transformer or CoordinateTransformer(spatial_context)
+    a_xy, b_xy = transformer.forward_many(((a.lon, a.lat), (b.lon, b.lat)))
+    ray_a = transformer.heading_vector(
+        a.lon,
+        a.lat,
+        (a.heading + 180.0) % 360.0,
+    )
+    ray_b = transformer.heading_vector(
+        b.lon,
+        b.lat,
+        (b.heading + 180.0) % 360.0,
+    )
+    hit = ray_intersection(a_xy, ray_a, b_xy, ray_b)
     if hit is None:
         return None
     x, y, distance_a, distance_b = hit
@@ -291,7 +346,7 @@ def _orthogonal_candidate(
     if distance_a > cfg.max_extension_m or distance_b > cfg.max_extension_m:
         return None
 
-    lon, lat = xy_m_to_lonlat(x, y, a.lon, a.lat)
+    lon, lat = transformer.inverse(x, y)
     return DerivedPoint(
         point_ref=PointRef(
             source_id=a.point_ref.source_id,
@@ -308,6 +363,8 @@ def _orthogonal_candidate(
         heading=(a.heading + delta / 2.0) % 360.0,
         speed=0.0,
         extra={},
+        x=x,
+        y=y,
     )
 
 
@@ -344,17 +401,3 @@ def ray_intersection(
     x = origin_a[0] + ta * direction_a[0]
     y = origin_a[1] + ta * direction_a[1]
     return x, y, ta, tb
-
-
-def lonlat_to_xy_m(lon: float, lat: float, origin_lon: float, origin_lat: float) -> tuple[float, float]:
-    lat0 = math.radians(origin_lat)
-    x = EARTH_RADIUS_M * math.radians(lon - origin_lon) * math.cos(lat0)
-    y = EARTH_RADIUS_M * math.radians(lat - origin_lat)
-    return x, y
-
-
-def xy_m_to_lonlat(x: float, y: float, origin_lon: float, origin_lat: float) -> tuple[float, float]:
-    lat0 = math.radians(origin_lat)
-    lon = origin_lon + math.degrees(x / (EARTH_RADIUS_M * math.cos(lat0)))
-    lat = origin_lat + math.degrees(y / EARTH_RADIUS_M)
-    return lon, lat

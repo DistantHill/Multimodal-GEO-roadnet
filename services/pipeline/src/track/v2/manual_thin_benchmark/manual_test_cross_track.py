@@ -1,9 +1,9 @@
 """手动测试 _extract_cross_track_windows 的薄壳脚本。
 
 用法：
-    python manual_test_cross_track.py
+    python manual_test_cross_track.py --processing-srid 32650
 
-    VSCode 调试：直接按 F5 或右键 → "Run Python File" 即可。
+    VSCode 调试：请在 launch args 中显式设置 --processing-srid。
     可以改下面的 CONFIG 区域来调整参数。
 
 依赖：需要 PostgreSQL 已运行且 trajectory_points/injected_points 表有数据。
@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
@@ -28,12 +29,14 @@ from track.v2.intersect2 import (
     _extract_cross_track_windows,
     _query_spatial_extent,
 )
+from track.v2.models import ProjectionConfig
+from track.v2.projection import CoordinateTransformer, create_spatial_context
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONFIG —— 在这里改参数
 # ═══════════════════════════════════════════════════════════════════════════
 
-# 留 None 则自动查询全量空间范围；也可以手动指定 (lon_min, lat_min, lon_max, lat_max)
+# 留 None 则自动查询全量空间范围；也可以手动指定投影米制 (x_min, y_min, x_max, y_max)
 MANUAL_EXTENT: tuple[float, float, float, float] | None = None
 
 # IntersectConfig 参数（需要改什么就覆盖什么）
@@ -52,6 +55,18 @@ CONFIG_OVERRIDES: dict = {
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--processing-srid",
+        type=int,
+        required=True,
+        help="Projected metre-based EPSG code valid for the complete benchmark data region.",
+    )
+    args = parser.parse_args()
+    spatial_context = create_spatial_context(
+        ProjectionConfig(processing_srid=args.processing_srid)
+    )
+    transformer = CoordinateTransformer(spatial_context)
     cfg = IntersectConfig(**CONFIG_OVERRIDES)
 
     print("=" * 60)
@@ -67,30 +82,31 @@ def main() -> None:
         extent = MANUAL_EXTENT
         print(f"\n  Extent (manual): {extent}")
     else:
-        extent = _query_spatial_extent(conn, table=cfg.db_table)
+        extent = _query_spatial_extent(
+            conn,
+            table=cfg.db_table,
+            spatial_context=spatial_context,
+        )
         if extent is None:
             print("  ERROR: No active points found in DB!")
             conn.close()
             return
-        print(f"\n  Extent (auto): lon=[{extent[0]:.6f}, {extent[2]:.6f}], "
-              f"lat=[{extent[1]:.6f}, {extent[3]:.6f}]")
-
-    # 用数据第一个点的 lon/lat 作为坐标原点
-    origin_lon, origin_lat = extent[0], extent[1]
+        print(f"\n  Extent (auto): x=[{extent[0]:.3f}, {extent[2]:.3f}]m, "
+              f"y=[{extent[1]:.3f}, {extent[3]:.3f}]m")
 
     print(f"\n  Config: use_orthogonal={cfg.use_orthogonal_candidates}")
     print(f"          db_table={cfg.db_table}")
     print(f"          window_size={cfg.spatial_window_size}")
     print(f"          window_overlap={cfg.spatial_window_overlap}")
-    print(f"          origin=({origin_lon:.6f}, {origin_lat:.6f})")
+    print(f"          processing_srid=EPSG:{spatial_context.processing_srid}")
     print("=" * 60)
 
     # ── 调用目标函数 ──────────────────────────────────────────────
     candidates = _extract_cross_track_windows(
         conn, cfg,
         extent=extent,
-        origin_lon=origin_lon,
-        origin_lat=origin_lat,
+        spatial_context=spatial_context,
+        transformer=transformer,
     )
 
     elapsed = time.perf_counter() - t_start

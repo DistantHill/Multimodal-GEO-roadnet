@@ -13,7 +13,19 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from track.v2.fitting import fit_centerlines
-from track.v2.models import ClipEndpoint, ClipReport, ClipResult, PointRef, TrackClip, TrajectoryPoint
+from track.v2.models import (
+    ClipEndpoint,
+    ClipReport,
+    ClipResult,
+    PointRef,
+    ProjectionConfig,
+    TrackClip,
+    TrajectoryPoint,
+)
+from track.v2.projection import create_spatial_context
+
+
+_SPATIAL_CONTEXT = create_spatial_context(ProjectionConfig(processing_srid=3857))
 
 
 def _clip(index: int, reverse: bool) -> TrackClip:
@@ -42,7 +54,11 @@ def main() -> int:
     parser.add_argument("--iterations", type=int, default=5)
     args = parser.parse_args()
     clips = tuple(_clip(index, bool(index % 2)) for index in range(args.clips))
-    result = ClipResult(clips, ClipReport(args.clips, args.clips, args.clips, 0, args.clips * 21))
+    result = ClipResult(
+        clips=clips,
+        report=ClipReport(args.clips, args.clips, args.clips, 0, args.clips * 21),
+        spatial_context=_SPATIAL_CONTEXT,
+    )
     split_s = combined_s = a_to_b_s = b_to_a_s = 0.0
     tracemalloc.start()
     wall_start = time.perf_counter()
@@ -59,10 +75,18 @@ def main() -> int:
             if clip.start.intersection_id > clip.end.intersection_id
         )
         a_result = ClipResult(
-            forward, ClipReport(len(forward), len(forward), len(forward), 0, len(forward) * 21),
+            clips=forward,
+            report=ClipReport(
+                len(forward), len(forward), len(forward), 0, len(forward) * 21,
+            ),
+            spatial_context=_SPATIAL_CONTEXT,
         )
         b_result = ClipResult(
-            reverse, ClipReport(len(reverse), len(reverse), len(reverse), 0, len(reverse) * 21),
+            clips=reverse,
+            report=ClipReport(
+                len(reverse), len(reverse), len(reverse), 0, len(reverse) * 21,
+            ),
+            spatial_context=_SPATIAL_CONTEXT,
         )
         split_s += time.perf_counter() - start
         start = time.perf_counter()

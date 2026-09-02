@@ -4,11 +4,12 @@ Examples::
 
     # Dense-window exploratory comparison (does not claim the merge gate).
     uv run python track/v2/manual_thin_benchmark/manual_bench_cross_track_inner.py \
-        --window-index 1753
+        --processing-srid 32650 --window-index 1753
 
     # Required gate: three full-stage legacy/new runs, snapshot under generated/.
     uv run python track/v2/manual_thin_benchmark/manual_bench_cross_track_inner.py \
-        --repetitions 3 --write-baseline cross_track_500k.json --require-target
+        --processing-srid 32650 --repetitions 3 \
+        --write-baseline cross_track_500k.json --require-target
 
 The script is read-only against the dedicated ``track_test`` database. It
 compares the retained legacy oracle and the bounded-grid implementation across
@@ -23,9 +24,11 @@ import argparse
 import contextlib
 import ctypes
 import io
+import json
 import statistics
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -35,14 +38,6 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-# ``io`` conflicts with Python's standard-library module, while this project
-# currently exposes the helper at repository-root ``io/output.py``. Add that
-# exact directory so this thin script still uses the shared serializer.
-_OUTPUT_HELPERS_DIR = _PROJECT_ROOT / "io"
-if str(_OUTPUT_HELPERS_DIR) not in sys.path:
-    sys.path.insert(0, str(_OUTPUT_HELPERS_DIR))
-
-from output import write_json
 from track.v2.cross_track import (
     extract_cross_track_candidates_legacy as _extract_orthogonal_cross_track_candidates_legacy,
     extract_cross_track_candidates as _extract_orthogonal_cross_track_candidates,
@@ -55,11 +50,22 @@ from track.v2.intersect2 import (
     _query_spatial_extent,
 )
 from track.v2.manual_thin_benchmark._thin_bench_helpers import connect_test_db
+from track.v2.models import ProjectionConfig, SpatialContext
+from track.v2.projection import CoordinateTransformer, create_spatial_context
 
 
 _GENERATED_DIR = _PROJECT_ROOT / "generated"
 _TARGET_SPEEDUP = 5.0
 _MIN_GATE_POINTS = 500_000
+
+
+def _write_json(path: Path, value: object) -> None:
+    """Write one deterministic benchmark artifact."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
 
 
 class _QuietLiveStatus:
@@ -111,13 +117,12 @@ def _candidate_records(candidates: list[object]) -> list[dict[str, object]]:
 
 
 def _cluster_records(
-    candidates: list[object], origin_lon: float, origin_lat: float, cfg: IntersectConfig,
+    candidates: list[object], transformer: CoordinateTransformer, cfg: IntersectConfig,
 ) -> list[dict[str, object]]:
     with contextlib.redirect_stdout(io.StringIO()):
         clusters = _cluster_orthogonal_cross_track_candidates(
             candidates,  # type: ignore[arg-type]
-            origin_lon,
-            origin_lat,
+            transformer,
             eps_m=cfg.cross_track_dbscan_eps_m,
             min_samples=cfg.cross_track_dbscan_min_samples,
         )
@@ -188,8 +193,9 @@ def _run_stage(
     conn: Any,
     cfg: IntersectConfig,
     extent: tuple[float, float, float, float],
-    origin_lon: float,
-    origin_lat: float,
+    spatial_context: SpatialContext,
+    transformer: CoordinateTransformer,
+    legacy_origin: tuple[float, float],
     extractor: Callable[..., tuple[list[object], int, int]],
     *,
     windows_override: list[object],
@@ -200,10 +206,19 @@ def _run_stage(
         conn,
         cfg,
         extent,
-        origin_lon,
-        origin_lat,
+        spatial_context,
+        transformer,
         live_status=_QuietLiveStatus(),
-        candidate_extractor=extractor,  # type: ignore[arg-type]
+        candidate_extractor=(
+            extractor
+            if extractor is _extract_orthogonal_cross_track_candidates_legacy
+            else None
+        ),  # type: ignore[arg-type]
+        legacy_origin=(
+            legacy_origin
+            if extractor is _extract_orthogonal_cross_track_candidates_legacy
+            else None
+        ),
         windows_override=windows_override,  # type: ignore[arg-type]
         telemetry=telemetry,
     )
@@ -231,6 +246,12 @@ def main() -> int:
         action="store_true",
         help=f"Fail unless full selected stage is equivalent and median speedup is at least {_TARGET_SPEEDUP:g}x.",
     )
+    parser.add_argument(
+        "--processing-srid",
+        type=int,
+        required=True,
+        help="Projected metre-based EPSG code valid for the complete benchmark data region.",
+    )
     args = parser.parse_args()
     if args.window_index < 0 or args.max_windows < 0 or args.repetitions < 1:
         parser.error("window limits must be non-negative and repetitions must be at least one")
@@ -243,10 +264,18 @@ def main() -> int:
     if args.require_target and not args.write_baseline:
         args.write_baseline = "cross_track_500k.json"
 
+    spatial_context = create_spatial_context(
+        ProjectionConfig(processing_srid=args.processing_srid)
+    )
+    transformer = CoordinateTransformer(spatial_context)
     cfg = IntersectConfig()
     conn = connect_test_db()
     try:
-        extent = _query_spatial_extent(conn, table=cfg.db_table)
+        extent = _query_spatial_extent(
+            conn,
+            table=cfg.db_table,
+            spatial_context=spatial_context,
+        )
         if extent is None:
             print("No active points found.", file=sys.stderr)
             return 2
@@ -257,8 +286,10 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        origin_lon = (extent[0] + extent[2]) / 2.0
-        origin_lat = (extent[1] + extent[3]) / 2.0
+        legacy_origin = transformer.inverse(
+            (extent[0] + extent[2]) / 2.0,
+            (extent[1] + extent[3]) / 2.0,
+        )
         windows = list(SpatialWindowIterator(
             extent,
             size=cfg.spatial_window_size,
@@ -295,18 +326,33 @@ def main() -> int:
             results: dict[str, tuple[list[object], float, dict[str, int | float]]] = {}
             for label, extractor in order:
                 results[label] = _run_stage(
-                    conn, cfg, extent, origin_lon, origin_lat, extractor,
+                    conn,
+                    cfg,
+                    extent,
+                    spatial_context,
+                    transformer,
+                    legacy_origin,
+                    extractor,
                     windows_override=selected,
                 )
             legacy, legacy_wall, legacy_timing = results["legacy"]
             optimized, optimized_wall, optimized_timing = results["optimized"]
+            legacy = [
+                replace(candidate, x=x, y=y)
+                for candidate, (x, y) in zip(
+                    legacy,
+                    transformer.forward_many(
+                        [(candidate.lon, candidate.lat) for candidate in legacy]
+                    ),
+                )
+            ]
             legacy_records = _candidate_records(legacy)
             optimized_records = _candidate_records(optimized)
             if legacy_records != optimized_records:
                 print(f"repetition={repetition + 1}: candidate/provenance/order mismatch", file=sys.stderr)
                 return 1
-            legacy_clusters = _cluster_records(legacy, origin_lon, origin_lat, cfg)
-            optimized_clusters = _cluster_records(optimized, origin_lon, origin_lat, cfg)
+            legacy_clusters = _cluster_records(legacy, transformer, cfg)
+            optimized_clusters = _cluster_records(optimized, transformer, cfg)
             if legacy_clusters != optimized_clusters:
                 print(f"repetition={repetition + 1}: downstream cluster mismatch", file=sys.stderr)
                 return 1
@@ -342,7 +388,7 @@ def main() -> int:
                 output_path = _baseline_path(args.write_baseline)
             except ValueError as error:
                 parser.error(str(error))
-            write_json(output_path, {
+            _write_json(output_path, {
                 "extent": extent,
                 "active_point_count": active_points,
                 "window_count": len(windows),

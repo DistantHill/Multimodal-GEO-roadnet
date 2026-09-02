@@ -143,6 +143,8 @@ class TrajectoryPoint(TrackModel):
     heading: float
     speed: float
     extra: dict[str, Any] = field(default_factory=dict)
+    x: float | None = None
+    y: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +310,29 @@ class CleanerConfig(TrackModel):
     excluded_sample_max: int = 50
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectionConfig(TrackModel):
+    """Run-level source and processing CRS policy.
+
+    ``processing_srid`` deliberately has no default. A projected CRS is a
+    property of the data region, not a safe repository-wide constant.
+    """
+
+    source_srid: int = 4326
+    processing_srid: int | None = None
+    enforce_area_of_use: bool = True
+    max_scale_error: float = 0.01
+
+
+@dataclass(frozen=True, slots=True)
+class SpatialContext(TrackModel):
+    """Concrete coordinate context inherited by every stage of one Clean Run."""
+
+    source_srid: int
+    processing_srid: int
+    projection_config: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class RuntimeConfig(TrackModel):
     """Cross-cutting runtime IO / DB / progress parameters.
@@ -363,6 +388,7 @@ class CleanerResult(TrackModel):
     active: TrajectorySourceHandle
     excluded: ExcludedIndex
     report: CleanReport
+    spatial_context: SpatialContext
     kept_subtracks: list[list[TrajectoryPoint]] = field(default_factory=list)
 
 
@@ -380,6 +406,7 @@ class CleanerIncrementalResult(TrackModel):
     kept: list[TrajectoryPoint]
     excluded: list[ExcludedPoint]
     derived: list[DerivedPoint]
+    spatial_context: SpatialContext
     derived_counts: dict[GeneratedReason, int] = field(default_factory=dict)
     subtracks: list[RefinementSubtrack] = field(default_factory=list) 
 
@@ -472,8 +499,6 @@ class CrossTrackCandidate(TrackModel):
     from_source_row_key: str
     to_source_id: str
     to_source_row_key: str
-    origin_lon: float
-    origin_lat: float
 
 
 @dataclass(frozen=True)
@@ -544,6 +569,8 @@ class CrossingPoint(TrackModel):
     vehicle_id: str
     point_ref: PointRef             # segment-start TrajectoryPoint
     segment_index: int              # index in (flattened) vehicle track
+    crossing_x: float               # processing-CRS metres
+    crossing_y: float               # processing-CRS metres
     crossing_lon: float
     crossing_lat: float
     is_entry: bool                  # True=entering circle, False=leaving
@@ -634,6 +661,7 @@ class ClipInput(TrackModel):
 
     intersections: tuple[ClipIntersection, ...]
     tracks: tuple[ClipTrack, ...]
+    spatial_context: SpatialContext
     detect_id: str | None = None
 
 
@@ -691,6 +719,7 @@ class ClipReport(TrackModel):
 class ClipResult(TrackModel):
     clips: tuple[TrackClip, ...]
     report: ClipReport
+    spatial_context: SpatialContext
     detect_id: str | None = None
     intersections: tuple[ClipIntersection, ...] = ()
 
@@ -758,6 +787,7 @@ class FitResult(TrackModel):
     centerlines: tuple[Centerline, ...]
     issues: tuple[FitIssue, ...]
     report: FitReport
+    spatial_context: SpatialContext
     detect_id: str | None = None
 
 

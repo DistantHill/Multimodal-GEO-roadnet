@@ -7,8 +7,11 @@ from uuid import UUID
 import pytest
 
 from backend.map_api import (
+    MapDataError,
     MapNotFoundError,
     PostgresMapStore,
+    _CoordinateTransformer,
+    _DetectContext,
     _Intersection,
     _TrackPoint,
     _clip_track,
@@ -16,6 +19,36 @@ from backend.map_api import (
     _crossings,
 )
 from backend.map_schemas import ClipRequest, ReplayRequest
+
+
+_PROJECTION_CONFIG = {"coordinate_semantics_version": 2}
+_TRANSFORMER = _CoordinateTransformer(
+    _DetectContext(
+        "detect",
+        "clean",
+        "trajectory_points",
+        4326,
+        3857,
+        _PROJECTION_CONFIG,
+    )
+)
+
+
+def detect_row(
+    detect_id: str,
+    clean_id: str,
+    *,
+    processing_srid: int | None = 3857,
+    projection_config: dict[str, Any] | None = None,
+) -> list[Any]:
+    return [
+        detect_id,
+        clean_id,
+        "trajectory_points",
+        4326,
+        processing_srid,
+        _PROJECTION_CONFIG if projection_config is None else projection_config,
+    ]
 
 
 class ScriptedCursor:
@@ -75,7 +108,7 @@ def intersections() -> list[_Intersection]:
 def test_intersection_layer_resolves_latest_completed_detect_and_parameterizes_bbox() -> None:
     polygon = {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [0, 0]]]}
     connection = ScriptedConnection(
-        [["detect-latest", "clean-latest", "trajectory_points"]],
+        [detect_row("detect-latest", "clean-latest")],
         [[101, 120.2, 30.3, 25.0, [0, 90], {"0->90": 4}, 4, "ok", polygon]],
     )
     store = PostgresMapStore(connection)
@@ -124,7 +157,7 @@ def test_centerline_layer_resolves_latest_completed_fit() -> None:
 def test_entry_exit_feature_carries_detect_context() -> None:
     geometry = {"type": "Point", "coordinates": [120.0, 30.0]}
     connection = ScriptedConnection(
-        [["detect-1", "clean-1", "trajectory_points"]],
+        [detect_row("detect-1", "clean-1")],
         [["8:entry", 8, 101, "vehicle-1", "entry", 45.0, geometry]],
     )
 
@@ -180,11 +213,10 @@ def test_clip_reads_bounded_clean_tracks_and_returns_geojson() -> None:
         point_row("vehicle-1", 1, 3, 2.0, 0.012),
     ]
     connection = ScriptedConnection(
-        [[
+        [detect_row(
             "12345678-1234-5678-1234-567812345678",
             "clean-1",
-            "trajectory_points",
-        ]],
+        )],
         intersection_rows,
         [["vehicle-1", 1]],
         track_rows,
@@ -209,12 +241,114 @@ def test_clip_reads_bounded_clean_tracks_and_returns_geojson() -> None:
     assert connection.executions[3][1][-1] == 11
 
 
+def test_clip_rejects_legacy_detect_without_fixed_processing_crs() -> None:
+    detect_id = "12345678-1234-5678-1234-567812345678"
+    connection = ScriptedConnection([
+        detect_row(
+            detect_id,
+            "clean-legacy",
+            processing_srid=None,
+            projection_config={},
+        )
+    ])
+
+    with pytest.raises(MapDataError, match="no fixed processing CRS"):
+        PostgresMapStore(connection).clip(
+            ClipRequest(
+                detect_id=UUID(detect_id),
+                intersection_ids=[101, 202],
+            )
+        )
+
+    assert len(connection.executions) == 1
+
+
+def test_coordinate_transformer_rejects_input_outside_projection_area() -> None:
+    transformer = _CoordinateTransformer(
+        _DetectContext(
+            "detect",
+            "clean",
+            "trajectory_points",
+            4326,
+            32650,
+            _PROJECTION_CONFIG,
+        )
+    )
+
+    with pytest.raises(MapDataError, match="area of use"):
+        transformer.forward_many([(110.0, 36.0), (116.0, 39.0)])
+
+
+def test_coordinate_transformer_handles_antimeridian_area_of_use() -> None:
+    transformer = _CoordinateTransformer(
+        _DetectContext(
+            "detect",
+            "clean",
+            "trajectory_points",
+            4326,
+            3338,
+            {
+                "coordinate_semantics_version": 2,
+                "max_scale_error": 1.0,
+            },
+        )
+    )
+
+    assert transformer.forward_many([(-150.0, 60.0)])
+    assert transformer.forward_many([(175.0, 60.0)])
+    with pytest.raises(MapDataError, match="area of use"):
+        transformer.forward_many([(0.0, 60.0)])
+
+
+def test_coordinate_transformer_rejects_excessive_scale_distortion() -> None:
+    transformer = _CoordinateTransformer(
+        _DetectContext(
+            "detect",
+            "clean",
+            "trajectory_points",
+            4326,
+            3857,
+            _PROJECTION_CONFIG,
+        )
+    )
+
+    with pytest.raises(MapDataError, match="scale distortion"):
+        transformer.forward_many([(116.0, 39.0), (116.1, 39.1)])
+
+
+def test_coordinate_transformer_wraps_transformer_construction_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenTransformer:
+        @staticmethod
+        def from_crs(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("projection operation unavailable")
+
+    monkeypatch.setattr("backend.map_api.Transformer", BrokenTransformer)
+
+    with pytest.raises(MapDataError, match="invalid projection context"):
+        _CoordinateTransformer(
+            _DetectContext(
+                "detect",
+                "clean",
+                "trajectory_points",
+                4326,
+                32650,
+                _PROJECTION_CONFIG,
+            )
+        )
+
+
 def test_clip_geometry_supports_both_directions_and_one_long_segment() -> None:
     forward = [track_point(-0.002, 0.0), track_point(0.012, 1.0)]
     reverse = list(reversed(forward))
 
-    forward_features = _clip_track(("v", 1), forward, intersections(), "detect")
-    reverse_features = _clip_track(("v", 1), reverse, intersections(), "detect")
+    forward_features = _clip_track(
+        ("v", 1), forward, intersections(), "detect", _TRANSFORMER
+    )
+    reverse_features = _clip_track(
+        ("v", 1), reverse, intersections(), "detect", _TRANSFORMER
+    )
 
     assert len(forward_features) == len(reverse_features) == 1
     assert forward_features[0]["properties"]["from_intersection_id"] == 101
@@ -233,7 +367,9 @@ def test_same_intersection_reentry_does_not_create_a_self_clip() -> None:
         track_point(0.012, 4.0),
     ]
 
-    features = _clip_track(("v", 1), points, intersections(), "detect")
+    features = _clip_track(
+        ("v", 1), points, intersections(), "detect", _TRANSFORMER
+    )
 
     assert features
     assert all(
@@ -252,15 +388,52 @@ def test_same_intersection_reentry_does_not_create_a_self_clip() -> None:
 
 
 def test_tangent_segment_does_not_create_crossing_events() -> None:
-    radius_degrees = 100.0 / 111_195.0
+    center_x, center_y = _TRANSFORMER.forward_many([(0.0, 0.0)])[0]
+    left_lon, left_lat = _TRANSFORMER.inverse(center_x - 300.0, center_y + 100.0)
+    right_lon, right_lat = _TRANSFORMER.inverse(center_x + 300.0, center_y + 100.0)
     points = [
-        _TrackPoint(None, 0.0, -0.002, radius_degrees, 0.0, 0.0, None, False),
-        _TrackPoint(None, 1.0, 0.002, radius_degrees, 0.0, 0.0, None, False),
+        _TrackPoint(None, 0.0, left_lon, left_lat, 0.0, 0.0, None, False),
+        _TrackPoint(None, 1.0, right_lon, right_lat, 0.0, 0.0, None, False),
     ]
 
-    events = _crossings(points, [intersections()[0]])
+    events = _crossings(points, [intersections()[0]], _TRANSFORMER)
 
     assert events == []
+
+
+def test_crossing_endpoints_are_inverted_from_one_fixed_projection() -> None:
+    transformer = _CoordinateTransformer(
+        _DetectContext(
+            "detect",
+            "clean",
+            "trajectory_points",
+            4326,
+            32650,
+            _PROJECTION_CONFIG,
+        )
+    )
+    center = (116.0, 39.0)
+    center_x, center_y = transformer.forward_many([center])[0]
+    start = transformer.inverse(center_x - 300.0, center_y)
+    end = transformer.inverse(center_x + 300.0, center_y)
+    points = [
+        _TrackPoint(None, 0.0, *start, 0.0, 0.0, None, False),
+        _TrackPoint(None, 1.0, *end, 0.0, 0.0, None, False),
+    ]
+
+    events = _crossings(
+        points,
+        [_Intersection(101, *center, 100.0)],
+        transformer,
+    )
+
+    assert [event.kind for event in events] == ["entry", "exit"]
+    for event in events:
+        event_x, event_y = transformer.forward_many([(event.lon, event.lat)])[0]
+        assert math.hypot(event_x - center_x, event_y - center_y) == pytest.approx(
+            100.0,
+            abs=1e-6,
+        )
 
 
 def test_point_limit_drops_a_partial_final_track_and_marks_truncation() -> None:

@@ -2,19 +2,41 @@ from __future__ import annotations
 
 import unittest
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from track.v2.config import PostgresConfig
+from track.v2.config.pipeline_config import PipelineConfig
 from track.v2.db.pipeline_store import CleanBatchResult, DetectPersistenceResult
 from track.v2.db_writer import CleanRunRecord
-from track.v2.intersect2 import IntersectResult
-from track.v2.models import IntersectReport
+from track.v2.intersect2 import IntersectConfig, IntersectResult
+from track.v2.models import (
+    CleanerConfig,
+    ClipConfig,
+    FittingConfig,
+    IntersectReport,
+    NetworkConfig,
+    ProjectionConfig,
+    RuntimeConfig,
+)
 from track.v2.pipeline import PipelineInput, run_pipeline
 from track.v2.pipeline_events import PipelineEvent, PipelineEventKind
+from track.v2.projection import create_spatial_context
 
 
 CLEAN_ID = "11111111-1111-1111-1111-111111111111"
 DETECT_ID = "22222222-2222-2222-2222-222222222222"
+_PROJECTION_CONFIG = ProjectionConfig(processing_srid=3857)
+_SPATIAL_CONTEXT = create_spatial_context(_PROJECTION_CONFIG)
+_PIPELINE_CONFIG = PipelineConfig(
+    projection=_PROJECTION_CONFIG,
+    cleaner=CleanerConfig(),
+    detect=IntersectConfig(),
+    clip=ClipConfig(),
+    fitting=FittingConfig(),
+    network=NetworkConfig(),
+    runtime=RuntimeConfig(),
+)
 
 
 def _empty_intersect_result() -> IntersectResult:
@@ -38,6 +60,7 @@ def _empty_intersect_result() -> IntersectResult:
             cluster_count_cross_track=0,
             complete_intersection_count=0,
         ),
+        spatial_context=_SPATIAL_CONTEXT,
     )
 
 
@@ -53,11 +76,14 @@ class _Connection:
 
 
 class _EmptyHandle:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
     def count_rows(self) -> int:
         return 0
 
     def close(self) -> None:
-        return None
+        self.close_calls += 1
 
 
 class _EmptyStream:
@@ -68,7 +94,7 @@ class _EmptyStream:
         return iter(())
 
     def close(self) -> None:
-        return None
+        self.handle.close()
 
 
 class _RecordingStore:
@@ -82,6 +108,7 @@ class _RecordingStore:
             source_kind="postgres_table",
             parameters={"target_table": "raw_points"},
             status="completed",
+            spatial_context=_SPATIAL_CONTEXT,
         )
         self.clip_result = MagicMock()
         self.clip_result.report.as_dict.return_value = {}
@@ -170,12 +197,18 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch("track.v2.pipeline.pg_connect", return_value=self.conn))
         self.stack.enter_context(
+            patch("track.v2.pipeline.load_pipeline_config", return_value=_PIPELINE_CONFIG)
+        )
+        self.stack.enter_context(
             patch("track.v2.pipeline.PostgresPipelineStore", return_value=self.store)
         )
         self.stack.enter_context(
             patch("track.v2.pipeline.detect_intersections", return_value=_empty_intersect_result())
         )
-        self.stack.enter_context(patch("track.v2.pipeline.get_database", return_value=_EmptyHandle()))
+        self.handle = _EmptyHandle()
+        self.stack.enter_context(
+            patch("track.v2.pipeline.get_database", return_value=self.handle)
+        )
         self.stack.enter_context(patch("track.v2.pipeline.StreamVehicleSource", _EmptyStream))
         self.stack.enter_context(
             patch("track.v2.pipeline.fit_centerline_variants", return_value=self.store.fit_bundle)
@@ -279,6 +312,67 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         )
         self.assertEqual(self.events.count("start_clean"), 0)
         self.assertEqual(self.events.count("get_clean"), 2)
+
+    def test_clean_stream_failure_closes_source_and_marks_run_failed(self) -> None:
+        class _FailingStream(_EmptyStream):
+            def iter_vehicle_tracks(self):
+                raise RuntimeError("stream failed")
+
+        with (
+            patch("track.v2.pipeline.StreamVehicleSource", _FailingStream),
+            self.assertRaisesRegex(RuntimeError, "stream failed"),
+        ):
+            run_pipeline(
+                PipelineInput(
+                    self.config,
+                    pg_source_table="raw_points",
+                    table="raw_points",
+                )
+            )
+
+        self.assertEqual(
+            self.events[-3:],
+            ["rollback", "finish_clean:failed", "commit"],
+        )
+        self.assertEqual(self.handle.close_calls, 1)
+        self.assertNotIn("start_detect", self.events)
+
+    def test_projection_bounds_failure_closes_source_and_marks_run_failed(self) -> None:
+        point = SimpleNamespace(lon=116.0, lat=39.0)
+
+        class _OneTrackStream(_EmptyStream):
+            def iter_vehicle_tracks(self):
+                return iter(([point],))
+
+        transformer = MagicMock()
+        transformer.validate_bounds.side_effect = ValueError("outside projection bounds")
+        clean_result = SimpleNamespace(
+            derived_counts={},
+            excluded=[],
+            subtracks=[],
+        )
+        with (
+            patch("track.v2.pipeline.StreamVehicleSource", _OneTrackStream),
+            patch("track.v2.pipeline.CoordinateTransformer", return_value=transformer),
+            patch("track.v2.pipeline.clean_vehicle", return_value=clean_result),
+            self.assertRaisesRegex(ValueError, "outside projection bounds"),
+        ):
+            run_pipeline(
+                PipelineInput(
+                    self.config,
+                    pg_source_table="raw_points",
+                    table="raw_points",
+                )
+            )
+
+        transformer.validate_bounds.assert_called_once_with((116.0, 39.0, 116.0, 39.0))
+        self.assertEqual(
+            self.events[-3:],
+            ["rollback", "finish_clean:failed", "commit"],
+        )
+        self.assertEqual(self.handle.close_calls, 1)
+        self.assertNotIn("persist_clean_batch", self.events)
+        self.assertNotIn("start_detect", self.events)
 
     def test_clip_failure_does_not_undo_completed_detect(self) -> None:
         self.store.clip_error = RuntimeError("clip failed")

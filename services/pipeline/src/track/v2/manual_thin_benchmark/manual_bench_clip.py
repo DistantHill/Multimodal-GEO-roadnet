@@ -37,11 +37,14 @@ from track.v2.models import (
     ClipIntersection,
     ClipTrack,
     PointRef,
+    ProjectionConfig,
     TrajectoryPoint,
 )
+from track.v2.projection import CoordinateTransformer, create_spatial_context
 
 
 _METERS_PER_DEGREE = 111_194.9266
+_SPATIAL_CONTEXT = create_spatial_context(ProjectionConfig(processing_srid=3857))
 
 
 def _point(index: int, x_m: float, y_m: float) -> TrajectoryPoint:
@@ -82,6 +85,7 @@ def _fixture(point_count: int, intersection_count: int) -> ClipInput:
     return ClipInput(
         intersections=intersections,
         tracks=(ClipTrack("benchmark-vehicle", "benchmark-trip", points),),
+        spatial_context=_SPATIAL_CONTEXT,
     )
 
 
@@ -97,7 +101,10 @@ def main() -> int:
     track = source.tracks[0]
 
     started = time.perf_counter()
-    grid = _IntersectionGrid(source.intersections)
+    grid = _IntersectionGrid(
+        source.intersections,
+        CoordinateTransformer(source.spatial_context),
+    )
     grid_build_s = time.perf_counter() - started
 
     coordinate_s = 0.0
