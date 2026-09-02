@@ -60,11 +60,14 @@ class _IntersectionGrid:
         self.cells: dict[tuple[int, int], list[_IndexedIntersection]] = {}
         indexed_intersections: list[_IndexedIntersection] = []
         overflow_intersections: list[_IndexedIntersection] = []
-        cluster_ids: set[int] = set()
+        intersection_ids: set[int] = set()
         for intersection in intersections:
-            if intersection.cluster_id in cluster_ids:
-                raise ValueError(f"duplicate ClipIntersection cluster_id: {intersection.cluster_id}")
-            cluster_ids.add(intersection.cluster_id)
+            if intersection.intersection_id in intersection_ids:
+                raise ValueError(
+                    "duplicate ClipIntersection intersection_id: "
+                    f"{intersection.intersection_id}"
+                )
+            intersection_ids.add(intersection.intersection_id)
             x, y = _to_xy(
                 intersection.lon,
                 intersection.lat,
@@ -116,7 +119,7 @@ class _IntersectionGrid:
             return self.indexed_intersections
 
         found: dict[int, _IndexedIntersection] = {
-            indexed.value.cluster_id: indexed
+            indexed.value.intersection_id: indexed
             for indexed in self.overflow_intersections
             if (
                 indexed.x + indexed.value.radius_m >= min_x
@@ -132,7 +135,7 @@ class _IntersectionGrid:
             max_y,
         ):
             for indexed in self.cells.get(cell, ()):
-                found[indexed.value.cluster_id] = indexed
+                found[indexed.value.intersection_id] = indexed
         return tuple(found.values())
 
     def _cell_count_for_bounds(
@@ -224,20 +227,22 @@ def extract_clips(
             skipped_degenerate_count=skipped_degenerate,
         ),
         detect_id=source.detect_id,
+        intersections=source.intersections,
     )
 
 
 def _validate_input(source: ClipInput) -> None:
-    cluster_ids: set[int] = set()
+    intersection_ids: set[int] = set()
     for intersection in source.intersections:
-        if intersection.cluster_id in cluster_ids:
+        if intersection.intersection_id in intersection_ids:
             raise ValueError(
-                f"duplicate ClipIntersection cluster_id: {intersection.cluster_id}"
+                "duplicate ClipIntersection intersection_id: "
+                f"{intersection.intersection_id}"
             )
-        cluster_ids.add(intersection.cluster_id)
+        intersection_ids.add(intersection.intersection_id)
         if not math.isfinite(intersection.radius_m) or intersection.radius_m <= 0.0:
             raise ValueError(
-                f"ClipIntersection {intersection.cluster_id} requires a positive radius"
+                f"ClipIntersection {intersection.intersection_id} requires a positive radius"
             )
     for track in source.tracks:
         if any(point.vehicle_id != track.vehicle_id for point in track.points):
@@ -389,7 +394,7 @@ def _extract_track_clips(
             pending_exit = endpoint
             continue
         if pending_exit is not None:
-            if pending_exit.cluster_id != endpoint.cluster_id:
+            if pending_exit.intersection_id != endpoint.intersection_id:
                 append_clip(pending_exit, endpoint, "inter_intersection")
             pending_exit = None
         elif event_index != 0:
@@ -433,7 +438,7 @@ def _crossing_events(
                     lon=start.lon + fraction * (end.lon - start.lon),
                     lat=start.lat + fraction * (end.lat - start.lat),
                     timestamp=start.timestamp + fraction * (end.timestamp - start.timestamp),
-                    cluster_id=intersection.cluster_id,
+                    intersection_id=intersection.intersection_id,
                     segment_index=segment_index,
                     segment_fraction=fraction,
                 )
@@ -444,7 +449,11 @@ def _crossing_events(
     events.sort(
         key=lambda event: (
             event.progress,
-            event.endpoint.cluster_id if event.endpoint.cluster_id is not None else -1,
+            (
+                event.endpoint.intersection_id
+                if event.endpoint.intersection_id is not None
+                else -1
+            ),
             event.endpoint.kind,
         )
     )
@@ -453,7 +462,7 @@ def _crossing_events(
         if deduplicated:
             previous = deduplicated[-1]
             if (
-                previous.endpoint.cluster_id == event.endpoint.cluster_id
+                previous.endpoint.intersection_id == event.endpoint.intersection_id
                 and abs(previous.progress - event.progress) <= _EPS
             ):
                 if previous.endpoint.kind != event.endpoint.kind:

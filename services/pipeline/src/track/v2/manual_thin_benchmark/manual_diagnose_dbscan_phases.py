@@ -44,9 +44,11 @@ events = [TurnEvent(i, f"phase-{i}", float(i), 116.0, 39.0, x, y, 0.0,
           for i, (x, y) in enumerate(zip(xs, ys))]
 # Canonicalize the transient first field across archived/current models.
 calculate_index_field = fields(TurnEvent)[0].name
+cluster_calculate_index_field = fields(HotspotCluster)[0].name
 
 def cluster_record(cluster):
     record = asdict(cluster)
+    record["cluster_calculate_index"] = record.pop(cluster_calculate_index_field)
     for event in record["events"]:
         event["event_calculate_index"] = event.pop(calculate_index_field)
     return record
@@ -54,7 +56,7 @@ def cluster_record(cluster):
 def instrumented_historical_state_machine():
     """Historical state machine with the source tree's actual neighbor path."""
     labels = [_UNVISITED] * len(xs)
-    cluster_id = 0
+    cluster_label = 0
     grid = None
     grid_build_s = 0.0
     neighbor_path = "scan"
@@ -85,9 +87,9 @@ def instrumented_historical_state_machine():
             labels[index] = _NOISE
             continue
         expansion_start = time.perf_counter()
-        labels[index] = cluster_id
+        labels[index] = cluster_label
         seeds = [candidate for candidate in neighbors if candidate != index]
-        epoch = cluster_id + 1
+        epoch = cluster_label + 1
         if queued_epoch is not None:
             for seed in seeds:
                 queued_epoch[seed] = epoch
@@ -96,11 +98,11 @@ def instrumented_historical_state_machine():
             expansion_start = time.perf_counter()
             current = seeds.pop()
             if labels[current] == _NOISE:
-                labels[current] = cluster_id
+                labels[current] = cluster_label
             if labels[current] != _UNVISITED:
                 expansion_s += time.perf_counter() - expansion_start
                 continue
-            labels[current] = cluster_id
+            labels[current] = cluster_label
             expansion_s += time.perf_counter() - expansion_start
             query_start = time.perf_counter()
             current_neighbors = neighbors_for(current)
@@ -117,7 +119,7 @@ def instrumented_historical_state_machine():
                         seeds.append(candidate)
                         queued_epoch[candidate] = epoch
                 expansion_s += time.perf_counter() - expansion_start
-        cluster_id += 1
+        cluster_label += 1
     total_s = time.perf_counter() - total_start
     return labels, {"neighbor_path": neighbor_path,
                     "expansion_path": "queued_epoch" if queued_epoch is not None else "historical_list_membership",
@@ -127,7 +129,7 @@ def instrumented_historical_state_machine():
                     "neighbor_query_exclusive_s": neighbor_query_s,
                     "cluster_expansion_exclusive_s": expansion_s,
                     "outer_loop_unattributed_s": total_s - neighbor_query_s - expansion_s,
-                    "cluster_count": cluster_id}
+                    "cluster_count": cluster_label}
 
 def assemble_wrapper_from_labels(labels):
     """The _cluster_dbscan wrapper section, excluding DBSCAN itself."""
@@ -140,7 +142,8 @@ def assemble_wrapper_from_labels(labels):
         cy = sum(event.y for event in cluster_items) / len(cluster_items)
         radius = max(_distance_m((cx, cy), (event.x, event.y)) for event in cluster_items)
         lon, lat = _to_lonlat(cx, cy, 116.0, 39.0)
-        cluster = HotspotCluster(cluster_id=cid, centroid_x=cx, centroid_y=cy,
+        cluster = HotspotCluster(**{cluster_calculate_index_field: cid},
+                                 centroid_x=cx, centroid_y=cy,
                                  centroid_lon=lon, centroid_lat=lat, radius_m=radius,
                                  cluster_ref=f"cluster_turn_{cid}", events=tuple(cluster_items),
                                  source="turn")

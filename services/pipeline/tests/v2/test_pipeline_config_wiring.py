@@ -89,9 +89,6 @@ class _ConfigRecordingStore:
     def persist_detect(self, *args: object, **kwargs: object) -> DetectPersistenceResult:
         return DetectPersistenceResult(
             tracks_cross_count=0,
-            candidate_intersection_ids={},
-            candidate_entry_exit_ids={},
-            intersection_ids={},
             turn_event_count=0,
             candidate_intersection_count=0,
             candidate_entry_exit_point_count=0,
@@ -162,7 +159,7 @@ class PipelineConfigWiringTest(unittest.TestCase):
         fit.assert_called_once_with(store.clip_result, config=fitting_config)
         network.assert_called_once_with(
             store.fit_bundle.combined,
-            intersections,
+            store.clip_result.intersections,
             config=network_config,
         )
 

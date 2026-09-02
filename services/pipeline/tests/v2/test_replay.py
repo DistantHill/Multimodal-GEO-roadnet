@@ -192,8 +192,12 @@ class ReplayServiceTest(unittest.TestCase):
         result = replay_centerline_inputs(conn, 7)
 
         self.assertEqual(result.centerline_wkt, "LINESTRING(0 0,1 1)")
+        self.assertEqual(result.from_intersection_id, 10)
+        self.assertEqual(result.to_intersection_id, 20)
         self.assertEqual(len(result.clips), 1)
         clip = result.clips[0]
+        self.assertEqual(clip.original_from_intersection_id, 20)
+        self.assertEqual(clip.original_to_intersection_id, 10)
         self.assertEqual(
             [point.point_ref.source_row_key for point in clip.interior_points],
             ["1", "2"],
@@ -221,20 +225,22 @@ class ReplayServiceTest(unittest.TestCase):
         self.assertEqual(len(detect_queries), 1)
 
     def test_turn_event_replays_injected_point_table_identity(self) -> None:
-        store = PostgresReplayStore(_LookupConnection())
         target = ReplayTarget("turn_event", 10, detect_id="detect-1")
 
-        parents = store.parent_refs(target, {
-            "from_source_id": "injected_points",
-            "from_source_row_key": "282",
-            "to_source_id": None,
-            "to_source_row_key": None,
-        })
+        for source_id in ("public.injected_points", "injected_points"):
+            with self.subTest(source_id=source_id):
+                store = PostgresReplayStore(_LookupConnection())
+                parents = store.parent_refs(target, {
+                    "from_source_id": source_id,
+                    "from_source_row_key": "282",
+                    "to_source_id": None,
+                    "to_source_row_key": None,
+                })
 
-        self.assertEqual(parents, [(
-            "input_from_0",
-            ReplayTarget("injected_point", 282, clean_id="clean-1"),
-        )])
+                self.assertEqual(parents, [(
+                    "input_from_0",
+                    ReplayTarget("injected_point", 282, clean_id="clean-1"),
+                )])
 
     def test_injected_point_is_terminal_clean_artifact(self) -> None:
         store = PostgresReplayStore(_LookupConnection())
@@ -460,6 +466,13 @@ class ReplayServiceTest(unittest.TestCase):
                 (20, "detect-1"),
             )],
         )
+        child_queries = [
+            sql
+            for sql, _params in store._conn.cursor_.executions
+            if sql.startswith("SELECT id FROM")
+        ]
+        self.assertTrue(child_queries)
+        self.assertTrue(all(sql.endswith("ORDER BY id") for sql in child_queries))
         cross_parents = store.parent_refs(
             ReplayTarget("tracks_cross", 16, detect_id="detect-1"),
             {

@@ -20,7 +20,7 @@ def main() -> None:
         clip
         for clip in result.clips
         if clip.clip_type == "inter_intersection"
-        and (clip.start.cluster_id, clip.end.cluster_id) in PAIRS
+        and (clip.start.intersection_id, clip.end.intersection_id) in PAIRS
     ]
 
     print(f"找到 {len(clips)} 条 Clip")
@@ -32,7 +32,7 @@ def main() -> None:
 
         print(
             clip.vehicle_id,
-            f"{clip.start.cluster_id} -> {clip.end.cluster_id}",
+            f"{clip.start.intersection_id} -> {clip.end.intersection_id}",
             f"distance={clip.distance_m:.1f}m",
             f"points={clip.point_count}",
             f"time={clip.start.timestamp} -> {clip.end.timestamp}",

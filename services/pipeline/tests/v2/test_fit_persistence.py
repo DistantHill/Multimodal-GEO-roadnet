@@ -140,10 +140,15 @@ class FitPersistenceTest(unittest.TestCase):
         self.assertEqual(ids, (100, 101, 102))
         self.assertEqual((conn.commit_count, conn.rollback_count), (0, 0))
         centerline_inserts = [
-            params for sql, params in conn.executions if "INSERT INTO centerlines" in sql
+            (sql, params)
+            for sql, params in conn.executions
+            if "INSERT INTO centerlines" in sql
         ]
         self.assertEqual(len(centerline_inserts), 1)
-        centerline_params = centerline_inserts[0]
+        centerline_sql, centerline_params = centerline_inserts[0]
+        self.assertIn("from_intersection_id", centerline_sql)
+        self.assertIn("to_intersection_id", centerline_sql)
+        self.assertNotIn("cluster_id", centerline_sql)
         self.assertEqual(
             [
                 (
@@ -160,6 +165,9 @@ class FitPersistenceTest(unittest.TestCase):
             if "COPY centerline_source_clips" in sql
         ]
         self.assertEqual(len(manifest_copies), 1)
+        self.assertIn("start_intersection_id", manifest_copies[0])
+        self.assertIn("end_intersection_id", manifest_copies[0])
+        self.assertNotIn("cluster_id", manifest_copies[0])
         combined = conn.copied_rows
         self.assertEqual(combined[0][0:4], (100, 0, "forward", "vehicle-forward"))
         self.assertFalse(combined[0][14])

@@ -65,16 +65,16 @@ class RequestContractTests(unittest.TestCase):
             with self.subTest(point_id=point_id), self.assertRaises(ContractError):
                 build_replay_payload([record({"id": point_id})])
 
-    def test_clip_uses_two_distinct_cluster_ids_and_common_detect_id(self):
+    def test_clip_uses_two_distinct_intersection_ids_and_common_detect_id(self):
         payload = build_clip_payload(
             [
-                record({"cluster_id": 7, "detect_id": DETECT_ID}, 70),
-                record({"cluster_id": 12, "detect_id": DETECT_ID}, 120),
+                record({"intersection_id": 101, "detect_id": DETECT_ID}, 70),
+                record({"intersection_id": 202, "detect_id": DETECT_ID}, 120),
             ]
         )
         self.assertEqual(
             payload,
-            {"detect_id": DETECT_ID, "intersection_ids": [7, 12]},
+            {"detect_id": DETECT_ID, "intersection_ids": [101, 202]},
         )
 
     def test_clip_falls_back_to_qgis_feature_id(self):
@@ -87,23 +87,39 @@ class RequestContractTests(unittest.TestCase):
 
     def test_clip_requires_exactly_two_features(self):
         with self.assertRaisesRegex(ContractError, "exactly two"):
-            build_clip_payload([record({"cluster_id": 1, "detect_id": DETECT_ID})])
+            build_clip_payload([record({"intersection_id": 1, "detect_id": DETECT_ID})])
 
     def test_clip_rejects_duplicate_intersections(self):
         with self.assertRaisesRegex(ContractError, "distinct"):
             build_clip_payload(
                 [
-                    record({"cluster_id": 1, "detect_id": DETECT_ID}, 10),
-                    record({"cluster_id": 1, "detect_id": DETECT_ID}, 11),
+                    record({"intersection_id": 1, "detect_id": DETECT_ID}, 10),
+                    record({"intersection_id": 1, "detect_id": DETECT_ID}, 11),
                 ]
             )
+
+    def test_clip_rejects_non_positive_intersection_ids(self):
+        for intersection_id in (0, -1):
+            with (
+                self.subTest(intersection_id=intersection_id),
+                self.assertRaises(ContractError),
+            ):
+                build_clip_payload(
+                    [
+                        record({
+                            "intersection_id": intersection_id,
+                            "detect_id": DETECT_ID,
+                        }),
+                        record({"intersection_id": 2, "detect_id": DETECT_ID}, 2),
+                    ]
+                )
 
     def test_clip_requires_a_common_detect_id(self):
         with self.assertRaisesRegex(ContractError, "common 'detect_id'"):
             build_clip_payload(
                 [
-                    record({"cluster_id": 1, "detect_id": "a"}),
-                    record({"cluster_id": 2, "detect_id": "b"}, 2),
+                    record({"intersection_id": 1, "detect_id": "a"}),
+                    record({"intersection_id": 2, "detect_id": "b"}, 2),
                 ]
             )
 
@@ -111,8 +127,8 @@ class RequestContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "valid UUID"):
             build_clip_payload(
                 [
-                    record({"cluster_id": 1, "detect_id": "not-a-uuid"}),
-                    record({"cluster_id": 2, "detect_id": "not-a-uuid"}, 2),
+                    record({"intersection_id": 1, "detect_id": "not-a-uuid"}),
+                    record({"intersection_id": 2, "detect_id": "not-a-uuid"}, 2),
                 ]
             )
 

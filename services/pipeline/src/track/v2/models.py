@@ -480,10 +480,12 @@ class CrossTrackCandidate(TrackModel):
 class HotspotCluster(TrackModel):
     """A DBSCAN cluster of candidate points (turn events or orthogonal candidates).
 
-    Uses ``tuple`` for events to preserve frozen-dataclass immutability.
+    ``cluster_calculate_index`` is a transient Detect-stage association key and
+    is never persisted. Uses ``tuple`` for events to preserve frozen-dataclass
+    immutability.
     """
 
-    cluster_id: int
+    cluster_calculate_index: int
     centroid_x: float
     centroid_y: float
     centroid_lon: float
@@ -516,9 +518,9 @@ class HotspotCluster(TrackModel):
 
 @dataclass(frozen=True)
 class EntryExitObservation(TrackModel):
-    """One vehicle's entry/exit through an intersection circle."""
+    """One vehicle's entry/exit linked by a transient cluster calculation key."""
 
-    cluster_id: int
+    cluster_calculate_index: int
     vehicle_id: str
     entry_branch_angle: float
     exit_branch_angle: float
@@ -537,7 +539,7 @@ class CrossingPoint(TrackModel):
     ``_segment_circle_crossings_batch``.
     """
 
-    crossing_id: int                # globally unique
+    crossing_id: int                # unique within one transient cluster
     cluster_ref: str                # FK → HotspotCluster.cluster_ref
     vehicle_id: str
     point_ref: PointRef             # segment-start TrajectoryPoint
@@ -572,9 +574,9 @@ class InOutIntersectionPoint(TrackModel):
 
 @dataclass(frozen=True)
 class IntersectionTopology(TrackModel):
-    """Extracted road topology for one intersection cluster."""
+    """Extracted topology linked by a transient cluster calculation key."""
 
-    cluster_id: int
+    cluster_calculate_index: int
     branch_centers_deg: list[float]
     transition_counts: dict[tuple[int, int], int]
     observation_count: int
@@ -610,7 +612,7 @@ class IntersectReport(TrackModel):
 class ClipIntersection(TrackModel):
     """One verified intersection circle used for trajectory clipping."""
 
-    cluster_id: int
+    intersection_id: int
     lon: float
     lat: float
     radius_m: float
@@ -643,7 +645,7 @@ class ClipEndpoint(TrackModel):
     lon: float
     lat: float
     timestamp: float
-    cluster_id: int | None
+    intersection_id: int | None
     segment_index: int
     segment_fraction: float
 
@@ -690,6 +692,7 @@ class ClipResult(TrackModel):
     clips: tuple[TrackClip, ...]
     report: ClipReport
     detect_id: str | None = None
+    intersections: tuple[ClipIntersection, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -714,10 +717,10 @@ CenterlineVariant = Literal["combined", "directed"]
 
 @dataclass(frozen=True, slots=True)
 class Centerline(TrackModel):
-    """One physical road centerline in canonical cluster-id direction."""
+    """One physical road centerline in canonical intersection-ID direction."""
 
-    from_cluster_id: int
-    to_cluster_id: int
+    from_intersection_id: int
+    to_intersection_id: int
     points: tuple[tuple[float, float], ...]
     length_m: float
     source_clip_ids: tuple[str, ...]
@@ -734,8 +737,8 @@ class Centerline(TrackModel):
 class FitIssue(TrackModel):
     """A rejected clip or connected pair, retained for auditability."""
 
-    from_cluster_id: int | None
-    to_cluster_id: int | None
+    from_intersection_id: int | None
+    to_intersection_id: int | None
     reason: str
     clip_id: str | None = None
 
@@ -777,7 +780,7 @@ class NetworkConfig(TrackModel):
 
 @dataclass(frozen=True, slots=True)
 class NetworkNode(TrackModel):
-    cluster_id: int
+    intersection_id: int
     lon: float
     lat: float
     radius_m: float
@@ -787,8 +790,8 @@ class NetworkNode(TrackModel):
 @dataclass(frozen=True, slots=True)
 class NetworkEdge(TrackModel):
     edge_id: str
-    from_cluster_id: int
-    to_cluster_id: int
+    from_intersection_id: int
+    to_intersection_id: int
     points: tuple[tuple[float, float], ...]
     length_m: float
     source_clip_count: int
@@ -798,8 +801,8 @@ class NetworkEdge(TrackModel):
 
 @dataclass(frozen=True, slots=True)
 class NetworkIssue(TrackModel):
-    from_cluster_id: int
-    to_cluster_id: int
+    from_intersection_id: int
+    to_intersection_id: int
     reason: str
 
 
@@ -836,8 +839,8 @@ class ReplayFitEndpoint(TrackModel):
 class ReplayFitClip(TrackModel):
     clip_id: str
     input_ordinal: int
-    original_from_cluster_id: int
-    original_to_cluster_id: int
+    original_from_intersection_id: int
+    original_to_intersection_id: int
     reverse_to_centerline_direction: bool
     start: ReplayFitEndpoint
     interior_points: tuple[TrajectoryPoint, ...]
@@ -852,8 +855,8 @@ class CenterlineInputReplay(TrackModel):
     detect_id: str
     clean_id: str
     variant: str
-    from_cluster_id: int
-    to_cluster_id: int
+    from_intersection_id: int
+    to_intersection_id: int
     centerline_wkt: str
     value_semantics: str
     clips: tuple[ReplayFitClip, ...]

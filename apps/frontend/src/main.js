@@ -453,7 +453,6 @@ function decorateFeature(feature, descriptor, metadata) {
     replayablePointLayer ? feature.getId() : undefined,
   );
   const intersectionId = firstValue(
-    properties.cluster_id,
     properties.intersection_id,
     role === 'intersection' ? properties.id : undefined,
     role === 'intersection' ? feature.getId() : undefined,
@@ -796,7 +795,7 @@ function updateActionState() {
   if (state.busy) dom.clipHint.textContent = '正在处理请求…';
   else if (features.length !== 2) dom.clipHint.textContent = `需要恰好两个交叉口 · 当前 ${intersections.length}`;
   else if (intersections.length !== 2) dom.clipHint.textContent = '所选要素必须都是交叉口';
-  else if (intersectionIds.length !== 2) dom.clipHint.textContent = '交叉口缺少 cluster_id';
+  else if (intersectionIds.length !== 2) dom.clipHint.textContent = '交叉口缺少 intersection_id';
   else if (detectIds.length !== 1) dom.clipHint.textContent = '两个交叉口不属于同一 detect';
   else dom.clipHint.textContent = `Detect ${detectIds[0]} · 已就绪`;
 }

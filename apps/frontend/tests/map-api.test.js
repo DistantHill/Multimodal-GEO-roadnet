@@ -80,6 +80,6 @@ test('clip requires exactly two intersections and detect context', async () => {
     body = JSON.parse(options.body);
     return jsonResponse({ type: 'FeatureCollection', features: [] });
   };
-  await requestClip({ detectId: 7, intersectionIds: [33, 44] });
-  assert.deepEqual(body, { detect_id: 7, intersection_ids: [33, 44] });
+  await requestClip({ detectId: 7, intersectionIds: [101, 202] });
+  assert.deepEqual(body, { detect_id: 7, intersection_ids: [101, 202] });
 });

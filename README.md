@@ -48,7 +48,7 @@ QGIS 3.44 LTR 插件源码位于 `apps/qgis-plugin/roadnet_tools/`。开发机�
 - `GET /api/v1/map/layers`：图层目录及默认 Detect/Fit 上下文。
 - `GET /api/v1/map/layers/{layer_id}`：读取有上限的 EPSG:4326 GeoJSON，可传 `bbox`、`detect_id`、`fit_id` 和 `limit`。
 - `POST /api/v1/map/replay`：按 `point_ids` 或 `bbox`（二选一）回放轨迹。
-- `POST /api/v1/map/clip`：按 `detect_id` 与两个 `intersection_ids` 截取交叉口间轨迹。
+- `POST /api/v1/map/clip`：按 `detect_id` 与两个 `intersection_ids` 截取交叉口间轨迹；ID 值是 PostgreSQL `intersections.id`，不再接受 Detect 运行时的 cluster 计算序号。
 
 这些 API 使用只读 PostgreSQL 事务、语句超时和请求数量上限；不会在 Backend 请求进程中启动完整 Pipeline 作业。
 
@@ -74,9 +74,11 @@ Pipeline 的数据库配置优先读取进程中的来源兼容变量 `TRACK_PG_
 make pipeline-init-db
 ```
 
-非 `--reset` 初始化在一个事务内处理当前建表、自动补列、显式结构迁移和索引同步；已有 named volume 升级代码后也必须执行。它会为旧表补齐 `turn_events.tp_source_id` 和 `turn_events.tp_source_row_key`，并删除旧的 `turn_events.event_id` 及其索引；事件唯一使用数据库 `id`，算法顺序不持久化。只有数据库仍存在早期单表 Run 注册表 `pipeline_runs` 且 Clean 父子关系无法确定时，才需要通过 `--legacy-clean-map` 提供精确的 Detect UUID → Clean UUID 映射。`--reset` 会删除全部 Pipeline 业务数据，不能用于普通升级。
+非 `--reset` 初始化在一个事务内处理当前建表、自动补列、显式结构迁移和索引同步；已有 named volume 升级代码后也必须执行。它会为旧表补齐 `turn_events.tp_source_id` 和 `turn_events.tp_source_row_key`，并删除不再持久化的事件及候选簇算法序号。事件唯一使用 `turn_events.id`；候选路口和完整路口分别使用 `candidate_intersections.id` 与 `intersections.id`，Centerline 端点也引用完整路口数据库 ID。运行时的事件和簇计算序号均不落库。只有数据库仍存在早期单表 Run 注册表 `pipeline_runs` 且 Clean 父子关系无法确定时，才需要通过 `--legacy-clean-map` 提供精确的 Detect UUID → Clean UUID 映射。`--reset` 会删除全部 Pipeline 业务数据，不能用于普通升级。
 
-删除 `turn_events.event_id` 的版本不支持新旧 writer 滚动混跑。升级已有数据库时，先停止 Pipeline 写入，执行 `make pipeline-init-db`，再启动新版本 Pipeline。
+删除这些计算序号列的版本不支持新旧 writer 滚动混跑。升级已有数据库时，先停止 Pipeline 写入，执行 `make pipeline-init-db`，再启动新版本 Pipeline。迁移会先校验旧的簇引用、回填 Centerline 及其 Clip manifest 的 `BIGINT` 路口 ID，再删除旧列；任何映射冲突或历史 combined Centerline 端点次序与数据库 ID 次序不一致都会中止并回滚，不会静默交换端点。
+
+地图 Clip 请求的值语义也随之改变：仓内 Frontend 与 QGIS 插件已改传 `intersections.id`，仍传旧 `cluster_id` 的外部客户端必须同步升级。
 
 查看完整参数或从外部数据目录运行 CSV：
 

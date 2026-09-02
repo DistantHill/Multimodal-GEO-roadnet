@@ -59,6 +59,16 @@ from .models import (
 
 # ── Batch size for multi-row INSERT ───────────────────────────────────
 _BATCH = 5000
+_CANONICAL_INJECTED_SOURCE_ID = "public.injected_points"
+_INJECTED_SOURCE_ID_ALIASES = frozenset({
+    "injected_points",
+    _CANONICAL_INJECTED_SOURCE_ID,
+})
+_SEQUENCE_ID_TABLES = frozenset({
+    "candidate_intersections",
+    "candidate_entry_exit_points",
+    "intersections",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,7 +209,8 @@ def insert_centerline_bundle(
         return ()
 
     centerline_columns = [
-        "fit_id", "detect_id", "variant", "from_cluster_id", "to_cluster_id",
+        "fit_id", "detect_id", "variant",
+        "from_intersection_id", "to_intersection_id",
         "geom", "length_m", "forward_clip_count", "reverse_clip_count",
     ]
     centerline_rows: list[tuple[Any, ...]] = []
@@ -209,8 +220,8 @@ def insert_centerline_bundle(
             fit_id,
             detect_id,
             centerline.variant,
-            centerline.from_cluster_id,
-            centerline.to_cluster_id,
+            centerline.from_intersection_id,
+            centerline.to_intersection_id,
             f"LINESTRING({points_wkt})",
             centerline.length_m,
             centerline.forward_clip_count,
@@ -227,18 +238,18 @@ def insert_centerline_bundle(
             centerline_columns,
             centerline_rows,
             value_template,
-            ["id", "variant", "from_cluster_id", "to_cluster_id"],
+            ["id", "variant", "from_intersection_id", "to_intersection_id"],
         )
 
     id_by_key = {
-        (str(variant), int(from_cluster_id), int(to_cluster_id)): int(centerline_id)
-        for centerline_id, variant, from_cluster_id, to_cluster_id in returned
+        (str(variant), int(from_id), int(to_id)): int(centerline_id)
+        for centerline_id, variant, from_id, to_id in returned
     }
     ordered_keys = [
         (
             centerline.variant,
-            centerline.from_cluster_id,
-            centerline.to_cluster_id,
+            centerline.from_intersection_id,
+            centerline.to_intersection_id,
         )
         for centerline in ordered_centerlines
     ]
@@ -252,26 +263,26 @@ def insert_centerline_bundle(
     for centerline_id, centerline in zip(centerline_ids, ordered_centerlines):
         for input_ordinal, clip_id in enumerate(centerline.source_clip_ids):
             clip = clips_by_id[clip_id]
-            start_cluster_id = clip.start.cluster_id
-            end_cluster_id = clip.end.cluster_id
-            assert start_cluster_id is not None and end_cluster_id is not None
+            start_intersection_id = clip.start.intersection_id
+            end_intersection_id = clip.end.intersection_id
+            assert start_intersection_id is not None and end_intersection_id is not None
             manifest_rows.append((
                 centerline_id, input_ordinal, clip.clip_id, clip.vehicle_id,
                 clip.subtrack_index, clip.clip_ordinal_in_track,
-                start_cluster_id, clip.start.segment_index,
+                start_intersection_id, clip.start.segment_index,
                 clip.start.segment_fraction, clip.interior_start_index,
-                clip.interior_end_index_exclusive, end_cluster_id,
+                clip.interior_end_index_exclusive, end_intersection_id,
                 clip.end.segment_index, clip.end.segment_fraction,
-                start_cluster_id != centerline.from_cluster_id,
+                start_intersection_id != centerline.from_intersection_id,
                 clip.point_count,
             ))
 
     manifest_columns = [
         "centerline_id", "input_ordinal", "clip_id", "vehicle_id",
-        "subtrack_index", "clip_ordinal_in_track", "start_cluster_id",
+        "subtrack_index", "clip_ordinal_in_track", "start_intersection_id",
         "start_segment_index", "start_segment_fraction",
         "interior_start_index", "interior_end_index_exclusive",
-        "end_cluster_id", "end_segment_index", "end_segment_fraction",
+        "end_intersection_id", "end_segment_index", "end_segment_fraction",
         "reverse_to_centerline_direction", "input_point_count",
     ]
     with conn.cursor() as cur:
@@ -315,6 +326,93 @@ _POLYGON_EXPR = (
     "%s"
     ")::geometry"
 )
+
+
+def _reserve_ids(cur: Any, table: str, count: int) -> tuple[int, ...]:
+    """Reserve database-generated BIGSERIAL IDs in a deterministic input order."""
+    if table not in _SEQUENCE_ID_TABLES:
+        raise ValueError(f"unsupported sequence-backed table: {table}")
+    if count <= 0:
+        return ()
+    cur.execute(
+        "SELECT ordinal, nextval(pg_get_serial_sequence("
+        f"'{table}', 'id')::regclass) "
+        "FROM generate_series(1, %s) AS reserved(ordinal) ORDER BY ordinal",
+        (count,),
+    )
+    rows = list(cur.fetchall())
+    if [int(row[0]) for row in rows] != list(range(1, count + 1)):
+        raise RuntimeError(f"failed to reserve ordered IDs for {table}")
+    ids = tuple(int(row[1]) for row in rows)
+    if len(ids) != count or len(set(ids)) != count:
+        raise RuntimeError(f"failed to reserve {count} unique IDs for {table}")
+    return ids
+
+
+def _candidate_crossing_source_ref(
+    point_ref: PointRef | None,
+) -> tuple[str | None, str | None]:
+    """Return a durable source-table reference for one crossing endpoint."""
+    if point_ref is None:
+        return None, None
+    source_id = str(point_ref.source_id)
+    source_row_key = str(point_ref.source_row_key)
+    if source_id in _INJECTED_SOURCE_ID_ALIASES:
+        try:
+            injected_point_id = int(source_row_key)
+        except ValueError as exc:
+            raise ValueError(
+                "injected crossing endpoints must reference injected_points.id"
+            ) from exc
+        if injected_point_id <= 0:
+            raise ValueError(
+                "injected crossing endpoints must reference a positive "
+                "injected_points.id"
+            )
+        return _CANONICAL_INJECTED_SOURCE_ID, str(injected_point_id)
+    if point_ref.generated_reason:
+        raise ValueError(
+            "injected crossing endpoints must be reloaded from "
+            "public.injected_points before persistence"
+        )
+    return source_id, source_row_key
+
+
+def _validate_candidate_crossing_injected_refs(
+    cur: Any,
+    detect_id: str,
+    injected_refs: set[tuple[int, str]],
+) -> None:
+    """Require injected endpoint IDs to belong to the Detect Run's Clean Run."""
+    if not injected_refs:
+        return
+    ordered_refs = sorted(injected_refs)
+    injected_ids = [injected_id for injected_id, _vehicle_id in ordered_refs]
+    vehicle_ids = [vehicle_id for _injected_id, vehicle_id in ordered_refs]
+    cur.execute(
+        "SELECT requested.injected_id, requested.vehicle_id "
+        "FROM unnest(%s::bigint[], %s::text[]) "
+        "AS requested(injected_id, vehicle_id) "
+        "JOIN detect_runs AS detect ON detect.id = %s "
+        "JOIN injected_points AS injected "
+        "ON injected.id = requested.injected_id "
+        "AND injected.clean_id = detect.clean_id "
+        "AND injected.vehicle_id = requested.vehicle_id",
+        (injected_ids, vehicle_ids, detect_id),
+    )
+    found = {(int(row[0]), str(row[1])) for row in cur.fetchall()}
+    expected = set(ordered_refs)
+    if found != expected:
+        missing = sorted(expected - found)
+        preview = ", ".join(
+            f"{injected_id}@{vehicle_id}"
+            for injected_id, vehicle_id in missing[:5]
+        )
+        suffix = ", ..." if len(missing) > 5 else ""
+        raise ValueError(
+            "candidate crossing injected-point references do not belong to "
+            f"Detect Run {detect_id}: {preview}{suffix}"
+        )
 
 
 def _chunked_insert_returning(
@@ -432,8 +530,7 @@ def _copy_insert(
 
     Detect and Fitting artifacts belong to freshly-created run ids and are
     written in one transaction.  COPY avoids constructing and parsing very
-    large VALUES statements; callers that need generated ids query their
-    run-scoped rows once after the copy.
+    large VALUES statements.
     """
     if not rows:
         return
@@ -849,15 +946,24 @@ def insert_candidate_intersections(
     """Insert candidate intersections with POLYGON geometry.
 
     ZH: 写入候选交叉口——POLYGON geom 在 SQL 中通过 ST_Buffer 计算。
-        返回 {cluster_id: db_id} 映射。
+        返回 {cluster_calculate_index: candidate_intersections.id} 临时映射。
     """
     if not clusters:
         return {}
     if detect_id is None:
         raise ValueError("detect_id is required for derived v2 persistence")
+    ordered_clusters = sorted(
+        clusters,
+        key=lambda cluster: cluster.cluster_calculate_index,
+    )
+    calculate_indexes = [
+        cluster.cluster_calculate_index for cluster in ordered_clusters
+    ]
+    if len(set(calculate_indexes)) != len(calculate_indexes):
+        raise ValueError("candidate cluster calculation indexes must be unique")
 
     columns = [
-        "cluster_id", "centroid_x", "centroid_y",
+        "id", "centroid_x", "centroid_y",
         "centroid_lon", "centroid_lat", "radius_m",
         "source", "sources", "source_counts", "source_ratios",
         "critical_sources",
@@ -866,58 +972,83 @@ def insert_candidate_intersections(
         "geom",  # ← must be last: _POLYGON_EXPR is appended to end of placeholders
     ]
     columns = ["detect_id", *columns]
-    rows = [
-        (
-            detect_id,
-            c.cluster_id,
-            c.centroid_x,
-            c.centroid_y,
-            c.centroid_lon,
-            c.centroid_lat,
-            c.radius_m,
-            c.source,
-            json.dumps(list(c.source_ids), ensure_ascii=False),
-            json.dumps(c.source_counts, ensure_ascii=False),
-            json.dumps(c.source_ratios, ensure_ascii=False),
-            json.dumps(list(c.critical_sources), ensure_ascii=False),
-            len([e for e in c.events if e.source == "turn"]),
-            len([e for e in c.events if e.source == "orthogonal"]),
-            len([e for e in c.events if e.source == "orthogonal_cross_track"]),
-            len(c.events),
-            origin_lon,
-            origin_lat,
-            c.centroid_lon,
-            c.centroid_lat,
-            c.radius_m,
-        )
-        for c in clusters
-    ]
-    value_template = ", ".join(["%s"] * (len(columns) - 1) + [_POLYGON_EXPR])
     with conn.cursor() as cur:
+        database_ids = _reserve_ids(
+            cur,
+            "candidate_intersections",
+            len(ordered_clusters),
+        )
+        rows = [
+            (
+                detect_id,
+                database_id,
+                cluster.centroid_x,
+                cluster.centroid_y,
+                cluster.centroid_lon,
+                cluster.centroid_lat,
+                cluster.radius_m,
+                cluster.source,
+                json.dumps(list(cluster.source_ids), ensure_ascii=False),
+                json.dumps(cluster.source_counts, ensure_ascii=False),
+                json.dumps(cluster.source_ratios, ensure_ascii=False),
+                json.dumps(list(cluster.critical_sources), ensure_ascii=False),
+                len([event for event in cluster.events if event.source == "turn"]),
+                len([event for event in cluster.events if event.source == "orthogonal"]),
+                len([
+                    event
+                    for event in cluster.events
+                    if event.source == "orthogonal_cross_track"
+                ]),
+                len(cluster.events),
+                origin_lon,
+                origin_lat,
+                cluster.centroid_lon,
+                cluster.centroid_lat,
+                cluster.radius_m,
+            )
+            for cluster, database_id in zip(
+                ordered_clusters,
+                database_ids,
+                strict=True,
+            )
+        ]
+        value_template = ", ".join(
+            ["%s"] * (len(columns) - 1) + [_POLYGON_EXPR]
+        )
         returned = _chunked_insert_template_returning(
             cur,
             "candidate_intersections",
             columns,
             rows,
             value_template,
-            ["id", "cluster_id"],
+            ["id"],
             batch_size=batch_size,
         )
-    mapping = {cluster_id: db_id for db_id, cluster_id in returned}
-    return mapping
+    if {int(row[0]) for row in returned} != set(database_ids):
+        raise RuntimeError("candidate intersection INSERT returned an incomplete ID set")
+    return {
+        cluster.cluster_calculate_index: database_id
+        for cluster, database_id in zip(
+            ordered_clusters,
+            database_ids,
+            strict=True,
+        )
+    }
 
 
 def insert_candidate_entry_exit_points(
     conn: Any,
     clusters: list[HotspotCluster],
-    ci_id_map: dict[int, int],
+    candidate_intersection_ids_by_calculate_index: dict[int, int],
     *,
     detect_id: str | None = None,
     batch_size: int = _BATCH,
 ) -> dict[tuple[int, int], int]:
-    """Insert crossing points, return ``{crossing_id: db_id}`` mapping."""
+    """Insert crossings and return a temporary calculation-index/ID mapping."""
+    if detect_id is None:
+        raise ValueError("detect_id is required for derived v2 persistence")
     columns = [
-        "candidate_intersection_id", "cluster_id", "vehicle_id",
+        "id", "candidate_intersection_id", "vehicle_id",
         "segment_index", "crossing_type",
         "crossing_x", "crossing_y", "crossing_lon", "crossing_lat",
         "branch_angle_deg", "origin_lon", "origin_lat",
@@ -925,16 +1056,30 @@ def insert_candidate_entry_exit_points(
         "to_source_id", "to_source_row_key",
     ]
     rows: list[tuple[Any, ...]] = []
-    crossing_ids: list[tuple[int, int]] = []  # (cluster_id, crossing_id), parallel to rows
-    for c in clusters:
-        ci_db_id = ci_id_map.get(c.cluster_id)
+    crossing_keys: list[tuple[int, int]] = []
+    injected_refs: set[tuple[int, str]] = set()
+    for c in sorted(clusters, key=lambda cluster: cluster.cluster_calculate_index):
+        ci_db_id = candidate_intersection_ids_by_calculate_index.get(
+            c.cluster_calculate_index
+        )
         if ci_db_id is None:
             continue
         for cp in c.crossing_points:
             cp_any: Any = cp  # HotspotCluster.crossing_points typed as tuple[()]
+            from_source_id, from_source_row_key = _candidate_crossing_source_ref(
+                cp_any.point_ref
+            )
+            to_source_id, to_source_row_key = _candidate_crossing_source_ref(
+                cp_any.end_point_ref
+            )
+            if from_source_id == _CANONICAL_INJECTED_SOURCE_ID:
+                assert from_source_row_key is not None
+                injected_refs.add((int(from_source_row_key), str(cp_any.vehicle_id)))
+            if to_source_id == _CANONICAL_INJECTED_SOURCE_ID:
+                assert to_source_row_key is not None
+                injected_refs.add((int(to_source_row_key), str(cp_any.vehicle_id)))
             rows.append((
                 ci_db_id,
-                c.cluster_id,
                 cp_any.vehicle_id,
                 cp_any.segment_index,
                 "entry" if cp_any.is_entry else "exit",
@@ -945,31 +1090,48 @@ def insert_candidate_entry_exit_points(
                 getattr(cp_any, "branch_angle_deg", None),
                 getattr(cp_any, "origin_lon", 0.0),
                 getattr(cp_any, "origin_lat", 0.0),
-                cp_any.point_ref.source_id,
-                cp_any.point_ref.source_row_key,
-                cp_any.end_point_ref.source_id if cp_any.end_point_ref else None,
-                cp_any.end_point_ref.source_row_key if cp_any.end_point_ref else None,
+                from_source_id,
+                from_source_row_key,
+                to_source_id,
+                to_source_row_key,
             ))
-            crossing_ids.append((c.cluster_id, cp_any.crossing_id))
+            crossing_keys.append((c.cluster_calculate_index, cp_any.crossing_id))
 
-    columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
+    if len(set(crossing_keys)) != len(crossing_keys):
+        raise ValueError("candidate crossing calculation keys must be unique")
     mapping: dict[tuple[int, int], int] = {}
     if rows:
         with conn.cursor() as cur:
+            _validate_candidate_crossing_injected_refs(
+                cur,
+                detect_id,
+                injected_refs,
+            )
+            database_ids = _reserve_ids(
+                cur,
+                "candidate_entry_exit_points",
+                len(rows),
+            )
+            rows = [
+                (database_id, *row)
+                for database_id, row in zip(database_ids, rows, strict=True)
+            ]
+            columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)
             returned = _chunked_insert_returning(
                 cur, "candidate_entry_exit_points", columns, rows, ["id"],
                 batch_size=batch_size,
             )
-        for (db_id,), crossing_id in zip(returned, crossing_ids):
-            mapping[crossing_id] = db_id
+        if {int(row[0]) for row in returned} != set(database_ids):
+            raise RuntimeError("candidate crossing INSERT returned an incomplete ID set")
+        mapping = dict(zip(crossing_keys, database_ids, strict=True))
     return mapping
 
 
 def insert_intersections(
     conn: Any,
     topologies: list[IntersectionTopology],
-    ci_id_map: dict[int, int],
-    clusters_by_id: dict[int, HotspotCluster],
+    candidate_intersection_ids_by_calculate_index: dict[int, int],
+    clusters_by_calculate_index: dict[int, HotspotCluster],
     *,
     detect_id: str | None = None,
     batch_size: int = _BATCH,
@@ -978,7 +1140,7 @@ def insert_intersections(
 
     ZH: 写入验证通过的交叉口。POLYGON geom 从关联的 candidate_intersection
         的 centroid + radius 派生（方案A：应用层计算）。
-        返回 {cluster_id: db_id} 映射。
+        返回 {cluster_calculate_index: intersections.id} 临时映射。
     """
     if not topologies:
         return {}
@@ -986,46 +1148,37 @@ def insert_intersections(
         raise ValueError("detect_id is required for derived v2 persistence")
 
     columns = [
-        "candidate_intersection_id", "cluster_id",
+        "id", "candidate_intersection_id",
         "branch_centers_deg", "transition_counts",
         "observation_count", "is_complete", "reason",
         "clip_radius_m",
         "geom",
     ]
     columns = ["detect_id", *columns]
-    rows: list[tuple[Any, ...]] = []
+    prepared: list[tuple[IntersectionTopology, int, HotspotCluster | None, float]] = []
     for topo in topologies:
         if not topo.is_complete:
             continue
-        ci_db_id = ci_id_map.get(topo.cluster_id)
+        ci_db_id = candidate_intersection_ids_by_calculate_index.get(
+            topo.cluster_calculate_index
+        )
         if ci_db_id is None:
             continue
-        cluster = clusters_by_id.get(topo.cluster_id)
+        cluster = clusters_by_calculate_index.get(topo.cluster_calculate_index)
         clip_radius_m = topo.clip_radius_m or (
             cluster.radius_m if cluster is not None else 0.0
         )
         if not clip_radius_m > 0.0:
             raise ValueError(
-                f"complete intersection {topo.cluster_id} requires a positive clip radius"
+                "complete intersection calculation index "
+                f"{topo.cluster_calculate_index} requires a positive clip radius"
             )
-        rows.append((
-            detect_id,
-            ci_db_id,
-            topo.cluster_id,
-            json.dumps(topo.branch_centers_deg, ensure_ascii=False),
-            json.dumps(
-                {f"{k[0]},{k[1]}": v for k, v in topo.transition_counts.items()},
-                ensure_ascii=False,
-            ),
-            topo.observation_count,
-            topo.is_complete,
-            topo.reason,
-            clip_radius_m,
-            cluster is not None,
-            cluster.centroid_lon if cluster is not None else None,
-            cluster.centroid_lat if cluster is not None else None,
-            clip_radius_m if cluster is not None else None,
-        ))
+        prepared.append((topo, ci_db_id, cluster, clip_radius_m))
+
+    prepared.sort(key=lambda item: item[0].cluster_calculate_index)
+    prepared_indexes = [item[0].cluster_calculate_index for item in prepared]
+    if len(set(prepared_indexes)) != len(prepared_indexes):
+        raise ValueError("intersection calculation indexes must be unique")
 
     optional_polygon = (
         "CASE WHEN %s::boolean THEN "
@@ -1035,58 +1188,114 @@ def insert_intersections(
     )
     value_template = ", ".join(["%s"] * (len(columns) - 1) + [optional_polygon])
     with conn.cursor() as cur:
+        database_ids = _reserve_ids(cur, "intersections", len(prepared))
+        rows = [
+            (
+                detect_id,
+                database_id,
+                ci_db_id,
+                json.dumps(topo.branch_centers_deg, ensure_ascii=False),
+                json.dumps(
+                    {
+                        f"{key[0]},{key[1]}": value
+                        for key, value in topo.transition_counts.items()
+                    },
+                    ensure_ascii=False,
+                ),
+                topo.observation_count,
+                topo.is_complete,
+                topo.reason,
+                clip_radius_m,
+                cluster is not None,
+                cluster.centroid_lon if cluster is not None else None,
+                cluster.centroid_lat if cluster is not None else None,
+                clip_radius_m if cluster is not None else None,
+            )
+            for database_id, (topo, ci_db_id, cluster, clip_radius_m) in zip(
+                database_ids,
+                prepared,
+                strict=True,
+            )
+        ]
         returned = _chunked_insert_template_returning(
             cur,
             "intersections",
             columns,
             rows,
             value_template,
-            ["id", "cluster_id"],
+            ["id"],
             batch_size=batch_size,
         )
-    mapping = {cluster_id: db_id for db_id, cluster_id in returned}
-    return mapping
+    if {int(row[0]) for row in returned} != set(database_ids):
+        raise RuntimeError("intersection INSERT returned an incomplete ID set")
+    return {
+        topo.cluster_calculate_index: database_id
+        for database_id, (topo, _ci_id, _cluster, _radius) in zip(
+            database_ids,
+            prepared,
+            strict=True,
+        )
+    }
 
 
 def insert_entry_exit_points(
     conn: Any,
     observations: list[EntryExitObservation],
-    int_id_map: dict[int, int],
-    crossing_id_map: dict[tuple[int, int], int] | None = None,
+    intersection_ids_by_calculate_index: dict[int, int],
+    crossing_ids_by_calculate_index: dict[tuple[int, int], int] | None = None,
     *,
     detect_id: str | None = None,
     batch_size: int = _BATCH,
 ) -> None:
     """Insert entry/exit observations.
 
-    ZH: 写入每辆车通过每个交叉口的出入观测。entry_crossing_id/exit_crossing_id
-        当前置 NULL（模型尚未携带这些引用）。
+    ZH: 写入每辆车通过每个交叉口的出入观测，并把运行时 crossing 引用映射为
+        ``candidate_entry_exit_points.id`` 外键。
     """
     if not observations:
         return
 
     columns = [
-        "intersection_id", "cluster_id", "vehicle_id",
+        "intersection_id", "vehicle_id",
         "entry_branch_angle", "exit_branch_angle",
         "inbound_bearing", "outbound_bearing", "turn_deg",
         "entry_crossing_id", "exit_crossing_id",
     ]
     rows: list[tuple[Any, ...]] = []
     for obs in observations:
-        int_db_id = int_id_map.get(obs.cluster_id)
+        int_db_id = intersection_ids_by_calculate_index.get(
+            obs.cluster_calculate_index
+        )
         if int_db_id is None:
             continue
+        entry_crossing_key = (
+            None
+            if obs.entry_crossing_id is None
+            else (obs.cluster_calculate_index, obs.entry_crossing_id)
+        )
+        exit_crossing_key = (
+            None
+            if obs.exit_crossing_id is None
+            else (obs.cluster_calculate_index, obs.exit_crossing_id)
+        )
         rows.append((
             int_db_id,
-            obs.cluster_id,
             obs.vehicle_id,
             obs.entry_branch_angle,
             obs.exit_branch_angle,
             obs.inbound_bearing,
             obs.outbound_bearing,
             obs.turn_deg,
-            (crossing_id_map or {}).get((obs.cluster_id, obs.entry_crossing_id or -1)),
-            (crossing_id_map or {}).get((obs.cluster_id, obs.exit_crossing_id or -1)),
+            (
+                (crossing_ids_by_calculate_index or {}).get(entry_crossing_key)
+                if entry_crossing_key is not None
+                else None
+            ),
+            (
+                (crossing_ids_by_calculate_index or {}).get(exit_crossing_key)
+                if exit_crossing_key is not None
+                else None
+            ),
         ))
 
     columns, rows = _with_stage_id(columns, rows, "detect_id", detect_id)

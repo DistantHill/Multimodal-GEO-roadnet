@@ -48,8 +48,16 @@ def main() -> int:
     wall_start = time.perf_counter()
     for _ in range(args.iterations):
         start = time.perf_counter()
-        forward = tuple(clip for clip in clips if clip.start.cluster_id < clip.end.cluster_id)
-        reverse = tuple(clip for clip in clips if clip.start.cluster_id > clip.end.cluster_id)
+        forward = tuple(
+            clip
+            for clip in clips
+            if clip.start.intersection_id < clip.end.intersection_id
+        )
+        reverse = tuple(
+            clip
+            for clip in clips
+            if clip.start.intersection_id > clip.end.intersection_id
+        )
         a_result = ClipResult(
             forward, ClipReport(len(forward), len(forward), len(forward), 0, len(forward) * 21),
         )

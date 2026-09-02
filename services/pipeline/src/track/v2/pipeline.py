@@ -456,7 +456,11 @@ def run_pipeline(
             fit_id=fit_id,
         )
         sink(PipelineEvent.stage_start("Network: 路网组装 / Network assembly"))
-        network_result = build_network(fit_bundle.combined, iresult, config=pc.network)
+        network_result = build_network(
+            fit_bundle.combined,
+            clip_result.intersections,
+            config=pc.network,
+        )
         _add_network_stats(stats, network_result)
         _emit_report(
             sink,

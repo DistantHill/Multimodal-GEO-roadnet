@@ -8,7 +8,6 @@ from track.v2 import (
     ClipReport,
     ClipResult,
     ClipIntersection,
-    IntersectResult,
     TrackClip,
     TrajectoryPoint,
     PointRef,
@@ -16,7 +15,7 @@ from track.v2 import (
     fit_centerline_variants,
     build_network,
 )
-from track.v2.models import FittingConfig, HotspotCluster, IntersectionTopology, IntersectReport
+from track.v2.models import FittingConfig
 
 
 _METERS_PER_DEGREE = 111_194.92664455874
@@ -26,13 +25,18 @@ def _lon(x_m: float) -> float:
     return x_m / _METERS_PER_DEGREE
 
 
-def _endpoint(kind: str, cluster_id: int, x_m: float, y_m: float) -> ClipEndpoint:
+def _endpoint(
+    kind: str,
+    intersection_id: int,
+    x_m: float,
+    y_m: float,
+) -> ClipEndpoint:
     return ClipEndpoint(
         kind=kind,
         lon=_lon(x_m),
         lat=_lon(y_m),
         timestamp=x_m,
-        cluster_id=cluster_id,
+        intersection_id=intersection_id,
         segment_index=0,
         segment_fraction=0.0,
     )
@@ -52,8 +56,8 @@ def _point(vehicle_id: str, row_key: str, x_m: float, y_m: float) -> TrajectoryP
 
 def _clip(
     clip_id: str,
-    start_cluster_id: int,
-    end_cluster_id: int,
+    start_intersection_id: int,
+    end_intersection_id: int,
     coords_m: list[tuple[float, float]],
 ) -> TrackClip:
     vehicle_id = f"vehicle-{clip_id}"
@@ -64,8 +68,8 @@ def _clip(
         vehicle_id=vehicle_id,
         trip_id=f"trip-{clip_id}",
         clip_type="inter_intersection",
-        start=_endpoint("exit", start_cluster_id, start_x, start_y),
-        end=_endpoint("entry", end_cluster_id, end_x, end_y),
+        start=_endpoint("exit", start_intersection_id, start_x, start_y),
+        end=_endpoint("entry", end_intersection_id, end_x, end_y),
         points=tuple(
             _point(vehicle_id, f"{clip_id}-{index}", x_m, y_m)
             for index, (x_m, y_m) in enumerate(coords_m[1:-1], start=1)
@@ -105,8 +109,8 @@ class FittingStageTest(unittest.TestCase):
         self.assertEqual(bundle.b_to_a.centerlines[0].source_clip_ids, ("reverse",))
         self.assertEqual(
             (
-                bundle.b_to_a.centerlines[0].from_cluster_id,
-                bundle.b_to_a.centerlines[0].to_cluster_id,
+                bundle.b_to_a.centerlines[0].from_intersection_id,
+                bundle.b_to_a.centerlines[0].to_intersection_id,
             ),
             (20, 10),
         )
@@ -136,7 +140,10 @@ class FittingStageTest(unittest.TestCase):
 
         self.assertEqual(len(result.centerlines), 1)
         centerline = result.centerlines[0]
-        self.assertEqual((centerline.from_cluster_id, centerline.to_cluster_id), (10, 20))
+        self.assertEqual(
+            (centerline.from_intersection_id, centerline.to_intersection_id),
+            (10, 20),
+        )
         self.assertEqual(centerline.source_clip_ids, ("forward", "reverse"))
         self.assertEqual(centerline.forward_clip_count, 1)
         self.assertEqual(centerline.reverse_clip_count, 1)
@@ -165,7 +172,10 @@ class FittingStageTest(unittest.TestCase):
         result = fit_centerlines(_clip_result(first_pair, second_pair, boundary))
 
         self.assertEqual(
-            [(line.from_cluster_id, line.to_cluster_id) for line in result.centerlines],
+            [
+                (line.from_intersection_id, line.to_intersection_id)
+                for line in result.centerlines
+            ],
             [(10, 20), (20, 30)],
         )
         first_x = [lon * _METERS_PER_DEGREE for lon, _ in result.centerlines[0].points]
@@ -222,60 +232,27 @@ class FittingStageTest(unittest.TestCase):
 class NetworkStageTest(unittest.TestCase):
     def test_centerline_becomes_one_edge_between_intersection_nodes(self) -> None:
         forward = _clip("forward", 10, 20, [(0, 0), (100, 0), (200, 0)])
-        fits = fit_centerlines(_clip_result(forward))
         intersections = (
             ClipIntersection(10, _lon(-20), 0.0, 20.0),
             ClipIntersection(20, _lon(220), 0.0, 20.0),
         )
+        clips = replace(_clip_result(forward), intersections=intersections)
+        fits = fit_centerlines(clips)
 
-        network = build_network(fits, intersections)
+        network = build_network(fits, clips.intersections)
 
-        self.assertEqual([node.cluster_id for node in network.nodes], [10, 20])
+        self.assertEqual([node.intersection_id for node in network.nodes], [10, 20])
         self.assertEqual([node.degree for node in network.nodes], [1, 1])
         self.assertEqual(len(network.edges), 1)
         edge = network.edges[0]
         self.assertEqual(edge.edge_id, "10--20")
-        self.assertEqual((edge.from_cluster_id, edge.to_cluster_id), (10, 20))
+        self.assertEqual(
+            (edge.from_intersection_id, edge.to_intersection_id),
+            (10, 20),
+        )
         self.assertEqual(edge.points, fits.centerlines[0].points)
         self.assertEqual(edge.source_clip_count, 1)
         self.assertEqual(network.report.isolated_node_count, 0)
-
-    def test_intersect_result_contributes_only_complete_intersections(self) -> None:
-        fits = fit_centerlines(
-            _clip_result(_clip("forward", 10, 20, [(0, 0), (200, 0)]))
-        )
-        intersect_result = IntersectResult(
-            turn_events=[],
-            hotspot_events=[],
-            orthogonal_candidates=[],
-            clusters=[
-                HotspotCluster(10, 0.0, 0.0, _lon(-20), 0.0, 10.0),
-                HotspotCluster(20, 0.0, 0.0, _lon(220), 0.0, 10.0),
-                HotspotCluster(30, 0.0, 0.0, _lon(400), 0.0, 10.0),
-            ],
-            topologies=[
-                IntersectionTopology(10, [], {}, 1, True, "complete", 20.0),
-                IntersectionTopology(20, [], {}, 1, True, "complete", 20.0),
-                IntersectionTopology(30, [], {}, 0, False, "incomplete", 20.0),
-            ],
-            report=IntersectReport(
-                track_count=0,
-                turn_event_count=0,
-                hotspot_event_count=0,
-                orthogonal_candidate_count=0,
-                cross_track_candidate_count=0,
-                cluster_count=3,
-                cluster_count_turn=0,
-                cluster_count_ortho=0,
-                cluster_count_cross_track=0,
-                complete_intersection_count=2,
-            ),
-        )
-
-        network = build_network(fits, intersect_result)
-
-        self.assertEqual([node.cluster_id for node in network.nodes], [10, 20])
-        self.assertEqual(network.report.edge_count, 1)
 
     def test_duplicate_or_noncanonical_centerline_is_rejected(self) -> None:
         fits = fit_centerlines(
@@ -298,8 +275,8 @@ class NetworkStageTest(unittest.TestCase):
                     centerlines=(
                         replace(
                             fits.centerlines[0],
-                            from_cluster_id=20,
-                            to_cluster_id=10,
+                            from_intersection_id=20,
+                            to_intersection_id=10,
                         ),
                     ),
                 ),

@@ -67,8 +67,8 @@ def track_point(lon: float, timestamp: float) -> _TrackPoint:
 
 def intersections() -> list[_Intersection]:
     return [
-        _Intersection(101, 10, 0.0, 0.0, 100.0),
-        _Intersection(202, 20, 0.01, 0.0, 100.0),
+        _Intersection(101, 0.0, 0.0, 100.0),
+        _Intersection(202, 0.01, 0.0, 100.0),
     ]
 
 
@@ -76,7 +76,7 @@ def test_intersection_layer_resolves_latest_completed_detect_and_parameterizes_b
     polygon = {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [0, 0]]]}
     connection = ScriptedConnection(
         [["detect-latest", "clean-latest", "trajectory_points"]],
-        [[10, 101, 120.2, 30.3, 25.0, [0, 90], {"0->90": 4}, 4, "ok", polygon]],
+        [[101, 120.2, 30.3, 25.0, [0, 90], {"0->90": 4}, 4, "ok", polygon]],
     )
     store = PostgresMapStore(connection)
 
@@ -90,8 +90,11 @@ def test_intersection_layer_resolves_latest_completed_detect_and_parameterizes_b
 
     assert result["metadata"]["detect_id"] == "detect-latest"
     assert result["metadata"]["clean_id"] == "clean-latest"
-    assert result["features"][0]["id"] == 10
-    assert result["features"][0]["properties"]["detect_id"] == "detect-latest"
+    feature = result["features"][0]
+    assert feature["id"] == 101
+    assert feature["properties"]["intersection_id"] == 101
+    assert feature["properties"]["detect_id"] == "detect-latest"
+    assert "cluster_id" not in feature["properties"]
     assert "d.status = 'completed'" in connection.executions[0][0]
     assert connection.executions[0][1] == ()
     layer_sql, params = connection.executions[1]
@@ -113,6 +116,8 @@ def test_centerline_layer_resolves_latest_completed_fit() -> None:
 
     assert result["metadata"]["fit_id"] == "fit-latest"
     assert result["metadata"]["detect_id"] == "detect-owner"
+    assert "from_intersection_id" in connection.executions[1][0]
+    assert "to_intersection_id" in connection.executions[1][0]
     assert connection.executions[1][1] == ("fit-latest", 6)
 
 
@@ -120,7 +125,7 @@ def test_entry_exit_feature_carries_detect_context() -> None:
     geometry = {"type": "Point", "coordinates": [120.0, 30.0]}
     connection = ScriptedConnection(
         [["detect-1", "clean-1", "trajectory_points"]],
-        [["8:entry", 8, 10, "vehicle-1", "entry", 45.0, geometry]],
+        [["8:entry", 8, 101, "vehicle-1", "entry", 45.0, geometry]],
     )
 
     result = PostgresMapStore(connection).read_layer(
@@ -129,7 +134,7 @@ def test_entry_exit_feature_carries_detect_context() -> None:
 
     properties = result["features"][0]["properties"]
     assert properties["detect_id"] == "detect-1"
-    assert properties["cluster_id"] == 10
+    assert properties["intersection_id"] == 101
 
 
 def test_replay_point_ids_reports_partial_resolution_and_returns_ordered_track() -> None:
@@ -166,8 +171,8 @@ def test_replay_unknown_point_ids_is_not_found() -> None:
 
 def test_clip_reads_bounded_clean_tracks_and_returns_geojson() -> None:
     intersection_rows = [
-        [101, 10, 0.0, 0.0, 100.0],
-        [202, 20, 0.01, 0.0, 100.0],
+        [101, 0.0, 0.0, 100.0],
+        [202, 0.01, 0.0, 100.0],
     ]
     track_rows = [
         point_row("vehicle-1", 1, 1, 0.0, -0.002),
@@ -186,7 +191,7 @@ def test_clip_reads_bounded_clean_tracks_and_returns_geojson() -> None:
     )
     request = ClipRequest(
         detect_id=UUID("12345678-1234-5678-1234-567812345678"),
-        intersection_ids=[10, 20],
+        intersection_ids=[101, 202],
         max_vehicles=5,
         max_points=10,
     )
@@ -196,8 +201,8 @@ def test_clip_reads_bounded_clean_tracks_and_returns_geojson() -> None:
     assert result["metadata"]["returned_clip_count"] == 1
     assert result["metadata"]["truncated"] is False
     feature = result["features"][0]
-    assert feature["properties"]["from_intersection_id"] == 10
-    assert feature["properties"]["to_intersection_id"] == 20
+    assert feature["properties"]["from_intersection_id"] == 101
+    assert feature["properties"]["to_intersection_id"] == 202
     assert feature["properties"]["distance_m"] > 0.0
     assert feature["geometry"]["type"] == "LineString"
     assert connection.executions[2][1][-1] == 6
@@ -212,10 +217,10 @@ def test_clip_geometry_supports_both_directions_and_one_long_segment() -> None:
     reverse_features = _clip_track(("v", 1), reverse, intersections(), "detect")
 
     assert len(forward_features) == len(reverse_features) == 1
-    assert forward_features[0]["properties"]["from_intersection_id"] == 10
-    assert forward_features[0]["properties"]["to_intersection_id"] == 20
-    assert reverse_features[0]["properties"]["from_intersection_id"] == 20
-    assert reverse_features[0]["properties"]["to_intersection_id"] == 10
+    assert forward_features[0]["properties"]["from_intersection_id"] == 101
+    assert forward_features[0]["properties"]["to_intersection_id"] == 202
+    assert reverse_features[0]["properties"]["from_intersection_id"] == 202
+    assert reverse_features[0]["properties"]["to_intersection_id"] == 101
     assert len(forward_features[0]["geometry"]["coordinates"]) == 2
 
 
@@ -241,7 +246,7 @@ def test_same_intersection_reentry_does_not_create_a_self_clip() -> None:
             feature["properties"]["from_intersection_id"],
             feature["properties"]["to_intersection_id"],
         }
-        == {10, 20}
+        == {101, 202}
         for feature in features
     )
 

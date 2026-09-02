@@ -61,8 +61,7 @@ class _DetectContext:
 
 @dataclass(frozen=True, slots=True)
 class _Intersection:
-    database_id: int
-    cluster_id: int
+    intersection_id: int
     lon: float
     lat: float
     radius_m: float
@@ -279,7 +278,7 @@ class PostgresMapStore:
         requested_ids = [int(value) for value in request.intersection_ids]
         intersections = self._fetch_intersections(context.detect_id, requested_ids)
         if len(intersections) != 2:
-            found = {item.cluster_id for item in intersections}
+            found = {item.intersection_id for item in intersections}
             missing = sorted(set(requested_ids) - found)
             raise MapNotFoundError(
                 f"completed intersections not found in Detect Run {context.detect_id}: {missing}"
@@ -382,20 +381,20 @@ class PostgresMapStore:
         )
         bbox_clause, bbox_params = _bbox_clause(geometry, bbox)
         sql = (
-            "SELECT i.cluster_id, i.id, ci.centroid_lon, ci.centroid_lat, "
+            "SELECT i.id, ci.centroid_lon, ci.centroid_lat, "
             "i.clip_radius_m, i.branch_centers_deg, i.transition_counts, "
             "i.observation_count, i.reason, ST_AsGeoJSON(" + geometry + ")::jsonb "
             "FROM intersections AS i JOIN candidate_intersections AS ci "
             "ON ci.id = i.candidate_intersection_id AND ci.detect_id = i.detect_id "
             "WHERE i.detect_id = %s AND i.is_complete IS TRUE" + bbox_clause +
-            " ORDER BY i.cluster_id LIMIT %s"
+            " ORDER BY i.id LIMIT %s"
         )
         return self._fetchall(sql, (detect_id, *bbox_params, limit))
 
     def _entry_exit_layer(self, detect_id: str, bbox: BBox | None, limit: int) -> list[Any]:
         bbox_clause, bbox_params = _bbox_clause("crossing.geom", bbox)
         sql = (
-            "SELECT CONCAT(eep.id, ':', endpoint.kind), eep.id, eep.cluster_id, "
+            "SELECT CONCAT(eep.id, ':', endpoint.kind), eep.id, eep.intersection_id, "
             "eep.vehicle_id, endpoint.kind, crossing.branch_angle_deg, "
             "ST_AsGeoJSON(crossing.geom)::jsonb "
             "FROM entry_exit_points AS eep "
@@ -411,8 +410,8 @@ class PostgresMapStore:
     def _centerline_layer(self, fit_id: str, bbox: BBox | None, limit: int) -> list[Any]:
         bbox_clause, bbox_params = _bbox_clause("c.geom", bbox)
         sql = (
-            "SELECT c.id, c.detect_id::text, c.variant, c.from_cluster_id, "
-            "c.to_cluster_id, c.length_m, c.forward_clip_count, c.reverse_clip_count, "
+            "SELECT c.id, c.detect_id::text, c.variant, c.from_intersection_id, "
+            "c.to_intersection_id, c.length_m, c.forward_clip_count, c.reverse_clip_count, "
             "ST_AsGeoJSON(c.geom)::jsonb FROM centerlines AS c "
             "WHERE c.fit_id = %s" + bbox_clause + " ORDER BY c.id LIMIT %s"
         )
@@ -511,8 +510,8 @@ class PostgresMapStore:
         sql = (
             "WITH matching_vehicles AS ("
             " SELECT eep.vehicle_id FROM entry_exit_points AS eep "
-            " WHERE eep.detect_id = %s AND eep.cluster_id = ANY(%s::integer[]) "
-            " GROUP BY eep.vehicle_id HAVING COUNT(DISTINCT eep.cluster_id) = 2"
+            " WHERE eep.detect_id = %s AND eep.intersection_id = ANY(%s::bigint[]) "
+            " GROUP BY eep.vehicle_id HAVING COUNT(DISTINCT eep.intersection_id) = 2"
             ") SELECT DISTINCT ktp.vehicle_id, ktp.subtrack_index "
             "FROM kept_trajectory_points AS ktp JOIN matching_vehicles AS mv "
             "ON mv.vehicle_id = ktp.vehicle_id WHERE ktp.clean_id = %s "
@@ -577,15 +576,15 @@ class PostgresMapStore:
         intersection_ids: list[int],
     ) -> list[_Intersection]:
         rows = self._fetchall(
-            "SELECT i.id, i.cluster_id, ci.centroid_lon, ci.centroid_lat, i.clip_radius_m "
+            "SELECT i.id, ci.centroid_lon, ci.centroid_lat, i.clip_radius_m "
             "FROM intersections AS i JOIN candidate_intersections AS ci "
             "ON ci.id = i.candidate_intersection_id AND ci.detect_id = i.detect_id "
             "WHERE i.detect_id = %s AND i.is_complete IS TRUE "
-            "AND i.cluster_id = ANY(%s::integer[]) ORDER BY i.cluster_id",
+            "AND i.id = ANY(%s::bigint[]) ORDER BY i.id",
             (detect_id, intersection_ids),
         )
         return [
-            _Intersection(int(row[0]), int(row[1]), float(row[2]), float(row[3]), float(row[4]))
+            _Intersection(int(row[0]), float(row[1]), float(row[2]), float(row[3]))
             for row in rows
         ]
 
@@ -611,16 +610,15 @@ class PostgresMapStore:
     def _intersection_feature(row: Any, detect_id: str) -> dict[str, Any]:
         return _feature(
             int(row[0]),
-            _geometry(row[9]),
-            database_id=int(row[1]),
+            _geometry(row[8]),
             detect_id=detect_id,
-            cluster_id=int(row[0]),
-            centroid=[float(row[2]), float(row[3])],
-            clip_radius_m=float(row[4]),
-            branch_centers_deg=_json_value(row[5], []),
-            transition_counts=_json_value(row[6], {}),
-            observation_count=int(row[7]),
-            reason=str(row[8]),
+            intersection_id=int(row[0]),
+            centroid=[float(row[1]), float(row[2])],
+            clip_radius_m=float(row[3]),
+            branch_centers_deg=_json_value(row[4], []),
+            transition_counts=_json_value(row[5], {}),
+            observation_count=int(row[6]),
+            reason=str(row[7]),
         )
 
     @staticmethod
@@ -630,7 +628,7 @@ class PostgresMapStore:
             _geometry(row[6]),
             entry_exit_id=int(row[1]),
             detect_id=detect_id,
-            cluster_id=int(row[2]),
+            intersection_id=int(row[2]),
             vehicle_id=str(row[3]),
             crossing_type=str(row[4]),
             branch_angle_deg=float(row[5]) if row[5] is not None else None,
@@ -837,7 +835,7 @@ def _clip_track(
 ) -> list[dict[str, Any]]:
     if len(points) < 2:
         return []
-    requested = {item.cluster_id for item in intersections}
+    requested = {item.intersection_id for item in intersections}
     events = _crossings(points, intersections)
     pending_exit: _Crossing | None = None
     features: list[dict[str, Any]] = []
@@ -911,7 +909,7 @@ def _crossings(
                     _Crossing(
                         progress=segment_index + fraction,
                         kind="entry" if radial_velocity < 0.0 else "exit",
-                        intersection_id=intersection.cluster_id,
+                        intersection_id=intersection.intersection_id,
                         segment_index=segment_index,
                         fraction=fraction,
                         lon=start.lon + fraction * (end.lon - start.lon),

@@ -72,7 +72,7 @@ def _fixture(point_count: int, intersection_count: int) -> ClipInput:
     y_offsets = (-300.0, -100.0, 100.0, 300.0)
     intersections = tuple(
         ClipIntersection(
-            cluster_id=index,
+            intersection_id=index + 1,
             lon=(-route_length_m / 2 + (index % columns) * spacing_m) / _METERS_PER_DEGREE,
             lat=y_offsets[index // columns] / _METERS_PER_DEGREE,
             radius_m=55.0,

@@ -38,9 +38,9 @@ def fit_centerlines(
 ) -> FitResult:
     """Fit one centerline for every connected intersection pair.
 
-    The lower cluster id defines a deterministic direction. Reverse clips are
-    flipped, sampled at common normalized arc-length positions, combined with
-    a coordinate-wise median, then resampled at ``point_spacing_m``.
+    The lower intersection id defines a deterministic direction. Reverse clips
+    are flipped, sampled at common normalized arc-length positions, combined
+    with a coordinate-wise median, then resampled at ``point_spacing_m``.
     """
     cfg = config or FittingConfig()
     _validate_config(cfg)
@@ -55,8 +55,8 @@ def fit_centerlines(
             issues.append(FitIssue(None, None, "unsupported_clip_type", clip.clip_id))
             continue
         eligible_count += 1
-        start_id = clip.start.cluster_id
-        end_id = clip.end.cluster_id
+        start_id = clip.start.intersection_id
+        end_id = clip.end.intersection_id
         pair = None
         if start_id is not None and end_id is not None and start_id != end_id:
             pair = (min(start_id, end_id), max(start_id, end_id))
@@ -121,23 +121,32 @@ def _fit_direction(
         clip
         for clip in clips.clips
         if clip.clip_type == "inter_intersection"
-        and clip.start.cluster_id is not None
-        and clip.end.cluster_id is not None
-        and clip.start.cluster_id != clip.end.cluster_id
-        and ((clip.start.cluster_id > clip.end.cluster_id) == reverse)
+        and clip.start.intersection_id is not None
+        and clip.end.intersection_id is not None
+        and clip.start.intersection_id != clip.end.intersection_id
+        and ((clip.start.intersection_id > clip.end.intersection_id) == reverse)
     )
     fitted = fit_centerlines(
-        ClipResult(clips=selected, report=clips.report, detect_id=clips.detect_id),
+        ClipResult(
+            clips=selected,
+            report=clips.report,
+            detect_id=clips.detect_id,
+            intersections=clips.intersections,
+        ),
         config=config,
     )
     centerlines = tuple(
         replace(
             centerline,
-            from_cluster_id=(
-                centerline.to_cluster_id if reverse else centerline.from_cluster_id
+            from_intersection_id=(
+                centerline.to_intersection_id
+                if reverse
+                else centerline.from_intersection_id
             ),
-            to_cluster_id=(
-                centerline.from_cluster_id if reverse else centerline.to_cluster_id
+            to_intersection_id=(
+                centerline.from_intersection_id
+                if reverse
+                else centerline.to_intersection_id
             ),
             points=(
                 tuple(reversed(centerline.points)) if reverse else centerline.points
@@ -159,8 +168,8 @@ def _validate_config(config: FittingConfig) -> None:
 
 
 def _orient_clip(clip: TrackClip) -> tuple[_OrientedClip | None, FitIssue | None]:
-    start_id = clip.start.cluster_id
-    end_id = clip.end.cluster_id
+    start_id = clip.start.intersection_id
+    end_id = clip.end.intersection_id
     if start_id is None or end_id is None:
         return None, FitIssue(start_id, end_id, "missing_intersection_endpoint", clip.clip_id)
     if start_id == end_id:
@@ -211,8 +220,8 @@ def _fit_pair(
         for x, y in spaced_xy
     )
     return Centerline(
-        from_cluster_id=pair[0],
-        to_cluster_id=pair[1],
+        from_intersection_id=pair[0],
+        to_intersection_id=pair[1],
         points=points,
         length_m=_xy_polyline_length(spaced_xy),
         source_clip_ids=tuple(clip.value.clip_id for clip in clips),

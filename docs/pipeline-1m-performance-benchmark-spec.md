@@ -271,9 +271,10 @@ Pipeline cgroup 精确峰值为 1,232.7 MiB。Pipeline 抽样峰值时 PostgreSQ
 - 原因：大量参数化 `INSERT VALUES` 会重复构造大 SQL 和参数数组，并增加协议解析
   与往返；历史运行还因 Schema 缺列在最后落库阶段整体回滚。
 - 改动：`tracks_cross`、`turn_events` 和 `entry_exit_points` 改为 PostgreSQL
-  COPY。确实需要生成 ID 的父表仍使用批量
-  `INSERT ... RETURNING`；`turn_events.id` 是唯一持久化事件 ID，运行时计算索引
-  不写入数据库，因此 COPY 后不再读取 ID map。
+  COPY。需要立即给子表提供外键的候选与验证交叉口会批量预留 PostgreSQL
+  sequence ID，再用批量 `INSERT ... RETURNING` 校验写入集合；`turn_events.id`
+  是唯一持久化事件 ID，运行时计算索引不写入数据库，因此 COPY 后不再读取
+  ID map。
   实现见 [`db_writer.py`](../services/pipeline/src/track/v2/db_writer.py)。
 - 效果：本次 191,520 条主要 append-only Detect 行成功持久化，完整 Detect
   Stage 为 63.667s。四个 PerfTracker 子阶段之外的 13.716s 还包含 extent 查询、

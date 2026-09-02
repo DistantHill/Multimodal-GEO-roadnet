@@ -57,12 +57,9 @@ class CleanBatchResult:
 
 @dataclass(frozen=True, slots=True)
 class DetectPersistenceResult:
-    """Counts and database-id maps needed by the rest of the runner."""
+    """Persisted Detect-stage row counts."""
 
     tracks_cross_count: int
-    candidate_intersection_ids: dict[int, int]
-    candidate_entry_exit_ids: dict[tuple[int, int], int]
-    intersection_ids: dict[int, int]
     turn_event_count: int
     candidate_intersection_count: int
     candidate_entry_exit_point_count: int
@@ -72,7 +69,7 @@ class DetectPersistenceResult:
 
 def _candidate_memberships(
     clusters: list[Any],
-    candidate_intersection_ids: dict[int, int],
+    candidate_intersection_ids_by_calculate_index: dict[int, int],
 ) -> tuple[
     dict[int, int],
     dict[tuple[str, str, str, str, str], int],
@@ -91,7 +88,9 @@ def _candidate_memberships(
         mapping[key] = candidate_id
 
     for cluster in clusters:
-        candidate_id = candidate_intersection_ids.get(cluster.cluster_id)
+        candidate_id = candidate_intersection_ids_by_calculate_index.get(
+            cluster.cluster_calculate_index
+        )
         if candidate_id is None:
             continue
         for event in cluster.events:
@@ -323,14 +322,14 @@ class PostgresPipelineStore:
         *,
         batch_size: int = _DEFAULT_BATCH_SIZE,
     ) -> DetectPersistenceResult:
-        candidate_intersection_ids = insert_candidate_intersections(
+        candidate_intersection_ids_by_calculate_index = insert_candidate_intersections(
             self._conn,
             result.clusters,
             detect_id=detect_id,
         )
         turn_membership_by_calculate_index, cross_membership = _candidate_memberships(
             result.clusters,
-            candidate_intersection_ids,
+            candidate_intersection_ids_by_calculate_index,
         )
         tracks_cross_count = insert_tracks_cross(
             self._conn,
@@ -348,44 +347,45 @@ class PostgresPipelineStore:
             ),
             batch_size=batch_size,
         )
-        candidate_entry_exit_ids = insert_candidate_entry_exit_points(
+        crossing_ids_by_calculate_index = insert_candidate_entry_exit_points(
             self._conn,
             result.clusters,
-            candidate_intersection_ids,
+            candidate_intersection_ids_by_calculate_index,
             detect_id=detect_id,
             batch_size=batch_size,
         )
-        clusters_by_id = {cluster.cluster_id: cluster for cluster in result.clusters}
-        intersection_ids = insert_intersections(
+        clusters_by_calculate_index = {
+            cluster.cluster_calculate_index: cluster
+            for cluster in result.clusters
+        }
+        intersection_ids_by_calculate_index = insert_intersections(
             self._conn,
             result.topologies,
-            candidate_intersection_ids,
-            clusters_by_id,
+            candidate_intersection_ids_by_calculate_index,
+            clusters_by_calculate_index,
             detect_id=detect_id,
         )
         insert_entry_exit_points(
             self._conn,
             result.observations,
-            intersection_ids,
-            candidate_entry_exit_ids,
+            intersection_ids_by_calculate_index,
+            crossing_ids_by_calculate_index,
             detect_id=detect_id,
             batch_size=batch_size,
         )
         return DetectPersistenceResult(
             tracks_cross_count=tracks_cross_count,
-            candidate_intersection_ids=candidate_intersection_ids,
-            candidate_entry_exit_ids=candidate_entry_exit_ids,
-            intersection_ids=intersection_ids,
             turn_event_count=turn_event_count,
             candidate_intersection_count=len(result.clusters),
             candidate_entry_exit_point_count=sum(
                 len(cluster.crossing_points) for cluster in result.clusters
             ),
-            intersection_count=len(intersection_ids),
+            intersection_count=len(intersection_ids_by_calculate_index),
             entry_exit_point_count=sum(
                 1
                 for observation in result.observations
-                if observation.cluster_id in intersection_ids
+                if observation.cluster_calculate_index
+                in intersection_ids_by_calculate_index
             ),
         )
 

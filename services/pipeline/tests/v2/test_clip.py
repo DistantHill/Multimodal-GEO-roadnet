@@ -91,7 +91,7 @@ class ClipExtractionTest(unittest.TestCase):
         candidates = grid.candidates((-10_000.0, 0.0), (10_000.0, 0.0))
 
         self.assertEqual(
-            [candidate.value.cluster_id for candidate in candidates],
+            [candidate.value.intersection_id for candidate in candidates],
             [10, 20],
         )
 
@@ -105,7 +105,7 @@ class ClipExtractionTest(unittest.TestCase):
         grid = clip_module._IntersectionGrid(intersections)
         target = next(
             indexed for indexed in grid.indexed_intersections
-            if indexed.value.cluster_id == 2
+            if indexed.value.intersection_id == 2
         )
 
         candidates = grid.candidates(
@@ -113,7 +113,10 @@ class ClipExtractionTest(unittest.TestCase):
             (target.x + 10.0, target.y),
         )
 
-        self.assertEqual([candidate.value.cluster_id for candidate in candidates], [2])
+        self.assertEqual(
+            [candidate.value.intersection_id for candidate in candidates],
+            [2],
+        )
 
     def test_extreme_radius_uses_bounded_overflow_index(self) -> None:
         intersections = (
@@ -124,7 +127,7 @@ class ClipExtractionTest(unittest.TestCase):
         grid = clip_module._IntersectionGrid(intersections)
         small = next(
             indexed for indexed in grid.indexed_intersections
-            if indexed.value.cluster_id == 2
+            if indexed.value.intersection_id == 2
         )
         candidates = grid.candidates(
             (small.x - 10.0, small.y),
@@ -132,12 +135,12 @@ class ClipExtractionTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            [indexed.value.cluster_id for indexed in grid.overflow_intersections],
+            [indexed.value.intersection_id for indexed in grid.overflow_intersections],
             [1],
         )
         self.assertLessEqual(len(grid.cells), 4)
         self.assertEqual(
-            {candidate.value.cluster_id for candidate in candidates},
+            {candidate.value.intersection_id for candidate in candidates},
             {1, 2},
         )
 
@@ -149,8 +152,18 @@ class ClipExtractionTest(unittest.TestCase):
         source = ClipInput(
             detect_id="detect-1",
             intersections=(
-                ClipIntersection(cluster_id=10, lon=-100 / _METERS_PER_DEGREE, lat=0.0, radius_m=20.0),
-                ClipIntersection(cluster_id=20, lon=100 / _METERS_PER_DEGREE, lat=0.0, radius_m=20.0),
+                ClipIntersection(
+                    intersection_id=10,
+                    lon=-100 / _METERS_PER_DEGREE,
+                    lat=0.0,
+                    radius_m=20.0,
+                ),
+                ClipIntersection(
+                    intersection_id=20,
+                    lon=100 / _METERS_PER_DEGREE,
+                    lat=0.0,
+                    radius_m=20.0,
+                ),
             ),
             tracks=(ClipTrack(vehicle_id="vehicle-1", trip_id="trip-1", points=points),),
         )
@@ -159,12 +172,13 @@ class ClipExtractionTest(unittest.TestCase):
 
         self.assertEqual(result.report.total_clips, 3)
         self.assertEqual(result.report.inter_intersection_clips, 1)
+        self.assertEqual(result.intersections, source.intersections)
         middle = next(clip for clip in result.clips if clip.clip_type == "inter_intersection")
         self.assertEqual(middle.start.kind, "exit")
-        self.assertEqual(middle.start.cluster_id, 10)
+        self.assertEqual(middle.start.intersection_id, 10)
         self.assertAlmostEqual(middle.start.lon * _METERS_PER_DEGREE, -80.0, places=6)
         self.assertEqual(middle.end.kind, "entry")
-        self.assertEqual(middle.end.cluster_id, 20)
+        self.assertEqual(middle.end.intersection_id, 20)
         self.assertAlmostEqual(middle.end.lon * _METERS_PER_DEGREE, 80.0, places=6)
         self.assertEqual([point.lon * _METERS_PER_DEGREE for point in middle.points], [-50.0, 0.0, 50.0])
         self.assertAlmostEqual(middle.distance_m, 160.0, places=5)
@@ -224,7 +238,14 @@ class ClipExtractionTest(unittest.TestCase):
     def test_one_long_segment_can_enter_and_exit_the_same_intersection(self) -> None:
         points = (_point("vehicle-1", 0, -200), _point("vehicle-1", 1, 200))
         source = ClipInput(
-            intersections=(ClipIntersection(cluster_id=10, lon=0.0, lat=0.0, radius_m=20.0),),
+            intersections=(
+                ClipIntersection(
+                    intersection_id=10,
+                    lon=0.0,
+                    lat=0.0,
+                    radius_m=20.0,
+                ),
+            ),
             tracks=(ClipTrack(vehicle_id="vehicle-1", trip_id="trip-1", points=points),),
         )
 
@@ -241,8 +262,18 @@ class ClipExtractionTest(unittest.TestCase):
         )
         source = ClipInput(
             intersections=(
-                ClipIntersection(cluster_id=10, lon=-100 / _METERS_PER_DEGREE, lat=0.0, radius_m=20.0),
-                ClipIntersection(cluster_id=20, lon=100 / _METERS_PER_DEGREE, lat=0.0, radius_m=20.0),
+                ClipIntersection(
+                    intersection_id=10,
+                    lon=-100 / _METERS_PER_DEGREE,
+                    lat=0.0,
+                    radius_m=20.0,
+                ),
+                ClipIntersection(
+                    intersection_id=20,
+                    lon=100 / _METERS_PER_DEGREE,
+                    lat=0.0,
+                    radius_m=20.0,
+                ),
             ),
             tracks=(ClipTrack(vehicle_id="vehicle-1", trip_id="trip-1", points=points),),
         )
@@ -255,7 +286,14 @@ class ClipExtractionTest(unittest.TestCase):
     def test_same_intersection_reentry_does_not_leave_a_stale_exit(self) -> None:
         points = tuple(_point("vehicle-1", index, x_m) for index, x_m in enumerate((0, 100, 0)))
         source = ClipInput(
-            intersections=(ClipIntersection(cluster_id=10, lon=0.0, lat=0.0, radius_m=20.0),),
+            intersections=(
+                ClipIntersection(
+                    intersection_id=10,
+                    lon=0.0,
+                    lat=0.0,
+                    radius_m=20.0,
+                ),
+            ),
             tracks=(ClipTrack(vehicle_id="vehicle-1", trip_id="trip-1", points=points),),
         )
 
@@ -268,8 +306,18 @@ class ClipExtractionTest(unittest.TestCase):
         points = (_point("vehicle-1", 0, -300), _point("vehicle-1", 1, 300))
         source = ClipInput(
             intersections=(
-                ClipIntersection(cluster_id=10, lon=-100 / _METERS_PER_DEGREE, lat=0.0, radius_m=20.0),
-                ClipIntersection(cluster_id=20, lon=100 / _METERS_PER_DEGREE, lat=0.0, radius_m=20.0),
+                ClipIntersection(
+                    intersection_id=10,
+                    lon=-100 / _METERS_PER_DEGREE,
+                    lat=0.0,
+                    radius_m=20.0,
+                ),
+                ClipIntersection(
+                    intersection_id=20,
+                    lon=100 / _METERS_PER_DEGREE,
+                    lat=0.0,
+                    radius_m=20.0,
+                ),
             ),
             tracks=(ClipTrack(vehicle_id="vehicle-1", trip_id="trip-1", points=points),),
         )
@@ -277,13 +325,23 @@ class ClipExtractionTest(unittest.TestCase):
         result = extract_clips(source)
 
         middle = next(clip for clip in result.clips if clip.clip_type == "inter_intersection")
-        self.assertEqual((middle.start.cluster_id, middle.end.cluster_id), (10, 20))
+        self.assertEqual(
+            (middle.start.intersection_id, middle.end.intersection_id),
+            (10, 20),
+        )
         self.assertLess(middle.start.timestamp, middle.end.timestamp)
 
     def test_tangent_contact_does_not_count_as_entering_an_intersection(self) -> None:
         points = (_point("vehicle-1", 0, -100, 20), _point("vehicle-1", 1, 100, 20))
         source = ClipInput(
-            intersections=(ClipIntersection(cluster_id=10, lon=0.0, lat=0.0, radius_m=20.0),),
+            intersections=(
+                ClipIntersection(
+                    intersection_id=10,
+                    lon=0.0,
+                    lat=0.0,
+                    radius_m=20.0,
+                ),
+            ),
             tracks=(ClipTrack(vehicle_id="vehicle-1", trip_id="trip-1", points=points),),
         )
 
@@ -366,7 +424,7 @@ class ClipDatabaseReplayTest(unittest.TestCase):
         ]
         point_rows.append(
             (
-                "vehicle-1", 1, 5, "synthetic", "6->7:orthogonal_heading",
+                "vehicle-1", 1, 5, "public.injected_points", "99",
                 55.0, 0.0, 0.0, 45.0, 0.0, {}, "6", "7", "orthogonal_heading",
                 1, 99,
             )
@@ -386,6 +444,10 @@ class ClipDatabaseReplayTest(unittest.TestCase):
         result = extract_clips_for_detect(conn, "detect-1")
 
         self.assertEqual(result.detect_id, "detect-1")
+        self.assertEqual(
+            [intersection.intersection_id for intersection in result.intersections],
+            [10, 20],
+        )
         self.assertEqual(result.report.inter_intersection_clips, 1)
         point_query, point_params = conn.executions[2]
         self.assertIn("kept_trajectory_points", point_query)
@@ -394,7 +456,10 @@ class ClipDatabaseReplayTest(unittest.TestCase):
         self.assertNotIn("is_active", point_query)
         self.assertIn("point_kind, row_id", point_query)
         self.assertNotIn("ORDER BY", point_query)
-        self.assertEqual(point_params, ("clean-1", "clean-1"))
+        self.assertEqual(
+            point_params,
+            ("clean-1", "public.injected_points", "clean-1"),
+        )
         self.assertEqual(result.clips[0].points[0].point_ref.source_id, "synthetic")
 
     def test_incomplete_run_is_rejected_before_loading_artifacts(self) -> None:

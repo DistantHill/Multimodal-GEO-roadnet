@@ -136,7 +136,7 @@ def test_replay_accepts_exactly_one_selection(
 
 @pytest.mark.parametrize(
     "intersection_ids",
-    [[], [1], [1, 1], [1, 2, 3]],
+    [[], [1], [1, 1], [0, 1], [-1, 2], [1, 2, 3]],
 )
 def test_clip_requires_exactly_two_distinct_intersections(
     client_and_store: tuple[TestClient, FakeMapStore],

@@ -90,14 +90,20 @@ mapping use PostgreSQL COPY:
 `turn_events.id` is the sole persisted event identifier.  Its calculation
 index exists only in memory, so COPY no longer needs a run-scoped ID-map read.
 
+`candidate_intersections.id` is likewise the sole persisted candidate identity.
+Detect keeps `cluster_calculate_index` only long enough to associate in-memory
+products. PostgreSQL sequence IDs are reserved in calculation order and written
+explicitly with the candidate and verified-intersection batches, so dependent
+rows receive real foreign keys without persisting the calculation index.
+
 Candidate membership is stored directly on `turn_events` and `tracks_cross`
 through `candidate_intersection_id`; there is no separate membership table.
 
 Tables whose generated IDs are needed by dependent rows continue to use
-batched `INSERT ... RETURNING`. Fitting writes the complete centerline bundle
-with one batched RETURNING operation and writes all
-`centerline_source_clips` manifests with one COPY operation. On the validated
-run this reduced roughly 1,680 centerline/manifest write operations to two.
+batched inserts with validated database-ID mappings. Fitting writes the complete
+centerline bundle with one batched RETURNING operation and writes all
+`centerline_source_clips` manifests with one COPY operation. On the validated run
+this reduced roughly 1,680 centerline/manifest write operations to two.
 
 Detect calculation and persistence share one transaction. An ordinary
 exception rolls back derived artifacts, then records the Detect Run as

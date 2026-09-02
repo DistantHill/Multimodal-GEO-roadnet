@@ -41,8 +41,8 @@ Then choose one of the toolbar/menu actions:
   `database_id`, and sends `point_ids`. If every point has the same non-null
   `detect_id`, it is sent too.
 - **Clip between intersections** requires exactly two selected points. It reads
-  `cluster_id` (falling back to the QGIS feature ID), rejects duplicate IDs, and
-  requires both features to have the same non-null `detect_id`.
+  `intersection_id` (falling back to the QGIS feature ID), rejects duplicate IDs,
+  and requires both features to have the same non-null `detect_id`.
 
 Requests run asynchronously and do not freeze the QGIS UI. Only the newest reply
 for each operation is applied. A validation, network, HTTP, JSON, CRS, or geometry
@@ -67,9 +67,12 @@ Clip request:
 ```json
 {
   "detect_id": "12345678-1234-5678-1234-567812345678",
-  "intersection_ids": [7, 12]
+  "intersection_ids": [101, 202]
 }
 ```
+
+`intersection_ids` contains PostgreSQL `intersections.id` values, not transient
+Detect-stage cluster calculation indexes.
 
 Both endpoints return an EPSG:4326 GeoJSON FeatureCollection. The plugin accepts
 the FeatureCollection directly or an envelope of the following form:

@@ -91,8 +91,9 @@ def _seed_candidate_chain(
         )
         cur.execute(
             "INSERT INTO candidate_intersections "
-            "(detect_id, cluster_id, centroid_x, centroid_y, centroid_lon, centroid_lat, radius_m, origin_lon, origin_lat) "
-            "VALUES (%s, 1, 0, 0, 116.0, 39.0, 1, 116.0, 39.0) RETURNING id",
+            "(detect_id, centroid_x, centroid_y, centroid_lon, centroid_lat, "
+            "radius_m, origin_lon, origin_lat) "
+            "VALUES (%s, 0, 0, 116.0, 39.0, 1, 116.0, 39.0) RETURNING id",
             (detect_id,),
         )
         candidate_id = int(cur.fetchone()[0])

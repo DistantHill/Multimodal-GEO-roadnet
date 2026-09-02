@@ -274,7 +274,7 @@ def plot_intersection(
         edgecolors="white", linewidths=0.5,
     )
     ax.annotate(
-        f"#{cluster.cluster_id}",
+        f"#{cluster.cluster_calculate_index}",
         xy=(cluster.centroid_lon, cluster.centroid_lat),
         fontsize=7, color=color, alpha=alpha,
         ha="center", va="bottom", xytext=(0, 4), textcoords="offset points",
@@ -286,7 +286,10 @@ def plot_intersection(
 
         # entry (green) / exit (red) crossing points
         for obs in observations:
-            if obs.cluster_id != cluster.cluster_id:
+            if (
+                obs.cluster_calculate_index
+                != cluster.cluster_calculate_index
+            ):
                 continue
             elon, elat = _branch_point(cluster.centroid_lon, cluster.centroid_lat,
                                        cluster.radius_m, obs.entry_branch_angle)
@@ -327,7 +330,8 @@ def plot_intersection(
     else:
         status = "✓" if is_complete else "✗"
         ax.set_title(
-            f"Cluster #{cluster.cluster_id}  [{source_label}]  {status}  "
+            f"Cluster #{cluster.cluster_calculate_index}  "
+            f"[{source_label}]  {status}  "
             f"r={cluster.radius_m:.0f}m  events={len(cluster.events)}"
         )
 
@@ -343,7 +347,9 @@ def plot_intersections(
     clusters: Sequence[HotspotCluster],
     *,
     topologies: Sequence[IntersectionTopology] = (),
-    observations_by_cluster: dict[int, list[EntryExitObservation]] | None = None,
+    observations_by_calculate_index: (
+        dict[int, list[EntryExitObservation]] | None
+    ) = None,
     branch: bool = False,
     all_clusters: bool = True,
     show: bool = False,
@@ -354,8 +360,10 @@ def plot_intersections(
 
     Args:
         clusters: HotspotCluster list.
-        topologies: IntersectionTopology list (matched by ``cluster_id``).
-        observations_by_cluster: ``{cluster_id: [EntryExitObservation, …]}``.
+        topologies: IntersectionTopology list (matched by
+                    ``cluster_calculate_index``).
+        observations_by_calculate_index: ``{cluster_calculate_index:
+                                         [EntryExitObservation, …]}``.
         branch: If True, draw branch arrows and entry/exit dots.
         all_clusters: If True, draw all topologies. If False, only draw
                       those with ``is_complete == True``.
@@ -369,20 +377,31 @@ def plot_intersections(
     if ax is None:
         _, ax = plt.subplots(figsize=(12, 10))
 
-    # Index topologies by cluster_id
-    topo_by_id: dict[int, IntersectionTopology] = {t.cluster_id: t for t in topologies}
-    obs_by_id = observations_by_cluster or {}
+    # Index topologies by the transient calculation index.
+    topology_by_calculate_index: dict[int, IntersectionTopology] = {
+        topology.cluster_calculate_index: topology
+        for topology in topologies
+    }
+    observations_index = observations_by_calculate_index or {}
 
     # Filter
     if all_clusters:
         draw_clusters = list(clusters)
     else:
-        complete_ids = {t.cluster_id for t in topologies if t.is_complete}
-        draw_clusters = [c for c in clusters if c.cluster_id in complete_ids]
+        complete_indexes = {
+            topology.cluster_calculate_index
+            for topology in topologies
+            if topology.is_complete
+        }
+        draw_clusters = [
+            cluster
+            for cluster in clusters
+            if cluster.cluster_calculate_index in complete_indexes
+        ]
 
     for c in draw_clusters:
-        topo = topo_by_id.get(c.cluster_id)
-        obs = obs_by_id.get(c.cluster_id, [])
+        topo = topology_by_calculate_index.get(c.cluster_calculate_index)
+        obs = observations_index.get(c.cluster_calculate_index, [])
         plot_intersection(
             c,
             topology=topo,

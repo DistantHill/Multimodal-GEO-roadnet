@@ -396,8 +396,16 @@ def _complete_source_report(
     clusters: list[HotspotCluster],
     topologies: list[IntersectionTopology],
 ) -> dict[str, dict[str, Any]]:
-    complete_ids = {topology.cluster_id for topology in topologies if topology.is_complete}
-    complete_clusters = [cluster for cluster in clusters if cluster.cluster_id in complete_ids]
+    complete_indexes = {
+        topology.cluster_calculate_index
+        for topology in topologies
+        if topology.is_complete
+    }
+    complete_clusters = [
+        cluster
+        for cluster in clusters
+        if cluster.cluster_calculate_index in complete_indexes
+    ]
 
     source_counts: dict[str, int] = {}
     critical_source_counts: dict[str, int] = {}
@@ -542,7 +550,10 @@ def _cluster_pipeline(
     # ── Merge + reindex + ablation ─────────────────────────────────
     merged = _merge_clusters(all_clusters, cfg.merge_centroid_distance_m,
                               origin_lon, origin_lat, perf=perf)
-    merged = [replace(c, cluster_id=i) for i, c in enumerate(merged)]
+    merged = [
+        replace(c, cluster_calculate_index=i)
+        for i, c in enumerate(merged)
+    ]
     annotated = _annotate_source_ablation(
         merged, hotspot_events, ortho_candidates,
         cfg, origin_lon, origin_lat,
@@ -2000,7 +2011,7 @@ def _run_dbscan_large_dispatch(
         )
 
     labels = [_UNVISITED] * n
-    cluster_id = 0
+    cluster_label = 0
     core_flags: list[bool | None] = [None] * n
     point_cells: list[tuple[int, int]] = [(0, 0)] * n
     available: dict[tuple[int, int], set[int]] = {}
@@ -2022,7 +2033,7 @@ def _run_dbscan_large_dispatch(
             labels[i] = _NOISE
             continue
 
-        labels[i] = cluster_id
+        labels[i] = cluster_label
         available[point_cells[i]].remove(i)
         seeds = _take_grid_frontier_neighbors(
             xs, ys, i, eps_m, grid, available, point_cells,
@@ -2030,10 +2041,10 @@ def _run_dbscan_large_dispatch(
         while seeds:
             current = seeds.pop()
             if labels[current] == _NOISE:
-                labels[current] = cluster_id
+                labels[current] = cluster_label
             if labels[current] != _UNVISITED:
                 continue
-            labels[current] = cluster_id
+            labels[current] = cluster_label
             is_core = core_flags[current]
             if is_core is None:
                 is_core = _grid_has_min_neighbors(
@@ -2050,19 +2061,19 @@ def _run_dbscan_large_dispatch(
                         seeds.extend(_take_grid_frontier_neighbors(
                             xs, ys, current, eps_m, grid, available, point_cells,
                         ))
-        cluster_id += 1
+        cluster_label += 1
         now = time.perf_counter()
         if i % 500 == 0 or (now - last_t) >= 3.0:
             _route_progress(
                 live_status,
-                detail=f"DBSCAN:\t{i + 1:,}/{n:,}\t点/points,\t{cluster_id}\t簇/clusters",
+                detail=f"DBSCAN:\t{i + 1:,}/{n:,}\t点/points,\t{cluster_label}\t簇/clusters",
                 progress=(i + 1) / n,
                 elapsed=now - t0,
                 stage=f"Intersect2: DBSCAN ({stage})",
             )
             last_t = now
 
-    log_info(f"    DBSCAN: {n:,} 点/points → {cluster_id:,} 簇/clusters ({time.perf_counter() - t0:.1f}s)")
+    log_info(f"    DBSCAN: {n:,} 点/points → {cluster_label:,} 簇/clusters ({time.perf_counter() - t0:.1f}s)")
     return labels
 
 
@@ -2079,7 +2090,7 @@ def _run_dbscan_scan(
     """Historical full-scan DBSCAN for tiny or non-indexable inputs."""
     n = len(xs)
     labels = [_UNVISITED] * n
-    cluster_id = 0
+    cluster_label = 0
     t0 = time.perf_counter()
     last_t = t0
     for i in _perf_iter(perf, range(n), name="dbscan_points", total=n):
@@ -2089,15 +2100,15 @@ def _run_dbscan_scan(
         if len(neighbors) < min_samples:
             labels[i] = _NOISE
             continue
-        labels[i] = cluster_id
+        labels[i] = cluster_label
         seeds = [nb for nb in neighbors if nb != i]
         while seeds:
             current = seeds.pop()
             if labels[current] == _NOISE:
-                labels[current] = cluster_id
+                labels[current] = cluster_label
             if labels[current] != _UNVISITED:
                 continue
-            labels[current] = cluster_id
+            labels[current] = cluster_label
             cur_neighbors = _neighbors_indices(xs, ys, current, eps_m)
             if len(cur_neighbors) >= min_samples:
                 if perf is None:
@@ -2109,18 +2120,18 @@ def _run_dbscan_scan(
                         for nb in cur_neighbors:
                             if labels[nb] in (_UNVISITED, _NOISE) and nb not in seeds:
                                 seeds.append(nb)
-        cluster_id += 1
+        cluster_label += 1
         now = time.perf_counter()
         if i % 500 == 0 or (now - last_t) >= 3.0:
             _route_progress(
                 live_status,
-                detail=f"DBSCAN:\t{i + 1:,}/{n:,}\t点/points,\t{cluster_id}\t簇/clusters",
+                detail=f"DBSCAN:\t{i + 1:,}/{n:,}\t点/points,\t{cluster_label}\t簇/clusters",
                 progress=(i + 1) / n,
                 elapsed=now - t0,
                 stage=f"Intersect2: DBSCAN ({stage})",
             )
             last_t = now
-    log_info(f"    DBSCAN: {n:,} 点/points → {cluster_id:,} 簇/clusters ({time.perf_counter() - t0:.1f}s)")
+    log_info(f"    DBSCAN: {n:,} 点/points → {cluster_label:,} 簇/clusters ({time.perf_counter() - t0:.1f}s)")
     return labels
 
 
@@ -2156,7 +2167,10 @@ def _group_cluster_items(items: list[Any], labels: list[int]) -> list[tuple[int,
     for index, label in enumerate(labels):
         if label >= 0:
             grouped[label].append(items[index])
-    return [(cluster_id, grouped[cluster_id]) for cluster_id in sorted(grouped)]
+    return [
+        (cluster_label, grouped[cluster_label])
+        for cluster_label in sorted(grouped)
+    ]
 
 
 def _cluster_dbscan(
@@ -2190,7 +2204,7 @@ def _cluster_dbscan(
         radius = max(_distance_m((cx, cy), (e.x, e.y)) for e in cluster_items)
         lon, lat = _to_lonlat(cx, cy, origin_lon, origin_lat)
         cluster = HotspotCluster(
-            cluster_id=cid,
+            cluster_calculate_index=cid,
             centroid_x=cx,
             centroid_y=cy,
             centroid_lon=lon,
@@ -2262,7 +2276,7 @@ def _cluster_orthogonal_candidates(
             for i, c in enumerate(cluster_items)
         )
         cluster = HotspotCluster(
-            cluster_id=cid,
+            cluster_calculate_index=cid,
             centroid_x=cx,
             centroid_y=cy,
             centroid_lon=lon,
@@ -2338,7 +2352,7 @@ def _cluster_orthogonal_cross_track_candidates(
             for i, c in enumerate(cluster_items)
         )
         cluster = HotspotCluster(
-            cluster_id=cid,
+            cluster_calculate_index=cid,
             centroid_x=cx,
             centroid_y=cy,
             centroid_lon=lon,
@@ -2453,7 +2467,7 @@ def _merge_clusters(
 
         new_lon, new_lat = _to_lonlat(new_cx, new_cy, origin_lon, origin_lat)
         merged_cluster = HotspotCluster(
-            cluster_id=ci.cluster_id,
+            cluster_calculate_index=ci.cluster_calculate_index,
             centroid_x=new_cx,
             centroid_y=new_cy,
             centroid_lon=new_lon,
@@ -2523,7 +2537,7 @@ def _make_observation(
     track: list[TrajectoryPoint],
     points: list[tuple[float, float]],
     *,
-    cluster_id: int,
+    cluster_calculate_index: int,
     center: tuple[float, float],
     entry_seg: int,
     entry_xy: tuple[float, float],
@@ -2542,7 +2556,7 @@ def _make_observation(
     inbound_bearing = _circular_mean_deg(inbound_angles)
     outbound_bearing = _circular_mean_deg(outbound_angles)
     return EntryExitObservation(
-        cluster_id=cluster_id,
+        cluster_calculate_index=cluster_calculate_index,
         vehicle_id=track[0].vehicle_id,
         entry_branch_angle=_branch_angle_from_center(center, entry_xy),
         exit_branch_angle=_branch_angle_from_center(center, exit_xy),
@@ -2604,7 +2618,7 @@ def _build_topology_for_cluster(
     )
 
     topology = IntersectionTopology(
-        cluster_id=cluster.cluster_id,
+        cluster_calculate_index=cluster.cluster_calculate_index,
         branch_centers_deg=branch_centers,
         transition_counts=transition_counts,
         observation_count=len(observations),
@@ -2775,7 +2789,7 @@ def _extract_entry_exit_observations_batch(
         obs = _make_observation(
             track_points_lookup[vehicle_id],
             xy_points_lookup[vehicle_id],
-            cluster_id=cluster.cluster_id,
+            cluster_calculate_index=cluster.cluster_calculate_index,
             center=center,
             entry_seg=entry_seg,
             entry_xy=entry_xy,

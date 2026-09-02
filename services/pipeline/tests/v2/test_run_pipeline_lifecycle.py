@@ -128,9 +128,6 @@ class _RecordingStore:
             raise self.persist_detect_error
         return DetectPersistenceResult(
             tracks_cross_count=0,
-            candidate_intersection_ids={},
-            candidate_entry_exit_ids={},
-            intersection_ids={},
             turn_event_count=0,
             candidate_intersection_count=0,
             candidate_entry_exit_point_count=0,

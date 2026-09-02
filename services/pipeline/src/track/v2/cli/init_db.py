@@ -192,7 +192,6 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         CREATE TABLE IF NOT EXISTS candidate_intersections (
             id                  BIGSERIAL PRIMARY KEY,
             detect_id           UUID NOT NULL REFERENCES detect_runs(id),
-            cluster_id          INTEGER NOT NULL,
             centroid_x          DOUBLE PRECISION NOT NULL,
             centroid_y          DOUBLE PRECISION NOT NULL,
             centroid_lon        DOUBLE PRECISION NOT NULL,
@@ -219,7 +218,6 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             id                          BIGSERIAL PRIMARY KEY,
             detect_id                   UUID NOT NULL REFERENCES detect_runs(id),
             candidate_intersection_id   BIGINT NOT NULL,
-            cluster_id                  INTEGER NOT NULL,
             vehicle_id                  TEXT NOT NULL,
             segment_index               INTEGER NOT NULL,
             crossing_type               TEXT NOT NULL,
@@ -248,7 +246,6 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             id                          BIGSERIAL PRIMARY KEY,
             detect_id                   UUID NOT NULL REFERENCES detect_runs(id),
             candidate_intersection_id   BIGINT NOT NULL,
-            cluster_id                  INTEGER NOT NULL,
             branch_centers_deg          JSONB NOT NULL DEFAULT '[]',
             transition_counts           JSONB NOT NULL DEFAULT '{}',
             observation_count           INTEGER NOT NULL,
@@ -258,7 +255,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             geom                        geometry(Polygon, 4326),  -- app-layer: derived from candidate_intersections
             created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (id, detect_id),
-            UNIQUE (detect_id, cluster_id),
+            CONSTRAINT intersections_detect_candidate_key
+                UNIQUE (detect_id, candidate_intersection_id),
             FOREIGN KEY (candidate_intersection_id, detect_id)
                 REFERENCES candidate_intersections(id, detect_id)
         )
@@ -268,7 +266,6 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             id                  BIGSERIAL PRIMARY KEY,
             detect_id           UUID NOT NULL REFERENCES detect_runs(id),
             intersection_id     BIGINT NOT NULL,
-            cluster_id          INTEGER NOT NULL,
             vehicle_id          TEXT NOT NULL,
             entry_branch_angle  DOUBLE PRECISION NOT NULL,
             exit_branch_angle   DOUBLE PRECISION NOT NULL,
@@ -308,19 +305,26 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             fit_id              UUID NOT NULL,
             detect_id           UUID NOT NULL,
             variant             TEXT NOT NULL CHECK (variant IN ('combined', 'directed')),
-            from_cluster_id     INTEGER NOT NULL,
-            to_cluster_id       INTEGER NOT NULL,
+            from_intersection_id BIGINT NOT NULL,
+            to_intersection_id  BIGINT NOT NULL,
             geom                geometry(LineString, 4326) NOT NULL,
             length_m            DOUBLE PRECISION NOT NULL,
             forward_clip_count  INTEGER NOT NULL,
             reverse_clip_count  INTEGER NOT NULL,
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             FOREIGN KEY (fit_id, detect_id) REFERENCES fit_runs(id, detect_id),
-            FOREIGN KEY (detect_id, from_cluster_id) REFERENCES intersections(detect_id, cluster_id),
-            FOREIGN KEY (detect_id, to_cluster_id) REFERENCES intersections(detect_id, cluster_id),
-            UNIQUE (fit_id, variant, from_cluster_id, to_cluster_id),
-            CHECK (from_cluster_id <> to_cluster_id),
-            CHECK (variant <> 'combined' OR from_cluster_id < to_cluster_id)
+            CONSTRAINT centerlines_from_intersection_detect_fkey
+                FOREIGN KEY (from_intersection_id, detect_id)
+                REFERENCES intersections(id, detect_id),
+            CONSTRAINT centerlines_to_intersection_detect_fkey
+                FOREIGN KEY (to_intersection_id, detect_id)
+                REFERENCES intersections(id, detect_id),
+            CONSTRAINT centerlines_fit_variant_endpoints_key
+                UNIQUE (fit_id, variant, from_intersection_id, to_intersection_id),
+            CONSTRAINT centerlines_distinct_endpoints_check
+                CHECK (from_intersection_id <> to_intersection_id),
+            CONSTRAINT centerlines_combined_endpoint_order_check
+                CHECK (variant <> 'combined' OR from_intersection_id < to_intersection_id)
         )
     """),
     ("centerline_source_clips", """
@@ -331,18 +335,22 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             vehicle_id                 TEXT NOT NULL,
             subtrack_index             INTEGER NOT NULL,
             clip_ordinal_in_track      INTEGER NOT NULL,
-            start_cluster_id           INTEGER NOT NULL,
+            start_intersection_id      BIGINT NOT NULL,
             start_segment_index        INTEGER NOT NULL,
             start_segment_fraction     DOUBLE PRECISION NOT NULL,
             interior_start_index       INTEGER NOT NULL,
             interior_end_index_exclusive INTEGER NOT NULL,
-            end_cluster_id             INTEGER NOT NULL,
+            end_intersection_id        BIGINT NOT NULL,
             end_segment_index          INTEGER NOT NULL,
             end_segment_fraction       DOUBLE PRECISION NOT NULL,
             reverse_to_centerline_direction BOOLEAN NOT NULL,
             input_point_count          INTEGER NOT NULL,
             PRIMARY KEY (centerline_id, input_ordinal),
-            UNIQUE (centerline_id, clip_id)
+            UNIQUE (centerline_id, clip_id),
+            CONSTRAINT centerline_source_clips_start_intersection_fkey
+                FOREIGN KEY (start_intersection_id) REFERENCES intersections(id),
+            CONSTRAINT centerline_source_clips_end_intersection_fkey
+                FOREIGN KEY (end_intersection_id) REFERENCES intersections(id)
         )
     """),
 ]
@@ -382,20 +390,20 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     ("idx_te_geom",            "CREATE INDEX IF NOT EXISTS idx_te_geom ON turn_events USING GIST (geom)"),
     ("idx_te_candidate",       "CREATE INDEX IF NOT EXISTS idx_te_candidate ON turn_events(detect_id, candidate_intersection_id) WHERE candidate_intersection_id IS NOT NULL"),
     # ── candidate_intersections ──
-    ("idx_ci_cluster_id",      "CREATE UNIQUE INDEX IF NOT EXISTS idx_ci_cluster_id ON candidate_intersections(detect_id, cluster_id)"),
+    ("idx_ci_detect_id",       "CREATE INDEX IF NOT EXISTS idx_ci_detect_id ON candidate_intersections(detect_id, id)"),
     ("idx_ci_source",          "CREATE INDEX IF NOT EXISTS idx_ci_source ON candidate_intersections(source)"),
     ("idx_ci_centroid",        "CREATE INDEX IF NOT EXISTS idx_ci_centroid ON candidate_intersections(centroid_lon, centroid_lat)"),
     ("idx_ci_geom",            "CREATE INDEX IF NOT EXISTS idx_ci_geom ON candidate_intersections USING GIST (geom)"),
     # ── candidate_entry_exit_points ──
-    ("idx_ceep_cluster",       "CREATE INDEX IF NOT EXISTS idx_ceep_cluster ON candidate_entry_exit_points(detect_id, cluster_id, vehicle_id)"),
+    ("idx_ceep_candidate",     "CREATE INDEX IF NOT EXISTS idx_ceep_candidate ON candidate_entry_exit_points(detect_id, candidate_intersection_id, vehicle_id)"),
     ("idx_ceep_type",          "CREATE INDEX IF NOT EXISTS idx_ceep_type ON candidate_entry_exit_points(crossing_type)"),
     ("idx_ceep_geom",          "CREATE INDEX IF NOT EXISTS idx_ceep_geom ON candidate_entry_exit_points USING GIST (geom)"),
     # ── intersections ──
-    ("idx_int_cluster_id",     "CREATE UNIQUE INDEX IF NOT EXISTS idx_int_cluster_id ON intersections(detect_id, cluster_id)"),
+    ("idx_int_detect_id",      "CREATE INDEX IF NOT EXISTS idx_int_detect_id ON intersections(detect_id, id)"),
     ("idx_int_complete",       "CREATE INDEX IF NOT EXISTS idx_int_complete ON intersections(is_complete)"),
     ("idx_int_geom",           "CREATE INDEX IF NOT EXISTS idx_int_geom ON intersections USING GIST (geom)"),
     # ── entry_exit_points ──
-    ("idx_eep_cluster_vehicle","CREATE INDEX IF NOT EXISTS idx_eep_cluster_vehicle ON entry_exit_points(detect_id, cluster_id, vehicle_id)"),
+    ("idx_eep_intersection_vehicle", "CREATE INDEX IF NOT EXISTS idx_eep_intersection_vehicle ON entry_exit_points(detect_id, intersection_id, vehicle_id)"),
     ("idx_eep_intersection",   "CREATE INDEX IF NOT EXISTS idx_eep_intersection ON entry_exit_points(intersection_id)"),
 ]
 
@@ -626,6 +634,410 @@ def _auto_add_missing_columns(cur: Any, table_name: str, ddl: str) -> int:
     return 0
 
 
+_BACKFILL_INTERSECTION_IDENTITIES_SQL = """
+DO $migration$
+DECLARE
+    base_legacy_columns INTEGER;
+    centerline_legacy_columns INTEGER;
+    manifest_legacy_columns INTEGER;
+    conflict BOOLEAN;
+BEGIN
+    SELECT COUNT(*) INTO base_legacy_columns
+    FROM information_schema.columns
+    WHERE table_schema = current_schema()
+      AND (table_name, column_name) IN (VALUES
+          ('candidate_intersections', 'cluster_id'),
+          ('candidate_entry_exit_points', 'cluster_id'),
+          ('intersections', 'cluster_id'),
+          ('entry_exit_points', 'cluster_id')
+      );
+    SELECT COUNT(*) INTO centerline_legacy_columns
+    FROM information_schema.columns
+    WHERE table_schema = current_schema()
+      AND table_name = 'centerlines'
+      AND column_name IN ('from_cluster_id', 'to_cluster_id');
+    SELECT COUNT(*) INTO manifest_legacy_columns
+    FROM information_schema.columns
+    WHERE table_schema = current_schema()
+      AND table_name = 'centerline_source_clips'
+      AND column_name IN ('start_cluster_id', 'end_cluster_id');
+
+    IF base_legacy_columns NOT IN (0, 4) THEN
+        RAISE EXCEPTION 'partial legacy cluster columns prevent migration';
+    END IF;
+    IF centerline_legacy_columns NOT IN (0, 2) THEN
+        RAISE EXCEPTION 'partial legacy centerline endpoints prevent migration';
+    END IF;
+    IF manifest_legacy_columns NOT IN (0, 2) THEN
+        RAISE EXCEPTION 'partial legacy centerline manifest endpoints prevent migration';
+    END IF;
+    IF (centerline_legacy_columns > 0 OR manifest_legacy_columns > 0)
+       AND base_legacy_columns = 0 THEN
+        RAISE EXCEPTION 'legacy endpoint migration requires intersections.cluster_id';
+    END IF;
+
+    IF base_legacy_columns = 4 THEN
+        EXECUTE $query$
+            SELECT EXISTS (
+                SELECT 1
+                FROM candidate_entry_exit_points AS crossing
+                LEFT JOIN candidate_intersections AS candidate
+                  ON candidate.id = crossing.candidate_intersection_id
+                 AND candidate.detect_id = crossing.detect_id
+                WHERE candidate.id IS NULL
+                   OR crossing.cluster_id IS DISTINCT FROM candidate.cluster_id
+            )
+        $query$ INTO conflict;
+        IF conflict THEN
+            RAISE EXCEPTION 'candidate crossing cluster identity is inconsistent';
+        END IF;
+
+        EXECUTE $query$
+            SELECT EXISTS (
+                SELECT 1
+                FROM intersections AS intersection
+                LEFT JOIN candidate_intersections AS candidate
+                  ON candidate.id = intersection.candidate_intersection_id
+                 AND candidate.detect_id = intersection.detect_id
+                WHERE candidate.id IS NULL
+                   OR intersection.cluster_id IS DISTINCT FROM candidate.cluster_id
+            )
+        $query$ INTO conflict;
+        IF conflict THEN
+            RAISE EXCEPTION 'intersection candidate identity is inconsistent';
+        END IF;
+
+        EXECUTE $query$
+            SELECT EXISTS (
+                SELECT 1
+                FROM entry_exit_points AS observation
+                LEFT JOIN intersections AS intersection
+                  ON intersection.id = observation.intersection_id
+                 AND intersection.detect_id = observation.detect_id
+                WHERE intersection.id IS NULL
+                   OR observation.cluster_id IS DISTINCT FROM intersection.cluster_id
+            )
+        $query$ INTO conflict;
+        IF conflict THEN
+            RAISE EXCEPTION 'entry/exit intersection identity is inconsistent';
+        END IF;
+    END IF;
+
+    SELECT EXISTS (
+        SELECT 1 FROM intersections
+        GROUP BY detect_id, candidate_intersection_id
+        HAVING COUNT(*) > 1
+    ) INTO conflict;
+    IF conflict THEN
+        RAISE EXCEPTION 'candidate maps to multiple completed intersections';
+    END IF;
+
+    IF centerline_legacy_columns = 2 THEN
+        EXECUTE $query$
+            SELECT EXISTS (
+                SELECT 1 FROM centerlines AS centerline
+                WHERE (SELECT COUNT(*) FROM intersections AS endpoint
+                       WHERE endpoint.detect_id = centerline.detect_id
+                         AND endpoint.cluster_id = centerline.from_cluster_id) <> 1
+                   OR (SELECT COUNT(*) FROM intersections AS endpoint
+                       WHERE endpoint.detect_id = centerline.detect_id
+                         AND endpoint.cluster_id = centerline.to_cluster_id) <> 1
+            )
+        $query$ INTO conflict;
+        IF conflict THEN
+            RAISE EXCEPTION 'centerline cluster endpoint is not uniquely mapped';
+        END IF;
+
+        EXECUTE $query$
+            SELECT EXISTS (
+                SELECT 1
+                FROM centerlines AS centerline
+                JOIN intersections AS source
+                  ON source.detect_id = centerline.detect_id
+                 AND source.cluster_id = centerline.from_cluster_id
+                JOIN intersections AS target
+                  ON target.detect_id = centerline.detect_id
+                 AND target.cluster_id = centerline.to_cluster_id
+                WHERE (centerline.from_intersection_id IS NOT NULL
+                       AND centerline.from_intersection_id <> source.id)
+                   OR (centerline.to_intersection_id IS NOT NULL
+                       AND centerline.to_intersection_id <> target.id)
+            )
+        $query$ INTO conflict;
+        IF conflict THEN
+            RAISE EXCEPTION 'centerline intersection ID backfill conflicts with existing data';
+        END IF;
+
+        EXECUTE $query$
+            UPDATE centerlines AS centerline
+            SET from_intersection_id = source.id,
+                to_intersection_id = target.id
+            FROM intersections AS source, intersections AS target
+            WHERE source.detect_id = centerline.detect_id
+              AND source.cluster_id = centerline.from_cluster_id
+              AND target.detect_id = centerline.detect_id
+              AND target.cluster_id = centerline.to_cluster_id
+        $query$;
+    END IF;
+
+    IF manifest_legacy_columns = 2 THEN
+        EXECUTE $query$
+            SELECT EXISTS (
+                SELECT 1
+                FROM centerline_source_clips AS manifest
+                LEFT JOIN centerlines AS centerline
+                  ON centerline.id = manifest.centerline_id
+                WHERE centerline.id IS NULL
+                   OR (SELECT COUNT(*) FROM intersections AS endpoint
+                       WHERE endpoint.detect_id = centerline.detect_id
+                         AND endpoint.cluster_id = manifest.start_cluster_id) <> 1
+                   OR (SELECT COUNT(*) FROM intersections AS endpoint
+                       WHERE endpoint.detect_id = centerline.detect_id
+                         AND endpoint.cluster_id = manifest.end_cluster_id) <> 1
+            )
+        $query$ INTO conflict;
+        IF conflict THEN
+            RAISE EXCEPTION 'source Clip cluster endpoint is not uniquely mapped';
+        END IF;
+
+        EXECUTE $query$
+            SELECT EXISTS (
+                SELECT 1
+                FROM centerline_source_clips AS manifest
+                JOIN centerlines AS centerline
+                  ON centerline.id = manifest.centerline_id
+                JOIN intersections AS source
+                  ON source.detect_id = centerline.detect_id
+                 AND source.cluster_id = manifest.start_cluster_id
+                JOIN intersections AS target
+                  ON target.detect_id = centerline.detect_id
+                 AND target.cluster_id = manifest.end_cluster_id
+                WHERE (manifest.start_intersection_id IS NOT NULL
+                       AND manifest.start_intersection_id <> source.id)
+                   OR (manifest.end_intersection_id IS NOT NULL
+                       AND manifest.end_intersection_id <> target.id)
+            )
+        $query$ INTO conflict;
+        IF conflict THEN
+            RAISE EXCEPTION 'source Clip intersection ID backfill conflicts with existing data';
+        END IF;
+
+        EXECUTE $query$
+            UPDATE centerline_source_clips AS manifest
+            SET start_intersection_id = source.id,
+                end_intersection_id = target.id
+            FROM centerlines AS centerline,
+                 intersections AS source,
+                 intersections AS target
+            WHERE centerline.id = manifest.centerline_id
+              AND source.detect_id = centerline.detect_id
+              AND source.cluster_id = manifest.start_cluster_id
+              AND target.detect_id = centerline.detect_id
+              AND target.cluster_id = manifest.end_cluster_id
+        $query$;
+    END IF;
+
+    SELECT EXISTS (
+        SELECT 1 FROM centerlines
+        WHERE from_intersection_id IS NULL OR to_intersection_id IS NULL
+    ) INTO conflict;
+    IF conflict THEN
+        RAISE EXCEPTION 'centerline intersection ID backfill is incomplete';
+    END IF;
+    SELECT EXISTS (
+        SELECT 1 FROM centerlines
+        WHERE from_intersection_id = to_intersection_id
+    ) INTO conflict;
+    IF conflict THEN
+        RAISE EXCEPTION 'centerline endpoints resolve to one intersection';
+    END IF;
+    SELECT EXISTS (
+        SELECT 1 FROM centerlines
+        WHERE variant = 'combined'
+          AND from_intersection_id >= to_intersection_id
+    ) INTO conflict;
+    IF conflict THEN
+        RAISE EXCEPTION 'combined centerline database ID order requires manual migration';
+    END IF;
+    SELECT EXISTS (
+        SELECT 1 FROM centerline_source_clips
+        WHERE start_intersection_id IS NULL OR end_intersection_id IS NULL
+    ) INTO conflict;
+    IF conflict THEN
+        RAISE EXCEPTION 'source Clip intersection ID backfill is incomplete';
+    END IF;
+END;
+$migration$
+"""
+
+
+_ADD_INTERSECTION_IDENTITY_CONSTRAINTS_SQL = """
+DO $migration$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'intersections_detect_candidate_key'
+          AND conrelid = 'intersections'::regclass
+    ) THEN
+        ALTER TABLE intersections
+            ADD CONSTRAINT intersections_detect_candidate_key
+            UNIQUE (detect_id, candidate_intersection_id);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'centerlines_from_intersection_detect_fkey'
+          AND conrelid = 'centerlines'::regclass
+    ) THEN
+        ALTER TABLE centerlines
+            ADD CONSTRAINT centerlines_from_intersection_detect_fkey
+            FOREIGN KEY (from_intersection_id, detect_id)
+            REFERENCES intersections(id, detect_id);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'centerlines_to_intersection_detect_fkey'
+          AND conrelid = 'centerlines'::regclass
+    ) THEN
+        ALTER TABLE centerlines
+            ADD CONSTRAINT centerlines_to_intersection_detect_fkey
+            FOREIGN KEY (to_intersection_id, detect_id)
+            REFERENCES intersections(id, detect_id);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'centerlines_fit_variant_endpoints_key'
+          AND conrelid = 'centerlines'::regclass
+    ) THEN
+        ALTER TABLE centerlines
+            ADD CONSTRAINT centerlines_fit_variant_endpoints_key
+            UNIQUE (fit_id, variant, from_intersection_id, to_intersection_id);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'centerlines_distinct_endpoints_check'
+          AND conrelid = 'centerlines'::regclass
+    ) THEN
+        ALTER TABLE centerlines
+            ADD CONSTRAINT centerlines_distinct_endpoints_check
+            CHECK (from_intersection_id <> to_intersection_id);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'centerlines_combined_endpoint_order_check'
+          AND conrelid = 'centerlines'::regclass
+    ) THEN
+        ALTER TABLE centerlines
+            ADD CONSTRAINT centerlines_combined_endpoint_order_check
+            CHECK (variant <> 'combined' OR from_intersection_id < to_intersection_id);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'centerline_source_clips_start_intersection_fkey'
+          AND conrelid = 'centerline_source_clips'::regclass
+    ) THEN
+        ALTER TABLE centerline_source_clips
+            ADD CONSTRAINT centerline_source_clips_start_intersection_fkey
+            FOREIGN KEY (start_intersection_id) REFERENCES intersections(id);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'centerline_source_clips_end_intersection_fkey'
+          AND conrelid = 'centerline_source_clips'::regclass
+    ) THEN
+        ALTER TABLE centerline_source_clips
+            ADD CONSTRAINT centerline_source_clips_end_intersection_fkey
+            FOREIGN KEY (end_intersection_id) REFERENCES intersections(id);
+    END IF;
+END;
+$migration$
+"""
+
+
+_DROP_CLUSTER_ID_CONSTRAINTS_SQL = """
+DO $migration$
+DECLARE
+    item RECORD;
+BEGIN
+    FOR item IN
+        SELECT DISTINCT constraint_row.conname
+        FROM pg_constraint AS constraint_row
+        JOIN LATERAL unnest(constraint_row.conkey) AS key_column(attnum) ON TRUE
+        JOIN pg_attribute AS attribute_row
+          ON attribute_row.attrelid = constraint_row.conrelid
+         AND attribute_row.attnum = key_column.attnum
+        WHERE constraint_row.conrelid = 'centerlines'::regclass
+          AND attribute_row.attname IN ('from_cluster_id', 'to_cluster_id')
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE centerlines DROP CONSTRAINT %I',
+            item.conname
+        );
+    END LOOP;
+    FOR item IN
+        SELECT DISTINCT constraint_row.conname
+        FROM pg_constraint AS constraint_row
+        JOIN LATERAL unnest(constraint_row.conkey) AS key_column(attnum) ON TRUE
+        JOIN pg_attribute AS attribute_row
+          ON attribute_row.attrelid = constraint_row.conrelid
+         AND attribute_row.attnum = key_column.attnum
+        WHERE constraint_row.conrelid = 'intersections'::regclass
+          AND attribute_row.attname = 'cluster_id'
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE intersections DROP CONSTRAINT %I',
+            item.conname
+        );
+    END LOOP;
+END;
+$migration$
+"""
+
+
+_CANONICALIZE_CANDIDATE_CROSSING_INJECTED_REFS_SQL = """
+DO $migration$
+DECLARE
+    conflict BOOLEAN;
+BEGIN
+    SELECT EXISTS (
+        SELECT 1
+        FROM candidate_entry_exit_points AS crossing
+        JOIN detect_runs AS detect ON detect.id = crossing.detect_id
+        CROSS JOIN LATERAL (VALUES
+            (crossing.from_source_id, crossing.from_source_row_key),
+            (crossing.to_source_id, crossing.to_source_row_key)
+        ) AS endpoint(source_id, source_row_key)
+        WHERE endpoint.source_id IN ('injected_points', 'public.injected_points')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM injected_points AS injected
+              WHERE injected.clean_id = detect.clean_id
+                AND injected.vehicle_id = crossing.vehicle_id
+                AND injected.id::text = endpoint.source_row_key
+          )
+    ) INTO conflict;
+    IF conflict THEN
+        RAISE EXCEPTION
+            'candidate crossing injected-point reference is invalid for its Clean Run';
+    END IF;
+
+    UPDATE candidate_entry_exit_points
+    SET from_source_id = CASE
+            WHEN from_source_id = 'injected_points'
+                THEN 'public.injected_points'
+            ELSE from_source_id
+        END,
+        to_source_id = CASE
+            WHEN to_source_id = 'injected_points'
+                THEN 'public.injected_points'
+            ELSE to_source_id
+        END
+    WHERE from_source_id = 'injected_points'
+       OR to_source_id = 'injected_points';
+END;
+$migration$
+"""
+
+
 def _run_migrations(cur: Any) -> None:
     """Structural changes that cannot be auto-detected from the DDL.
 
@@ -707,6 +1119,73 @@ def _run_migrations(cur: Any) -> None:
         (
             "drop_turn_event_event_id_column",
             "ALTER TABLE turn_events DROP COLUMN IF EXISTS event_id",
+        ),
+        (
+            "canonicalize_candidate_crossing_injected_refs",
+            _CANONICALIZE_CANDIDATE_CROSSING_INJECTED_REFS_SQL,
+        ),
+        (
+            "backfill_intersection_identities",
+            _BACKFILL_INTERSECTION_IDENTITIES_SQL,
+        ),
+        (
+            "require_intersection_endpoint_ids",
+            "ALTER TABLE centerlines "
+            "ALTER COLUMN from_intersection_id SET NOT NULL, "
+            "ALTER COLUMN to_intersection_id SET NOT NULL; "
+            "ALTER TABLE centerline_source_clips "
+            "ALTER COLUMN start_intersection_id SET NOT NULL, "
+            "ALTER COLUMN end_intersection_id SET NOT NULL",
+        ),
+        (
+            "add_intersection_identity_constraints",
+            _ADD_INTERSECTION_IDENTITY_CONSTRAINTS_SQL,
+        ),
+        (
+            "drop_cluster_identity_constraints",
+            _DROP_CLUSTER_ID_CONSTRAINTS_SQL,
+        ),
+        ("drop_ci_cluster_index", "DROP INDEX IF EXISTS idx_ci_cluster_id"),
+        ("drop_ceep_cluster_index", "DROP INDEX IF EXISTS idx_ceep_cluster"),
+        ("drop_int_cluster_index", "DROP INDEX IF EXISTS idx_int_cluster_id"),
+        (
+            "drop_eep_cluster_index",
+            "DROP INDEX IF EXISTS idx_eep_cluster_vehicle",
+        ),
+        (
+            "drop_manifest_start_cluster_column",
+            "ALTER TABLE centerline_source_clips "
+            "DROP COLUMN IF EXISTS start_cluster_id",
+        ),
+        (
+            "drop_manifest_end_cluster_column",
+            "ALTER TABLE centerline_source_clips "
+            "DROP COLUMN IF EXISTS end_cluster_id",
+        ),
+        (
+            "drop_centerline_from_cluster_column",
+            "ALTER TABLE centerlines DROP COLUMN IF EXISTS from_cluster_id",
+        ),
+        (
+            "drop_centerline_to_cluster_column",
+            "ALTER TABLE centerlines DROP COLUMN IF EXISTS to_cluster_id",
+        ),
+        (
+            "drop_entry_exit_cluster_column",
+            "ALTER TABLE entry_exit_points DROP COLUMN IF EXISTS cluster_id",
+        ),
+        (
+            "drop_intersection_cluster_column",
+            "ALTER TABLE intersections DROP COLUMN IF EXISTS cluster_id",
+        ),
+        (
+            "drop_candidate_crossing_cluster_column",
+            "ALTER TABLE candidate_entry_exit_points "
+            "DROP COLUMN IF EXISTS cluster_id",
+        ),
+        (
+            "drop_candidate_cluster_column",
+            "ALTER TABLE candidate_intersections DROP COLUMN IF EXISTS cluster_id",
         ),
         (
             "add_candidate_membership_fks",

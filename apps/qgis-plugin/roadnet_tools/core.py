@@ -109,13 +109,13 @@ def build_clip_payload(records: Sequence[SelectionRecord]) -> dict[str, Any]:
 
     intersection_ids: list[Any] = []
     for record in records:
-        value = _first_present(record.properties, ("cluster_id",))
+        value = _first_present(record.properties, ("intersection_id",))
         if value is None:
             value = record.feature_id
-        _append_unique(intersection_ids, _integer_identifier(value, "intersection ID", 0))
+        _append_unique(intersection_ids, _integer_identifier(value, "intersection ID", 1))
 
     if len(intersection_ids) != 2:
-        raise ContractError("The two intersections must have distinct cluster IDs.")
+        raise ContractError("The two intersections must have distinct intersection IDs.")
 
     detect_id = _common_property(records, "detect_id", required=True)
     return {

@@ -137,10 +137,10 @@ cgroup 指标验收，不能只看进程 RSS。
 |---|---|---|---|
 | Cleaner | 公共 `clean()` 的 active/excluded/subtracks；生产 PG 路径不走它 | O(raw/active rows) | DB Pipeline 禁用 eager API；单车状态也要 spill |
 | Detect | `tracks` dict、turn/ortho/cross lists、segment/grid、G*/DBSCAN、topology point arrays、`IntersectResult` | O(active points + events + memberships) | DB staging + tile/halo + shard；只返回 compact summary |
-| Detect persistence | 全量 row tuple、`_with_stage_id` 第二份 list、百万级 ID map | O(output rows) | generator COPY + 分批/外存映射 |
+| Detect persistence | 全量 row tuple、`_with_stage_id` 第二份 list、百万级临时候选归属 map | O(output rows) | generator COPY + 分批/外存映射 |
 | Clip | unnamed cursor result、`grouped_rows`、全部 `TrajectoryPoint`、`ClipInput`、完整 `ClipResult` | O(active points + clips + clip points) | named cursor，一次一个 subtrack，eligible clip 写 spool |
 | Fitting | 全部 oriented coordinate tuples、pair NumPy stack、manifest rows | O(eligible clip points + manifests) | 一次一个 pair，sample matrix spill，generator manifest |
-| Network | 自身图很小，但当前依赖完整 `iresult` 和 `fit_bundle` | O(intersections + centerlines)，另继承上游 | 从持久化窄表加载，Stage 进程隔离 |
+| Network | 自身图很小，已只读取 Clip 携带的 compact intersections，但 runner 仍保留上游结果与 `fit_bundle` | O(intersections + centerlines)，另继承上游 | 从持久化窄表加载，Stage 进程隔离 |
 
 ### 3.2 对象代理的证据等级
 
@@ -291,8 +291,9 @@ COPY 协议本身逐行，但 writer 调用方先创建全量 row tuple，`_with
 
 这些值是原 rows list 与 `_with_stage_id` 新 tuple list 转换瞬间的 CPython 浅层
 载荷，未计字段对象和 libpq buffer；五个批次顺序发生，不能彼此相加，转换返回后
-原 list 可释放，但每批都与完整 `IntersectResult` 共存。百万级 turn/crossing ID
-map 还会被 `DetectPersistenceResult` 继续引用。
+原 list 可释放，但每批都与完整 `IntersectResult` 共存。百万级 turn/crossing
+候选归属 map 只在 Detect 持久化期间临时存在；`DetectPersistenceResult` 已只返回
+计数，不再把这些 map 传给后续 Stage。
 
 #### Detect 结论
 
@@ -358,7 +359,7 @@ Fitting 自身新增量不是当前最大风险，问题是它与完整 Detect�
 
 达标改造要求：
 
-- 从 clip spool 按 `(from_cluster, to_cluster)` 一次读取一个 pair；
+- 从 clip spool 按 `(from_intersection_id, to_intersection_id)` 一次读取一个 pair；
 - 同一遍生成 combined、A→B、B→A，避免三次全量遍历；
 - 对 `max_clips_per_pair` 和 `max_pair_sample_matrix_bytes` 设置硬预算，超限使用
   memmap/DB spill，而不是依赖平均 pair 大小；
@@ -427,7 +428,7 @@ cgroup OOM。预算必须以 bytes 和实测 high-water 校准，不只配置“
 - 给 `TrackModel` 增加空 slots，使 `slots=True` 子类真正没有实例 dict；
 - `_copy_insert` 接受一次性 iterable，stage ID 由 generator 附加；
 - 修复 Cleaner exclusion self-copy/跨 subtrack 累积，并持久化 exclusions；
-- Detect 完成后只保留 compact intersections，清除百万级 ID maps；
+- Detect 完成后只保留 compact intersections，并及时释放临时候选归属 maps；
 - 新增精确输入行数断言和所有 high-water telemetry。
 
 这些改动会降低常数，但单独完成 Phase A 仍不能宣称 20M 达标。

@@ -47,7 +47,7 @@ _IP_UNIFIED_COLS = (
     "from_source_row_key, to_source_row_key, generated_reason"
 )
 
-_INJECTED_SOURCE_ID = "injected_points"
+_INJECTED_SOURCE_ID = "public.injected_points"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -144,8 +144,7 @@ def build_active_in_window_sql(
         return (
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
             f"       source_id, source_row_key, extra, "
-            f"       NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
-            f"       ''::text AS generated_reason "
+            f"       from_source_row_key, to_source_row_key, generated_reason "
             f"FROM ("
             f"  SELECT ktp.vehicle_id, tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, "
             f"         ktp.source_id, ktp.source_row_key, tp.extra, "
@@ -165,8 +164,7 @@ def build_active_in_window_sql(
     return (
         f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
         f"       source_id, source_row_key, extra, "
-        f"       NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
-        f"       ''::text AS generated_reason "
+        f"       from_source_row_key, to_source_row_key, generated_reason "
         f"FROM ("
         f"  SELECT {_TP_UNIFIED_COLS} "
         f"  FROM {table} "
@@ -582,15 +580,15 @@ def fetch_intersections(conn: object, detect_id: str) -> list[ClipIntersection]:
     intersections: list[ClipIntersection] = []
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(
-            "SELECT i.cluster_id, ci.centroid_lon, ci.centroid_lat, i.clip_radius_m "
+            "SELECT i.id, ci.centroid_lon, ci.centroid_lat, i.clip_radius_m "
             "FROM intersections AS i "
             "JOIN candidate_intersections AS ci "
             "ON ci.id = i.candidate_intersection_id AND ci.detect_id = i.detect_id "
             "WHERE i.detect_id = %s AND i.is_complete IS TRUE "
-            "ORDER BY i.cluster_id",
+            "ORDER BY i.id",
             (detect_id,),
         )
-        for cluster_id, lon, lat, radius_m in cur:
+        for intersection_id, lon, lat, radius_m in cur:
             if radius_m is None:
                 raise ValueError(
                     f"Detect Run {detect_id} predates Clip radius persistence"
@@ -599,7 +597,7 @@ def fetch_intersections(conn: object, detect_id: str) -> list[ClipIntersection]:
                 raise ValueError(f"Detect Run {detect_id} has an invalid Clip radius")
             intersections.append(
                 ClipIntersection(
-                    cluster_id=int(cluster_id),
+                    intersection_id=int(intersection_id),
                     lon=float(lon),
                     lat=float(lat),
                     radius_m=float(radius_m),
@@ -631,14 +629,19 @@ def fetch_clean_points(
         "  WHERE ktp.clean_id = %s "
         "  UNION ALL "
         "  SELECT ip.vehicle_id, ip.subtrack_index, ip.after_sequence_in_subtrack, "
-        "         ip.source_id, ip.source_row_key, "
+        "         %s::text AS source_id, ip.id::text AS source_row_key, "
         "         ip.timestamp, ip.lon, ip.lat, ip.heading, ip.speed, '{}'::jsonb, "
         "         ip.from_source_row_key, ip.to_source_row_key, ip.generated_reason, "
         "         1 AS point_kind, ip.id AS row_id "
         "  FROM injected_points AS ip WHERE ip.clean_id = %s"
         ") AS clean_points"
     )
-    return _group_points(conn, sql, (clean_id, clean_id), clean_id)
+    return _group_points(
+        conn,
+        sql,
+        (clean_id, _INJECTED_SOURCE_ID, clean_id),
+        clean_id,
+    )
 
 
 def fetch_clean_points_for_subtracks(
@@ -674,7 +677,7 @@ def fetch_clean_points_for_subtracks(
         "  WHERE ktp.clean_id = %s "
         "  UNION ALL "
         "  SELECT ip.vehicle_id, ip.subtrack_index, ip.after_sequence_in_subtrack, "
-        "         ip.source_id, ip.source_row_key, "
+        "         %s::text AS source_id, ip.id::text AS source_row_key, "
         "         ip.timestamp, ip.lon, ip.lat, ip.heading, ip.speed, '{}'::jsonb, "
         "         ip.from_source_row_key, ip.to_source_row_key, ip.generated_reason, "
         "         1 AS point_kind, ip.id AS row_id "
@@ -686,7 +689,13 @@ def fetch_clean_points_for_subtracks(
     return _group_points(
         conn,
         sql,
-        (vehicle_ids, subtrack_indexes, clean_id, clean_id),
+        (
+            vehicle_ids,
+            subtrack_indexes,
+            clean_id,
+            _INJECTED_SOURCE_ID,
+            clean_id,
+        ),
         clean_id,
     )
 

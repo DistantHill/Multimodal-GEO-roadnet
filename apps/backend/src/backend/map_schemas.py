@@ -77,8 +77,8 @@ class ClipRequest(BaseModel):
     @field_validator("intersection_ids")
     @classmethod
     def validate_intersection_ids(cls, value: list[int]) -> list[int]:
-        if any(item < 0 for item in value):
-            raise ValueError("intersection_ids must be non-negative")
+        if any(item <= 0 for item in value):
+            raise ValueError("intersection_ids must contain positive integers")
         if len(set(value)) != 2:
             raise ValueError("intersection_ids must contain exactly two distinct values")
         return value

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 
 from track.v2.db_writer import (
     create_clean_run,
@@ -11,7 +12,9 @@ from track.v2.db_writer import (
     create_fit_run,
     finish_clean_run,
     finish_detect_run,
+    insert_candidate_entry_exit_points,
     insert_candidate_intersections,
+    insert_entry_exit_points,
     insert_intersections,
     insert_injected_points,
     insert_kept_trajectory_points,
@@ -22,6 +25,7 @@ from track.v2.models import (
     ClipConfig,
     CrossTrackCandidate,
     DerivedPoint,
+    EntryExitObservation,
     GeneratedReason,
     HotspotCluster,
     IntersectionTopology,
@@ -59,20 +63,27 @@ class _RecordingCursor:
 
     def fetchall(self) -> list[tuple[int, ...]]:
         sql, params = self.executions[-1]
+        if "AS requested(injected_id, vehicle_id)" in sql:
+            return list(zip(params[0], params[1]))  # type: ignore[arg-type,return-value]
+        if "generate_series" in sql:
+            return [
+                (index + 1, index + 1)
+                for index in range(int(params[0]))
+            ]
         if "INSERT INTO candidate_intersections" in sql:
             row_count = sql.count("ST_Buffer(")
             width = len(params) // row_count
-            return [
-                (index + 1, params[index * width + 1])
+            return list(reversed([
+                (int(params[index * width + 1]),)
                 for index in range(row_count)
-            ]
+            ]))
         if "INSERT INTO intersections" in sql:
             row_count = sql.count("CASE WHEN")
             width = len(params) // row_count
-            return [
-                (index + 1, params[index * width + 2])
+            return list(reversed([
+                (int(params[index * width + 1]),)
                 for index in range(row_count)
-            ]
+            ]))
         return [(1,)]
 
 
@@ -100,9 +111,9 @@ class _RecordingConnection:
         return self.recording_cursor
 
 
-def _cluster(cluster_id: int) -> HotspotCluster:
+def _cluster(cluster_calculate_index: int) -> HotspotCluster:
     return HotspotCluster(
-        cluster_id=cluster_id,
+        cluster_calculate_index=cluster_calculate_index,
         centroid_x=0.0,
         centroid_y=0.0,
         centroid_lon=116.0,
@@ -250,7 +261,7 @@ class InsertIntersectionsTest(unittest.TestCase):
     def test_only_complete_topologies_are_written(self) -> None:
         conn = _RecordingConnection()
         incomplete = IntersectionTopology(
-            cluster_id=10,
+            cluster_calculate_index=10,
             branch_centers_deg=[0.0],
             transition_counts={},
             observation_count=1,
@@ -258,7 +269,7 @@ class InsertIntersectionsTest(unittest.TestCase):
             reason="insufficient observations",
         )
         complete = IntersectionTopology(
-            cluster_id=20,
+            cluster_calculate_index=20,
             branch_centers_deg=[0.0, 90.0, 180.0],
             transition_counts={(0, 1): 3},
             observation_count=8,
@@ -276,10 +287,12 @@ class InsertIntersectionsTest(unittest.TestCase):
         )
 
         self.assertEqual(result, {20: 1})
-        self.assertEqual(len(conn.recording_cursor.executions), 1)
-        sql, params = conn.recording_cursor.executions[0]
+        self.assertEqual(len(conn.recording_cursor.executions), 2)
+        sql, params = conn.recording_cursor.executions[-1]
         self.assertIn("clip_radius_m", sql)
-        self.assertEqual(params[2], 20)
+        self.assertNotIn("cluster_id", sql)
+        self.assertEqual(params[1], 1)
+        self.assertEqual(params[2], 120)
         self.assertIs(params[6], True)
         self.assertEqual(params[8], 145.0)
         self.assertEqual(params[-1], 145.0)
@@ -288,7 +301,7 @@ class InsertIntersectionsTest(unittest.TestCase):
         conn = _RecordingConnection()
         topologies = [
             IntersectionTopology(
-                cluster_id=cluster_id,
+                cluster_calculate_index=cluster_calculate_index,
                 branch_centers_deg=[0.0, 90.0],
                 transition_counts={(0, 1): 2},
                 observation_count=4,
@@ -296,7 +309,7 @@ class InsertIntersectionsTest(unittest.TestCase):
                 reason="complete",
                 clip_radius_m=100.0,
             )
-            for cluster_id in (10, 20)
+            for cluster_calculate_index in (20, 10)
         ]
 
         result = insert_intersections(
@@ -308,7 +321,7 @@ class InsertIntersectionsTest(unittest.TestCase):
         )
 
         self.assertEqual(result, {10: 1, 20: 2})
-        self.assertEqual(len(conn.recording_cursor.executions), 1)
+        self.assertEqual(len(conn.recording_cursor.executions), 2)
 
 
 class InsertTracksCrossTest(unittest.TestCase):
@@ -422,8 +435,9 @@ class CandidateIntersectionSourcesTest(unittest.TestCase):
 
         insert_candidate_intersections(conn, [cluster], detect_id="detect-1")
 
-        sql, params = conn.recording_cursor.executions[0]
+        sql, params = conn.recording_cursor.executions[-1]
         self.assertIn("detect_id", sql)
+        self.assertNotIn("cluster_id", sql)
         self.assertEqual(params[0], "detect-1")
         self.assertEqual(params[8], '["C:/input-a.csv", "project_raw_points"]')
 
@@ -432,12 +446,179 @@ class CandidateIntersectionSourcesTest(unittest.TestCase):
 
         result = insert_candidate_intersections(
             conn,
-            [_cluster(5), _cluster(6)],
+            [_cluster(6), _cluster(5)],
             detect_id="detect-1",
         )
 
         self.assertEqual(result, {5: 1, 6: 2})
-        self.assertEqual(len(conn.recording_cursor.executions), 1)
+        self.assertEqual(len(conn.recording_cursor.executions), 2)
+
+    def test_duplicate_calculation_indexes_are_rejected_before_writing(self) -> None:
+        conn = _RecordingConnection()
+
+        with self.assertRaisesRegex(ValueError, "calculation indexes must be unique"):
+            insert_candidate_intersections(
+                conn,
+                [_cluster(5), _cluster(5)],
+                detect_id="detect-1",
+            )
+
+        self.assertEqual(conn.recording_cursor.executions, [])
+
+
+class CandidateChildIdentityTest(unittest.TestCase):
+    def test_crossing_writer_requires_detect_id(self) -> None:
+        conn = _RecordingConnection()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "detect_id is required for derived v2 persistence",
+        ):
+            insert_candidate_entry_exit_points(conn, [], {})
+
+        self.assertEqual(conn.recording_cursor.executions, [])
+
+    def test_crossing_and_observation_rows_omit_calculation_index(self) -> None:
+        cluster = replace(
+            _cluster(5),
+            crossing_points=(SimpleNamespace(
+                crossing_id=7,
+                vehicle_id="vehicle-1",
+                segment_index=3,
+                is_entry=True,
+                crossing_lon=116.0,
+                crossing_lat=39.0,
+                point_ref=PointRef(
+                    "injected_points",
+                    "282",
+                    stable=False,
+                    generated_reason="orthogonal_heading",
+                ),
+                end_point_ref=PointRef(
+                    "public.injected_points",
+                    "283",
+                    stable=False,
+                    generated_reason="orthogonal_heading",
+                ),
+            ),),
+        )
+        conn = _RecordingConnection()
+
+        crossing_ids = insert_candidate_entry_exit_points(
+            conn,
+            [cluster],
+            {5: 55},
+            detect_id="detect-1",
+        )
+        insert_entry_exit_points(
+            conn,
+            [
+                EntryExitObservation(
+                    5,
+                    "vehicle-1",
+                    0.0,
+                    90.0,
+                    0.0,
+                    90.0,
+                    90.0,
+                    entry_crossing_id=0,
+                    exit_crossing_id=7,
+                )
+            ],
+            {5: 65},
+            {(5, 0): 70, **crossing_ids},
+            detect_id="detect-1",
+        )
+
+        crossing_sql, crossing_params = next(
+            (sql, params)
+            for sql, params in conn.recording_cursor.executions
+            if "INSERT INTO candidate_entry_exit_points" in sql
+        )
+        self.assertNotIn("cluster_id", crossing_sql)
+        self.assertEqual(
+            tuple(crossing_params[-4:]),
+            (
+                "public.injected_points",
+                "282",
+                "public.injected_points",
+                "283",
+            ),
+        )
+        observation_sql = conn.recording_cursor.copy_statements[-1]
+        self.assertIn("intersection_id", observation_sql)
+        self.assertNotIn("cluster_id", observation_sql)
+        observation_row = conn.recording_cursor.copy_rows[-1]
+        self.assertEqual(observation_row[-2:], (70, 1))
+
+    def test_unpersisted_injected_crossing_reference_is_rejected(self) -> None:
+        cluster = replace(
+            _cluster(5),
+            crossing_points=(SimpleNamespace(
+                crossing_id=0,
+                vehicle_id="vehicle-1",
+                segment_index=0,
+                is_entry=True,
+                crossing_lon=116.0,
+                crossing_lat=39.0,
+                point_ref=PointRef(
+                    "public.raw_points",
+                    "10->11:orthogonal_heading",
+                    stable=False,
+                    generated_reason="orthogonal_heading",
+                ),
+                end_point_ref=PointRef("public.raw_points", "11", stable=True),
+            ),),
+        )
+        conn = _RecordingConnection()
+
+        with self.assertRaisesRegex(ValueError, "must be reloaded"):
+            insert_candidate_entry_exit_points(
+                conn,
+                [cluster],
+                {5: 55},
+                detect_id="detect-1",
+            )
+
+        self.assertEqual(conn.recording_cursor.executions, [])
+
+    def test_injected_crossing_reference_must_belong_to_detect_clean_vehicle(self) -> None:
+        cluster = replace(
+            _cluster(5),
+            crossing_points=(SimpleNamespace(
+                crossing_id=0,
+                vehicle_id="vehicle-1",
+                segment_index=0,
+                is_entry=True,
+                crossing_lon=116.0,
+                crossing_lat=39.0,
+                point_ref=PointRef(
+                    "public.injected_points",
+                    "282",
+                    stable=False,
+                    generated_reason="orthogonal_heading",
+                ),
+                end_point_ref=PointRef("public.raw_points", "11", stable=True),
+            ),),
+        )
+        conn = _RecordingConnection()
+        conn.recording_cursor.fetchall = lambda: []  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(ValueError, "do not belong to Detect Run"):
+            insert_candidate_entry_exit_points(
+                conn,
+                [cluster],
+                {5: 55},
+                detect_id="detect-1",
+            )
+
+        validation_sql = conn.recording_cursor.executions[-1][0]
+        self.assertIn("injected.clean_id = detect.clean_id", validation_sql)
+        self.assertIn(
+            "injected.vehicle_id = requested.vehicle_id",
+            validation_sql,
+        )
+        self.assertNotIn("generate_series", validation_sql)
 
 
 if __name__ == "__main__":

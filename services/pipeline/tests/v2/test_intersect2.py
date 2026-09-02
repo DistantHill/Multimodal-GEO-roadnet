@@ -629,7 +629,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             conn.cursor_instance.params,
             [
                 "source-A", -1.0, -2.0, 3.0, 4.0,
-                "injected_points", -1.0, -2.0, 3.0, 4.0, "clean-9",
+                "public.injected_points", -1.0, -2.0, 3.0, 4.0, "clean-9",
             ],
         )
         self.assertEqual(len(points), 1)
@@ -662,7 +662,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             conn.cursor_instance.params,
             [
                 "clean-9", -1.0, -2.0, 3.0, 4.0,
-                "injected_points", -1.0, -2.0, 3.0, 4.0, "clean-9",
+                "public.injected_points", -1.0, -2.0, 3.0, 4.0, "clean-9",
             ],
         )
         self.assertEqual(len(points), 1)
@@ -678,10 +678,38 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
                 clean_id=None,
             )
 
+    def test_window_preserves_injected_point_database_identity_and_provenance(self):
+        rows = [(
+            "vehicle-1", 123.5, 116.1, 39.2, 90.0, 0.0,
+            "public.injected_points", "282", {}, "21022680", "21022681",
+            "orthogonal_heading",
+        )]
+        conn = self._Connection(rows)
+
+        points = _query_active_points_in_window(
+            conn,
+            SpatialWindow(-1.0, -2.0, 3.0, 4.0),
+            table="tp",
+            kept_table="ktp",
+            clean_id="clean-9",
+        )
+
+        self.assertEqual(
+            points[0].point_ref,
+            PointRef(
+                "public.injected_points",
+                "282",
+                stable=False,
+                from_ref="21022680",
+                to_ref="21022681",
+                generated_reason="orthogonal_heading",
+            ),
+        )
+
     def test_stream_uses_injected_table_and_id_as_point_identity(self):
         rows = [(
             "vehicle-1", 123.5, 116.1, 39.2, 90.0, 0.0,
-            "injected_points", "282", {}, "21022680", "21022681",
+            "public.injected_points", "282", {}, "21022680", "21022681",
             "heading_orthogonal",
         )]
         conn = self._Connection(rows)
@@ -695,14 +723,14 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
 
         self.assertEqual(
             conn.cursor_instance.params,
-            ["clean-9", "injected_points", "clean-9"],
+            ["clean-9", "public.injected_points", "clean-9"],
         )
         self.assertEqual(len(tracks), 1)
         self.assertEqual(len(tracks[0]), 1)
         self.assertEqual(
             tracks[0][0].point_ref,
             PointRef(
-                "injected_points",
+                "public.injected_points",
                 "282",
                 stable=False,
                 from_ref="21022680",
@@ -1199,7 +1227,7 @@ class DBSCANTest(unittest.TestCase):
     def _historical_scan_oracle(xs, ys, eps_m, min_samples):
         unvisited, noise = -99, -1
         labels = [unvisited] * len(xs)
-        cluster_id = 0
+        cluster_label = 0
         def neighbors(index):
             result = []
             eps_sq = eps_m * eps_m
@@ -1219,21 +1247,21 @@ class DBSCANTest(unittest.TestCase):
             if len(near) < min_samples:
                 labels[index] = noise
                 continue
-            labels[index] = cluster_id
+            labels[index] = cluster_label
             seeds = [candidate for candidate in near if candidate != index]
             while seeds:
                 current = seeds.pop()
                 if labels[current] == noise:
-                    labels[current] = cluster_id
+                    labels[current] = cluster_label
                 if labels[current] != unvisited:
                     continue
-                labels[current] = cluster_id
+                labels[current] = cluster_label
                 current_near = neighbors(current)
                 if len(current_near) >= min_samples:
                     for candidate in current_near:
                         if labels[candidate] in (unvisited, noise) and candidate not in seeds:
                             seeds.append(candidate)
-            cluster_id += 1
+            cluster_label += 1
         return labels
     """I2-13 ~ I2-15: DBSCAN clustering."""
 
@@ -1685,7 +1713,7 @@ class TopologyExtractionTest(unittest.TestCase):
         tracks = {"v1": points}
 
         cluster = HotspotCluster(
-            cluster_id=0,
+            cluster_calculate_index=0,
             centroid_x=0.0, centroid_y=0.0,
             centroid_lon=origin_lon, centroid_lat=origin_lat,
             radius_m=50.0,
@@ -1708,7 +1736,7 @@ class TopologyExtractionTest(unittest.TestCase):
         )
         clusters = [
             HotspotCluster(
-                cluster_id=index,
+                cluster_calculate_index=index,
                 centroid_x=0.0,
                 centroid_y=0.0,
                 centroid_lon=lon,
@@ -1759,7 +1787,7 @@ class TopologyExtractionTest(unittest.TestCase):
             topology_radius_padding_m=0.0,
         )
         cluster = HotspotCluster(
-            cluster_id=0,
+            cluster_calculate_index=0,
             centroid_x=0.0,
             centroid_y=0.0,
             centroid_lon=0.0,
@@ -1802,7 +1830,7 @@ class TopologyExtractionTest(unittest.TestCase):
         """I2-20: Observed transitions populate correct counts."""
         # Create a simple intersection topology manually
         topology = IntersectionTopology(
-            cluster_id=0,
+            cluster_calculate_index=0,
             branch_centers_deg=[0.0, 90.0, 180.0, 270.0],
             transition_counts={(0, 1): 5, (1, 2): 3, (2, 3): 2, (0, 2): 4},
             observation_count=14,
@@ -1826,7 +1854,7 @@ class TopologyExtractionTest(unittest.TestCase):
         point = _make_point("v1", "1", 1.0, 116.0, 39.0, 0.0, 5.0)
         tracks = {"v1": [point]}
         cluster = HotspotCluster(
-            cluster_id=0,
+            cluster_calculate_index=0,
             centroid_x=0.0,
             centroid_y=0.0,
             centroid_lon=116.0,
@@ -1836,7 +1864,7 @@ class TopologyExtractionTest(unittest.TestCase):
             source="turn",
         )
         topology = IntersectionTopology(
-            cluster_id=0,
+            cluster_calculate_index=0,
             branch_centers_deg=[],
             transition_counts={},
             observation_count=0,
@@ -1885,7 +1913,7 @@ class ClusterMergeTest(unittest.TestCase):
         """Overlapping clusters from both methods are merged."""
         origin_lon, origin_lat = 116.0, 39.0
         c1 = HotspotCluster(
-            cluster_id=0, centroid_x=0.0, centroid_y=0.0,
+            cluster_calculate_index=0, centroid_x=0.0, centroid_y=0.0,
             centroid_lon=origin_lon, centroid_lat=origin_lat,
             radius_m=50.0,
             events=(TurnEvent(0, "v1", 1000, origin_lon, origin_lat,
@@ -1894,7 +1922,7 @@ class ClusterMergeTest(unittest.TestCase):
             source_point_refs={"turn": (PointRef("raw", "1", stable=True),)},
         )
         c2 = HotspotCluster(
-            cluster_id=0, centroid_x=20.0, centroid_y=20.0,
+            cluster_calculate_index=0, centroid_x=20.0, centroid_y=20.0,
             centroid_lon=origin_lon, centroid_lat=origin_lat,
             radius_m=30.0,
             events=(TurnEvent(1, "v2", 1001, origin_lon, origin_lat,
@@ -1926,12 +1954,12 @@ class ClusterMergeTest(unittest.TestCase):
         """Distant clusters are not merged."""
         origin_lon, origin_lat = 116.0, 39.0
         c1 = HotspotCluster(
-            cluster_id=0, centroid_x=0.0, centroid_y=0.0,
+            cluster_calculate_index=0, centroid_x=0.0, centroid_y=0.0,
             centroid_lon=116.0, centroid_lat=39.0,
             radius_m=50.0, events=(), source="turn",
         )
         c2 = HotspotCluster(
-            cluster_id=1, centroid_x=5000.0, centroid_y=5000.0,
+            cluster_calculate_index=1, centroid_x=5000.0, centroid_y=5000.0,
             centroid_lon=117.0, centroid_lat=40.0,
             radius_m=50.0, events=(), source="orthogonal",
         )

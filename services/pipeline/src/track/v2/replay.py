@@ -45,8 +45,8 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
     """Rebuild exact ordered Clip membership for one persisted centerline."""
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(
-            "SELECT c.fit_id, c.detect_id, c.variant, c.from_cluster_id, "
-            "c.to_cluster_id, ST_AsText(c.geom), c.forward_clip_count, "
+            "SELECT c.fit_id, c.detect_id, c.variant, c.from_intersection_id, "
+            "c.to_intersection_id, ST_AsText(c.geom), c.forward_clip_count, "
             "c.reverse_clip_count "
             "FROM centerlines AS c JOIN fit_runs AS f ON f.id = c.fit_id "
             "AND f.detect_id = c.detect_id "
@@ -61,8 +61,8 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(
             "SELECT input_ordinal, clip_id, vehicle_id, subtrack_index, "
-            "start_cluster_id, start_segment_index, start_segment_fraction, "
-            "interior_start_index, interior_end_index_exclusive, end_cluster_id, "
+            "start_intersection_id, start_segment_index, start_segment_fraction, "
+            "interior_start_index, interior_end_index_exclusive, end_intersection_id, "
             "end_segment_index, end_segment_fraction, "
             "reverse_to_centerline_direction, input_point_count "
             "FROM centerline_source_clips WHERE centerline_id = %s "
@@ -85,9 +85,9 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
     )
     clips: list[ReplayFitClip] = []
     for row in manifest_rows:
-        (ordinal, clip_id, vehicle_id, subtrack_index, start_cluster_id,
+        (ordinal, clip_id, vehicle_id, subtrack_index, start_intersection_id,
          start_segment, start_fraction, interior_start, interior_end,
-         end_cluster_id, end_segment, end_fraction, reverse_direction,
+         end_intersection_id, end_segment, end_fraction, reverse_direction,
          input_point_count) = row
         track = grouped.get((str(vehicle_id), int(subtrack_index)))
         if track is None:
@@ -103,15 +103,16 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
         )
         clips.append(ReplayFitClip(
             clip_id=str(clip_id), input_ordinal=int(ordinal),
-            original_from_cluster_id=int(start_cluster_id),
-            original_to_cluster_id=int(end_cluster_id),
+            original_from_intersection_id=int(start_intersection_id),
+            original_to_intersection_id=int(end_intersection_id),
             reverse_to_centerline_direction=bool(reverse_direction),
             start=start, interior_points=interior, end=end, points=oriented_points,
         ))
     return CenterlineInputReplay(
         centerline_id=centerline_id, fit_id=str(fit_id), detect_id=str(detect_id),
-        clean_id=detect.clean_id, variant=str(variant), from_cluster_id=int(from_id),
-        to_cluster_id=int(to_id), centerline_wkt=str(centerline_wkt),
+        clean_id=detect.clean_id, variant=str(variant),
+        from_intersection_id=int(from_id), to_intersection_id=int(to_id),
+        centerline_wkt=str(centerline_wkt),
         value_semantics="current_kept_values_and_persisted_injected_values",
         clips=tuple(clips),
     )
@@ -365,7 +366,7 @@ class PostgresReplayStore:
             add("candidate_intersection", row.get("candidate_intersection_id"), "candidate")
             parents.extend(self._children(
                 "SELECT id FROM entry_exit_points WHERE intersection_id = %s "
-                "AND detect_id = %s",
+                "AND detect_id = %s ORDER BY id",
                 target.id,
                 "entry_exit_point",
                 detect_id,
@@ -384,7 +385,7 @@ class PostgresReplayStore:
             ))
             parents.extend(self._children(
                 "SELECT id FROM tracks_cross WHERE candidate_intersection_id = %s "
-                "AND detect_id = %s",
+                "AND detect_id = %s ORDER BY id",
                 target.id,
                 "tracks_cross",
                 detect_id,
@@ -392,7 +393,7 @@ class PostgresReplayStore:
             ))
             parents.extend(self._children(
                 "SELECT id FROM candidate_entry_exit_points "
-                "WHERE candidate_intersection_id = %s AND detect_id = %s",
+                "WHERE candidate_intersection_id = %s AND detect_id = %s ORDER BY id",
                 target.id,
                 "candidate_entry_exit_point",
                 detect_id,
@@ -503,7 +504,7 @@ class PostgresReplayStore:
         if not source_id or not source_row_key:
             return
         clean_id, source_kind, _target_table = self._clean_context(owner)
-        if str(source_id) == "injected_points":
+        if str(source_id) in {"injected_points", "public.injected_points"}:
             parents.append((
                 relation,
                 ReplayTarget(
@@ -737,7 +738,10 @@ def replay_clusters(
     tracks: dict[str, list[TrajectoryPoint]],
 ) -> dict[str, list[TrajectoryPoint]]:
     """{cluster_ref: [TrajectoryPoint, ...]} for every cluster."""
-    return {c.cluster_ref or str(c.cluster_id): replay_cluster(c, tracks) for c in clusters}
+    return {
+        c.cluster_ref or str(c.cluster_calculate_index): replay_cluster(c, tracks)
+        for c in clusters
+    }
 
 
 # ── Crossing-point replay ────────────────────────────────────────────

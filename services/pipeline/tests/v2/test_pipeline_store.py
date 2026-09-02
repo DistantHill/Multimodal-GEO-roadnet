@@ -185,7 +185,7 @@ class PipelineStoreCleanTest(unittest.TestCase):
 
 
 class PipelineStoreDetectTest(unittest.TestCase):
-    def test_persist_detect_uses_fixed_foreign_key_order_and_returns_maps(self) -> None:
+    def test_persist_detect_uses_fixed_foreign_key_order_and_returns_counts(self) -> None:
         conn = object()
         store = PostgresPipelineStore(conn)
         turn_member = SimpleNamespace(source="turn", event_calculate_index=1)
@@ -198,12 +198,12 @@ class PipelineStoreDetectTest(unittest.TestCase):
             to_source_row_key="3,4",
         )
         cluster_a = SimpleNamespace(
-            cluster_id=10,
+            cluster_calculate_index=10,
             events=(turn_member, cross_member),
             crossing_points=(object(),),
         )
         cluster_b = SimpleNamespace(
-            cluster_id=20,
+            cluster_calculate_index=20,
             events=(),
             crossing_points=(),
         )
@@ -213,9 +213,9 @@ class PipelineStoreDetectTest(unittest.TestCase):
             clusters=[cluster_a, cluster_b],
             topologies=[object()],
             observations=[
-                SimpleNamespace(cluster_id=10),
-                SimpleNamespace(cluster_id=20),
-                SimpleNamespace(cluster_id=99),
+                SimpleNamespace(cluster_calculate_index=10),
+                SimpleNamespace(cluster_calculate_index=20),
+                SimpleNamespace(cluster_calculate_index=99),
             ],
         )
         events: list[str] = []
@@ -270,9 +270,6 @@ class PipelineStoreDetectTest(unittest.TestCase):
             persisted,
             DetectPersistenceResult(
                 tracks_cross_count=7,
-                candidate_intersection_ids={10: 110, 20: 120},
-                candidate_entry_exit_ids={(10, 1): 1001},
-                intersection_ids={10: 111},
                 turn_event_count=2,
                 candidate_intersection_count=2,
                 candidate_entry_exit_point_count=1,
@@ -314,7 +311,7 @@ class PipelineStoreDetectTest(unittest.TestCase):
 
     def test_orthogonal_member_without_detect_entity_is_not_assigned(self) -> None:
         cluster = SimpleNamespace(
-            cluster_id=10,
+            cluster_calculate_index=10,
             events=(SimpleNamespace(source="orthogonal"),),
         )
 

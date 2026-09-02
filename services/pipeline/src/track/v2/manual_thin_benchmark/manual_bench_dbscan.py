@@ -156,6 +156,8 @@ elif mode == "phase_diagnostic":
     calculate_index_field=fields(TurnEvent)[0].name
     def cluster_record(cluster):
         record=asdict(cluster)
+        cluster_index_field=fields(type(cluster))[0].name
+        record["cluster_calculate_index"]=record.pop(cluster_index_field)
         for event in record["events"]:
             event["event_calculate_index"]=event.pop(calculate_index_field)
         return record

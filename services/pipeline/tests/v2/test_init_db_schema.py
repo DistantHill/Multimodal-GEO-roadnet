@@ -348,7 +348,10 @@ class CleanDetectSchemaContractTest(unittest.TestCase):
         manifest_sql = " ".join(ddl_by_table["centerline_source_clips"].split())
         self.assertIn("UNIQUE (id, detect_id)", fit_sql)
         self.assertIn("geometry(LineString, 4326)", centerline_sql)
-        self.assertIn("UNIQUE (fit_id, variant, from_cluster_id, to_cluster_id)", centerline_sql)
+        self.assertIn(
+            "UNIQUE (fit_id, variant, from_intersection_id, to_intersection_id)",
+            centerline_sql,
+        )
         self.assertIn("PRIMARY KEY (centerline_id, input_ordinal)", manifest_sql)
         self.assertNotIn("source_clip_ids", centerline_sql)
 
@@ -683,6 +686,159 @@ class TurnEventIdentitySchemaTest(unittest.TestCase):
                 "ALTER TABLE turn_events DROP COLUMN IF EXISTS event_id",
             ],
         )
+
+
+class CandidateIntersectionIdentitySchemaTest(unittest.TestCase):
+    def test_calculation_cluster_indexes_are_not_persisted(self) -> None:
+        ddl_by_table = dict(DDL_STATEMENTS)
+        legacy_columns = {
+            "candidate_intersections": "cluster_id",
+            "candidate_entry_exit_points": "cluster_id",
+            "intersections": "cluster_id",
+            "entry_exit_points": "cluster_id",
+            "centerlines": "from_cluster_id",
+            "centerline_source_clips": "start_cluster_id",
+        }
+        for table, column in legacy_columns.items():
+            with self.subTest(table=table, column=column):
+                self.assertNotIn(column, parse_ddl_columns(ddl_by_table[table]))
+        self.assertNotIn("to_cluster_id", parse_ddl_columns(ddl_by_table["centerlines"]))
+        self.assertNotIn(
+            "end_cluster_id",
+            parse_ddl_columns(ddl_by_table["centerline_source_clips"]),
+        )
+
+        centerline_columns = parse_ddl_columns(ddl_by_table["centerlines"])
+        manifest_columns = parse_ddl_columns(ddl_by_table["centerline_source_clips"])
+        self.assertEqual(centerline_columns["from_intersection_id"], "BIGINT NOT NULL")
+        self.assertEqual(centerline_columns["to_intersection_id"], "BIGINT NOT NULL")
+        self.assertEqual(manifest_columns["start_intersection_id"], "BIGINT NOT NULL")
+        self.assertEqual(manifest_columns["end_intersection_id"], "BIGINT NOT NULL")
+
+        index_names = {name for name, _sql in INDEX_STATEMENTS}
+        self.assertTrue({
+            "idx_ci_cluster_id",
+            "idx_ceep_cluster",
+            "idx_int_cluster_id",
+            "idx_eep_cluster_vehicle",
+        }.isdisjoint(index_names))
+        self.assertTrue({
+            "idx_ci_detect_id",
+            "idx_ceep_candidate",
+            "idx_int_detect_id",
+            "idx_eep_intersection_vehicle",
+        }.issubset(index_names))
+
+    def test_schema_uses_database_identity_constraints(self) -> None:
+        ddl_by_table = {
+            table: " ".join(ddl.split())
+            for table, ddl in DDL_STATEMENTS
+        }
+        self.assertIn(
+            "UNIQUE (detect_id, candidate_intersection_id)",
+            ddl_by_table["intersections"],
+        )
+        self.assertIn(
+            "FOREIGN KEY (from_intersection_id, detect_id) "
+            "REFERENCES intersections(id, detect_id)",
+            ddl_by_table["centerlines"],
+        )
+        self.assertIn(
+            "FOREIGN KEY (to_intersection_id, detect_id) "
+            "REFERENCES intersections(id, detect_id)",
+            ddl_by_table["centerlines"],
+        )
+        self.assertIn(
+            "FOREIGN KEY (start_intersection_id) REFERENCES intersections(id)",
+            ddl_by_table["centerline_source_clips"],
+        )
+        self.assertIn(
+            "FOREIGN KEY (end_intersection_id) REFERENCES intersections(id)",
+            ddl_by_table["centerline_source_clips"],
+        )
+
+    def test_structural_migration_backfills_before_dropping_legacy_columns(self) -> None:
+        cur = _MigrationRecordingCursor()
+
+        _run_migrations(cur)
+
+        sql = cur.executed
+        backfill_index = next(
+            index for index, statement in enumerate(sql)
+            if "UPDATE centerlines AS centerline" in statement
+        )
+        constraint_index = next(
+            index for index, statement in enumerate(sql)
+            if "centerlines_from_intersection_detect_fkey" in statement
+            and "ADD CONSTRAINT" in statement
+        )
+        first_drop_index = next(
+            index for index, statement in enumerate(sql)
+            if "DROP COLUMN IF EXISTS start_cluster_id" in statement
+        )
+        self.assertLess(backfill_index, constraint_index)
+        self.assertLess(constraint_index, first_drop_index)
+        self.assertIn(
+            "combined centerline database ID order requires manual migration",
+            sql[backfill_index],
+        )
+
+        expected_drops = [
+            "DROP INDEX IF EXISTS idx_ci_cluster_id",
+            "DROP INDEX IF EXISTS idx_ceep_cluster",
+            "DROP INDEX IF EXISTS idx_int_cluster_id",
+            "DROP INDEX IF EXISTS idx_eep_cluster_vehicle",
+            "ALTER TABLE centerline_source_clips DROP COLUMN IF EXISTS start_cluster_id",
+            "ALTER TABLE centerline_source_clips DROP COLUMN IF EXISTS end_cluster_id",
+            "ALTER TABLE centerlines DROP COLUMN IF EXISTS from_cluster_id",
+            "ALTER TABLE centerlines DROP COLUMN IF EXISTS to_cluster_id",
+            "ALTER TABLE entry_exit_points DROP COLUMN IF EXISTS cluster_id",
+            "ALTER TABLE intersections DROP COLUMN IF EXISTS cluster_id",
+            "ALTER TABLE candidate_entry_exit_points DROP COLUMN IF EXISTS cluster_id",
+            "ALTER TABLE candidate_intersections DROP COLUMN IF EXISTS cluster_id",
+        ]
+        removals = [
+            statement for statement in sql
+            if statement in expected_drops
+        ]
+        self.assertEqual(removals, expected_drops)
+        self.assertNotIn("CASCADE", "\n".join(removals).upper())
+
+    def test_migration_canonicalizes_injected_crossing_table_references(self) -> None:
+        cur = _MigrationRecordingCursor()
+
+        _run_migrations(cur)
+
+        statement = next(
+            sql for sql in cur.executed
+            if "candidate crossing injected-point reference is invalid" in sql
+        )
+        self.assertIn("injected.clean_id = detect.clean_id", statement)
+        self.assertIn("injected.vehicle_id = crossing.vehicle_id", statement)
+        self.assertIn("injected.id::text = endpoint.source_row_key", statement)
+        self.assertIn("THEN 'public.injected_points'", statement)
+
+    def test_auto_migration_adds_bigint_endpoints_as_nullable_before_backfill(self) -> None:
+        ddl_by_table = dict(DDL_STATEMENTS)
+        cases = {
+            "centerlines": {"from_intersection_id", "to_intersection_id"},
+            "centerline_source_clips": {
+                "start_intersection_id",
+                "end_intersection_id",
+            },
+        }
+        for table, new_columns in cases.items():
+            columns = parse_ddl_columns(ddl_by_table[table])
+            migrations = build_auto_migrations(
+                table,
+                ddl_by_table[table],
+                set(columns) - new_columns,
+            )
+            with self.subTest(table=table):
+                self.assertEqual(
+                    {column: fragment for column, fragment, _sql in migrations},
+                    {column: "BIGINT" for column in new_columns},
+                )
 
 
 class TurnEventProvenanceSchemaTest(unittest.TestCase):
