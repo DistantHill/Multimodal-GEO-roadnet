@@ -47,7 +47,7 @@ _IP_UNIFIED_COLS = (
     "from_source_row_key, to_source_row_key, generated_reason"
 )
 
-_INJECTED_SOURCE_ID = "injected_points"
+_INJECTED_SOURCE_ID = "public.injected_points"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -722,10 +722,11 @@ def _group_points(
                     f"Clean Run {clean_id} references a missing source row"
                 )
             generated_reason = str(row[13])
+            is_injected = int(row[14]) == 1
             point = TrajectoryPoint(
                 point_ref=PointRef(
-                    str(row[3]),
-                    str(row[4]),
+                    "public.injected_points" if is_injected else str(row[3]),
+                    str(row[15]) if is_injected else str(row[4]),
                     stable=not generated_reason,
                     from_ref=str(row[11]) if row[11] is not None else None,
                     to_ref=str(row[12]) if row[12] is not None else None,

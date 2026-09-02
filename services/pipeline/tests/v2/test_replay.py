@@ -225,7 +225,7 @@ class ReplayServiceTest(unittest.TestCase):
         target = ReplayTarget("turn_event", 10, detect_id="detect-1")
 
         parents = store.parent_refs(target, {
-            "from_source_id": "injected_points",
+            "from_source_id": "public.injected_points",
             "from_source_row_key": "282",
             "to_source_id": None,
             "to_source_row_key": None,

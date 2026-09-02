@@ -186,9 +186,9 @@ def plot_multi_traj(
 # ═══════════════════════════════════════════════════════════════════════
 
 _SOURCE_COLORS: dict[str, str] = {
-    "turn":        "steelblue",
-    "orthogonal":  "darkorange",
-    "merged":      "mediumpurple",
+    "turn":                    "steelblue",
+    "orthogonal_cross_track":  "darkorange",
+    "merged":                  "mediumpurple",
 }
 
 
@@ -399,7 +399,7 @@ def plot_intersections(
         Line2D([0], [0], marker="o", color="w", markerfacecolor="steelblue",
                markersize=8, label="turn events"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor="darkorange",
-               markersize=8, label="orthogonal"),
+               markersize=8, label="orthogonal cross-track"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor="mediumpurple",
                markersize=8, label="merged"),
     ]

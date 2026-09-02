@@ -432,7 +432,7 @@ def _build_cross_csv(tmpdir: Path) -> Path:
 def _e2e_run(csv_path: Path, source_label: str) -> dict:
     cfg = IntersectConfig(
         use_turn_events=True,
-        use_orthogonal_candidates=False,  # 只用 Method 1 (与 test_intersect2 I2-23 一致)
+        use_cross_track_candidates=False,  # 只用 Method 1 (与 test_intersect2 I2-23 一致)
         turn_window=2,
         min_turn_deg=45.0,
         max_turn_deg=170.0,

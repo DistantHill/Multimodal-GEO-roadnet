@@ -410,12 +410,49 @@ class InsertTurnEventsTest(unittest.TestCase):
         )
         self.assertEqual(conn.recording_cursor.executions, [])
 
+    def test_injected_turn_event_persists_injected_table_identity(self) -> None:
+        point_ref = PointRef(
+            "public.injected_points",
+            "282",
+            stable=False,
+            from_ref="21022680",
+            to_ref="21022681",
+            generated_reason="orthogonal_heading",
+        )
+        event = TurnEvent(
+            event_calculate_index=0,
+            vehicle_id="vehicle-1",
+            timestamp=1.0,
+            lon=116.0,
+            lat=39.0,
+            x=0.0,
+            y=0.0,
+            in_bearing=0.0,
+            out_bearing=90.0,
+            turn_deg=90.0,
+            score=90.0,
+            source="turn",
+            point_ref=point_ref,
+            source_ids=(point_ref.source_id,),
+            from_source_id=point_ref.source_id,
+            from_source_row_key=point_ref.source_row_key,
+        )
+        conn = _RecordingConnection()
+
+        insert_turn_events(conn, [event], detect_id="detect-1")
+
+        row = conn.recording_cursor.copy_rows[0]
+        self.assertEqual(row[11], "turn")
+        self.assertEqual((row[12], row[13]), ("public.injected_points", "282"))
+        self.assertEqual((row[14], row[15]), ("public.injected_points", "282"))
+        self.assertEqual((row[16], row[17]), (None, None))
+
 
 class CandidateIntersectionSourcesTest(unittest.TestCase):
     def test_sources_column_contains_data_source_ids_and_detect_id(self) -> None:
         cluster = replace(
             _cluster(5),
-            algorithm_sources=("turn", "orthogonal"),
+            algorithm_sources=("turn", "orthogonal_cross_track"),
             source_ids=("C:/input-a.csv", "project_raw_points"),
         )
         conn = _RecordingConnection()

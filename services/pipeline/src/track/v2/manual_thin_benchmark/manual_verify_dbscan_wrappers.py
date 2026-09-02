@@ -16,9 +16,10 @@ _CHILD = r'''
 import hashlib, json, sys
 from dataclasses import asdict, fields
 from pathlib import Path
-from track.v2.intersect2 import (_cluster_dbscan, _cluster_orthogonal_candidates,
-    _cluster_orthogonal_cross_track_candidates)
-from track.v2.models import CrossTrackCandidate, OrthogonalCandidate, PointRef, TurnEvent
+from track.v2.intersect2 import (
+    _cluster_dbscan, _cluster_orthogonal_cross_track_candidates,
+)
+from track.v2.models import CrossTrackCandidate, PointRef, TurnEvent
 
 origin_lon, origin_lat = 116.0, 39.0
 turns = [TurnEvent(i, f"turn-{i}", 1000.0+i, origin_lon, origin_lat,
@@ -27,10 +28,6 @@ turns = [TurnEvent(i, f"turn-{i}", 1000.0+i, origin_lon, origin_lat,
                    source_ids=("turn_source",), from_source_id="turn_source",
                    from_source_row_key=str(i), to_source_id="turn_source",
                    to_source_row_key=str(i)) for i in range(4)]
-orthogonal = [OrthogonalCandidate(PointRef("ortho_source", str(i), stable=False,
-                   generated_reason="orthogonal_heading", from_ref=f"{i}a", to_ref=f"{i}b"),
-                   f"ortho-{i}", 2000.0+i, origin_lon, origin_lat, float(i), float(i))
-                   for i in range(4)]
 cross = [CrossTrackCandidate(PointRef("a_source", str(i), stable=True), f"a|b-{i}",
                    3000.0+i, origin_lon, origin_lat, float(i), float(i), 0.0, 10.0,
                    "a_source", f"{i}a,{i}b", "b_source", f"{i}c,{i}d", origin_lon, origin_lat)
@@ -46,7 +43,6 @@ def cluster_record(cluster):
 
 value = {
  "turn": [cluster_record(cluster) for cluster in _cluster_dbscan(turns, origin_lon, origin_lat, eps_m=100.0, min_samples=3)],
- "orthogonal": [cluster_record(cluster) for cluster in _cluster_orthogonal_candidates(orthogonal, origin_lon, origin_lat, eps_m=100.0, min_samples=3)],
  "cross_track": [cluster_record(cluster) for cluster in _cluster_orthogonal_cross_track_candidates(cross, origin_lon, origin_lat, eps_m=100.0, min_samples=3)],
 }
 tree=Path.cwd()

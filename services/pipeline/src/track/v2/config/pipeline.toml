@@ -15,7 +15,7 @@ excluded_sample_max = 50
 
 [detect]
 use_turn_events = true
-use_orthogonal_candidates = true
+use_cross_track_candidates = true
 turn_window = 2
 min_turn_deg = 45.0
 max_turn_deg = 170.0
@@ -25,8 +25,6 @@ g_star_radius_m = 180.0
 g_star_min_z = 0.5
 dbscan_eps_m_turn = 140.0
 dbscan_min_samples_turn = 4
-dbscan_eps_m_ortho = 100.0
-dbscan_min_samples_ortho = 3
 cross_track_straightness_deg = 15.0
 cross_track_min_angle_deg = 80.0
 cross_track_max_angle_deg = 100.0

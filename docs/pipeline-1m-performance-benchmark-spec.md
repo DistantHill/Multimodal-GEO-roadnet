@@ -207,7 +207,7 @@ Pipeline cgroup 精确峰值为 1,232.7 MiB。Pipeline 抽样峰值时 PostgreSQ
 
 - 原因：旧 DB 路径在 Method 1/2、跨车候选和拓扑验证之间重复读取轨迹，且后续
   逻辑依赖大量按窗口数据库查询；数据库往返和重复对象构建成为主耗时。
-- 改动：`_stream_extract_methods_1_2` 在流式检测时构建一次
+- 改动：`_stream_extract_method_1` 在流式检测时构建一次
   `dict[vehicle_id, list[TrajectoryPoint]]`，由转向/正交检测、全局跨车计算和拓扑
   验证共享。实现见
   [`intersect2.py`](../services/pipeline/src/track/v2/intersect2.py)。

@@ -247,7 +247,6 @@ class NetworkStageTest(unittest.TestCase):
         intersect_result = IntersectResult(
             turn_events=[],
             hotspot_events=[],
-            orthogonal_candidates=[],
             clusters=[
                 HotspotCluster(10, 0.0, 0.0, _lon(-20), 0.0, 10.0),
                 HotspotCluster(20, 0.0, 0.0, _lon(220), 0.0, 10.0),
@@ -262,11 +261,9 @@ class NetworkStageTest(unittest.TestCase):
                 track_count=0,
                 turn_event_count=0,
                 hotspot_event_count=0,
-                orthogonal_candidate_count=0,
                 cross_track_candidate_count=0,
                 cluster_count=3,
                 cluster_count_turn=0,
-                cluster_count_ortho=0,
                 cluster_count_cross_track=0,
                 complete_intersection_count=2,
             ),

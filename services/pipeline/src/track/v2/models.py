@@ -434,24 +434,6 @@ class TurnEvent(TrackModel):
 
 
 @dataclass(frozen=True)
-class OrthogonalCandidate(TrackModel):
-    """Intersection candidate from orthogonal heading injection.
-
-    Cleaner 1 injects synthetic points where two consecutive headings are
-    ~90° apart (``generated_reason="orthogonal_heading"``). Intersect2
-    extracts these as high-confidence intersection candidates.
-    """
-
-    point_ref: PointRef  # derived PointRef with from_ref / to_ref
-    vehicle_id: str
-    timestamp: float
-    lon: float
-    lat: float
-    x: float
-    y: float
-
-
-@dataclass(frozen=True)
 class CrossTrackCandidate(TrackModel):
     """One orthogonal intersection between segments from two vehicles.
 
@@ -478,7 +460,7 @@ class CrossTrackCandidate(TrackModel):
 
 @dataclass(frozen=True)
 class HotspotCluster(TrackModel):
-    """A DBSCAN cluster of candidate points (turn events or orthogonal candidates).
+    """A DBSCAN cluster of turn or cross-track candidate events.
 
     Uses ``tuple`` for events to preserve frozen-dataclass immutability.
     """
@@ -590,11 +572,9 @@ class IntersectReport(TrackModel):
     track_count: int
     turn_event_count: int
     hotspot_event_count: int
-    orthogonal_candidate_count: int
     cross_track_candidate_count: int
     cluster_count: int
     cluster_count_turn: int
-    cluster_count_ortho: int
     cluster_count_cross_track: int
     complete_intersection_count: int
     complete_intersection_source_counts: dict[str, int] = field(default_factory=dict)

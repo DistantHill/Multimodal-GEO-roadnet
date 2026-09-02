@@ -110,9 +110,7 @@ def _candidate_memberships(
                     str(event.to_source_row_key or ""),
                 )
                 assign(cross_membership, key, candidate_id)
-            # ``orthogonal`` is an in-memory Method 2 observation. It has no
-            # Detect-level A/C row on which to store reverse membership.
-            elif event.source != "orthogonal":
+            else:
                 raise ValueError(f"unsupported candidate event source: {event.source}")
     return turn_membership_by_calculate_index, cross_membership
 

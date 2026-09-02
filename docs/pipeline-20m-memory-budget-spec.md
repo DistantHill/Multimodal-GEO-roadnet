@@ -231,7 +231,7 @@ M_cleaner ≈ base
 
 [`_stream_vehicle_tracks_from_db`](../services/pipeline/src/track/v2/db/queries.py) 本身
 是 named cursor，但
-[`_stream_extract_methods_1_2`](../services/pipeline/src/track/v2/intersect2.py)
+[`_stream_extract_method_1`](../services/pipeline/src/track/v2/intersect2.py)
 把每个 track 存入全局 `tracks` dict，直到 cross-track 和 topology 都结束才释放。
 
 Pipeline Python 3.12 容器内，`PointRef + TrajectoryPoint + empty extra + 一个 list

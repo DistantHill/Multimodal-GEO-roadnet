@@ -503,7 +503,7 @@ class PostgresReplayStore:
         if not source_id or not source_row_key:
             return
         clean_id, source_kind, _target_table = self._clean_context(owner)
-        if str(source_id) == "injected_points":
+        if str(source_id) in {"injected_points", "public.injected_points"}:
             parents.append((
                 relation,
                 ReplayTarget(
@@ -714,7 +714,7 @@ def replay_cluster(
             seen.add(key)
             result.append(pt)
 
-    # From source_point_refs (turn events + orthogonal candidates)
+    # From source_point_refs (turn events + cross-track candidates)
     for _source, refs in cluster.source_point_refs.items():
         for ref in refs:
             pt = _resolve_point("", ref, index, tracks)  # vehicle_id unknown from ref alone

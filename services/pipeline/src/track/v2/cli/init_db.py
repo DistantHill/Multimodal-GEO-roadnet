@@ -205,7 +205,6 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             source_ratios       JSONB NOT NULL DEFAULT '{}',
             critical_sources    JSONB NOT NULL DEFAULT '[]',
             turn_event_count    INTEGER NOT NULL DEFAULT 0,
-            orthogonal_count    INTEGER NOT NULL DEFAULT 0,
             cross_track_count   INTEGER NOT NULL DEFAULT 0,
             total_event_count   INTEGER NOT NULL DEFAULT 0,
             origin_lon          DOUBLE PRECISION NOT NULL,

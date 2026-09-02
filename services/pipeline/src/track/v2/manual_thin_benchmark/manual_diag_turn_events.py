@@ -51,7 +51,7 @@ def diagnose_turn_events(
     verbose: bool = False,
 ) -> dict:
     """ZH: 逐车统计转向事件过滤条件，返回汇总 dict。"""
-    cfg = IntersectConfig(use_orthogonal_candidates=False, use_turn_events=True)
+    cfg = IntersectConfig(use_cross_track_candidates=False, use_turn_events=True)
 
     conn = connect_test_db()
     print(f"Connected: {conn.info.host}:{conn.info.port}/{conn.info.dbname}")

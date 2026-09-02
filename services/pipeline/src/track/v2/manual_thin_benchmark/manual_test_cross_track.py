@@ -38,7 +38,7 @@ MANUAL_EXTENT: tuple[float, float, float, float] | None = None
 
 # IntersectConfig 参数（需要改什么就覆盖什么）
 CONFIG_OVERRIDES: dict = {
-    "use_orthogonal_candidates": True,
+    "use_cross_track_candidates": True,
     "db_table": "trajectory_points",
     "spatial_window_size": (2000.0, 2000.0),   # 滑窗大小（米）
     "spatial_window_overlap": 0.15,             # 每侧重叠比例
@@ -78,7 +78,7 @@ def main() -> None:
     # 用数据第一个点的 lon/lat 作为坐标原点
     origin_lon, origin_lat = extent[0], extent[1]
 
-    print(f"\n  Config: use_orthogonal={cfg.use_orthogonal_candidates}")
+    print(f"\n  Config: use_cross_track={cfg.use_cross_track_candidates}")
     print(f"          db_table={cfg.db_table}")
     print(f"          window_size={cfg.spatial_window_size}")
     print(f"          window_overlap={cfg.spatial_window_overlap}")
