@@ -11,6 +11,7 @@ from fastapi import FastAPI
 
 from .database import postgres_connection_settings, verify_runtime_schema
 from .map_api import router as map_router
+from .database_catalog import router as database_catalog_router
 
 
 @asynccontextmanager
@@ -22,6 +23,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Roadnet Backend", version="0.3.0", lifespan=lifespan)
 app.include_router(map_router)
+app.include_router(database_catalog_router)
 
 
 def _postgres_status() -> str:

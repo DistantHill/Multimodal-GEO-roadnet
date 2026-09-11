@@ -24,6 +24,12 @@ class BackendClient(QObject):
 
     def post_json(self, operation: str, url: str, payload: dict[str, Any]) -> None:
         """Start a non-blocking POST; only the latest result per operation is emitted."""
+        self._request(operation, url, payload)
+
+    def get_json(self, operation: str, url: str) -> None:
+        self._request(operation, url, None)
+
+    def _request(self, operation: str, url: str, payload: dict[str, Any] | None) -> None:
 
         request_id = uuid.uuid4().hex
         self._latest_request[operation] = request_id
@@ -37,7 +43,7 @@ class BackendClient(QObject):
         body = QByteArray(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         )
-        reply = self._manager.post(request, body)
+        reply = self._manager.get(request) if payload is None else self._manager.post(request, body)
         self._replies.add(reply)
         reply.finished.connect(
             lambda current=reply: self._finish(operation, request_id, current)
@@ -45,6 +51,7 @@ class BackendClient(QObject):
         self.request_started.emit(operation)
 
     def cancel_all(self) -> None:
+        self._latest_request.clear()
         for reply in tuple(self._replies):
             reply.abort()
 

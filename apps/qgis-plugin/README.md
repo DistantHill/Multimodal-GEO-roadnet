@@ -34,6 +34,24 @@ configured in QGIS continue to apply.
 
 ## Use
 
+Choose **Browse databases** in the Roadnet Tools toolbar/menu to open a two-pane
+catalog browser. Select a database on the left to list its user tables, schema
+names and **Rows** on the right. Plain numbers are estimates; a trailing `*`
+marks an exact COUNT result, as explained below the table. Unknown or estimated counts
+below 50,000 trigger `COUNT(*)` and are labeled exact (for that query snapshot).
+Counts at or above 50,000 retain PostgreSQL `reltuples` estimates. If COUNT fails
+or times out, the estimate or “未知” is retained with an explanatory tooltip.
+Exact partition-parent counts include children; parent estimates may not.
+Click the Table name or Rows header to toggle ascending/descending sorting.
+Rows sorts numerically, with unknown values first ascending and last descending.
+System schemas and template
+databases are excluded. Browsing does not require Roadnet schema v3, change
+the active map layer, or modify data. Connection errors appear in QGIS' message
+bar. Use **刷新数据库** to reload; requests are asynchronous.
+
+Catalog endpoints: `GET /api/v1/map/databases` and
+`GET /api/v1/map/databases/tables?database_name=...`.
+
 Replay/Clip requests now include `database_name`, read from the active PostgreSQL
 layer's connection URI. Select a PostgreSQL layer with an explicit database name;
 memory, file, and HTTP layers cannot establish this database identity and are

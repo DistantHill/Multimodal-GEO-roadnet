@@ -10,6 +10,7 @@ from qgis.PyQt.QtWidgets import QAction
 from qgis.core import NULL, Qgis, QgsDataSourceUri, QgsVectorLayer, QgsWkbTypes
 
 from .client import BackendClient
+from .database_browser import DatabaseBrowserDialog
 from .core import (
     ContractError,
     SelectionRecord,
@@ -30,6 +31,7 @@ class RoadnetToolsPlugin:
         self.iface = iface
         self._actions: list[QAction] = []
         self._toolbar = None
+        self._database_browser = None
         self._client = BackendClient()
         self._client.request_started.connect(self._on_request_started)
         self._client.request_succeeded.connect(self._on_request_succeeded)
@@ -55,12 +57,21 @@ class RoadnetToolsPlugin:
         )
         self._add_action(
             icon,
+            "Browse databases",
+            "浏览数据库、表名和估算行数",
+            self.show_database_browser,
+        )
+        self._add_action(
+            icon,
             "Roadnet Tools settings",
             "Configure the Roadnet backend and endpoint paths",
             self.show_settings,
         )
 
     def unload(self) -> None:
+        if self._database_browser is not None:
+            self._database_browser.close()
+            self._database_browser.deleteLater()
         for action in self._actions:
             self.iface.removePluginVectorMenu(MENU_NAME, action)
             self.iface.removeToolBarIcon(action)
@@ -118,6 +129,17 @@ class RoadnetToolsPlugin:
             )
             return
         dialog.exec_()
+
+    def show_database_browser(self) -> None:
+        if self._database_browser is not None:
+            self._database_browser.close()
+            self._database_browser.deleteLater()
+        try:
+            self._database_browser = DatabaseBrowserDialog(self.iface.mainWindow(), self._critical)
+        except ContractError as exc:
+            self._critical(str(exc))
+            return
+        self._database_browser.show()
 
     def _add_action(
         self,
