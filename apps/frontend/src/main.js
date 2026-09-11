@@ -3,6 +3,8 @@ import { selectFeaturesInExtent, replayFocusFeatures } from './selection.js';
 import View from 'ol/View.js';
 import GeoJSON from 'ol/format/GeoJSON.js';
 import DragBox from 'ol/interaction/DragBox.js';
+import DragPan from 'ol/interaction/DragPan.js';
+import { isMiddleButton, isPrimaryButton, installToolbarTooltips } from './pointer-tools.js';
 import Select from 'ol/interaction/Select.js';
 import { defaults as defaultInteractions } from 'ol/interaction/defaults.js';
 import TileLayer from 'ol/layer/Tile.js';
@@ -330,6 +332,7 @@ state.layerRecords.set('tmp', {
 });
 
 const selectedFeatures = new Select({
+  condition: (event) => event.type === 'singleclick' && isPrimaryButton(event),
   hitTolerance: 8,
   layers: (layer) =>
     layer.get('id') === state.activeLayerId &&
@@ -343,10 +346,19 @@ map.addInteraction(selectedFeatures);
 
 const dragBox = new DragBox({
   className: 'roadnet-drag-box',
-  condition: () => true,
+  condition: isPrimaryButton,
 });
 dragBox.setActive(false);
 map.addInteraction(dragBox);
+// Last-added interactions run first. Middle-button pan stays active in all modes.
+map.addInteraction(new DragPan({ condition: isMiddleButton }));
+map.getViewport().addEventListener('mousedown', (event) => {
+  if (event.button === 1) event.preventDefault(); // Suppress browser autoscroll.
+});
+map.getViewport().addEventListener('auxclick', (event) => {
+  if (event.button === 1) event.preventDefault();
+});
+installToolbarTooltips(document.querySelector('.tool-bar'));
 
 selectedFeatures.on('select', () => {
   state.selectionOrigin = 'point';
