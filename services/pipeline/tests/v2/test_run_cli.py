@@ -7,13 +7,13 @@ from track.v2.cli.run import main
 from track.v2.config import PostgresConfig
 
 
-class RunCliCompatibilityTest(unittest.TestCase):
+class RunCliV3Test(unittest.TestCase):
     def setUp(self) -> None:
         self.config = PostgresConfig(
             host="localhost", port=5432, database="track", user="track", password="",
         )
 
-    def test_main_preserves_historical_wrapper_call_shape(self) -> None:
+    def test_main_forwards_reused_clean_run(self) -> None:
         with (
             patch("sys.argv", ["track.v2.cli.run", "--clean-id", "11111111-1111-1111-1111-111111111111"]),
             patch("track.v2.cli.run.default_postgres_config", return_value=self.config),
@@ -26,10 +26,8 @@ class RunCliCompatibilityTest(unittest.TestCase):
 
         run_pipeline.assert_called_once_with(
             self.config,
-            csv_path=None,
-            pg_source_table=None,
+            source_table=None,
             clean_id="11111111-1111-1111-1111-111111111111",
-            table="trajectory_points",
             config_path=None,
             processing_srid=None,
         )
@@ -39,7 +37,7 @@ class RunCliCompatibilityTest(unittest.TestCase):
         with (
             patch(
                 "sys.argv",
-                ["track.v2.cli.run", "--pg-table", "raw_points", "--processing-srid", "32650"],
+                ["track.v2.cli.run", "--source-table", "raw_points", "--processing-srid", "32650"],
             ),
             patch("track.v2.cli.run.default_postgres_config", return_value=self.config),
             patch("track.v2.cli.run.init_logger"),

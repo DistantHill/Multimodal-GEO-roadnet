@@ -16,30 +16,32 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from ..models import (
+    CleanedPointRef,
     ClipIntersection,
+    ClipTrack,
     HotspotCluster,
     PointRef,
+    ResolvedTrackPoint,
     SpatialContext,
     TrajectoryPoint,
 )
 from ..projection import CoordinateTransformer, spatial_context_from_values
+from .source_table import quote_table_name, validate_source_table
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # Column select fragments
 # ═══════════════════════════════════════════════════════════════════════
-# trajectory_points and injected_points have different column names;
-# these fragments alias them into a shared 14-column result:
-#   (vehicle_id, timestamp, lon, lat, heading, speed,
-#    source_id, source_row_key, extra, from_source_row_key,
-#    to_source_row_key, generated_reason, x, y)
+# Source rows and injected points are mapped into one p/i row shape.  Parent
+# source pairs were removed in v3: order is the stable Clean sequence contract.
 
 _IP_UNIFIED_COLS = (
     "vehicle_id, timestamp, lon, lat, heading, speed, "
     "%s::text AS source_id, "
     "id::text AS source_row_key, "
     "'{}'::jsonb AS extra, "
-    "from_source_row_key, to_source_row_key, generated_reason, x, y"
+    "generated_reason, x, y, 1 AS point_kind, id AS row_id, "
+    "subtrack_index, after_sequence_in_subtrack AS anchor_sequence"
 )
 
 _INJECTED_SOURCE_ID = "public.injected_points"
@@ -53,9 +55,9 @@ def _tp_unified_cols(processing_srid: int, *, alias: str = "") -> str:
         f"{prefix}vehicle_id, {prefix}timestamp, {prefix}lon, {prefix}lat, "
         f"{prefix}heading, {prefix}speed, %s::text AS source_id, "
         f"{prefix}id::text AS source_row_key, {prefix}extra, "
-        "NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
         f"''::text AS generated_reason, ST_X({projected}) AS x, "
-        f"ST_Y({projected}) AS y"
+        f"ST_Y({projected}) AS y, 0 AS point_kind, {prefix}id AS row_id, "
+        "1 AS subtrack_index, 0 AS anchor_sequence"
     )
 
 
@@ -63,7 +65,7 @@ def _tp_unified_cols(processing_srid: int, *, alias: str = "") -> str:
 # Row mapping helper
 # ═══════════════════════════════════════════════════════════════════════
 def row_to_dict(row: Any) -> dict[str, Any]:
-    """Convert a DB cursor row (unified 14-column format) to a dict.
+    """Convert a DB cursor row (unified schema-v3 p/i format) to a dict.
 
     ZH: 将统一 14 列格式的 DB 游标行转为 dict。
         替代 intersect2.py 中重复的 ``rows.append({...})``。
@@ -78,11 +80,13 @@ def row_to_dict(row: Any) -> dict[str, Any]:
         "source_id": row[6],
         "source_row_key": row[7],
         "extra": row[8] if isinstance(row[8], dict) else {},
-        "from_source_row_key": row[9],
-        "to_source_row_key": row[10],
-        "generated_reason": row[11],
-        "x": float(row[12]),
-        "y": float(row[13]),
+        "generated_reason": row[9],
+        "x": float(row[10]),
+        "y": float(row[11]),
+        "point_kind": int(row[12]),
+        "row_id": int(row[13]),
+        "subtrack_index": int(row[14]),
+        "anchor_sequence": int(row[15]),
     }
 
 
@@ -95,6 +99,7 @@ def build_spatial_extent_sql(
     has_clean_id: bool = False,
     kept_table: str | None = None,
     spatial_context: SpatialContext,
+    source_key_sql_type: str = "bigint",
 ) -> str:
     """MIN/MAX processing-CRS x/y of active points.
 
@@ -118,7 +123,8 @@ def build_spatial_extent_sql(
             f"  SELECT ST_X(ST_Transform(tp.geom, {processing_srid})) AS x, "
             f"         ST_Y(ST_Transform(tp.geom, {processing_srid})) AS y "
             f"  FROM {kept_table} AS ktp "
-            f"  JOIN {table} AS tp ON tp.id = ktp.trajectory_point_id "
+            f"  JOIN {table} AS tp "
+            f"    ON tp.id = ktp.source_row_key::{source_key_sql_type} "
             f"  WHERE ktp.clean_id = %s "
             "  UNION ALL "
             "  SELECT ip.x, ip.y FROM injected_points AS ip "
@@ -130,7 +136,7 @@ def build_spatial_extent_sql(
         f"MAX(ST_X(ST_Transform(geom, {processing_srid}))), "
         f"MIN(ST_Y(ST_Transform(geom, {processing_srid}))), "
         f"MAX(ST_Y(ST_Transform(geom, {processing_srid}))) "
-        f"FROM {table} WHERE is_active = TRUE"
+        f"FROM {table}"
     )
     return raw_extent
 
@@ -141,6 +147,8 @@ def build_active_in_window_sql(
     has_clean_id: bool = False,
     kept_table: str | None = None,
     spatial_context: SpatialContext,
+    source_key_sql_type: str = "bigint",
+    source_has_extra: bool = True,
 ) -> str:
     """UNION ALL query for active + injected points inside a spatial bbox.
 
@@ -182,19 +190,21 @@ def build_active_in_window_sql(
     projected_tp = f"ST_Transform(tp.geom, {processing_srid})"
     injected_window = "x >= %s AND y >= %s AND x <= %s AND y <= %s"
     if kept_table is not None:
+        extra = "tp.extra" if source_has_extra else "'{}'::jsonb"
         return (
             f"SELECT vehicle_id, timestamp, lon, lat, heading, speed, "
-            f"       source_id, source_row_key, extra, "
-            f"       from_source_row_key, to_source_row_key, "
-            f"       generated_reason, x, y "
+            f"       source_id, source_row_key, extra, generated_reason, "
+            f"       x, y, point_kind, row_id, subtrack_index, anchor_sequence "
             f"FROM ("
             f"  SELECT ktp.vehicle_id, tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, "
-            f"         ktp.source_id, ktp.source_row_key, tp.extra, "
-            f"         NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
+            f"         %s::text AS source_id, ktp.source_row_key, {extra} AS extra, "
             f"         ''::text AS generated_reason, "
-            f"         ST_X({projected_tp}) AS x, ST_Y({projected_tp}) AS y "
+            f"         ST_X({projected_tp}) AS x, ST_Y({projected_tp}) AS y, "
+            f"         0 AS point_kind, ktp.id AS row_id, ktp.subtrack_index, "
+            f"         ktp.sequence_in_subtrack AS anchor_sequence "
             f"  FROM {kept_table} AS ktp "
-            f"  JOIN {table} AS tp ON tp.id = ktp.trajectory_point_id "
+            f"  JOIN {table} AS tp "
+            f"    ON tp.id = ktp.source_row_key::{source_key_sql_type} "
             f"  WHERE ktp.clean_id = %s "
             f"    AND tp.geom && {source_envelope} "
             f"    AND {projected_tp} && {projected_envelope} "
@@ -204,15 +214,14 @@ def build_active_in_window_sql(
             f"  WHERE geom && {source_envelope} "
             f"    AND {injected_window} AND clean_id = %s "
             f") AS combined "
-            f"ORDER BY vehicle_id, timestamp"
+            f"ORDER BY subtrack_index, anchor_sequence, point_kind, row_id"
         )
     return (
         f"SELECT {_tp_unified_cols(processing_srid)} "
         f"FROM {table} "
-        f"WHERE is_active = TRUE "
-        f"  AND geom && {source_envelope} "
+        f"WHERE geom && {source_envelope} "
         f"  AND ST_Transform(geom, {processing_srid}) && {projected_envelope} "
-        f"ORDER BY vehicle_id, timestamp"
+        f"ORDER BY vehicle_id, timestamp, id::text"
     )
 
 
@@ -222,14 +231,14 @@ def build_stream_all_sql(
     has_clean_id: bool = False,
     kept_table: str | None = None,
     spatial_context: SpatialContext,
+    source_key_sql_type: str = "bigint",
+    source_has_extra: bool = True,
 ) -> str:
-    """UNION ALL query to stream all active + injected points (no spatial filter).
+    """Stream raw or one Clean Run's kept + injected points without a bbox.
 
-    ZH: 全量 active + injected points UNION ALL 查询（无空间过滤）。
+    ZH: 全量来源点，或指定 Clean Run 的 kept + injected UNION ALL 查询。
         用于 server-side named cursor 逐车流式读取。
-        使用 ``is_active = TRUE`` 以匹配 partial index ``idx_tp_active``。
-        未提供 ``clean_id`` 时不读取 injected_points，避免混入其它 Run 或
-        legacy local-origin x/y。
+        未提供 ``clean_id`` 时不读取 injected_points，避免混入其它 Run。
         ``kept_table`` 非空时，trajectory 分支改为 JOIN 清洗结果表
         (``kept_table`` 的 vehicle_id 带 _seg 后缀，几何列取自 ``table``)，
         并按 ``ktp.clean_id`` 只读本次 Clean Run。
@@ -240,10 +249,10 @@ def build_stream_all_sql(
 
     Parameter placeholders (in order, caller must bind):
         Raw mode (``kept_table`` is None):
-            1.  %s::text          — source_id literal
+            no parameters
         Kept mode (``kept_table`` set):
-            1.  %s               — ktp.clean_id
-            2.  %s::text         — injected_points table name
+            1.  %s::text         — source table label for the in-memory PointRef
+            2.  %s               — ktp.clean_id
             3.  %s               — injected_points.clean_id
     """
     if has_clean_id and kept_table is None:
@@ -251,25 +260,27 @@ def build_stream_all_sql(
     processing_srid = int(spatial_context.processing_srid)
     projected_tp = f"ST_Transform(tp.geom, {processing_srid})"
     if kept_table is not None:
+        extra = "tp.extra" if source_has_extra else "'{}'::jsonb"
         return (
             f"SELECT ktp.vehicle_id, tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, "
-            f"       ktp.source_id, ktp.source_row_key, tp.extra, "
-            f"       NULL::text AS from_source_row_key, NULL::text AS to_source_row_key, "
+            f"       %s::text AS source_id, ktp.source_row_key, {extra} AS extra, "
             f"       ''::text AS generated_reason, "
-            f"       ST_X({projected_tp}) AS x, ST_Y({projected_tp}) AS y "
+            f"       ST_X({projected_tp}) AS x, ST_Y({projected_tp}) AS y, "
+            f"       0 AS point_kind, ktp.id AS row_id, ktp.subtrack_index, "
+            f"       ktp.sequence_in_subtrack AS anchor_sequence "
             f"FROM {kept_table} AS ktp "
-            f"JOIN {table} AS tp ON tp.id = ktp.trajectory_point_id "
+            f"JOIN {table} AS tp "
+            f"  ON tp.id = ktp.source_row_key::{source_key_sql_type} "
             f"WHERE ktp.clean_id = %s "
             f"UNION ALL "
             f"SELECT {_IP_UNIFIED_COLS} "
             f"FROM injected_points WHERE clean_id = %s "
-            f"ORDER BY vehicle_id, timestamp"
+            f"ORDER BY subtrack_index, anchor_sequence, point_kind, row_id"
         )
     return (
         f"SELECT {_tp_unified_cols(processing_srid)} "
         f"FROM {table} "
-        f"WHERE is_active = TRUE "
-        f"ORDER BY vehicle_id, timestamp"
+        f"ORDER BY vehicle_id, timestamp, id::text"
     )
 
 
@@ -362,7 +373,7 @@ def _query_spatial_extent(
     *,
     table: str = "trajectory_points",
     kept_table: str | None = None,
-    source_id: str | None = None,
+    source_table: str | None = None,
     clean_id: str | None = None,
     spatial_context: SpatialContext,
 ) -> tuple[float, float, float, float] | None:
@@ -375,11 +386,15 @@ def _query_spatial_extent(
     """
     if kept_table is not None and clean_id is None:
         raise ValueError("kept_table requires clean_id")
+    if kept_table is None and clean_id is not None:
+        raise ValueError("clean_id requires kept_table for complete Run isolation")
+    contract = validate_source_table(conn, table)
     sql = build_spatial_extent_sql(
-        table,
+        contract.quoted_table,
         has_clean_id=clean_id is not None,
         kept_table=kept_table,
         spatial_context=spatial_context,
+        source_key_sql_type=contract.key_sql_type,
     )
     if kept_table is not None:
         params: tuple[Any, ...] = (clean_id, clean_id)
@@ -400,7 +415,7 @@ def _query_active_points_in_window(
     *,
     table: str = "trajectory_points",
     kept_table: str | None = None,
-    source_id: str | None = None,
+    source_table: str | None = None,
     clean_id: str | None = None,
     spatial_context: SpatialContext,
     telemetry: dict[str, int | float] | None = None,
@@ -422,11 +437,12 @@ def _query_active_points_in_window(
     if kept_table is None and clean_id is not None:
         raise ValueError("clean_id requires kept_table for complete Run isolation")
     transformer = _transformer or CoordinateTransformer(spatial_context)
+    contract = validate_source_table(conn, table)
     source_bounds = transformer.inverse_bounds(
         (window.x_min, window.y_min, window.x_max, window.y_max)
     )
     if kept_table is not None:
-        params: list[Any] = [clean_id]
+        params: list[Any] = [source_table or table, clean_id]
         params.extend(source_bounds)
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
         params.append(_INJECTED_SOURCE_ID)
@@ -434,17 +450,19 @@ def _query_active_points_in_window(
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
         params.append(clean_id)
     else:
-        params = [source_id or ""]
+        params = [source_table or ""]
         params.extend(source_bounds)
         params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
     query_started = time.perf_counter() if telemetry is not None else 0.0
     with conn.cursor() as cur:
         cur.execute(
             build_active_in_window_sql(
-                table,
+                contract.quoted_table,
                 has_clean_id=has_clean_id,
                 kept_table=kept_table,
                 spatial_context=spatial_context,
+                source_key_sql_type=contract.key_sql_type,
+                source_has_extra=contract.has_extra,
             ),
             params,
         )
@@ -471,7 +489,7 @@ def _stream_vehicle_tracks_from_db(
     *,
     table: str = "trajectory_points",
     kept_table: str | None = None,
-    source_id: str | None = None,
+    source_table: str | None = None,
     clean_id: str | None = None,
     spatial_context: SpatialContext,
 ) -> Iterator[list[TrajectoryPoint]]:
@@ -489,9 +507,15 @@ def _stream_vehicle_tracks_from_db(
     if kept_table is None and clean_id is not None:
         raise ValueError("clean_id requires kept_table for complete Run isolation")
     if kept_table is not None:
-        params: list[Any] = [clean_id, _INJECTED_SOURCE_ID, clean_id]
+        params: list[Any] = [
+            source_table or table,
+            clean_id,
+            _INJECTED_SOURCE_ID,
+            clean_id,
+        ]
     else:
-        params = [source_id or ""]
+        params = [source_table or ""]
+    contract = validate_source_table(conn, table)
     # ZH: 服务器端命名游标 — PG 按需 FETCH，避免全量物化到 portal。
     # EN: Server-side named cursor — FETCHes on demand, no full portal materialization.
     with conn.cursor(
@@ -499,29 +523,33 @@ def _stream_vehicle_tracks_from_db(
     ) as cur:
         cur.execute(
             build_stream_all_sql(
-                table,
+                contract.quoted_table,
                 has_clean_id=has_clean_id,
                 kept_table=kept_table,
                 spatial_context=spatial_context,
+                source_key_sql_type=contract.key_sql_type,
+                source_has_extra=contract.has_extra,
             ),
             params,
         )
-        current_vid: str | None = None
+        current_subtrack: int | None = None
         current_track: list[TrajectoryPoint] = []
+        cleaned_sequence = 0
         for row in cur:
             vid = str(row[0])
-            if current_vid is not None and vid != current_vid:
+            subtrack_index = int(row[14])
+            if current_subtrack is not None and subtrack_index != current_subtrack:
                 yield current_track
                 current_track = []
-            current_vid = vid
+                cleaned_sequence = 0
+            current_subtrack = subtrack_index
+            is_injected = int(row[12]) == 1
             current_track.append(TrajectoryPoint(
                 point_ref=PointRef(
                     source_id=str(row[6] or ""),
                     source_row_key=str(row[7] or ""),
-                    stable=not bool(row[11]),
-                    from_ref=str(row[9]) if row[9] is not None else None,
-                    to_ref=str(row[10]) if row[10] is not None else None,
-                    generated_reason=str(row[11] or ""),
+                    stable=not is_injected,
+                    generated_reason=str(row[9] or ""),
                 ),
                 vehicle_id=vid,
                 timestamp=float(row[1]),
@@ -530,9 +558,16 @@ def _stream_vehicle_tracks_from_db(
                 heading=float(row[4]),
                 speed=float(row[5]),
                 extra=row[8] if isinstance(row[8], dict) else {},
-                x=float(row[12]),
-                y=float(row[13]),
+                x=float(row[10]),
+                y=float(row[11]),
+                cleaned_point_ref=CleanedPointRef(
+                    point_kind="injected" if is_injected else "kept",
+                    point_id=int(row[13]),
+                    subtrack_index=subtrack_index,
+                    cleaned_sequence_in_subtrack=cleaned_sequence,
+                ),
             ))
+            cleaned_sequence += 1
         if current_track:
             yield current_track
 
@@ -544,7 +579,7 @@ def _query_active_points_near_cluster(
     *,
     table: str = "trajectory_points",
     kept_table: str | None = None,
-    source_id: str | None = None,
+    source_table: str | None = None,
     clean_id: str | None = None,
     spatial_context: SpatialContext,
 ) -> list[TrajectoryPoint]:
@@ -565,7 +600,7 @@ def _query_active_points_near_cluster(
         window,
         table=table,
         kept_table=kept_table,
-        source_id=source_id,
+        source_table=source_table,
         clean_id=clean_id,
         spatial_context=spatial_context,
     )
@@ -574,20 +609,16 @@ def _query_active_points_near_cluster(
 def _build_points_from_rows(rows: list[dict[str, Any]]) -> list[TrajectoryPoint]:
     """Convert DB row dicts to TrajectoryPoint objects."""
     points: list[TrajectoryPoint] = []
+    cleaned_sequences: dict[int, int] = {}
     for r in rows:
+        subtrack_index = int(r["subtrack_index"])
+        cleaned_sequence = cleaned_sequences.get(subtrack_index, 0)
+        is_injected = int(r["point_kind"]) == 1
         points.append(TrajectoryPoint(
             point_ref=PointRef(
                 source_id=r["source_id"],
                 source_row_key=r["source_row_key"],
-                stable=not bool(r.get("generated_reason")),
-                from_ref=(
-                    str(r["from_source_row_key"])
-                    if r.get("from_source_row_key") is not None else None
-                ),
-                to_ref=(
-                    str(r["to_source_row_key"])
-                    if r.get("to_source_row_key") is not None else None
-                ),
+                stable=not is_injected,
                 generated_reason=str(r.get("generated_reason") or ""),
             ),
             vehicle_id=r["vehicle_id"],
@@ -599,17 +630,28 @@ def _build_points_from_rows(rows: list[dict[str, Any]]) -> list[TrajectoryPoint]
             extra=r["extra"],
             x=r["x"],
             y=r["y"],
+            cleaned_point_ref=CleanedPointRef(
+                point_kind="injected" if is_injected else "kept",
+                point_id=int(r["row_id"]),
+                subtrack_index=subtrack_index,
+                cleaned_sequence_in_subtrack=cleaned_sequence,
+            ),
         ))
+        cleaned_sequences[subtrack_index] = cleaned_sequence + 1
     return points
 
 
 def _tracks_from_points(points: list[TrajectoryPoint]) -> dict[str, list[TrajectoryPoint]]:
-    """Group points by vehicle_id into a tracks dict."""
+    """Group points by globally unique Clean subtrack, retaining vehicle IDs."""
     tracks: dict[str, list[TrajectoryPoint]] = {}
     for tp in points:
-        if tp.vehicle_id not in tracks:
-            tracks[tp.vehicle_id] = []
-        tracks[tp.vehicle_id].append(tp)
+        subtrack_index = (
+            tp.cleaned_point_ref.subtrack_index
+            if tp.cleaned_point_ref is not None
+            else 1
+        )
+        key = f"{tp.vehicle_id}\x00{subtrack_index}"
+        tracks.setdefault(key, []).append(tp)
     return tracks
 
 
@@ -618,7 +660,7 @@ class _RunRow:
     """One Detect Run together with its parent Clean Run metadata."""
 
     clean_id: str
-    source_id: str
+    source_table: str
     parameters: dict[str, object]
     status: str
     spatial_context: SpatialContext
@@ -628,7 +670,7 @@ def fetch_detect_row(conn: object, detect_id: str) -> _RunRow:
     """Fetch a Detect Run and the source metadata of its parent Clean Run."""
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(
-            "SELECT d.clean_id, c.source_id, c.parameters, d.status, "
+            "SELECT d.clean_id, c.source_table, c.parameters, d.status, "
             "c.source_srid, c.processing_srid, c.projection_config "
             "FROM detect_runs AS d JOIN clean_runs AS c ON c.id = d.clean_id "
             "WHERE d.id = %s",
@@ -637,10 +679,10 @@ def fetch_detect_row(conn: object, detect_id: str) -> _RunRow:
         row = cur.fetchone()
     if row is None:
         raise ValueError(f"unknown Detect Run: {detect_id}")
-    clean_id, source_id, raw_parameters, status, source_srid, processing_srid, projection_config = row
+    clean_id, source_table, raw_parameters, status, source_srid, processing_srid, projection_config = row
     return _RunRow(
         clean_id=str(clean_id),
-        source_id=str(source_id),
+        source_table=str(source_table),
         parameters=_decode_json_object(raw_parameters),
         status=str(status),
         spatial_context=spatial_context_from_values(
@@ -660,14 +702,14 @@ def fetch_intersections(conn: object, detect_id: str) -> list[ClipIntersection]:
             "FROM intersections AS i "
             "JOIN candidate_intersections AS ci "
             "ON ci.id = i.candidate_intersection_id AND ci.detect_id = i.detect_id "
-            "WHERE i.detect_id = %s AND i.is_complete IS TRUE "
+            "WHERE i.detect_id = %s "
             "ORDER BY i.id",
             (detect_id,),
         )
         for intersection_id, lon, lat, radius_m in cur:
             if radius_m is None:
                 raise ValueError(
-                    f"Detect Run {detect_id} predates Clip radius persistence"
+                    f"Detect Run {detect_id} is missing its Clip radius"
                 )
             if not math.isfinite(float(radius_m)) or float(radius_m) <= 0.0:
                 raise ValueError(f"Detect Run {detect_id} has an invalid Clip radius")
@@ -682,6 +724,98 @@ def fetch_intersections(conn: object, detect_id: str) -> list[ClipIntersection]:
     return intersections
 
 
+def fetch_resolved_clip_tracks(
+    conn: object,
+    detect_id: str,
+) -> list[ClipTrack]:
+    """Load the final p/i/c sequence for Clip without reconstructing roots."""
+    run = fetch_detect_row(conn, detect_id)
+    if run.status != "completed":
+        raise ValueError(f"Detect Run {detect_id} is not completed")
+    contract = validate_source_table(conn, run.source_table)
+    query = f"""
+        WITH subtrack_vehicles AS (
+            SELECT resolved.subtrack_index,
+                   MIN(COALESCE(kept.vehicle_id, injected.vehicle_id)) AS vehicle_id,
+                   COUNT(DISTINCT COALESCE(kept.vehicle_id, injected.vehicle_id))
+                       AS vehicle_count
+              FROM resolved_subtrack_points AS resolved
+              LEFT JOIN kept_trajectory_points AS kept
+                ON kept.id = resolved.kept_point_id
+              LEFT JOIN injected_points AS injected
+                ON injected.id = resolved.injected_point_id
+             WHERE resolved.detect_id = %s
+               AND resolved.crossing_point_id IS NULL
+             GROUP BY resolved.subtrack_index
+        )
+        SELECT resolved.id,
+               resolved.subtrack_index,
+               resolved.sequence_in_subtrack,
+               vehicles.vehicle_id,
+               COALESCE(source.lon, injected.lon, crossing.crossing_lon) AS lon,
+               COALESCE(source.lat, injected.lat, crossing.crossing_lat) AS lat,
+               crossing.id AS crossing_id,
+               intersection.id AS intersection_id,
+               crossing.crossing_type
+          FROM resolved_subtrack_points AS resolved
+          JOIN subtrack_vehicles AS vehicles
+            ON vehicles.subtrack_index = resolved.subtrack_index
+           AND vehicles.vehicle_count = 1
+          LEFT JOIN kept_trajectory_points AS kept
+            ON kept.id = resolved.kept_point_id
+          LEFT JOIN {contract.quoted_table} AS source
+            ON source.id = kept.source_row_key::{contract.key_sql_type}
+          LEFT JOIN injected_points AS injected
+            ON injected.id = resolved.injected_point_id
+          LEFT JOIN candidate_entry_exit_points AS crossing
+            ON crossing.id = resolved.crossing_point_id
+           AND crossing.detect_id = resolved.detect_id
+          LEFT JOIN intersections AS intersection
+            ON intersection.detect_id = crossing.detect_id
+           AND intersection.candidate_intersection_id =
+               crossing.candidate_intersection_id
+         WHERE resolved.detect_id = %s
+         ORDER BY resolved.subtrack_index, resolved.sequence_in_subtrack
+    """
+    grouped: dict[int, tuple[str, list[ResolvedTrackPoint]]] = {}
+    with conn.cursor() as cur:  # type: ignore[attr-defined]
+        cur.execute(query, (detect_id, detect_id))
+        for row in cur:
+            if row[3] is None or row[4] is None or row[5] is None:
+                raise ValueError(
+                    f"Detect Run {detect_id} has missing resolved point data"
+                )
+            subtrack_index = int(row[1])
+            vehicle_id = str(row[3])
+            previous = grouped.get(subtrack_index)
+            if previous is None:
+                points: list[ResolvedTrackPoint] = []
+                grouped[subtrack_index] = (vehicle_id, points)
+            else:
+                if previous[0] != vehicle_id:
+                    raise ValueError(
+                        f"subtrack {subtrack_index} contains multiple vehicles"
+                    )
+                points = previous[1]
+            points.append(ResolvedTrackPoint(
+                resolved_point_id=int(row[0]),
+                lon=float(row[4]),
+                lat=float(row[5]),
+                crossing_id=None if row[6] is None else int(row[6]),
+                intersection_id=None if row[7] is None else int(row[7]),
+                crossing_type=None if row[8] is None else int(row[8]),
+            ))
+    return [
+        ClipTrack(
+            vehicle_id=vehicle_id,
+            trip_id=f"{vehicle_id}:subtrack-{subtrack_index:04d}",
+            points=tuple(points),
+            subtrack_index=subtrack_index,
+        )
+        for subtrack_index, (vehicle_id, points) in sorted(grouped.items())
+    ]
+
+
 def fetch_clean_points(
     conn: object,
     table: str,
@@ -690,39 +824,38 @@ def fetch_clean_points(
     spatial_context: SpatialContext,
 ) -> dict[tuple[str, int], list[TrajectoryPoint]]:
     """Load one Clean Run's frozen kept members and injected points."""
-    safe_table = _quoted_identifier(table)
+    contract = validate_source_table(conn, table)
     processing_srid = int(spatial_context.processing_srid)
+    extra = "tp.extra" if contract.has_extra else "'{}'::jsonb"
     sql = (
-        "SELECT vehicle_id, subtrack_index, anchor_sequence, "
+        "SELECT vehicle_id, subtrack_index, anchor_sequence, point_kind, row_id, "
         "source_id, source_row_key, timestamp, lon, lat, heading, speed, extra, "
-        "from_source_row_key, to_source_row_key, generated_reason, x, y, "
-        "point_kind, row_id "
+        "generated_reason, x, y "
         "FROM ("
         "  SELECT ktp.vehicle_id, ktp.subtrack_index, ktp.sequence_in_subtrack AS anchor_sequence, "
-        "         ktp.source_id, ktp.source_row_key, "
-        "         tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, tp.extra, "
-        "         NULL::text AS from_source_row_key, "
-        "         NULL::text AS to_source_row_key, ''::text AS generated_reason, "
+        "         0 AS point_kind, ktp.id AS row_id, "
+        "         %s::text AS source_id, ktp.source_row_key, "
+        f"         tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, {extra} AS extra, "
+        "         ''::text AS generated_reason, "
         f"         ST_X(ST_Transform(tp.geom, {processing_srid})) AS x, "
-        f"         ST_Y(ST_Transform(tp.geom, {processing_srid})) AS y, "
-        "         0 AS point_kind, ktp.id AS row_id "
+        f"         ST_Y(ST_Transform(tp.geom, {processing_srid})) AS y "
         "  FROM kept_trajectory_points AS ktp "
-        f"  LEFT JOIN {safe_table} AS tp ON tp.id = ktp.trajectory_point_id "
+        f"  JOIN {contract.quoted_table} AS tp "
+        f"    ON tp.id = ktp.source_row_key::{contract.key_sql_type} "
         "  WHERE ktp.clean_id = %s "
         "  UNION ALL "
         "  SELECT ip.vehicle_id, ip.subtrack_index, ip.after_sequence_in_subtrack, "
+        "         1 AS point_kind, ip.id AS row_id, "
         "         %s::text AS source_id, ip.id::text AS source_row_key, "
         "         ip.timestamp, ip.lon, ip.lat, ip.heading, ip.speed, '{}'::jsonb, "
-        "         ip.from_source_row_key, ip.to_source_row_key, ip.generated_reason, "
-        "         ip.x, ip.y, "
-        "         1 AS point_kind, ip.id AS row_id "
+        "         ip.generated_reason, ip.x, ip.y "
         "  FROM injected_points AS ip WHERE ip.clean_id = %s"
         ") AS clean_points"
     )
     return _group_points(
         conn,
         sql,
-        (clean_id, _INJECTED_SOURCE_ID, clean_id),
+        (table, clean_id, _INJECTED_SOURCE_ID, clean_id),
         clean_id,
     )
 
@@ -741,36 +874,35 @@ def fetch_clean_points_for_subtracks(
     requested = sorted(subtracks)
     vehicle_ids = [vehicle_id for vehicle_id, _ in requested]
     subtrack_indexes = [subtrack_index for _, subtrack_index in requested]
-    safe_table = _quoted_identifier(table)
+    contract = validate_source_table(conn, table)
     processing_srid = int(spatial_context.processing_srid)
+    extra = "tp.extra" if contract.has_extra else "'{}'::jsonb"
     sql = (
         "WITH requested(vehicle_id, subtrack_index) AS ("
         "  SELECT * FROM unnest(%s::text[], %s::integer[])"
         ") "
-        "SELECT vehicle_id, subtrack_index, anchor_sequence, "
+        "SELECT vehicle_id, subtrack_index, anchor_sequence, point_kind, row_id, "
         "source_id, source_row_key, timestamp, lon, lat, heading, speed, extra, "
-        "from_source_row_key, to_source_row_key, generated_reason, x, y, "
-        "point_kind, row_id "
+        "generated_reason, x, y "
         "FROM ("
         "  SELECT ktp.vehicle_id, ktp.subtrack_index, ktp.sequence_in_subtrack AS anchor_sequence, "
-        "         ktp.source_id, ktp.source_row_key, "
-        "         tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, tp.extra, "
-        "         NULL::text AS from_source_row_key, "
-        "         NULL::text AS to_source_row_key, ''::text AS generated_reason, "
+        "         0 AS point_kind, ktp.id AS row_id, "
+        "         %s::text AS source_id, ktp.source_row_key, "
+        f"         tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, {extra} AS extra, "
+        "         ''::text AS generated_reason, "
         f"         ST_X(ST_Transform(tp.geom, {processing_srid})) AS x, "
-        f"         ST_Y(ST_Transform(tp.geom, {processing_srid})) AS y, "
-        "         0 AS point_kind, ktp.id AS row_id "
+        f"         ST_Y(ST_Transform(tp.geom, {processing_srid})) AS y "
         "  FROM kept_trajectory_points AS ktp "
         "  JOIN requested AS r USING (vehicle_id, subtrack_index) "
-        f"  LEFT JOIN {safe_table} AS tp ON tp.id = ktp.trajectory_point_id "
+        f"  JOIN {contract.quoted_table} AS tp "
+        f"    ON tp.id = ktp.source_row_key::{contract.key_sql_type} "
         "  WHERE ktp.clean_id = %s "
         "  UNION ALL "
         "  SELECT ip.vehicle_id, ip.subtrack_index, ip.after_sequence_in_subtrack, "
+        "         1 AS point_kind, ip.id AS row_id, "
         "         %s::text AS source_id, ip.id::text AS source_row_key, "
         "         ip.timestamp, ip.lon, ip.lat, ip.heading, ip.speed, '{}'::jsonb, "
-        "         ip.from_source_row_key, ip.to_source_row_key, ip.generated_reason, "
-        "         ip.x, ip.y, "
-        "         1 AS point_kind, ip.id AS row_id "
+        "         ip.generated_reason, ip.x, ip.y "
         "  FROM injected_points AS ip "
         "  JOIN requested AS r USING (vehicle_id, subtrack_index) "
         "  WHERE ip.clean_id = %s"
@@ -782,6 +914,7 @@ def fetch_clean_points_for_subtracks(
         (
             vehicle_ids,
             subtrack_indexes,
+            table,
             clean_id,
             _INJECTED_SOURCE_ID,
             clean_id,
@@ -812,42 +945,61 @@ def _group_points(
         for row in cur:
             vehicle_id = str(row[0])
             subtrack_index = int(row[1])
-            if row[3] is None or row[4] is None:
+            if row[5] is None or row[6] is None:
                 raise ValueError(
-                    f"Clean Run {clean_id} predates persisted source references"
+                    f"Clean Run {clean_id} has missing source references"
                 )
-            if any(row[index] is None for index in range(5, 10)):
+            if any(row[index] is None for index in range(7, 12)):
                 raise ValueError(
                     f"Clean Run {clean_id} references a missing source row"
                 )
             generated_reason = str(row[13])
-            is_injected = int(row[16]) == 1
+            is_injected = int(row[3]) == 1
             point = TrajectoryPoint(
                 point_ref=PointRef(
-                    "public.injected_points" if is_injected else str(row[3]),
-                    str(row[17]) if is_injected else str(row[4]),
+                    "public.injected_points" if is_injected else str(row[5]),
+                    str(row[4]) if is_injected else str(row[6]),
                     stable=not generated_reason,
-                    from_ref=str(row[11]) if row[11] is not None else None,
-                    to_ref=str(row[12]) if row[12] is not None else None,
                     generated_reason=generated_reason,
                 ),
                 vehicle_id=vehicle_id,
-                timestamp=float(row[5]),
-                lon=float(row[6]),
-                lat=float(row[7]),
-                heading=float(row[8]),
-                speed=float(row[9]),
-                extra=row[10] if isinstance(row[10], dict) else {},
+                timestamp=float(row[7]),
+                lon=float(row[8]),
+                lat=float(row[9]),
+                heading=float(row[10]),
+                speed=float(row[11]),
+                extra=row[12] if isinstance(row[12], dict) else {},
                 x=float(row[14]),
                 y=float(row[15]),
             )
             grouped_rows.setdefault((vehicle_id, subtrack_index), []).append(
-                (int(row[2]), int(row[16]), int(row[17]), point)
+                (int(row[2]), int(row[3]), int(row[4]), point)
             )
-    return {
-        key: [item[3] for item in sorted(rows, key=lambda item: item[:3])]
-        for key, rows in grouped_rows.items()
-    }
+    grouped: dict[tuple[str, int], list[TrajectoryPoint]] = {}
+    for key, rows in grouped_rows.items():
+        ordered = sorted(rows, key=lambda item: item[:3])
+        grouped[key] = [
+            TrajectoryPoint(
+                point_ref=item[3].point_ref,
+                vehicle_id=item[3].vehicle_id,
+                timestamp=item[3].timestamp,
+                lon=item[3].lon,
+                lat=item[3].lat,
+                heading=item[3].heading,
+                speed=item[3].speed,
+                extra=item[3].extra,
+                x=item[3].x,
+                y=item[3].y,
+                cleaned_point_ref=CleanedPointRef(
+                    point_kind="injected" if item[1] == 1 else "kept",
+                    point_id=item[2],
+                    subtrack_index=key[1],
+                    cleaned_sequence_in_subtrack=sequence,
+                ),
+            )
+            for sequence, item in enumerate(ordered)
+        ]
+    return grouped
 
 
 def _decode_json_object(value: object) -> dict[str, object]:

@@ -7,7 +7,7 @@ from typing import Any
 
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
-from qgis.core import NULL, Qgis, QgsVectorLayer, QgsWkbTypes
+from qgis.core import NULL, Qgis, QgsDataSourceUri, QgsVectorLayer, QgsWkbTypes
 
 from .client import BackendClient
 from .core import (
@@ -81,8 +81,15 @@ class RoadnetToolsPlugin:
 
     def replay_selection(self) -> None:
         try:
-            records = self._selected_point_records()
-            payload = build_replay_payload(records)
+            layer = self.iface.activeLayer()
+            intersection_layer = (
+                isinstance(layer, QgsVectorLayer)
+                and layer.providerType() == "postgres"
+                and QgsDataSourceUri(layer.source()).table() == "intersections"
+            )
+            records = self._selected_point_records(allow_polygon=intersection_layer)
+            payload = build_replay_payload(records, intersection_layer=intersection_layer)
+            payload["database_name"] = self._selected_database_name()
             settings = PluginSettings.load()
             url = endpoint_url(settings.backend_url, settings.replay_path)
         except ContractError as exc:
@@ -94,6 +101,7 @@ class RoadnetToolsPlugin:
         try:
             records = self._selected_point_records()
             payload = build_clip_payload(records)
+            payload["database_name"] = self._selected_database_name()
             settings = PluginSettings.load()
             url = endpoint_url(settings.backend_url, settings.clip_path)
         except ContractError as exc:
@@ -125,11 +133,20 @@ class RoadnetToolsPlugin:
         self._toolbar.addAction(action)
         self._actions.append(action)
 
-    def _selected_point_records(self) -> list[SelectionRecord]:
+    def _selected_database_name(self) -> str:
+        layer = self.iface.activeLayer()
+        if not isinstance(layer, QgsVectorLayer) or layer.providerType() != "postgres":
+            raise ContractError("无法确认图层数据库。请选择 PostgreSQL 图层，并确认 database 是否对应。")
+        database_name = QgsDataSourceUri(layer.source()).database()
+        if not database_name:
+            raise ContractError("图层连接中缺少 database name，请在 PostgreSQL 连接设置中明确指定数据库。")
+        return database_name
+
+    def _selected_point_records(self, *, allow_polygon: bool = False) -> list[SelectionRecord]:
         layer = self.iface.activeLayer()
         if not isinstance(layer, QgsVectorLayer):
             raise ContractError("Make a point vector layer active, then select its features.")
-        if QgsWkbTypes.geometryType(layer.wkbType()) != QgsWkbTypes.PointGeometry:
+        if not allow_polygon and QgsWkbTypes.geometryType(layer.wkbType()) != QgsWkbTypes.PointGeometry:
             raise ContractError("The active layer must be a point vector layer.")
 
         selected = layer.selectedFeatures()

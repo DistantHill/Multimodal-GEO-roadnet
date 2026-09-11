@@ -1,7 +1,7 @@
-"""Replay one persisted v2 result back to verified source rows.
+"""Replay one persisted schema-v3 result back to verified source rows.
 
 Clean artifacts use ``--clean-id``; Detect artifacts use ``--detect-id``;
-``trajectory_point`` has no stage identifier.
+Centerlines carry their own completed Fit/Detect context.
 """
 
 from __future__ import annotations
@@ -11,13 +11,13 @@ import getpass
 import uuid
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
+from ..db.schema import require_schema_v3
 from ..logger import init_logger, shutdown_logger
 from ..output import error_payload, print_json
 from ..replay import (
     CLEAN_REPLAY_KINDS,
     DETECT_REPLAY_KINDS,
     PostgresReplayStore,
-    PostgresSourceRowResolver,
     ReplayService,
     ReplayTarget,
     replay_centerline_inputs,
@@ -35,33 +35,52 @@ def _target_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace)
     if args.kind == "centerline":
         if args.clean_id or args.detect_id:
             parser.error("centerline does not take a stage ID")
-        return ReplayTarget(args.kind, args.id)
-    if args.kind == "trajectory_point":
-        if args.clean_id or args.detect_id:
-            parser.error("trajectory_point does not take a stage ID")
-        return ReplayTarget(args.kind, args.id)
+        return ReplayTarget(args.kind, _internal_id(parser, args.id))
     if args.kind in CLEAN_REPLAY_KINDS:
         if args.clean_id is None:
             parser.error(f"{args.kind} requires --clean-id")
-        return ReplayTarget(args.kind, args.id, clean_id=args.clean_id)
+        target_id: int | str = (
+            args.id
+            if args.kind in {"source_point", "excluded_point"}
+            else _internal_id(parser, args.id)
+        )
+        return ReplayTarget(args.kind, target_id, clean_id=args.clean_id)
     if args.kind in DETECT_REPLAY_KINDS:
         if args.detect_id is None:
             parser.error(f"{args.kind} requires --detect-id")
-        return ReplayTarget(args.kind, args.id, detect_id=args.detect_id)
+        return ReplayTarget(
+            args.kind,
+            _internal_id(parser, args.id),
+            detect_id=args.detect_id,
+        )
     parser.error(f"unsupported replay kind: {args.kind}")
     raise AssertionError("argparse.error always exits")
+
+
+def _internal_id(parser: argparse.ArgumentParser, value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError:
+        parser.error("this replay kind requires an integer database ID")
+    if result <= 0:
+        parser.error("database ID must be positive")
+    return result
 
 
 def main() -> int:
     defaults = default_postgres_config()
     parser = argparse.ArgumentParser(
-        description="Replay one persisted v2 entity to verified source rows."
+        description="Replay one persisted schema-v3 entity to verified source rows."
     )
     stage_group = parser.add_mutually_exclusive_group()
     stage_group.add_argument("--clean-id", type=_uuid_arg, help="Clean Run UUID.")
     stage_group.add_argument("--detect-id", type=_uuid_arg, help="Detect Run UUID.")
     parser.add_argument("--kind", required=True, help="Persisted entity kind.")
-    parser.add_argument("--id", required=True, type=int, help="Database primary key.")
+    parser.add_argument(
+        "--id",
+        required=True,
+        help="Internal database ID, or source_row_key for source/excluded points.",
+    )
     parser.add_argument("--host", default=defaults.host)
     parser.add_argument("--port", type=int, default=defaults.port)
     parser.add_argument("--database", default=defaults.database)
@@ -85,10 +104,8 @@ def main() -> int:
     try:
         try:
             with pg_connect(config) as conn:
-                service = ReplayService(
-                    PostgresReplayStore(conn),
-                    source_row_resolver=PostgresSourceRowResolver(conn),
-                )
+                require_schema_v3(conn)
+                service = ReplayService(PostgresReplayStore(conn))
                 trace = service.replay(target)
         except (RuntimeError, ValueError) as exc:
             print_json(error_payload("invalid_request", str(exc)))
@@ -98,7 +115,7 @@ def main() -> int:
             return 1
 
         print_json(trace.as_dict())
-        return 0 if target.kind == "centerline" or trace.status == "ok" else 1
+        return 0 if trace.status == "ok" else 1
     finally:
         shutdown_logger()
 

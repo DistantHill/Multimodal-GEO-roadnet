@@ -17,7 +17,7 @@ class PipelineApiTest(unittest.TestCase):
         )
 
     def test_public_types_are_frozen_dataclasses(self) -> None:
-        pipeline_input = PipelineInput(self.config, pg_source_table="raw_points")
+        pipeline_input = PipelineInput(self.config, source_table="raw_points")
         result = PipelineResult(stats={"detect_id": "detect-1"})
 
         self.assertTrue(is_dataclass(PipelineInput))
@@ -25,11 +25,11 @@ class PipelineApiTest(unittest.TestCase):
         self.assertIs(v2.PipelineInput, PipelineInput)
         self.assertIs(v2.PipelineResult, PipelineResult)
         with self.assertRaises(FrozenInstanceError):
-            pipeline_input.table = "other"
+            pipeline_input.source_table = "other"
         with self.assertRaises(FrozenInstanceError):
             result.stats = {}
 
-    def test_cli_adapter_keeps_historical_signature_and_result_shape(self) -> None:
+    def test_cli_adapter_exposes_only_the_v3_source_contract(self) -> None:
         pipeline_result = PipelineResult(stats={"detect_id": "detect-1"})
         reporter = MagicMock()
         with (
@@ -38,16 +38,14 @@ class PipelineApiTest(unittest.TestCase):
         ):
             stats = cli_run_pipeline(
                 self.config,
-                pg_source_table="raw_points",
-                table="target_points",
+                source_table="raw_points",
             )
 
         self.assertEqual(stats, pipeline_result.stats)
         run.assert_called_once_with(
             PipelineInput(
                 db_config=self.config,
-                pg_source_table="raw_points",
-                table="target_points",
+                source_table="raw_points",
             ),
             emit=reporter,
         )
@@ -63,10 +61,10 @@ class PipelineApiTest(unittest.TestCase):
             ) as run,
             self.assertRaisesRegex(RuntimeError, "core failed"),
         ):
-            cli_run_pipeline(self.config, pg_source_table="raw_points")
+            cli_run_pipeline(self.config, source_table="raw_points")
 
         run.assert_called_once_with(
-            PipelineInput(db_config=self.config, pg_source_table="raw_points"),
+            PipelineInput(db_config=self.config, source_table="raw_points"),
             emit=reporter,
         )
         reporter.close.assert_called_once_with()

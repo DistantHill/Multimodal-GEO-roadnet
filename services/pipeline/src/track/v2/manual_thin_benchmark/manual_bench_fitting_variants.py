@@ -15,12 +15,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from track.v2.fitting import fit_centerlines
 from track.v2.models import (
     ClipEndpoint,
+    ClipPoint,
     ClipReport,
     ClipResult,
-    PointRef,
     ProjectionConfig,
     TrackClip,
-    TrajectoryPoint,
 )
 from track.v2.projection import create_spatial_context
 
@@ -33,18 +32,35 @@ def _clip(index: int, reverse: bool) -> TrackClip:
     coordinates = list(reversed(range(21))) if reverse else list(range(21))
     vehicle = f"v-{index}"
     points = tuple(
-        TrajectoryPoint(
-            PointRef("bench", f"{index}-{value}", True), vehicle, float(value),
-            value * 0.0001, index * 0.000001, 90.0, 10.0,
-        )
+        ClipPoint(index * 100 + value, value * 0.0001, index * 0.000001)
         for value in coordinates[1:-1]
     )
     return TrackClip(
         clip_id=f"clip-{index:06d}", vehicle_id=vehicle, trip_id=vehicle,
-        clip_type="inter_intersection",
-        start=ClipEndpoint("exit", coordinates[0] * 0.0001, index * 0.000001, 0.0, start_id, 0, 0.0),
-        end=ClipEndpoint("entry", coordinates[-1] * 0.0001, index * 0.000001, 20.0, end_id, 19, 1.0),
+        clip_type="between_intersection",
+        start=ClipEndpoint(
+            "exit", coordinates[0] * 0.0001, index * 0.000001,
+            start_id, index * 2 + 1,
+        ),
+        end=ClipEndpoint(
+            "entry", coordinates[-1] * 0.0001, index * 0.000001,
+            end_id, index * 2 + 2,
+        ),
         points=points, distance_m=222.0, point_count=21,
+        subtrack_index=index + 1,
+    )
+
+
+def _report(clips: tuple[TrackClip, ...]) -> ClipReport:
+    return ClipReport(
+        total_vehicles=len(clips),
+        total_subtracks=len(clips),
+        total_clips=len(clips),
+        between_intersection_clips=len(clips),
+        boundary_start_clips=0,
+        boundary_end_clips=0,
+        full_track_clips=0,
+        total_points_in_clips=sum(clip.point_count for clip in clips),
     )
 
 
@@ -56,7 +72,7 @@ def main() -> int:
     clips = tuple(_clip(index, bool(index % 2)) for index in range(args.clips))
     result = ClipResult(
         clips=clips,
-        report=ClipReport(args.clips, args.clips, args.clips, 0, args.clips * 21),
+        report=_report(clips),
         spatial_context=_SPATIAL_CONTEXT,
     )
     split_s = combined_s = a_to_b_s = b_to_a_s = 0.0
@@ -76,16 +92,12 @@ def main() -> int:
         )
         a_result = ClipResult(
             clips=forward,
-            report=ClipReport(
-                len(forward), len(forward), len(forward), 0, len(forward) * 21,
-            ),
+            report=_report(forward),
             spatial_context=_SPATIAL_CONTEXT,
         )
         b_result = ClipResult(
             clips=reverse,
-            report=ClipReport(
-                len(reverse), len(reverse), len(reverse), 0, len(reverse) * 21,
-            ),
+            report=_report(reverse),
             spatial_context=_SPATIAL_CONTEXT,
         )
         split_s += time.perf_counter() - start

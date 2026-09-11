@@ -22,6 +22,7 @@ DETECT_ARTIFACT_TABLES = (
     "candidate_entry_exit_points",
     "turn_events",
     "tracks_cross",
+    "resolved_subtrack_points",
     "candidate_intersections",
 )
 
@@ -137,6 +138,15 @@ class DeleteRunService:
             self._conn.rollback()  # type: ignore[attr-defined]
             raise RuntimeError("delete impact tree changed after UUID confirmation")
 
+        # Completed Detect/Fit artifacts are immutable during ordinary DML.
+        # This confirmation-gated service is the sole intentional deletion
+        # path, so scope the bypass to this transaction only.
+        with self._conn.cursor() as cur:  # type: ignore[attr-defined]
+            cur.execute(
+                "SET LOCAL track_v2.allow_completed_run_delete = 'on'",
+                (),
+            )
+
         if locked.target_kind == "detect":
             self._delete_detect(locked.target_id)
         else:
@@ -195,7 +205,6 @@ class DeleteRunService:
                     (),
                 )
 
-    
     def _delete_detect(self, detect_id: str) -> None:
         with self._conn.cursor() as cur:  # type: ignore[attr-defined]
             cur.execute(

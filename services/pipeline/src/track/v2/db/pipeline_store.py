@@ -23,17 +23,11 @@ from ..db_writer import (
     finish_clean_run,
     finish_detect_run,
     finish_fit_run,
-    insert_candidate_entry_exit_points,
-    insert_candidate_intersections,
     insert_centerline_bundle,
-    insert_entry_exit_points,
     insert_excluded_points,
     insert_injected_points,
-    insert_intersections,
     insert_kept_trajectory_points,
-    insert_tracks_cross,
-    insert_trajectory_points,
-    insert_turn_events,
+    persist_detect_result,
 )
 from ..intersect2 import IntersectResult
 from ..models import (
@@ -45,7 +39,6 @@ from ..models import (
     FittingConfig,
     RefinementSubtrack,
     SpatialContext,
-    TrajectoryPoint,
 )
 
 
@@ -64,59 +57,14 @@ class CleanBatchResult:
 class DetectPersistenceResult:
     """Persisted Detect-stage row counts."""
 
+    resolved_point_count: int
     tracks_cross_count: int
     turn_event_count: int
     candidate_intersection_count: int
     candidate_entry_exit_point_count: int
     intersection_count: int
     entry_exit_point_count: int
-
-
-def _candidate_memberships(
-    clusters: list[Any],
-    candidate_intersection_ids_by_calculate_index: dict[int, int],
-) -> tuple[
-    dict[int, int],
-    dict[tuple[str, str, str, str, str], int],
-]:
-    """Build exclusive A/C child-to-candidate assignments."""
-    turn_membership_by_calculate_index: dict[int, int] = {}
-    cross_membership: dict[tuple[str, str, str, str, str], int] = {}
-
-    def assign(mapping: dict[Any, int], key: Any, candidate_id: int) -> None:
-        previous = mapping.get(key)
-        if previous is not None and previous != candidate_id:
-            raise ValueError(
-                f"event {key!r} belongs to multiple candidate intersections: "
-                f"{previous}, {candidate_id}"
-            )
-        mapping[key] = candidate_id
-
-    for cluster in clusters:
-        candidate_id = candidate_intersection_ids_by_calculate_index.get(
-            cluster.cluster_calculate_index
-        )
-        if candidate_id is None:
-            continue
-        for event in cluster.events:
-            if event.source == "turn":
-                assign(
-                    turn_membership_by_calculate_index,
-                    event.event_calculate_index,
-                    candidate_id,
-                )
-            elif event.source == "orthogonal_cross_track":
-                key = (
-                    event.vehicle_id,
-                    str(event.from_source_id or ""),
-                    str(event.from_source_row_key or ""),
-                    str(event.to_source_id or ""),
-                    str(event.to_source_row_key or ""),
-                )
-                assign(cross_membership, key, candidate_id)
-            else:
-                raise ValueError(f"unsupported candidate event source: {event.source}")
-    return turn_membership_by_calculate_index, cross_membership
+    resolved_sequence_elapsed_s: float = 0.0
 
 
 class PipelineStore(Protocol):
@@ -135,30 +83,24 @@ class PipelineStore(Protocol):
     def start_clean_run(
         self,
         *,
-        source_id: str,
-        source_kind: str,
+        source_table: str,
         parameters: dict[str, Any],
         spatial_context: SpatialContext,
     ) -> str: ...
 
-    def finish_clean(self, clean_id: str, *, status: str) -> None: ...
-
-    def write_raw_points(
+    def finish_clean(
         self,
-        points: list[TrajectoryPoint],
+        clean_id: str,
         *,
-        table: str = "trajectory_points",
-        batch_size: int = _DEFAULT_BATCH_SIZE,
-    ) -> dict[tuple[str, str], int]: ...
+        status: str,
+        source_fingerprint: dict[str, object] | None = None,
+    ) -> None: ...
 
     def persist_clean_batch(
         self,
         clean_id: str,
-        table: str,
-        point_id_map: dict[tuple[str, str], int],
         pending_excluded: list[ExcludedPoint],
         pending_subtracks: list[RefinementSubtrack],
-        pending_point_keys: list[tuple[str, str]],
         subtrack_index: int,
         *,
         spatial_context: SpatialContext,
@@ -236,44 +178,36 @@ class PostgresPipelineStore:
     def start_clean_run(
         self,
         *,
-        source_id: str,
-        source_kind: str,
+        source_table: str,
         parameters: dict[str, Any],
         spatial_context: SpatialContext,
     ) -> str:
         return create_clean_run(
             self._conn,
-            source_id=source_id,
-            source_kind=source_kind,
+            source_table=source_table,
             parameters=parameters,
             spatial_context=spatial_context,
         )
 
-    def finish_clean(self, clean_id: str, *, status: str) -> None:
-        finish_clean_run(self._conn, clean_id, status=status)
-
-    def write_raw_points(
+    def finish_clean(
         self,
-        points: list[TrajectoryPoint],
+        clean_id: str,
         *,
-        table: str = "trajectory_points",
-        batch_size: int = _DEFAULT_BATCH_SIZE,
-    ) -> dict[tuple[str, str], int]:
-        return insert_trajectory_points(
+        status: str,
+        source_fingerprint: dict[str, object] | None = None,
+    ) -> None:
+        finish_clean_run(
             self._conn,
-            points,
-            table=table,
-            batch_size=batch_size,
+            clean_id,
+            status=status,
+            source_fingerprint=source_fingerprint,
         )
 
     def persist_clean_batch(
         self,
         clean_id: str,
-        table: str,
-        point_id_map: dict[tuple[str, str], int],
         pending_excluded: list[ExcludedPoint],
         pending_subtracks: list[RefinementSubtrack],
-        pending_point_keys: list[tuple[str, str]],
         subtrack_index: int,
         *,
         spatial_context: SpatialContext,
@@ -304,7 +238,6 @@ class PostgresPipelineStore:
             kept_count = insert_kept_trajectory_points(
                 self._conn,
                 assigned_subtracks,
-                point_id_map,
                 clean_id=clean_id,
             )
             insert_injected_points(
@@ -317,9 +250,6 @@ class PostgresPipelineStore:
             subtrack_index += len(assigned_subtracks)
             pending_subtracks.clear()
 
-        for key in pending_point_keys:
-            point_id_map.pop(key, None)
-        pending_point_keys.clear()
         return CleanBatchResult(
             next_subtrack_index=subtrack_index,
             kept_count=kept_count,
@@ -352,76 +282,21 @@ class PostgresPipelineStore:
             raise ValueError(
                 f"Detect Run {detect_id} SpatialContext does not match its Clean Run"
             )
-        candidate_intersection_ids_by_calculate_index = insert_candidate_intersections(
+        counts = persist_detect_result(
             self._conn,
-            result.clusters,
-            detect_id=detect_id,
-            spatial_context=spatial_context,
-        )
-        turn_membership_by_calculate_index, cross_membership = _candidate_memberships(
-            result.clusters,
-            candidate_intersection_ids_by_calculate_index,
-        )
-        tracks_cross_count = insert_tracks_cross(
-            self._conn,
-            result.cross_track_candidates,
-            detect_id=detect_id,
-            candidate_intersection_ids=cross_membership,
-            spatial_context=spatial_context,
-            batch_size=batch_size,
-        )
-        turn_event_count = insert_turn_events(
-            self._conn,
-            result.turn_events,
-            detect_id=detect_id,
-            candidate_intersection_ids_by_calculate_index=(
-                turn_membership_by_calculate_index
-            ),
-            spatial_context=spatial_context,
-            batch_size=batch_size,
-        )
-        crossing_ids_by_calculate_index = insert_candidate_entry_exit_points(
-            self._conn,
-            result.clusters,
-            candidate_intersection_ids_by_calculate_index,
-            detect_id=detect_id,
-            spatial_context=spatial_context,
-            batch_size=batch_size,
-        )
-        clusters_by_calculate_index = {
-            cluster.cluster_calculate_index: cluster
-            for cluster in result.clusters
-        }
-        intersection_ids_by_calculate_index = insert_intersections(
-            self._conn,
-            result.topologies,
-            candidate_intersection_ids_by_calculate_index,
-            clusters_by_calculate_index,
-            detect_id=detect_id,
-            spatial_context=spatial_context,
-        )
-        insert_entry_exit_points(
-            self._conn,
-            result.observations,
-            intersection_ids_by_calculate_index,
-            crossing_ids_by_calculate_index,
-            detect_id=detect_id,
+            detect_id,
+            result,
             batch_size=batch_size,
         )
         return DetectPersistenceResult(
-            tracks_cross_count=tracks_cross_count,
-            turn_event_count=turn_event_count,
-            candidate_intersection_count=len(result.clusters),
-            candidate_entry_exit_point_count=sum(
-                len(cluster.crossing_points) for cluster in result.clusters
-            ),
-            intersection_count=len(intersection_ids_by_calculate_index),
-            entry_exit_point_count=sum(
-                1
-                for observation in result.observations
-                if observation.cluster_calculate_index
-                in intersection_ids_by_calculate_index
-            ),
+            resolved_point_count=counts.resolved_point_count,
+            tracks_cross_count=counts.tracks_cross_count,
+            turn_event_count=counts.turn_event_count,
+            candidate_intersection_count=counts.candidate_intersection_count,
+            candidate_entry_exit_point_count=counts.candidate_entry_exit_point_count,
+            intersection_count=counts.intersection_count,
+            entry_exit_point_count=counts.entry_exit_point_count,
+            resolved_sequence_elapsed_s=counts.resolved_sequence_elapsed_s,
         )
 
     def finish_detect(self, detect_id: str, *, status: str) -> None:

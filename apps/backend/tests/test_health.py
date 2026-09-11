@@ -1,10 +1,5 @@
-from fastapi.testclient import TestClient
-
-from backend.main import app
+from backend.main import health
 
 
-def test_health_endpoint() -> None:
-    response = TestClient(app).get("/health")
-
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok", "service": "backend"}
+def test_health_endpoint_payload() -> None:
+    assert health() == {"status": "ok", "service": "backend"}

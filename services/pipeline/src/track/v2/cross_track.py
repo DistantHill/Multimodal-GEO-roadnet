@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterator
 
 import numpy as np
@@ -177,7 +177,10 @@ def extract_cross_track_candidates(
         )
 
     ordered_candidates.sort(key=lambda item: item[0])
-    candidates = [candidate for _, candidate in ordered_candidates]
+    candidates = [
+        replace(candidate, cross_track_calculate_index=index)
+        for index, (_key, candidate) in enumerate(ordered_candidates)
+    ]
     elapsed = time.perf_counter() - started
     _emit_progress(
         live_status,
@@ -280,9 +283,20 @@ def _prepare_segments(
     cfg: Any,
 ) -> tuple[list[_CrossTrackSegment], int]:
     """Preserve straight-segment filtering in stable vehicle order."""
-    per_vehicle: list[tuple[str, list[tuple[int, float, float, float, float]]]] = []
-    for vehicle_id in sorted(tracks):
-        track = tracks[vehicle_id]
+    actual_vehicle_ids = sorted({
+        track[0].vehicle_id for track in tracks.values() if track
+    })
+    vehicle_rank_by_id = {
+        vehicle_id: rank for rank, vehicle_id in enumerate(actual_vehicle_ids)
+    }
+    per_track: list[
+        tuple[str, str, int, list[tuple[int, float, float, float, float]]]
+    ] = []
+    for track_key in sorted(tracks):
+        track = tracks[track_key]
+        if not track:
+            continue
+        vehicle_id = track[0].vehicle_id
         raw_segments: list[tuple[int, float, float, float, float]] = []
         projected_points: dict[int, tuple[float, float]] = {}
 
@@ -309,11 +323,16 @@ def _prepare_segments(
             x2, y2 = point_xy(segment_index + 1)
             raw_segments.append((segment_index, x1, y1, x2, y2))
         if raw_segments:
-            per_vehicle.append((vehicle_id, raw_segments))
+            per_track.append((
+                track_key,
+                vehicle_id,
+                vehicle_rank_by_id[vehicle_id],
+                raw_segments,
+            ))
 
     segments: list[_CrossTrackSegment] = []
-    for vehicle_rank, (vehicle_id, raw_segments) in enumerate(per_vehicle):
-        track = tracks[vehicle_id]
+    for track_key, vehicle_id, vehicle_rank, raw_segments in per_track:
+        track = tracks[track_key]
         for segment_index, x1, y1, x2, y2 in raw_segments:
             start = track[segment_index]
             segments.append(_CrossTrackSegment(
@@ -330,7 +349,7 @@ def _prepare_segments(
                 timestamp=start.timestamp,
                 cell_span=_grid_span(x1, y1, x2, y2, cfg.cross_track_grid_cell_m),
             ))
-    return segments, len(per_vehicle)
+    return segments, len(actual_vehicle_ids)
 
 
 def _build_grid(
@@ -453,6 +472,8 @@ def _candidate_from_segments(
     lon, lat = transformer.inverse(x, y)
     return CrossTrackCandidate(
         point_ref=segment_a.start.point_ref,
+        from_segment_start_point_ref=segment_a.start.point_ref,
+        to_segment_start_point_ref=segment_b.start.point_ref,
         vehicle_id=f"{segment_a.vehicle_id}|{segment_b.vehicle_id}",
         timestamp=(segment_a.timestamp + segment_b.timestamp) / 2.0,
         lon=lon,
@@ -461,14 +482,8 @@ def _candidate_from_segments(
         y=y,
         heading=segment_a.heading,
         speed=segment_a.start.speed,
-        from_source_id=segment_a.start.point_ref.source_id,
-        from_source_row_key=(
-            f"{segment_a.start.point_ref.source_row_key},{segment_a.end.point_ref.source_row_key}"
-        ),
-        to_source_id=segment_b.start.point_ref.source_id,
-        to_source_row_key=(
-            f"{segment_b.start.point_ref.source_row_key},{segment_b.end.point_ref.source_row_key}"
-        ),
+        from_segment_start=segment_a.start.cleaned_point_ref,
+        to_segment_start=segment_b.start.cleaned_point_ref,
     )
 
 

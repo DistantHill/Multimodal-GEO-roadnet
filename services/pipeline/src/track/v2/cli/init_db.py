@@ -1,78 +1,97 @@
-"""Initialize the track.v2 PostgreSQL database schema.
+"""Create the destructive track.v2 schema-v3 PostgreSQL contract.
 
-ZH: 连接到已部署的 PostgreSQL 数据库，创建流水线所需的全部数据表。
-通过 --ask-password 在 ps/CMD 窗口中交互式输入密码。
---reset 会先清空所有表数据再重建（等价于 DROP + CREATE）。
-
-EN: Connect to the deployed PostgreSQL database and create all pipeline tables.
-Use --ask-password for interactive password entry in ps/CMD windows.
---reset drops all tables first, then recreates them (DROP + CREATE).
-
-Usage / 用法::
-
-    python -m track.v2.cli.init_db --ask-password
-    python -m track.v2.cli.init_db --host 127.0.0.1 --port 5432 --database postgres --user postgres --ask-password
-    python -m track.v2.cli.init_db --reset --ask-password
+Schema v3 deliberately has no in-place upgrade path.  An existing v1/v2
+database must be recreated with ``--reset`` so an old column can never retain
+an ambiguous meaning behind a new API.
 """
 
 from __future__ import annotations
 
 import argparse
 import getpass
-import json
-import re
-import uuid
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
-from ..db.legacy_migration import load_legacy_clean_map, migrate_legacy_pipeline_runs
 from ..logger import init_logger, shutdown_logger
 
 
+SCHEMA_COMPONENT = "track.v2"
+SCHEMA_VERSION = 3
+
+
 DDL_STATEMENTS: list[tuple[str, str]] = [
-    ("clean_runs", """
+    (
+        "pipeline_schema_versions",
+        """
+        CREATE TABLE IF NOT EXISTS pipeline_schema_versions (
+            component       TEXT PRIMARY KEY,
+            version         INTEGER NOT NULL CHECK (version > 0),
+            installed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    ),
+    (
+        "clean_runs",
+        """
         CREATE TABLE IF NOT EXISTS clean_runs (
-            id              UUID PRIMARY KEY,
-            source_id       TEXT NOT NULL,
-            source_kind     TEXT NOT NULL,
-            source_srid     INTEGER NOT NULL DEFAULT 4326,
-            processing_srid INTEGER,
-            projection_config JSONB NOT NULL DEFAULT '{}',
-            parameters      JSONB NOT NULL DEFAULT '{}',
-            status          TEXT NOT NULL,
-            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            finished_at     TIMESTAMPTZ,
-            CONSTRAINT clean_runs_fixed_crs_complete CHECK (
-                source_srid = 4326
-                AND jsonb_typeof(projection_config) = 'object'
-                AND (
-                    processing_srid IS NULL OR (
-                        processing_srid > 0
-                        AND processing_srid <> 4326
-                        AND projection_config @>
-                            '{"coordinate_semantics_version": 2}'::jsonb
+            id                  UUID PRIMARY KEY,
+            source_table        TEXT NOT NULL,
+            source_srid         INTEGER NOT NULL DEFAULT 4326,
+            processing_srid     INTEGER,
+            projection_config   JSONB NOT NULL DEFAULT '{}',
+            parameters          JSONB NOT NULL DEFAULT '{}',
+            source_fingerprint  JSONB,
+            status              TEXT NOT NULL
+                                CHECK (status IN ('running', 'completed', 'failed')),
+            started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at         TIMESTAMPTZ,
+            CONSTRAINT clean_runs_source_table_not_blank
+                CHECK (BTRIM(source_table) <> ''),
+            CONSTRAINT clean_runs_projection_config_object
+                CHECK (jsonb_typeof(projection_config) = 'object'),
+            CONSTRAINT clean_runs_parameters_object
+                CHECK (jsonb_typeof(parameters) = 'object'),
+            CONSTRAINT clean_runs_source_fingerprint_object
+                CHECK (
+                    source_fingerprint IS NULL
+                    OR jsonb_typeof(source_fingerprint) = 'object'
+                ),
+            CONSTRAINT clean_runs_fixed_crs
+                CHECK (
+                    source_srid = 4326
+                    AND (
+                        processing_srid IS NULL
+                        OR (
+                            processing_srid > 0
+                            AND processing_srid <> 4326
+                            AND projection_config @>
+                                '{"coordinate_semantics_version": 2}'::jsonb
+                        )
                     )
                 )
-            )
         )
-    """),
-    ("detect_runs", """
+        """,
+    ),
+    (
+        "detect_runs",
+        """
         CREATE TABLE IF NOT EXISTS detect_runs (
             id              UUID PRIMARY KEY,
-            clean_id        UUID NOT NULL REFERENCES clean_runs(id),
-            parameters      JSONB NOT NULL DEFAULT '{}',
-            status          TEXT NOT NULL,
+            clean_id        UUID NOT NULL REFERENCES clean_runs(id) ON DELETE CASCADE,
+            parameters      JSONB NOT NULL DEFAULT '{}'
+                            CHECK (jsonb_typeof(parameters) = 'object'),
+            status          TEXT NOT NULL
+                            CHECK (status IN ('running', 'completed', 'failed')),
             started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             finished_at     TIMESTAMPTZ
         )
-    """),
-    # ── Parser 0 ──
-    ("trajectory_points", """
+        """,
+    ),
+    (
+        "trajectory_points",
+        """
         CREATE TABLE IF NOT EXISTS trajectory_points (
             id              BIGSERIAL PRIMARY KEY,
-            is_active       BOOLEAN NOT NULL DEFAULT TRUE,
             vehicle_id      TEXT NOT NULL,
             timestamp       DOUBLE PRECISION NOT NULL,
             lon             DOUBLE PRECISION NOT NULL,
@@ -85,252 +104,329 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             extra           JSONB NOT NULL DEFAULT '{}',
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
-    """),
-    # ── Cleaner 1 ──
-    ("excluded_points", """
+        """,
+    ),
+    (
+        "excluded_points",
+        """
         CREATE TABLE IF NOT EXISTS excluded_points (
-            id              BIGSERIAL PRIMARY KEY,
-            clean_id        UUID NOT NULL REFERENCES clean_runs(id),
-            source_id       TEXT NOT NULL,
+            clean_id        UUID NOT NULL REFERENCES clean_runs(id) ON DELETE CASCADE,
             source_row_key  TEXT NOT NULL,
             reason          TEXT NOT NULL,
-            lon             DOUBLE PRECISION NOT NULL,
-            lat             DOUBLE PRECISION NOT NULL,
-            geom            geometry(Point, 4326) GENERATED ALWAYS AS (
-                                ST_SetSRID(ST_MakePoint(lon, lat), 4326)
-                            ) STORED,
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (clean_id, source_row_key)
         )
-    """),
-    ("kept_trajectory_points", """
+        """,
+    ),
+    (
+        "kept_trajectory_points",
+        """
         CREATE TABLE IF NOT EXISTS kept_trajectory_points (
             id                      BIGSERIAL PRIMARY KEY,
-            clean_id                UUID NOT NULL REFERENCES clean_runs(id),
-            trajectory_point_id     BIGINT NOT NULL,
-            source_id               TEXT NOT NULL,
+            clean_id                UUID NOT NULL
+                                    REFERENCES clean_runs(id) ON DELETE CASCADE,
             source_row_key          TEXT NOT NULL,
             vehicle_id              TEXT NOT NULL,
-            subtrack_index          INTEGER NOT NULL DEFAULT 1,
-            sequence_in_subtrack    INTEGER NOT NULL,
-            created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            subtrack_index          INTEGER NOT NULL CHECK (subtrack_index >= 1),
+            sequence_in_subtrack    INTEGER NOT NULL
+                                    CHECK (sequence_in_subtrack >= 0),
+            created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT kept_points_source_member_key
+                UNIQUE (clean_id, source_row_key),
+            CONSTRAINT kept_points_sequence_key
+                UNIQUE (clean_id, subtrack_index, sequence_in_subtrack)
         )
-    """),
-    ("injected_points", """
+        """,
+    ),
+    (
+        "injected_points",
+        """
         CREATE TABLE IF NOT EXISTS injected_points (
-            id                  BIGSERIAL PRIMARY KEY,
-            clean_id            UUID NOT NULL REFERENCES clean_runs(id),
-            vehicle_id          TEXT NOT NULL,
-            subtrack_index      INTEGER NOT NULL,
-            after_sequence_in_subtrack INTEGER NOT NULL,
-            source_id           TEXT NOT NULL,
-            source_row_key      TEXT NOT NULL,
-            timestamp           DOUBLE PRECISION NOT NULL,
-            lon                 DOUBLE PRECISION NOT NULL,
-            lat                 DOUBLE PRECISION NOT NULL,
-            x                   DOUBLE PRECISION NOT NULL,
-            y                   DOUBLE PRECISION NOT NULL,
-            heading             DOUBLE PRECISION NOT NULL,
-            speed               DOUBLE PRECISION NOT NULL DEFAULT 0,
-            geom                geometry(Point, 4326) GENERATED ALWAYS AS (
-                                    ST_SetSRID(ST_MakePoint(lon, lat), 4326)
-                                ) STORED,
-            from_source_id      TEXT NOT NULL,
-            from_source_row_key TEXT NOT NULL,
-            to_source_id        TEXT NOT NULL,
-            to_source_row_key   TEXT NOT NULL,
-            generated_reason    TEXT NOT NULL DEFAULT 'orthogonal_heading',
-            origin_lon          DOUBLE PRECISION,
-            origin_lat          DOUBLE PRECISION,
-            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            id                          BIGSERIAL PRIMARY KEY,
+            clean_id                    UUID NOT NULL
+                                        REFERENCES clean_runs(id) ON DELETE CASCADE,
+            vehicle_id                  TEXT NOT NULL,
+            subtrack_index              INTEGER NOT NULL CHECK (subtrack_index >= 1),
+            after_sequence_in_subtrack  INTEGER NOT NULL
+                                        CHECK (after_sequence_in_subtrack >= 0),
+            timestamp                   DOUBLE PRECISION NOT NULL,
+            lon                         DOUBLE PRECISION NOT NULL,
+            lat                         DOUBLE PRECISION NOT NULL,
+            x                           DOUBLE PRECISION NOT NULL,
+            y                           DOUBLE PRECISION NOT NULL,
+            heading                     DOUBLE PRECISION NOT NULL,
+            speed                       DOUBLE PRECISION NOT NULL DEFAULT 0,
+            geom                        geometry(Point, 4326) GENERATED ALWAYS AS (
+                                            ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+                                        ) STORED,
+            generated_reason            TEXT NOT NULL DEFAULT 'orthogonal_heading',
+            created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT injected_points_anchor_key
+                UNIQUE (clean_id, subtrack_index, after_sequence_in_subtrack)
         )
-    """),
-    # ── Detect ──
-    ("tracks_cross", """
-        CREATE TABLE IF NOT EXISTS tracks_cross (
-            id                  BIGSERIAL PRIMARY KEY,
-            detect_id           UUID NOT NULL REFERENCES detect_runs(id),
-            candidate_intersection_id BIGINT,
-            vehicle_id          TEXT NOT NULL,
-            timestamp           DOUBLE PRECISION NOT NULL,
-            lon                 DOUBLE PRECISION NOT NULL,
-            lat                 DOUBLE PRECISION NOT NULL,
-            x                   DOUBLE PRECISION NOT NULL,
-            y                   DOUBLE PRECISION NOT NULL,
-            heading             DOUBLE PRECISION NOT NULL,
-            speed               DOUBLE PRECISION NOT NULL DEFAULT 0,
-            geom                geometry(Point, 4326) GENERATED ALWAYS AS (
-                                    ST_SetSRID(ST_MakePoint(lon, lat), 4326)
-                                ) STORED,
-            from_source_id      TEXT NOT NULL,
-            from_source_row_key TEXT NOT NULL,
-            to_source_id        TEXT NOT NULL,
-            to_source_row_key   TEXT NOT NULL,
-            generated_reason    TEXT NOT NULL DEFAULT 'orthogonal_cross_track',
-            origin_lon          DOUBLE PRECISION,
-            origin_lat          DOUBLE PRECISION,
-            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        """,
+    ),
+    (
+        "resolved_subtrack_points",
+        """
+        CREATE TABLE IF NOT EXISTS resolved_subtrack_points (
+            id                              BIGSERIAL PRIMARY KEY,
+            detect_id                       UUID NOT NULL
+                                            REFERENCES detect_runs(id) ON DELETE CASCADE,
+            subtrack_index                  INTEGER NOT NULL CHECK (subtrack_index >= 1),
+            cleaned_sequence_in_subtrack    INTEGER
+                                            CHECK (cleaned_sequence_in_subtrack >= 0),
+            sequence_in_subtrack            INTEGER NOT NULL
+                                            CHECK (sequence_in_subtrack >= 0),
+            kept_point_id                   BIGINT REFERENCES kept_trajectory_points(id),
+            injected_point_id               BIGINT REFERENCES injected_points(id),
+            crossing_point_id               BIGINT,
+            created_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT resolved_points_id_detect_key UNIQUE (id, detect_id),
+            CONSTRAINT resolved_points_exactly_one_source
+                CHECK (num_nonnulls(kept_point_id, injected_point_id, crossing_point_id) = 1),
+            CONSTRAINT resolved_points_sequence_kind_check
+                CHECK (
+                    (crossing_point_id IS NOT NULL AND cleaned_sequence_in_subtrack IS NULL)
+                    OR
+                    (crossing_point_id IS NULL AND cleaned_sequence_in_subtrack IS NOT NULL)
+                ),
+            CONSTRAINT resolved_points_final_sequence_key
+                UNIQUE (detect_id, subtrack_index, sequence_in_subtrack),
+            CONSTRAINT resolved_points_cleaned_sequence_key
+                UNIQUE (detect_id, subtrack_index, cleaned_sequence_in_subtrack),
+            CONSTRAINT resolved_points_kept_key UNIQUE (detect_id, kept_point_id),
+            CONSTRAINT resolved_points_injected_key UNIQUE (detect_id, injected_point_id),
+            CONSTRAINT resolved_points_crossing_key UNIQUE (detect_id, crossing_point_id)
         )
-    """),
-    ("turn_events", """
-        CREATE TABLE IF NOT EXISTS turn_events (
-            id                  BIGSERIAL PRIMARY KEY,
-            detect_id           UUID NOT NULL REFERENCES detect_runs(id),
-            candidate_intersection_id BIGINT,
-            vehicle_id          TEXT NOT NULL,
-            timestamp           DOUBLE PRECISION NOT NULL,
-            lon                 DOUBLE PRECISION NOT NULL,
-            lat                 DOUBLE PRECISION NOT NULL,
-            x                   DOUBLE PRECISION NOT NULL,
-            y                   DOUBLE PRECISION NOT NULL,
-            in_bearing          DOUBLE PRECISION NOT NULL,
-            out_bearing         DOUBLE PRECISION NOT NULL,
-            turn_deg            DOUBLE PRECISION NOT NULL,
-            score               DOUBLE PRECISION NOT NULL,
-            source              TEXT NOT NULL DEFAULT 'turn',
-            tp_source_id        TEXT,
-            tp_source_row_key   TEXT,
-            geom                geometry(Point, 4326) GENERATED ALWAYS AS (
-                                    ST_SetSRID(ST_MakePoint(lon, lat), 4326)
-                                ) STORED,
-            from_source_id      TEXT,
-            from_source_row_key TEXT,
-            to_source_id        TEXT,
-            to_source_row_key   TEXT,
-            origin_lon          DOUBLE PRECISION,
-            origin_lat          DOUBLE PRECISION,
-            g_star_z            DOUBLE PRECISION,
-            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE (id, detect_id)
-        )
-    """),
-    ("candidate_intersections", """
+        """,
+    ),
+    (
+        "candidate_intersections",
+        """
         CREATE TABLE IF NOT EXISTS candidate_intersections (
-            id                  BIGSERIAL PRIMARY KEY,
-            detect_id           UUID NOT NULL REFERENCES detect_runs(id),
-            centroid_x          DOUBLE PRECISION NOT NULL,
-            centroid_y          DOUBLE PRECISION NOT NULL,
-            centroid_lon        DOUBLE PRECISION NOT NULL,
-            centroid_lat        DOUBLE PRECISION NOT NULL,
-            radius_m            DOUBLE PRECISION NOT NULL,
-            geom                geometry(Polygon, 4326),  -- fixed-CRS metre buffer transformed to 4326
-            source              TEXT NOT NULL DEFAULT 'turn',
-            sources             JSONB NOT NULL DEFAULT '[]',
-            source_counts       JSONB NOT NULL DEFAULT '{}',
-            source_ratios       JSONB NOT NULL DEFAULT '{}',
-            critical_sources    JSONB NOT NULL DEFAULT '[]',
-            turn_event_count    INTEGER NOT NULL DEFAULT 0,
-            cross_track_count   INTEGER NOT NULL DEFAULT 0,
-            total_event_count   INTEGER NOT NULL DEFAULT 0,
-            origin_lon          DOUBLE PRECISION,
-            origin_lat          DOUBLE PRECISION,
-            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE (id, detect_id)
+            id                      BIGSERIAL PRIMARY KEY,
+            detect_id               UUID NOT NULL
+                                    REFERENCES detect_runs(id) ON DELETE CASCADE,
+            centroid_x              DOUBLE PRECISION NOT NULL,
+            centroid_y              DOUBLE PRECISION NOT NULL,
+            centroid_lon            DOUBLE PRECISION NOT NULL,
+            centroid_lat            DOUBLE PRECISION NOT NULL,
+            radius_m                DOUBLE PRECISION NOT NULL CHECK (radius_m > 0),
+            geom                    geometry(Polygon, 4326),
+            contributors            JSONB NOT NULL DEFAULT '{}'
+                                    CHECK (jsonb_typeof(contributors) = 'object'),
+            critical_contributors   JSONB NOT NULL DEFAULT '[]'
+                                    CHECK (jsonb_typeof(critical_contributors) = 'array'),
+            created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT candidate_intersections_id_detect_key UNIQUE (id, detect_id)
         )
-    """),
-    ("candidate_entry_exit_points", """
+        """,
+    ),
+    (
+        "tracks_cross",
+        """
+        CREATE TABLE IF NOT EXISTS tracks_cross (
+            id                              BIGSERIAL PRIMARY KEY,
+            detect_id                       UUID NOT NULL
+                                            REFERENCES detect_runs(id) ON DELETE CASCADE,
+            candidate_intersection_id       BIGINT,
+            from_segment_start_point_id     BIGINT NOT NULL,
+            to_segment_start_point_id       BIGINT NOT NULL,
+            x                               DOUBLE PRECISION NOT NULL,
+            y                               DOUBLE PRECISION NOT NULL,
+            lon                             DOUBLE PRECISION NOT NULL,
+            lat                             DOUBLE PRECISION NOT NULL,
+            geom                            geometry(Point, 4326) GENERATED ALWAYS AS (
+                                                ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+                                            ) STORED,
+            created_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT tracks_cross_candidate_fkey
+                FOREIGN KEY (candidate_intersection_id, detect_id)
+                REFERENCES candidate_intersections(id, detect_id),
+            CONSTRAINT tracks_cross_from_segment_fkey
+                FOREIGN KEY (from_segment_start_point_id, detect_id)
+                REFERENCES resolved_subtrack_points(id, detect_id),
+            CONSTRAINT tracks_cross_to_segment_fkey
+                FOREIGN KEY (to_segment_start_point_id, detect_id)
+                REFERENCES resolved_subtrack_points(id, detect_id),
+            CONSTRAINT tracks_cross_segment_order_check
+                CHECK (from_segment_start_point_id < to_segment_start_point_id),
+            CONSTRAINT tracks_cross_segment_pair_key
+                UNIQUE (
+                    detect_id,
+                    from_segment_start_point_id,
+                    to_segment_start_point_id
+                )
+        )
+        """,
+    ),
+    (
+        "turn_events",
+        """
+        CREATE TABLE IF NOT EXISTS turn_events (
+            id                          BIGSERIAL PRIMARY KEY,
+            detect_id                   UUID NOT NULL
+                                        REFERENCES detect_runs(id) ON DELETE CASCADE,
+            candidate_intersection_id   BIGINT,
+            resolved_point_id           BIGINT NOT NULL,
+            entry_bearing               DOUBLE PRECISION NOT NULL,
+            exit_bearing                DOUBLE PRECISION NOT NULL,
+            turn_deg                    DOUBLE PRECISION NOT NULL,
+            score                       DOUBLE PRECISION NOT NULL,
+            g_star_z                    DOUBLE PRECISION,
+            created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT turn_events_id_detect_key UNIQUE (id, detect_id),
+            CONSTRAINT turn_events_candidate_fkey
+                FOREIGN KEY (candidate_intersection_id, detect_id)
+                REFERENCES candidate_intersections(id, detect_id),
+            CONSTRAINT turn_events_resolved_point_fkey
+                FOREIGN KEY (resolved_point_id, detect_id)
+                REFERENCES resolved_subtrack_points(id, detect_id),
+            CONSTRAINT turn_events_resolved_point_key
+                UNIQUE (detect_id, resolved_point_id)
+        )
+        """,
+    ),
+    (
+        "candidate_entry_exit_points",
+        """
         CREATE TABLE IF NOT EXISTS candidate_entry_exit_points (
             id                          BIGSERIAL PRIMARY KEY,
-            detect_id                   UUID NOT NULL REFERENCES detect_runs(id),
+            detect_id                   UUID NOT NULL
+                                        REFERENCES detect_runs(id) ON DELETE CASCADE,
             candidate_intersection_id   BIGINT NOT NULL,
-            vehicle_id                  TEXT NOT NULL,
-            segment_index               INTEGER NOT NULL,
-            crossing_type               TEXT NOT NULL,
+            segment_start_point_id      BIGINT NOT NULL,
+            crossing_type               SMALLINT NOT NULL
+                                        CHECK (crossing_type IN (0, 1)),
             crossing_x                  DOUBLE PRECISION NOT NULL,
             crossing_y                  DOUBLE PRECISION NOT NULL,
             crossing_lon                DOUBLE PRECISION NOT NULL,
             crossing_lat                DOUBLE PRECISION NOT NULL,
             geom                        geometry(Point, 4326) GENERATED ALWAYS AS (
-                                            ST_SetSRID(ST_MakePoint(crossing_lon, crossing_lat), 4326)
+                                            ST_SetSRID(
+                                                ST_MakePoint(crossing_lon, crossing_lat),
+                                                4326
+                                            )
                                         ) STORED,
-            branch_angle_deg            DOUBLE PRECISION,
-            origin_lon                  DOUBLE PRECISION,
-            origin_lat                  DOUBLE PRECISION,
-            from_source_id              TEXT,
-            from_source_row_key         TEXT,
-            to_source_id                TEXT,
-            to_source_row_key           TEXT,
             created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE (id, detect_id),
-            FOREIGN KEY (candidate_intersection_id, detect_id)
-                REFERENCES candidate_intersections(id, detect_id)
+            CONSTRAINT candidate_crossings_id_detect_key UNIQUE (id, detect_id),
+            CONSTRAINT candidate_crossings_candidate_fkey
+                FOREIGN KEY (candidate_intersection_id, detect_id)
+                REFERENCES candidate_intersections(id, detect_id),
+            CONSTRAINT candidate_crossings_segment_start_fkey
+                FOREIGN KEY (segment_start_point_id, detect_id)
+                REFERENCES resolved_subtrack_points(id, detect_id),
+            CONSTRAINT candidate_crossings_segment_type_key
+                UNIQUE (
+                    detect_id,
+                    candidate_intersection_id,
+                    segment_start_point_id,
+                    crossing_type
+                )
         )
-    """),
-    ("intersections", """
+        """,
+    ),
+    (
+        "intersections",
+        """
         CREATE TABLE IF NOT EXISTS intersections (
             id                          BIGSERIAL PRIMARY KEY,
-            detect_id                   UUID NOT NULL REFERENCES detect_runs(id),
+            detect_id                   UUID NOT NULL
+                                        REFERENCES detect_runs(id) ON DELETE CASCADE,
             candidate_intersection_id   BIGINT NOT NULL,
-            branch_centers_deg          JSONB NOT NULL DEFAULT '[]',
-            transition_counts           JSONB NOT NULL DEFAULT '{}',
-            observation_count           INTEGER NOT NULL,
-            is_complete                 BOOLEAN NOT NULL DEFAULT TRUE,
-            reason                      TEXT NOT NULL,
-            clip_radius_m               DOUBLE PRECISION NOT NULL,
-            geom                        geometry(Polygon, 4326),  -- app-layer: derived from candidate_intersections
+            branch_centers_deg          JSONB NOT NULL DEFAULT '[]'
+                                        CHECK (jsonb_typeof(branch_centers_deg) = 'array'),
+            transition_counts           JSONB NOT NULL DEFAULT '{}'
+                                        CHECK (jsonb_typeof(transition_counts) = 'object'),
+            observation_count           INTEGER NOT NULL CHECK (observation_count >= 0),
+            clip_radius_m               DOUBLE PRECISION NOT NULL CHECK (clip_radius_m > 0),
+            geom                        geometry(Polygon, 4326) NOT NULL,
             created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE (id, detect_id),
+            CONSTRAINT intersections_id_detect_key UNIQUE (id, detect_id),
             CONSTRAINT intersections_detect_candidate_key
                 UNIQUE (detect_id, candidate_intersection_id),
-            FOREIGN KEY (candidate_intersection_id, detect_id)
+            CONSTRAINT intersections_candidate_fkey
+                FOREIGN KEY (candidate_intersection_id, detect_id)
                 REFERENCES candidate_intersections(id, detect_id)
         )
-    """),
-    ("entry_exit_points", """
+        """,
+    ),
+    (
+        "entry_exit_points",
+        """
         CREATE TABLE IF NOT EXISTS entry_exit_points (
             id                  BIGSERIAL PRIMARY KEY,
-            detect_id           UUID NOT NULL REFERENCES detect_runs(id),
+            detect_id           UUID NOT NULL
+                                REFERENCES detect_runs(id) ON DELETE CASCADE,
             intersection_id     BIGINT NOT NULL,
-            vehicle_id          TEXT NOT NULL,
-            entry_branch_angle  DOUBLE PRECISION NOT NULL,
-            exit_branch_angle   DOUBLE PRECISION NOT NULL,
-            inbound_bearing     DOUBLE PRECISION NOT NULL,
-            outbound_bearing    DOUBLE PRECISION NOT NULL,
-            turn_deg            DOUBLE PRECISION NOT NULL,
-            entry_crossing_id   BIGINT,
-            exit_crossing_id    BIGINT,
+            entry_bearing       DOUBLE PRECISION NOT NULL,
+            exit_bearing        DOUBLE PRECISION NOT NULL,
+            entry_crossing_id   BIGINT NOT NULL,
+            exit_crossing_id    BIGINT NOT NULL,
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            FOREIGN KEY (intersection_id, detect_id)
+            CONSTRAINT entry_exit_points_id_detect_key UNIQUE (id, detect_id),
+            CONSTRAINT entry_exit_points_intersection_fkey
+                FOREIGN KEY (intersection_id, detect_id)
                 REFERENCES intersections(id, detect_id),
-            FOREIGN KEY (entry_crossing_id, detect_id)
+            CONSTRAINT entry_exit_points_entry_crossing_fkey
+                FOREIGN KEY (entry_crossing_id, detect_id)
                 REFERENCES candidate_entry_exit_points(id, detect_id),
-            FOREIGN KEY (exit_crossing_id, detect_id)
-                REFERENCES candidate_entry_exit_points(id, detect_id)
+            CONSTRAINT entry_exit_points_exit_crossing_fkey
+                FOREIGN KEY (exit_crossing_id, detect_id)
+                REFERENCES candidate_entry_exit_points(id, detect_id),
+            CONSTRAINT entry_exit_points_distinct_crossings_check
+                CHECK (entry_crossing_id <> exit_crossing_id),
+            CONSTRAINT entry_exit_points_pair_key
+                UNIQUE (detect_id, intersection_id, entry_crossing_id, exit_crossing_id)
         )
-    """),
-    ("fit_runs", """
+        """,
+    ),
+    (
+        "fit_runs",
+        """
         CREATE TABLE IF NOT EXISTS fit_runs (
             id                  UUID PRIMARY KEY,
-            detect_id           UUID NOT NULL REFERENCES detect_runs(id),
+            detect_id           UUID NOT NULL
+                                REFERENCES detect_runs(id) ON DELETE CASCADE,
             clip_algorithm      TEXT NOT NULL,
             clip_version        TEXT NOT NULL,
             fitting_algorithm   TEXT NOT NULL,
             fitting_version     TEXT NOT NULL,
-            parameters          JSONB NOT NULL DEFAULT '{}',
+            parameters          JSONB NOT NULL DEFAULT '{}'
+                                CHECK (jsonb_typeof(parameters) = 'object'),
             report              JSONB,
-            status              TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+            status              TEXT NOT NULL
+                                CHECK (status IN ('running', 'completed', 'failed')),
             started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             finished_at         TIMESTAMPTZ,
-            UNIQUE (id, detect_id)
+            CONSTRAINT fit_runs_id_detect_key UNIQUE (id, detect_id)
         )
-    """),
-    ("centerlines", """
+        """,
+    ),
+    (
+        "centerlines",
+        """
         CREATE TABLE IF NOT EXISTS centerlines (
-            id                  BIGSERIAL PRIMARY KEY,
-            fit_id              UUID NOT NULL,
-            detect_id           UUID NOT NULL,
-            variant             TEXT NOT NULL CHECK (variant IN ('combined', 'directed')),
-            from_intersection_id BIGINT NOT NULL,
-            to_intersection_id  BIGINT NOT NULL,
-            geom                geometry(LineString, 4326) NOT NULL,
-            length_m            DOUBLE PRECISION NOT NULL,
-            forward_clip_count  INTEGER NOT NULL,
-            reverse_clip_count  INTEGER NOT NULL,
-            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            FOREIGN KEY (fit_id, detect_id) REFERENCES fit_runs(id, detect_id),
-            CONSTRAINT centerlines_from_intersection_detect_fkey
+            id                      BIGSERIAL PRIMARY KEY,
+            fit_id                  UUID NOT NULL,
+            detect_id               UUID NOT NULL,
+            variant                 TEXT NOT NULL
+                                    CHECK (variant IN ('combined', 'directed')),
+            from_intersection_id    BIGINT NOT NULL,
+            to_intersection_id      BIGINT NOT NULL,
+            geom                    geometry(LineString, 4326) NOT NULL,
+            length_m                DOUBLE PRECISION NOT NULL CHECK (length_m > 0),
+            forward_clip_count      INTEGER NOT NULL CHECK (forward_clip_count >= 0),
+            reverse_clip_count      INTEGER NOT NULL CHECK (reverse_clip_count >= 0),
+            created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT centerlines_id_detect_key UNIQUE (id, detect_id),
+            CONSTRAINT centerlines_fit_fkey
+                FOREIGN KEY (fit_id, detect_id) REFERENCES fit_runs(id, detect_id),
+            CONSTRAINT centerlines_from_intersection_fkey
                 FOREIGN KEY (from_intersection_id, detect_id)
                 REFERENCES intersections(id, detect_id),
-            CONSTRAINT centerlines_to_intersection_detect_fkey
+            CONSTRAINT centerlines_to_intersection_fkey
                 FOREIGN KEY (to_intersection_id, detect_id)
                 REFERENCES intersections(id, detect_id),
             CONSTRAINT centerlines_fit_variant_endpoints_key
@@ -338,1145 +434,1429 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             CONSTRAINT centerlines_distinct_endpoints_check
                 CHECK (from_intersection_id <> to_intersection_id),
             CONSTRAINT centerlines_combined_endpoint_order_check
-                CHECK (variant <> 'combined' OR from_intersection_id < to_intersection_id)
+                CHECK (variant <> 'combined' OR from_intersection_id < to_intersection_id),
+            CONSTRAINT centerlines_nonempty_evidence_check
+                CHECK (forward_clip_count + reverse_clip_count > 0)
         )
-    """),
-    ("centerline_source_clips", """
+        """,
+    ),
+    (
+        "centerline_source_clips",
+        """
         CREATE TABLE IF NOT EXISTS centerline_source_clips (
-            centerline_id              BIGINT NOT NULL REFERENCES centerlines(id),
-            input_ordinal              INTEGER NOT NULL,
-            clip_id                    TEXT NOT NULL,
-            vehicle_id                 TEXT NOT NULL,
-            subtrack_index             INTEGER NOT NULL,
-            clip_ordinal_in_track      INTEGER NOT NULL,
-            start_intersection_id      BIGINT NOT NULL,
-            start_segment_index        INTEGER NOT NULL,
-            start_segment_fraction     DOUBLE PRECISION NOT NULL,
-            interior_start_index       INTEGER NOT NULL,
-            interior_end_index_exclusive INTEGER NOT NULL,
-            end_intersection_id        BIGINT NOT NULL,
-            end_segment_index          INTEGER NOT NULL,
-            end_segment_fraction       DOUBLE PRECISION NOT NULL,
+            centerline_id                  BIGINT NOT NULL,
+            detect_id                      UUID NOT NULL,
+            input_ordinal                  INTEGER NOT NULL CHECK (input_ordinal >= 0),
+            start_crossing_id              BIGINT NOT NULL,
+            end_crossing_id                BIGINT NOT NULL,
             reverse_to_centerline_direction BOOLEAN NOT NULL,
-            input_point_count          INTEGER NOT NULL,
             PRIMARY KEY (centerline_id, input_ordinal),
-            UNIQUE (centerline_id, clip_id),
-            CONSTRAINT centerline_source_clips_start_intersection_fkey
-                FOREIGN KEY (start_intersection_id) REFERENCES intersections(id),
-            CONSTRAINT centerline_source_clips_end_intersection_fkey
-                FOREIGN KEY (end_intersection_id) REFERENCES intersections(id)
+            CONSTRAINT centerline_source_clips_centerline_fkey
+                FOREIGN KEY (centerline_id, detect_id)
+                REFERENCES centerlines(id, detect_id) ON DELETE CASCADE,
+            CONSTRAINT centerline_source_clips_start_crossing_fkey
+                FOREIGN KEY (start_crossing_id, detect_id)
+                REFERENCES candidate_entry_exit_points(id, detect_id),
+            CONSTRAINT centerline_source_clips_end_crossing_fkey
+                FOREIGN KEY (end_crossing_id, detect_id)
+                REFERENCES candidate_entry_exit_points(id, detect_id),
+            CONSTRAINT centerline_source_clips_distinct_crossings_check
+                CHECK (start_crossing_id <> end_crossing_id),
+            CONSTRAINT centerline_source_clips_crossing_pair_key
+                UNIQUE (centerline_id, start_crossing_id, end_crossing_id)
         )
-    """),
+        """,
+    ),
 ]
 
-# ── Index DDL (separate for cleaner error reporting) ────────────────
 
 INDEX_STATEMENTS: list[tuple[str, str]] = [
-    ("idx_clean_runs_source", "CREATE INDEX IF NOT EXISTS idx_clean_runs_source ON clean_runs(source_id, started_at DESC)"),
-    ("idx_detect_runs_clean", "CREATE INDEX IF NOT EXISTS idx_detect_runs_clean ON detect_runs(clean_id, started_at DESC)"),
-    ("idx_fit_runs_detect", "CREATE INDEX IF NOT EXISTS idx_fit_runs_detect ON fit_runs(detect_id, started_at DESC)"),
-    ("idx_centerlines_fit", "CREATE INDEX IF NOT EXISTS idx_centerlines_fit ON centerlines(fit_id, variant)"),
-    # ── trajectory_points ──
-    ("idx_tp_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_tp_vehicle_ts ON trajectory_points(vehicle_id, timestamp)"),
-    ("idx_tp_geom",            "CREATE INDEX IF NOT EXISTS idx_tp_geom ON trajectory_points USING GIST (geom)"),
-    ("idx_tp_active",          "CREATE INDEX IF NOT EXISTS idx_tp_active ON trajectory_points(is_active) WHERE is_active = TRUE"),
-    # ── excluded_points ──
-    ("idx_ep_reason",          "CREATE INDEX IF NOT EXISTS idx_ep_reason ON excluded_points(reason)"),
-    ("idx_ep_geom",            "CREATE INDEX IF NOT EXISTS idx_ep_geom ON excluded_points USING GIST (geom)"),
-    ("idx_ep_clean",           "CREATE INDEX IF NOT EXISTS idx_ep_clean ON excluded_points(clean_id)"),
-    # ── kept_trajectory_points ──
-    ("idx_ktp_tp_clean_cover", "CREATE INDEX IF NOT EXISTS idx_ktp_tp_clean_cover ON kept_trajectory_points(trajectory_point_id, clean_id) INCLUDE (vehicle_id, source_id, source_row_key)"),
-    ("idx_ktp_member_unique",  "CREATE UNIQUE INDEX IF NOT EXISTS idx_ktp_member_unique ON kept_trajectory_points(clean_id, vehicle_id, subtrack_index, sequence_in_subtrack)"),
-    # ── injected_points ──
-    ("idx_ip_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_ip_vehicle_ts ON injected_points(clean_id, vehicle_id, timestamp)"),
-    ("idx_ip_member_unique",   "CREATE UNIQUE INDEX IF NOT EXISTS idx_ip_member_unique ON injected_points(clean_id, vehicle_id, subtrack_index, after_sequence_in_subtrack)"),
-    ("idx_ip_geom",            "CREATE INDEX IF NOT EXISTS idx_ip_geom ON injected_points USING GIST (geom)"),
-    # ── tracks_cross ──
-    ("idx_tc_vehicle_ts",      "CREATE INDEX IF NOT EXISTS idx_tc_vehicle_ts ON tracks_cross(detect_id, vehicle_id, timestamp)"),
-    ("idx_tc_geom",            "CREATE INDEX IF NOT EXISTS idx_tc_geom ON tracks_cross USING GIST (geom)"),
-    ("idx_tc_segment_pair",    "CREATE UNIQUE INDEX IF NOT EXISTS idx_tc_segment_pair ON tracks_cross (detect_id, vehicle_id, from_source_id, from_source_row_key, to_source_id, to_source_row_key)"),
-    ("idx_tc_candidate",       "CREATE INDEX IF NOT EXISTS idx_tc_candidate ON tracks_cross(detect_id, candidate_intersection_id) WHERE candidate_intersection_id IS NOT NULL"),
-    # ── turn_events ──
-    ("idx_te_vehicle_ts",      "CREATE UNIQUE INDEX IF NOT EXISTS idx_te_vehicle_ts ON turn_events(detect_id, vehicle_id, timestamp)"),
-    ("idx_te_detect_id",       "CREATE INDEX IF NOT EXISTS idx_te_detect_id ON turn_events(detect_id)"),
-    ("idx_te_source",          "CREATE INDEX IF NOT EXISTS idx_te_source ON turn_events(source)"),
-    ("idx_te_xy",              "CREATE INDEX IF NOT EXISTS idx_te_xy ON turn_events(detect_id, x, y)"),
-    ("idx_te_geom",            "CREATE INDEX IF NOT EXISTS idx_te_geom ON turn_events USING GIST (geom)"),
-    ("idx_te_candidate",       "CREATE INDEX IF NOT EXISTS idx_te_candidate ON turn_events(detect_id, candidate_intersection_id) WHERE candidate_intersection_id IS NOT NULL"),
-    # ── candidate_intersections ──
-    ("idx_ci_detect_id",       "CREATE INDEX IF NOT EXISTS idx_ci_detect_id ON candidate_intersections(detect_id, id)"),
-    ("idx_ci_source",          "CREATE INDEX IF NOT EXISTS idx_ci_source ON candidate_intersections(source)"),
-    ("idx_ci_centroid",        "CREATE INDEX IF NOT EXISTS idx_ci_centroid ON candidate_intersections(centroid_lon, centroid_lat)"),
-    ("idx_ci_geom",            "CREATE INDEX IF NOT EXISTS idx_ci_geom ON candidate_intersections USING GIST (geom)"),
-    # ── candidate_entry_exit_points ──
-    ("idx_ceep_candidate",     "CREATE INDEX IF NOT EXISTS idx_ceep_candidate ON candidate_entry_exit_points(detect_id, candidate_intersection_id, vehicle_id)"),
-    ("idx_ceep_type",          "CREATE INDEX IF NOT EXISTS idx_ceep_type ON candidate_entry_exit_points(crossing_type)"),
-    ("idx_ceep_geom",          "CREATE INDEX IF NOT EXISTS idx_ceep_geom ON candidate_entry_exit_points USING GIST (geom)"),
-    # ── intersections ──
-    ("idx_int_detect_id",      "CREATE INDEX IF NOT EXISTS idx_int_detect_id ON intersections(detect_id, id)"),
-    ("idx_int_complete",       "CREATE INDEX IF NOT EXISTS idx_int_complete ON intersections(is_complete)"),
-    ("idx_int_geom",           "CREATE INDEX IF NOT EXISTS idx_int_geom ON intersections USING GIST (geom)"),
-    # ── entry_exit_points ──
-    ("idx_eep_intersection_vehicle", "CREATE INDEX IF NOT EXISTS idx_eep_intersection_vehicle ON entry_exit_points(detect_id, intersection_id, vehicle_id)"),
-    ("idx_eep_intersection",   "CREATE INDEX IF NOT EXISTS idx_eep_intersection ON entry_exit_points(intersection_id)"),
+    (
+        "idx_clean_runs_source_table",
+        "CREATE INDEX IF NOT EXISTS idx_clean_runs_source_table "
+        "ON clean_runs(source_table, started_at DESC)",
+    ),
+    (
+        "idx_detect_runs_clean",
+        "CREATE INDEX IF NOT EXISTS idx_detect_runs_clean "
+        "ON detect_runs(clean_id, started_at DESC)",
+    ),
+    (
+        "idx_fit_runs_detect",
+        "CREATE INDEX IF NOT EXISTS idx_fit_runs_detect "
+        "ON fit_runs(detect_id, started_at DESC)",
+    ),
+    (
+        "idx_trajectory_points_vehicle_time",
+        "CREATE INDEX IF NOT EXISTS idx_trajectory_points_vehicle_time "
+        "ON trajectory_points(vehicle_id, timestamp, id)",
+    ),
+    (
+        "idx_trajectory_points_geom",
+        "CREATE INDEX IF NOT EXISTS idx_trajectory_points_geom "
+        "ON trajectory_points USING GIST (geom)",
+    ),
+    (
+        "idx_excluded_points_reason",
+        "CREATE INDEX IF NOT EXISTS idx_excluded_points_reason "
+        "ON excluded_points(clean_id, reason)",
+    ),
+    (
+        "idx_kept_points_subtrack",
+        "CREATE INDEX IF NOT EXISTS idx_kept_points_subtrack "
+        "ON kept_trajectory_points(clean_id, subtrack_index, sequence_in_subtrack)",
+    ),
+    (
+        "idx_injected_points_subtrack",
+        "CREATE INDEX IF NOT EXISTS idx_injected_points_subtrack "
+        "ON injected_points(clean_id, subtrack_index, after_sequence_in_subtrack)",
+    ),
+    (
+        "idx_injected_points_geom",
+        "CREATE INDEX IF NOT EXISTS idx_injected_points_geom "
+        "ON injected_points USING GIST (geom)",
+    ),
+    (
+        "idx_resolved_points_final",
+        "CREATE INDEX IF NOT EXISTS idx_resolved_points_final "
+        "ON resolved_subtrack_points(detect_id, subtrack_index, sequence_in_subtrack)",
+    ),
+    (
+        "idx_candidate_intersections_geom",
+        "CREATE INDEX IF NOT EXISTS idx_candidate_intersections_geom "
+        "ON candidate_intersections USING GIST (geom)",
+    ),
+    (
+        "idx_tracks_cross_candidate",
+        "CREATE INDEX IF NOT EXISTS idx_tracks_cross_candidate "
+        "ON tracks_cross(detect_id, candidate_intersection_id) "
+        "WHERE candidate_intersection_id IS NOT NULL",
+    ),
+    (
+        "idx_tracks_cross_geom",
+        "CREATE INDEX IF NOT EXISTS idx_tracks_cross_geom "
+        "ON tracks_cross USING GIST (geom)",
+    ),
+    (
+        "idx_turn_events_candidate",
+        "CREATE INDEX IF NOT EXISTS idx_turn_events_candidate "
+        "ON turn_events(detect_id, candidate_intersection_id) "
+        "WHERE candidate_intersection_id IS NOT NULL",
+    ),
+    (
+        "idx_candidate_crossings_candidate",
+        "CREATE INDEX IF NOT EXISTS idx_candidate_crossings_candidate "
+        "ON candidate_entry_exit_points(detect_id, candidate_intersection_id)",
+    ),
+    (
+        "idx_candidate_crossings_geom",
+        "CREATE INDEX IF NOT EXISTS idx_candidate_crossings_geom "
+        "ON candidate_entry_exit_points USING GIST (geom)",
+    ),
+    (
+        "idx_intersections_geom",
+        "CREATE INDEX IF NOT EXISTS idx_intersections_geom "
+        "ON intersections USING GIST (geom)",
+    ),
+    (
+        "idx_entry_exit_points_intersection",
+        "CREATE INDEX IF NOT EXISTS idx_entry_exit_points_intersection "
+        "ON entry_exit_points(detect_id, intersection_id)",
+    ),
+    (
+        "idx_centerlines_fit",
+        "CREATE INDEX IF NOT EXISTS idx_centerlines_fit "
+        "ON centerlines(fit_id, variant)",
+    ),
 ]
 
 
-def reset_tables(config: PostgresConfig,skip_tables: list[str]) -> int:
-    """Drop all pipeline tables in reverse dependency order.
-
-    ZH: 按反向依赖顺序删除所有流水线数据表（先删引用表，再删被引用表），
-        清除全部数据。如果表不存在则跳过（IF EXISTS）。
-    EN: Drop all pipeline tables in reverse FK order — referencing tables
-        first, referenced tables last. Skips nonexistent tables (IF EXISTS).
-    """
-    # ZH: 反向遍历 DDL 列表，确保引用表先被删除
-    # EN: Reverse DDL order so referencing tables are dropped before their parents
-    drop_order = [
-        ("candidate_intersection_events", ""),
-        *reversed(DDL_STATEMENTS),
-        ("pipeline_runs", ""),
-    ]
-    drop_order = [(name, ddl) for name, ddl in drop_order if name not in skip_tables]
-    tables_dropped = 0
-
-    with pg_connect(config) as conn:
-        with conn.cursor() as cur:
-            print("\n── 重置数据表 / Resetting Tables ──")
-            for name, _ in drop_order:
-                sql = f"DROP TABLE IF EXISTS {name} CASCADE"
-                cur.execute(sql)
-                status = cur.statusmessage
-                print(f"  [OK] DROP {name:40s} {status}")
-                tables_dropped += 1
-        conn.commit()
-
-    print(f"\n  已删除 / Dropped: {tables_dropped} 表/tables")
-    return 0
-
-
-# ── Auto column migration helpers ────────────────────────────────────
-# ZH: 从 CREATE TABLE DDL 中解析列定义，对比 information_schema.columns，
-#     自动生成 ALTER TABLE ADD COLUMN IF NOT EXISTS，消除手动维护迁移列表的需求。
-# EN: Parse column definitions from CREATE TABLE DDL, diff against
-#     information_schema.columns, and auto-generate ALTER TABLE ADD COLUMN
-#     IF NOT EXISTS — eliminating the need for a hand-maintained migration list.
-
-
-def _strip_sql_comments(text: str) -> str:
-    """Remove SQL single-line comments (``-- ...``) from *text*.
-
-    ZH: 去掉 ``--`` 注释，防止注释中的括号和逗号干扰 DDL 解析。
-    EN: Strip ``--`` comments so their parens/commas don't break the DDL parser.
-    """
-    return re.sub(r"--[^\n]*", "", text)
-
-
-def _matching_paren(text: str, open_idx: int) -> int:
-    """Return the index of the closing paren that matches ``text[open_idx]``."""
-    depth = 0
-    for i in range(open_idx, len(text)):
-        if text[i] == "(":
-            depth += 1
-        elif text[i] == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-    raise ValueError("Unmatched parenthesis in DDL")
-
-
-def _split_top_level(text: str, sep: str = ",") -> list[str]:
-    """Split *text* by *sep*, but only when paren-depth is zero.
-
-    ZH: 按分隔符切分，但跳过括号内的分隔符。
-        保护 ``geometry(Point, 4326)``、``ST_MakePoint(lon, lat)`` 等片段。
-    """
-    parts: list[str] = []
-    depth = 0
-    current: list[str] = []
-    for char in text:
-        if char == "(":
-            depth += 1
-            current.append(char)
-        elif char == ")":
-            depth -= 1
-            current.append(char)
-        elif char == sep and depth == 0:
-            parts.append("".join(current))
-            current = []
-        else:
-            current.append(char)
-    if current:
-        parts.append("".join(current))
-    return parts
-
-
-def parse_ddl_columns(ddl: str) -> dict[str, str]:
-    """Parse a ``CREATE TABLE`` DDL string, returning ``{column_name: definition}``.
-
-    ZH: 从 CREATE TABLE DDL 中提取列定义。跳过 GENERATED 列、SERIAL 类型
-        和表级约束（PRIMARY KEY / UNIQUE / CHECK / FOREIGN KEY / CONSTRAINT）。
-
-    EN: Extract column definitions from a CREATE TABLE DDL. Skips GENERATED
-        columns, SERIAL types, and table-level constraints.
-    """
-    text = _strip_sql_comments(ddl)
-    try:
-        open_idx = text.index("(")
-    except ValueError:
-        return {}
-    close_idx = _matching_paren(text, open_idx)
-    body = text[open_idx + 1 : close_idx]
-
-    columns: dict[str, str] = {}
-    for part in _split_top_level(body):
-        part = part.strip()
-        if not part:
-            continue
-        up = part.upper().lstrip()
-
-        # Skip table-level constraints
-        if up.startswith(
-            ("PRIMARY KEY", "UNIQUE", "CHECK", "FOREIGN KEY", "CONSTRAINT")
-        ):
-            continue
-
-        # Split into column-name and the rest
-        first_space = part.find(" ")
-        if first_space == -1:
-            continue
-        col_name = part[:first_space].strip()
-        col_def = part[first_space + 1 :].strip()
-        if not col_def:
-            continue
-
-        columns[col_name] = col_def
-
-    return columns
-
-
-def column_to_alter_fragment(col_name: str, col_def: str) -> str | None:
-    """Convert a CREATE TABLE column definition into an ALTER TABLE-safe fragment.
-
-    ZH: 将 CREATE TABLE 的列定义转为 ALTER TABLE ADD COLUMN 安全形式。
-        - GENERATED ALWAYS AS / SERIAL → 返回 None（无法通过 ALTER 添加）
-        - NOT NULL 无 DEFAULT → 去除 NOT NULL（现有行会是 NULL）
-        - PRIMARY KEY / UNIQUE → 去除（有数据的表无法加约束）
-
-    Returns the ALTER-safe type + constraint fragment, or *None* to skip.
-    """
-    defn = col_def.strip()
-    if not defn:
-        return None
-
-    # Skip generated (computed) columns — can't ALTER ADD
-    if re.search(r"\bGENERATED\s+ALWAYS\s+AS\b", defn, re.IGNORECASE):
-        return None
-
-    # Skip SERIAL types — PostgreSQL auto-creates the sequence
-    type_token = defn.split(maxsplit=1)[0].upper()
-    if type_token in ("SERIAL", "SMALLSERIAL", "BIGSERIAL"):
-        return None
-
-    # NOT NULL without DEFAULT → strip NOT NULL (existing rows get NULL)
-    has_not_null = bool(re.search(r"\bNOT\s+NULL\b", defn, re.IGNORECASE))
-    has_default = bool(re.search(r"\bDEFAULT\b", defn, re.IGNORECASE))
-    if has_not_null and not has_default:
-        defn = re.sub(r"\bNOT\s+NULL\b", "", defn, flags=re.IGNORECASE)
-
-    # Strip inline PRIMARY KEY / UNIQUE (can't add to populated table)
-    defn = re.sub(r"\bPRIMARY\s+KEY\b", "", defn, flags=re.IGNORECASE)
-    defn = re.sub(r"\bUNIQUE\b", "", defn, flags=re.IGNORECASE)
-
-    # Collapse whitespace
-    return re.sub(r"\s+", " ", defn).strip()
-
-
-def build_auto_migrations(
-    table_name: str, ddl: str, existing: set[str]
-) -> list[tuple[str, str | None, str | None]]:
-    """Diff DDL columns against existing columns; return migration entries.
-
-    ZH: 对比 DDL 和数据库实际列，返回 ``[(column_name, fragment|None, sql|None)]``。
-        纯函数，不接触数据库——是测试核心。
-    """
-    expected = parse_ddl_columns(ddl)
-    out: list[tuple[str, str | None, str | None]] = []
-    for col, defn in expected.items():
-        if col in existing:
-            continue
-        fragment = column_to_alter_fragment(col, defn)
-        sql = (
-            None
-            if fragment is None
-            else f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {col} {fragment}"
-        )
-        out.append((col, fragment, sql))
-    return out
-
-
-def _fetch_existing_columns(cur: Any, table_name: str) -> set[str]:
-    """Query *information_schema.columns* for the current column set."""
-    cur.execute(
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema = current_schema() AND table_name = %s",
-        (table_name,),
-    )
-    return {row[0] for row in cur.fetchall()}
-
-
-def _auto_add_missing_columns(cur: Any, table_name: str, ddl: str) -> int:
-    """Compare DDL vs live columns and add any missing ones.
-
-    ZH: 对比 DDL 与实际列，动态执行 ``ALTER TABLE ADD COLUMN IF NOT EXISTS``。
-        跳过无法通过 ALTER 添加的列（GENERATED / SERIAL）。
-        返回失败数（0 = 全部成功或无需变更）。
-    """
-    existing = _fetch_existing_columns(cur, table_name)
-    for col, fragment, sql in build_auto_migrations(table_name, ddl, existing):
-        if fragment is None:
-            print(
-                f"  [SKIP] auto-add {table_name}.{col:28s} "
-                f"generated/serial — cannot ALTER"
-            )
-            continue
-        cur.execute(sql)
-        print(
-            f"  [OK] auto-add {table_name}.{col:28s} "
-            f"{cur.statusmessage}"
-        )
-    return 0
-
-
-_BACKFILL_INTERSECTION_IDENTITIES_SQL = """
-DO $migration$
-DECLARE
-    base_legacy_columns INTEGER;
-    centerline_legacy_columns INTEGER;
-    manifest_legacy_columns INTEGER;
-    conflict BOOLEAN;
-BEGIN
-    SELECT COUNT(*) INTO base_legacy_columns
-    FROM information_schema.columns
-    WHERE table_schema = current_schema()
-      AND (table_name, column_name) IN (VALUES
-          ('candidate_intersections', 'cluster_id'),
-          ('candidate_entry_exit_points', 'cluster_id'),
-          ('intersections', 'cluster_id'),
-          ('entry_exit_points', 'cluster_id')
-      );
-    SELECT COUNT(*) INTO centerline_legacy_columns
-    FROM information_schema.columns
-    WHERE table_schema = current_schema()
-      AND table_name = 'centerlines'
-      AND column_name IN ('from_cluster_id', 'to_cluster_id');
-    SELECT COUNT(*) INTO manifest_legacy_columns
-    FROM information_schema.columns
-    WHERE table_schema = current_schema()
-      AND table_name = 'centerline_source_clips'
-      AND column_name IN ('start_cluster_id', 'end_cluster_id');
-
-    IF base_legacy_columns NOT IN (0, 4) THEN
-        RAISE EXCEPTION 'partial legacy cluster columns prevent migration';
-    END IF;
-    IF centerline_legacy_columns NOT IN (0, 2) THEN
-        RAISE EXCEPTION 'partial legacy centerline endpoints prevent migration';
-    END IF;
-    IF manifest_legacy_columns NOT IN (0, 2) THEN
-        RAISE EXCEPTION 'partial legacy centerline manifest endpoints prevent migration';
-    END IF;
-    IF (centerline_legacy_columns > 0 OR manifest_legacy_columns > 0)
-       AND base_legacy_columns = 0 THEN
-        RAISE EXCEPTION 'legacy endpoint migration requires intersections.cluster_id';
-    END IF;
-
-    IF base_legacy_columns = 4 THEN
-        EXECUTE $query$
-            SELECT EXISTS (
+POST_DDL_STATEMENTS: list[tuple[str, str]] = [
+    (
+        "resolved_points_crossing_fkey",
+        """
+        DO $ddl$
+        BEGIN
+            IF NOT EXISTS (
                 SELECT 1
-                FROM candidate_entry_exit_points AS crossing
-                LEFT JOIN candidate_intersections AS candidate
-                  ON candidate.id = crossing.candidate_intersection_id
-                 AND candidate.detect_id = crossing.detect_id
-                WHERE candidate.id IS NULL
-                   OR crossing.cluster_id IS DISTINCT FROM candidate.cluster_id
-            )
-        $query$ INTO conflict;
-        IF conflict THEN
-            RAISE EXCEPTION 'candidate crossing cluster identity is inconsistent';
-        END IF;
-
-        EXECUTE $query$
-            SELECT EXISTS (
-                SELECT 1
-                FROM intersections AS intersection
-                LEFT JOIN candidate_intersections AS candidate
-                  ON candidate.id = intersection.candidate_intersection_id
-                 AND candidate.detect_id = intersection.detect_id
-                WHERE candidate.id IS NULL
-                   OR intersection.cluster_id IS DISTINCT FROM candidate.cluster_id
-            )
-        $query$ INTO conflict;
-        IF conflict THEN
-            RAISE EXCEPTION 'intersection candidate identity is inconsistent';
-        END IF;
-
-        EXECUTE $query$
-            SELECT EXISTS (
-                SELECT 1
-                FROM entry_exit_points AS observation
-                LEFT JOIN intersections AS intersection
-                  ON intersection.id = observation.intersection_id
-                 AND intersection.detect_id = observation.detect_id
-                WHERE intersection.id IS NULL
-                   OR observation.cluster_id IS DISTINCT FROM intersection.cluster_id
-            )
-        $query$ INTO conflict;
-        IF conflict THEN
-            RAISE EXCEPTION 'entry/exit intersection identity is inconsistent';
-        END IF;
-    END IF;
-
-    SELECT EXISTS (
-        SELECT 1 FROM intersections
-        GROUP BY detect_id, candidate_intersection_id
-        HAVING COUNT(*) > 1
-    ) INTO conflict;
-    IF conflict THEN
-        RAISE EXCEPTION 'candidate maps to multiple completed intersections';
-    END IF;
-
-    IF centerline_legacy_columns = 2 THEN
-        EXECUTE $query$
-            SELECT EXISTS (
-                SELECT 1 FROM centerlines AS centerline
-                WHERE (SELECT COUNT(*) FROM intersections AS endpoint
-                       WHERE endpoint.detect_id = centerline.detect_id
-                         AND endpoint.cluster_id = centerline.from_cluster_id) <> 1
-                   OR (SELECT COUNT(*) FROM intersections AS endpoint
-                       WHERE endpoint.detect_id = centerline.detect_id
-                         AND endpoint.cluster_id = centerline.to_cluster_id) <> 1
-            )
-        $query$ INTO conflict;
-        IF conflict THEN
-            RAISE EXCEPTION 'centerline cluster endpoint is not uniquely mapped';
-        END IF;
-
-        EXECUTE $query$
-            SELECT EXISTS (
-                SELECT 1
-                FROM centerlines AS centerline
-                JOIN intersections AS source
-                  ON source.detect_id = centerline.detect_id
-                 AND source.cluster_id = centerline.from_cluster_id
-                JOIN intersections AS target
-                  ON target.detect_id = centerline.detect_id
-                 AND target.cluster_id = centerline.to_cluster_id
-                WHERE (centerline.from_intersection_id IS NOT NULL
-                       AND centerline.from_intersection_id <> source.id)
-                   OR (centerline.to_intersection_id IS NOT NULL
-                       AND centerline.to_intersection_id <> target.id)
-            )
-        $query$ INTO conflict;
-        IF conflict THEN
-            RAISE EXCEPTION 'centerline intersection ID backfill conflicts with existing data';
-        END IF;
-
-        EXECUTE $query$
-            UPDATE centerlines AS centerline
-            SET from_intersection_id = source.id,
-                to_intersection_id = target.id
-            FROM intersections AS source, intersections AS target
-            WHERE source.detect_id = centerline.detect_id
-              AND source.cluster_id = centerline.from_cluster_id
-              AND target.detect_id = centerline.detect_id
-              AND target.cluster_id = centerline.to_cluster_id
-        $query$;
-    END IF;
-
-    IF manifest_legacy_columns = 2 THEN
-        EXECUTE $query$
-            SELECT EXISTS (
-                SELECT 1
-                FROM centerline_source_clips AS manifest
-                LEFT JOIN centerlines AS centerline
-                  ON centerline.id = manifest.centerline_id
-                WHERE centerline.id IS NULL
-                   OR (SELECT COUNT(*) FROM intersections AS endpoint
-                       WHERE endpoint.detect_id = centerline.detect_id
-                         AND endpoint.cluster_id = manifest.start_cluster_id) <> 1
-                   OR (SELECT COUNT(*) FROM intersections AS endpoint
-                       WHERE endpoint.detect_id = centerline.detect_id
-                         AND endpoint.cluster_id = manifest.end_cluster_id) <> 1
-            )
-        $query$ INTO conflict;
-        IF conflict THEN
-            RAISE EXCEPTION 'source Clip cluster endpoint is not uniquely mapped';
-        END IF;
-
-        EXECUTE $query$
-            SELECT EXISTS (
-                SELECT 1
-                FROM centerline_source_clips AS manifest
-                JOIN centerlines AS centerline
-                  ON centerline.id = manifest.centerline_id
-                JOIN intersections AS source
-                  ON source.detect_id = centerline.detect_id
-                 AND source.cluster_id = manifest.start_cluster_id
-                JOIN intersections AS target
-                  ON target.detect_id = centerline.detect_id
-                 AND target.cluster_id = manifest.end_cluster_id
-                WHERE (manifest.start_intersection_id IS NOT NULL
-                       AND manifest.start_intersection_id <> source.id)
-                   OR (manifest.end_intersection_id IS NOT NULL
-                       AND manifest.end_intersection_id <> target.id)
-            )
-        $query$ INTO conflict;
-        IF conflict THEN
-            RAISE EXCEPTION 'source Clip intersection ID backfill conflicts with existing data';
-        END IF;
-
-        EXECUTE $query$
-            UPDATE centerline_source_clips AS manifest
-            SET start_intersection_id = source.id,
-                end_intersection_id = target.id
-            FROM centerlines AS centerline,
-                 intersections AS source,
-                 intersections AS target
-            WHERE centerline.id = manifest.centerline_id
-              AND source.detect_id = centerline.detect_id
-              AND source.cluster_id = manifest.start_cluster_id
-              AND target.detect_id = centerline.detect_id
-              AND target.cluster_id = manifest.end_cluster_id
-        $query$;
-    END IF;
-
-    SELECT EXISTS (
-        SELECT 1 FROM centerlines
-        WHERE from_intersection_id IS NULL OR to_intersection_id IS NULL
-    ) INTO conflict;
-    IF conflict THEN
-        RAISE EXCEPTION 'centerline intersection ID backfill is incomplete';
-    END IF;
-    SELECT EXISTS (
-        SELECT 1 FROM centerlines
-        WHERE from_intersection_id = to_intersection_id
-    ) INTO conflict;
-    IF conflict THEN
-        RAISE EXCEPTION 'centerline endpoints resolve to one intersection';
-    END IF;
-    SELECT EXISTS (
-        SELECT 1 FROM centerlines
-        WHERE variant = 'combined'
-          AND from_intersection_id >= to_intersection_id
-    ) INTO conflict;
-    IF conflict THEN
-        RAISE EXCEPTION 'combined centerline database ID order requires manual migration';
-    END IF;
-    SELECT EXISTS (
-        SELECT 1 FROM centerline_source_clips
-        WHERE start_intersection_id IS NULL OR end_intersection_id IS NULL
-    ) INTO conflict;
-    IF conflict THEN
-        RAISE EXCEPTION 'source Clip intersection ID backfill is incomplete';
-    END IF;
-END;
-$migration$
-"""
-
-
-_ADD_INTERSECTION_IDENTITY_CONSTRAINTS_SQL = """
-DO $migration$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'intersections_detect_candidate_key'
-          AND conrelid = 'intersections'::regclass
-    ) THEN
-        ALTER TABLE intersections
-            ADD CONSTRAINT intersections_detect_candidate_key
-            UNIQUE (detect_id, candidate_intersection_id);
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'centerlines_from_intersection_detect_fkey'
-          AND conrelid = 'centerlines'::regclass
-    ) THEN
-        ALTER TABLE centerlines
-            ADD CONSTRAINT centerlines_from_intersection_detect_fkey
-            FOREIGN KEY (from_intersection_id, detect_id)
-            REFERENCES intersections(id, detect_id);
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'centerlines_to_intersection_detect_fkey'
-          AND conrelid = 'centerlines'::regclass
-    ) THEN
-        ALTER TABLE centerlines
-            ADD CONSTRAINT centerlines_to_intersection_detect_fkey
-            FOREIGN KEY (to_intersection_id, detect_id)
-            REFERENCES intersections(id, detect_id);
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'centerlines_fit_variant_endpoints_key'
-          AND conrelid = 'centerlines'::regclass
-    ) THEN
-        ALTER TABLE centerlines
-            ADD CONSTRAINT centerlines_fit_variant_endpoints_key
-            UNIQUE (fit_id, variant, from_intersection_id, to_intersection_id);
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'centerlines_distinct_endpoints_check'
-          AND conrelid = 'centerlines'::regclass
-    ) THEN
-        ALTER TABLE centerlines
-            ADD CONSTRAINT centerlines_distinct_endpoints_check
-            CHECK (from_intersection_id <> to_intersection_id);
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'centerlines_combined_endpoint_order_check'
-          AND conrelid = 'centerlines'::regclass
-    ) THEN
-        ALTER TABLE centerlines
-            ADD CONSTRAINT centerlines_combined_endpoint_order_check
-            CHECK (variant <> 'combined' OR from_intersection_id < to_intersection_id);
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'centerline_source_clips_start_intersection_fkey'
-          AND conrelid = 'centerline_source_clips'::regclass
-    ) THEN
-        ALTER TABLE centerline_source_clips
-            ADD CONSTRAINT centerline_source_clips_start_intersection_fkey
-            FOREIGN KEY (start_intersection_id) REFERENCES intersections(id);
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'centerline_source_clips_end_intersection_fkey'
-          AND conrelid = 'centerline_source_clips'::regclass
-    ) THEN
-        ALTER TABLE centerline_source_clips
-            ADD CONSTRAINT centerline_source_clips_end_intersection_fkey
-            FOREIGN KEY (end_intersection_id) REFERENCES intersections(id);
-    END IF;
-END;
-$migration$
-"""
-
-
-_DROP_CLUSTER_ID_CONSTRAINTS_SQL = """
-DO $migration$
-DECLARE
-    item RECORD;
-BEGIN
-    FOR item IN
-        SELECT DISTINCT constraint_row.conname
-        FROM pg_constraint AS constraint_row
-        JOIN LATERAL unnest(constraint_row.conkey) AS key_column(attnum) ON TRUE
-        JOIN pg_attribute AS attribute_row
-          ON attribute_row.attrelid = constraint_row.conrelid
-         AND attribute_row.attnum = key_column.attnum
-        WHERE constraint_row.conrelid = 'centerlines'::regclass
-          AND attribute_row.attname IN ('from_cluster_id', 'to_cluster_id')
-    LOOP
-        EXECUTE format(
-            'ALTER TABLE centerlines DROP CONSTRAINT %I',
-            item.conname
-        );
-    END LOOP;
-    FOR item IN
-        SELECT DISTINCT constraint_row.conname
-        FROM pg_constraint AS constraint_row
-        JOIN LATERAL unnest(constraint_row.conkey) AS key_column(attnum) ON TRUE
-        JOIN pg_attribute AS attribute_row
-          ON attribute_row.attrelid = constraint_row.conrelid
-         AND attribute_row.attnum = key_column.attnum
-        WHERE constraint_row.conrelid = 'intersections'::regclass
-          AND attribute_row.attname = 'cluster_id'
-    LOOP
-        EXECUTE format(
-            'ALTER TABLE intersections DROP CONSTRAINT %I',
-            item.conname
-        );
-    END LOOP;
-END;
-$migration$
-"""
-
-
-_CANONICALIZE_CANDIDATE_CROSSING_INJECTED_REFS_SQL = """
-DO $migration$
-DECLARE
-    conflict BOOLEAN;
-BEGIN
-    SELECT EXISTS (
-        SELECT 1
-        FROM candidate_entry_exit_points AS crossing
-        JOIN detect_runs AS detect ON detect.id = crossing.detect_id
-        CROSS JOIN LATERAL (VALUES
-            (crossing.from_source_id, crossing.from_source_row_key),
-            (crossing.to_source_id, crossing.to_source_row_key)
-        ) AS endpoint(source_id, source_row_key)
-        WHERE endpoint.source_id IN ('injected_points', 'public.injected_points')
-          AND NOT EXISTS (
-              SELECT 1
-              FROM injected_points AS injected
-              WHERE injected.clean_id = detect.clean_id
-                AND injected.vehicle_id = crossing.vehicle_id
-                AND injected.id::text = endpoint.source_row_key
-          )
-    ) INTO conflict;
-    IF conflict THEN
-        RAISE EXCEPTION
-            'candidate crossing injected-point reference is invalid for its Clean Run';
-    END IF;
-
-    UPDATE candidate_entry_exit_points
-    SET from_source_id = CASE
-            WHEN from_source_id = 'injected_points'
-                THEN 'public.injected_points'
-            ELSE from_source_id
-        END,
-        to_source_id = CASE
-            WHEN to_source_id = 'injected_points'
-                THEN 'public.injected_points'
-            ELSE to_source_id
+                FROM pg_constraint
+                WHERE conname = 'resolved_points_crossing_fkey'
+                  AND conrelid = 'resolved_subtrack_points'::regclass
+            ) THEN
+                ALTER TABLE resolved_subtrack_points
+                    ADD CONSTRAINT resolved_points_crossing_fkey
+                    FOREIGN KEY (crossing_point_id, detect_id)
+                    REFERENCES candidate_entry_exit_points(id, detect_id)
+                    DEFERRABLE INITIALLY DEFERRED;
+            END IF;
         END
-    WHERE from_source_id = 'injected_points'
-       OR to_source_id = 'injected_points';
-END;
-$migration$
-"""
+        $ddl$
+        """,
+    ),
+    (
+        "remove_row_semantic_triggers",
+        """
+        DROP TRIGGER IF EXISTS resolved_point_membership_check
+            ON resolved_subtrack_points;
+        DROP TRIGGER IF EXISTS candidate_crossing_segment_start_check
+            ON candidate_entry_exit_points;
+        DROP TRIGGER IF EXISTS tracks_cross_segments_check ON tracks_cross;
+        DROP TRIGGER IF EXISTS turn_event_point_check ON turn_events;
+        DROP TRIGGER IF EXISTS entry_exit_observation_check ON entry_exit_points;
+        DROP TRIGGER IF EXISTS centerline_source_clip_check
+            ON centerline_source_clips;
+
+        DROP FUNCTION IF EXISTS validate_resolved_point_membership();
+        DROP FUNCTION IF EXISTS validate_resolved_segment_start();
+        DROP FUNCTION IF EXISTS validate_tracks_cross_segments();
+        DROP FUNCTION IF EXISTS validate_turn_event_point();
+        DROP FUNCTION IF EXISTS validate_entry_exit_observation();
+        DROP FUNCTION IF EXISTS validate_centerline_source_clip();
+        """,
+    ),
+    (
+        "run_state_transition_function",
+        """
+        CREATE OR REPLACE FUNCTION enforce_pipeline_run_state_transition()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $function$
+        BEGIN
+            IF OLD.status <> 'running' THEN
+                RAISE EXCEPTION '% % is immutable after status %',
+                    TG_TABLE_NAME, OLD.id, OLD.status;
+            END IF;
+            RETURN NEW;
+        END
+        $function$
+        """,
+    ),
+    (
+        "run_initial_status_function",
+        """
+        CREATE OR REPLACE FUNCTION enforce_pipeline_run_initial_status()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $function$
+        BEGIN
+            IF NEW.status <> 'running' THEN
+                RAISE EXCEPTION '% must be inserted with status running',
+                    TG_TABLE_NAME;
+            END IF;
+            RETURN NEW;
+        END
+        $function$
+        """,
+    ),
+    (
+        "run_initial_status_triggers",
+        """
+        DROP TRIGGER IF EXISTS clean_run_initial_status_guard ON clean_runs;
+        CREATE TRIGGER clean_run_initial_status_guard
+        BEFORE INSERT ON clean_runs
+        FOR EACH ROW EXECUTE FUNCTION enforce_pipeline_run_initial_status();
+        DROP TRIGGER IF EXISTS detect_run_initial_status_guard ON detect_runs;
+        CREATE TRIGGER detect_run_initial_status_guard
+        BEFORE INSERT ON detect_runs
+        FOR EACH ROW EXECUTE FUNCTION enforce_pipeline_run_initial_status();
+        DROP TRIGGER IF EXISTS fit_run_initial_status_guard ON fit_runs;
+        CREATE TRIGGER fit_run_initial_status_guard
+        BEFORE INSERT ON fit_runs
+        FOR EACH ROW EXECUTE FUNCTION enforce_pipeline_run_initial_status()
+        """,
+    ),
+    (
+        "clean_run_state_trigger",
+        """
+        DROP TRIGGER IF EXISTS clean_run_state_guard ON clean_runs;
+        CREATE TRIGGER clean_run_state_guard
+        BEFORE UPDATE ON clean_runs
+        FOR EACH ROW EXECUTE FUNCTION enforce_pipeline_run_state_transition()
+        """,
+    ),
+    (
+        "detect_run_state_trigger",
+        """
+        DROP TRIGGER IF EXISTS detect_run_state_guard ON detect_runs;
+        CREATE TRIGGER detect_run_state_guard
+        BEFORE UPDATE ON detect_runs
+        FOR EACH ROW EXECUTE FUNCTION enforce_pipeline_run_state_transition()
+        """,
+    ),
+    (
+        "fit_run_state_trigger",
+        """
+        DROP TRIGGER IF EXISTS fit_run_state_guard ON fit_runs;
+        CREATE TRIGGER fit_run_state_guard
+        BEFORE UPDATE ON fit_runs
+        FOR EACH ROW EXECUTE FUNCTION enforce_pipeline_run_state_transition()
+        """,
+    ),
+    (
+        "run_delete_guard_function",
+        """
+        CREATE OR REPLACE FUNCTION guard_pipeline_run_delete()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $function$
+        BEGIN
+            IF current_setting(
+                'track_v2.allow_completed_run_delete', true
+            ) IS DISTINCT FROM 'on' THEN
+                RAISE EXCEPTION
+                    '% rows may only be deleted through DeleteRunService',
+                    TG_TABLE_NAME;
+            END IF;
+            RETURN NULL;
+        END
+        $function$
+        """,
+    ),
+    (
+        "run_delete_guard_triggers",
+        """
+        DROP TRIGGER IF EXISTS clean_run_delete_guard ON clean_runs;
+        CREATE TRIGGER clean_run_delete_guard
+        BEFORE DELETE ON clean_runs
+        FOR EACH STATEMENT EXECUTE FUNCTION guard_pipeline_run_delete();
+        DROP TRIGGER IF EXISTS detect_run_delete_guard ON detect_runs;
+        CREATE TRIGGER detect_run_delete_guard
+        BEFORE DELETE ON detect_runs
+        FOR EACH STATEMENT EXECUTE FUNCTION guard_pipeline_run_delete();
+        DROP TRIGGER IF EXISTS fit_run_delete_guard ON fit_runs;
+        CREATE TRIGGER fit_run_delete_guard
+        BEFORE DELETE ON fit_runs
+        FOR EACH STATEMENT EXECUTE FUNCTION guard_pipeline_run_delete()
+        """,
+    ),
+    (
+        "validate_detect_completion_function",
+        """
+        CREATE OR REPLACE FUNCTION validate_detect_run_completion()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $function$
+        DECLARE
+            violation TEXT;
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                  FROM clean_runs
+                 WHERE id = NEW.clean_id
+                   AND status = 'completed'
+            ) THEN
+                RAISE EXCEPTION
+                    'completed Detect Run requires a completed parent Clean Run';
+            END IF;
+
+            -- This is intentionally one aggregate scan, not one query per
+            -- resolved row.  It validates parent-Clean membership, subtrack
+            -- membership, and the A80 single-vehicle contract together.
+            WITH point_sources AS MATERIALIZED (
+                SELECT resolved.subtrack_index,
+                       resolved.cleaned_sequence_in_subtrack,
+                       CASE
+                           WHEN resolved.kept_point_id IS NOT NULL
+                               THEN 'kept'::TEXT
+                           ELSE 'injected'::TEXT
+                       END AS source_kind,
+                       COALESCE(
+                           resolved.kept_point_id,
+                           resolved.injected_point_id
+                       ) AS source_point_id,
+                       COALESCE(kept.clean_id, injected.clean_id) AS clean_id,
+                       COALESCE(
+                           kept.subtrack_index,
+                           injected.subtrack_index
+                       ) AS source_subtrack,
+                       COALESCE(kept.vehicle_id, injected.vehicle_id) AS vehicle_id
+                  FROM resolved_subtrack_points AS resolved
+                  LEFT JOIN kept_trajectory_points AS kept
+                    ON kept.id = resolved.kept_point_id
+                  LEFT JOIN injected_points AS injected
+                    ON injected.id = resolved.injected_point_id
+                 WHERE resolved.detect_id = NEW.id
+                   AND resolved.crossing_point_id IS NULL
+            ), expected_sources AS (
+                SELECT source_kind,
+                       source_point_id,
+                       subtrack_index,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY subtrack_index
+                           ORDER BY anchor_sequence, kind_order, source_point_id
+                       ) - 1 AS expected_cleaned_sequence
+                  FROM (
+                        SELECT 'kept'::TEXT AS source_kind,
+                               id AS source_point_id,
+                               subtrack_index,
+                               sequence_in_subtrack AS anchor_sequence,
+                               0 AS kind_order
+                          FROM kept_trajectory_points
+                         WHERE clean_id = NEW.clean_id
+                        UNION ALL
+                        SELECT 'injected'::TEXT,
+                               id,
+                               subtrack_index,
+                               after_sequence_in_subtrack,
+                               1
+                          FROM injected_points
+                         WHERE clean_id = NEW.clean_id
+                       ) AS clean_members
+            ), subtrack_checks AS (
+                SELECT subtrack_index,
+                       BOOL_OR(
+                           clean_id IS DISTINCT FROM NEW.clean_id
+                           OR source_subtrack IS DISTINCT FROM subtrack_index
+                       ) AS has_bad_membership,
+                       MIN(vehicle_id) AS first_vehicle,
+                       MAX(vehicle_id) AS last_vehicle
+                  FROM point_sources
+                 GROUP BY subtrack_index
+            )
+            SELECT invalid.issue
+              INTO violation
+              FROM (
+                    SELECT CASE
+                               WHEN expected.source_point_id IS NULL
+                                    OR actual.source_point_id IS NULL THEN
+                                   'resolved p/i set must exactly equal the Detect parent Clean p/i set'
+                               ELSE
+                                   'resolved cleaned sequence must equal the derived Clean p/i order'
+                           END AS issue
+                      FROM expected_sources AS expected
+                      FULL JOIN point_sources AS actual
+                        ON actual.source_kind = expected.source_kind
+                       AND actual.source_point_id = expected.source_point_id
+                     WHERE expected.source_point_id IS NULL
+                        OR actual.source_point_id IS NULL
+                        OR actual.subtrack_index IS DISTINCT FROM
+                           expected.subtrack_index
+                        OR actual.cleaned_sequence_in_subtrack IS DISTINCT FROM
+                           expected.expected_cleaned_sequence
+                    UNION ALL
+                    SELECT CASE
+                               WHEN has_bad_membership THEN
+                                   'resolved p/i point must belong to the Detect parent Clean Run and subtrack'
+                               ELSE 'resolved subtrack contains multiple vehicles'
+                           END
+                      FROM subtrack_checks
+                     WHERE has_bad_membership
+                        OR first_vehicle IS DISTINCT FROM last_vehicle
+                   ) AS invalid
+             LIMIT 1;
+            IF violation IS NOT NULL THEN
+                RAISE EXCEPTION '%', violation;
+            END IF;
+
+            -- UNIQUE constraints prevent duplicates; min/max/count therefore
+            -- prove that both snapshots are dense zero-based sequences.
+            SELECT 'resolved subtrack cleaned/final sequence must be contiguous from zero'
+              INTO violation
+              FROM resolved_subtrack_points AS resolved
+             WHERE resolved.detect_id = NEW.id
+             GROUP BY resolved.subtrack_index
+            HAVING MIN(resolved.sequence_in_subtrack) <> 0
+                OR MAX(resolved.sequence_in_subtrack) <> COUNT(*) - 1
+                OR COUNT(resolved.cleaned_sequence_in_subtrack) = 0
+                OR MIN(resolved.cleaned_sequence_in_subtrack) <> 0
+                OR MAX(resolved.cleaned_sequence_in_subtrack) <>
+                   COUNT(resolved.cleaned_sequence_in_subtrack) - 1
+             LIMIT 1;
+            IF violation IS NOT NULL THEN
+                RAISE EXCEPTION '%', violation;
+            END IF;
+
+            SELECT
+                'resolved p/i final sequence must strictly increase with cleaned sequence'
+              INTO violation
+              FROM (
+                    SELECT resolved.sequence_in_subtrack,
+                           LAG(resolved.sequence_in_subtrack) OVER (
+                               PARTITION BY resolved.subtrack_index
+                               ORDER BY resolved.cleaned_sequence_in_subtrack
+                           ) AS previous_final_sequence
+                      FROM resolved_subtrack_points AS resolved
+                     WHERE resolved.detect_id = NEW.id
+                       AND resolved.cleaned_sequence_in_subtrack IS NOT NULL
+                   ) AS ordered_cleaned
+             WHERE sequence_in_subtrack <= previous_final_sequence
+             LIMIT 1;
+            IF violation IS NOT NULL THEN
+                RAISE EXCEPTION '%', violation;
+            END IF;
+
+            -- The resolved crossing set must exactly equal the crossing set
+            -- of complete intersections.  The same join also validates that
+            -- every crossing inherits its cleaned segment's subtrack.
+            WITH actual_crossings AS MATERIALIZED (
+                SELECT resolved.id AS resolved_id,
+                       resolved.crossing_point_id,
+                       resolved.subtrack_index,
+                       resolved.sequence_in_subtrack,
+                       crossing.id AS crossing_id,
+                       segment_start.subtrack_index AS source_subtrack,
+                       segment_start.sequence_in_subtrack AS segment_start_sequence,
+                       successor.sequence_in_subtrack AS successor_sequence,
+                       complete_intersection.id AS complete_intersection_id
+                  FROM resolved_subtrack_points AS resolved
+                  LEFT JOIN candidate_entry_exit_points AS crossing
+                    ON crossing.id = resolved.crossing_point_id
+                   AND crossing.detect_id = resolved.detect_id
+                  LEFT JOIN resolved_subtrack_points AS segment_start
+                    ON segment_start.id = crossing.segment_start_point_id
+                   AND segment_start.detect_id = crossing.detect_id
+                  LEFT JOIN resolved_subtrack_points AS successor
+                    ON successor.detect_id = segment_start.detect_id
+                   AND successor.subtrack_index = segment_start.subtrack_index
+                   AND successor.cleaned_sequence_in_subtrack =
+                       segment_start.cleaned_sequence_in_subtrack + 1
+                  LEFT JOIN intersections AS complete_intersection
+                    ON complete_intersection.detect_id = crossing.detect_id
+                   AND complete_intersection.candidate_intersection_id =
+                       crossing.candidate_intersection_id
+                 WHERE resolved.detect_id = NEW.id
+                   AND resolved.crossing_point_id IS NOT NULL
+            ), expected_crossings AS (
+                SELECT crossing.id
+                  FROM candidate_entry_exit_points AS crossing
+                  JOIN intersections AS complete_intersection
+                    ON complete_intersection.detect_id = crossing.detect_id
+                   AND complete_intersection.candidate_intersection_id =
+                       crossing.candidate_intersection_id
+                 WHERE crossing.detect_id = NEW.id
+            )
+            SELECT invalid.issue
+              INTO violation
+              FROM (
+                    SELECT CASE
+                               WHEN crossing_id IS NULL
+                                   THEN 'resolved crossing does not exist'
+                               WHEN complete_intersection_id IS NULL
+                                   THEN 'resolved crossing is not attached to a complete intersection'
+                               WHEN NOT (
+                                   segment_start_sequence < sequence_in_subtrack
+                                   AND sequence_in_subtrack < successor_sequence
+                               ) THEN
+                                   'resolved crossing must lie between its cleaned segment endpoints'
+                               ELSE 'resolved crossing belongs to the wrong subtrack'
+                           END AS issue
+                      FROM actual_crossings
+                     WHERE crossing_id IS NULL
+                        OR complete_intersection_id IS NULL
+                        OR source_subtrack IS DISTINCT FROM subtrack_index
+                        OR NOT (
+                            segment_start_sequence < sequence_in_subtrack
+                            AND sequence_in_subtrack < successor_sequence
+                        )
+                    UNION ALL
+                    SELECT 'complete-intersection crossing is absent from resolved sequence'
+                      FROM expected_crossings AS expected
+                      LEFT JOIN actual_crossings AS actual
+                        ON actual.crossing_point_id = expected.id
+                     WHERE actual.resolved_id IS NULL
+                   ) AS invalid
+             LIMIT 1;
+            IF violation IS NOT NULL THEN
+                RAISE EXCEPTION '%', violation;
+            END IF;
+
+            WITH segment_uses AS (
+                SELECT 'candidate crossing'::TEXT AS kind,
+                       crossing.segment_start_point_id AS point_id
+                  FROM candidate_entry_exit_points AS crossing
+                 WHERE crossing.detect_id = NEW.id
+                UNION ALL
+                SELECT 'track cross', track_cross.from_segment_start_point_id
+                  FROM tracks_cross AS track_cross
+                 WHERE track_cross.detect_id = NEW.id
+                UNION ALL
+                SELECT 'track cross', track_cross.to_segment_start_point_id
+                  FROM tracks_cross AS track_cross
+                 WHERE track_cross.detect_id = NEW.id
+            )
+            SELECT FORMAT(
+                       '%s endpoint %s is not a valid cleaned segment start',
+                       segment_use.kind,
+                       segment_use.point_id
+                   )
+              INTO violation
+              FROM segment_uses AS segment_use
+              LEFT JOIN resolved_subtrack_points AS segment_start
+                ON segment_start.id = segment_use.point_id
+               AND segment_start.detect_id = NEW.id
+              LEFT JOIN resolved_subtrack_points AS successor
+                ON successor.detect_id = segment_start.detect_id
+               AND successor.subtrack_index = segment_start.subtrack_index
+               AND successor.cleaned_sequence_in_subtrack =
+                   segment_start.cleaned_sequence_in_subtrack + 1
+             WHERE segment_start.cleaned_sequence_in_subtrack IS NULL
+                OR successor.id IS NULL
+             LIMIT 1;
+            IF violation IS NOT NULL THEN
+                RAISE EXCEPTION '%', violation;
+            END IF;
+
+            SELECT 'track cross segments must belong to different vehicles/subtracks'
+              INTO violation
+              FROM tracks_cross AS track_cross
+              JOIN resolved_subtrack_points AS from_point
+                ON from_point.id = track_cross.from_segment_start_point_id
+               AND from_point.detect_id = track_cross.detect_id
+              JOIN resolved_subtrack_points AS to_point
+                ON to_point.id = track_cross.to_segment_start_point_id
+               AND to_point.detect_id = track_cross.detect_id
+              LEFT JOIN kept_trajectory_points AS from_kept
+                ON from_kept.id = from_point.kept_point_id
+              LEFT JOIN injected_points AS from_injected
+                ON from_injected.id = from_point.injected_point_id
+              LEFT JOIN kept_trajectory_points AS to_kept
+                ON to_kept.id = to_point.kept_point_id
+              LEFT JOIN injected_points AS to_injected
+                ON to_injected.id = to_point.injected_point_id
+             WHERE track_cross.detect_id = NEW.id
+               AND (
+                   from_point.subtrack_index IS NOT DISTINCT FROM
+                       to_point.subtrack_index
+                   OR COALESCE(from_kept.vehicle_id, from_injected.vehicle_id)
+                      IS NOT DISTINCT FROM
+                      COALESCE(to_kept.vehicle_id, to_injected.vehicle_id)
+               )
+             LIMIT 1;
+            IF violation IS NOT NULL THEN
+                RAISE EXCEPTION '%', violation;
+            END IF;
+
+            SELECT 'turn event point must be a cleaned p/i resolved point'
+              INTO violation
+              FROM turn_events AS turn_event
+              LEFT JOIN resolved_subtrack_points AS resolved
+                ON resolved.id = turn_event.resolved_point_id
+               AND resolved.detect_id = turn_event.detect_id
+             WHERE turn_event.detect_id = NEW.id
+               AND resolved.cleaned_sequence_in_subtrack IS NULL
+             LIMIT 1;
+            IF violation IS NOT NULL THEN
+                RAISE EXCEPTION '%', violation;
+            END IF;
+
+            SELECT CASE
+                       WHEN entry_crossing.crossing_type IS DISTINCT FROM 1
+                            OR exit_crossing.crossing_type IS DISTINCT FROM 0
+                           THEN 'entry/exit crossing types must be 1/0'
+                       WHEN entry_crossing.candidate_intersection_id
+                                IS DISTINCT FROM intersection.candidate_intersection_id
+                            OR exit_crossing.candidate_intersection_id
+                                IS DISTINCT FROM intersection.candidate_intersection_id
+                           THEN 'entry/exit crossings must belong to the intersection candidate'
+                       WHEN entry_resolved.subtrack_index
+                                IS DISTINCT FROM exit_resolved.subtrack_index
+                           THEN 'entry/exit crossings must belong to one subtrack'
+                       ELSE 'entry crossing must precede exit crossing'
+                   END
+              INTO violation
+              FROM entry_exit_points AS observation
+              JOIN intersections AS intersection
+                ON intersection.id = observation.intersection_id
+               AND intersection.detect_id = observation.detect_id
+              LEFT JOIN candidate_entry_exit_points AS entry_crossing
+                ON entry_crossing.id = observation.entry_crossing_id
+               AND entry_crossing.detect_id = observation.detect_id
+              LEFT JOIN candidate_entry_exit_points AS exit_crossing
+                ON exit_crossing.id = observation.exit_crossing_id
+               AND exit_crossing.detect_id = observation.detect_id
+              LEFT JOIN resolved_subtrack_points AS entry_resolved
+                ON entry_resolved.crossing_point_id = entry_crossing.id
+               AND entry_resolved.detect_id = observation.detect_id
+              LEFT JOIN resolved_subtrack_points AS exit_resolved
+                ON exit_resolved.crossing_point_id = exit_crossing.id
+               AND exit_resolved.detect_id = observation.detect_id
+             WHERE observation.detect_id = NEW.id
+               AND (
+                   entry_crossing.crossing_type IS DISTINCT FROM 1
+                   OR exit_crossing.crossing_type IS DISTINCT FROM 0
+                   OR entry_crossing.candidate_intersection_id
+                        IS DISTINCT FROM intersection.candidate_intersection_id
+                   OR exit_crossing.candidate_intersection_id
+                        IS DISTINCT FROM intersection.candidate_intersection_id
+                   OR entry_resolved.subtrack_index
+                        IS DISTINCT FROM exit_resolved.subtrack_index
+                   OR entry_resolved.sequence_in_subtrack >=
+                        exit_resolved.sequence_in_subtrack
+               )
+             LIMIT 1;
+            IF violation IS NOT NULL THEN
+                RAISE EXCEPTION '%', violation;
+            END IF;
+
+            RETURN NEW;
+        END
+        $function$
+        """,
+    ),
+    (
+        "detect_completion_trigger",
+        """
+        DROP TRIGGER IF EXISTS detect_completion_check ON detect_runs;
+        CREATE CONSTRAINT TRIGGER detect_completion_check
+        AFTER UPDATE OF status ON detect_runs
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW
+        WHEN (NEW.status = 'completed' AND OLD.status IS DISTINCT FROM NEW.status)
+        EXECUTE FUNCTION validate_detect_run_completion()
+        """,
+    ),
+    (
+        "guard_clean_artifact_mutation_function",
+        """
+        CREATE OR REPLACE FUNCTION guard_clean_artifact_mutation()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $function$
+        DECLARE
+            changed_clean_id UUID;
+            run_status TEXT;
+        BEGIN
+            IF TG_OP = 'DELETE'
+               AND current_setting(
+                   'track_v2.allow_completed_run_delete', true
+               ) = 'on' THEN
+                RETURN NULL;
+            END IF;
+
+            IF TG_OP = 'INSERT' THEN
+                FOR changed_clean_id IN
+                    SELECT clean_id FROM new_rows
+                     GROUP BY clean_id ORDER BY clean_id
+                LOOP
+                    SELECT status INTO run_status
+                      FROM clean_runs
+                     WHERE id = changed_clean_id
+                     FOR SHARE;
+                    IF run_status = 'completed' THEN
+                        RAISE EXCEPTION
+                            'completed Clean Run % artifacts are immutable',
+                            changed_clean_id;
+                    END IF;
+                END LOOP;
+            ELSIF TG_OP = 'DELETE' THEN
+                FOR changed_clean_id IN
+                    SELECT clean_id FROM old_rows
+                     GROUP BY clean_id ORDER BY clean_id
+                LOOP
+                    SELECT status INTO run_status
+                      FROM clean_runs
+                     WHERE id = changed_clean_id
+                     FOR SHARE;
+                    IF run_status = 'completed' THEN
+                        RAISE EXCEPTION
+                            'completed Clean Run % artifacts are immutable',
+                            changed_clean_id;
+                    END IF;
+                END LOOP;
+            ELSE
+                FOR changed_clean_id IN
+                    SELECT clean_id
+                      FROM (
+                            SELECT clean_id FROM old_rows
+                            UNION
+                            SELECT clean_id FROM new_rows
+                           ) AS changed
+                     ORDER BY clean_id
+                LOOP
+                    SELECT status INTO run_status
+                      FROM clean_runs
+                     WHERE id = changed_clean_id
+                     FOR SHARE;
+                    IF run_status = 'completed' THEN
+                        RAISE EXCEPTION
+                            'completed Clean Run % artifacts are immutable',
+                            changed_clean_id;
+                    END IF;
+                END LOOP;
+            END IF;
+
+            RETURN NULL;
+        END
+        $function$
+        """,
+    ),
+    (
+        "clean_artifact_mutation_triggers",
+        """
+        DO $ddl$
+        DECLARE
+            artifact_table TEXT;
+        BEGIN
+            FOREACH artifact_table IN ARRAY ARRAY[
+                'excluded_points',
+                'kept_trajectory_points',
+                'injected_points'
+            ] LOOP
+                EXECUTE FORMAT(
+                    'DROP TRIGGER IF EXISTS guard_completed_clean_insert ON %I',
+                    artifact_table
+                );
+                EXECUTE FORMAT(
+                    'CREATE TRIGGER guard_completed_clean_insert '
+                    'AFTER INSERT ON %I REFERENCING NEW TABLE AS new_rows '
+                    'FOR EACH STATEMENT '
+                    'EXECUTE FUNCTION guard_clean_artifact_mutation()',
+                    artifact_table
+                );
+                EXECUTE FORMAT(
+                    'DROP TRIGGER IF EXISTS guard_completed_clean_update ON %I',
+                    artifact_table
+                );
+                EXECUTE FORMAT(
+                    'CREATE TRIGGER guard_completed_clean_update '
+                    'AFTER UPDATE ON %I '
+                    'REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows '
+                    'FOR EACH STATEMENT '
+                    'EXECUTE FUNCTION guard_clean_artifact_mutation()',
+                    artifact_table
+                );
+                EXECUTE FORMAT(
+                    'DROP TRIGGER IF EXISTS guard_completed_clean_delete ON %I',
+                    artifact_table
+                );
+                EXECUTE FORMAT(
+                    'CREATE TRIGGER guard_completed_clean_delete '
+                    'AFTER DELETE ON %I REFERENCING OLD TABLE AS old_rows '
+                    'FOR EACH STATEMENT '
+                    'EXECUTE FUNCTION guard_clean_artifact_mutation()',
+                    artifact_table
+                );
+            END LOOP;
+        END
+        $ddl$
+        """,
+    ),
+    (
+        "guard_detect_artifact_mutation_function",
+        """
+        CREATE OR REPLACE FUNCTION guard_detect_artifact_mutation()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $function$
+        DECLARE
+            changed_detect_id UUID;
+            run_status TEXT;
+        BEGIN
+            IF TG_OP = 'DELETE'
+               AND current_setting(
+                   'track_v2.allow_completed_run_delete', true
+               ) = 'on' THEN
+                RETURN NULL;
+            END IF;
+
+            IF TG_OP = 'INSERT' THEN
+                FOR changed_detect_id IN
+                    SELECT detect_id FROM new_rows
+                     GROUP BY detect_id ORDER BY detect_id
+                LOOP
+                    SELECT status INTO run_status
+                      FROM detect_runs
+                     WHERE id = changed_detect_id
+                     FOR SHARE;
+                    IF run_status = 'completed' THEN
+                        RAISE EXCEPTION
+                            'completed Detect Run % artifacts are immutable',
+                            changed_detect_id;
+                    END IF;
+                END LOOP;
+            ELSIF TG_OP = 'DELETE' THEN
+                FOR changed_detect_id IN
+                    SELECT detect_id FROM old_rows
+                     GROUP BY detect_id ORDER BY detect_id
+                LOOP
+                    SELECT status INTO run_status
+                      FROM detect_runs
+                     WHERE id = changed_detect_id
+                     FOR SHARE;
+                    IF run_status = 'completed' THEN
+                        RAISE EXCEPTION
+                            'completed Detect Run % artifacts are immutable',
+                            changed_detect_id;
+                    END IF;
+                END LOOP;
+            ELSE
+                FOR changed_detect_id IN
+                    SELECT detect_id
+                      FROM (
+                            SELECT detect_id FROM old_rows
+                            UNION
+                            SELECT detect_id FROM new_rows
+                           ) AS changed
+                     ORDER BY detect_id
+                LOOP
+                    SELECT status INTO run_status
+                      FROM detect_runs
+                     WHERE id = changed_detect_id
+                     FOR SHARE;
+                    IF run_status = 'completed' THEN
+                        RAISE EXCEPTION
+                            'completed Detect Run % artifacts are immutable',
+                            changed_detect_id;
+                    END IF;
+                END LOOP;
+            END IF;
+
+            RETURN NULL;
+        END
+        $function$
+        """,
+    ),
+    (
+        "detect_artifact_mutation_triggers",
+        """
+        DO $ddl$
+        DECLARE
+            artifact_table TEXT;
+        BEGIN
+            FOREACH artifact_table IN ARRAY ARRAY[
+                'resolved_subtrack_points',
+                'candidate_intersections',
+                'tracks_cross',
+                'turn_events',
+                'candidate_entry_exit_points',
+                'intersections',
+                'entry_exit_points'
+            ] LOOP
+                EXECUTE FORMAT(
+                    'DROP TRIGGER IF EXISTS guard_completed_detect_insert ON %I',
+                    artifact_table
+                );
+                EXECUTE FORMAT(
+                    'CREATE TRIGGER guard_completed_detect_insert '
+                    'AFTER INSERT ON %I REFERENCING NEW TABLE AS new_rows '
+                    'FOR EACH STATEMENT '
+                    'EXECUTE FUNCTION guard_detect_artifact_mutation()',
+                    artifact_table
+                );
+                EXECUTE FORMAT(
+                    'DROP TRIGGER IF EXISTS guard_completed_detect_update ON %I',
+                    artifact_table
+                );
+                EXECUTE FORMAT(
+                    'CREATE TRIGGER guard_completed_detect_update '
+                    'AFTER UPDATE ON %I '
+                    'REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows '
+                    'FOR EACH STATEMENT '
+                    'EXECUTE FUNCTION guard_detect_artifact_mutation()',
+                    artifact_table
+                );
+                EXECUTE FORMAT(
+                    'DROP TRIGGER IF EXISTS guard_completed_detect_delete ON %I',
+                    artifact_table
+                );
+                EXECUTE FORMAT(
+                    'CREATE TRIGGER guard_completed_detect_delete '
+                    'AFTER DELETE ON %I REFERENCING OLD TABLE AS old_rows '
+                    'FOR EACH STATEMENT '
+                    'EXECUTE FUNCTION guard_detect_artifact_mutation()',
+                    artifact_table
+                );
+            END LOOP;
+        END
+        $ddl$
+        """,
+    ),
+    (
+        "validate_fit_completion_function",
+        """
+        CREATE OR REPLACE FUNCTION validate_fit_run_completion()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $function$
+        DECLARE
+            violation TEXT;
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                  FROM detect_runs
+                 WHERE id = NEW.detect_id
+                   AND status = 'completed'
+            ) THEN
+                RAISE EXCEPTION
+                    'completed Fit Run requires a completed Detect Run';
+            END IF;
+
+            -- Counts are relative to the persisted centerline direction:
+            -- false manifests are forward evidence and true manifests are
+            -- reverse evidence.  LEFT JOIN also exposes a missing manifest.
+            SELECT
+                'centerline manifest direction counts must match persisted clip counts'
+              INTO violation
+              FROM centerlines AS centerline
+              LEFT JOIN centerline_source_clips AS manifest
+                ON manifest.centerline_id = centerline.id
+               AND manifest.detect_id = centerline.detect_id
+             WHERE centerline.fit_id = NEW.id
+             GROUP BY centerline.id,
+                      centerline.forward_clip_count,
+                      centerline.reverse_clip_count
+            HAVING COUNT(manifest.centerline_id) FILTER (
+                       WHERE NOT manifest.reverse_to_centerline_direction
+                   ) <> centerline.forward_clip_count
+                OR COUNT(manifest.centerline_id) FILTER (
+                       WHERE manifest.reverse_to_centerline_direction
+                   ) <> centerline.reverse_clip_count
+             LIMIT 1;
+            IF violation IS NOT NULL THEN
+                RAISE EXCEPTION '%', violation;
+            END IF;
+
+            SELECT CASE
+                       WHEN start_crossing.crossing_type IS DISTINCT FROM 0
+                            OR end_crossing.crossing_type IS DISTINCT FROM 1
+                           THEN 'centerline clip must start at exit and end at entry'
+                       WHEN start_resolved.subtrack_index
+                                IS DISTINCT FROM end_resolved.subtrack_index
+                           THEN 'centerline clip crossings must belong to one subtrack'
+                       WHEN start_resolved.sequence_in_subtrack >=
+                            end_resolved.sequence_in_subtrack
+                           THEN 'centerline clip start crossing must precede end crossing'
+                       WHEN manifest.reverse_to_centerline_direction
+                           THEN 'reversed clip endpoints do not match centerline endpoints'
+                       ELSE 'clip endpoints do not match centerline endpoints'
+                   END
+              INTO violation
+              FROM centerline_source_clips AS manifest
+              JOIN centerlines AS centerline
+                ON centerline.id = manifest.centerline_id
+               AND centerline.detect_id = manifest.detect_id
+              JOIN intersections AS source_intersection
+                ON source_intersection.id = centerline.from_intersection_id
+               AND source_intersection.detect_id = centerline.detect_id
+              JOIN intersections AS target_intersection
+                ON target_intersection.id = centerline.to_intersection_id
+               AND target_intersection.detect_id = centerline.detect_id
+              LEFT JOIN candidate_entry_exit_points AS start_crossing
+                ON start_crossing.id = manifest.start_crossing_id
+               AND start_crossing.detect_id = manifest.detect_id
+              LEFT JOIN candidate_entry_exit_points AS end_crossing
+                ON end_crossing.id = manifest.end_crossing_id
+               AND end_crossing.detect_id = manifest.detect_id
+              LEFT JOIN resolved_subtrack_points AS start_resolved
+                ON start_resolved.crossing_point_id = start_crossing.id
+               AND start_resolved.detect_id = manifest.detect_id
+              LEFT JOIN resolved_subtrack_points AS end_resolved
+                ON end_resolved.crossing_point_id = end_crossing.id
+               AND end_resolved.detect_id = manifest.detect_id
+             WHERE centerline.fit_id = NEW.id
+               AND (
+                   start_crossing.crossing_type IS DISTINCT FROM 0
+                   OR end_crossing.crossing_type IS DISTINCT FROM 1
+                   OR start_resolved.subtrack_index
+                        IS DISTINCT FROM end_resolved.subtrack_index
+                   OR start_resolved.sequence_in_subtrack >=
+                        end_resolved.sequence_in_subtrack
+                   OR (
+                       manifest.reverse_to_centerline_direction
+                       AND (
+                           start_crossing.candidate_intersection_id
+                                IS DISTINCT FROM
+                                target_intersection.candidate_intersection_id
+                           OR end_crossing.candidate_intersection_id
+                                IS DISTINCT FROM
+                                source_intersection.candidate_intersection_id
+                       )
+                   )
+                   OR (
+                       NOT manifest.reverse_to_centerline_direction
+                       AND (
+                           start_crossing.candidate_intersection_id
+                                IS DISTINCT FROM
+                                source_intersection.candidate_intersection_id
+                           OR end_crossing.candidate_intersection_id
+                                IS DISTINCT FROM
+                                target_intersection.candidate_intersection_id
+                       )
+                   )
+               )
+             LIMIT 1;
+            IF violation IS NOT NULL THEN
+                RAISE EXCEPTION '%', violation;
+            END IF;
+
+            RETURN NEW;
+        END
+        $function$
+        """,
+    ),
+    (
+        "fit_completion_trigger",
+        """
+        DROP TRIGGER IF EXISTS fit_completion_check ON fit_runs;
+        CREATE CONSTRAINT TRIGGER fit_completion_check
+        AFTER UPDATE OF status ON fit_runs
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW
+        WHEN (NEW.status = 'completed' AND OLD.status IS DISTINCT FROM NEW.status)
+        EXECUTE FUNCTION validate_fit_run_completion()
+        """,
+    ),
+    (
+        "guard_centerline_mutation_function",
+        """
+        CREATE OR REPLACE FUNCTION guard_centerline_mutation()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $function$
+        DECLARE
+            changed_fit_id UUID;
+            run_status TEXT;
+        BEGIN
+            IF TG_OP = 'DELETE'
+               AND current_setting(
+                   'track_v2.allow_completed_run_delete', true
+               ) = 'on' THEN
+                RETURN NULL;
+            END IF;
+
+            IF TG_OP = 'INSERT' THEN
+                FOR changed_fit_id IN
+                    SELECT fit_id FROM new_rows
+                     GROUP BY fit_id ORDER BY fit_id
+                LOOP
+                    SELECT status INTO run_status
+                      FROM fit_runs WHERE id = changed_fit_id FOR SHARE;
+                    IF run_status = 'completed' THEN
+                        RAISE EXCEPTION
+                            'completed Fit Run % artifacts are immutable',
+                            changed_fit_id;
+                    END IF;
+                END LOOP;
+            ELSIF TG_OP = 'DELETE' THEN
+                FOR changed_fit_id IN
+                    SELECT fit_id FROM old_rows
+                     GROUP BY fit_id ORDER BY fit_id
+                LOOP
+                    SELECT status INTO run_status
+                      FROM fit_runs WHERE id = changed_fit_id FOR SHARE;
+                    IF run_status = 'completed' THEN
+                        RAISE EXCEPTION
+                            'completed Fit Run % artifacts are immutable',
+                            changed_fit_id;
+                    END IF;
+                END LOOP;
+            ELSE
+                FOR changed_fit_id IN
+                    SELECT fit_id
+                      FROM (
+                            SELECT fit_id FROM old_rows
+                            UNION
+                            SELECT fit_id FROM new_rows
+                           ) AS changed
+                     ORDER BY fit_id
+                LOOP
+                    SELECT status INTO run_status
+                      FROM fit_runs WHERE id = changed_fit_id FOR SHARE;
+                    IF run_status = 'completed' THEN
+                        RAISE EXCEPTION
+                            'completed Fit Run % artifacts are immutable',
+                            changed_fit_id;
+                    END IF;
+                END LOOP;
+            END IF;
+            RETURN NULL;
+        END
+        $function$
+        """,
+    ),
+    (
+        "guard_centerline_source_clip_mutation_function",
+        """
+        CREATE OR REPLACE FUNCTION guard_centerline_source_clip_mutation()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $function$
+        DECLARE
+            changed_fit_id UUID;
+            run_status TEXT;
+        BEGIN
+            IF TG_OP = 'DELETE'
+               AND current_setting(
+                   'track_v2.allow_completed_run_delete', true
+               ) = 'on' THEN
+                RETURN NULL;
+            END IF;
+
+            IF TG_OP = 'INSERT' THEN
+                FOR changed_fit_id IN
+                    SELECT centerline.fit_id
+                      FROM new_rows AS changed
+                      JOIN centerlines AS centerline
+                        ON centerline.id = changed.centerline_id
+                       AND centerline.detect_id = changed.detect_id
+                     GROUP BY centerline.fit_id
+                     ORDER BY centerline.fit_id
+                LOOP
+                    SELECT status INTO run_status
+                      FROM fit_runs WHERE id = changed_fit_id FOR SHARE;
+                    IF run_status = 'completed' THEN
+                        RAISE EXCEPTION
+                            'completed Fit Run % artifacts are immutable',
+                            changed_fit_id;
+                    END IF;
+                END LOOP;
+            ELSIF TG_OP = 'DELETE' THEN
+                FOR changed_fit_id IN
+                    SELECT centerline.fit_id
+                      FROM old_rows AS changed
+                      JOIN centerlines AS centerline
+                        ON centerline.id = changed.centerline_id
+                       AND centerline.detect_id = changed.detect_id
+                     GROUP BY centerline.fit_id
+                     ORDER BY centerline.fit_id
+                LOOP
+                    SELECT status INTO run_status
+                      FROM fit_runs WHERE id = changed_fit_id FOR SHARE;
+                    IF run_status = 'completed' THEN
+                        RAISE EXCEPTION
+                            'completed Fit Run % artifacts are immutable',
+                            changed_fit_id;
+                    END IF;
+                END LOOP;
+            ELSE
+                FOR changed_fit_id IN
+                    SELECT centerline.fit_id
+                      FROM (
+                            SELECT centerline_id, detect_id FROM old_rows
+                            UNION
+                            SELECT centerline_id, detect_id FROM new_rows
+                           ) AS changed
+                      JOIN centerlines AS centerline
+                        ON centerline.id = changed.centerline_id
+                       AND centerline.detect_id = changed.detect_id
+                     GROUP BY centerline.fit_id
+                     ORDER BY centerline.fit_id
+                LOOP
+                    SELECT status INTO run_status
+                      FROM fit_runs WHERE id = changed_fit_id FOR SHARE;
+                    IF run_status = 'completed' THEN
+                        RAISE EXCEPTION
+                            'completed Fit Run % artifacts are immutable',
+                            changed_fit_id;
+                    END IF;
+                END LOOP;
+            END IF;
+            RETURN NULL;
+        END
+        $function$
+        """,
+    ),
+    (
+        "fit_artifact_mutation_triggers",
+        """
+        DROP TRIGGER IF EXISTS guard_completed_fit_insert ON centerlines;
+        CREATE TRIGGER guard_completed_fit_insert
+        AFTER INSERT ON centerlines REFERENCING NEW TABLE AS new_rows
+        FOR EACH STATEMENT EXECUTE FUNCTION guard_centerline_mutation();
+        DROP TRIGGER IF EXISTS guard_completed_fit_update ON centerlines;
+        CREATE TRIGGER guard_completed_fit_update
+        AFTER UPDATE ON centerlines
+        REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows
+        FOR EACH STATEMENT EXECUTE FUNCTION guard_centerline_mutation();
+        DROP TRIGGER IF EXISTS guard_completed_fit_delete ON centerlines;
+        CREATE TRIGGER guard_completed_fit_delete
+        AFTER DELETE ON centerlines REFERENCING OLD TABLE AS old_rows
+        FOR EACH STATEMENT EXECUTE FUNCTION guard_centerline_mutation();
+
+        DROP TRIGGER IF EXISTS guard_completed_fit_insert
+            ON centerline_source_clips;
+        CREATE TRIGGER guard_completed_fit_insert
+        AFTER INSERT ON centerline_source_clips
+        REFERENCING NEW TABLE AS new_rows
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION guard_centerline_source_clip_mutation();
+        DROP TRIGGER IF EXISTS guard_completed_fit_update
+            ON centerline_source_clips;
+        CREATE TRIGGER guard_completed_fit_update
+        AFTER UPDATE ON centerline_source_clips
+        REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION guard_centerline_source_clip_mutation();
+        DROP TRIGGER IF EXISTS guard_completed_fit_delete
+            ON centerline_source_clips;
+        CREATE TRIGGER guard_completed_fit_delete
+        AFTER DELETE ON centerline_source_clips
+        REFERENCING OLD TABLE AS old_rows
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION guard_centerline_source_clip_mutation()
+        """,
+    ),
+]
 
 
-def _run_migrations(cur: Any) -> None:
-    """Structural changes that cannot be auto-detected from the DDL.
-
-    ZH: DDL 无法表达的结构性变更（DROP NOT NULL / DROP INDEX / DROP FK）。
-        可自动检测的列添加已由 ``_auto_add_missing_columns`` 处理。
-    """
-    # ZH: 仅保留 DDL 无法表达的结构性变更。
-    #     列添加已由 _auto_add_missing_columns 自动处理。
-    # EN: Only structural changes that the DDL cannot express.
-    #     Column additions are handled automatically by _auto_add_missing_columns.
-    migrations: list[tuple[str, str]] = [
-        (
-            "clean_run_fixed_crs_complete",
-            "DO $$ BEGIN IF NOT EXISTS ("
-            "SELECT 1 FROM pg_constraint "
-            "WHERE conname = 'clean_runs_fixed_crs_complete' "
-            "AND conrelid = 'clean_runs'::regclass AND contype = 'c'"
-            ") THEN ALTER TABLE clean_runs ADD CONSTRAINT "
-            "clean_runs_fixed_crs_complete CHECK (source_srid = 4326 AND "
-            "jsonb_typeof(projection_config) = 'object' AND "
-            "(processing_srid IS NULL OR (processing_srid > 0 AND "
-            "processing_srid <> 4326 AND projection_config @> "
-            "'{\"coordinate_semantics_version\": 2}'::jsonb))); "
-            "END IF; END $$",
-        ),
-        (
-            "clean_run_context_immutable_function",
-            "CREATE OR REPLACE FUNCTION reject_v2_clean_run_context_update() "
-            "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
-            "IF OLD.projection_config @> "
-            "'{\"coordinate_semantics_version\": 2}'::jsonb AND "
-            "ROW(NEW.source_srid, NEW.processing_srid, NEW.projection_config) "
-            "IS DISTINCT FROM "
-            "ROW(OLD.source_srid, OLD.processing_srid, OLD.projection_config) "
-            "THEN RAISE EXCEPTION 'fixed-CRS Clean Run context is immutable'; "
-            "END IF; RETURN NEW; END $$",
-        ),
-        (
-            "clean_run_context_immutable_trigger",
-            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_trigger "
-            "WHERE tgname = 'trg_clean_run_context_immutable' "
-            "AND tgrelid = 'clean_runs'::regclass AND NOT tgisinternal) "
-            "THEN CREATE TRIGGER trg_clean_run_context_immutable "
-            "BEFORE UPDATE OF source_srid, processing_srid, projection_config "
-            "ON clean_runs FOR EACH ROW EXECUTE FUNCTION "
-            "reject_v2_clean_run_context_update(); END IF; END $$",
-        ),
-        (
-            "backfill_candidate_membership",
-            "DO $$ DECLARE conflict boolean; BEGIN "
-            "IF to_regclass('candidate_intersection_events') IS NOT NULL THEN "
-            "EXECUTE 'SELECT EXISTS (SELECT 1 FROM candidate_intersection_events "
-            "WHERE event_kind = ''turn'' GROUP BY detect_id, turn_event_id "
-            "HAVING COUNT(DISTINCT candidate_intersection_id) > 1)' INTO conflict; "
-            "IF conflict THEN RAISE EXCEPTION "
-            "'turn event belongs to multiple candidate intersections'; END IF; "
-            "EXECUTE 'SELECT EXISTS (SELECT 1 FROM candidate_intersection_events "
-            "WHERE event_kind = ''orthogonal_cross_track'' "
-            "GROUP BY detect_id, from_source_id, from_source_row_key, "
-            "to_source_id, to_source_row_key "
-            "HAVING COUNT(DISTINCT candidate_intersection_id) > 1)' INTO conflict; "
-            "IF conflict THEN RAISE EXCEPTION "
-            "'cross event belongs to multiple candidate intersections'; END IF; "
-            "EXECUTE 'UPDATE turn_events AS te SET candidate_intersection_id = m.candidate_id "
-            "FROM (SELECT detect_id, turn_event_id, MIN(candidate_intersection_id) AS candidate_id "
-            "FROM candidate_intersection_events WHERE event_kind = ''turn'' "
-            "GROUP BY detect_id, turn_event_id) AS m "
-            "WHERE te.detect_id = m.detect_id AND te.id = m.turn_event_id'; "
-            "EXECUTE 'UPDATE tracks_cross AS tc SET candidate_intersection_id = m.candidate_id "
-            "FROM (SELECT detect_id, from_source_id, from_source_row_key, "
-            "to_source_id, to_source_row_key, MIN(candidate_intersection_id) AS candidate_id "
-            "FROM candidate_intersection_events WHERE event_kind = ''orthogonal_cross_track'' "
-            "GROUP BY detect_id, from_source_id, from_source_row_key, "
-            "to_source_id, to_source_row_key) AS m "
-            "WHERE tc.detect_id = m.detect_id "
-            "AND tc.from_source_id = m.from_source_id "
-            "AND tc.from_source_row_key = m.from_source_row_key "
-            "AND tc.to_source_id = m.to_source_id "
-            "AND tc.to_source_row_key = m.to_source_row_key'; "
-            "EXECUTE 'SELECT EXISTS (SELECT 1 FROM candidate_intersection_events AS cie "
-            "WHERE cie.event_kind = ''turn'' AND NOT EXISTS "
-            "(SELECT 1 FROM turn_events AS te WHERE te.detect_id = cie.detect_id "
-            "AND te.id = cie.turn_event_id AND te.candidate_intersection_id = cie.candidate_intersection_id))' "
-            "INTO conflict; "
-            "IF conflict THEN RAISE EXCEPTION 'unmapped turn candidate membership'; END IF; "
-            "EXECUTE 'SELECT EXISTS (SELECT 1 FROM candidate_intersection_events AS cie "
-            "WHERE cie.event_kind = ''orthogonal_cross_track'' AND NOT EXISTS "
-            "(SELECT 1 FROM tracks_cross AS tc WHERE tc.detect_id = cie.detect_id "
-            "AND tc.from_source_id = cie.from_source_id "
-            "AND tc.from_source_row_key = cie.from_source_row_key "
-            "AND tc.to_source_id = cie.to_source_id "
-            "AND tc.to_source_row_key = cie.to_source_row_key "
-            "GROUP BY tc.detect_id HAVING COUNT(*) = 1))' INTO conflict; "
-            "IF conflict THEN RAISE EXCEPTION "
-            "'cross candidate membership is not uniquely mapped'; END IF; "
-            "EXECUTE 'SELECT EXISTS (SELECT 1 FROM candidate_intersection_events AS cie "
-            "WHERE cie.event_kind = ''orthogonal_cross_track'' AND NOT EXISTS "
-            "(SELECT 1 FROM tracks_cross AS tc WHERE tc.detect_id = cie.detect_id "
-            "AND tc.from_source_id = cie.from_source_id "
-            "AND tc.from_source_row_key = cie.from_source_row_key "
-            "AND tc.to_source_id = cie.to_source_id "
-            "AND tc.to_source_row_key = cie.to_source_row_key "
-            "AND tc.candidate_intersection_id = cie.candidate_intersection_id))' INTO conflict; "
-            "IF conflict THEN RAISE EXCEPTION 'unmapped cross candidate membership'; END IF; "
-            "END IF; END $$",
-        ),
-        (
-            "drop_candidate_intersection_events",
-            "DROP TABLE IF EXISTS candidate_intersection_events",
-        ),
-        (
-            "drop_turn_event_event_id_index",
-            "DROP INDEX IF EXISTS idx_te_event_id",
-        ),
-        (
-            "drop_turn_event_event_id_column",
-            "ALTER TABLE turn_events DROP COLUMN IF EXISTS event_id",
-        ),
-        (
-            "canonicalize_candidate_crossing_injected_refs",
-            _CANONICALIZE_CANDIDATE_CROSSING_INJECTED_REFS_SQL,
-        ),
-        (
-            "backfill_intersection_identities",
-            _BACKFILL_INTERSECTION_IDENTITIES_SQL,
-        ),
-        (
-            "require_intersection_endpoint_ids",
-            "ALTER TABLE centerlines "
-            "ALTER COLUMN from_intersection_id SET NOT NULL, "
-            "ALTER COLUMN to_intersection_id SET NOT NULL; "
-            "ALTER TABLE centerline_source_clips "
-            "ALTER COLUMN start_intersection_id SET NOT NULL, "
-            "ALTER COLUMN end_intersection_id SET NOT NULL",
-        ),
-        (
-            "add_intersection_identity_constraints",
-            _ADD_INTERSECTION_IDENTITY_CONSTRAINTS_SQL,
-        ),
-        (
-            "drop_cluster_identity_constraints",
-            _DROP_CLUSTER_ID_CONSTRAINTS_SQL,
-        ),
-        ("drop_ci_cluster_index", "DROP INDEX IF EXISTS idx_ci_cluster_id"),
-        ("drop_ceep_cluster_index", "DROP INDEX IF EXISTS idx_ceep_cluster"),
-        ("drop_int_cluster_index", "DROP INDEX IF EXISTS idx_int_cluster_id"),
-        (
-            "drop_eep_cluster_index",
-            "DROP INDEX IF EXISTS idx_eep_cluster_vehicle",
-        ),
-        (
-            "drop_manifest_start_cluster_column",
-            "ALTER TABLE centerline_source_clips "
-            "DROP COLUMN IF EXISTS start_cluster_id",
-        ),
-        (
-            "drop_manifest_end_cluster_column",
-            "ALTER TABLE centerline_source_clips "
-            "DROP COLUMN IF EXISTS end_cluster_id",
-        ),
-        (
-            "drop_centerline_from_cluster_column",
-            "ALTER TABLE centerlines DROP COLUMN IF EXISTS from_cluster_id",
-        ),
-        (
-            "drop_centerline_to_cluster_column",
-            "ALTER TABLE centerlines DROP COLUMN IF EXISTS to_cluster_id",
-        ),
-        (
-            "drop_entry_exit_cluster_column",
-            "ALTER TABLE entry_exit_points DROP COLUMN IF EXISTS cluster_id",
-        ),
-        (
-            "drop_intersection_cluster_column",
-            "ALTER TABLE intersections DROP COLUMN IF EXISTS cluster_id",
-        ),
-        (
-            "drop_candidate_crossing_cluster_column",
-            "ALTER TABLE candidate_entry_exit_points "
-            "DROP COLUMN IF EXISTS cluster_id",
-        ),
-        (
-            "drop_candidate_cluster_column",
-            "ALTER TABLE candidate_intersections DROP COLUMN IF EXISTS cluster_id",
-        ),
-        (
-            "drop_candidate_orthogonal_count_column",
-            "ALTER TABLE candidate_intersections "
-            "DROP COLUMN IF EXISTS orthogonal_count",
-        ),
-        (
-            "add_candidate_membership_fks",
-            "DO $$ BEGIN "
-            "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
-            "WHERE conname = 'turn_events_candidate_intersection_fkey' "
-            "AND conrelid = 'turn_events'::regclass) THEN "
-            "ALTER TABLE turn_events ADD CONSTRAINT turn_events_candidate_intersection_fkey "
-            "FOREIGN KEY (candidate_intersection_id, detect_id) "
-            "REFERENCES candidate_intersections(id, detect_id); END IF; "
-            "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
-            "WHERE conname = 'tracks_cross_candidate_intersection_fkey' "
-            "AND conrelid = 'tracks_cross'::regclass) THEN "
-            "ALTER TABLE tracks_cross ADD CONSTRAINT tracks_cross_candidate_intersection_fkey "
-            "FOREIGN KEY (candidate_intersection_id, detect_id) "
-            "REFERENCES candidate_intersections(id, detect_id); END IF; "
-            "END $$",
-        ),
-        (
-            "injected_origin_nullable",
-            "ALTER TABLE injected_points "
-            "ALTER COLUMN origin_lon DROP NOT NULL, "
-            "ALTER COLUMN origin_lat DROP NOT NULL",
-        ),
-        (
-            "tracks_cross_origin_nullable",
-            "ALTER TABLE tracks_cross "
-            "ALTER COLUMN origin_lon DROP NOT NULL, "
-            "ALTER COLUMN origin_lat DROP NOT NULL",
-        ),
-        (
-            "turn_event_origin_nullable",
-            "ALTER TABLE turn_events "
-            "ALTER COLUMN origin_lon DROP NOT NULL, "
-            "ALTER COLUMN origin_lat DROP NOT NULL",
-        ),
-        (
-            "candidate_intersection_origin_nullable",
-            "ALTER TABLE candidate_intersections "
-            "ALTER COLUMN origin_lon DROP NOT NULL, "
-            "ALTER COLUMN origin_lat DROP NOT NULL",
-        ),
-        (
-            "candidate_entry_exit_origin_nullable",
-            "ALTER TABLE candidate_entry_exit_points "
-            "ALTER COLUMN origin_lon DROP NOT NULL, "
-            "ALTER COLUMN origin_lat DROP NOT NULL",
-        ),
-        ("replace_cross_unique_index", "DROP INDEX IF EXISTS idx_tc_segment_pair"),
-        ("replace_turn_unique_index", "DROP INDEX IF EXISTS idx_te_vehicle_ts"),
-        (
-            "replace_turn_xy_index",
-            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_indexes "
-            "WHERE schemaname = current_schema() AND indexname = 'idx_te_xy' "
-            "AND indexdef NOT LIKE '%(detect_id, x, y)%') "
-            "THEN DROP INDEX idx_te_xy; END IF; END $$",
-        ),
-        ("drop_redundant_ktp_tp_id", "DROP INDEX IF EXISTS idx_ktp_tp_id"),
-        (
-            "drop_redundant_ktp_vehicle_sub",
-            "DROP INDEX IF EXISTS idx_ktp_vehicle_sub",
-        ),
-        (
-            "ktp_drop_tp_fk",
-            "DO $$ DECLARE cname text; BEGIN "
-            "SELECT con.conname INTO cname FROM pg_constraint con "
-            "JOIN pg_class rel ON rel.oid = con.conrelid "
-            "WHERE rel.relname = 'kept_trajectory_points' "
-            "AND con.contype = 'f' AND con.confrelid = 'trajectory_points'::regclass; "
-            "IF cname IS NOT NULL THEN "
-            "EXECUTE 'ALTER TABLE kept_trajectory_points DROP CONSTRAINT ' || cname; "
-            "END IF; END $$",
-        ),
-        (
-            "validate_kept_membership_unique",
-            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM kept_trajectory_points "
-            "GROUP BY clean_id, vehicle_id, subtrack_index, sequence_in_subtrack "
-            "HAVING COUNT(*) > 1) THEN "
-            "RAISE EXCEPTION 'duplicate kept membership prevents migration'; "
-            "END IF; END $$",
-        ),
-        (
-            "validate_legacy_injected_parent_unique",
-            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM injected_points "
-            "WHERE subtrack_index IS NULL OR after_sequence_in_subtrack IS NULL "
-            "GROUP BY clean_id, vehicle_id, from_source_id, from_source_row_key, "
-            "to_source_id, to_source_row_key HAVING COUNT(*) > 1) THEN "
-            "RAISE EXCEPTION 'legacy injected parents are ambiguous'; "
-            "END IF; END $$",
-        ),
-        (
-            "backfill_injected_membership",
-            "UPDATE injected_points AS ip SET "
-            "source_id = ip.from_source_id, "
-            "source_row_key = CONCAT(ip.from_source_row_key, '->', "
-            "ip.to_source_row_key, ':', ip.generated_reason), "
-            "subtrack_index = left_point.subtrack_index, "
-            "after_sequence_in_subtrack = left_point.sequence_in_subtrack "
-            "FROM kept_trajectory_points AS left_point "
-            "JOIN kept_trajectory_points AS right_point "
-            "ON right_point.clean_id = left_point.clean_id "
-            "AND right_point.vehicle_id = left_point.vehicle_id "
-            "AND right_point.subtrack_index = left_point.subtrack_index "
-            "AND right_point.sequence_in_subtrack = left_point.sequence_in_subtrack + 1 "
-            "WHERE ip.clean_id = left_point.clean_id "
-            "AND ip.vehicle_id = left_point.vehicle_id "
-            "AND ip.from_source_id = left_point.source_id "
-            "AND ip.from_source_row_key = left_point.source_row_key "
-            "AND ip.to_source_id = right_point.source_id "
-            "AND ip.to_source_row_key = right_point.source_row_key "
-            "AND (ip.subtrack_index IS NULL OR ip.after_sequence_in_subtrack IS NULL "
-            "OR ip.source_id IS NULL OR ip.source_row_key IS NULL)",
-        ),
-        (
-            "validate_injected_membership",
-            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM injected_points WHERE "
-            "subtrack_index IS NULL OR after_sequence_in_subtrack IS NULL "
-            "OR source_id IS NULL OR source_row_key IS NULL) THEN "
-            "RAISE EXCEPTION 'legacy injected provenance is incomplete'; "
-            "END IF; END $$",
-        ),
-        (
-            "validate_injected_membership_unique",
-            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM injected_points "
-            "GROUP BY clean_id, vehicle_id, subtrack_index, after_sequence_in_subtrack "
-            "HAVING COUNT(*) > 1) THEN "
-            "RAISE EXCEPTION 'duplicate injected membership prevents migration'; "
-            "END IF; END $$",
-        ),
-        (
-            "require_injected_membership",
-            "ALTER TABLE injected_points "
-            "ALTER COLUMN subtrack_index SET NOT NULL, "
-            "ALTER COLUMN after_sequence_in_subtrack SET NOT NULL, "
-            "ALTER COLUMN source_id SET NOT NULL, "
-            "ALTER COLUMN source_row_key SET NOT NULL",
-        ),
-    ]
-    for label, sql in migrations:
-        cur.execute(sql)
-        print(f"  [OK] migration {label:30s} {cur.statusmessage}")
+LEGACY_TABLES = (
+    "candidate_intersection_events",
+    "pipeline_runs",
+)
 
 
-def create_tables(
-    config: PostgresConfig,
-    *,
-    legacy_clean_map: dict[str, str] | None = None,
-) -> int:
-    """Create or migrate the complete schema in one transaction.
+def _schema_version(cur: Any) -> int | None:
+    cur.execute("SELECT to_regclass('pipeline_schema_versions')")
+    if cur.fetchone()[0] is None:
+        return None
+    cur.execute(
+        "SELECT version FROM pipeline_schema_versions WHERE component = %s",
+        (SCHEMA_COMPONENT,),
+    )
+    row = cur.fetchone()
+    return None if row is None else int(row[0])
 
-    ZH: 任一步失败都向上传播，由连接上下文回滚整个事务。
-    EN: Any error propagates so the connection context rolls back every change.
-    """
-    tables_created = 0
-    indexes_created = 0
 
+def _existing_pipeline_tables(cur: Any) -> list[str]:
+    names = [name for name, _ in DDL_STATEMENTS if name != "pipeline_schema_versions"]
+    names.extend(LEGACY_TABLES)
+    cur.execute(
+        """
+        SELECT table_name
+          FROM information_schema.tables
+         WHERE table_schema = current_schema()
+           AND table_name = ANY(%s)
+         ORDER BY table_name
+        """,
+        (names,),
+    )
+    return [str(row[0]) for row in cur.fetchall()]
+
+
+def _require_empty_or_v3(cur: Any) -> None:
+    version = _schema_version(cur)
+    if version == SCHEMA_VERSION:
+        return
+    if version is not None:
+        raise RuntimeError(
+            f"database schema is v{version}; track.v2 requires v{SCHEMA_VERSION}. "
+            "Run init_db --reset to perform the destructive v3 switch."
+        )
+    existing = _existing_pipeline_tables(cur)
+    if existing:
+        preview = ", ".join(existing[:8])
+        suffix = " ..." if len(existing) > 8 else ""
+        raise RuntimeError(
+            "unversioned/legacy pipeline tables exist "
+            f"({preview}{suffix}); schema v3 has no in-place migration. "
+            "Run init_db --reset."
+        )
+
+
+def reset_tables(config: PostgresConfig) -> int:
+    """Drop every known pipeline table; schema v3 intentionally has no migration."""
+    current_names = [name for name, _ in reversed(DDL_STATEMENTS)]
+    drop_names = [*current_names, *LEGACY_TABLES]
     with pg_connect(config) as conn:
         with conn.cursor() as cur:
-            migrate_legacy_pipeline_runs(
-                cur,
-                legacy_clean_map or {},
-                registry_ddl=dict(DDL_STATEMENTS),
-                index_statements=INDEX_STATEMENTS,
-            )
-            # ── Create tables ──
+            cur.execute("SELECT current_database(), current_user, current_schema()")
+            database, user, schema = cur.fetchone()
+            print("\n── 重置目标核对 / Reset Target ──")
+            print(f"  database={database} user={user} schema={schema}")
+            print("\n── 重置数据表 / Resetting Tables ──")
+            for name in drop_names:
+                cur.execute(f'DROP TABLE IF EXISTS "{name}" CASCADE')
+                print(f"  [OK] DROP {name:40s} {cur.statusmessage}")
+            for function_name in (
+                "validate_resolved_point_membership",
+                "validate_resolved_segment_start",
+                "validate_tracks_cross_segments",
+                "validate_turn_event_point",
+                "validate_entry_exit_observation",
+                "validate_centerline_source_clip",
+                "enforce_pipeline_run_state_transition",
+                "enforce_pipeline_run_initial_status",
+                "guard_pipeline_run_delete",
+                "validate_detect_run_completion",
+                "guard_clean_artifact_mutation",
+                "guard_detect_artifact_mutation",
+                "validate_fit_run_completion",
+                "guard_centerline_mutation",
+                "guard_centerline_source_clip_mutation",
+            ):
+                cur.execute(f"DROP FUNCTION IF EXISTS {function_name}() CASCADE")
+        conn.commit()
+    print(f"\n  已删除 / Dropped: {len(drop_names)} known tables")
+    return 0
+
+
+def create_tables(config: PostgresConfig) -> int:
+    """Create schema v3 in one transaction, refusing every legacy schema."""
+    with pg_connect(config) as conn:
+        with conn.cursor() as cur:
+            _require_empty_or_v3(cur)
+
             print("\n── 创建数据表 / Creating Tables ──")
             for name, ddl in DDL_STATEMENTS:
                 cur.execute(ddl)
-                status = cur.statusmessage
-                print(f"  [OK] {name:40s} {status}")
-                tables_created += 1
+                print(f"  [OK] {name:40s} {cur.statusmessage}")
 
-            # ── Auto column migrations: diff DDL vs information_schema ──
-            print("\n── 自动列迁移 / Auto Column Migrations ──")
-            for name, ddl in DDL_STATEMENTS:
-                _auto_add_missing_columns(cur, name, ddl)
+            cur.execute(
+                """
+                INSERT INTO pipeline_schema_versions(component, version)
+                VALUES (%s, %s)
+                ON CONFLICT (component) DO NOTHING
+                """,
+                (SCHEMA_COMPONENT, SCHEMA_VERSION),
+            )
+            cur.execute(
+                "SELECT version FROM pipeline_schema_versions WHERE component = %s",
+                (SCHEMA_COMPONENT,),
+            )
+            installed_version = int(cur.fetchone()[0])
+            if installed_version != SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"track.v2 schema version is {installed_version}; "
+                    f"expected {SCHEMA_VERSION}"
+                )
 
-            # ── Structural migrations (DROP NOT NULL / DROP INDEX / DROP FK) ──
-            print("\n── 结构性迁移 / Structural Migrations ──")
-            _run_migrations(cur)
+            print("\n── 创建关系约束 / Creating Relational Guards ──")
+            for name, ddl in POST_DDL_STATEMENTS:
+                cur.execute(ddl)
+                print(f"  [OK] {name:40s} {cur.statusmessage}")
 
-            # ── Create indexes ──
             print("\n── 创建索引 / Creating Indexes ──")
             for name, ddl in INDEX_STATEMENTS:
                 cur.execute(ddl)
-                status = cur.statusmessage
-                print(f"  [OK] {name:40s} {status}")
-                indexes_created += 1
-
+                print(f"  [OK] {name:40s} {cur.statusmessage}")
         conn.commit()
 
-    print(f"\n── 汇总 / Summary ──")
-    print(f"  表 / Tables:  {tables_created} processed")
-    print(f"  索引 / Indexes: {indexes_created} processed")
-    print(f"  [OK] 全部成功 / All succeeded")
+    print("\n── 汇总 / Summary ──")
+    print(f"  Schema: {SCHEMA_COMPONENT} v{SCHEMA_VERSION}")
+    print(f"  表 / Tables: {len(DDL_STATEMENTS)} processed")
+    print(f"  索引 / Indexes: {len(INDEX_STATEMENTS)} processed")
+    print("  [OK] 全部成功 / All succeeded")
     return 0
 
 
 def main() -> int:
-    # ZH: 从 .env 加载默认连接参数，CLI 参数可覆盖
-    # EN: Load defaults from .env; CLI args take precedence
-    _env = default_postgres_config()
-
+    defaults = default_postgres_config()
     parser = argparse.ArgumentParser(
-        description="Initialize track.v2 PostgreSQL database schema."
+        description="Initialize the destructive track.v2 PostgreSQL schema v3."
     )
-    parser.add_argument("--host", default=_env.host)
-    parser.add_argument("--port", type=int, default=_env.port)
-    parser.add_argument("--database", default=_env.database)
-    parser.add_argument("--user", default=_env.user)
+    parser.add_argument("--host", default=defaults.host)
+    parser.add_argument("--port", type=int, default=defaults.port)
+    parser.add_argument("--database", default=defaults.database)
+    parser.add_argument("--user", default=defaults.user)
     parser.add_argument(
-        "--ask-password", action="store_true",
-        help="Prompt for password interactively (secure, no echo). Overrides .env password."
+        "--ask-password",
+        action="store_true",
+        help="Prompt for a password instead of using the environment value.",
     )
-    parser.add_argument("--connect-timeout", type=int, default=_env.connect_timeout)
-    parser.add_argument("--sslmode", default=_env.sslmode)
+    parser.add_argument("--connect-timeout", type=int, default=defaults.connect_timeout)
+    parser.add_argument("--sslmode", default=defaults.sslmode)
     parser.add_argument(
-        "--reset", action="store_true",
-        help="Drop all tables (CASCADE) before recreating them, clearing all data."
-    )
-    parser.add_argument("--skip-tables", nargs="*", default=[], metavar="TABLE",
-                        help="Skip creating/migrating the specified tables.")
-    parser.add_argument(
-        "--legacy-clean-map",
-        type=Path,
-        help=("JSON object mapping ambiguous legacy Detect UUIDs to their exact "
-              "parent Clean UUIDs. No relationship is inferred."),
+        "--reset",
+        action="store_true",
+        help="Destructively drop all known Pipeline tables before creating v3.",
     )
     args = parser.parse_args()
 
-    # ── Resolve password: CLI prompt > .env > empty ──
-    if args.ask_password:
-        password = getpass.getpass("PostgreSQL password: ")
-    else:
-        password = _env.password
-
+    password = (
+        getpass.getpass("PostgreSQL password: ")
+        if args.ask_password
+        else defaults.password
+    )
     config = PostgresConfig(
         host=args.host,
         port=args.port,
@@ -1489,32 +1869,18 @@ def main() -> int:
 
     print(f"连接目标 / Target: {config.safe_dsn()}")
     init_logger()
-
     try:
         if args.reset:
-            reset_failures = reset_tables(config,skip_tables=args.skip_tables)
-            print(f"--reset 已清空所有表，{', '.join(args.skip_tables)} 将被忽略 / "
-                      f"--reset cleared all tables, so {', '.join(args.skip_tables)} is ignored.")
-            if reset_failures > 0:
-                print("[FAIL] 重置失败，终止操作 / Reset failed, aborting.")
-                return 1
-            
-        legacy_clean_map = (
-            load_legacy_clean_map(args.legacy_clean_map)
-            if args.legacy_clean_map is not None
-            else {}
-        )
-        failures = create_tables(config, legacy_clean_map=legacy_clean_map)
+            reset_tables(config)
+        return create_tables(config)
     except RuntimeError as exc:
-        print(str(exc))
+        print(f"[FAIL] {exc}")
         return 2
     except Exception as exc:
         print(f"[FAIL] 连接或执行失败 / Connection or execution failed: {exc}")
         return 1
     finally:
         shutdown_logger()
-
-    return 0 if failures == 0 else 1
 
 
 if __name__ == "__main__":

@@ -6,12 +6,11 @@ from dataclasses import replace
 
 from track.v2 import (
     ClipEndpoint,
+    ClipPoint,
     ClipReport,
     ClipResult,
     ClipIntersection,
     TrackClip,
-    TrajectoryPoint,
-    PointRef,
     fit_centerlines,
     fit_centerline_variants,
     build_network,
@@ -47,26 +46,14 @@ def _endpoint(
         kind=kind,
         lon=lon,
         lat=lat,
-        timestamp=x_m,
         intersection_id=intersection_id,
-        segment_index=0,
-        segment_fraction=0.0,
+        crossing_id=intersection_id * 10 + (1 if kind == "entry" else 0),
     )
 
 
-def _point(vehicle_id: str, row_key: str, x_m: float, y_m: float) -> TrajectoryPoint:
+def _point(resolved_point_id: int, x_m: float, y_m: float) -> ClipPoint:
     lon, lat = _TRANSFORMER.inverse(x_m, y_m)
-    return TrajectoryPoint(
-        point_ref=PointRef("fit-test", row_key, stable=True),
-        vehicle_id=vehicle_id,
-        timestamp=x_m,
-        lon=lon,
-        lat=lat,
-        heading=90.0,
-        speed=10.0,
-        x=x_m,
-        y=y_m,
-    )
+    return ClipPoint(resolved_point_id=resolved_point_id, lon=lon, lat=lat)
 
 
 def _clip(
@@ -82,11 +69,11 @@ def _clip(
         clip_id=clip_id,
         vehicle_id=vehicle_id,
         trip_id=f"trip-{clip_id}",
-        clip_type="inter_intersection",
+        clip_type="between_intersection",
         start=_endpoint("exit", start_intersection_id, start_x, start_y),
         end=_endpoint("entry", end_intersection_id, end_x, end_y),
         points=tuple(
-            _point(vehicle_id, f"{clip_id}-{index}", x_m, y_m)
+            _point(index, x_m, y_m)
             for index, (x_m, y_m) in enumerate(coords_m[1:-1], start=1)
         ),
         distance_m=200.0,
@@ -99,9 +86,18 @@ def _clip_result(*clips: TrackClip) -> ClipResult:
         clips=clips,
         report=ClipReport(
             total_vehicles=len(clips),
+            total_subtracks=len(clips),
             total_clips=len(clips),
-            inter_intersection_clips=len(clips),
-            boundary_clips=0,
+            between_intersection_clips=sum(
+                clip.clip_type == "between_intersection" for clip in clips
+            ),
+            boundary_start_clips=sum(
+                clip.clip_type == "boundary_start" for clip in clips
+            ),
+            boundary_end_clips=sum(
+                clip.clip_type == "boundary_end" for clip in clips
+            ),
+            full_track_clips=sum(clip.clip_type == "full_track" for clip in clips),
             total_points_in_clips=sum(clip.point_count for clip in clips),
         ),
         spatial_context=_SPATIAL_CONTEXT,
@@ -123,6 +119,20 @@ class FittingStageTest(unittest.TestCase):
         self.assertEqual(bundle.b_to_a.centerlines[0].variant, "directed")
         self.assertEqual(bundle.a_to_b.centerlines[0].source_clip_ids, ("forward",))
         self.assertEqual(bundle.b_to_a.centerlines[0].source_clip_ids, ("reverse",))
+        self.assertEqual(
+            (
+                bundle.a_to_b.centerlines[0].forward_clip_count,
+                bundle.a_to_b.centerlines[0].reverse_clip_count,
+            ),
+            (1, 0),
+        )
+        self.assertEqual(
+            (
+                bundle.b_to_a.centerlines[0].forward_clip_count,
+                bundle.b_to_a.centerlines[0].reverse_clip_count,
+            ),
+            (1, 0),
+        )
         self.assertEqual(bundle.combined.spatial_context, _SPATIAL_CONTEXT)
         self.assertEqual(bundle.a_to_b.spatial_context, _SPATIAL_CONTEXT)
         self.assertEqual(bundle.b_to_a.spatial_context, _SPATIAL_CONTEXT)

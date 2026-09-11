@@ -1,5 +1,10 @@
 # Pipeline 2,000 万行内存预算与外存化 Spec
 
+> 历史容量审计：本文基于 2026-09-02 的 pre-v3 对象生命周期。Schema v3 已将
+> Clip 改为读取最终 resolved p/i/c 序列，并重构 Detect 持久化；文中的旧结构
+> 数字不能作为当前实现验收结果。20M 验收前必须按
+> [schema-v3 benchmark](schema-v3-cutover-benchmark.md) 重新建立基线。
+
 状态：容量审计完成，当前实现不达标，20M 实测待外存化改造后执行
 
 日期：2026-09-02

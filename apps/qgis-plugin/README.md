@@ -34,12 +34,39 @@ configured in QGIS continue to apply.
 
 ## Use
 
+Replay/Clip requests now include `database_name`, read from the active PostgreSQL
+layer's connection URI. Select a PostgreSQL layer with an explicit database name;
+memory, file, and HTTP layers cannot establish this database identity and are
+rejected locally. Only the database name is sent, never the connection password.
+The Backend checks `pg_database` before spatial queries. If the database exists,
+it opens a request-scoped, read-only connection to that database on the configured
+PostgreSQL server, using Backend credentials, and verifies schema v3. Concurrent
+requests and the default database are unaffected. Responses identify the database
+in `metadata.database_name`. A missing database returns HTTP 404 with
+`detail.error=database_not_found`; incompatible schema returns 409; connection or
+SQL errors return 503. Errors appear in the QGIS native message bar and retain the
+previous `tmp` output. Existing Web requests may omit `database_name` and continue
+using the configured Backend database. The Backend role must have CONNECT and
+read permissions on each target database; no credentials or host from QGIS are used.
+
 Activate a point vector layer and use QGIS' normal point or rectangle selection.
 Then choose one of the toolbar/menu actions:
 
-- **Replay selected points** reads each selected feature's `id`, falling back to
-  `database_id`, and sends `point_ids`. If every point has the same non-null
-  `detect_id`, it is sent too.
+- For intersection Replay, activate the PostgreSQL `intersections` layer (point
+  or polygon), select exactly one feature, and choose **Replay selected points**.
+  The plugin sends its database `id` as `intersection_id`, plus `database_name`
+  and the feature's `detect_id` when available. The Backend resolves the
+  intersection's candidate within that Detect Run, selects matching `turn_events`
+  and `tracks_cross`, and calls Pipeline's `replay_points` to return constituent
+  points into `tmp`. Crossing events include both endpoints of both cleaned
+  segments; turn events include their referenced point. Points are deduplicated.
+  This mode does not limit vehicles. Exceeding `max_points` (default 10,000,
+  maximum 50,000) returns an error instead of silently returning partial data.
+- **Replay selected points** prefers `resolved_point_id` and sends
+  `resolved_point_ids` with one common `detect_id`. Otherwise it reads
+  `source_row_key` (falling back to a raw layer's `id`/`database_id`), serializes
+  it as text, and sends `source_row_keys`. One selection cannot mix the two
+  identity domains.
 - **Clip between intersections** requires exactly two selected points. It reads
   `intersection_id` (falling back to the QGIS feature ID), rejects duplicate IDs,
   and requires both features to have the same non-null `detect_id`.
@@ -55,12 +82,22 @@ intersections.
 
 Replay request:
 
+For a selected intersection: `{"database_name": "roadnet", "intersection_id": 101}`.
+The `intersection_id` selection cannot be combined with source keys, resolved
+point IDs, or a bounding box. Backend images now include the Pipeline package
+to reuse its point-replay helper; rebuild using the Compose configuration, which
+supplies the `pipeline_source` build context. No batch Pipeline job is run in
+the request handler and results are not persisted.
+
 ```json
 {
   "detect_id": "12345678-1234-5678-1234-567812345678",
-  "point_ids": [101, 102]
+  "resolved_point_ids": [101, 102]
 }
 ```
+
+For original/Clean source rows, the alternative request is
+`{"source_row_keys": ["101", "external-key"]}`; `detect_id` is optional.
 
 Clip request:
 

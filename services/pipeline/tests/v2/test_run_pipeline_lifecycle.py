@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 from track.v2.config import PostgresConfig
 from track.v2.config.pipeline_config import PipelineConfig
 from track.v2.db.pipeline_store import CleanBatchResult, DetectPersistenceResult
+from track.v2.db.source_table import SourceTableContract
 from track.v2.db_writer import CleanRunRecord
 from track.v2.intersect2 import IntersectConfig, IntersectResult
 from track.v2.models import (
@@ -101,11 +102,11 @@ class _RecordingStore:
         self.detect_ids = iter((DETECT_ID, "33333333-3333-3333-3333-333333333333"))
         self.clean_record = CleanRunRecord(
             id=CLEAN_ID,
-            source_id="raw_points",
-            source_kind="postgres_table",
-            parameters={"target_table": "raw_points"},
+            source_table="raw_points",
+            parameters={},
             status="completed",
             spatial_context=_SPATIAL_CONTEXT,
+            source_fingerprint={"version": 1, "row_count": 0, "sha256": "0"},
         )
         self.clip_result = MagicMock()
         self.clip_result.report.as_dict.return_value = {}
@@ -131,12 +132,14 @@ class _RecordingStore:
         self.events.append("start_clean")
         return CLEAN_ID
 
-    def finish_clean(self, clean_id: str, *, status: str) -> None:
+    def finish_clean(
+        self,
+        clean_id: str,
+        *,
+        status: str,
+        source_fingerprint: dict[str, object] | None = None,
+    ) -> None:
         self.events.append(f"finish_clean:{status}")
-
-    def write_raw_points(self, points: list[object], **kwargs: object) -> dict[tuple[str, str], int]:
-        self.events.append("write_raw")
-        return {}
 
     def persist_clean_batch(self, *args: object, **kwargs: object) -> CleanBatchResult:
         self.events.append("persist_clean_batch")
@@ -151,6 +154,7 @@ class _RecordingStore:
         if self.persist_detect_error is not None:
             raise self.persist_detect_error
         return DetectPersistenceResult(
+            resolved_point_count=0,
             tracks_cross_count=0,
             turn_event_count=0,
             candidate_intersection_count=0,
@@ -199,6 +203,25 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.stack.enter_context(
             patch("track.v2.pipeline.PostgresPipelineStore", return_value=self.store)
         )
+        self.stack.enter_context(patch("track.v2.pipeline.require_schema_v3"))
+        self.stack.enter_context(patch("track.v2.pipeline.verify_clean_source_fingerprint"))
+        self.stack.enter_context(
+            patch(
+                "track.v2.pipeline.validate_source_table",
+                return_value=SourceTableContract(
+                    source_table="raw_points",
+                    quoted_table='"raw_points"',
+                    key_sql_type="bigint",
+                    has_extra=True,
+                ),
+            )
+        )
+        self.stack.enter_context(
+            patch(
+                "track.v2.pipeline.calculate_source_fingerprint",
+                return_value={"version": 1, "row_count": 0, "sha256": "0"},
+            )
+        )
         self.stack.enter_context(
             patch("track.v2.pipeline.detect_intersections", return_value=_empty_intersect_result())
         )
@@ -219,7 +242,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
     def test_full_run_uses_stage_store_and_preserves_commit_order(self) -> None:
         emitted: list[PipelineEvent] = []
         result = run_pipeline(
-            PipelineInput(self.config, pg_source_table="raw_points", table="raw_points"),
+            PipelineInput(self.config, source_table="raw_points"),
             emit=emitted.append,
         ).stats
 
@@ -228,7 +251,8 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             self.events,
             [
                 "start_clean", "commit", "persist_clean_batch", "finish_clean:completed", "commit",
-                "start_detect", "commit", "persist_detect", "finish_detect:completed", "commit",
+                "start_detect", "commit", "rollback",
+                "persist_detect", "finish_detect:completed", "commit",
                 "load_clip", "start_fit", "commit", "persist_fit", "finish_fit:completed", "commit",
             ],
         )
@@ -292,12 +316,15 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         phase_messages = [
             message for message in log_messages if message.startswith("[stage-phase]")
         ]
-        self.assertEqual(len(phase_messages), 2)
+        self.assertEqual(len(phase_messages), 4)
         for phase, message in zip(
-            ("fit_compute", "fit_persist"), phase_messages, strict=True,
+            ("detect_compute", "detect_persist", "fit_compute", "fit_persist"),
+            phase_messages,
+            strict=True,
         ):
-            self.assertIn(f"stage=fitting phase={phase}", message)
-            self.assertRegex(message, r"elapsed_s=\d+\.\d{3}$")
+            stage = "intersect2" if phase.startswith("detect_") else "fitting"
+            self.assertIn(f"stage={stage} phase={phase}", message)
+            self.assertRegex(message, r"elapsed_s=\d+\.\d{3}")
 
     def test_completed_clean_reuses_store_record_without_clean_stage(self) -> None:
         first = run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID)).stats
@@ -322,8 +349,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             run_pipeline(
                 PipelineInput(
                     self.config,
-                    pg_source_table="raw_points",
-                    table="raw_points",
+                    source_table="raw_points",
                 )
             )
 
@@ -357,8 +383,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             run_pipeline(
                 PipelineInput(
                     self.config,
-                    pg_source_table="raw_points",
-                    table="raw_points",
+                    source_table="raw_points",
                 )
             )
 
@@ -377,10 +402,10 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "clip failed"):
             run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID))
 
-        self.assertEqual(self.events[-4:], [
-            "persist_detect", "finish_detect:completed", "commit", "load_clip",
+        self.assertEqual(self.events[-5:], [
+            "rollback", "persist_detect", "finish_detect:completed", "commit", "load_clip",
         ])
-        self.assertNotIn("rollback", self.events)
+        self.assertEqual(self.events.count("rollback"), 1)
 
     def test_detect_persistence_failure_rolls_back_and_marks_detect_failed(self) -> None:
         self.store.persist_detect_error = RuntimeError("detect write failed")
@@ -389,9 +414,25 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID))
 
         self.assertEqual(self.events[-5:], [
-            "commit", "persist_detect", "rollback", "finish_detect:failed", "commit",
+            "rollback", "persist_detect", "rollback", "finish_detect:failed", "commit",
         ])
         self.assertNotIn("finish_detect:completed", self.events)
+
+    def test_detect_compute_failure_closes_snapshot_and_marks_detect_failed(self) -> None:
+        with (
+            patch(
+                "track.v2.pipeline.detect_intersections",
+                side_effect=RuntimeError("detect compute failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "detect compute failed"),
+        ):
+            run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID))
+
+        self.assertEqual(
+            self.events[-4:],
+            ["commit", "rollback", "finish_detect:failed", "commit"],
+        )
+        self.assertNotIn("persist_detect", self.events)
 
     def test_fit_expected_failure_rolls_back_and_marks_fit_failed(self) -> None:
         self.store.fit_bundle_error = RuntimeError("write failed")

@@ -1,5 +1,5 @@
-COMPOSE_DEV = docker compose -f infra/docker/compose.dev.yml
-COMPOSE_PROD = docker compose -f infra/docker/compose.prod.yml
+COMPOSE_DEV = docker compose --env-file .env -f infra/docker/compose.dev.yml
+COMPOSE_PROD = docker compose --env-file .env -f infra/docker/compose.prod.yml
 VISION_IMAGE = roadnet-vision-yolov8:8.3.0-cu117
 
 .PHONY: dev-up dev-down dev-logs dev-config build test frontend-test qgis-plugin-test pipeline-check pipeline-init-db pipeline-help vision-build vision-check vision-run prod-config

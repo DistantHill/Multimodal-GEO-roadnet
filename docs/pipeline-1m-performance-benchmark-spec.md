@@ -4,7 +4,13 @@
 
 基准日期：2026-09-01
 
-适用范围：`services/pipeline/src/track/v2/` 当前运行架构
+适用范围：2026-09-01 的 pre-v3 架构（历史基线）
+
+> 2026-09-04 的 schema v3 已把 circle crossing 移到 Detect，并以
+> `resolved_subtrack_points` 驱动 Clip；本页的 Clip grid、宽 UNION row 和旧
+> manifest 结论不再描述当前实现。v3 的测量契约与已完成的 cutover 记录见
+> [`Schema v3 cutover benchmark`](schema-v3-cutover-benchmark.md)。在相同 100 万
+> 行输入完成新的受控运行前，不得把本页数值当作 v3 性能结果。
 
 > 该结果只验证 100 万行。2,000 万行的线性规模推演和 3 GB 内存合同见
 > [`Pipeline 20M memory budget Spec`](pipeline-20m-memory-budget-spec.md)。当前
@@ -334,8 +340,8 @@ Pipeline cgroup 精确峰值为 1,232.7 MiB。Pipeline 抽样峰值时 PostgreSQ
 
 以下改动是本次完整基准能够成立的必要条件，但不计入性能加速条目：
 
-- 当前 Schema 初始化为 `turn_events` 提供 `tp_source_id` 和
-  `tp_source_row_key`，非 reset 升级也会为旧表补列；
+- 当时的 pre-v3 Schema 为 `turn_events` 提供 `tp_source_id` 和
+  `tp_source_row_key`；这些列和原地升级路径已在 v3 删除；
 - Detect 普通异常会先回滚派生事务，再在新事务中把 Run 标为 `failed`；
 - schema-qualified source 通过 `to_regclass(source_id)` 获取 planner estimate，
   `public.day01` 不再误报 0；

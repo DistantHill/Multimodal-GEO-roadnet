@@ -4,8 +4,10 @@ The default mode is deliberately read-only.  ``--apply`` is an explicit,
 destructive opt-in: it takes a verified full ``track_test`` backup before it
 changes the target, then replaces the target in one PostgreSQL transaction.
 
-The source selection is intentionally identical to ``manual_bench_seed_1m``:
+The frozen pre-v3 source selection was:
 ``postgres.public.day01 ORDER BY vehicle_id, timestamp LIMIT 1000000``.
+It intentionally retains the historical columns and must not be used as a v3
+schema initializer or migration path.
 No connection string, password, or environment contents are included in the
 JSON audit artifact.
 """

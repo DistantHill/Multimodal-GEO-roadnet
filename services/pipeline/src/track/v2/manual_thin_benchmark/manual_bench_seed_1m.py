@@ -1,4 +1,4 @@
-"""薄壳脚本：从 postgres.day01 取前 N 行覆盖 track_test.trajectory_points。
+"""薄壳脚本：从 postgres.day01 取前 N 行覆盖 v3 来源表。
 
 ZH: 使用源端命名游标 + 目标端 COPY FROM STDIN 流式传输，
     避免 Python 内存中物化全部数据。映射所有公共列。
@@ -30,21 +30,16 @@ import psycopg
 from track.v2.manual_thin_benchmark._thin_bench_helpers import load_test_env, TEST_DB_NAME
 
 
-# ── day01 → trajectory_points 列映射 ──
-# ZH: 源列名和目标列名一致，按 SELECT/INSERT 顺序列出。
-#     id/geom/created_at 由目标端自动生成。
+# ── day01 → v3 trajectory source contract ──
+# ZH: 这里只复制 A72 要求的公共值列。目标 id、geom、extra/created_at
+#     分别由 identity/generated/default 生成。
 _COPY_COLUMNS = [
-    "source_id",
-    "source_row_key",
-    "stable",
-    "is_active",
     "vehicle_id",
     "timestamp",
     "lon",
     "lat",
     "heading",
     "speed",
-    "extra",
 ]
 
 # 每 10 万行打印一次进度
@@ -113,7 +108,8 @@ def run_migration(
     src_cur = src_conn.cursor(name=f"seed_1m_{uuid4().hex}")
     src_cur.itersize = 10_000
     src_cur.execute(
-        f"SELECT {cols} FROM day01 ORDER BY vehicle_id, timestamp LIMIT %s",
+        f"SELECT {cols} FROM day01 "
+        "ORDER BY vehicle_id, timestamp, id::text LIMIT %s",
         (limit,),
     )
     col_count = len(src_cur.description or [])
@@ -160,7 +156,10 @@ def verify(conn: psycopg.Connection) -> None:
 
         cur.execute("SELECT MIN(id), MAX(id) FROM trajectory_points")
         min_id, max_id = cur.fetchone()
-        print(f"  id 范围 / id range: {min_id:,} ~ {max_id:,}")
+        if min_id is None:
+            print("  id 范围 / id range: empty")
+        else:
+            print(f"  id 范围 / id range: {min_id:,} ~ {max_id:,}")
 
         cur.execute("""
             SELECT vehicle_id, timestamp, lon, lat, heading, speed
@@ -175,7 +174,7 @@ def verify(conn: psycopg.Connection) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="从 postgres.day01 复制 N 行到 track_test.trajectory_points"
+        description="从 postgres.day01 复制 N 行到 track_test 的 v3 来源表"
     )
     parser.add_argument(
         "--limit", type=int, default=1_000_000,

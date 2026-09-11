@@ -62,6 +62,7 @@ from track.v2.intersect2 import (
     detect_intersections,
 )
 from track.v2.models import (
+    CleanedPointRef,
     CrossTrackCandidate,
     EntryExitObservation,
     GeneratedReason,
@@ -73,6 +74,7 @@ from track.v2.models import (
     TrajectoryPoint,
     TurnEvent,
 )
+from track.v2.db.source_table import SourceTableContract
 from track.v2.parser0 import CsvSource, get_database
 from track.v2.projection import CoordinateTransformer, ProjectionError
 
@@ -98,10 +100,8 @@ def _candidate_keys(candidates):
     return [
         (
             candidate.vehicle_id,
-            candidate.from_source_id,
-            candidate.from_source_row_key,
-            candidate.to_source_id,
-            candidate.to_source_row_key,
+            candidate.from_segment_start_point_ref,
+            candidate.to_segment_start_point_ref,
         )
         for candidate in candidates
     ]
@@ -135,6 +135,39 @@ def _make_point(
         lat=lat,
         heading=heading,
         speed=speed,
+    )
+
+
+def _make_xy_cleaned_point(
+    vehicle_id: str,
+    point_id: int,
+    timestamp: float,
+    x: float,
+    y: float,
+    *,
+    subtrack_index: int,
+    sequence_in_subtrack: int,
+) -> TrajectoryPoint:
+    """Build one already-projected p/i point with a stable Clean identity."""
+    lon, lat = _TEST_TRANSFORMER.inverse(x, y)
+    return replace(
+        _make_point(
+            vehicle_id,
+            str(point_id),
+            timestamp,
+            lon,
+            lat,
+            90.0,
+            5.0,
+        ),
+        x=x,
+        y=y,
+        cleaned_point_ref=CleanedPointRef(
+            point_kind="kept",
+            point_id=point_id,
+            subtrack_index=subtrack_index,
+            cleaned_sequence_in_subtrack=sequence_in_subtrack,
+        ),
     )
 
 
@@ -197,7 +230,7 @@ class TurnEventModelTest(unittest.TestCase):
             timestamp=1000.0,
             lon=116.0, lat=39.0,
             x=0.0, y=0.0,
-            in_bearing=0.0, out_bearing=90.0,
+            entry_bearing=0.0, exit_bearing=90.0,
             turn_deg=90.0, score=90.0,
         )
         d = event.as_dict()
@@ -460,10 +493,8 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
             candidate.y,
             candidate.heading,
             candidate.speed,
-            candidate.from_source_id,
-            candidate.from_source_row_key,
-            candidate.to_source_id,
-            candidate.to_source_row_key,
+            candidate.from_segment_start_point_ref,
+            candidate.to_segment_start_point_ref,
         )
 
     def _historical_oracle(self, tracks, origin_lon=116.0, origin_lat=39.0):
@@ -537,10 +568,14 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
         self.assertAlmostEqual(candidate.lon, 116.0)
         self.assertAlmostEqual(candidate.lat, 39.0)
         self.assertEqual(candidate.point_ref, PointRef("source-a", "A-start", stable=True))
-        self.assertEqual(candidate.from_source_id, "source-a")
-        self.assertEqual(candidate.from_source_row_key, "A-start,A-end")
-        self.assertEqual(candidate.to_source_id, "source-b")
-        self.assertEqual(candidate.to_source_row_key, "B-start,B-end")
+        self.assertEqual(
+            candidate.from_segment_start_point_ref,
+            PointRef("source-a", "A-start", stable=True),
+        )
+        self.assertEqual(
+            candidate.to_segment_start_point_ref,
+            PointRef("source-b", "B-start", stable=True),
+        )
         self.assertEqual([self._payload(item) for item in actual], [self._payload(item) for item in oracle])
         self.assertEqual(telemetry["vehicle_aabb_pairs"], 1)
         self.assertEqual(telemetry["vehicle_aabb_rejected"], 0)
@@ -611,9 +646,23 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
 
     _ROWS = [(
         "vehicle-1", 123.5, 116.1, 39.2, 90.0, 8.0,
-        "source-A", "row-7", {"tag": "kept"}, None, None, "",
-        12_934_999.25, 4_748_000.5,
+        "source-A", "row-7", {"tag": "kept"}, "",
+        12_934_999.25, 4_748_000.5, 0, 7, 1, 0,
     )]
+
+    def setUp(self) -> None:
+        source_contract = SourceTableContract(
+            source_table="source-A",
+            quoted_table='"custom_points"',
+            key_sql_type="bigint",
+            has_extra=True,
+        )
+        patcher = patch(
+            "track.v2.db.queries.validate_source_table",
+            return_value=source_contract,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     class _Cursor:
         def __init__(self, rows):
@@ -649,12 +698,12 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             conn,
             window,
             table="custom_points",
-            source_id="source-A",
+            source_table="source-A",
             spatial_context=_TEST_SPATIAL_CONTEXT,
             telemetry=None,
         )
 
-        self.assertIn("FROM custom_points", conn.cursor_instance.query)
+        self.assertIn('FROM "custom_points"', conn.cursor_instance.query)
         self.assertNotIn("injected_points", conn.cursor_instance.query)
         self.assertIn(
             "geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)",
@@ -687,14 +736,15 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             window,
             table="tp",
             kept_table="ktp",
-            source_id="source-A",
+            source_table="source-A",
             clean_id="clean-9",
             spatial_context=_TEST_SPATIAL_CONTEXT,
             telemetry=None,
         )
 
         self.assertIn("FROM ktp AS ktp", conn.cursor_instance.query)
-        self.assertIn("JOIN tp AS tp ON tp.id = ktp.trajectory_point_id", conn.cursor_instance.query)
+        self.assertIn('JOIN "custom_points" AS tp', conn.cursor_instance.query)
+        self.assertIn("ON tp.id = ktp.source_row_key::bigint", conn.cursor_instance.query)
         self.assertIn("ktp.clean_id = %s", conn.cursor_instance.query)
         self.assertNotIn("is_active", conn.cursor_instance.query)
         self.assertIn(
@@ -706,6 +756,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
         self.assertEqual(
             conn.cursor_instance.params,
             [
+                "source-A",
                 "clean-9",
                 *source_bounds,
                 -1.0,
@@ -738,8 +789,8 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
     def test_window_preserves_injected_database_identity_provenance_and_xy(self):
         rows = [(
             "vehicle-1", 123.5, 116.1, 39.2, 90.0, 0.0,
-            "public.injected_points", "282", {}, "21022680", "21022681",
-            "orthogonal_heading", 12_946_000.25, 4_762_000.5,
+            "public.injected_points", "282", {}, "orthogonal_heading",
+            12_946_000.25, 4_762_000.5, 1, 282, 1, 0,
         )]
         conn = self._Connection(rows)
 
@@ -748,14 +799,14 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             SpatialWindow(-1.0, -2.0, 3.0, 4.0),
             table="tp",
             kept_table="ktp",
-            source_id="source-A",
+            source_table="source-A",
             clean_id="clean-9",
             spatial_context=_TEST_SPATIAL_CONTEXT,
         )
 
         outer_select, _separator, _branches = conn.cursor_instance.query.partition("FROM (")
-        self.assertIn("from_source_row_key", outer_select)
-        self.assertIn("to_source_row_key", outer_select)
+        self.assertNotIn("from_source_row_key", outer_select)
+        self.assertNotIn("to_source_row_key", outer_select)
         self.assertIn("generated_reason", outer_select)
         self.assertIn("x, y", outer_select)
         self.assertEqual(
@@ -764,8 +815,6 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
                 "public.injected_points",
                 "282",
                 stable=False,
-                from_ref="21022680",
-                to_ref="21022681",
                 generated_reason="orthogonal_heading",
             ),
         )
@@ -774,8 +823,8 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
     def test_stream_uses_injected_table_and_id_as_point_identity(self):
         rows = [(
             "vehicle-1", 123.5, 116.1, 39.2, 90.0, 0.0,
-            "public.injected_points", "282", {}, "21022680", "21022681",
-            "heading_orthogonal", 12_946_000.25, 4_762_000.5,
+            "public.injected_points", "282", {}, "heading_orthogonal",
+            12_946_000.25, 4_762_000.5, 1, 282, 1, 0,
         )]
         conn = self._Connection(rows)
 
@@ -789,7 +838,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
 
         self.assertEqual(
             conn.cursor_instance.params,
-            ["clean-9", "public.injected_points", "clean-9"],
+            ["tp", "clean-9", "public.injected_points", "clean-9"],
         )
         self.assertEqual(len(tracks), 1)
         self.assertEqual(len(tracks[0]), 1)
@@ -799,8 +848,6 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
                 "public.injected_points",
                 "282",
                 stable=False,
-                from_ref="21022680",
-                to_ref="21022681",
                 generated_reason="heading_orthogonal",
             ),
         )
@@ -811,7 +858,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
         telemetry: dict[str, int | float] = {}
 
         with patch(
-            "track.v2.intersect2.time.perf_counter",
+            "track.v2.db.queries.time.perf_counter",
             side_effect=(10.0, 12.5, 20.0, 20.75),
         ):
             points = _query_active_points_in_window(
@@ -1107,13 +1154,15 @@ class TurnDetectionTest(unittest.TestCase):
         ]
         self.assertEqual(len(injected_events), 1)
         self.assertEqual(injected_events[0].source, "turn")
-        self.assertEqual(injected_events[0].from_source_id, "public.injected_points")
-        self.assertEqual(injected_events[0].from_source_row_key, "282")
+        self.assertEqual(injected_events[0].point_ref.source_id, "public.injected_points")
+        self.assertEqual(injected_events[0].point_ref.source_row_key, "282")
 
         hotspots, clusters = _cluster_pipeline(
             events, [], _TEST_TRANSFORMER, cfg,
         )
-        self.assertIn(injected_events[0], hotspots)
+        self.assertTrue(any(
+            event.point_ref == injected_events[0].point_ref for event in hotspots
+        ))
         self.assertTrue(clusters)
         self.assertEqual(
             {source for cluster in clusters for source in cluster.algorithm_sources},
@@ -1185,7 +1234,7 @@ class TurnDetectionTest(unittest.TestCase):
             )
 
         self.assertEqual(actual, expected)
-        self.assertEqual(workspace["v1"], projected["v1"])
+        self.assertEqual(workspace["v1\x001"], projected["v1"])
 
     def test_straight_line_no_turns(self):
         """I2-05: A vehicle on a straight line generates 0 turn events."""
@@ -1544,7 +1593,7 @@ class DBSCANTest(unittest.TestCase):
         clusters = _cluster_dbscan(events, _TEST_TRANSFORMER,
                                    eps_m=100.0, min_samples=3)
         self.assertEqual(len(clusters), 2, f"Expected 2 clusters, got {len(clusters)}")
-        self.assertEqual(clusters[0].sources, ("turn",))
+        self.assertEqual(clusters[0].algorithm_sources, ("turn",))
         self.assertEqual(clusters[0].source_counts["turn"], 4)
         self.assertEqual(clusters[0].source_ratios["turn"], 1.0)
 
@@ -1743,10 +1792,14 @@ class CrossTrackCandidateTest(unittest.TestCase):
         self.assertEqual(total_pairs, 1)
         candidate = candidates[0]
         self.assertEqual(candidate.vehicle_id, "A|B")
-        self.assertEqual(candidate.from_source_id, "table_a")
-        self.assertEqual(candidate.from_source_row_key, "102,105")
-        self.assertEqual(candidate.to_source_id, "table_b")
-        self.assertEqual(candidate.to_source_row_key, "77,78")
+        self.assertEqual(
+            candidate.from_segment_start_point_ref,
+            PointRef("table_a", "102", stable=True),
+        )
+        self.assertEqual(
+            candidate.to_segment_start_point_ref,
+            PointRef("table_b", "77", stable=True),
+        )
         self.assertEqual(candidate.heading, 0.0)
         self.assertEqual(candidate.speed, 12.0)
 
@@ -1776,10 +1829,14 @@ class CrossTrackCandidateTest(unittest.TestCase):
         self.assertEqual((pair_count, total_pairs), (3, 3))
         self.assertEqual(
             [
-                (candidate.vehicle_id, candidate.from_source_row_key, candidate.to_source_row_key)
+                (
+                    candidate.vehicle_id,
+                    candidate.from_segment_start_point_ref.source_row_key,
+                    candidate.to_segment_start_point_ref.source_row_key,
+                )
                 for candidate in candidates
             ],
-            [("A|B", "a0,a1", "b0,b1"), ("A|C", "a1,a2", "c0,c1")],
+            [("A|B", "a0", "b0"), ("A|C", "a1", "c0")],
         )
 
     def test_cross_track_grid_keeps_intersection_on_cell_boundary(self):
@@ -1949,8 +2006,8 @@ class TopologyExtractionTest(unittest.TestCase):
             self.assertAlmostEqual(point.crossing_x, roundtrip_x, places=6)
             self.assertAlmostEqual(point.crossing_y, roundtrip_y, places=6)
 
-    def test_global_tracks_are_routed_to_projected_topology_query_boxes(self):
-        """One projected track scan reproduces each former per-cluster result."""
+    def test_global_segments_route_complete_subtracks_to_topology_query_boxes(self):
+        """A segment hit routes its complete, originally ordered subtrack."""
         cfg = IntersectConfig(
             min_intersection_radius_m=100.0,
             topology_radius_padding_m=0.0,
@@ -1978,15 +2035,16 @@ class TopologyExtractionTest(unittest.TestCase):
         point_index = _build_topology_point_index({"v1": track})
         routed = [point_index.tracks_in(window) for window in windows]
 
-        self.assertEqual(len(point_index.points), len(track))
-        self.assertEqual(len(point_index.coordinates), len(track))
+        self.assertEqual(len(point_index.segments), len(track) - 1)
+        self.assertEqual(len(point_index.lower_bounds), len(track) - 1)
+        self.assertEqual(len(point_index.prefix_upper_bounds), len(track) - 1)
         self.assertEqual(
             [point.point_ref.source_row_key for point in routed[0]["v1"]],
-            ["1", "2", "3"],
+            [str(index) for index in range(len(track))],
         )
         self.assertEqual(
             [point.point_ref.source_row_key for point in routed[1]["v1"]],
-            ["4", "5"],
+            [str(index) for index in range(len(track))],
         )
 
         tie_track = _with_processing_xy({"tie": [
@@ -2002,7 +2060,7 @@ class TopologyExtractionTest(unittest.TestCase):
             ["stream-first", "stream-second"],
         )
 
-    def test_topology_from_tracks_extracts_only_routed_points(self):
+    def test_topology_from_tracks_extracts_complete_routed_subtrack(self):
         cfg = IntersectConfig(
             min_intersection_radius_m=100.0,
             topology_radius_padding_m=0.0,
@@ -2034,11 +2092,145 @@ class TopologyExtractionTest(unittest.TestCase):
         routed_track = extract.call_args.args[0]["v1"]
         self.assertEqual(
             [point.point_ref.source_row_key for point in routed_track],
-            ["inside-a", "inside-b"],
+            ["outside", "inside-a", "inside-b"],
         )
         self.assertEqual(len(topologies), 1)
         self.assertEqual(len(annotated), 1)
         self.assertEqual(observations, [])
+
+    def test_segments_with_outer_endpoints_still_produce_entry_and_exit(self):
+        """Each boundary segment remains real when its outer point misses the window."""
+        cfg = IntersectConfig(
+            min_intersection_radius_m=50.0,
+            topology_radius_padding_m=0.0,
+            bearing_window=1,
+        )
+        cluster = HotspotCluster(
+            cluster_calculate_index=0,
+            centroid_x=0.0,
+            centroid_y=0.0,
+            centroid_lon=0.0,
+            centroid_lat=0.0,
+            radius_m=1.0,
+            events=(),
+            source="turn",
+        )
+        track = [
+            _make_xy_cleaned_point(
+                "v1", 1, 0.0, -250.0, 0.0,
+                subtrack_index=1, sequence_in_subtrack=0,
+            ),
+            _make_xy_cleaned_point(
+                "v1", 2, 1.0, 0.0, 0.0,
+                subtrack_index=1, sequence_in_subtrack=1,
+            ),
+            _make_xy_cleaned_point(
+                "v1", 3, 2.0, 250.0, 0.0,
+                subtrack_index=1, sequence_in_subtrack=2,
+            ),
+        ]
+
+        _topologies, annotated, observations = _build_topologies_from_tracks(
+            [cluster], {"v1\x001": track}, cfg, _TEST_TRANSFORMER,
+        )
+
+        crossings = annotated[0].crossing_points
+        self.assertEqual([crossing.is_entry for crossing in crossings], [True, False])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(
+            [crossing.segment_start.point_id for crossing in crossings],
+            [1, 2],
+        )
+
+    def test_same_vehicle_subtracks_do_not_form_a_synthetic_segment(self):
+        """Window routing retains track keys instead of regrouping by vehicle."""
+        cfg = IntersectConfig(
+            min_intersection_radius_m=50.0,
+            topology_radius_padding_m=0.0,
+            bearing_window=1,
+        )
+        cluster = HotspotCluster(
+            cluster_calculate_index=0,
+            centroid_x=0.0,
+            centroid_y=0.0,
+            centroid_lon=0.0,
+            centroid_lat=0.0,
+            radius_m=1.0,
+            events=(),
+            source="turn",
+        )
+        tracks = {
+            "v1\x001": [
+                _make_xy_cleaned_point(
+                    "v1", 1, 0.0, -90.0, 0.0,
+                    subtrack_index=1, sequence_in_subtrack=0,
+                ),
+                _make_xy_cleaned_point(
+                    "v1", 2, 1.0, -80.0, 0.0,
+                    subtrack_index=1, sequence_in_subtrack=1,
+                ),
+            ],
+            "v1\x002": [
+                _make_xy_cleaned_point(
+                    "v1", 3, 2.0, 80.0, 0.0,
+                    subtrack_index=2, sequence_in_subtrack=0,
+                ),
+                _make_xy_cleaned_point(
+                    "v1", 4, 3.0, 90.0, 0.0,
+                    subtrack_index=2, sequence_in_subtrack=1,
+                ),
+            ],
+        }
+
+        point_index = _build_topology_point_index(tracks)
+        routed = point_index.tracks_in(_topology_point_windows([cluster], cfg)[0])
+        self.assertEqual(list(routed), ["v1\x001", "v1\x002"])
+
+        _topologies, annotated, observations = _build_topologies_from_tracks(
+            [cluster], tracks, cfg, _TEST_TRANSFORMER,
+        )
+        self.assertEqual(annotated[0].crossing_points, ())
+        self.assertEqual(observations, [])
+
+    def test_long_segment_crosses_circle_when_both_endpoints_miss_window(self):
+        """AABB routing retains a two-root segment with no endpoint in the box."""
+        cfg = IntersectConfig(
+            min_intersection_radius_m=50.0,
+            topology_radius_padding_m=0.0,
+            bearing_window=1,
+        )
+        cluster = HotspotCluster(
+            cluster_calculate_index=0,
+            centroid_x=0.0,
+            centroid_y=0.0,
+            centroid_lon=0.0,
+            centroid_lat=0.0,
+            radius_m=1.0,
+            events=(),
+            source="turn",
+        )
+        track = [
+            _make_xy_cleaned_point(
+                "v1", 1, 0.0, -250.0, 0.0,
+                subtrack_index=1, sequence_in_subtrack=0,
+            ),
+            _make_xy_cleaned_point(
+                "v1", 2, 1.0, 250.0, 0.0,
+                subtrack_index=1, sequence_in_subtrack=1,
+            ),
+        ]
+
+        _topologies, annotated, observations = _build_topologies_from_tracks(
+            [cluster], {"v1\x001": track}, cfg, _TEST_TRANSFORMER,
+        )
+
+        crossings = annotated[0].crossing_points
+        self.assertEqual([crossing.is_entry for crossing in crossings], [True, False])
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(
+            [crossing.segment_start.point_id for crossing in crossings],
+            [1, 1],
+        )
 
     def test_branch_clustering(self):
         """I2-19: 4 cardinal directions cluster to 4 branches."""
@@ -2166,7 +2358,10 @@ class ClusterMergeTest(unittest.TestCase):
         )
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0].source, "merged")
-        self.assertEqual(merged[0].sources, ("orthogonal_cross_track", "turn"))
+        self.assertEqual(
+            merged[0].algorithm_sources,
+            ("orthogonal_cross_track", "turn"),
+        )
         self.assertEqual(merged[0].source_counts["turn"], 1)
         self.assertEqual(merged[0].source_counts["orthogonal_cross_track"], 2)
         self.assertAlmostEqual(merged[0].source_ratios["orthogonal_cross_track"], 2 / 3)
@@ -2223,7 +2418,7 @@ class SourceAblationTest(unittest.TestCase):
         )
 
         self.assertEqual(len(annotated), 1)
-        self.assertEqual(annotated[0].sources, ("turn",))
+        self.assertEqual(annotated[0].algorithm_sources, ("turn",))
         self.assertEqual(annotated[0].critical_sources, ("turn",))
 
     def test_cross_track_source_is_reclustered_for_ablation(self):
@@ -2236,6 +2431,12 @@ class SourceAblationTest(unittest.TestCase):
             lon, lat = _TEST_TRANSFORMER.inverse(x, y)
             candidates.append(CrossTrackCandidate(
                 point_ref=PointRef("public.day01", str(index), stable=True),
+                from_segment_start_point_ref=PointRef(
+                    "public.day01", f"a{index}", stable=True,
+                ),
+                to_segment_start_point_ref=PointRef(
+                    "public.day02", f"b{index}", stable=True,
+                ),
                 vehicle_id=f"A|B-{index}",
                 timestamp=float(index),
                 lon=lon,
@@ -2244,10 +2445,6 @@ class SourceAblationTest(unittest.TestCase):
                 y=y,
                 heading=0.0,
                 speed=10.0,
-                from_source_id="public.day01",
-                from_source_row_key=f"a{index},a{index + 1}",
-                to_source_id="public.day02",
-                to_source_row_key=f"b{index},b{index + 1}",
             ))
         cfg = IntersectConfig(
             cross_track_dbscan_eps_m=100.0,

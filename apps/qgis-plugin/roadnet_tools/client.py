@@ -91,7 +91,9 @@ def _response_error(status: Any, network_error: str, body: str) -> str:
         payload = json.loads(body)
         if isinstance(payload, dict):
             raw_detail = payload.get("detail", payload.get("message", ""))
-            if isinstance(raw_detail, list):
+            if isinstance(raw_detail, dict):
+                detail = str(raw_detail.get("message", raw_detail.get("error", raw_detail)))
+            elif isinstance(raw_detail, list):
                 detail = "; ".join(
                     str(item.get("msg", item)) if isinstance(item, dict) else str(item)
                     for item in raw_detail

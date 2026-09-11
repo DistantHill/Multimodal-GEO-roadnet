@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from track.v2.db.queries import (
     SpatialWindow,
@@ -13,6 +14,7 @@ from track.v2.db.queries import (
     build_spatial_extent_sql,
     fetch_detect_row,
 )
+from track.v2.db.source_table import SourceTableContract
 from track.v2.models import SpatialContext
 from track.v2.projection import CoordinateTransformer, ProjectionError
 
@@ -21,6 +23,12 @@ _SPATIAL_CONTEXT = SpatialContext(
     source_srid=4326,
     processing_srid=32650,
     projection_config={"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": 0.01},
+)
+_SOURCE_CONTRACT = SourceTableContract(
+    source_table="raw_points",
+    quoted_table='"raw_points"',
+    key_sql_type="bigint",
+    has_extra=True,
 )
 
 
@@ -72,13 +80,17 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
     def test_extent_executor_binds_clean_id_to_kept_and_injected_branches(self) -> None:
         conn = _Connection((100.0, 900.0, 200.0, 1000.0))
 
-        extent = _query_spatial_extent(
-            conn,
-            table="raw_points",
-            kept_table="kept_trajectory_points",
-            clean_id="clean-1",
-            spatial_context=_SPATIAL_CONTEXT,
-        )
+        with patch(
+            "track.v2.db.queries.validate_source_table",
+            return_value=_SOURCE_CONTRACT,
+        ):
+            extent = _query_spatial_extent(
+                conn,
+                table="raw_points",
+                kept_table="kept_trajectory_points",
+                clean_id="clean-1",
+                spatial_context=_SPATIAL_CONTEXT,
+            )
 
         self.assertEqual(extent, (100.0, 200.0, 900.0, 1000.0))
         self.assertEqual(conn.cursor_instance.params, ("clean-1", "clean-1"))
@@ -106,8 +118,9 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
         )
         self.assertIn("AND x >= %s AND y >= %s AND x <= %s AND y <= %s", sql)
         self.assertEqual(sql.count("ST_MakeEnvelope(%s, %s, %s, %s, 4326)"), 2)
-        self.assertEqual(sql.count("%s"), 19)
-        self.assertIn("from_source_row_key, to_source_row_key", sql)
+        self.assertEqual(sql.count("%s"), 20)
+        self.assertNotIn("from_source_row_key", sql)
+        self.assertNotIn("to_source_row_key", sql)
         self.assertIn("ST_X(ST_Transform(tp.geom, 32650)) AS x", sql)
         self.assertNotIn("geom_projected", sql)
 
@@ -141,13 +154,17 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
             (window.x_min, window.y_min, window.x_max, window.y_max)
         )
 
-        points = _query_active_points_in_window(
-            conn,
-            window,
-            table="raw_points",
-            source_id="source-1",
-            spatial_context=_SPATIAL_CONTEXT,
-        )
+        with patch(
+            "track.v2.db.queries.validate_source_table",
+            return_value=_SOURCE_CONTRACT,
+        ):
+            points = _query_active_points_in_window(
+                conn,
+                window,
+                table="raw_points",
+                source_table="source-1",
+                spatial_context=_SPATIAL_CONTEXT,
+            )
 
         self.assertEqual(points, [])
         self.assertEqual(
@@ -168,19 +185,25 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
             window.y_max,
         )
 
-        points = _query_active_points_in_window(
-            conn,
-            window,
-            table="raw_points",
-            kept_table="kept_trajectory_points",
-            clean_id="clean-1",
-            spatial_context=_SPATIAL_CONTEXT,
-        )
+        with patch(
+            "track.v2.db.queries.validate_source_table",
+            return_value=_SOURCE_CONTRACT,
+        ):
+            points = _query_active_points_in_window(
+                conn,
+                window,
+                table="raw_points",
+                source_table="raw_points",
+                kept_table="kept_trajectory_points",
+                clean_id="clean-1",
+                spatial_context=_SPATIAL_CONTEXT,
+            )
 
         self.assertEqual(points, [])
         self.assertEqual(
             conn.cursor_instance.params,
             [
+                "raw_points",
                 "clean-1",
                 *expected_source,
                 *projected_bounds,

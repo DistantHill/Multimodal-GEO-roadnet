@@ -17,12 +17,18 @@ from .cleaner import clean_vehicle
 from .config import PostgresConfig, connect as pg_connect
 from .config.pipeline_config import load_pipeline_config
 from .db.pipeline_store import PipelineStore, PostgresPipelineStore
+from .db.schema import require_schema_v3
+from .db.source_table import (
+    calculate_source_fingerprint,
+    source_order_query,
+    validate_source_table,
+    verify_clean_source_fingerprint,
+)
 from .fitting import fit_centerline_variants
 from .intersect2 import detect_intersections
 from .logger import log_info
 from .models import (
     ClipResult,
-    CsvSource,
     FitResult,
     GeneratedReason,
     NetworkResult,
@@ -43,10 +49,8 @@ class PipelineInput:
     """Inputs accepted by the database-backed pipeline runner."""
 
     db_config: PostgresConfig
-    csv_path: str | None = None
-    pg_source_table: str | None = None
+    source_table: str | None = None
     clean_id: str | None = None
-    table: str = "trajectory_points"
     config_path: str | Path | None = None
     processing_srid: int | None = None
 
@@ -55,7 +59,7 @@ class PipelineInput:
 class PipelineResult:
     """Persisted row counts and stage summary produced by one pipeline run."""
 
-    stats: dict[str, int | str | list[int]]
+    stats: dict[str, float | int | str | list[int]]
 
 
 def _noop_event_sink(_event: PipelineEvent) -> None:
@@ -70,61 +74,48 @@ def run_pipeline(
     """Run the full pipeline with its existing write and commit ordering."""
     sink: EventSink = _noop_event_sink if emit is None else emit
     db_config = pipeline_input.db_config
-    csv_path = pipeline_input.csv_path
-    pg_source_table = pipeline_input.pg_source_table
+    source_table = pipeline_input.source_table
     clean_id = pipeline_input.clean_id
-    table = pipeline_input.table
     config_path = pipeline_input.config_path
 
     pc = load_pipeline_config(config_path)
 
-    if sum(value is not None for value in (csv_path, pg_source_table, clean_id)) != 1:
-        raise ValueError("exactly one of csv_path, pg_source_table, or clean_id is required")
+    if sum(value is not None for value in (source_table, clean_id)) != 1:
+        raise ValueError("exactly one of source_table or clean_id is required")
     if clean_id is not None and pipeline_input.processing_srid is not None:
         raise ValueError("a reused Clean Run inherits processing_srid and cannot override it")
 
-    stats: dict[str, int | str | list[int]] = {}
+    stats: dict[str, float | int | str | list[int]] = {}
     t_start = time.perf_counter()
     reuse_clean = clean_id is not None
-    is_pg_source = pg_source_table is not None
-
-    if csv_path is not None:
-        source = CsvSource(path=csv_path)
-        source_label = csv_path
-        source_id = str(Path(csv_path).resolve())
-        source_kind = "csv"
-    elif pg_source_table is not None:
-        source = PostgresSource(
-            config=db_config,
-            query=f"SELECT * FROM {pg_source_table} ORDER BY vehicle_id, timestamp",
-            source_id=pg_source_table,
-            primary_key_field="id",
-        )
-        source_label = f"postgresql://{db_config.database}/{pg_source_table}"
-        source_id = str(pg_source_table)
-        source_kind = "postgres_table"
 
     with pg_connect(db_config) as conn:
+        require_schema_v3(conn)
         store: PipelineStore = PostgresPipelineStore(conn)
         if reuse_clean:
             clean_record = store.get_clean_run(str(clean_id))
             if clean_record.status != "completed":
                 raise ValueError(f"Clean Run {clean_id} is not completed")
-            table = str(clean_record.parameters["target_table"])
-            source_id = clean_record.source_id
-            source_kind = clean_record.source_kind
-            is_pg_source = source_kind == "postgres_table"
+            source_table = clean_record.source_table
+            verify_clean_source_fingerprint(conn, str(clean_id))
             spatial_context = clean_record.spatial_context
         else:
+            assert source_table is not None
+            source_contract = validate_source_table(conn, source_table)
+            source = PostgresSource(
+                config=db_config,
+                query=source_order_query(source_contract),
+                source_id=source_table,
+                primary_key_field="id",
+            )
+            source_label = f"postgresql://{db_config.database}/{source_table}"
             spatial_context = create_spatial_context(
                 pc.projection,
                 processing_srid=pipeline_input.processing_srid,
             )
             clean_id = store.start_clean_run(
-                source_id=source_id,
-                source_kind=source_kind,
+                source_table=source_table,
                 parameters={
-                    "target_table": table,
                     "cleaner_max_gap_s": pc.cleaner.max_gap_s,
                 },
                 spatial_context=spatial_context,
@@ -139,7 +130,6 @@ def run_pipeline(
             total_injected = 0
             total_excluded = 0
             total_kept = 0
-            tp_id_map: dict[tuple[str, str], int] = {}
         else:
             assert clean_id is not None
             handle = None
@@ -160,12 +150,10 @@ def run_pipeline(
                     )
                     total_raw = 0
                     total_injected = 0
-                    tp_id_map = {}
                     total_excluded = 0
                     total_kept = 0
                     _pending_excluded: list = []
                     _pending_subtracks: list[RefinementSubtrack] = []
-                    _pending_tp_keys: list[tuple[str, str]] = []
                     _pending_point_count = 0
                     subtrack_index = 1
 
@@ -193,14 +181,6 @@ def run_pipeline(
                             )
                         total_raw += len(vehicle_points)
                         vehicle_count += 1
-                        if not is_pg_source:
-                            batch_map = store.write_raw_points(
-                                vehicle_points,
-                                table=table,
-                                batch_size=pc.runtime.db_insert_batch,
-                            )
-                            tp_id_map.update(batch_map)
-                            _pending_tp_keys.extend(batch_map.keys())
                         vresult = clean_vehicle(
                             vehicle_points,
                             config=pc.cleaner,
@@ -223,11 +203,8 @@ def run_pipeline(
                             subtrack_index, batch_kept = _flush_clean_batch(
                                 store,
                                 clean_id=clean_id,
-                                table=table,
-                                tp_id_map=tp_id_map,
                                 pending_excluded=_pending_excluded,
                                 pending_subtracks=_pending_subtracks,
-                                pending_tp_keys=_pending_tp_keys,
                                 subtrack_index=subtrack_index,
                                 batch_size=pc.runtime.db_insert_batch,
                                 spatial_context=spatial_context,
@@ -254,11 +231,8 @@ def run_pipeline(
                     subtrack_index, batch_kept = _flush_clean_batch(
                         store,
                         clean_id=clean_id,
-                        table=table,
-                        tp_id_map=tp_id_map,
                         pending_excluded=_pending_excluded,
                         pending_subtracks=_pending_subtracks,
-                        pending_tp_keys=_pending_tp_keys,
                         subtrack_index=subtrack_index,
                         batch_size=pc.runtime.db_insert_batch,
                         spatial_context=spatial_context,
@@ -282,14 +256,23 @@ def run_pipeline(
                     f"  读取&清洗 / Read&Clean: {total_raw:,} 点/points, "
                     f"{vehicle_count:,} 车辆/vehicles ({elapsed_read:.1f}s)",
                 )
-                stats["trajectory_points"] = total_raw
+                stats["source_points"] = total_raw
                 _emit_message(sink, f"  排除 / Excluded: {total_excluded:,}")
                 _emit_message(sink, f"  注入 / Injected: {total_injected:,}")
                 stats["kept_trajectory_points"] = total_kept
                 stats["injected_points"] = total_injected
                 _emit_message(sink, f"  kept_trajectory_points: {total_kept:,} rows")
                 _emit_message(sink, f"  injected_points: {total_injected:,} rows")
-                store.finish_clean(clean_id, status="completed")
+                source_fingerprint = calculate_source_fingerprint(
+                    conn,
+                    clean_id,
+                    source_contract,
+                )
+                store.finish_clean(
+                    clean_id,
+                    status="completed",
+                    source_fingerprint=source_fingerprint,
+                )
                 store.commit()
             except Exception:
                 store.rollback()
@@ -310,7 +293,7 @@ def run_pipeline(
 
         detect_id = store.start_detect_run(
             clean_id=clean_id,
-            parameters={"target_table": table},
+            parameters={},
         )
         stats["detect_id"] = detect_id
         store.commit()
@@ -324,23 +307,38 @@ def run_pipeline(
             clean_id=clean_id,
             detect_id=detect_id,
         )
-        intersect_source_id = source_id
         live_intersect = EventProgressAdapter(detect_stage, sink)
         live_intersect.start()
         icfg = replace(
             pc.detect,
             query_active_from_db=True,
-            db_table=table,
+            db_table=source_table,
             kept_table="kept_trajectory_points",
-            source_id=intersect_source_id,
+            source_table=source_table,
             clean_id=clean_id,
             live_status=live_intersect,
         )
+        detect_completed = False
         try:
+            detect_compute_started = time.perf_counter()
             iresult = detect_intersections(
                 conn=store.connection,
                 config=icfg,
                 spatial_context=spatial_context,
+            )
+            detect_compute_elapsed = time.perf_counter() - detect_compute_started
+            # psycopg starts a transaction for the Detect SELECTs. The result
+            # is fully materialized now, so discard that read snapshot before
+            # opening the short, atomic Detect persistence transaction.
+            store.rollback()
+            stats["detect_compute_s"] = round(detect_compute_elapsed, 6)
+            log_info(
+                "[stage-phase] stage=intersect2 phase=detect_compute "
+                f"elapsed_s={detect_compute_elapsed:.3f}"
+            )
+            live_intersect.update(
+                detail="detect_compute",
+                elapsed=detect_compute_elapsed,
             )
 
             _emit_message(sink, f"  转向事件 / Turn events: {iresult.report.turn_event_count:,}")
@@ -351,14 +349,39 @@ def run_pipeline(
                 f"  完整交叉口 / Complete intersections: {iresult.report.complete_intersection_count:,}",
             )
 
+            detect_persist_started = time.perf_counter()
             persisted_detect = store.persist_detect(
                 detect_id,
                 iresult,
                 batch_size=pc.runtime.db_insert_batch,
             )
+            # Persistence is not complete until the run-level validator and
+            # every deferred FK/constraint have passed at COMMIT.  Keep that
+            # work inside ``detect_persist_s``; measuring only the writer made
+            # large deferred-trigger regressions invisible in A65 reports.
+            store.finish_detect(detect_id, status="completed")
+            store.commit()
+            detect_completed = True
+            detect_persist_elapsed = time.perf_counter() - detect_persist_started
+            stats["detect_persist_s"] = round(detect_persist_elapsed, 6)
+            stats["resolved_sequence_s"] = round(
+                persisted_detect.resolved_sequence_elapsed_s,
+                6,
+            )
+            log_info(
+                "[stage-phase] stage=intersect2 phase=detect_persist "
+                f"elapsed_s={detect_persist_elapsed:.3f} "
+                "resolved_sequence_s="
+                f"{persisted_detect.resolved_sequence_elapsed_s:.3f}"
+            )
+            live_intersect.update(
+                detail="detect_persist",
+                elapsed=detect_persist_elapsed,
+            )
             stats.update(
                 {
                     "tracks_cross": persisted_detect.tracks_cross_count,
+                    "resolved_subtrack_points": persisted_detect.resolved_point_count,
                     "turn_events": persisted_detect.turn_event_count,
                     "candidate_intersections": persisted_detect.candidate_intersection_count,
                     "candidate_entry_exit_points": persisted_detect.candidate_entry_exit_point_count,
@@ -376,12 +399,14 @@ def run_pipeline(
             _emit_message(sink, f"  intersections: {persisted_detect.intersection_count:,} rows")
             _emit_message(sink, f"  entry_exit_points: {persisted_detect.entry_exit_point_count:,} rows")
 
-            store.finish_detect(detect_id, status="completed")
-            store.commit()
         except Exception:
             store.rollback()
-            store.finish_detect(detect_id, status="failed")
-            store.commit()
+            # Once the atomic Detect transaction has committed, later output
+            # or progress-rendering failures must not rewrite an immutable
+            # completed run as failed.
+            if not detect_completed:
+                store.finish_detect(detect_id, status="failed")
+                store.commit()
             raise
         intersect_elapsed = _log_stage_finish(
             "intersect2",
@@ -398,7 +423,12 @@ def run_pipeline(
         )
         sink(PipelineEvent.stage_start("Clip: 路段切分 / Track clipping"))
         clip_config = pc.clip
+        clip_assembly_started = time.perf_counter()
         clip_result = store.load_clip(detect_id, config=clip_config)
+        stats["clip_assembly_s"] = round(
+            time.perf_counter() - clip_assembly_started,
+            6,
+        )
         _add_clip_stats(stats, clip_result)
         _emit_report(sink, "  Clip 报告 / Clip report", clip_result.report.as_dict())
         clip_elapsed = _log_stage_finish(
@@ -539,7 +569,7 @@ def run_pipeline(
         _emit_message(sink, "\n  提交 / Committed.")
 
     elapsed = time.perf_counter() - t_start
-    stats["_elapsed_s"] = int(elapsed)
+    stats["_elapsed_s"] = round(elapsed, 6)
     _emit_message(sink, f"\n── 完成 / Done ({elapsed:.1f}s) ──")
     return PipelineResult(stats=stats)
 
@@ -548,23 +578,17 @@ def _flush_clean_batch(
     store: PipelineStore,
     *,
     clean_id: str,
-    table: str,
-    tp_id_map: dict[tuple[str, str], int],
     pending_excluded: list,
     pending_subtracks: list[RefinementSubtrack],
-    pending_tp_keys: list[tuple[str, str]],
     subtrack_index: int,
     batch_size: int,
     spatial_context: SpatialContext,
 ) -> tuple[int, int]:
-    """Flush one batch of Cleaner 1 outputs and trim ``tp_id_map``."""
+    """Flush one batch of frozen Cleaner outputs."""
     result = store.persist_clean_batch(
         clean_id,
-        table,
-        tp_id_map,
         pending_excluded,
         pending_subtracks,
-        pending_tp_keys,
         subtrack_index,
         batch_size=batch_size,
         spatial_context=spatial_context,
@@ -621,7 +645,10 @@ def _emit_report(sink: EventSink, title: str, report: dict[str, object]) -> None
         _emit_message(sink, f"  {key}: {rendered}")
 
 
-def _add_clip_stats(stats: dict[str, int | str | list[int]], result: ClipResult) -> None:
+def _add_clip_stats(
+    stats: dict[str, float | int | str | list[int]],
+    result: ClipResult,
+) -> None:
     stats.update(
         {
             f"clip_{name}": value
@@ -631,7 +658,10 @@ def _add_clip_stats(stats: dict[str, int | str | list[int]], result: ClipResult)
     )
 
 
-def _add_fit_stats(stats: dict[str, int | str | list[int]], result: FitResult) -> None:
+def _add_fit_stats(
+    stats: dict[str, float | int | str | list[int]],
+    result: FitResult,
+) -> None:
     stats.update(
         {
             f"fitting_{name}": value
@@ -641,7 +671,10 @@ def _add_fit_stats(stats: dict[str, int | str | list[int]], result: FitResult) -
     )
 
 
-def _add_network_stats(stats: dict[str, int | str | list[int]], result: NetworkResult) -> None:
+def _add_network_stats(
+    stats: dict[str, float | int | str | list[int]],
+    result: NetworkResult,
+) -> None:
     stats.update(
         {
             f"network_{name}": value

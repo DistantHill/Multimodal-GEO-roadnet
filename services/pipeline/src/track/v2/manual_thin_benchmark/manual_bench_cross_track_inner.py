@@ -182,9 +182,9 @@ def _baseline_path(filename: str) -> Path:
     return _GENERATED_DIR / requested
 
 
-def _active_point_count(conn: Any, table: str) -> int:
+def _source_point_count(conn: Any, table: str) -> int:
     with conn.cursor() as cur:
-        cur.execute(f"SELECT COUNT(*) FROM {table} WHERE is_active IS NOT FALSE")
+        cur.execute(f"SELECT COUNT(*) FROM {table}")
         row = cur.fetchone()
     return int(row[0]) if row is not None else 0
 
@@ -277,12 +277,13 @@ def main() -> int:
             spatial_context=spatial_context,
         )
         if extent is None:
-            print("No active points found.", file=sys.stderr)
+            print("No source points found.", file=sys.stderr)
             return 2
-        active_points = _active_point_count(conn, cfg.db_table)
-        if args.require_target and active_points < _MIN_GATE_POINTS:
+        source_points = _source_point_count(conn, cfg.db_table)
+        if args.require_target and source_points < _MIN_GATE_POINTS:
             print(
-                f"merge_gate_failed: active point count {active_points:,} is below {_MIN_GATE_POINTS:,}",
+                f"merge_gate_failed: source point count {source_points:,} "
+                f"is below {_MIN_GATE_POINTS:,}",
                 file=sys.stderr,
             )
             return 1
@@ -305,7 +306,8 @@ def main() -> int:
             selected = windows
 
         print(
-            f"active_points={active_points:,} selected_windows={len(selected):,}/{len(windows):,} "
+            f"source_points={source_points:,} "
+            f"selected_windows={len(selected):,}/{len(windows):,} "
             f"repetitions={args.repetitions} "
             f"target_gate={'on' if args.require_target else 'off'}"
         )

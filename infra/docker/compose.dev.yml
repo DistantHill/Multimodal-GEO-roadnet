@@ -35,6 +35,8 @@ services:
     build:
       context: ../../apps/backend
       dockerfile: Dockerfile
+      additional_contexts:
+        pipeline_source: ../../services/pipeline
     environment:
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
@@ -45,6 +47,7 @@ services:
       QDRANT_PORT: ${QDRANT_PORT:-6333}
     volumes:
       - ../../apps/backend:/app
+      - ../../services/pipeline/src:/opt/pipeline/src:ro
     command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     ports:
       - "${BACKEND_PORT:-8000}:8000"

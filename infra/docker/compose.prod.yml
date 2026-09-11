@@ -31,6 +31,8 @@ services:
     build:
       context: ../../apps/backend
       dockerfile: Dockerfile
+      additional_contexts:
+        pipeline_source: ../../services/pipeline
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432

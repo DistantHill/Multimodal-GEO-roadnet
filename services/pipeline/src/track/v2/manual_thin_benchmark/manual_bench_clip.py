@@ -1,174 +1,131 @@
-"""Thin benchmark for Clip's segment/intersection scan.
+"""Thin in-memory benchmark for schema-v3 resolved active-set Clip assembly.
 
-ZH: 生成一条长轨迹和规则分布的交叉口圆，分别累计坐标转换、空间索引
-候选查询和线圆求交时间，并单独测量公开 ``extract_clips`` 的墙钟时间。
-
-EN: Generates one long track plus regularly distributed intersection circles,
-accumulates coordinate conversion, grid lookup, and root-solving time, and
-separately measures the public ``extract_clips`` wall clock.
-
-Usage::
-
-    conda run -n torch python track/v2/manual_thin_benchmark/manual_bench_clip.py
-    set VERBOSE=1
+Detect owns geometric root solving in v3. This fixture supplies a final p/i/c
+sequence and measures Clip validation, active-set updates, minimal
+``ClipPoint`` construction, and polyline distance calculation.
 """
 
 from __future__ import annotations
 
 import argparse
 import math
-import os
-import sys
+import statistics
 import time
-from pathlib import Path
 
-
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-
-from track.v2.clip import (
-    _IntersectionGrid,
-    _circle_crossing_fractions,
-    extract_clips,
-)
+from track.v2.clip import extract_clips
 from track.v2.models import (
     ClipInput,
     ClipIntersection,
     ClipTrack,
-    PointRef,
     ProjectionConfig,
-    TrajectoryPoint,
+    ResolvedTrackPoint,
 )
-from track.v2.projection import CoordinateTransformer, create_spatial_context
+from track.v2.projection import create_spatial_context
 
 
 _METERS_PER_DEGREE = 111_194.9266
 _SPATIAL_CONTEXT = create_spatial_context(ProjectionConfig(processing_srid=3857))
 
 
-def _point(index: int, x_m: float, y_m: float) -> TrajectoryPoint:
-    return TrajectoryPoint(
-        point_ref=PointRef("clip-benchmark", str(index), stable=True),
-        vehicle_id="benchmark-vehicle",
-        timestamp=float(index),
-        lon=x_m / _METERS_PER_DEGREE,
-        lat=y_m / _METERS_PER_DEGREE,
-        heading=90.0,
-        speed=10.0,
-    )
-
-
 def _fixture(point_count: int, intersection_count: int) -> ClipInput:
-    route_length_m = 100_000.0
-    points = tuple(
-        _point(
-            index,
-            -route_length_m / 2 + route_length_m * index / (point_count - 1),
-            300.0 * math.sin(index / 180.0),
+    if point_count < intersection_count * 3 + 2:
+        raise ValueError("--points must be at least 3 * --intersections + 2")
+    points: list[ResolvedTrackPoint] = [
+        ResolvedTrackPoint(1, -100.0 / _METERS_PER_DEGREE, 0.0)
+    ]
+    intersections: list[ClipIntersection] = []
+    next_resolved_id = 2
+    for intersection_id in range(1, intersection_count + 1):
+        center_x = intersection_id * 100.0
+        intersections.append(
+            ClipIntersection(
+                intersection_id,
+                center_x / _METERS_PER_DEGREE,
+                0.0,
+                20.0,
+            )
         )
-        for index in range(point_count)
-    )
-    rows = 4
-    columns = math.ceil(intersection_count / rows)
-    spacing_m = route_length_m / max(columns - 1, 1)
-    y_offsets = (-300.0, -100.0, 100.0, 300.0)
-    intersections = tuple(
-        ClipIntersection(
-            intersection_id=index + 1,
-            lon=(-route_length_m / 2 + (index % columns) * spacing_m) / _METERS_PER_DEGREE,
-            lat=y_offsets[index // columns] / _METERS_PER_DEGREE,
-            radius_m=55.0,
+        for offset, crossing_type in ((-20.0, 1), (20.0, 0)):
+            points.append(
+                ResolvedTrackPoint(
+                    resolved_point_id=next_resolved_id,
+                    lon=(center_x + offset) / _METERS_PER_DEGREE,
+                    lat=0.0,
+                    crossing_id=intersection_id * 2 + crossing_type,
+                    intersection_id=intersection_id,
+                    crossing_type=crossing_type,
+                )
+            )
+            next_resolved_id += 1
+            if crossing_type == 1:
+                points.append(
+                    ResolvedTrackPoint(
+                        next_resolved_id,
+                        center_x / _METERS_PER_DEGREE,
+                        0.0,
+                    )
+                )
+                next_resolved_id += 1
+
+    final_x = (intersection_count + 1) * 100.0
+    while len(points) < point_count:
+        progress = (len(points) - intersection_count) / max(
+            point_count - intersection_count - 1,
+            1,
         )
-        for index in range(intersection_count)
-    )
+        points.append(
+            ResolvedTrackPoint(
+                next_resolved_id,
+                (final_x + progress * 10_000.0) / _METERS_PER_DEGREE,
+                10.0 * math.sin(progress * math.tau) / _METERS_PER_DEGREE,
+            )
+        )
+        next_resolved_id += 1
+
     return ClipInput(
-        intersections=intersections,
-        tracks=(ClipTrack("benchmark-vehicle", "benchmark-trip", points),),
+        intersections=tuple(intersections),
+        tracks=(
+            ClipTrack(
+                "benchmark-vehicle",
+                "benchmark-trip",
+                tuple(points),
+                subtrack_index=1,
+            ),
+        ),
         spatial_context=_SPATIAL_CONTEXT,
+        detect_id="benchmark",
     )
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Benchmark Clip spatial candidate scanning.")
+    parser = argparse.ArgumentParser(description="Benchmark resolved active-set Clip")
     parser.add_argument("--points", type=int, default=20_000)
     parser.add_argument("--intersections", type=int, default=2_500)
+    parser.add_argument("--repetitions", type=int, default=5)
     args = parser.parse_args()
-    if args.points < 2 or args.intersections < 1:
-        parser.error("--points must be >= 2 and --intersections must be positive")
-    verbose = os.environ.get("VERBOSE") == "1"
-    source = _fixture(args.points, args.intersections)
-    track = source.tracks[0]
+    if args.points < 2 or args.intersections < 1 or args.repetitions < 1:
+        parser.error("points >= 2, intersections >= 1, and repetitions >= 1")
+    try:
+        source = _fixture(args.points, args.intersections)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    started = time.perf_counter()
-    grid = _IntersectionGrid(
-        source.intersections,
-        CoordinateTransformer(source.spatial_context),
-    )
-    grid_build_s = time.perf_counter() - started
-
-    coordinate_s = 0.0
-    candidate_lookup_s = 0.0
-    root_s = 0.0
-    candidate_count = 0
-    crossing_count = 0
-    loop_started = time.perf_counter()
-    for segment_index, (start, end) in enumerate(zip(track.points, track.points[1:]), start=1):
-        phase_started = time.perf_counter()
-        start_xy = grid.point_xy(start)
-        end_xy = grid.point_xy(end)
-        coordinate_s += time.perf_counter() - phase_started
-
-        phase_started = time.perf_counter()
-        candidates = grid.candidates(start_xy, end_xy)
-        candidate_lookup_s += time.perf_counter() - phase_started
-        candidate_count += len(candidates)
-
-        phase_started = time.perf_counter()
-        segment_crossings = 0
-        for candidate in candidates:
-            relative_start = (start_xy[0] - candidate.x, start_xy[1] - candidate.y)
-            relative_end = (end_xy[0] - candidate.x, end_xy[1] - candidate.y)
-            segment_crossings += len(
-                _circle_crossing_fractions(
-                    relative_start,
-                    relative_end,
-                    candidate.value.radius_m,
-                )
-            )
-        crossing_count += segment_crossings
-        root_s += time.perf_counter() - phase_started
-
-        if verbose:
-            print(
-                f"  segment={segment_index:,}/{args.points - 1:,} "
-                f"state={'full' if candidates else 'empty'} "
-                f"candidates={len(candidates):,} crossings={segment_crossings:,}"
-            )
-    loop_wall_s = time.perf_counter() - loop_started
-
-    started = time.perf_counter()
-    result = extract_clips(source)
-    public_api_s = time.perf_counter() - started
-
-    accounted_s = coordinate_s + candidate_lookup_s + root_s
-    segment_count = args.points - 1
+    samples: list[float] = []
+    result = None
+    for _ in range(args.repetitions):
+        started = time.perf_counter()
+        result = extract_clips(source)
+        samples.append(time.perf_counter() - started)
+    assert result is not None
+    median = statistics.median(samples)
     print(f"points={args.points:,}")
     print(f"intersections={args.intersections:,}")
-    print(f"segments={segment_count:,}")
-    print(f"grid_build_seconds={grid_build_s:.6f}")
-    print(f"scan_wall_seconds={loop_wall_s:.6f}")
-    print(f"coordinate_seconds={coordinate_s:.6f} ({coordinate_s / loop_wall_s:.1%})")
-    print(f"candidate_lookup_seconds={candidate_lookup_s:.6f} ({candidate_lookup_s / loop_wall_s:.1%})")
-    print(f"root_seconds={root_s:.6f} ({root_s / loop_wall_s:.1%})")
-    print(f"loop_overhead_seconds={max(0.0, loop_wall_s - accounted_s):.6f}")
-    print(f"candidate_checks={candidate_count:,}")
-    print(f"crossing_roots={crossing_count:,}")
-    print(f"scan_per_segment_us={loop_wall_s / segment_count * 1_000_000:.3f}")
-    print(f"candidate_checks_per_segment={candidate_count / segment_count:.4f}")
-    print(f"public_extract_seconds={public_api_s:.6f}")
-    print(f"public_extract_per_point_us={public_api_s / args.points * 1_000_000:.3f}")
+    print(f"repetitions={args.repetitions:,}")
+    print(f"assembly_samples_s={samples}")
+    print(f"assembly_median_s={median:.6f}")
+    print(f"assembly_per_point_us={median / args.points * 1_000_000:.3f}")
     print(f"clips={result.report.total_clips:,}")
+    print(f"between_intersection={result.report.between_intersection_clips:,}")
     return 0
 
 

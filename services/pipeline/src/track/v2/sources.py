@@ -974,11 +974,10 @@ def _row_to_dict(row: Any, columns: list[str]) -> dict[str, Any]:
 
 
 def source_row_hash(row: dict[str, Any]) -> str:
-    """Return a stable SHA-256 fingerprint for one raw source row.
+    """Return a stable identity hash used by the standalone CSV parser.
 
-    Replay stores only this fingerprint, then validates a live source row
-    before exposing it.  The source payload itself never lands in the replay
-    metadata.
+    This remains part of ``CsvSource``/importer identity handling; schema-v3
+    database replay validates ``clean_runs.source_fingerprint`` instead.
     """
     normalized = {
         str(key): "" if value is None else str(value)

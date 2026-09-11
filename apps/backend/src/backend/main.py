@@ -3,15 +3,24 @@ from __future__ import annotations
 import os
 import urllib.error
 import urllib.request
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import psycopg
 from fastapi import FastAPI
 
-from .database import postgres_connection_settings
+from .database import postgres_connection_settings, verify_runtime_schema
 from .map_api import router as map_router
 
 
-app = FastAPI(title="Roadnet Backend", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Reject a stale database before accepting any Backend request."""
+    verify_runtime_schema()
+    yield
+
+
+app = FastAPI(title="Roadnet Backend", version="0.3.0", lifespan=lifespan)
 app.include_router(map_router)
 
 

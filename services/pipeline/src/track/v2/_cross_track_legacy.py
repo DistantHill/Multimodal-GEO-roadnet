@@ -147,6 +147,8 @@ def extract_cross_track_candidates_legacy(
                     lon, lat = _to_lonlat(float(x), float(y), origin_lon, origin_lat)
                     candidates.append(CrossTrackCandidate(
                         point_ref=start_a.point_ref,
+                        from_segment_start_point_ref=start_a.point_ref,
+                        to_segment_start_point_ref=start_b.point_ref,
                         vehicle_id=f"{vehicle_a}|{vehicle_b}",
                         timestamp=(timestamps_a[segment_index_a] + timestamps_b[segment_index_b]) / 2.0,
                         lon=lon,
@@ -155,14 +157,9 @@ def extract_cross_track_candidates_legacy(
                         y=float(y),
                         heading=segments_a[segment_index_a][4],
                         speed=start_a.speed,
-                        from_source_id=start_a.point_ref.source_id,
-                        from_source_row_key=(
-                            f"{start_a.point_ref.source_row_key},{end_a.point_ref.source_row_key}"
-                        ),
-                        to_source_id=start_b.point_ref.source_id,
-                        to_source_row_key=(
-                            f"{start_b.point_ref.source_row_key},{end_b.point_ref.source_row_key}"
-                        ),
+                        from_segment_start=start_a.cleaned_point_ref,
+                        to_segment_start=start_b.cleaned_point_ref,
+                        cross_track_calculate_index=len(candidates),
                     ))
                 if telemetry is not None:
                     telemetry["payload_seconds"] = telemetry.get("payload_seconds", 0.0) + (

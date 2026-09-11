@@ -33,6 +33,9 @@ class _Cursor:
         if sql.startswith("LOCK TABLE"):
             self.rows = []
             return
+        if sql.startswith("SET LOCAL"):
+            self.rows = []
+            return
         if sql.startswith("DELETE"):
             self.rows = []
             return
@@ -133,6 +136,10 @@ class DeleteRunServiceTest(unittest.TestCase):
             + ["DELETE FROM detect_runs WHERE id = %s"],
         )
         self.assertFalse(any(sql.startswith("DELETE FROM trajectory_points ") for sql in deletes))
+        bypass_index = next(
+            index for index, (sql, _) in enumerate(conn.executions)
+            if sql == "SET LOCAL track_v2.allow_completed_run_delete = 'on'"
+        )
         artifact_locks = [
             sql for sql, _ in conn.executions if sql.startswith("LOCK TABLE")
         ]
@@ -161,6 +168,7 @@ class DeleteRunServiceTest(unittest.TestCase):
             if sql.startswith("DELETE")
         )
         self.assertLess(last_table_lock, first_final_count)
+        self.assertLess(bypass_index, first_delete)
         self.assertLess(last_table_lock, first_delete)
 
     def test_clean_delete_removes_children_then_clean_artifacts_and_registry(self) -> None:
@@ -188,6 +196,13 @@ class DeleteRunServiceTest(unittest.TestCase):
         ] + ["DELETE FROM clean_runs WHERE id = %s"]
         self.assertEqual(deletes, expected_detect + expected_clean)
         self.assertFalse(any(sql.startswith("DELETE FROM trajectory_points ") for sql in deletes))
+        self.assertEqual(
+            sum(
+                sql == "SET LOCAL track_v2.allow_completed_run_delete = 'on'"
+                for sql, _ in conn.executions
+            ),
+            1,
+        )
         final_clean_lock = max(
             index for index, (sql, _) in enumerate(conn.executions)
             if sql == "LOCK TABLE tracks_cross IN SHARE ROW EXCLUSIVE MODE"

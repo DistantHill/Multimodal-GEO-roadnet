@@ -28,10 +28,8 @@ class RunCliCleanReuseTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         run_pipeline.assert_called_once_with(
             self.config,
-            csv_path=None,
-            pg_source_table=None,
+            source_table=None,
             clean_id=clean_id,
-            table="trajectory_points",
             config_path=None,
             processing_srid=None,
         )

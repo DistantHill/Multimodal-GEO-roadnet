@@ -19,7 +19,7 @@ def main() -> None:
     clips = [
         clip
         for clip in result.clips
-        if clip.clip_type == "inter_intersection"
+        if clip.clip_type == "between_intersection"
         and (clip.start.intersection_id, clip.end.intersection_id) in PAIRS
     ]
 
@@ -35,7 +35,7 @@ def main() -> None:
             f"{clip.start.intersection_id} -> {clip.end.intersection_id}",
             f"distance={clip.distance_m:.1f}m",
             f"points={clip.point_count}",
-            f"time={clip.start.timestamp} -> {clip.end.timestamp}",
+            f"crossings={clip.start.crossing_id} -> {clip.end.crossing_id}",
         )
 
 

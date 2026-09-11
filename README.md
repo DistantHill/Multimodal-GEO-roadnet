@@ -21,7 +21,7 @@ Detect 内部的视觉判别能力仍可作为 Pipeline 内部逻辑。独立 YO
 
 ```sh
 cp .env.example .env
-docker compose -f infra/docker/compose.dev.yml up -d --build
+docker compose --env-file .env -f infra/docker/compose.dev.yml up -d --build
 ```
 
 服务入口：
@@ -39,7 +39,7 @@ docker compose -f infra/docker/compose.dev.yml up -d --build
 
 ## Web GIS 与 QGIS 插件
 
-打开 Frontend 后可在左侧图层树切换业务图层，在地图工具栏选择平移、点选或框选。Replay 接受轨迹点主键或 WGS84 框选范围；Clip 要求同一 Detect Run 中恰好两个交叉口。两者的返回值只绘制到内存 `tmp` 图层，不写数据库或中间文件。地图窗口显示 EPSG:3857，Backend GeoJSON 固定为 EPSG:4326，前端负责投影转换。
+打开 Frontend 后可在左侧图层树切换业务图层，在地图工具栏选择平移、点选或框选。Replay 接受来源行键、Detect resolved point ID 或 WGS84 框选范围；Clip 要求同一 Detect Run 中恰好两个交叉口。两者的返回值只绘制到内存 `tmp` 图层，不写数据库或中间文件。地图窗口显示 EPSG:3857，Backend GeoJSON 固定为 EPSG:4326，前端负责投影转换。
 
 QGIS 3.44 LTR 插件源码位于 `apps/qgis-plugin/roadnet_tools/`。开发机可将该目录链接到 QGIS 用户插件目录，或按 [插件说明](apps/qgis-plugin/README.md) 打包 ZIP 安装。启用 **Roadnet Tools** 后，在点图层中使用 QGIS 自带点选/框选，随后从 **Vector → Roadnet Tools** 执行 Replay 或 Clip；后端 URL 默认为 `http://localhost:8000`，可在插件设置中修改。成功响应会替换插件管理的内存图层 `tmp`，请求或解析失败会保留上一次成功结果。
 
@@ -47,7 +47,9 @@ QGIS 3.44 LTR 插件源码位于 `apps/qgis-plugin/roadnet_tools/`。开发机�
 
 - `GET /api/v1/map/layers`：图层目录及默认 Detect/Fit 上下文。
 - `GET /api/v1/map/layers/{layer_id}`：读取有上限的 EPSG:4326 GeoJSON，可传 `bbox`、`detect_id`、`fit_id` 和 `limit`。
-- `POST /api/v1/map/replay`：按 `point_ids` 或 `bbox`（二选一）回放轨迹。
+- `POST /api/v1/map/replay`：按 `source_row_keys`、`resolved_point_ids` 或
+  `bbox`（三选一）回放轨迹。Detect 产物使用内部 `resolved_point_ids` 并要求
+  `detect_id`；原始/Clean 来源使用字符串化的 `source_row_keys`。
 - `POST /api/v1/map/clip`：按 `detect_id` 与两个 `intersection_ids` 截取交叉口间轨迹；ID 值是 PostgreSQL `intersections.id`，不再接受 Detect 运行时的 cluster 计算序号。
 
 这些 API 使用只读 PostgreSQL 事务、语句超时和请求数量上限；不会在 Backend 请求进程中启动完整 Pipeline 作业。
@@ -68,30 +70,41 @@ Pipeline 的数据库配置优先读取进程中的来源兼容变量 `TRACK_PG_
 
 ## Pipeline 运行
 
-首次创建或更新业务表结构时执行当前权威 Python 初始化/迁移入口：
+Schema v3 是破坏性切换，不提供旧数据迁移。首次切换必须先停止 Pipeline 写入，
+核对连接目标，然后显式全量重建：
 
 ```sh
-make pipeline-init-db
+docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm pipeline \
+  python -m pipeline init-db --database roadnet --reset
 ```
 
-非 `--reset` 初始化在一个事务内处理当前建表、自动补列、显式结构迁移和索引同步；已有 named volume 升级代码后也必须执行。它会为旧表补齐 `turn_events.tp_source_id` 和 `turn_events.tp_source_row_key`，并删除不再持久化的事件及候选簇算法序号。事件唯一使用 `turn_events.id`；候选路口和完整路口分别使用 `candidate_intersections.id` 与 `intersections.id`，Centerline 端点也引用完整路口数据库 ID。运行时的事件和簇计算序号均不落库。只有数据库仍存在早期单表 Run 注册表 `pipeline_runs` 且 Clean 父子关系无法确定时，才需要通过 `--legacy-clean-map` 提供精确的 Detect UUID → Clean UUID 映射。`--reset` 会删除全部 Pipeline 业务数据，不能用于普通升级。
-
-删除这些计算序号列的版本不支持新旧 writer 滚动混跑。升级已有数据库时，先停止 Pipeline 写入，执行 `make pipeline-init-db`，再启动新版本 Pipeline。迁移会先校验旧的簇引用、回填 Centerline 及其 Clip manifest 的 `BIGINT` 路口 ID，再删除旧列；任何映射冲突或历史 combined Centerline 端点次序与数据库 ID 次序不一致都会中止并回滚，不会静默交换端点。
+初始化器只创建 `track.v2` schema version 3。无 `--reset` 时，它只接受空库或
+已经标记为 v3 的数据库；检测到未版本化表、v1 或 v2 会立即失败。Pipeline 与
+Backend 启动时同样校验版本。`--reset` 会删除全部 Pipeline 业务数据，因此每次
+执行前都要核对输出的 database、user 与 schema。
 
 地图 Clip 请求的值语义也随之改变：仓内 Frontend 与 QGIS 插件已改传 `intersections.id`，仍传旧 `cluster_id` 的外部客户端必须同步升级。
 
-查看完整参数或从外部数据目录运行 CSV：
+查看完整参数或从 PostgreSQL 来源表运行：
 
 ```sh
 make pipeline-help
-docker compose -f infra/docker/compose.dev.yml run --rm pipeline \
-  python -m pipeline run --csv /data/parquet-or-csv/input.csv \
+docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm pipeline \
+  python -m pipeline run --source-table public.day01 \
   --processing-srid 32650
 ```
 
-输入使用 `--csv`、`--pg-table` 或 `--clean-id` 三选一。`--pg-table` 接受 `public.day01` 这类 schema-qualified 名称；进度总行数通过 `to_regclass` 解析 `pg_class.reltuples`，因此是估算值。`--clean-id UUID` 只复用已完成的 Clean Run，并始终创建新的 Detect Run；Detect 完成后再创建新的 Fit Run。Clip 没有独立 Run 注册表，Network 当前也不单独持久化。Pipeline 是独立批处理进程，不经由 Backend API request process 启动。
+输入使用 `--source-table` 或 `--clean-id` 二选一。来源表接受
+`public.day01` 这类 schema-qualified 名称，并必须提供唯一非空的 `id` 以及
+`vehicle_id/timestamp/lon/lat/heading/speed/geom`；`extra` 可选。Pipeline 不再把
+CSV 当作运行入口，需要时先用独立 importer 导入 PostgreSQL。`--clean-id UUID`
+只复用已完成且来源指纹仍一致的 Clean Run，并始终创建新的 Detect Run；Detect
+完成后再创建 Fit Run。Pipeline 是独立批处理进程，不经由 Backend 请求启动。
 
-当前 Run lineage 为 `clean_runs → detect_runs → fit_runs`，早期的 `pipeline_runs` 只属于一次性数据库迁移输入，不是当前执行模型。Detect 的 append-only 派生产物使用 PostgreSQL COPY，并假定写入新建的 Run ID；同一 Detect/Fit Run 的重复落库不保证幂等，重新计算应创建新 Run。普通 Detect 异常会回滚派生产物，并把 Run 标为 `failed`；进程被强制终止时仍可能需要运维侧清理长期 `running` 记录。
+当前 Run lineage 为 `clean_runs → detect_runs → fit_runs`。Detect 的完整
+`resolved_subtrack_points` 序列与所有 Detect 子产物在一个最终事务中落盘；失败
+会回滚子表并单独标记 Run 为 `failed`。只有 completed Detect 可供 Clip/Replay
+消费。同一 Detect/Fit Run 不支持重复落库，重新计算应创建新 Run。
 
 `32650` 仅是北京所在 UTM 分区的命令示例，不是项目默认值。新 Clean Run 必须按完整数据范围明确选择米制投影；也可在自定义 `pipeline.toml` 的 `[projection]` 中配置。使用 `--clean-id UUID` 时会继承原 Run 的投影，不能覆盖。选择与迁移规则见 [Run 级投影上下文](docs/run-projection-context.md)。
 

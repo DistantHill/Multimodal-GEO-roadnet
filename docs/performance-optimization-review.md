@@ -105,49 +105,55 @@ centerline bundle with one batched RETURNING operation and writes all
 `centerline_source_clips` manifests with one COPY operation. On the validated run
 this reduced roughly 1,680 centerline/manifest write operations to two.
 
-Detect calculation and persistence share one transaction. An ordinary
-exception rolls back derived artifacts, then records the Detect Run as
-`failed` in a new transaction before re-raising. Fitting emits separate
-`fit_compute` and `fit_persist` phase timings so persistence time is not
-included in geometry compute. Scheduler delay, swapping, and CPU contention
-still affect both wall-clock phases and require host metrics or a controlled
-rerun to diagnose.
+Detect calculation runs outside the final write transaction. After calculation,
+one transaction writes the complete p/i/c `resolved_subtrack_points` sequence,
+all Detect children, and the completed status. An ordinary exception rolls that
+transaction back, then records the Detect Run as `failed` separately. Telemetry
+now separates `detect_compute`, `detect_persist`, and the resolved-sequence part
+of persistence. Fitting continues to separate `fit_compute` and `fit_persist`.
 
 Implementation: [`db_writer.py`](../services/pipeline/src/track/v2/db_writer.py)
 and [`pipeline.py`](../services/pipeline/src/track/v2/pipeline.py).
 
-### Clip and Clean-point loading
+### Resolved sequence and Clip
 
-Clip uses a fixed 100m intersection grid. A circle whose bounding box would
-occupy more than 4,096 cells is kept in a bounded overflow collection and is
-filtered by an exact conservative segment/circle bbox check. Long segment AABBs
-choose the cheaper of enumerating grid cells or scanning the indexed
-intersections.
+Schema v3 moves every segment/circle root to Detect. Detect persists only roots
+that change circle membership and orders simultaneous events by exit, entry,
+intersection ID, then crossing ID. `resolved_subtrack_points` stores stable p/i
+identity, immutable Clean ordering, and the final p/i/c order without copying
+coordinates or vehicle IDs.
 
-Clean-point loading no longer asks PostgreSQL to globally sort hundreds of
-thousands of wide UNION rows. Rows are grouped by `(vehicle_id,
-subtrack_index)` and each small group is sorted locally by
-`(anchor_sequence, point_kind, row_id)`, preserving the previous order.
+Clip no longer owns a spatial grid or solves roots. It streams that final order,
+uses complete-intersection geometry only to initialize the active set at the
+first point, and emits a road fragment only while the active set is empty. Its
+interior contract is the minimal `(resolved_point_id, lon, lat)` tuple. Natural
+boundaries are explicit `boundary_start`/`boundary_end`; an entirely outside
+track with no crossing is `full_track`, while an entirely inside track emits
+nothing. Fitting accepts only `between_intersection`.
 
 Implementation: [`clip.py`](../services/pipeline/src/track/v2/clip.py) and
 [`queries.py`](../services/pipeline/src/track/v2/db/queries.py).
 
-### Source names and Schema upgrades
+### Source tables and schema version
 
 PostgreSQL progress estimates resolve the source with
-`to_regclass(source_id)`, so schema-qualified names such as `public.day01` are
+`to_regclass(source_table)`, so schema-qualified names such as `public.day01` are
 handled correctly. The value comes from `pg_class.reltuples` and remains an
 estimate used only for progress.
 
-`python -m pipeline init-db` is the current Schema authority. A normal,
-non-reset upgrade auto-adds missing columns, including
-`turn_events.tp_source_id` and `turn_events.tp_source_row_key`, before applying
-explicit structural migrations and indexes in the same transaction.
+`python -m pipeline init-db` is the Schema authority. Version 3 has no in-place
+upgrade path: v1/v2 or unversioned tables require an explicitly confirmed
+`--reset`. Pipeline and Backend fail at startup when the metadata version does
+not match. Pipeline itself accepts only `source_table` (or a completed
+`clean_id`); CSV remains a separate parser/importer facility.
 
 Implementation: [`sources.py`](../services/pipeline/src/track/v2/sources.py) and
 [`init_db.py`](../services/pipeline/src/track/v2/cli/init_db.py).
 
-## 2026-08-31 1,000,000-row validation (historical)
+The schema-v3 cutover audit and repeatable A65 commands are recorded in
+[`schema-v3-cutover-benchmark.md`](schema-v3-cutover-benchmark.md).
+
+## 2026-08-31 1,000,000-row validation (historical, pre-v3)
 
 Dataset and machine:
 
@@ -238,16 +244,16 @@ called out where they supersede the original implementation detail.
 |---|---|---|---|---|
 | 1 | Named PostgreSQL cursors use batched fetches | Yes | Yes | Core sources and the remaining 1M seed cursor use batched fetches. |
 | 2 | Group DBSCAN labels in one pass at three call sites | Yes | Yes | O(KN) result grouping became O(N); large-input neighbour discovery is now also the exact grid/active-frontier path described above. |
-| 3 | Reuse the Clip intersection grid globally | Yes | Yes | One immutable grid is reused per Clip input; it now uses fixed 100m cells and a 4,096-cell overflow bound. |
+| 3 | Reuse the Clip intersection grid globally | Yes | Superseded | This was valid for the pre-v3 implementation. Schema v3 consumes resolved crossings and has no Clip grid/root solver. |
 | 4 | Batch candidate/intersection INSERT RETURNING | Yes | Yes | ID-dependent tables retain batched RETURNING; append-only Detect artifacts and Fitting manifests have since moved to COPY. |
 | 5 | Change high-frequency performance timing to block level | Yes | Yes | G* and DBSCAN retain telemetry names while avoiding timer calls for every candidate. |
 | 6 | Generate only cross-vehicle segment pairs | Yes | Yes | The rank-ordered iterator emits canonical cross-vehicle pairs only; it is now used by the global broad phase. |
 | 7 | Construct DB models directly from tuples | Yes | No | This was already present in `PostgresTrajectorySourceHandle`; the dict parser remains for general rows. |
-| 8 | Replay manifest first and query named subtracks | Yes | Yes | Replay validates its manifest, loads only referenced subtracks, and caches Detect-to-Clean resolution. |
+| 8 | Replay manifest first and query named subtracks | Yes | Superseded | Schema v3 manifests retain only crossing endpoints; replay slices the final resolved sequence between those stable IDs. |
 | 9 | Add a Cleaner pending-point flush cap | Yes | Yes | A configurable 100k-point cap flushes only between complete vehicle groups. |
 | 10 | Cache Cross-track endpoint projections | Yes | Yes | Accepted point indexes are projected once per vehicle, allowing adjacent segments to reuse endpoints. |
 | 11 | Remove redundant indexes and add a composite index | Yes | Yes | The covering and membership indexes replace the superseded `idx_ktp_tp_id` and `idx_ktp_vehicle_sub`; structural migration drops those redundant indexes. |
 | 12 | Accumulate cluster provenance in lists | Yes | Yes | Merge provenance stays mutable during absorption and becomes immutable once at model construction. |
 | 13 | Process Topology segment metadata once | Yes | Yes | Metadata sharing remains; DB topology now additionally uses one global `_TopologyPointIndex` instead of per-cluster SQL. |
-| 14 | Adapt Clip scanning for long AABBs | Yes | Yes | The cheaper scan/cell strategy remains and is combined with fixed cells plus exact overflow filtering. |
+| 14 | Adapt Clip scanning for long AABBs | Yes | Superseded | Detect owns roots in schema v3, so Clip has no AABB/circle scan. |
 | 15 | Remove redundant writer/source counting | Yes | Yes | Streaming paths reuse their write/parse counts; schema-qualified PostgreSQL estimates now resolve through `to_regclass`. |

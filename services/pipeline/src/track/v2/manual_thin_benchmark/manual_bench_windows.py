@@ -501,6 +501,16 @@ def _legacy_phase_capture(
 
 
 def _candidate_key(candidate: Any) -> list[str]:
+    if hasattr(candidate, "from_segment_start_point_ref"):
+        from_ref = candidate.from_segment_start_point_ref
+        to_ref = candidate.to_segment_start_point_ref
+        return [
+            candidate.vehicle_id,
+            from_ref.source_id,
+            from_ref.source_row_key,
+            to_ref.source_id,
+            to_ref.source_row_key,
+        ]
     return [
         candidate.vehicle_id,
         candidate.from_source_id,

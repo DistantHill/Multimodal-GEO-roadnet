@@ -69,36 +69,87 @@ def endpoint_url(base_url: str, endpoint_path: str) -> str:
     return normalize_backend_url(base_url) + normalize_endpoint_path(endpoint_path)
 
 
-def build_replay_payload(records: Sequence[SelectionRecord]) -> dict[str, Any]:
-    """Build the replay body from selected raw trajectory point features."""
+def build_replay_payload(records: Sequence[SelectionRecord], *, intersection_layer: bool = False) -> dict[str, Any]:
+    """Build a schema-v3 replay body from selected trajectory features."""
 
     if not records:
         raise ContractError("Select one or more trajectory points before Replay.")
 
-    point_ids: list[Any] = []
+    if intersection_layer:
+        if len(records) != 1:
+            raise ContractError("交叉口 Replay 需要恰好选择一个交叉口。")
+        value = _first_present(records[0].properties, ("intersection_id", "id", "database_id"))
+        if value is None:
+            raise ContractError("交叉口图层缺少 intersections.id，无法回放。")
+        payload = {"intersection_id": _integer_identifier(value, "intersection ID", 1)}
+        detect_id = _common_property(records, "detect_id", required=False)
+        if detect_id is not None:
+            payload["detect_id"] = _uuid_identifier(detect_id)
+        return payload
+
+    resolved_point_ids: list[Any] = []
+    source_row_keys: list[str] = []
+    identity_kinds: set[str] = set()
     missing: list[str] = []
     for record in records:
-        value = _first_present(record.properties, ("id", "database_id"))
-        if value is None:
+        resolved_value = _first_present(record.properties, ("resolved_point_id",))
+        source_value = _first_present(
+            record.properties,
+            ("source_row_key", "id", "database_id"),
+        )
+        if resolved_value is not None:
+            identity_kinds.add("resolved")
+            _append_unique(
+                resolved_point_ids,
+                _integer_identifier(resolved_value, "resolved point ID", 1),
+            )
+        elif source_value is not None:
+            identity_kinds.add("source")
+            _append_unique(source_row_keys, _source_row_key(source_value))
+        else:
             missing.append(str(record.feature_id))
-            continue
-        _append_unique(point_ids, _integer_identifier(value, "point ID", 1))
 
     if missing:
         shown = ", ".join(missing[:5])
         suffix = "..." if len(missing) > 5 else ""
         raise ContractError(
-            "Selected trajectory features must contain an 'id' or 'database_id' "
+            "Selected trajectory features must contain 'resolved_point_id', "
+            "'source_row_key', 'id', or 'database_id' "
             f"attribute (missing on feature IDs: {shown}{suffix})."
         )
-    if len(point_ids) > 1_000:
-        raise ContractError("Replay accepts at most 1000 distinct selected point IDs.")
+    if len(identity_kinds) != 1:
+        raise ContractError(
+            "Replay selection cannot mix resolved point IDs with source row keys."
+        )
+    selected_count = len(resolved_point_ids) or len(source_row_keys)
+    if selected_count > 1_000:
+        raise ContractError("Replay accepts at most 1000 distinct selected point keys.")
 
-    payload: dict[str, Any] = {"point_ids": point_ids}
+    payload: dict[str, Any]
     common_detect_id = _common_property(records, "detect_id", required=False)
-    if common_detect_id is not None:
+    if resolved_point_ids:
+        if common_detect_id is None:
+            raise ContractError(
+                "Resolved point Replay requires one common non-null detect_id."
+            )
+        payload = {
+            "detect_id": _uuid_identifier(common_detect_id),
+            "resolved_point_ids": resolved_point_ids,
+        }
+    else:
+        payload = {"source_row_keys": source_row_keys}
+    if common_detect_id is not None and "detect_id" not in payload:
         payload["detect_id"] = _uuid_identifier(common_detect_id)
     return payload
+
+
+def _source_row_key(value: Any) -> str:
+    if value is None or isinstance(value, bool) or isinstance(value, (dict, list, tuple, set)):
+        raise ContractError("source row key must be a non-empty scalar value.")
+    normalized = str(value)
+    if not normalized:
+        raise ContractError("source row key must be a non-empty scalar value.")
+    return normalized
 
 
 def build_clip_payload(records: Sequence[SelectionRecord]) -> dict[str, Any]:

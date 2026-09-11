@@ -415,8 +415,8 @@ def _segment_circle_crossings_batch(
     b_xy: np.ndarray,
     center: tuple[float, float],
     radius_m: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Vectorized first intersections between many segments and one circle.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return zero, one, or two ordered state-changing roots per segment.
 
     Args:
         a_xy: ``(n, 2)`` segment start coordinates in meters.
@@ -425,9 +425,11 @@ def _segment_circle_crossings_batch(
         radius_m: Circle radius in meters.
 
     Returns:
-        ``(hit_mask, crossing_xy)`` where ``hit_mask`` is a boolean ``(n,)``
-        array and ``crossing_xy`` is an ``(n, 2)`` array. Misses are filled
-        with ``nan``; the first intersection along a→b is returned per segment.
+        ``(root_counts, fractions, crossing_xy)``. ``root_counts`` has shape
+        ``(n,)``; ``fractions`` has shape ``(n, 2)``; and ``crossing_xy`` has
+        shape ``(n, 2, 2)``. Empty slots are ``nan``. Tangencies are omitted
+        because touching a circle without changing inside/outside state is not
+        a crossing.
     """
     a = np.asarray(a_xy, dtype=float)
     b = np.asarray(b_xy, dtype=float)
@@ -436,7 +438,11 @@ def _segment_circle_crossings_batch(
 
     n = a.shape[0]
     if n == 0:
-        return np.zeros(0, dtype=bool), np.empty((0, 2), dtype=float)
+        return (
+            np.zeros(0, dtype=np.int8),
+            np.empty((0, 2), dtype=float),
+            np.empty((0, 2, 2), dtype=float),
+        )
 
     center_xy = np.asarray(center, dtype=float)
     rel_a = a - center_xy
@@ -448,7 +454,12 @@ def _segment_circle_crossings_batch(
     qc = np.einsum("ij,ij->i", rel_a, rel_a) - radius_m * radius_m
     disc = qb * qb - 4.0 * qa * qc
 
-    valid = (qa > 0.0) & (disc >= 0.0)
+    # A zero discriminant is a tangent: it does not toggle circle membership.
+    tolerance = np.finfo(float).eps * np.maximum(
+        1.0,
+        np.abs(qb * qb) + np.abs(4.0 * qa * qc),
+    ) * 16.0
+    valid = (qa > 0.0) & (disc > tolerance)
     sqrt_disc = np.zeros(n, dtype=float)
     sqrt_disc[valid] = np.sqrt(disc[valid])
 
@@ -461,14 +472,18 @@ def _segment_circle_crossings_batch(
 
     t1_inside = (0.0 <= t1) & (t1 <= 1.0)
     t2_inside = (0.0 <= t2) & (t2 <= 1.0)
-    hit_mask = valid & (t1_inside | t2_inside)
-    t = np.where(t1_inside, t1, np.where(t2_inside, t2, np.nan))
+    fractions = np.full((n, 2), np.nan, dtype=float)
+    fractions[:, 0] = np.where(t1_inside, t1, np.where(t2_inside, t2, np.nan))
+    fractions[:, 1] = np.where(t1_inside & t2_inside, t2, np.nan)
+    root_counts = np.sum(np.isfinite(fractions), axis=1, dtype=np.int8)
 
-    crossing_xy = np.full((n, 2), np.nan, dtype=float)
-    crossing_xy[hit_mask] = (
-        center_xy + rel_a[hit_mask] + t[hit_mask, None] * delta[hit_mask]
-    )
-    return hit_mask, crossing_xy
+    crossing_xy = np.full((n, 2, 2), np.nan, dtype=float)
+    for root_index in (0, 1):
+        hit = np.isfinite(fractions[:, root_index])
+        crossing_xy[hit, root_index] = (
+            a[hit] + fractions[hit, root_index, None] * delta[hit]
+        )
+    return root_counts, fractions, crossing_xy
 
 
 # ── Branch angle relative to center ───────────────────────────────────

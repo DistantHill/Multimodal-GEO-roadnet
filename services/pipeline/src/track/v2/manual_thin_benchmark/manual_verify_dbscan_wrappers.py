@@ -43,27 +43,46 @@ def coordinates(index):
 
 turns, cross = [], []
 calculate_index_field = fields(TurnEvent)[0].name
+turn_fields = {field.name for field in fields(TurnEvent)}
 cross_fields = {field.name for field in fields(CrossTrackCandidate)}
 for i in range(4):
     lon, lat, x, y = coordinates(i)
     turn_kwargs = dict(
         vehicle_id=f"turn-{i}", timestamp=1000.0+i,
-        lon=lon, lat=lat, x=x, y=y, in_bearing=0.0, out_bearing=90.0,
+        lon=lon, lat=lat, x=x, y=y,
         turn_deg=90.0, score=1.0,
         point_ref=PointRef("turn_source", str(i), stable=True),
-        source_ids=("turn_source",), from_source_id="turn_source",
-        from_source_row_key=str(i), to_source_id="turn_source",
-        to_source_row_key=str(i),
     )
+    if "entry_bearing" in turn_fields:
+        turn_kwargs.update(entry_bearing=0.0, exit_bearing=90.0)
+    else:
+        turn_kwargs.update(in_bearing=0.0, out_bearing=90.0)
+    if "source_ids" in turn_fields:
+        turn_kwargs["source_ids"] = ("turn_source",)
+    if "from_source_id" in turn_fields:
+        turn_kwargs.update(
+            from_source_id="turn_source", from_source_row_key=str(i),
+            to_source_id="turn_source", to_source_row_key=str(i),
+        )
     turn_kwargs[calculate_index_field] = i
     turns.append(TurnEvent(**turn_kwargs))
+    from_ref = PointRef("a_source", str(i), stable=True)
+    to_ref = PointRef("b_source", str(i), stable=True)
     cross_kwargs = dict(
-        point_ref=PointRef("a_source", str(i), stable=True),
+        point_ref=from_ref,
         vehicle_id=f"a|b-{i}", timestamp=3000.0+i,
         lon=lon, lat=lat, x=x, y=y, heading=0.0, speed=10.0,
-        from_source_id="a_source", from_source_row_key=f"{i}a,{i}b",
-        to_source_id="b_source", to_source_row_key=f"{i}c,{i}d",
     )
+    if "from_segment_start_point_ref" in cross_fields:
+        cross_kwargs.update(
+            from_segment_start_point_ref=from_ref,
+            to_segment_start_point_ref=to_ref,
+        )
+    else:
+        cross_kwargs.update(
+            from_source_id="a_source", from_source_row_key=f"{i}a,{i}b",
+            to_source_id="b_source", to_source_row_key=f"{i}c,{i}d",
+        )
     if "origin_lon" in cross_fields:
         cross_kwargs.update(origin_lon=origin_lon, origin_lat=origin_lat)
     cross.append(CrossTrackCandidate(**cross_kwargs))

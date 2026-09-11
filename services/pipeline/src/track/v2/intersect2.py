@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 import time
-from bisect import bisect_left, bisect_right
+from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, TYPE_CHECKING
@@ -143,7 +143,7 @@ class IntersectConfig(TrackModel):
     query_active_from_db: bool = False
     db_table: str = "trajectory_points"
     kept_table: str | None = None
-    source_id: str | None = None
+    source_table: str | None = None
     clean_id: str | None = None
     spatial_window_size: tuple[float, float] = (2000.0, 2000.0)
     spatial_window_overlap: float = 0.15
@@ -757,18 +757,21 @@ def _stream_extract_method_1(
         conn,
         table=cfg.db_table,
         kept_table=cfg.kept_table,
-        source_id=cfg.source_id,
+        source_table=cfg.source_table,
         clean_id=cfg.clean_id,
         spatial_context=spatial_context,
     ):
+        subtrack_index = (
+            track[0].cleaned_point_ref.subtrack_index
+            if track[0].cleaned_point_ref is not None
+            else 1
+        )
+        track_key = f"{track[0].vehicle_id}\x00{subtrack_index}"
         track = _project_tracks(
-            {track[0].vehicle_id: track}, transformer, trust_existing=True
-        )[
-            track[0].vehicle_id
-        ]
-        vid = track[0].vehicle_id
-        tracks[vid] = track
-        batch[vid] = track
+            {track_key: track}, transformer, trust_existing=True
+        )[track_key]
+        tracks[track_key] = track
+        batch[track_key] = track
         track_count += 1
 
         if len(batch) >= cfg.stream_batch_size:
@@ -894,7 +897,7 @@ def _extract_cross_track_memory_windows(
                         assigned_points += 1
 
     candidates: list[CrossTrackCandidate] = []
-    seen_segment_pairs: set[tuple[str, str, str, str, str]] = set()
+    seen_segment_pairs: set[tuple[object, ...]] = set()
     populated = sorted(buckets)
     for processed, window_index in enumerate(
         _perf_iter(
@@ -926,7 +929,10 @@ def _extract_cross_track_memory_windows(
             key = _cross_track_candidate_key(candidate)
             if key not in seen_segment_pairs:
                 seen_segment_pairs.add(key)
-                candidates.append(candidate)
+                candidates.append(replace(
+                    candidate,
+                    cross_track_calculate_index=len(candidates),
+                ))
 
     log_info(
         "    内存分窗 / In-memory windows: "
@@ -1015,7 +1021,7 @@ def _extract_cross_track_windows(
     benchmark. ``perf`` feeds the hierarchical stage tracker.
     """
     candidates: list[CrossTrackCandidate] = []
-    seen_segment_pairs: set[tuple[str, str, str, str, str]] = set()
+    seen_segment_pairs: set[tuple[object, ...]] = set()
     if not cfg.use_cross_track_candidates:
         return candidates
     if candidate_extractor is not None and legacy_origin is None:
@@ -1073,7 +1079,7 @@ def _extract_cross_track_windows(
             window,
             table=cfg.db_table,
             kept_table=cfg.kept_table,
-            source_id=cfg.source_id,
+            source_table=cfg.source_table,
             clean_id=cfg.clean_id,
             spatial_context=spatial_context,
             telemetry=telemetry,
@@ -1125,7 +1131,10 @@ def _extract_cross_track_windows(
             key = _cross_track_candidate_key(candidate)
             if key not in seen_segment_pairs:
                 seen_segment_pairs.add(key)
-                candidates.append(candidate)
+                candidates.append(replace(
+                    candidate,
+                    cross_track_calculate_index=len(candidates),
+                ))
                 added += 1
         if telemetry is not None:
             telemetry["dedupe_seconds"] = telemetry.get("dedupe_seconds", 0.0) + (
@@ -1156,14 +1165,23 @@ def _extract_cross_track_windows(
 
 def _cross_track_candidate_key(
     candidate: CrossTrackCandidate,
-) -> tuple[str, str, str, str, str]:
+) -> tuple[object, ...]:
     """Stable identity for one canonical A/B segment-pair intersection."""
+    if (
+        candidate.from_segment_start is not None
+        and candidate.to_segment_start is not None
+    ):
+        return (
+            candidate.from_segment_start.point_kind,
+            candidate.from_segment_start.point_id,
+            candidate.to_segment_start.point_kind,
+            candidate.to_segment_start.point_id,
+        )
     return (
-        candidate.vehicle_id,
-        candidate.from_source_id,
-        candidate.from_source_row_key,
-        candidate.to_source_id,
-        candidate.to_source_row_key,
+        candidate.from_segment_start_point_ref.source_id,
+        candidate.from_segment_start_point_ref.source_row_key,
+        candidate.to_segment_start_point_ref.source_id,
+        candidate.to_segment_start_point_ref.source_row_key,
     )
 
 
@@ -1192,82 +1210,113 @@ def _topology_point_windows(
 
 @dataclass
 class _TopologyPointIndex:
-    """Memory-bounded one-dimensional spatial index over trajectory points."""
+    """One-dimensional interval index over real adjacent track segments.
+
+    A point-only window query loses a segment whenever one or both endpoints
+    sit outside the query box.  It can also join different subtracks after
+    grouping the selected points by ``vehicle_id``.  Instead, retain the
+    caller's track key and route a complete subtrack when any of its real
+    adjacent segment AABBs intersects the query window.  The complete subtrack
+    is required to initialise circle membership from its true first point and
+    to preserve the full bearing context around a crossing.
+    """
 
     axis: str
-    coordinates: list[float]
-    points: list[TrajectoryPoint]
+    lower_bounds: list[float]
+    prefix_upper_bounds: list[float]
+    segments: list[tuple[str, float, float, float, float]]
     tracks: dict[str, list[TrajectoryPoint]]
 
     def tracks_in(self, window: SpatialWindow) -> dict[str, list[TrajectoryPoint]]:
-        """Materialise one window only, ordered as the former SQL result."""
+        """Return complete subtracks with a segment AABB touching ``window``."""
         if self.axis == "x":
             lower, upper = window.x_min, window.x_max
         else:
             lower, upper = window.y_min, window.y_max
-        start = bisect_left(self.coordinates, lower)
-        stop = bisect_right(self.coordinates, upper)
+        stop = bisect_right(self.lower_bounds, upper)
 
-        grouped: dict[str, list[TrajectoryPoint]] = defaultdict(list)
-        for point_index in range(start, stop):
-            point = self.points[point_index]
-            point_x, point_y = _point_xy(point)
-            if (window.x_min <= point_x <= window.x_max
-                    and window.y_min <= point_y <= window.y_max):
-                grouped[point.vehicle_id].append(point)
+        selected_track_keys: set[str] = set()
+        segment_index = stop - 1
+        while segment_index >= 0:
+            # No interval at or before this position can reach the window.
+            if self.prefix_upper_bounds[segment_index] < lower:
+                break
+            track_key, min_x, min_y, max_x, max_y = self.segments[segment_index]
+            if (
+                min_x <= window.x_max
+                and max_x >= window.x_min
+                and min_y <= window.y_max
+                and max_y >= window.y_min
+            ):
+                selected_track_keys.add(track_key)
+            segment_index -= 1
 
-        ordered: dict[str, list[TrajectoryPoint]] = {}
-        for vehicle_id in sorted(grouped):
-            points = grouped[vehicle_id]
-            timestamps = {point.timestamp for point in points}
-            if len(timestamps) == len(points):
-                points.sort(key=lambda point: point.timestamp)
-                ordered[vehicle_id] = points
-                continue
-            # Equal timestamps have no total SQL ordering.  Retain the exact
-            # order of the shared stream instead of allowing the spatial sort
-            # axis to invent a different adjacent segment.
-            selected_ids = {id(point) for point in points}
-            ordered[vehicle_id] = [
-                point
-                for point in self.tracks[vehicle_id]
-                if id(point) in selected_ids
-            ]
-        return ordered
+        # Preserve the original, complete subtrack and its ordering.  In
+        # particular, do not key this result by vehicle_id: one vehicle may
+        # own several independent subtracks.
+        return {
+            track_key: self.tracks[track_key]
+            for track_key in sorted(selected_track_keys)
+        }
 
 
 def _build_topology_point_index(
     tracks: dict[str, list[TrajectoryPoint]],
 ) -> _TopologyPointIndex:
-    """Index the global track stream once for transient per-window lookup.
+    """Index real adjacent segment AABBs once for per-window topology routing.
 
-    The wider dataset axis is sorted once.  Each query uses binary search on
-    that axis and an exact predicate on the other, avoiding both an N+1 DB scan
-    and the per-cell object overhead of a Python grid.  The retained index is
-    two pointer arrays of length N; one former SQL result is materialised and
-    released at a time.
+    Segments are sorted by their lower bound on the wider dataset axis.  A
+    prefix maximum of upper bounds lets a backwards query stop as soon as no
+    earlier interval can overlap.  Each segment is stored once and no
+    projected geometry or circle fraction is persisted.
     """
-    points: list[TrajectoryPoint] = []
-    for track in tracks.values():
-        points.extend(track)
-    if not points:
+    point_coordinates = [
+        _point_xy(point)
+        for track in tracks.values()
+        for point in track
+    ]
+    if not point_coordinates:
         return _TopologyPointIndex(
-            axis="x", coordinates=[], points=[], tracks=tracks,
+            axis="x",
+            lower_bounds=[],
+            prefix_upper_bounds=[],
+            segments=[],
+            tracks=tracks,
         )
-    point_coordinates = [_point_xy(point) for point in points]
     axis = (
         "x"
         if (max(x for x, _ in point_coordinates) - min(x for x, _ in point_coordinates)
             >= max(y for _, y in point_coordinates) - min(y for _, y in point_coordinates))
         else "y"
     )
-    points.sort(key=lambda point: _point_xy(point)[0 if axis == "x" else 1])
-    coordinates = [
-        _point_xy(point)[0 if axis == "x" else 1]
-        for point in points
-    ]
+
+    segments: list[tuple[str, float, float, float, float]] = []
+    for track_key, track in tracks.items():
+        for start, end in zip(track, track[1:]):
+            start_x, start_y = _point_xy(start)
+            end_x, end_y = _point_xy(end)
+            segments.append((
+                track_key,
+                min(start_x, end_x),
+                min(start_y, end_y),
+                max(start_x, end_x),
+                max(start_y, end_y),
+            ))
+    axis_min_index = 1 if axis == "x" else 2
+    axis_max_index = 3 if axis == "x" else 4
+    segments.sort(key=lambda segment: segment[axis_min_index])
+    lower_bounds = [segment[axis_min_index] for segment in segments]
+    prefix_upper_bounds: list[float] = []
+    prefix_upper = -math.inf
+    for segment in segments:
+        prefix_upper = max(prefix_upper, segment[axis_max_index])
+        prefix_upper_bounds.append(prefix_upper)
     return _TopologyPointIndex(
-        axis=axis, coordinates=coordinates, points=points, tracks=tracks,
+        axis=axis,
+        lower_bounds=lower_bounds,
+        prefix_upper_bounds=prefix_upper_bounds,
+        segments=segments,
+        tracks=tracks,
     )
 
 
@@ -1357,7 +1406,7 @@ def _detect_intersections_db(
         conn,
         table=cfg.db_table,
         kept_table=cfg.kept_table,
-        source_id=cfg.source_id,
+        source_table=cfg.source_table,
         clean_id=cfg.clean_id,
         spatial_context=spatial_context,
     )
@@ -1492,7 +1541,7 @@ def _detect_turn_events(
     track_count = 0
     log_info(f"── 转向事件检测 / Turn event detection ({total_tracks:,} 轨迹/tracks) ...")
 
-    for vehicle_id, track in _perf_iter(perf, tracks.items(), name="tracks_turn"):
+    for _track_key, track in _perf_iter(perf, tracks.items(), name="tracks_turn"):
         if len(track) < 2 * w + 1:
             continue
 
@@ -1528,21 +1577,20 @@ def _detect_turn_events(
                 events.append(
                     TurnEvent(
                         event_calculate_index=len(events),
-                        vehicle_id=vehicle_id,
+                        vehicle_id=p.vehicle_id,
                         timestamp=p.timestamp,
                         lon=p.lon,
                         lat=p.lat,
                         x=xy[i][0],
                         y=xy[i][1],
-                        in_bearing=in_bearing,
-                        out_bearing=out_bearing,
+                        entry_bearing=in_bearing,
+                        exit_bearing=out_bearing,
                         turn_deg=turn,
                         score=abs_turn,
                         source="turn",
                         point_ref=p.point_ref,
+                        cleaned_point_ref=p.cleaned_point_ref,
                         source_ids=(p.point_ref.source_id,),
-                        from_source_id=p.point_ref.source_id,
-                        from_source_row_key=p.point_ref.source_row_key,
                     )
                 )
 
@@ -1774,7 +1822,7 @@ def _select_hotspot_events(
     t0 = time.perf_counter()
     z_scores = _compute_getis_ord_g_star(events, cfg.g_star_radius_m, live_status=live_status, perf=perf)
     result = [
-        e
+        replace(e, g_star_z=z_scores.get(e.event_calculate_index, 0.0))
         for e in events
         if z_scores.get(e.event_calculate_index, 0.0) >= cfg.g_star_min_z
         and abs(e.turn_deg) >= cfg.min_turn_deg
@@ -2252,17 +2300,17 @@ def _cluster_orthogonal_cross_track_candidates(
                 lat=c.lat,
                 x=c.x,
                 y=c.y,
-                in_bearing=0.0,
-                out_bearing=0.0,
+                entry_bearing=0.0,
+                exit_bearing=0.0,
                 turn_deg=0.0,
                 score=0.0,
                 source="orthogonal_cross_track",
                 point_ref=c.point_ref,
-                source_ids=tuple(sorted({c.from_source_id, c.to_source_id})),
-                from_source_id=c.from_source_id,
-                from_source_row_key=c.from_source_row_key,
-                to_source_id=c.to_source_id,
-                to_source_row_key=c.to_source_row_key,
+                cross_track_calculate_index=c.cross_track_calculate_index,
+                source_ids=tuple(sorted({
+                    c.from_segment_start_point_ref.source_id,
+                    c.to_segment_start_point_ref.source_id,
+                })),
             )
             for i, c in enumerate(cluster_items)
         )
@@ -2458,8 +2506,8 @@ def _make_observation(
     exit_seg: int,
     exit_xy: tuple[float, float],
     bearing_window: int,
-    entry_crossing_id: int | None = None,
-    exit_crossing_id: int | None = None,
+    entry_crossing_calculate_index: int | None = None,
+    exit_crossing_calculate_index: int | None = None,
 ) -> EntryExitObservation | None:
     """Build a single EntryExitObservation from matched entry/exit segments."""
     inbound_angles = _segment_bearings(points, entry_seg - bearing_window, entry_seg + 1)
@@ -2474,11 +2522,11 @@ def _make_observation(
         vehicle_id=track[0].vehicle_id,
         entry_branch_angle=_branch_angle_from_center(center, entry_xy),
         exit_branch_angle=_branch_angle_from_center(center, exit_xy),
-        inbound_bearing=inbound_bearing,
-        outbound_bearing=outbound_bearing,
+        entry_bearing=inbound_bearing,
+        exit_bearing=outbound_bearing,
         turn_deg=_angle_delta_deg(inbound_bearing, outbound_bearing),
-        entry_crossing_id=entry_crossing_id,
-        exit_crossing_id=exit_crossing_id,
+        entry_crossing_calculate_index=entry_crossing_calculate_index,
+        exit_crossing_calculate_index=exit_crossing_calculate_index,
     )
 
 
@@ -2610,106 +2658,155 @@ def _extract_entry_exit_observations_batch(
     radius_m: float,
     bearing_window: int = 2,
 ) -> tuple[list[EntryExitObservation], list[CrossingPoint]]:
-    """Batch-compute entry/exit observations for one intersection candidate.
+    """Compute every state-changing circle root and pair complete entry/exits.
 
-    All trajectory segments are flattened into ``(n, 2)`` matrices and
-    intersected with the candidate circle in one NumPy call. The Python
-    loop that remains walks segment metadata to pair every entry with its
-    following exit — a vehicle crossing the circle multiple times yields one
-    observation per crossing.
+    A segment may contribute two roots (outside → inside → outside). Roots at
+    the same trajectory progress are handled as one batch so a vertex touch
+    does not create an entry/exit pair with zero road length.
     """
     center = (cluster.centroid_x, cluster.centroid_y)
     starts: list[tuple[float, float]] = []
     ends: list[tuple[float, float]] = []
-    segment_meta: list[tuple[str, int]] = []  # (vehicle_id, seg_idx)
+    segment_meta: list[tuple[str, int]] = []  # (track key, segment index)
     track_points_lookup: dict[str, list[TrajectoryPoint]] = {}
     xy_points_lookup: dict[str, list[tuple[float, float]]] = {}
 
-    for vehicle_id, track in tracks.items():
+    for track_key, track in sorted(tracks.items()):
         if len(track) < 2:
             continue
         xy_points = [_point_xy(p) for p in track]
-        track_points_lookup[vehicle_id] = track
-        xy_points_lookup[vehicle_id] = xy_points
+        track_points_lookup[track_key] = track
+        xy_points_lookup[track_key] = xy_points
         for seg_idx in range(len(xy_points) - 1):
             starts.append(xy_points[seg_idx])
             ends.append(xy_points[seg_idx + 1])
-            segment_meta.append((vehicle_id, seg_idx))
+            segment_meta.append((track_key, seg_idx))
 
     if not starts:
         return [], []
 
     starts_xy = np.asarray(starts, dtype=float)
     ends_xy = np.asarray(ends, dtype=float)
-    center_xy = np.asarray(center, dtype=float)
-    radius_sq = radius_m * radius_m
-    start_delta = starts_xy - center_xy
-    end_delta = ends_xy - center_xy
-    start_inside = np.einsum("ij,ij->i", start_delta, start_delta) <= radius_sq
-    end_inside = np.einsum("ij,ij->i", end_delta, end_delta) <= radius_sq
-    hit_mask, crossing_xy_np = _segment_circle_crossings_batch(
+    root_counts, root_fractions, crossing_xy_np = _segment_circle_crossings_batch(
         starts_xy, ends_xy, center, radius_m
     )
 
-    entry_mask = (~start_inside) & end_inside & hit_mask
-    exit_mask = start_inside & (~end_inside) & hit_mask
-    # (vehicle_id, entry_seg, entry_crossing, exit_seg, exit_crossing)
-    pairs: list[tuple[str, int, tuple[float, float], int, tuple[float, float]]] = []
-    pending_entry: dict[str, tuple[int, tuple[float, float]]] = {}
+    # progress, segment, fraction, is_entry, crossing xy
+    roots_by_track: dict[
+        str,
+        list[tuple[float, int, float, bool, tuple[float, float]]],
+    ] = defaultdict(list)
+    center_x, center_y = center
+    for flat_index, (track_key, segment_index) in enumerate(segment_meta):
+        start_x, start_y = starts[flat_index]
+        delta_x = ends[flat_index][0] - start_x
+        delta_y = ends[flat_index][1] - start_y
+        for root_index in range(int(root_counts[flat_index])):
+            fraction = float(root_fractions[flat_index, root_index])
+            crossing_x = float(crossing_xy_np[flat_index, root_index, 0])
+            crossing_y = float(crossing_xy_np[flat_index, root_index, 1])
+            radial_velocity = (
+                (crossing_x - center_x) * delta_x
+                + (crossing_y - center_y) * delta_y
+            )
+            if abs(radial_velocity) <= 1e-9:
+                continue
+            roots_by_track[track_key].append((
+                segment_index + fraction,
+                segment_index,
+                fraction,
+                radial_velocity < 0.0,
+                (crossing_x, crossing_y),
+            ))
+
     crossing_counter = 0
     crossing_points: list[CrossingPoint] = []
-    crossing_id_by_segment: dict[tuple[str, int, bool], int] = {}
-
-    for flat_idx, (vehicle_id, seg_idx) in enumerate(segment_meta):
-        if not hit_mask[flat_idx]:
-            continue
-        crossing = (
-            float(crossing_xy_np[flat_idx][0]),
-            float(crossing_xy_np[flat_idx][1]),
-        )
-        if entry_mask[flat_idx] and vehicle_id not in pending_entry:
-            pending_entry[vehicle_id] = (seg_idx, crossing)
-        elif exit_mask[flat_idx] and vehicle_id in pending_entry:
-            entry_seg, entry_crossing = pending_entry.pop(vehicle_id)
-            pairs.append((vehicle_id, entry_seg, entry_crossing, seg_idx, crossing))
-        seg_start_pt = track_points_lookup[vehicle_id][seg_idx]
-        is_entry = bool(entry_mask[flat_idx])
-        # Convert crossing xy → lon/lat
-        cx_m, cy_m = float(crossing_xy_np[flat_idx][0]), float(crossing_xy_np[flat_idx][1])
-        clon, clat = transformer.inverse(cx_m, cy_m)
-        crossing_points.append(
-            CrossingPoint(
-                crossing_id=crossing_counter,
-                cluster_ref=cluster.cluster_ref,
-                vehicle_id=vehicle_id,
-                point_ref=seg_start_pt.point_ref,
-                segment_index=seg_idx,
-                crossing_x=cx_m,
-                crossing_y=cy_m,
-                crossing_lon=clon,
-                crossing_lat=clat,
-                is_entry=is_entry,
-                end_point_ref=track_points_lookup[vehicle_id][seg_idx + 1].point_ref,
-            )
-        )
-        crossing_id_by_segment[(vehicle_id, seg_idx, is_entry)] = crossing_counter
-        crossing_counter += 1
-
     observations: list[EntryExitObservation] = []
-    for vehicle_id, entry_seg, entry_xy, exit_seg, exit_xy in pairs:
-        obs = _make_observation(
-            track_points_lookup[vehicle_id],
-            xy_points_lookup[vehicle_id],
-            cluster_calculate_index=cluster.cluster_calculate_index,
-            center=center,
-            entry_seg=entry_seg,
-            entry_xy=entry_xy,
-            exit_seg=exit_seg,
-            exit_xy=exit_xy,
-            bearing_window=bearing_window,
-            entry_crossing_id=crossing_id_by_segment.get((vehicle_id, entry_seg, True)),
-            exit_crossing_id=crossing_id_by_segment.get((vehicle_id, exit_seg, False)),
+    for track_key, track in sorted(track_points_lookup.items()):
+        roots = sorted(
+            roots_by_track.get(track_key, ()),
+            key=lambda item: (item[0], 0 if not item[3] else 1, item[1]),
         )
-        if obs is not None:
-            observations.append(obs)
+        first_x, first_y = xy_points_lookup[track_key][0]
+        inside = math.hypot(first_x - center_x, first_y - center_y) < radius_m
+        pending_entry: tuple[int, tuple[float, float], int] | None = None
+        cursor = 0
+        while cursor < len(roots):
+            batch_end = cursor + 1
+            while (
+                batch_end < len(roots)
+                and abs(roots[batch_end][0] - roots[cursor][0]) <= 1e-9
+            ):
+                batch_end += 1
+            batch = roots[cursor:batch_end]
+            kinds = {root[3] for root in batch}
+            cursor = batch_end
+
+            # An entry and exit at the same progress leaves membership
+            # unchanged. This covers shared-vertex touches deterministically.
+            if len(kinds) != 1:
+                continue
+            is_entry = kinds.pop()
+            if is_entry == inside:
+                # Duplicate root at a shared vertex; one transition was enough.
+                continue
+
+            # Prefer the t=0 representation at a shared vertex. It identifies
+            # the following real segment and avoids depending on the prior one.
+            root = min(batch, key=lambda item: (item[2] != 0.0, item[1]))
+            _progress, segment_index, fraction, _kind, crossing_xy = root
+            segment_start = track[segment_index]
+            cleaned_ref = segment_start.cleaned_point_ref
+            subtrack_index = (
+                cleaned_ref.subtrack_index if cleaned_ref is not None else 1
+            )
+            crossing_lon, crossing_lat = transformer.inverse(*crossing_xy)
+            crossing = CrossingPoint(
+                crossing_calculate_index=crossing_counter,
+                cluster_ref=cluster.cluster_ref,
+                vehicle_id=track[0].vehicle_id,
+                segment_start=cleaned_ref,
+                subtrack_index=subtrack_index,
+                point_ref=segment_start.point_ref,
+                crossing_x=crossing_xy[0],
+                crossing_y=crossing_xy[1],
+                crossing_lon=crossing_lon,
+                crossing_lat=crossing_lat,
+                is_entry=is_entry,
+                branch_angle_deg=_branch_angle_from_center(center, crossing_xy),
+                segment_fraction=fraction,
+            )
+            crossing_points.append(crossing)
+            crossing_counter += 1
+
+            inside = is_entry
+            if is_entry:
+                pending_entry = (
+                    segment_index,
+                    crossing_xy,
+                    crossing.crossing_calculate_index,
+                )
+                continue
+            if pending_entry is None:
+                # The subtrack began inside this circle. The boundary exit is
+                # still persisted for Clip, but it has no complete observation.
+                continue
+
+            entry_segment, entry_xy, entry_index = pending_entry
+            pending_entry = None
+            observation = _make_observation(
+                track,
+                xy_points_lookup[track_key],
+                cluster_calculate_index=cluster.cluster_calculate_index,
+                center=center,
+                entry_seg=entry_segment,
+                entry_xy=entry_xy,
+                exit_seg=segment_index,
+                exit_xy=crossing_xy,
+                bearing_window=bearing_window,
+                entry_crossing_calculate_index=entry_index,
+                exit_crossing_calculate_index=crossing.crossing_calculate_index,
+            )
+            if observation is not None:
+                observations.append(observation)
     return observations, crossing_points

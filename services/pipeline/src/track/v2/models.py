@@ -129,6 +129,21 @@ class PointRef(TrackModel):
 
 
 @dataclass(frozen=True, slots=True)
+class CleanedPointRef(TrackModel):
+    """Stable identity of one p/i point in the frozen Clean result.
+
+    ``point_id`` is either ``kept_trajectory_points.id`` or
+    ``injected_points.id``.  Detect uses this identity while calculating; the
+    final persistence transaction maps it to ``resolved_subtrack_points.id``.
+    """
+
+    point_kind: Literal["kept", "injected"]
+    point_id: int
+    subtrack_index: int
+    cleaned_sequence_in_subtrack: int
+
+
+@dataclass(frozen=True, slots=True)
 class TrajectoryPoint(TrackModel):
     """Normalized trajectory point emitted by Parser 0 iter_points().
 
@@ -145,6 +160,7 @@ class TrajectoryPoint(TrackModel):
     extra: dict[str, Any] = field(default_factory=dict)
     x: float | None = None
     y: float | None = None
+    cleaned_point_ref: CleanedPointRef | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +176,9 @@ class DerivedPoint(TrajectoryPoint):
     heading: float
     speed: float
     extra: dict[str, Any] = field(default_factory=dict)
+    x: float | None = None
+    y: float | None = None
+    cleaned_point_ref: CleanedPointRef | None = None
 
 @dataclass(frozen=True)
 class FieldSpec(TrackModel):
@@ -447,28 +466,30 @@ class TurnEvent(TrackModel):
     lat: float
     x: float  # meter coordinate
     y: float  # meter coordinate
-    in_bearing: float  # mean bearing before turn
-    out_bearing: float  # mean bearing after turn
+    entry_bearing: float  # mean bearing before turn
+    exit_bearing: float  # mean bearing after turn
     turn_deg: float  # signed turn angle in [-180, 180)
     score: float  # = abs(turn_deg) for ranking
     source: str = "turn"
     point_ref: PointRef | None = None
+    cleaned_point_ref: CleanedPointRef | None = None
+    cross_track_calculate_index: int | None = None
+    g_star_z: float | None = None
+    # Transient algorithm provenance.  Schema v3 does not persist these fields.
     source_ids: tuple[str, ...] = ()
-    from_source_id: str | None = None
-    from_source_row_key: str | None = None
-    to_source_id: str | None = None
-    to_source_row_key: str | None = None
 
 
 @dataclass(frozen=True)
 class CrossTrackCandidate(TrackModel):
     """One orthogonal intersection between segments from two vehicles.
 
-    ``from_*`` records the canonical vehicle A segment and ``to_*`` records
-    vehicle B.  Each row key contains the segment's start/end source keys.
+    The two stable Clean point references identify the start of each source
+    segment.  The segment end is the next cleaned sequence member.
     """
 
     point_ref: PointRef
+    from_segment_start_point_ref: PointRef
+    to_segment_start_point_ref: PointRef
     vehicle_id: str
     timestamp: float
     lon: float
@@ -477,10 +498,9 @@ class CrossTrackCandidate(TrackModel):
     y: float
     heading: float
     speed: float
-    from_source_id: str
-    from_source_row_key: str
-    to_source_id: str
-    to_source_row_key: str
+    from_segment_start: CleanedPointRef | None = None
+    to_segment_start: CleanedPointRef | None = None
+    cross_track_calculate_index: int = -1
 
 
 @dataclass(frozen=True)
@@ -508,20 +528,8 @@ class HotspotCluster(TrackModel):
     source_point_refs: dict[str, tuple[PointRef, ...]] = field(default_factory=dict)
     critical_sources: tuple[str, ...] = ()
     # ── topology intermediate products ──
-    crossing_points: tuple[()] = ()   # tuple[CrossingPoint, ...]; forward-ref via ()
-    inout_points: tuple[()] = ()      # tuple[InOutIntersectionPoint, ...]
-
-    @property
-    def sources(self) -> tuple[str, ...]:
-        """Backward-compatible alias for algorithm source labels.
-
-        ``candidate_intersections.sources`` is now reserved for physical
-        ``source_id`` values.  Algorithm provenance remains available through
-        this compatibility property plus ``source_counts`` and
-        ``critical_sources``.
-        """
-        return self.algorithm_sources
-
+    crossing_points: tuple[CrossingPoint, ...] = ()
+    inout_points: tuple[InOutIntersectionPoint, ...] = ()
 
 @dataclass(frozen=True)
 class EntryExitObservation(TrackModel):
@@ -531,11 +539,11 @@ class EntryExitObservation(TrackModel):
     vehicle_id: str
     entry_branch_angle: float
     exit_branch_angle: float
-    inbound_bearing: float
-    outbound_bearing: float
+    entry_bearing: float
+    exit_bearing: float
     turn_deg: float
-    entry_crossing_id: int | None = None
-    exit_crossing_id: int | None = None
+    entry_crossing_calculate_index: int | None = None
+    exit_crossing_calculate_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -546,17 +554,19 @@ class CrossingPoint(TrackModel):
     ``_segment_circle_crossings_batch``.
     """
 
-    crossing_id: int                # unique within one transient cluster
+    crossing_calculate_index: int   # unique within one transient cluster
     cluster_ref: str                # FK → HotspotCluster.cluster_ref
     vehicle_id: str
-    point_ref: PointRef             # segment-start TrajectoryPoint
-    segment_index: int              # index in (flattened) vehicle track
+    segment_start: CleanedPointRef | None
+    subtrack_index: int
+    point_ref: PointRef             # transient segment-start provenance
     crossing_x: float               # processing-CRS metres
     crossing_y: float               # processing-CRS metres
     crossing_lon: float
     crossing_lat: float
     is_entry: bool                  # True=entering circle, False=leaving
-    end_point_ref: PointRef | None = None
+    branch_angle_deg: float
+    segment_fraction: float
     produced_by: str = "segment_circle_crossings_batch"
 
 
@@ -576,7 +586,7 @@ class InOutIntersectionPoint(TrackModel):
     inbound_bearing: float
     outbound_bearing: float
     turn_deg: float
-    crossing_refs: tuple[int, ...]  # → CrossingPoint.crossing_id
+    crossing_refs: tuple[int, ...]  # → CrossingPoint.crossing_calculate_index
     vehicle_id: str
     produced_by: str = "_cluster_angles_greedy"
 
@@ -626,12 +636,24 @@ class ClipIntersection(TrackModel):
 
 
 @dataclass(frozen=True, slots=True)
+class ResolvedTrackPoint(TrackModel):
+    """One point in the final Detect-owned p/i/c sequence consumed by Clip."""
+
+    resolved_point_id: int
+    lon: float
+    lat: float
+    crossing_id: int | None = None
+    intersection_id: int | None = None
+    crossing_type: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ClipTrack(TrackModel):
     """One time-ordered trip presented to the Clip module."""
 
     vehicle_id: str
     trip_id: str
-    points: tuple[TrajectoryPoint, ...]
+    points: tuple[ResolvedTrackPoint, ...]
     subtrack_index: int = 1
 
 
@@ -647,23 +669,30 @@ class ClipInput(TrackModel):
 
 @dataclass(frozen=True, slots=True)
 class ClipEndpoint(TrackModel):
-    """An exact trip or interpolated intersection endpoint."""
+    """A natural subtrack boundary or persisted intersection crossing."""
 
     kind: str
     lon: float
     lat: float
-    timestamp: float
     intersection_id: int | None
-    segment_index: int
-    segment_fraction: float
+    crossing_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ClipPoint(TrackModel):
+    """Minimal non-endpoint geometry member exposed by a ``TrackClip``."""
+
+    resolved_point_id: int
+    lon: float
+    lat: float
 
 
 @dataclass(frozen=True, slots=True)
 class TrackClip(TrackModel):
     """One trajectory fragment outside verified intersection circles.
 
-    ``points`` contains only source points strictly inside the exact endpoint
-    bounds. ``point_count`` includes both explicit endpoints.
+    ``points`` contains only resolved points strictly between the endpoints.
+    ``point_count`` includes both explicit endpoints.
     """
 
     clip_id: str
@@ -672,13 +701,11 @@ class TrackClip(TrackModel):
     clip_type: str
     start: ClipEndpoint
     end: ClipEndpoint
-    points: tuple[TrajectoryPoint, ...]
+    points: tuple[ClipPoint, ...]
     distance_m: float
     point_count: int
     subtrack_index: int = 1
     clip_ordinal_in_track: int = 0
-    interior_start_index: int = 0
-    interior_end_index_exclusive: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -686,12 +713,13 @@ class ClipReport(TrackModel):
     """Aggregate counts; ``total_points_in_clips`` includes endpoints."""
 
     total_vehicles: int
+    total_subtracks: int
     total_clips: int
-    inter_intersection_clips: int
-    boundary_clips: int
+    between_intersection_clips: int
+    boundary_start_clips: int
+    boundary_end_clips: int
+    full_track_clips: int
     total_points_in_clips: int
-    unmatched_entry_count: int = 0
-    unmatched_exit_count: int = 0
     skipped_degenerate_count: int = 0
 
 
@@ -839,23 +867,23 @@ class NetworkResult(TrackModel):
 
 @dataclass(frozen=True, slots=True)
 class ReplayFitEndpoint(TrackModel):
-    point: TrajectoryPoint
-    bracket_refs: tuple[PointRef, PointRef]
-    segment_index: int
-    segment_fraction: float
+    resolved_point_id: int
+    crossing_id: int
+    intersection_id: int
+    kind: str
+    lon: float
+    lat: float
 
 
 @dataclass(frozen=True, slots=True)
 class ReplayFitClip(TrackModel):
-    clip_id: str
     input_ordinal: int
     original_from_intersection_id: int
     original_to_intersection_id: int
     reverse_to_centerline_direction: bool
     start: ReplayFitEndpoint
-    interior_points: tuple[TrajectoryPoint, ...]
+    interior_points: tuple[ClipPoint, ...]
     end: ReplayFitEndpoint
-    points: tuple[TrajectoryPoint, ...]
 
 
 @dataclass(frozen=True, slots=True)

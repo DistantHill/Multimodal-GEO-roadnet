@@ -23,7 +23,7 @@ PostgreSQL 层级 / PostgreSQL Hierarchy::
     │       ├── turn_events
     │       ├── candidate_intersections
     │       ├── intersections
-    │       └── ... (共 12 张表 + 索引)
+    │       └── ... (schema v3 共 17 张表 + 索引)
     └── Role "postgres"            ← 连接用户
 """
 

@@ -1,4 +1,4 @@
-"""Fitting stage — aggregate inter-intersection clips into centerlines."""
+"""Fitting stage — aggregate between-intersection clips into centerlines."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def fit_centerlines(
     for clip in clips.clips:
         if clip.clip_type in _BOUNDARY_CLIP_TYPES:
             continue
-        if clip.clip_type != "inter_intersection":
+        if clip.clip_type != "between_intersection":
             issues.append(FitIssue(None, None, "unsupported_clip_type", clip.clip_id))
             continue
         eligible_count += 1
@@ -122,7 +122,7 @@ def _fit_direction(
     selected = tuple(
         clip
         for clip in clips.clips
-        if clip.clip_type == "inter_intersection"
+        if clip.clip_type == "between_intersection"
         and clip.start.intersection_id is not None
         and clip.end.intersection_id is not None
         and clip.start.intersection_id != clip.end.intersection_id
@@ -147,6 +147,19 @@ def _fit_direction(
             ),
             points=(
                 tuple(reversed(centerline.points)) if reverse else centerline.points
+            ),
+            # ``fit_centerlines`` reports counts against its canonical
+            # low-id → high-id direction.  Once the directed reverse variant
+            # flips that direction, forward and reverse evidence swap roles.
+            forward_clip_count=(
+                centerline.reverse_clip_count
+                if reverse
+                else centerline.forward_clip_count
+            ),
+            reverse_clip_count=(
+                centerline.forward_clip_count
+                if reverse
+                else centerline.reverse_clip_count
             ),
             variant="directed",
         )

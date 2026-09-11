@@ -61,11 +61,11 @@ class _ConfigRecordingStore:
         self.connection = object()
         self.clean_record = CleanRunRecord(
             id=CLEAN_ID,
-            source_id="raw_points",
-            source_kind="postgres_table",
-            parameters={"target_table": "raw_points"},
+            source_table="raw_points",
+            parameters={},
             status="completed",
             spatial_context=_SPATIAL_CONTEXT,
+            source_fingerprint={"version": 1, "row_count": 0, "sha256": "0"},
         )
         self.clip_result = MagicMock()
         self.clip_result.report.as_dict.return_value = {}
@@ -91,6 +91,7 @@ class _ConfigRecordingStore:
 
     def persist_detect(self, *args: object, **kwargs: object) -> DetectPersistenceResult:
         return DetectPersistenceResult(
+            resolved_point_count=0,
             tracks_cross_count=0,
             turn_event_count=0,
             candidate_intersection_count=0,
@@ -148,6 +149,8 @@ class PipelineConfigWiringTest(unittest.TestCase):
             patch("track.v2.pipeline.load_pipeline_config", return_value=pipeline_config),
             patch("track.v2.pipeline.pg_connect", return_value=_Connection()),
             patch("track.v2.pipeline.PostgresPipelineStore", return_value=store),
+            patch("track.v2.pipeline.require_schema_v3"),
+            patch("track.v2.pipeline.verify_clean_source_fingerprint"),
             patch("track.v2.pipeline.detect_intersections", return_value=intersections),
             patch("track.v2.pipeline.fit_centerline_variants", return_value=store.fit_bundle) as fit,
             patch("track.v2.pipeline.build_network", return_value=MagicMock()) as network,
