@@ -110,6 +110,10 @@ CSV 当作运行入口，需要时先用独立 importer 导入 PostgreSQL。`--c
 
 ## 常用命令
 
+交叉口 CV 的原始点统计、五组灰度归一化和交互预览，见
+[灰度归一化预览](docs/cv-normalization-preview.md)。入口为
+`python -m pipeline cv-preview`，产物写入 `DATA_ROOT`，不启动模型训练。
+
 ```sh
 make dev-config
 make dev-up

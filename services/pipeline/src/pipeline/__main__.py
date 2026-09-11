@@ -56,10 +56,14 @@ def serve(config: PipelineConfig) -> int:
 
 
 def main() -> int:
-    if len(sys.argv) > 1 and sys.argv[1] in {"init-db", "run"}:
+    if len(sys.argv) > 1 and sys.argv[1] in {"init-db", "run", "cv-preview", "cv-tune"}:
         command, forwarded = sys.argv[1], sys.argv[2:]
         if command == "init-db":
             from track.v2.cli.init_db import main as delegated_main
+        elif command == "cv-preview":
+            from track.v2.cli.cv_preview import main as delegated_main
+        elif command == "cv-tune":
+            from track.v2.cli.cv_tune import main as delegated_main
         else:
             from track.v2.cli.run import main as delegated_main
 

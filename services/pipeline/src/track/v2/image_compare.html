@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>交互图片对比</title>
+<style>
+:root{color-scheme:dark;--panel-width:260px;--columns:3}
+*{box-sizing:border-box}body{margin:0;background:#10161d;color:#e6edf3;font:15px/1.6 system-ui,sans-serif}
+header,main,footer{padding:24px 32px}header{max-width:1250px}h1{font-size:28px;margin:0 0 12px}h2{font-size:19px;margin:0}
+p{margin:8px 0;color:#b6c4cf}nav{position:sticky;top:0;z-index:4;display:flex;flex-wrap:wrap;gap:14px 22px;padding:14px 32px;background:#1a2632;border-block:1px solid #324251}
+label{display:flex;gap:8px;align-items:center}button,select,.file-label{font:inherit;background:#243645;color:#eef6fc;border:1px solid #526776;border-radius:6px;padding:5px 9px}
+button,.file-label{cursor:pointer}input[type=file]{display:none}section{margin-bottom:34px}.sample-meta{margin-bottom:10px}
+.cards{display:grid;grid-template-columns:repeat(var(--columns),minmax(var(--panel-width),1fr));gap:14px;overflow:auto;padding:3px 0 12px}
+figure{margin:0;min-width:0;background:#17212b;border:1px solid #2b3d4c;border-radius:8px;overflow:hidden}
+figcaption{padding:10px 12px;font-weight:650}.image-wrap{position:relative;line-height:0;background:#000}
+img{display:block;width:100%;image-rendering:pixelated}.image-wrap svg{position:absolute;inset:0;width:100%;height:100%;fill:none;stroke:#ffd166;stroke-width:1;display:none}
+body.show-overlays .image-wrap svg{display:block}.card-note{font-size:12px;padding:8px 12px;white-space:pre-wrap;color:#b6c4cf;line-height:1.5}
+.empty{padding:28px;color:#ffcf81}.summary{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}.chip{background:#223242;border:1px solid #3a5267;padding:4px 10px;border-radius:20px}
+.message{color:#ffcf81}details{margin:16px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#17212b;padding:16px;border-radius:8px}footer{border-top:1px solid #324251}
+</style>
+<header><h1 id="title">交互图片对比</h1><div id="description"></div><div id="summary" class="summary"></div></header>
+<nav id="controls"></nav><main id="samples"></main>
+<footer><p id="message" class="message" role="status"></p>
+<label class="file-label">载入对比 JSON<input id="load-config" type="file" accept=".json,application/json"></label>
+<button id="save-html">保存当前独立 HTML</button> <button id="save-selection">导出当前参数 JSON</button>
+<details><summary>配置与来源</summary><pre id="metadata"></pre></details>
+<p>本页无网络依赖。参数切换选择已生成的图片，不自动运行模型或计算新参数。
+替换内嵌 comparison-data JSON 可复用；图片用 data URL 可保持单文件携带。</p></footer>
+<script id="comparison-data" type="application/json">__COMPARISON_DATA__</script>
+<script>
+(() => {
+  'use strict';
+  let config;
+  let state = Object.create(null);
+  let entries = [];
+  const byId = id => document.getElementById(id);
+  const element = (tag, text, className) => {
+    const node = document.createElement(tag);
+    if (text !== undefined) node.textContent = String(text);
+    if (className) node.className = className;
+    return node;
+  };
+  function checkConfig(value) {
+    if (!value || !Array.isArray(value.axes) || !Array.isArray(value.columns) ||
+        !Array.isArray(value.samples) || !value.columns.length) throw Error('需要 axes、columns、samples 数组');
+    const ids = new Set();
+    value.axes.forEach(axis => {
+      if (!axis.id || ids.has(axis.id) || !Array.isArray(axis.values) || !axis.values.length)
+        throw Error('参数轴必须有唯一 id 和非空 values');
+      ids.add(axis.id);
+    });
+    const columns = new Set(value.columns.map(column => column.id));
+    if (columns.size !== value.columns.length) throw Error('对比列 id 不能重复');
+    value.samples.forEach(sample => {
+      if (!Array.isArray(sample.variants)) throw Error('每个样例需要 variants 数组');
+      sample.variants.forEach(variant => {
+        if (!columns.has(variant.column) || !variant.when || typeof variant.image !== 'string')
+          throw Error('图片记录需要 column、when、image');
+        if (!Object.keys(variant.when).every(key => ids.has(key))) throw Error('图片引用了不存在的参数轴');
+        // Remote URLs never load automatically; use embedded or local relative images.
+        const image = variant.image;
+        if (!/^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(image) &&
+            (/^[a-z][a-z0-9+.-]*:/i.test(image) || image.startsWith('/') || image.startsWith('\\')))
+          throw Error('图片只支持内嵌 PNG/JPEG/WebP/GIF 或相对路径');
+      });
+    });
+    return value;
+  }
+  function options(values, initial) {
+    const select = element('select');
+    values.forEach(value => {
+      const option = element('option', value);
+      option.value = String(value);
+      select.append(option);
+    });
+    select.value = String(initial);
+    return select;
+  }
+  function render() {
+    byId('title').textContent = config.title || '交互图片对比';
+    document.title = config.title || '交互图片对比';
+    byId('description').replaceChildren(...(config.description || []).map(text => element('p', text)));
+    byId('summary').replaceChildren(...(config.summary || []).map(text => element('span', text, 'chip')));
+    const controls = byId('controls'); controls.replaceChildren();
+    state = Object.create(null);
+    config.axes.forEach(axis => {
+      const initial = axis.values.find(value => String(value) === String(axis.default)) ?? axis.values[0];
+      state[axis.id] = String(initial);
+      const select = options(axis.values, initial); select.dataset.axis = axis.id;
+      select.addEventListener('change', () => { state[axis.id] = select.value; refresh(); });
+      const label = element('label', axis.label || axis.id); label.append(select); controls.append(label);
+    });
+    const zoom = options(['自适应', '512 px', '1024 px'], '自适应'); zoom.id = 'zoom';
+    zoom.addEventListener('change', () => document.documentElement.style.setProperty('--panel-width',
+      zoom.value === '自适应' ? '260px' : zoom.value.replace(' ', '')));
+    const zoomLabel = element('label', '图片宽度'); zoomLabel.append(zoom); controls.append(zoomLabel);
+    const overlay = element('input'); overlay.type = 'checkbox'; overlay.id = 'overlays';
+    overlay.checked = document.body.classList.contains('show-overlays');
+    overlay.addEventListener('change', () => document.body.classList.toggle('show-overlays', overlay.checked));
+    const overlayLabel = element('label', config.overlay_label || '显示参考叠加'); overlayLabel.prepend(overlay); controls.append(overlayLabel);
+    const root = byId('samples'); root.replaceChildren(); entries = [];
+    document.documentElement.style.setProperty('--columns', config.columns.length);
+    config.samples.forEach(sample => {
+      const section = element('section'); section.append(element('h2', sample.title || sample.id));
+      section.append(element('p', sample.subtitle || '', 'sample-meta'));
+      const cards = element('div', undefined, 'cards');
+      config.columns.forEach(column => {
+        const card = element('figure'); card.dataset.column = column.id;
+        card.append(element('figcaption', column.title || column.id));
+        const wrap = element('div', undefined, 'image-wrap');
+        const image = element('img'); image.alt = `${sample.title || sample.id} — ${column.title || column.id}`;
+        const note = element('div', undefined, 'card-note');
+        image.addEventListener('error', () => { note.textContent = '图片无法读取，请检查相对路径或内嵌数据'; });
+        wrap.append(image);
+        if (sample.circles && sample.width > 0 && sample.height > 0) {
+          const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+          svg.setAttribute('viewBox', `0 0 ${sample.width} ${sample.height}`);
+          sample.circles.forEach(item => {
+            if (![item.cx, item.cy, item.r].every(Number.isFinite) || item.r <= 0) return;
+            const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            ['cx', 'cy', 'r'].forEach(key => circle.setAttribute(key, item[key])); svg.append(circle);
+          });
+          wrap.append(svg);
+        }
+        const empty = element('div', '此参数组合没有图片', 'empty'); empty.hidden = true;
+        card.append(wrap, empty, note); cards.append(card);
+        entries.push({sample, column, image, wrap, empty, note});
+      });
+      section.append(cards); root.append(section);
+    });
+    byId('metadata').textContent = JSON.stringify(config.metadata || {}, null, 2);
+    refresh();
+  }
+  function refresh() {
+    entries.forEach(entry => {
+      const matches = entry.sample.variants.filter(variant => variant.column === entry.column.id &&
+        Object.entries(variant.when).every(([key, value]) => state[key] === String(value)));
+      const variant = matches.length === 1 ? matches[0] : null;
+      entry.wrap.hidden = !variant; entry.empty.hidden = Boolean(variant);
+      entry.empty.textContent = matches.length > 1 ? '此参数组合匹配了多张图片，请检查配置' : '此参数组合没有图片';
+      entry.note.textContent = variant ? (variant.note || '') : '';
+      if (variant && entry.image.getAttribute('src') !== variant.image) entry.image.src = variant.image;
+    });
+  }
+  function download(text, type, name) {
+    const url = URL.createObjectURL(new Blob([text], {type}));
+    const link = element('a'); link.href = url; link.download = name; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  byId('load-config').addEventListener('change', async event => {
+    const file = event.target.files[0]; if (!file) return;
+    try { config = checkConfig(JSON.parse(await file.text())); render(); byId('message').textContent = '已载入，所有参数切换均在本地完成。'; }
+    catch (error) { byId('message').textContent = error.message; }
+  });
+  byId('save-selection').addEventListener('click', () => download(JSON.stringify({
+    title: config.title, selection: state, metadata: config.metadata || {},
+    status: 'manual preview selection; not a validated optimum'
+  }, null, 2), 'application/json', 'comparison-selection.json'));
+  byId('save-html').addEventListener('click', () => {
+    if (config.samples.some(sample => sample.variants.some(variant => !variant.image.startsWith('data:image/')))) {
+      byId('message').textContent = '含相对路径图片：请先转为内嵌 data URL，再保存为独立 HTML。';
+      return;
+    }
+    const saved = JSON.parse(JSON.stringify(config));
+    saved.axes.forEach(axis => axis.default = state[axis.id]);
+    const clone = document.documentElement.cloneNode(true);
+    clone.querySelector('#comparison-data').textContent = JSON.stringify(saved).replace(/</g, '\\u003c');
+    clone.querySelector('#samples').replaceChildren();
+    clone.querySelector('#load-config').value = '';
+    download('<!doctype html>\n' + clone.outerHTML, 'text/html', 'image-comparison.html');
+  });
+  try { config = checkConfig(JSON.parse(byId('comparison-data').textContent)); render(); }
+  catch (error) { byId('message').textContent = '配置读取失败：' + error.message; }
+})();
+</script>
+</html>
