@@ -428,7 +428,6 @@ function roundCoordinate(value) {
 function decorateFeature(feature, descriptor, metadata) {
   const properties = feature.getProperties();
   const role = inferRole(descriptor);
-  const replayablePointLayer = role === 'trajectory' || descriptor.id === 'trajectory_points';
   const detectId = firstValue(
     properties.detect_id,
     properties.detectId,
@@ -443,14 +442,10 @@ function decorateFeature(feature, descriptor, metadata) {
     metadata.resolved_fit_id,
     metadata.context?.fit_id,
   );
-  const rawPointId = firstValue(
-    properties.point_id,
-    properties.raw_point_id,
-    properties.trajectory_point_id,
-    properties.raw_id,
-    replayablePointLayer ? properties.database_id : undefined,
-    replayablePointLayer ? properties.id : undefined,
-    replayablePointLayer ? feature.getId() : undefined,
+  const sourceRowKey = firstValue(properties.source_row_key, properties.sourceRowKey);
+  const resolvedPointId = firstValue(
+    properties.resolved_point_id,
+    properties.resolvedPointId,
   );
   const intersectionId = firstValue(
     properties.intersection_id,
@@ -463,7 +458,8 @@ function decorateFeature(feature, descriptor, metadata) {
   feature.set('_layerRole', role, true);
   feature.set('_detectId', detectId, true);
   feature.set('_fitId', fitId, true);
-  feature.set('_rawPointId', rawPointId, true);
+  feature.set('_sourceRowKey', sourceRowKey, true);
+  feature.set('_resolvedPointId', resolvedPointId, true);
   feature.set('_intersectionId', intersectionId, true);
 }
 
@@ -731,7 +727,8 @@ function selectionItem(feature, index) {
   const properties = feature.getProperties();
   const displayId = firstValue(
     feature.get('_intersectionId'),
-    feature.get('_rawPointId'),
+    feature.get('_resolvedPointId'),
+    feature.get('_sourceRowKey'),
     properties.name,
     properties.id,
     feature.getId(),
@@ -758,9 +755,32 @@ function formatBbox(bbox) {
 
 function updateActionState() {
   const features = selectedFeatures.getFeatures().getArray();
-  const pointIds = unique(features.map((feature) => feature.get('_rawPointId')).filter(isPresent));
+  const allResolved = features.length > 0 && features.every(
+    (feature) => isPresent(feature.get('_resolvedPointId')),
+  );
+  const allSource = features.length > 0 && features.every(
+    (feature) => isPresent(feature.get('_sourceRowKey')),
+  );
+  const resolvedPointIds = unique(
+    features.map((feature) => feature.get('_resolvedPointId')).filter(isPresent),
+  );
+  const sourceRowKeys = unique(
+    features.map((feature) => feature.get('_sourceRowKey')).filter(isPresent),
+  );
+  const replayKeys = allResolved ? resolvedPointIds : allSource ? sourceRowKeys : [];
+  const replayDetectIds = unique(
+    features
+      .map((feature) => firstValue(feature.get('_detectId'), state.context.detectId))
+      .filter(isPresent),
+  );
   const boxReady = state.selectionOrigin === 'box' && state.selectionBbox?.length === 4;
-  const replayReady = !state.busy && (boxReady || (pointIds.length > 0 && pointIds.length <= 1_000));
+  const replayReady = !state.busy && (
+    boxReady || (
+      replayKeys.length > 0 &&
+      replayKeys.length <= 1_000 &&
+      (!allResolved || replayDetectIds.length === 1)
+    )
+  );
 
   dom.replayAction.disabled = !replayReady;
   if (state.busy) {
@@ -769,12 +789,15 @@ function updateActionState() {
     dom.replayHint.textContent = features.length
       ? `按框选范围回放 · 命中 ${features.length} 个要素`
       : '按当前框选范围回放';
-  } else if (pointIds.length) {
-    dom.replayHint.textContent = pointIds.length > 1_000
-      ? `点选上限为 1000 · 当前 ${pointIds.length}`
-      : `${pointIds.length} 个轨迹点已就绪`;
+  } else if (replayKeys.length) {
+    dom.replayHint.textContent = allResolved && replayDetectIds.length !== 1
+      ? 'resolved point 必须属于同一 Detect Run'
+      : replayKeys.length > 1_000
+      ? `点选上限为 1000 · 当前 ${replayKeys.length}`
+      : `${replayKeys.length} 个轨迹点已就绪`;
   } else if (features.length) {
-    dom.replayHint.textContent = '所选要素缺少原始 point_id';
+    dom.replayHint.textContent =
+      '所选要素缺少统一的 source_row_key 或 resolved_point_id';
   } else {
     dom.replayHint.textContent = '选择轨迹点或框选范围';
   }
@@ -818,7 +841,18 @@ async function runReplay() {
   if (dom.replayAction.disabled) return;
   const features = selectedFeatures.getFeatures().getArray();
   const useBbox = state.selectionOrigin === 'box' && state.selectionBbox?.length === 4;
-  const pointIds = unique(features.map((feature) => feature.get('_rawPointId')).filter(isPresent));
+  const resolvedPointIds = unique(
+    features.map((feature) => feature.get('_resolvedPointId')).filter(isPresent),
+  );
+  const sourceRowKeys = unique(
+    features.map((feature) => feature.get('_sourceRowKey')).filter(isPresent),
+  );
+  const allResolved = features.length > 0 && features.every(
+    (feature) => isPresent(feature.get('_resolvedPointId')),
+  );
+  const allSource = features.length > 0 && features.every(
+    (feature) => isPresent(feature.get('_sourceRowKey')),
+  );
   const detectIds = unique(
     features.map((feature) => feature.get('_detectId')).filter(isPresent),
   );
@@ -829,7 +863,8 @@ async function runReplay() {
 
   await runAnalysis('Replay', (signal) => requestReplay({
     detectId,
-    pointIds: useBbox ? undefined : pointIds,
+    resolvedPointIds: useBbox || !allResolved ? undefined : resolvedPointIds,
+    sourceRowKeys: useBbox || allResolved || !allSource ? undefined : sourceRowKeys,
     bbox: useBbox ? state.selectionBbox : undefined,
   }, { signal }));
 }

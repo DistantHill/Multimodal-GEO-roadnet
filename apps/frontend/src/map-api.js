@@ -157,18 +157,24 @@ export async function loadMapLayer(
 }
 
 export async function requestReplay(
-  { detectId, pointIds, bbox, maxVehicles, maxPoints },
+  { detectId, sourceRowKeys, resolvedPointIds, bbox, maxVehicles, maxPoints },
   { signal } = {},
 ) {
   const body = {};
   if (detectId !== undefined && detectId !== null) body.detect_id = detectId;
-  if (pointIds?.length) body.point_ids = pointIds;
+  if (sourceRowKeys?.length) body.source_row_keys = sourceRowKeys.map(String);
+  if (resolvedPointIds?.length) body.resolved_point_ids = resolvedPointIds;
   if (bbox?.length === 4) body.bbox = bbox.map(Number);
   if (maxVehicles !== undefined) body.max_vehicles = maxVehicles;
   if (maxPoints !== undefined) body.max_points = maxPoints;
 
-  if (!body.point_ids && !body.bbox) {
-    throw new MapApiError('Replay 需要点主键或框选范围。');
+  const selections = [body.source_row_keys, body.resolved_point_ids, body.bbox]
+    .filter(Boolean);
+  if (selections.length !== 1) {
+    throw new MapApiError('Replay 需要且只能提供来源键、resolved point ID 或框选范围。');
+  }
+  if (body.resolved_point_ids && !body.detect_id) {
+    throw new MapApiError('resolved point ID Replay 缺少 detect_id 上下文。');
   }
 
   const payload = await requestJson('/map/replay', { method: 'POST', body, signal });

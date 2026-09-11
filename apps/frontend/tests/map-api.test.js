@@ -25,12 +25,12 @@ function jsonResponse(payload, status = 200) {
 test('layer catalog keeps the backend default context', async () => {
   globalThis.fetch = async () => jsonResponse({
     default_context: { detect_id: 41, fit_id: 9 },
-    layers: [{ id: 'trajectory_points', title: '轨迹点', geometry_type: 'Point' }],
+    layers: [{ id: 'resolved_subtrack_points', title: '轨迹点', geometry_type: 'Point' }],
   });
 
   const catalog = await listMapLayers();
 
-  assert.equal(catalog.layers[0].id, 'trajectory_points');
+  assert.equal(catalog.layers[0].id, 'resolved_subtrack_points');
   assert.equal(catalog.layers[0].role, 'trajectory');
   assert.deepEqual(catalog.metadata.context, { detect_id: 41, fit_id: 9 });
   assert.equal(catalog.metadata.detect_id, 41);
@@ -51,18 +51,27 @@ test('layer request defaults to the backend-safe 5000 feature limit', async () =
   assert.equal(requestedUrl.searchParams.get('fit_id'), '3');
 });
 
-test('replay emits either raw point ids or a WGS84 bbox', async () => {
+test('replay separates source keys from resolved point IDs', async () => {
   const bodies = [];
   globalThis.fetch = async (_url, options) => {
     bodies.push(JSON.parse(options.body));
     return jsonResponse({ data: { type: 'FeatureCollection', features: [] }, meta: { detect_id: 7 } });
   };
 
-  await requestReplay({ detectId: 7, pointIds: [101, 102] });
+  await requestReplay({ sourceRowKeys: ['external-101', 102] });
+  await requestReplay({ detectId: 7, resolvedPointIds: [201, 202] });
   await requestReplay({ bbox: [120.1, 30.2, 120.3, 30.4] });
 
-  assert.deepEqual(bodies[0], { detect_id: 7, point_ids: [101, 102] });
-  assert.deepEqual(bodies[1], { bbox: [120.1, 30.2, 120.3, 30.4] });
+  assert.deepEqual(bodies[0], { source_row_keys: ['external-101', '102'] });
+  assert.deepEqual(bodies[1], { detect_id: 7, resolved_point_ids: [201, 202] });
+  assert.deepEqual(bodies[2], { bbox: [120.1, 30.2, 120.3, 30.4] });
+});
+
+test('resolved point replay requires detect context', async () => {
+  await assert.rejects(
+    requestReplay({ resolvedPointIds: [201] }),
+    (error) => error instanceof MapApiError && /detect_id/.test(error.message),
+  );
 });
 
 test('clip requires exactly two intersections and detect context', async () => {
