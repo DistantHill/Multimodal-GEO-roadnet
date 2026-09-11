@@ -36,6 +36,7 @@ def test_intersection_reuses_pipeline_helper_and_preserves_injected_identity(mon
     store = make_store([member(1, "7", 20), member(2, None, 10, injected_id=7)])
     result = store.replay(ReplayRequest(intersection_id=5))
     helper.assert_called_once()
+    store._verify_source_fingerprint.assert_not_called()
     assert [feature["id"] for feature in result["features"]] == [2, 1]
     assert all(feature["geometry"]["type"] == "Point" for feature in result["features"])
     assert result["features"][0]["properties"]["candidate_intersection_id"] == 42

@@ -127,8 +127,10 @@ def test_replay_accepts_external_and_internal_id_namespaces() -> None:
 def test_replay_requires_exactly_one_selection() -> None:
     with pytest.raises(ValidationError, match="provide exactly one"):
         ReplayRequest()
-    with pytest.raises(ValidationError, match="provide exactly one"):
+    with pytest.raises(ValidationError, match="不支持 bbox"):
         ReplayRequest(source_row_keys=["7"], bbox=(120, 30, 121, 31))
+    with pytest.raises(ValidationError, match="不支持 bbox"):
+        ReplayRequest(bbox=(120, 30, 121, 31))
 
 
 @pytest.mark.parametrize(

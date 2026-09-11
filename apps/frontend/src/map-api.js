@@ -167,7 +167,7 @@ export async function loadMapLayer(
 }
 
 export async function requestReplay(
-  { detectId, sourceRowKeys, resolvedPointIds, bbox, maxVehicles, maxPoints, databaseName },
+  { detectId, sourceRowKeys, resolvedPointIds, intersectionId, bbox, maxVehicles, maxPoints, databaseName },
   { signal } = {},
 ) {
   const body = {};
@@ -175,14 +175,15 @@ export async function requestReplay(
   if (detectId !== undefined && detectId !== null) body.detect_id = detectId;
   if (sourceRowKeys?.length) body.source_row_keys = sourceRowKeys.map(String);
   if (resolvedPointIds?.length) body.resolved_point_ids = resolvedPointIds;
-  if (bbox?.length === 4) body.bbox = bbox.map(Number);
+  if (bbox !== undefined) throw new MapApiError('Replay 不支持 bbox，请选择准确的点或交叉口 ID。');
+  if (intersectionId !== undefined) body.intersection_id = intersectionId;
   if (maxVehicles !== undefined) body.max_vehicles = maxVehicles;
   if (maxPoints !== undefined) body.max_points = maxPoints;
 
-  const selections = [body.source_row_keys, body.resolved_point_ids, body.bbox]
-    .filter(Boolean);
+  const selections = [body.source_row_keys, body.resolved_point_ids, body.intersection_id]
+    .filter((value) => value !== undefined);
   if (selections.length !== 1) {
-    throw new MapApiError('Replay 需要且只能提供来源键、resolved point ID 或框选范围。');
+    throw new MapApiError('Replay 需要且只能提供来源键、resolved point ID 或 intersection ID。');
   }
   if (body.resolved_point_ids && !body.detect_id) {
     throw new MapApiError('resolved point ID Replay 缺少 detect_id 上下文。');

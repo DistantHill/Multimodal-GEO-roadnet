@@ -117,6 +117,19 @@ the request handler and results are not persisted.
 For original/Clean source rows, the alternative request is
 `{"source_row_keys": ["101", "external-key"]}`; `detect_id` is optional.
 
+Replay is ID-driven only: bbox requests are rejected, including from Web clients.
+Point IDs identify selected subtracks; only those tracks are hydrated through
+their source foreign keys. Intersection Replay follows candidate/event endpoint
+references. Replay does not load all Clean source rows or recompute a full-source
+fingerprint; unrelated source changes are not validated by this request.
+
+Point Replay returns individual source segments tagged `replay_role=highlight`
+or `context`. Entry/exit points highlight their referenced cleaned segment;
+ordinary points highlight adjacent segments. Other segments of the same selected
+subtracks are grey context only. Web and QGIS automatically zoom to highlighted
+segments, not the extent of the whole subtrack. Context still requires bounded
+reading of the selected subtracks; no full Clean scan is performed.
+
 Clip request:
 
 ```json

@@ -48,8 +48,12 @@ QGIS 3.44 LTR 插件源码位于 `apps/qgis-plugin/roadnet_tools/`。开发机�
 - `GET /api/v1/map/layers`：图层目录及默认 Detect/Fit 上下文。
 - `GET /api/v1/map/layers/{layer_id}`：读取有上限的 EPSG:4326 GeoJSON，可传 `bbox`、`detect_id`、`fit_id` 和 `limit`。
 - `POST /api/v1/map/replay`：按 `source_row_keys`、`resolved_point_ids` 或
-  `bbox`（三选一）回放轨迹。Detect 产物使用内部 `resolved_point_ids` 并要求
+  `intersection_id`（三选一）回放。Replay 拒绝 `bbox`；前端框选只提交已加载要素的准确 ID。
+  Detect 产物使用内部 `resolved_point_ids` 并要求
   `detect_id`；原始/Clean 来源使用字符串化的 `source_row_keys`。
+  点 ID 先定位命中子轨迹，再有界读取其来源点；交叉口 ID 沿候选交叉口及事件外键读取构成点。
+  Replay 不再全量读取 Clean 源表计算指纹，仅读取所选溯源链，并检查读取到的来源记录是否缺失。
+  这不等价于全库不可变性校验：与选择无关的源行变更不会在 Replay 中检测。
 - `POST /api/v1/map/clip`：按 `detect_id` 与两个 `intersection_ids` 截取交叉口间轨迹；ID 值是 PostgreSQL `intersections.id`，不再接受 Detect 运行时的 cluster 计算序号。
 
 这些 API 使用只读 PostgreSQL 事务、语句超时和请求数量上限；不会在 Backend 请求进程中启动完整 Pipeline 作业。

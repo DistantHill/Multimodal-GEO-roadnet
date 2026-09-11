@@ -48,6 +48,29 @@ class MapDataError(Exception):
     pass
 
 
+def database_query_error(exc: psycopg.Error) -> HTTPException:
+    """Expose actionable resource errors without exposing SQL or credentials."""
+    sqlstate = exc.sqlstate
+    if sqlstate in {"53100", "53200"}:
+        primary = exc.diag.message_primary or ""
+        shared_memory = "shared memory" in primary.lower()
+        message = (
+            "PostgreSQL 共享内存空间不足（/dev/shm），查询失败。请检查容器 shm_size 和并行查询占用。"
+            if shared_memory else
+            "PostgreSQL 可用内存不足，查询失败。请检查数据库内存及查询并发。"
+            if sqlstate == "53200" else
+            "PostgreSQL 存储空间不足，查询失败。请检查数据盘、临时文件及共享内存空间。"
+        )
+        return HTTPException(503, detail={
+            "error": "database_resource_exhausted", "sqlstate": sqlstate,
+            "message": f"{message}（SQLSTATE {sqlstate}）",
+        })
+    return HTTPException(503, detail={
+        "error": "database_query_failed",
+        "message": "所选数据库连接或查询失败，请确认访问权限及 QGIS 图层的 database 是否对应。",
+    })
+
+
 class MapStore(Protocol):
     def layer_catalog(self) -> dict[str, Any]: ...
 
@@ -361,7 +384,6 @@ class PostgresMapStore:
             else None
         )
         clean = detect.clean if detect is not None else self._resolve_clean(None)
-        self._verify_source_fingerprint(clean)
         if request.resolved_point_ids is not None:
             assert detect is not None
             selection = "resolved_point_ids"
@@ -394,24 +416,7 @@ class PostgresMapStore:
                 )
             missing = sorted(set(request.source_row_keys) - {str(value) for value in found})
         else:
-            assert request.bbox is not None
-            selection = "bbox"
-            missing = None
-            if detect is not None:
-                selected, _, vehicles_truncated = self._select_resolved_tracks(
-                    detect,
-                    resolved_point_ids=None,
-                    source_row_keys=None,
-                    bbox=request.bbox,
-                    max_vehicles=request.max_vehicles,
-                )
-            else:
-                selected, _, vehicles_truncated = self._select_clean_tracks(
-                    clean,
-                    source_row_keys=None,
-                    bbox=request.bbox,
-                    max_vehicles=request.max_vehicles,
-                )
+            raise MapDataError("Replay 必须使用准确 ID，不允许范围查询。")
 
         if not selected:
             raise MapNotFoundError(f"no replay points match {selection}")
@@ -420,12 +425,12 @@ class PostgresMapStore:
             if detect is not None
             else self._fetch_clean_tracks(clean, selected, request.max_points + 1)
         )
+        if any(row[1] is None or row[4] is None or row[5] is None for row in rows):
+            raise MapDataError("所选轨迹的溯源记录缺失，无法完整回放。")
         grouped, points_truncated = _complete_tracks(rows, request.max_points)
-        features = [
-            _track_feature(key, points, detect.detect_id if detect else None)
-            for key, points in grouped.items()
-            if points
-        ]
+        from .replay_segments import segment_features
+
+        features = segment_features(self, grouped, request, detect.detect_id if detect else None)
         return _feature_collection(
             features,
             operation="replay",
@@ -433,7 +438,9 @@ class PostgresMapStore:
             detect_id=detect.detect_id if detect else None,
             clean_id=clean.clean_id,
             selected_track_count=len(selected),
-            returned_track_count=len(features),
+            returned_track_count=len(grouped),
+            highlight_segment_count=sum(f["properties"]["replay_role"] == "highlight" for f in features),
+            context_segment_count=sum(f["properties"]["replay_role"] == "context" for f in features),
             returned_point_count=sum(len(points) for points in grouped.values()),
             missing_source_row_keys=missing if selection == "source_row_keys" else None,
             missing_resolved_point_ids=(
@@ -533,10 +540,7 @@ class PostgresMapStore:
                 result.setdefault("metadata", {})["database_name"] = request.database_name
                 return result
         except psycopg.Error as exc:
-            raise HTTPException(status_code=503, detail={
-                "error": "database_query_failed",
-                "message": "所选数据库连接或查询失败，请确认访问权限及 QGIS 图层的 database 是否对应。",
-            }) from exc
+            raise database_query_error(exc) from exc
 
     def _resolve_detect(self, detect_id: str | None) -> _DetectContext:
         clause = "d.id = %s" if detect_id else "TRUE"
@@ -749,30 +753,34 @@ class PostgresMapStore:
         bbox: BBox | None,
         max_vehicles: int,
     ) -> tuple[list[int], set[int | str], bool]:
-        base = self._resolved_base_sql(context.clean)
-        params: list[Any] = [context.detect_id, context.detect_id]
         if resolved_point_ids is not None:
-            predicate = "resolved_point_id = ANY(%s::bigint[])"
-            params.append(resolved_point_ids)
-            identity = "resolved_point_id"
-        elif source_row_keys is not None:
-            predicate = "source_row_key = ANY(%s::text[])"
-            params.append(source_row_keys)
-            identity = "source_row_key"
-        else:
-            assert bbox is not None
-            predicate = "geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)"
-            params.extend(bbox)
-            identity = "NULL"
-        rows = self._fetchall(
-            base
-            + f" SELECT DISTINCT vehicle_id, subtrack_index, {identity} "
-            "FROM resolved WHERE detect_id = %s AND "
-            + predicate
-            + " ORDER BY vehicle_id, subtrack_index",
-            tuple(params),
-        )
-        return _limit_selected_tracks(rows, max_vehicles)
+            rows = self._fetchall(
+                "SELECT vehicle.vehicle_id, point.subtrack_index, point.id "
+                "FROM resolved_subtrack_points point "
+                "CROSS JOIN LATERAL ("
+                " SELECT COALESCE(k.vehicle_id, i.vehicle_id) AS vehicle_id"
+                " FROM resolved_subtrack_points anchor"
+                " LEFT JOIN kept_trajectory_points k ON k.id = anchor.kept_point_id"
+                " LEFT JOIN injected_points i ON i.id = anchor.injected_point_id"
+                " WHERE anchor.detect_id = point.detect_id AND anchor.subtrack_index = point.subtrack_index"
+                " AND (anchor.kept_point_id IS NOT NULL OR anchor.injected_point_id IS NOT NULL)"
+                " ORDER BY anchor.sequence_in_subtrack LIMIT 1"
+                ") vehicle WHERE point.detect_id = %s AND point.id = ANY(%s::bigint[])"
+                " ORDER BY vehicle.vehicle_id, point.subtrack_index",
+                (context.detect_id, resolved_point_ids),
+            )
+            return _limit_selected_tracks(rows, max_vehicles)
+        if source_row_keys is not None:
+            rows = self._fetchall(
+                "SELECT kept.vehicle_id, point.subtrack_index, kept.source_row_key"
+                " FROM kept_trajectory_points kept JOIN resolved_subtrack_points point"
+                " ON point.kept_point_id = kept.id AND point.detect_id = %s"
+                " WHERE kept.clean_id = %s AND kept.source_row_key = ANY(%s::text[])"
+                " ORDER BY kept.vehicle_id, point.subtrack_index",
+                (context.detect_id, context.clean.clean_id, source_row_keys),
+            )
+            return _limit_selected_tracks(rows, max_vehicles)
+        raise MapDataError("Replay 必须使用准确 ID，不允许范围查询。")
 
     def _select_clean_tracks(
         self,
@@ -791,20 +799,7 @@ class PostgresMapStore:
                 (clean.clean_id, source_row_keys),
             )
         else:
-            assert bbox is not None
-            rows = self._fetchall(
-                "SELECT vehicle_id, subtrack_index, NULL::text FROM ("
-                "SELECT kept.vehicle_id, kept.subtrack_index "
-                f"FROM kept_trajectory_points AS kept JOIN {clean.quoted_source_table} AS source "
-                f"ON source.id = kept.source_row_key::{clean.source_key_sql_type} "
-                "WHERE kept.clean_id = %s AND source.geom && "
-                "ST_MakeEnvelope(%s, %s, %s, %s, 4326) "
-                "UNION SELECT injected.vehicle_id, injected.subtrack_index "
-                "FROM injected_points AS injected WHERE injected.clean_id = %s "
-                "AND injected.geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)"
-                ") AS matching ORDER BY vehicle_id, subtrack_index",
-                (clean.clean_id, *bbox, clean.clean_id, *bbox),
-            )
+            raise MapDataError("Replay 必须使用准确来源键，不允许范围查询。")
         return _limit_selected_tracks(rows, max_vehicles)
 
     def _select_clip_tracks(
@@ -845,14 +840,34 @@ class PostgresMapStore:
     ) -> list[Any]:
         if not subtrack_indexes:
             return []
-        base = self._resolved_base_sql(context.clean)
+        clean = context.clean
         return self._fetchall(
-            base
-            + " SELECT subtrack_index, vehicle_id, resolved_point_id, source_row_key, "
-            "lon, lat, point_kind, crossing_id, intersection_id, crossing_type "
-            "FROM resolved WHERE detect_id = %s AND subtrack_index = ANY(%s::integer[]) "
-            "ORDER BY subtrack_index, sequence_in_subtrack LIMIT %s",
-            (context.detect_id, context.detect_id, subtrack_indexes, limit),
+            "WITH selected AS MATERIALIZED ("
+            " SELECT * FROM resolved_subtrack_points WHERE detect_id = %s"
+            " AND subtrack_index = ANY(%s::integer[])"
+            " ORDER BY subtrack_index, sequence_in_subtrack LIMIT %s"
+            ") SELECT point.subtrack_index, vehicle.vehicle_id, point.id, kept.source_row_key,"
+            " COALESCE(source.lon, injected.lon, crossing.crossing_lon),"
+            " COALESCE(source.lat, injected.lat, crossing.crossing_lat),"
+            " CASE WHEN point.kept_point_id IS NOT NULL THEN 'kept'"
+            " WHEN point.injected_point_id IS NOT NULL THEN 'injected' ELSE 'crossing' END,"
+            " crossing.id, intersection.id, crossing.crossing_type"
+            " FROM selected point"
+            " LEFT JOIN LATERAL (SELECT * FROM kept_trajectory_points WHERE id = point.kept_point_id AND clean_id = %s LIMIT 1) kept ON TRUE"
+            f" LEFT JOIN LATERAL (SELECT * FROM {clean.quoted_source_table} WHERE id = kept.source_row_key::{clean.source_key_sql_type} LIMIT 1) source ON TRUE"
+            " LEFT JOIN LATERAL (SELECT * FROM injected_points WHERE id = point.injected_point_id AND clean_id = %s LIMIT 1) injected ON TRUE"
+            " LEFT JOIN candidate_entry_exit_points crossing ON crossing.id = point.crossing_point_id AND crossing.detect_id = point.detect_id"
+            " LEFT JOIN intersections intersection ON intersection.detect_id = crossing.detect_id"
+            " AND intersection.candidate_intersection_id = crossing.candidate_intersection_id"
+            " CROSS JOIN LATERAL ("
+            " SELECT COALESCE(k.vehicle_id, i.vehicle_id) AS vehicle_id FROM resolved_subtrack_points anchor"
+            " LEFT JOIN kept_trajectory_points k ON k.id = anchor.kept_point_id"
+            " LEFT JOIN injected_points i ON i.id = anchor.injected_point_id"
+            " WHERE anchor.detect_id = point.detect_id AND anchor.subtrack_index = point.subtrack_index"
+            " AND (anchor.kept_point_id IS NOT NULL OR anchor.injected_point_id IS NOT NULL)"
+            " ORDER BY anchor.sequence_in_subtrack LIMIT 1) vehicle"
+            " ORDER BY point.subtrack_index, point.sequence_in_subtrack",
+            (context.detect_id, subtrack_indexes, limit, clean.clean_id, clean.clean_id),
         )
 
     def _fetch_clean_tracks(
@@ -1016,7 +1031,10 @@ def get_map_store(
 ):
     store = PostgresMapStore(connection)
     if database_name is None:
-        yield store
+        try:
+            yield store
+        except psycopg.Error as exc:
+            raise database_query_error(exc) from exc
         return
     store._validate_database(database_name)
     try:
@@ -1027,7 +1045,7 @@ def get_map_store(
                 raise HTTPException(409, detail="所选数据库不兼容 schema v3，请选择业务数据库。") from exc
             yield PostgresMapStore(target)
     except psycopg.Error as exc:
-        raise HTTPException(503, detail="所选数据库连接或查询失败，请检查权限。") from exc
+        raise database_query_error(exc) from exc
 
 
 @router.get("/layers")

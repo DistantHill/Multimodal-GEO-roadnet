@@ -25,7 +25,6 @@ def replay_intersection(store: "PostgresMapStore", request: "ReplayRequest") -> 
         raise MapNotFoundError("intersection does not belong to the requested Detect Run")
     detect = store._resolve_detect(detect_id)
     clean = detect.clean
-    store._verify_source_fingerprint(clean)
 
     # Segment endpoints use cleaned order: final order may contain subsequently
     # inserted crossing points which were not part of the detection segment.
@@ -40,10 +39,11 @@ def replay_intersection(store: "PostgresMapStore", request: "ReplayRequest") -> 
         "), members AS ("
         " SELECT id, kind, event_id FROM event_points"
         " UNION SELECT successor.id, event.kind, event.event_id FROM event_points AS event"
-        " JOIN resolved_subtrack_points AS start ON start.id = event.id AND start.detect_id = %s"
-        " LEFT JOIN resolved_subtrack_points AS successor ON successor.detect_id = start.detect_id"
+        " JOIN LATERAL (SELECT * FROM resolved_subtrack_points WHERE id = event.id AND detect_id = %s LIMIT 1) AS start ON TRUE"
+        " LEFT JOIN LATERAL (SELECT successor.id FROM resolved_subtrack_points successor"
+        " WHERE successor.detect_id = start.detect_id"
         " AND successor.subtrack_index = start.subtrack_index"
-        " AND successor.cleaned_sequence_in_subtrack = start.cleaned_sequence_in_subtrack + 1"
+        " AND successor.cleaned_sequence_in_subtrack = start.cleaned_sequence_in_subtrack + 1 LIMIT 1) AS successor ON TRUE"
         " WHERE event.segment"
         ") SELECT point.id, kept.source_row_key, injected.id,"
         " COALESCE(kept.vehicle_id, injected.vehicle_id),"
@@ -51,10 +51,10 @@ def replay_intersection(store: "PostgresMapStore", request: "ReplayRequest") -> 
         " COALESCE(source.lon, injected.lon), COALESCE(source.lat, injected.lat),"
         " COALESCE(source.heading, injected.heading), COALESCE(source.speed, injected.speed),"
         " jsonb_agg(DISTINCT jsonb_build_object('kind', members.kind, 'id', members.event_id))"
-        " FROM members LEFT JOIN resolved_subtrack_points AS point ON point.id = members.id AND point.detect_id = %s"
-        " LEFT JOIN kept_trajectory_points AS kept ON kept.id = point.kept_point_id AND kept.clean_id = %s"
-        " LEFT JOIN injected_points AS injected ON injected.id = point.injected_point_id AND injected.clean_id = %s"
-        f" LEFT JOIN {clean.quoted_source_table} AS source ON source.id = kept.source_row_key::{clean.source_key_sql_type}"
+        " FROM members LEFT JOIN LATERAL (SELECT * FROM resolved_subtrack_points WHERE id = members.id AND detect_id = %s LIMIT 1) AS point ON TRUE"
+        " LEFT JOIN LATERAL (SELECT * FROM kept_trajectory_points WHERE id = point.kept_point_id AND clean_id = %s LIMIT 1) AS kept ON TRUE"
+        " LEFT JOIN LATERAL (SELECT * FROM injected_points WHERE id = point.injected_point_id AND clean_id = %s LIMIT 1) AS injected ON TRUE"
+        f" LEFT JOIN LATERAL (SELECT * FROM {clean.quoted_source_table} WHERE id = kept.source_row_key::{clean.source_key_sql_type} LIMIT 1) AS source ON TRUE"
         " GROUP BY point.id, kept.source_row_key, injected.id, kept.vehicle_id, injected.vehicle_id,"
         " source.timestamp, injected.timestamp, source.lon, injected.lon, source.lat, injected.lat,"
         " source.heading, injected.heading, source.speed, injected.speed"

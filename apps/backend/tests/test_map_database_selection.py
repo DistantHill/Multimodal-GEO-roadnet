@@ -5,7 +5,7 @@ import pytest
 import psycopg
 from fastapi import HTTPException
 
-from backend.map_api import PostgresMapStore
+from backend.map_api import PostgresMapStore, database_query_error
 from backend.map_schemas import ClipRequest, ReplayRequest
 
 
@@ -95,3 +95,19 @@ def test_target_connection_error_is_sanitized():
     assert error.value.status_code == 503
     assert error.value.detail["error"] == "database_query_failed"
     assert "sensitive" not in str(error.value.detail)
+
+
+@pytest.mark.parametrize("sqlstate,primary,expected", [
+    ("53100", 'could not resize shared memory segment: No space left on device', "共享内存"),
+    ("53100", 'could not extend file', "存储空间"),
+    ("53200", 'out of memory', "可用内存"),
+])
+def test_resource_errors_report_sqlstate_without_query(sqlstate, primary, expected):
+    error = Mock(sqlstate=sqlstate)
+    error.diag.message_primary = primary
+    result = database_query_error(error)
+    assert result.status_code == 503
+    assert result.detail["error"] == "database_resource_exhausted"
+    assert result.detail["sqlstate"] == sqlstate
+    assert expected in result.detail["message"]
+    assert sqlstate in result.detail["message"]

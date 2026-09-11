@@ -4,3 +4,7 @@ export function selectFeaturesInExtent(source, extent, collection) {
     collection.push(feature);
   });
 }
+
+export function replayFocusFeatures(features) {
+  return features.filter((feature) => feature.get('replay_role') !== 'context');
+}

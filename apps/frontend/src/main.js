@@ -1,5 +1,5 @@
 import OlMap from 'ol/Map.js';
-import { selectFeaturesInExtent } from './selection.js';
+import { selectFeaturesInExtent, replayFocusFeatures } from './selection.js';
 import View from 'ol/View.js';
 import GeoJSON from 'ol/format/GeoJSON.js';
 import DragBox from 'ol/interaction/DragBox.js';
@@ -264,9 +264,15 @@ const baseLayer = new TileLayer({
 });
 
 const tmpSource = new VectorSource();
+const replayHighlightStyle = createLayerStyle('tmp');
+replayHighlightStyle.setZIndex(2);
+const replayContextStyle = new Style({
+  stroke: new Stroke({ color: 'rgba(140, 148, 154, 0.65)', width: 2 }),
+  zIndex: 1,
+});
 const tmpLayer = new VectorLayer({
   source: tmpSource,
-  style: createLayerStyle('tmp'),
+  style: (feature) => feature.get('replay_role') === 'context' ? replayContextStyle : replayHighlightStyle,
   zIndex: 900,
   properties: {
     id: 'tmp',
@@ -726,7 +732,7 @@ function renderSelection() {
       ? '框选范围内暂无已加载要素'
       : '请选择图层中的要素';
     dom.selectionList.innerHTML = state.selectionBbox
-      ? `<div class="bbox-selection"><span>${icon('box', 20)}</span><strong>已定义 Replay 范围</strong><small>${formatBbox(state.selectionBbox)}</small></div>`
+      ? `<div class="bbox-selection"><span>${icon('box', 20)}</span><strong>未选中已加载要素，无法 Replay</strong><small>Replay 仅提交选中要素 ID，不发送范围。</small></div>`
       : `<div class="empty-selection"><span class="empty-selection__icon">${icon('pointer', 22)}</span><span>使用点选或框选工具</span><small>点选时按住 Shift 可增减选择</small></div>`;
   } else {
     const record = state.layerRecords.get(features[0].get('_layerId'));
@@ -793,9 +799,10 @@ function updateActionState() {
       .map((feature) => firstValue(feature.get('_detectId'), state.context.detectId))
       .filter(isPresent),
   );
-  const boxReady = state.selectionOrigin === 'box' && state.selectionBbox?.length === 4;
+  const intersectionReady = features.length === 1 && features[0].get('_layerRole') === 'intersection'
+    && isPresent(features[0].get('_intersectionId'));
   const replayReady = !state.busy && (
-    boxReady || (
+    intersectionReady || (
       replayKeys.length > 0 &&
       replayKeys.length <= 1_000 &&
       (!allResolved || replayDetectIds.length === 1)
@@ -805,10 +812,8 @@ function updateActionState() {
   dom.replayAction.disabled = !replayReady;
   if (state.busy) {
     dom.replayHint.textContent = '正在处理请求…';
-  } else if (boxReady) {
-    dom.replayHint.textContent = features.length
-      ? `按框选范围回放 · 命中 ${features.length} 个要素`
-      : '按当前框选范围回放';
+  } else if (intersectionReady) {
+    dom.replayHint.textContent = '按 intersection.id 回放交叉口构成点';
   } else if (replayKeys.length) {
     dom.replayHint.textContent = allResolved && replayDetectIds.length !== 1
       ? 'resolved point 必须属于同一 Detect Run'
@@ -819,7 +824,7 @@ function updateActionState() {
     dom.replayHint.textContent =
       '所选要素缺少统一的 source_row_key 或 resolved_point_id';
   } else {
-    dom.replayHint.textContent = '选择轨迹点或框选范围';
+    dom.replayHint.textContent = '选择已加载的点或一个交叉口（按 ID 回放）';
   }
 
   const intersections = features.filter((feature) => feature.get('_layerRole') === 'intersection');
@@ -860,7 +865,8 @@ function unique(values) {
 async function runReplay() {
   if (dom.replayAction.disabled) return;
   const features = selectedFeatures.getFeatures().getArray();
-  const useBbox = state.selectionOrigin === 'box' && state.selectionBbox?.length === 4;
+  const intersectionId = features.length === 1 && features[0].get('_layerRole') === 'intersection'
+    ? features[0].get('_intersectionId') : undefined;
   const resolvedPointIds = unique(
     features.map((feature) => feature.get('_resolvedPointId')).filter(isPresent),
   );
@@ -884,9 +890,9 @@ async function runReplay() {
   await runAnalysis('Replay', (signal) => requestReplay({
     databaseName: state.databaseName,
     detectId,
-    resolvedPointIds: useBbox || !allResolved ? undefined : resolvedPointIds,
-    sourceRowKeys: useBbox || allResolved || !allSource ? undefined : sourceRowKeys,
-    bbox: useBbox ? state.selectionBbox : undefined,
+    intersectionId,
+    resolvedPointIds: intersectionId !== undefined || !allResolved ? undefined : resolvedPointIds,
+    sourceRowKeys: intersectionId !== undefined || allResolved || !allSource ? undefined : sourceRowKeys,
   }, { signal }));
 }
 
@@ -942,8 +948,13 @@ function drawResult(name, featureCollection, metadata = {}) {
   updateFeatureTotal();
 
   if (features.length) {
-    const extent = tmpSource.getExtent();
-    view.fit(extent, { duration: 420, maxZoom: 18, padding: [70, 70, 70, 70] });
+    const extent = createEmpty();
+    replayFocusFeatures(features).forEach((feature) => {
+      if (feature.getGeometry()) extend(extent, feature.getGeometry().getExtent());
+    });
+    if (!isEmptyExtent(extent)) {
+      view.fit(extent, { duration: 420, maxZoom: 18, padding: [70, 70, 70, 70] });
+    }
     setStatus(`${name} 完成 · ${features.length.toLocaleString('zh-CN')} 个要素已绘制到 tmp`);
     showToast(`${name} 完成，结果已绘制到 tmp 图层。`, 'success');
   } else {

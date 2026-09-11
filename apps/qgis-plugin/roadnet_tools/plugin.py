@@ -8,6 +8,7 @@ from typing import Any
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
 from qgis.core import NULL, Qgis, QgsDataSourceUri, QgsVectorLayer, QgsWkbTypes
+from qgis.core import QgsRectangle, QgsCoordinateTransform, QgsProject
 
 from .client import BackendClient
 from .database_browser import DatabaseBrowserDialog
@@ -204,9 +205,22 @@ class RoadnetToolsPlugin:
             return
 
         if feature_count:
-            primary = next((layer for layer in layers if layer.featureCount()), None)
-            if primary is not None and not primary.extent().isEmpty():
-                self.iface.mapCanvas().setExtent(primary.extent())
+            extent = QgsRectangle()
+            for layer in layers:
+                transform = QgsCoordinateTransform(layer.crs(), self.iface.mapCanvas().mapSettings().destinationCrs(), QgsProject.instance())
+                classified = layer.fields().indexFromName("replay_role") >= 0
+                for feature in layer.getFeatures():
+                    if classified and feature["replay_role"] == "context":
+                        continue
+                    if not feature.hasGeometry():
+                        continue
+                    bounds = transform.transformBoundingBox(feature.geometry().boundingBox())
+                    if extent.isNull():
+                        extent = QgsRectangle(bounds)
+                    else:
+                        extent.combineExtentWith(bounds)
+            if not extent.isEmpty():
+                self.iface.mapCanvas().setExtent(extent)
             self.iface.mapCanvas().refresh()
             self.iface.messageBar().pushMessage(
                 "Roadnet Tools",

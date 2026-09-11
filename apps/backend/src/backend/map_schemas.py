@@ -82,6 +82,8 @@ class ReplayRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_selection(self) -> "ReplayRequest":
+        if self.bbox is not None:
+            raise ValueError("Replay 不支持 bbox，请发送选中要素的 resolved_point_ids 或 intersection_id")
         selections = (
             self.intersection_id,
             self.source_row_keys,
@@ -90,7 +92,7 @@ class ReplayRequest(BaseModel):
         )
         if sum(value is not None for value in selections) != 1:
             raise ValueError(
-                "provide exactly one of source_row_keys, resolved_point_ids, bbox, or intersection_id"
+                "provide exactly one of source_row_keys, resolved_point_ids, or intersection_id"
             )
         if self.resolved_point_ids is not None and self.detect_id is None:
             raise ValueError("resolved_point_ids requires detect_id")

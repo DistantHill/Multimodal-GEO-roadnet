@@ -16,6 +16,9 @@ from qgis.core import (
     QgsLayerTreeLayer,
     QgsProject,
     QgsVectorLayer,
+    QgsCategorizedSymbolRenderer,
+    QgsRendererCategory,
+    QgsSymbol,
 )
 
 from .core import ContractError, ParsedGeoJson, geometry_groups
@@ -206,6 +209,19 @@ def _field_value(value: Any, field_type: Any) -> Any:
 
 
 def _apply_default_style(layer: QgsVectorLayer, operation: str) -> None:
+    if operation == "replay" and layer.fields().indexFromName("replay_role") >= 0:
+        categories = []
+        for role, color, width, label in (
+            ("context", "#9ca3af", 0.4, "其他 segment"),
+            ("highlight", "#e33f8e", 1.0, "直接参与 segment"),
+        ):
+            symbol = QgsSymbol.defaultSymbol(layer.geometryType())
+            symbol.setColor(QColor(color))
+            if hasattr(symbol, "setWidth"):
+                symbol.setWidth(width)
+            categories.append(QgsRendererCategory(role, symbol, label))
+        layer.setRenderer(QgsCategorizedSymbolRenderer("replay_role", categories))
+        return
     renderer = layer.renderer()
     symbol = renderer.symbol() if renderer is not None else None
     if symbol is None:

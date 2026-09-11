@@ -11,6 +11,15 @@ import {
 
 const originalFetch = globalThis.fetch;
 
+test('Replay exposes database resource exhaustion message', async () => {
+  const message = 'PostgreSQL 共享内存空间不足（SQLSTATE 53100）';
+  globalThis.fetch = async () => jsonResponse({ detail: {
+    error: 'database_resource_exhausted', sqlstate: '53100', message,
+  } }, 503);
+  await assert.rejects(requestReplay({ sourceRowKeys: ['1'] }),
+    (error) => error.message === message && error.details.detail.sqlstate === '53100');
+});
+
 afterEach(() => {
   globalThis.fetch = originalFetch;
 });
@@ -79,11 +88,12 @@ test('replay separates source keys from resolved point IDs', async () => {
 
   await requestReplay({ sourceRowKeys: ['external-101', 102] });
   await requestReplay({ detectId: 7, resolvedPointIds: [201, 202] });
-  await requestReplay({ bbox: [120.1, 30.2, 120.3, 30.4] });
+  await requestReplay({ intersectionId: 12 });
+  await assert.rejects(requestReplay({ bbox: [120.1, 30.2, 120.3, 30.4] }), /不支持 bbox/);
 
   assert.deepEqual(bodies[0], { source_row_keys: ['external-101', '102'] });
   assert.deepEqual(bodies[1], { detect_id: 7, resolved_point_ids: [201, 202] });
-  assert.deepEqual(bodies[2], { bbox: [120.1, 30.2, 120.3, 30.4] });
+  assert.deepEqual(bodies[2], { intersection_id: 12 });
 });
 
 test('resolved point replay requires detect context', async () => {

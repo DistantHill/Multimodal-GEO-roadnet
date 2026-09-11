@@ -292,8 +292,6 @@ def test_resolved_replay_reports_missing_ids_and_returns_full_track() -> None:
     connection = ScriptedConnection(
         [detect_row(detect_id, "clean-1")],
         [["int8"]],
-        [[False]],
-        [],
         [["vehicle-1", 7, 1]],
         [
             resolved_row(7, "vehicle-1", 1, 120.0, source_row_key="external-1"),
@@ -315,16 +313,20 @@ def test_resolved_replay_reports_missing_ids_and_returns_full_track() -> None:
     assert feature["properties"]["resolved_point_ids"] == [1, 2]
     assert feature["properties"]["source_row_keys"] == ["external-1", "external-2"]
     for sql, _ in connection.executions:
+        assert "WITH referenced" not in sql
+        assert "subtrack_vehicle" not in sql
         assert "99" not in sql
         assert not any(word in sql.upper() for word in ("INSERT", "UPDATE", "DELETE"))
+    fetch_sql, fetch_params = connection.executions[-1]
+    assert "WITH selected AS MATERIALIZED" in fetch_sql
+    assert "subtrack_index = ANY(%s::integer[])" in fetch_sql
+    assert fetch_params[:3] == (detect_id, [7], 11)
 
 
 def test_source_key_replay_works_without_detect_context() -> None:
     connection = ScriptedConnection(
         [["clean-1", "public.source_points", _EMPTY_FINGERPRINT]],
         [["int8"]],
-        [[False]],
-        [],
         [["vehicle-1", 7, "external-1"]],
         [
             resolved_row(7, "vehicle-1", 0, 120.0, source_row_key="external-1"),
@@ -350,8 +352,6 @@ def test_unknown_resolved_ids_are_not_found_after_context_validation() -> None:
     connection = ScriptedConnection(
         [detect_row(detect_id, "clean-1")],
         [["int8"]],
-        [[False]],
-        [],
         [],
     )
     with pytest.raises(MapNotFoundError, match="no replay points match resolved_point_ids"):
@@ -521,12 +521,12 @@ def test_dynamic_values_are_bound_parameters() -> None:
     store = PostgresMapStore(connection)
     selected, _, _ = store._select_resolved_tracks(
         _DETECT,
-        resolved_point_ids=None,
+        resolved_point_ids=[1201234567],
         source_row_keys=None,
-        bbox=(120.1234567, 30.0, 121.0, 31.0),
+        bbox=None,
         max_vehicles=7,
     )
     assert selected == [7]
     sql, params = connection.executions[0]
-    assert "120.1234567" not in sql
-    assert params == ("detect-1", "detect-1", 120.1234567, 30.0, 121.0, 31.0)
+    assert "1201234567" not in sql
+    assert params == ("detect-1", [1201234567])
