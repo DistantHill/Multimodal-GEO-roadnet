@@ -1,6 +1,5 @@
-import './style.css';
-
 import OlMap from 'ol/Map.js';
+import { selectFeaturesInExtent } from './selection.js';
 import View from 'ol/View.js';
 import GeoJSON from 'ol/format/GeoJSON.js';
 import DragBox from 'ol/interaction/DragBox.js';
@@ -19,6 +18,8 @@ import { createEmpty, extend, isEmpty as isEmptyExtent } from 'ol/extent.js';
 import { fromLonLat, getPointResolution, toLonLat, transformExtent } from 'ol/proj.js';
 import {
   listMapLayers,
+  listDatabases,
+  listRuns,
   loadMapLayer,
   requestClip,
   requestReplay,
@@ -58,8 +59,10 @@ app.innerHTML = `
         <span>Multimodal GEO workspace</span>
       </div>
       <div class="header-context" aria-label="当前数据上下文">
-        <span class="context-chip"><i class="context-dot context-dot--detect"></i>Detect <b id="detect-id">—</b></span>
-        <span class="context-chip"><i class="context-dot context-dot--fit"></i>Fit <b id="fit-id">—</b></span>
+        <label class="context-chip">Database <select id="database-select" aria-label="选择数据库"><option value="">Backend 默认库</option></select></label>
+        <label class="context-chip run-context">Clean <select id="clean-id" aria-label="Clean ID"></select><small class="run-time" id="clean-id-time" title="创建时间（started_at，北京时间）">—</small></label>
+        <label class="context-chip run-context">Detect <select id="detect-id" aria-label="Detect ID"></select><small class="run-time" id="detect-id-time" title="创建时间（started_at，北京时间）">—</small></label>
+        <label class="context-chip run-context">Fit <select id="fit-id" aria-label="Fit ID"></select><small class="run-time" id="fit-id-time" title="创建时间（started_at，北京时间）">—</small></label>
       </div>
       <div class="service-state" id="service-state">
         <span class="service-state__dot"></span>
@@ -289,6 +292,10 @@ const map = new OlMap({
 });
 
 const state = {
+  runs: { clean: [], detect: [], fit: [] },
+  cleanId: null,
+  runsAbortController: null,
+  databaseName: null,
   activeLayerId: null,
   analysisAbortController: null,
   busy: false,
@@ -350,8 +357,8 @@ dragBox.on('boxend', () => {
   const record = state.layerRecords.get(state.activeLayerId);
   const collection = selectedFeatures.getFeatures();
 
-  if (record?.descriptor.selectable && record.source instanceof VectorSource) {
-    record.source.forEachFeatureIntersectingExtent(extent, (feature) => collection.push(feature));
+  if (record?.descriptor.selectable && record.layer.getVisible() && record.source instanceof VectorSource) {
+    selectFeaturesInExtent(record.source, extent, collection);
   }
 
   state.selectionOrigin = 'box';
@@ -406,15 +413,11 @@ function inferRole(descriptor) {
 }
 
 function updateContext(metadata = {}) {
-  const source = metadata.context || metadata;
-  const detectId = firstValue(source.detect_id, source.detectId, metadata.resolved_detect_id);
-  const fitId = firstValue(source.fit_id, source.fitId, metadata.resolved_fit_id);
-  if (detectId !== undefined) state.context.detectId = detectId;
-  if (fitId !== undefined) state.context.fitId = fitId;
-  dom.detectId.textContent = state.context.detectId ?? '—';
-  dom.fitId.textContent = state.context.fitId ?? '—';
+  dom.detectId.value = state.context.detectId || '';
+  dom.fitId.value = state.context.fitId || '';
   dom.detectId.title = state.context.detectId === null ? '未解析' : String(state.context.detectId);
   dom.fitId.title = state.context.fitId === null ? '未解析' : String(state.context.fitId);
+  for (const id of ['clean-id', 'detect-id', 'fit-id']) updateRunTime(document.getElementById(id));
 }
 
 function firstValue(...values) {
@@ -488,6 +491,7 @@ async function loadLayers() {
   state.layerAbortController?.abort();
   state.layerAbortController = new AbortController();
   const { signal } = state.layerAbortController;
+  const databaseName = state.databaseName;
 
   clearSelection();
   removeBusinessLayers();
@@ -498,7 +502,14 @@ async function loadLayers() {
   renderLayerTree();
 
   try {
-    const catalog = await listMapLayers({ signal });
+    if (!state.context.detectId) {
+      setServiceState('warning', '所选 Clean 暂无已完成 Detect');
+      setStatus('请选择具有已完成 Detect 的 Clean ID');
+      dom.mapNotice.hidden = false;
+      return;
+    }
+    const catalog = await listMapLayers({ signal, databaseName });
+    if (signal.aborted) return;
     updateContext(catalog.metadata);
 
     if (!catalog.layers.length) {
@@ -517,11 +528,20 @@ async function loadLayers() {
     const results = await Promise.allSettled(
       catalog.layers.map(async (descriptor) => {
         const requiredContext = descriptor.required_context || descriptor.requiredContext || [];
+        if (requiredContext.includes('fit_id') && !state.context.fitId) {
+          const record = state.layerRecords.get(descriptor.id);
+          record.status = 'ready';
+          record.featureCount = 0;
+          return;
+        }
         const result = await loadMapLayer(descriptor.id, {
-          detectId: requiredContext.includes('detect_id') ? state.context.detectId : undefined,
+          databaseName,
+          cleanId: state.cleanId,
+          detectId: state.context.detectId,
           fitId: requiredContext.includes('fit_id') ? state.context.fitId : undefined,
           signal,
         });
+        if (signal.aborted) return;
         const record = state.layerRecords.get(descriptor.id);
         if (!record) return;
 
@@ -862,6 +882,7 @@ async function runReplay() {
     : firstValue(activeMetadata.detect_id, activeMetadata.context?.detect_id);
 
   await runAnalysis('Replay', (signal) => requestReplay({
+    databaseName: state.databaseName,
     detectId,
     resolvedPointIds: useBbox || !allResolved ? undefined : resolvedPointIds,
     sourceRowKeys: useBbox || allResolved || !allSource ? undefined : sourceRowKeys,
@@ -875,19 +896,21 @@ async function runClip() {
   const intersectionIds = features.map((feature) => feature.get('_intersectionId'));
   const detectId = firstValue(features[0].get('_detectId'), state.context.detectId);
 
-  await runAnalysis('Clip', (signal) => requestClip({ detectId, intersectionIds }, { signal }));
+  await runAnalysis('Clip', (signal) => requestClip({ detectId, intersectionIds, databaseName: state.databaseName }, { signal }));
 }
 
 async function runAnalysis(name, request) {
   state.analysisAbortController?.abort();
   state.analysisAbortController = new AbortController();
+  const { signal } = state.analysisAbortController;
   state.busy = true;
   updateActionState();
   setStatus(`${name} 请求处理中…`);
   dom.analysisFootnote.textContent = `${name} 正在后端内存中计算，请稍候…`;
 
   try {
-    const result = await request(state.analysisAbortController.signal);
+    const result = await request(signal);
+    if (signal.aborted) return;
     updateContext(result.metadata);
     drawResult(name, result.featureCollection, result.metadata);
   } catch (error) {
@@ -1090,4 +1113,101 @@ window.addEventListener('resize', () => map.updateSize());
 renderLayerTree();
 renderSelection();
 updateMapStatus();
-loadLayers();
+const databaseSelect = document.querySelector('#database-select');
+databaseSelect.addEventListener('change', () => {
+  state.databaseName = databaseSelect.value || null;
+  state.analysisAbortController?.abort();
+  clearResult();
+  state.context = { detectId: null, fitId: null };
+  updateContext({});
+  refreshRuns();
+});
+function setRunOptions(select, rows, preferred) {
+  select.replaceChildren();
+  for (const row of rows) {
+    const time = formatRunTime(row.started_at);
+    const option = new Option(`${row.id}　 ${time}（北京时间）`, row.id);
+    option.dataset.time = time;
+    select.add(option);
+  }
+  if (!rows.length) select.add(new Option('暂无已完成运行', ''));
+  select.disabled = !rows.length;
+  select.value = rows.some((row) => row.id === preferred) ? preferred : (rows[0]?.id || '');
+  select.title = select.value;
+  updateRunTime(select);
+  return select.value || null;
+}
+function formatRunTime(value) {
+  if (!value || Number.isNaN(Date.parse(value))) return '—';
+  return new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).format(new Date(value));
+}
+function updateRunTime(select) {
+  const time = select.selectedOptions[0]?.dataset.time || '—';
+  document.getElementById(`${select.id}-time`).textContent = time;
+  select.title = `${select.value || '暂无运行'} · ${time}（北京时间）`;
+}
+const cleanSelect = document.querySelector('#clean-id');
+function syncRuns(level = 'clean') {
+  if (level === 'clean') {
+    state.cleanId = cleanSelect.value || null;
+    state.context.detectId = setRunOptions(dom.detectId,
+      state.runs.detect.filter((row) => row.clean_id === state.cleanId), null);
+  } else state.context.detectId = dom.detectId.value || null;
+  state.context.fitId = setRunOptions(dom.fitId,
+    state.runs.fit.filter((row) => row.detect_id === state.context.detectId), null);
+  reloadRunLayers();
+}
+function reloadRunLayers() {
+  state.analysisAbortController?.abort();
+  clearResult();
+  updateContext();
+  loadLayers();
+}
+cleanSelect.addEventListener('change', () => syncRuns());
+dom.detectId.addEventListener('change', () => syncRuns('detect'));
+dom.fitId.addEventListener('change', () => {
+  state.context.fitId = dom.fitId.value || null;
+  reloadRunLayers();
+});
+async function refreshRuns() {
+  state.runsAbortController?.abort();
+  state.layerAbortController?.abort();
+  state.analysisAbortController?.abort();
+  clearSelection();
+  clearResult();
+  removeBusinessLayers();
+  state.context = { detectId: null, fitId: null };
+  for (const select of [cleanSelect, dom.detectId, dom.fitId]) setRunOptions(select, [], null);
+  const controller = new AbortController();
+  state.runsAbortController = controller;
+  try {
+    const runs = await listRuns({ databaseName: state.databaseName, signal: controller.signal });
+    if (controller.signal.aborted) return;
+    state.runs = runs;
+    setRunOptions(cleanSelect, runs.clean, null);
+    syncRuns();
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    setMapLoading(false);
+    setStatus(error.message, true);
+    showToast(error.message, 'error');
+  }
+}
+async function initializeDatabases() {
+  try {
+    const payload = await listDatabases();
+    databaseSelect.replaceChildren();
+    for (const name of new Set(payload.databases)) {
+      databaseSelect.add(new Option(name === payload.default_database ? `${name}（默认库）` : name, name));
+    }
+    databaseSelect.value = payload.default_database || payload.databases[0] || '';
+    state.databaseName = databaseSelect.value || null;
+  } catch (error) {
+    showToast(`数据库列表加载失败：${error.message}`, 'error');
+  }
+  await refreshRuns();
+}
+initializeDatabases();

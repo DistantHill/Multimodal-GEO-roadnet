@@ -1010,13 +1010,44 @@ class PostgresMapStore:
         )
 
 
-def get_map_store(connection: Any = Depends(get_read_connection)) -> MapStore:
-    return PostgresMapStore(connection)
+def get_map_store(
+    connection: Any = Depends(get_read_connection),
+    database_name: str | None = Query(default=None, min_length=1, max_length=63),
+):
+    store = PostgresMapStore(connection)
+    if database_name is None:
+        yield store
+        return
+    store._validate_database(database_name)
+    try:
+        with open_read_connection(database_name) as target:
+            try:
+                require_schema_v3(target)
+            except RuntimeError as exc:
+                raise HTTPException(409, detail="所选数据库不兼容 schema v3，请选择业务数据库。") from exc
+            yield PostgresMapStore(target)
+    except psycopg.Error as exc:
+        raise HTTPException(503, detail="所选数据库连接或查询失败，请检查权限。") from exc
 
 
 @router.get("/layers")
 def layer_catalog(store: MapStore = Depends(get_map_store)) -> dict[str, Any]:
     return store.layer_catalog()
+
+
+@router.get("/runs")
+def run_catalog(store: Any = Depends(get_map_store)) -> dict[str, Any]:
+    return {
+        "clean": [{"id": row[0], "started_at": row[1]} for row in store._fetchall(
+            "SELECT id::text, started_at FROM clean_runs WHERE status = 'completed' ORDER BY finished_at DESC NULLS LAST, started_at DESC", ()
+        )],
+        "detect": [{"id": row[0], "clean_id": row[1], "started_at": row[2]} for row in store._fetchall(
+            "SELECT id::text, clean_id::text, started_at FROM detect_runs WHERE status = 'completed' ORDER BY finished_at DESC NULLS LAST, started_at DESC", ()
+        )],
+        "fit": [{"id": row[0], "detect_id": row[1], "started_at": row[2]} for row in store._fetchall(
+            "SELECT id::text, detect_id::text, started_at FROM fit_runs WHERE status = 'completed' ORDER BY finished_at DESC NULLS LAST, started_at DESC", ()
+        )],
+    }
 
 
 @router.get("/layers/{layer_id}", response_model=FeatureCollection)
@@ -1025,10 +1056,22 @@ def read_layer(
     bbox: str | None = Query(default=None, description="minLon,minLat,maxLon,maxLat"),
     detect_id: UUID | None = None,
     fit_id: UUID | None = None,
+    clean_id: UUID | None = None,
     limit: int = Query(default=_LAYER_LIMIT_DEFAULT, ge=1, le=_LAYER_LIMIT_MAX),
     store: MapStore = Depends(get_map_store),
 ) -> dict[str, Any]:
     try:
+        if clean_id is not None:
+            if detect_id is None or store._fetchone(
+                "SELECT 1 FROM detect_runs WHERE id = %s AND clean_id = %s",
+                (str(detect_id), str(clean_id)),
+            ) is None:
+                raise MapDataError("Detect ID 不属于所选 Clean ID。")
+            if fit_id is not None and store._fetchone(
+                "SELECT 1 FROM fit_runs WHERE id = %s AND detect_id = %s",
+                (str(fit_id), str(detect_id)),
+            ) is None:
+                raise MapDataError("Fit ID 不属于所选 Detect ID。")
         return store.read_layer(
             layer_id,
             bbox=parse_bbox(bbox),

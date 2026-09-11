@@ -38,7 +38,8 @@ def databases(connection: Any = Depends(get_read_connection)) -> dict[str, Any]:
     rows = connection.execute(
         "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY datname"
     ).fetchall()
-    return {"databases": [row[0] for row in rows]}
+    return {"databases": [row[0] for row in rows],
+            "default_database": connection.execute("SELECT current_database()").fetchone()[0]}
 
 
 @router.get("/tables")

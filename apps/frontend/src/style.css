@@ -110,6 +110,19 @@ input:focus-visible {
   min-width: 0;
   margin-left: 18px;
   gap: 6px;
+  flex-wrap: wrap;
+}
+
+.context-chip.run-context {
+  max-width: none;
+  overflow: visible;
+}
+
+.run-time {
+  margin-left: 6px;
+  color: #b5c9c4;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
 }
 
 .context-chip {
@@ -134,6 +147,30 @@ input:focus-visible {
   color: #f7fbfc;
   font-weight: 600;
   text-overflow: ellipsis;
+}
+
+.header-context select {
+  color-scheme: dark;
+  margin-left: 6px;
+  min-width: 120px;
+  max-width: 150px;
+  padding: 2px 6px;
+  color: #fff;
+  background-color: #243d3a;
+  border: 1px solid rgba(205, 225, 235, 0.25);
+  border-radius: 4px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.header-context select option {
+  color: #fff;
+  background-color: #243d3a;
+}
+
+.header-context select:focus-visible {
+  outline: 2px solid #8cbcb2;
+  outline-offset: 1px;
 }
 
 .context-dot {

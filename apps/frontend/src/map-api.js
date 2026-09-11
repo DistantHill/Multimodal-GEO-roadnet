@@ -127,8 +127,16 @@ function normalizeAnalysisResult(payload) {
   };
 }
 
-export async function listMapLayers({ signal } = {}) {
-  const payload = await requestJson('/map/layers', { signal });
+export async function listDatabases({ signal } = {}) {
+  return requestJson('/map/databases', { signal });
+}
+
+export async function listRuns({ databaseName, signal } = {}) {
+  return requestJson(`/map/runs${buildQuery({ database_name: databaseName })}`, { signal });
+}
+
+export async function listMapLayers({ signal, databaseName } = {}) {
+  const payload = await requestJson(`/map/layers${buildQuery({ database_name: databaseName })}`, { signal });
   const candidates = firstDefined(payload?.layers, payload?.items, payload?.data, payload);
   const descriptors = Array.isArray(candidates) ? candidates : [];
 
@@ -140,9 +148,11 @@ export async function listMapLayers({ signal } = {}) {
 
 export async function loadMapLayer(
   layerId,
-  { bbox, detectId, fitId, limit = 5_000, signal } = {},
+  { bbox, detectId, fitId, cleanId, databaseName, limit = 5_000, signal } = {},
 ) {
   const query = buildQuery({
+    database_name: databaseName,
+    clean_id: cleanId,
     bbox,
     detect_id: detectId,
     fit_id: fitId,
@@ -157,10 +167,11 @@ export async function loadMapLayer(
 }
 
 export async function requestReplay(
-  { detectId, sourceRowKeys, resolvedPointIds, bbox, maxVehicles, maxPoints },
+  { detectId, sourceRowKeys, resolvedPointIds, bbox, maxVehicles, maxPoints, databaseName },
   { signal } = {},
 ) {
   const body = {};
+  if (databaseName) body.database_name = databaseName;
   if (detectId !== undefined && detectId !== null) body.detect_id = detectId;
   if (sourceRowKeys?.length) body.source_row_keys = sourceRowKeys.map(String);
   if (resolvedPointIds?.length) body.resolved_point_ids = resolvedPointIds;
@@ -182,7 +193,7 @@ export async function requestReplay(
 }
 
 export async function requestClip(
-  { detectId, intersectionIds, maxVehicles, maxPoints },
+  { detectId, intersectionIds, maxVehicles, maxPoints, databaseName },
   { signal } = {},
 ) {
   if (detectId === undefined || detectId === null || detectId === '') {
@@ -196,6 +207,7 @@ export async function requestClip(
     detect_id: detectId,
     intersection_ids: intersectionIds,
   };
+  if (databaseName) body.database_name = databaseName;
   if (maxVehicles !== undefined) body.max_vehicles = maxVehicles;
   if (maxPoints !== undefined) body.max_points = maxPoints;
 

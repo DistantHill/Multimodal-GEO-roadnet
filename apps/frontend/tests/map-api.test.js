@@ -22,6 +22,25 @@ function jsonResponse(payload, status = 200) {
   });
 }
 
+test('database selection propagates to catalog, layers and analysis', async () => {
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), body: options.body && JSON.parse(options.body) });
+    return jsonResponse({ type: 'FeatureCollection', features: [], layers: [] });
+  };
+  await listMapLayers({ databaseName: 'test' });
+  await loadMapLayer('intersections', { databaseName: 'test', cleanId: 'clean-1', detectId: 'detect-1', fitId: 'fit-1' });
+  await requestReplay({ databaseName: 'test', sourceRowKeys: ['1'] });
+  await requestClip({ databaseName: 'test', detectId: 'run', intersectionIds: [1, 2] });
+  assert.match(calls[0].url, /database_name=test/);
+  assert.match(calls[1].url, /database_name=test/);
+  assert.match(calls[1].url, /clean_id=clean-1/);
+  assert.match(calls[1].url, /detect_id=detect-1/);
+  assert.match(calls[1].url, /fit_id=fit-1/);
+  assert.equal(calls[2].body.database_name, 'test');
+  assert.equal(calls[3].body.database_name, 'test');
+});
+
 test('layer catalog keeps the backend default context', async () => {
   globalThis.fetch = async () => jsonResponse({
     default_context: { detect_id: 41, fit_id: 9 },

@@ -10,7 +10,8 @@ from backend.database_catalog import databases, tables, table_counts
 def test_database_list():
     connection = Mock()
     connection.execute.return_value.fetchall.return_value = [("roadnet",), ("test",)]
-    assert databases(connection) == {"databases": ["roadnet", "test"]}
+    connection.execute.return_value.fetchone.return_value = ("roadnet",)
+    assert databases(connection) == {"databases": ["roadnet", "test"], "default_database": "roadnet"}
 
 
 def test_tables_use_statistics_not_counts():
