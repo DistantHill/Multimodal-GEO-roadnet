@@ -13,11 +13,11 @@ import uuid
 
 import numpy as np
 
-from ..config import connect, default_postgres_config
-from ..cv_preview import fit_profile, split_tiles, write_report
-from ..db.queries import fetch_detect_row, fetch_intersections
-from ..db.source_table import validate_source_table, verify_clean_source_fingerprint
-from ..projection import CoordinateTransformer
+from track.v2.config import connect, default_postgres_config
+from .preview import fit_profile, split_tiles, write_report
+from track.v2.db.queries import fetch_detect_row, fetch_intersections
+from track.v2.db.source_table import validate_source_table, verify_clean_source_fingerprint
+from track.v2.projection import CoordinateTransformer
 
 
 def read_pixels(conn, quoted_table: str, srid: int, pixel_size: float,
@@ -68,8 +68,7 @@ def main() -> int:
     if not all(math.isfinite(s) and s > 0 for s in (args.log_scale, args.asinh_scale)):
         parser.error("curve scales must be finite and positive")
     output = args.output.resolve()
-    package_root = Path(__file__).resolve().parents[4]
-    repository = package_root.parents[1] if package_root.parent.name == "services" else package_root
+    repository = Path(__file__).resolve().parents[2]
     if output == repository or repository in output.parents:
         parser.error("runtime output must be outside the repository")
     if output.exists():

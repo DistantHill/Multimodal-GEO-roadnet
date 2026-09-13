@@ -21,7 +21,7 @@ build:
 
 test:
 	$(COMPOSE_DEV) run --rm backend pytest
-	$(COMPOSE_DEV) run --rm pipeline pytest
+	$(COMPOSE_DEV) run --rm pipeline python -m pytest tests scripts/cv_human_check/tests
 
 frontend-test:
 	cd apps/frontend && npm test && npm run build

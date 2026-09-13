@@ -3,8 +3,8 @@ import json
 import numpy as np
 import pytest
 
-from track.v2.cv_preview import fit_profile
-from track.v2.cv_tuning import render_comparison, write_tuning_report
+from scripts.cv_human_check.preview import fit_profile
+from scripts.cv_human_check.tuning import render_comparison, write_tuning_report
 
 
 def test_three_family_sweep_reuses_frozen_training_profile_and_saved_counts(tmp_path):
@@ -51,8 +51,8 @@ def test_embedded_configuration_cannot_end_script_block():
 
 def test_cli_does_not_write_runtime_files_into_repository(monkeypatch):
     from pathlib import Path
-    from track.v2.cli.cv_tune import main
-    package_root = Path(__file__).resolve().parents[2]
+    from scripts.cv_human_check.cv_tune import main
+    package_root = Path(__file__).resolve().parents[3]
     monkeypatch.setattr("sys.argv", ["cv-tune", "--preview", "/tmp/unused", "--output", str(package_root / "unsafe")])
     with pytest.raises(SystemExit) as error:
         main()

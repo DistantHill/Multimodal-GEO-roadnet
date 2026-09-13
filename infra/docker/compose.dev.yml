@@ -75,6 +75,7 @@ services:
       QDRANT_PORT: 6333
     volumes:
       - ../../services/pipeline:/app
+      - ../../scripts/cv_human_check:/app/scripts/cv_human_check:ro
       - ${DATA_ROOT:-/data/road-network}:/data
     command: ["python", "-m", "pipeline", "serve"]
     depends_on:

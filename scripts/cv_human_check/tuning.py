@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from .cv_preview import PERCENTILES, normalize
+from .preview import PERCENTILES, normalize
 
 
 TRAINING_METHODS = ("sqrt", "log1p", "asinh")

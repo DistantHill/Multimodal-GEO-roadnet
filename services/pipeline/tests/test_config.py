@@ -47,11 +47,3 @@ def test_run_subcommand_forwards_help_to_original_cli(monkeypatch) -> None:
 
     delegated.assert_called_once_with()
     assert __import__("sys").argv == ["track.v2.cli.run", "--help"]
-
-
-def test_cv_preview_subcommand_forwards_help(monkeypatch) -> None:
-    monkeypatch.setattr("sys.argv", ["pipeline", "cv-preview", "--help"])
-    with patch("track.v2.cli.cv_preview.main", return_value=0) as delegated:
-        assert main() == 0
-    delegated.assert_called_once_with()
-    assert __import__("sys").argv == ["track.v2.cli.cv_preview", "--help"]

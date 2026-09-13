@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pytest
 
-from track.v2.cv_preview import (
+from scripts.cv_human_check.preview import (
     METHODS, count_quantile, fit_profile, normalize, raster_tile, split_tiles, write_report,
 )
 
@@ -86,7 +86,7 @@ def test_report_contains_five_methods_and_counts_but_no_external_assets(tmp_path
 
 
 def test_cli_rejects_invalid_configuration_before_database_access(monkeypatch, tmp_path):
-    from track.v2.cli.cv_preview import main
+    from scripts.cv_human_check.cv_preview import main
     for flag, value in [("--pixel-size", "nan"), ("--tile-size", "0"), ("--log-scale", "0")]:
         monkeypatch.setattr("sys.argv", ["cv-preview", "--detect-id", "00000000-0000-0000-0000-000000000001",
                                        "--output", str(tmp_path / "out"), flag, value])

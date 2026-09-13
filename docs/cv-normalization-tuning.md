@@ -85,7 +85,7 @@ Q=25 时的公式计算结果：
 
 ```sh
 docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm --no-deps pipeline \
-  python -m pipeline cv-tune \
+  python -m scripts.cv_human_check.cv_tune \
   --preview /data/vision/normalization/preview-20260911-v2 \
   --output /data/vision/normalization/tuning-20260911
 ```
@@ -99,4 +99,4 @@ docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm --no-dep
 
 网页支持独立调整两种 s、切换 Q、放大、规则圆叠加、导出当前参数及保存 HTML。
 原有五组历史预览保留。泛用个人模板位于用户指定 Obsidian `00_inbox`，使用
-合成示例而非项目数据；页面渲染模板源码为 Pipeline 的 `image_compare.html`。
+合成示例而非项目数据；页面渲染模板源码为 `scripts/cv_human_check/image_compare.html`。

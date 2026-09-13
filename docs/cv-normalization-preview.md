@@ -19,7 +19,7 @@
 
 ```sh
 docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm --no-deps pipeline \
-  python -m pipeline cv-preview \
+  python -m scripts.cv_human_check.cv_preview \
   --database test \
   --detect-id 91257149-a6e7-41cc-8142-c6ca83977605 \
   --output /data/vision/normalization/preview-20260911-v2 \
@@ -89,8 +89,8 @@ CDF 提亮单点并不代表单点更可靠；saturation 也不是判定交叉�
 - `tile-*-counts.npz`：原始整型计数，可重建浮点映射。
 - `tile-*-*-p*.png`：五组灰度图与截断敏感性预览。
 
-所有产物在 DATA_ROOT，均不进入 Git。源码在 Pipeline 的独立批处理入口，Backend
-请求处理与 Vision GPU 运行时不承担数据扫描。
+所有产物在 DATA_ROOT，均不进入 Git。源码在 `scripts/cv_human_check/`，复用 Pipeline 的运行环境与数据库读取接口；
+Backend 请求处理与 Vision GPU 运行时不承担数据扫描。
 
 ## 本次数据发现（2026-09-11）
 

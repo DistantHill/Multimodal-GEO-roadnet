@@ -27,4 +27,3 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "track.v2.config" = ["*.toml"]
-"track.v2" = ["image_compare.html"]
