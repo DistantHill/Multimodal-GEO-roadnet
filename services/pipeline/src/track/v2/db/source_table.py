@@ -144,6 +144,86 @@ def source_order_query(contract: SourceTableContract) -> str:
     )
 
 
+def _fingerprint_encode(value: object) -> bytes:
+    """Keep the original v1 JSON representation, including its extra fallback."""
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")
+
+
+def _fingerprint_row(row: tuple[Any, ...], *, preserve_vehicle_null: bool = False) -> bytes:
+    return _fingerprint_encode({
+        "source_row_key": str(row[0]),
+        "vehicle_id": None if preserve_vehicle_null and row[2] is None else str(row[2]),
+        "timestamp": row[3],
+        "lon": row[4],
+        "lat": row[5],
+        "heading": row[6],
+        "speed": row[7],
+        "extra": row[8] if isinstance(row[8], dict) else {},
+    })
+
+
+def calculate_input_fingerprint(
+    conn: Any,
+    contract: SourceTableContract,
+    *,
+    fetch_size: int = 10_000,
+) -> dict[str, object]:
+    """Hash all source rows, including rows not referenced by any Clean Run.
+
+    Version 2 with scope ``full_input`` is separate from the referenced-row v1
+    digest. Its domain header binds the table name, key type, version and scope.
+    Rows use the v1 canonical fields (id, vehicle_id, timestamp, lon, lat, heading,
+    speed and optional extra), except SQL NULL vehicle IDs remain JSON null rather
+    than colliding with the literal string "None". This is not a digest of geom
+    or arbitrary columns.
+    Text-cast keys use explicit PostgreSQL C collation, independent of the default
+    locale. Equal content under a different source identifier is a different input.
+
+    The caller supplies a validated contract and owns the transaction; no commit,
+    rollback, source lock or immutable snapshot is imposed. The source must stay
+    sealed between fingerprinting and computation. The fetch bound counts rows,
+    not bytes or PostgreSQL execution memory, and each row is encoded separately.
+    """
+    if type(fetch_size) is not int or fetch_size <= 0:
+        raise ValueError("fetch_size must be a positive integer")
+    metadata: dict[str, object] = {
+        "version": 2,
+        "scope": "full_input",
+        "source_table": contract.source_table,
+        "key_sql_type": contract.key_sql_type,
+    }
+    header = _fingerprint_encode(metadata)
+    digest = hashlib.sha256()
+    digest.update(len(header).to_bytes(8, "big"))
+    digest.update(header)
+    extra_sql = "source.extra" if contract.has_extra else "'{}'::jsonb"
+    query = f"""
+        SELECT source.id::text,
+               source.id IS NOT NULL,
+               source.vehicle_id,
+               source.timestamp,
+               source.lon,
+               source.lat,
+               source.heading,
+               source.speed,
+               {extra_sql}
+          FROM {contract.quoted_table} AS source
+         ORDER BY source.id::text COLLATE "C"
+    """
+    row_count = 0
+    with conn.cursor(name=f"input_fingerprint_{uuid4().hex}") as cur:
+        cur.itersize = fetch_size
+        cur.execute(query, ())
+        for row in cur:
+            encoded = _fingerprint_row(row, preserve_vehicle_null=True)
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+            row_count += 1
+    return {**metadata, "row_count": row_count, "sha256": digest.hexdigest()}
+
+
 def calculate_source_fingerprint(
     conn: Any,
     clean_id: str,
@@ -191,23 +271,7 @@ def calculate_source_fingerprint(
                 raise ValueError(
                     f"Clean Run {clean_id} references missing source row {row[0]!r}"
                 )
-            canonical = {
-                "source_row_key": str(row[0]),
-                "vehicle_id": str(row[2]),
-                "timestamp": row[3],
-                "lon": row[4],
-                "lat": row[5],
-                "heading": row[6],
-                "speed": row[7],
-                "extra": row[8] if isinstance(row[8], dict) else {},
-            }
-            encoded = json.dumps(
-                canonical,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            ).encode("utf-8")
+            encoded = _fingerprint_row(row)
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
             row_count += 1
