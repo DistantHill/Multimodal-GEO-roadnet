@@ -649,7 +649,8 @@ Q13–Q16 的保留要求仍适用于新运行的恢复依赖、尝试记录与�
 单任务块内部检查点（Q8）；强制源表权限改造/输入全量复制（Q6）。
 旧版本历史数据的无损迁移与长期留存不作为本次目标（Q18 后更正）。
 Clip/Fitting/Network 仍需完成业务验收，但尚未被要求新增任务块级恢复能力。
-GPU 和全面重写均未选定。当前继续维护 Spec，不依据局部问题的采纳直接启动实现。
+GPU 和全面重写均未选定。用户已另行授权分步实施与小模块提交；按
+[实施任务卡](pipeline-streaming-implementation.md)推进，不将设计确认或基础模块完成等同于业务验收通过。
 
 ### 9.3 设计树与当前问题前沿
 
@@ -806,7 +807,8 @@ Q12 更正后的职责为：工作单元/协调器一对多派发 → 进程池�
 
 ### 9.6 代码调研事实与证据边界
 
-以下证据来自代码阅读，未运行容量基准，也未查询实际业务表以证明物理数据分布：
+以下为实施前代码阅读的审计记录，未运行容量基准，也未查询实际业务表以证明物理数据分布。
+实施后的变化单独注明，完整进度与测试见[实施任务卡](pipeline-streaming-implementation.md)：
 
 - `services/pipeline/src/track/v2/db/source_table.py::source_order_query` 使用
   `ORDER BY vehicle_id, timestamp, id::text`，不是仅按 `id`。
@@ -907,8 +909,9 @@ Q10 发问时的 3 GB / 26M 以上 / 少于 24 小时只是历史建议，随后
 - `cli/init_db.py:34` / `:76` 已有 `parameters` JSONB，但 `pipeline.py:117`
   Clean 仅传 `cleaner_max_gap_s`，`:293` Detect 传空 `parameters`；现有记录不完整。
   `cli/run.py:139` 的 `--stats-json` 及 Pipeline 阶段时序可作为报告扩展入口。
-- `db/source_table.py:146` 的 `source_fingerprint` 仅覆盖 Clean 输出引用的源行，
-  且用普通游标，不能直接当作未完成 Clean 的完整封存批次指纹。
+- 实施前 `db/source_table.py` 的 `calculate_source_fingerprint` 仅覆盖 Clean 输出引用的源行，
+  且用普通游标。2026-09-13 的 P01 已改为命名游标并通过真实 PostgreSQL 测试，
+  但引用范围不变，仍不能当作未完成 Clean 的完整封存批次指纹；完整输入指纹属于 P06。
 - `manual_bench_windows.py:837` / `:875` 已有源码/未提交差异/依赖锁/输入摘要
   的来源追溯信息模式可参考；检索未发现生产路径完整采集 CPU/磁盘配置。
 
