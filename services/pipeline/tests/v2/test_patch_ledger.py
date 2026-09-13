@@ -552,3 +552,67 @@ def test_publish_invalid_callback_rejected_before_sql():
     with pytest.raises(ValueError, match="callable"):
         ledger.publish(42)
     assert not conn.statements
+
+
+@pytest.mark.parametrize("unlock_error", [KeyboardInterrupt(), SystemExit(), OSError("unlock lost")])
+@pytest.mark.parametrize("close_error", [None, KeyboardInterrupt(), SystemExit(), OSError("close lost")])
+def test_start_failure_preserves_original_when_cleanup_is_interrupted(unlock_error, close_error):
+    conn = Connection([(False,), (True,)])
+    original = ArithmeticError("initialization failed after acquiring lock")
+
+    class InitializationFailure(Cursor):
+        def execute(self, query, params=()):
+            result = super().execute(query, params)
+            if "SELECT signature, generation" in str(query):
+                raise original
+            return result
+
+    conn.cursor = lambda: InitializationFailure(conn)
+    close_calls = []
+
+    def execute(query, params=()):
+        assert query == "SELECT pg_advisory_unlock(%s)"
+        raise unlock_error
+
+    def close():
+        close_calls.append(True)
+        if close_error is not None:
+            raise close_error
+        conn.closed = True
+
+    conn.execute, conn.close = execute, close
+    ledger = PatchLedger(conn)
+    with pytest.raises(ArithmeticError) as raised:
+        ledger.start("run", "clean", SIGNATURE, execution_config={}, environment={})
+    assert raised.value is original
+    assert close_calls == [True]
+    assert conn.closed is (close_error is None)
+    assert conn.rollbacks == 1
+    assert ledger._lock_key is None
+    assert ledger.run_id is ledger.stage is ledger.generation is ledger.signature is None
+    if close_error is not None:
+        assert "Connection close was not confirmed" in raised.value.__notes__[0]
+
+
+def test_failed_acquisition_close_interruption_preserves_original_and_clears_identity():
+    conn = Connection([(False,)])
+    original = OSError("acquisition acknowledgement lost")
+
+    class FailedAcquisition(Cursor):
+        def execute(self, query, params=()):
+            result = super().execute(query, params)
+            if "pg_try_advisory_lock" in str(query):
+                raise original
+            return result
+
+    def close():
+        raise KeyboardInterrupt("close interrupted")
+
+    conn.cursor, conn.close = lambda: FailedAcquisition(conn), close
+    ledger = PatchLedger(conn)
+    with pytest.raises(OSError) as raised:
+        ledger.start("run", "clean", SIGNATURE, execution_config={}, environment={})
+    assert raised.value is original
+    assert "Connection close was not confirmed" in raised.value.__notes__[0]
+    assert ledger._lock_key is None
+    assert ledger.run_id is ledger.stage is ledger.generation is ledger.signature is None

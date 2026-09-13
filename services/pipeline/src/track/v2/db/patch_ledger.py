@@ -216,10 +216,18 @@ class PatchLedger:
                 if not cur.fetchone()[0]:
                     acquisition_may_hold_lock = False
                     raise RunLocked("Another coordinator owns this run")
-        except BaseException:
-            if acquisition_may_hold_lock:
-                self.conn.close()
-            self._lock_key = None
+        except BaseException as original:
+            try:
+                if acquisition_may_hold_lock:
+                    self.conn.close()
+            except BaseException:
+                original.add_note("Connection close was not confirmed; discard this connection "
+                                  "and verify the old database session ended before retrying")
+            finally:
+                self._lock_key = None
+                self.run_id = self.stage = None
+                self.generation = None
+                self.signature = None
             raise
         try:
             with self.conn.transaction(), self.conn.cursor() as cur:
@@ -257,13 +265,21 @@ class PatchLedger:
             self.run_id, self.stage = run_id, stage
             self.signature, self.generation = signature, generation
             return generation
-        except BaseException:
+        except BaseException as original:
             # Never hide the original failure if the connection is already lost.
             try:
                 self.conn.execute("SELECT pg_advisory_unlock(%s)", (key,))
-            except Exception:
-                self.conn.close()
-            self._lock_key = None
+            except BaseException:
+                try:
+                    self.conn.close()
+                except BaseException:
+                    original.add_note("Connection close was not confirmed; discard this connection "
+                                      "and verify the old database session ended before retrying")
+            finally:
+                self._lock_key = None
+                self.run_id = self.stage = None
+                self.generation = None
+                self.signature = None
             raise
 
     def close(self) -> None:
