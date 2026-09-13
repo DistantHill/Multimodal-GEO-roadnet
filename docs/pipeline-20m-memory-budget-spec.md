@@ -1,11 +1,29 @@
-# Pipeline 2,000 万行内存预算与外存化 Spec
+# 数据处理流水线（Pipeline）2,000 万行内存预算与验收标准（memory budget and acceptance criteria）设计说明（Spec）
 
-> 历史容量审计：本文基于 2026-09-02 的 pre-v3 对象生命周期。Schema v3 已将
-> Clip 改为读取最终 resolved p/i/c 序列，并重构 Detect 持久化；文中的旧结构
+术语与写作规则统一见[项目术语与写作规范](terminology.md)，本文不重复收录通用术语表。
+
+> 当前访谈状态：已确认，Q1–Q18 已收到回答；用户以“Q18通过”确认共享设计。
+> Q18 后更正：实施不要求保留旧版本历史数据，允许清理重建；重点核对前后端接口字段。
+> 当前目标：精确 26M 行、Pipeline 峰值内存 < 1 GB、全链路耗时 < 1 小时（Q10）；
+> 以十进制 1 GB = 1,000,000,000 字节解释，PostgreSQL 内存单列（Q3）。
+> 第 3 轮已确认中央提交者、进程池、外存保留与运行环境记录；Q12 已追加术语更正。
+> 第 4 轮已确认参数分类/续跑兼容性、有限重试和数值容差；现已授权分步实施。
+> 执行与提交记录见[分步实施任务卡](pipeline-streaming-implementation.md)，不以基础模块完成代替全链路验收。
+> 更新日期：2026-09-13，回答原文均已进入 QA 附录。
+> 本文复用于每日 2,600 万行以上输入的子轨迹 / 空间网格任务块流式并行设计，
+> 以及允许 C++、Rust 等原生计算内核的扩展讨论。当前需求与待决事项见第 9 节，
+> 完整输入和访谈问题见文末 QA 附录。
+> 已按用户的术语更正统一正文表述；最终设计确认来自后续独立回答“Q18通过”。
+> 第 1–8 节及下方历史状态、日期保留 2026-09-02 审计结论；本次仅规范术语；其中“当前”、
+> 精确 20M、固定 3 GB、实施要求均属于当时版本，不能直接视为本轮已确认的验收标准。
+> 当前进入分步实施，尚无 26M 容量或加速比验收结论。
+
+> 历史容量审计：本文基于 2026-09-02 的版本 3 之前（pre-v3）的对象生命周期。第 3 版数据库结构（Schema v3）已将
+> Clip 改为读取最终已解析 p/i/c 序列，并重构 Detect 持久化；文中的旧结构
 > 数字不能作为当前实现验收结果。20M 验收前必须按
-> [schema-v3 benchmark](schema-v3-cutover-benchmark.md) 重新建立基线。
+> [第 3 版数据库结构基准（schema-v3 benchmark）](schema-v3-cutover-benchmark.md) 重新建立基线。
 
-状态：容量审计完成，当前实现不达标，20M 实测待外存化改造后执行
+历史状态：容量审计完成，当时实现不达标，20M 实测待外存化改造后执行
 
 日期：2026-09-02
 
@@ -13,55 +31,55 @@
 
 适用路径：PostgreSQL 大表输入的 Cleaner → Detect → Clip → Fitting → Network
 
-## 1. 内存合同与当前结论
+## 1. 内存预算与验收口径（memory budget and acceptance criteria）：当前结论
 
 本 Spec 把“内存不超过 3 GB”定义为：
 
-- fresh Pipeline parent cgroup 设置 `memory.max = 3,000,000,000 bytes`，所有
-  Stage child cgroup 都位于其下；parent `memory.peak` 还必须小于该值，即约
+- 新建 Pipeline 父控制组（fresh Pipeline parent cgroup）设置 `memory.max = 3,000,000,000 bytes`，所有
+  阶段子控制组（stage child cgroup）都位于其下；父控制组 `memory.peak` 还必须小于该值，即约
   2,861 MiB / 2.794 GiB；
 - 运行前设置 `memory.swap.max = 0`，结束时 `memory.swap.current = 0`；
-- 使用新建 cgroup，或记录 `memory.events` 前后差值，要求本次运行新增的 `oom = 0`、
+- 使用新建控制组，或记录 `memory.events` 前后差值，要求本次运行新增的 `oom = 0`、
   `oom_kill = 0`；`memory.peak` 同样必须来自新建/已重置计量边界；
 - PostgreSQL 是独立容器，单独报告内存、临时文件和磁盘，不计入上述 Pipeline
-  3 GB。如果合同要求 Pipeline 与 PostgreSQL 合计小于 3 GB，必须另行收紧
-  PostgreSQL cgroup、`work_mem`、并行 worker 和 Pipeline 软预算；
+  3 GB。如果验收标准（acceptance criteria）要求 Pipeline 与 PostgreSQL 合计小于 3 GB，必须另行收紧
+  PostgreSQL 控制组、`work_mem`、并行工作单元和 Pipeline 软预算；
 - 2,000 万行是 Cleaner 的精确输入行数；所有下游数量仅按 100 万行基准乘 20
   做容量规划，不是算法输出承诺。
 
-当前代码不能满足这个合同，不能进入 20M 验收签字：
+当前代码不满足该验收标准（acceptance criteria），不能通过 20M 验收确认（acceptance sign-off）：
 
 - Cleaner 的生产 PG CLI 基本是流式的，按分布保持的 20× 输入预计约
   0.1–0.25 GiB，但单个超长车辆仍没有硬上限；
 - Detect 会把 12,317,500 个有效点全部保留为 Python 对象；只计两个模型对象、
-  empty `extra` 和一个 list 槽的浅层下限已经约 3.304 GiB，容器 allocation 代理
+  空 `extra` 和一个列表槽的浅层下限已经约 3.304 GiB，容器内存分配代理
   则约 6.83 GiB；
 - Clip 会再次全量物化这 12,317,500 个点，保守结构下限约 4.54 GiB，计入数值、
   字符串和客户端查询缓冲后预计约 7–8 GiB；
 - Detect、Clip、Fitting 的大对象生命周期还在 Pipeline 函数中重叠。
 
-因此，本报告的 20M 数字是 projected，不是 verified。1M 的 1.204 GiB cgroup
+因此，本报告的 20M 数字是推算，不是实测验证。1M 的 1.204 GiB 控制组
 峰值也不能简单乘 20：流式结构接近常量内存，全量对象结构才随行数近似线性增长。
 
 ### 1.1 当前内存报告
 
-下表是本次容量审计的最终结论。1M 列来自 2026-09-01 cgroup/`docker stats`
+下表是本次容量审计的最终结论。1M 列来自 2026-09-01 控制组/`docker stats`
 观测；20M 列是按本 Spec 规模模型做的对象与工作集推算，不是 20M RSS 实测。
 
-| Stage | 1M Pipeline 抽样峰值 | 20M 当前架构工作集推算 | 3 GB 结论 |
+| 阶段 | 1M Pipeline 抽样峰值 | 20M 当前架构工作集推算 | 3 GB 结论 |
 |---|---:|---:|---|
-| Cleaner | 92.6 MiB（迟到抽样） | 分布保持时约 0.1–0.25 GiB；超长单车未硬约束 | 条件可控，尚不能签字 |
-| Detect | 1,049.6 MiB | 12.3175M-point workspace 浅层下限约 3.304 GiB、容器 allocation 代理约 6.83 GiB；turn/cross output 另有独立风险代理 | **不达标** |
-| Clip | 1,226.8 MiB | 全量输入结构下限约 4.54 GiB，预计约 7–8 GiB；Clip output point graph 下限另约 2.31 GiB | **不达标** |
-| Fitting | 1,220.6 MiB | 自身新增约 0.35–0.40 GiB，但继承 Detect/Clip 大对象及 allocator 高水位 | **不达标** |
-| Network | 未采到（Stage 12ms） | 独立加载约数 MiB至数十 MiB；当前同进程仍持有上游结果 | 算法可控，当前全链路不达标 |
-| 完整 Pipeline | cgroup `memory.peak` 1.204 GiB | 无可信的去重后峰值推算；多个 O(N) 单项代理已分别违约 | **不达标，20M 未实测** |
+| Cleaner | 92.6 MiB（迟到抽样） | 分布保持时约 0.1–0.25 GiB；超长单车未强制约束 | 条件可控，尚未通过验收确认 |
+| Detect | 1,049.6 MiB | 1,231.75 万点工作区浅层下限约 3.304 GiB、容器内存分配代理约 6.83 GiB；转向/跨轨迹输出另有独立风险代理 | **不达标** |
+| Clip | 1,226.8 MiB | 全量输入结构下限约 4.54 GiB，预计约 7–8 GiB；Clip 输出点对象图下限另约 2.31 GiB | **不达标** |
+| Fitting | 1,220.6 MiB | 自身新增约 0.35–0.40 GiB，但继承 Detect/Clip 大对象及内存分配器高水位 | **不达标** |
+| Network | 未采到（阶段耗时 12 ms） | 独立加载约数 MiB至数十 MiB；当前同进程仍持有上游结果 | 算法可控，当前全链路不达标 |
+| 完整 Pipeline | 控制组 `memory.peak` 1.204 GiB | 无可信的去重后峰值推算；多个 O(N) 单项代理已分别超出内存上限 | **不达标，20M 未实测** |
 
 上述各行不能直接相加：有些临时结构串行出现，有些对象共享底层引用；但 Detect
-workspace、Detect eager output 和跨 Stage 保留确实重叠，workspace 浅层下限已足以
-否定 3 GB 合同。当前不提供一个看似精确但重复计算共享对象的 20M 总峰值。
+工作区、Detect 全量物化输出和跨阶段保留确实重叠，工作区浅层下限已足以
+判定不满足 3 GB 内存上限（memory limit）。当前不提供一个看似精确但重复计算共享对象的 20M 总峰值。
 
-## 2. 规模合同
+## 2. 数据规模与验收标准
 
 ### 2.1 推演方法
 
@@ -73,7 +91,7 @@ Cleaner 原始输入固定为精确 20,000,000 行。其他数量使用：
 
 这个模型等价于复制数据分布而不是把 20 份完全重叠的轨迹放在同一空间。若复制
 数据用于实测，每份必须使用唯一主键和车辆 ID，并做足够远的空间平移；直接重叠
-会使跨车 segment pair 接近平方增长，不再满足用户指定的线性下游假设。
+会使跨车线段对接近平方增长，不再满足用户指定的线性下游假设。
 
 ### 2.2 规划数量
 
@@ -81,31 +99,31 @@ Cleaner 原始输入固定为精确 20,000,000 行。其他数量使用：
 |---|---:|---:|---|
 | Cleaner 原始输入 | 1,000,000 | **20,000,000** | 20M 必须精确校验 |
 | 原始车辆 | 1,598 | 31,960 | 20× 推演 |
-| kept points | 614,879 | 12,297,580 | 20× 推演 |
-| injected points | 996 | 19,920 | 20× 推演 |
-| Detect active points | 615,875 | 12,317,500 | kept + injected |
-| tracks/subtracks | 34,281 | 685,620 | 20× 推演 |
-| turn events | 56,170 | 1,123,400 | 20× 推演 |
-| hotspot events | 10,082 | 201,640 | 20× 推演 |
-| cross-track candidates | 58,669 | 1,173,380 | 20× 推演 |
-| global grid memberships | 2,904,079 | 58,081,580 | 20× 推演 |
-| candidate clusters | 394 | 7,880 | 20× 推演 |
-| candidate events | 68,438 | 1,368,760 | 20× 推演 |
-| candidate crossing points | 33,808 | 676,160 | 20× 推演 |
-| complete intersections | 175 | 3,500 | 20× 推演 |
-| complete entry/exit observations | 8,243 | 164,860 | 20× 推演 |
-| clips | 31,826 | 636,520 | 20× 推演 |
-| eligible clips | 14,294 | 285,880 | 20× 推演 |
-| boundary clips | 17,532 | 350,640 | 20× 推演 |
-| points in clips | 494,646 | 9,892,920 | 20× 推演 |
-| combined centerlines | 310 | 6,200 | 20× 推演 |
-| directed centerlines | 530 | 10,600 | 20× 推演 |
-| centerline manifests | 28,588 | 571,760 | 20× 推演 |
-| network nodes / edges / isolated | 175 / 310 / 10 | 3,500 / 6,200 / 200 | 20× 推演 |
+| 保留点 | 614,879 | 12,297,580 | 20× 推演 |
+| 注入点 | 996 | 19,920 | 20× 推演 |
+| Detect 有效点 | 615,875 | 12,317,500 | 保留 + 注入 |
+| 轨迹/子轨迹 | 34,281 | 685,620 | 20× 推演 |
+| 转向事件 | 56,170 | 1,123,400 | 20× 推演 |
+| 热点事件 | 10,082 | 201,640 | 20× 推演 |
+| 跨轨迹候选 | 58,669 | 1,173,380 | 20× 推演 |
+| 全局网格归属记录 | 2,904,079 | 58,081,580 | 20× 推演 |
+| 候选簇 | 394 | 7,880 | 20× 推演 |
+| 候选事件 | 68,438 | 1,368,760 | 20× 推演 |
+| 候选穿越点 | 33,808 | 676,160 | 20× 推演 |
+| 完整交叉口 | 175 | 3,500 | 20× 推演 |
+| 完整进出观测 | 8,243 | 164,860 | 20× 推演 |
+| 片段 | 31,826 | 636,520 | 20× 推演 |
+| 可用片段 | 14,294 | 285,880 | 20× 推演 |
+| 边界片段 | 17,532 | 350,640 | 20× 推演 |
+| 片段内点 | 494,646 | 9,892,920 | 20× 推演 |
+| 合并中心线 | 310 | 6,200 | 20× 推演 |
+| 有向中心线 | 530 | 10,600 | 20× 推演 |
+| 中心线清单 | 28,588 | 571,760 | 20× 推演 |
+| 路网节点 / 边 / 孤立节点 | 175 / 310 / 10 | 3,500 / 6,200 / 200 | 20× 推演 |
 
-100 万行源表及索引的 PostgreSQL pretty-size 报告值为 527 MB；按其二进制单位
-机械外推约 10,540 MiB / 10.3 GiB。1M 新 Run 的数据库报告值约增长 400 MB，
-同口径外推约 7.8 GiB。它们只是磁盘容量量级，索引页、TOAST、数据分布和 vacuum
+100 万行源表及索引的 PostgreSQL 易读容量格式报告值为 527 MB；按其二进制单位
+机械外推约 10,540 MiB / 10.3 GiB。1M 新运行批次的数据库报告值约增长 400 MB，
+同口径外推约 7.8 GiB。它们只是磁盘容量量级，索引页、TOAST、数据分布和数据库清理
 状态会改变实际值。磁盘表大小本身不会直接决定 Pipeline 内存，读取方式才是
 决定因素。
 
@@ -118,73 +136,73 @@ Cleaner 原始输入固定为精确 20,000,000 行。其他数量使用：
 | 流式 | `M ≈ base + fetch_batch + max_group` | 总表变大主要增加时间，不应线性增加内存 |
 | 固定批次 | `M ≈ base + bytes_per_row × batch_limit` | 必须按字节而非只按行数设上限 |
 | 全量物化 | `M ≈ base + bytes_per_row × N` | 12.3M Python 对象必然突破 3 GB |
-| 跨 Stage 保留 | `M ≈ Σ live_stage_objects` | 单 Stage 看似可接受，叠加后仍会 OOM |
+| 跨阶段保留 | `M ≈ Σ live_stage_objects` | 单阶段看似可接受，叠加后仍会 OOM |
 
-Python 对象的 `bytes_per_row` 不只是 dataclass 浅尺寸，还包括：
+Python 对象的 `bytes_per_row` 不只是数据类浅尺寸，还包括：
 
-- `PointRef`、唯一 row key、vehicle/source 字符串；
-- 每个数值字段的 Python float/int 对象；
-- `extra` dict、tuple/list/dict/set 的槽位和扩容余量；
-- DB client result buffer、NumPy scratch 和 CPython allocator 碎片。
+- `PointRef`、唯一行键、车辆/源数据字符串；
+- 每个数值字段的 Python 浮点数/整数对象；
+- `extra` 字典、元组/列表/字典/集合的槽位和扩容余量；
+- 数据库客户端结果缓冲区、NumPy 临时工作区和 CPython 内存分配器碎片。
 
-cgroup `memory.peak` 还会记账 Pipeline cgroup 内的文件页缓存。因此把对象写到本地
-temp file 并不自动等于零内存；spool 必须顺序访问、限制 mmap/window 大小，并在
-消费后主动释放页缓存，或者优先放入单独计量的 PostgreSQL staging。最终仍以
-cgroup 指标验收，不能只看进程 RSS。
+控制组 `memory.peak` 还会记账 Pipeline 控制组内的文件页缓存。因此把对象写到本地
+临时文件并不自动等于零内存；磁盘暂存必须顺序访问、限制内存映射/窗口大小，并在
+消费后主动释放页缓存，或者优先放入单独计量的 PostgreSQL 中间暂存。最终仍以
+控制组指标验收，不能只看进程 RSS。
 
-只有明确标为“浅层下限”的结构数字用于证明最低占用；allocation proxy 只表示风险
-量级，两者都不能当成精确 RSS 预测。最终验收权威值只能是 20M 容器的 cgroup
+只有明确标为“浅层下限”的结构数字用于证明最低占用；内存分配代理测量只表示风险
+量级，两者都不能当成精确 RSS 预测。最终验收权威值只能是 20M 容器的控制组
 `memory.peak`。
 
 ### 3.1 全量物化清单
 
-| Stage | 当前全量物化点 | 与 20M 规模关系 | 处理决定 |
+| 阶段 | 当前全量物化点 | 与 20M 规模关系 | 处理决定 |
 |---|---|---|---|
-| Cleaner | 公共 `clean()` 的 active/excluded/subtracks；生产 PG 路径不走它 | O(raw/active rows) | DB Pipeline 禁用 eager API；单车状态也要 spill |
-| Detect | `tracks` dict、turn/ortho/cross lists、segment/grid、G*/DBSCAN、topology point arrays、`IntersectResult` | O(active points + events + memberships) | DB staging + tile/halo + shard；只返回 compact summary |
-| Detect persistence | 全量 row tuple、`_with_stage_id` 第二份 list、百万级临时候选归属 map | O(output rows) | generator COPY + 分批/外存映射 |
-| Clip | unnamed cursor result、`grouped_rows`、全部 `TrajectoryPoint`、`ClipInput`、完整 `ClipResult` | O(active points + clips + clip points) | named cursor，一次一个 subtrack，eligible clip 写 spool |
-| Fitting | 全部 oriented coordinate tuples、pair NumPy stack、manifest rows | O(eligible clip points + manifests) | 一次一个 pair，sample matrix spill，generator manifest |
-| Network | 自身图很小，已只读取 Clip 携带的 compact intersections，但 runner 仍保留上游结果与 `fit_bundle` | O(intersections + centerlines)，另继承上游 | 从持久化窄表加载，Stage 进程隔离 |
+| Cleaner | 公共 `clean()` 的有效/剔除/子轨迹；生产 PG 路径不走它 | O(原始/有效行) | DB Pipeline 禁用全量物化接口；单车状态也要外存溢写 |
+| Detect | `tracks` 字典、转向/正交/跨轨迹列表、线段/空间网格、G*/DBSCAN、拓扑点数组、`IntersectResult` | O(有效点 + 事件 + 归属记录) | DB 中间暂存 + 空间分块/邻域缓冲区 + 分片；只返回紧凑摘要 |
+| Detect 持久化 | 全量行元组、`_with_stage_id` 第二份列表、百万级临时候选归属映射 | O(输出行) | 生成器 COPY + 分批/外存映射 |
+| Clip | 未命名游标结果、`grouped_rows`、全部 `TrajectoryPoint`、`ClipInput`、完整 `ClipResult` | O(有效点 + 片段 + 片段内点) | 命名游标，一次一个子轨迹，可用片段写磁盘暂存 |
+| Fitting | 全部定向坐标元组、配对 NumPy 堆叠数组、清单行 | O(可用片段内点 + 清单) | 一次一个配对，采样矩阵外存溢写，生成器清单 |
+| Network | 自身图很小，已只读取 Clip 携带的紧凑交叉口摘要，但运行器仍保留上游结果与 `fit_bundle` | O(交叉口 + 中心线)，另继承上游 | 从持久化窄表加载，阶段进程隔离 |
 
 ### 3.2 对象代理的证据等级
 
 本次在现有 Pipeline 镜像内使用
 `tracemalloc.get_traced_memory()[0]` 前后差除以样本数，样本量均为 100,000；每个
-样本创建独立 row key、字符串、数值和 empty dict。环境和结果为：
+样本创建独立行键、字符串、数值和空字典。环境和结果为：
 
 | 项目 | 值 |
 |---|---:|
 | 镜像 ID | `sha256:57094894992a8c07918095aff867a2d9c0ed088471e8202bfe7f83029914b37e` |
 | Python | 3.12.14 |
-| `PointRef` shallow size | 104 B |
-| `TrajectoryPoint` shallow size | 112 B |
-| empty `extra` / one list slot | 64 B / 8 B |
-| point workspace | 595.16414 B/item |
-| standalone turn | 659.01750 B/item |
-| standalone cross candidate + cluster wrapper | 1,022.79826 B/item |
+| `PointRef` 浅层大小 | 104 B |
+| `TrajectoryPoint` 浅层大小 | 112 B |
+| 空 `extra` / 单个列表槽位 | 64 B / 8 B |
+| 点数据工作区 | 595.16414 B/item |
+| 独立转向 | 659.01750 B/item |
+| 独立跨轨迹候选 + 簇包装对象 | 1,022.79826 B/item |
 
 命令通过一次性 `docker compose run --rm --no-deps pipeline` 执行，容器挂载当前源码；
-没有读取数据库。它未覆盖 NumPy、libpq、native allocator、文件页缓存，脚本与输出
-也尚未作为长期制品归档。因此它仍只是实验性 Python allocation 代理，不能当作
-cgroup RSS 实测或严格下限。若后续要把精确 bytes/row 作为长期容量基线，必须把
-harness 纳入仓库并归档命令、输出和代码哈希。
+没有读取数据库。它未覆盖 NumPy、libpq、原生内存分配器、文件页缓存，脚本与输出
+也尚未作为长期制品归档。因此它仍只是实验性 Python 内存分配代理，不能当作
+控制组 RSS 实测或严格下限。若后续要把精确字节/行作为长期容量基线，必须把
+测试驱动程序纳入仓库并归档命令、输出和代码哈希。
 
-## 4. 各 Stage 审计
+## 4. 各阶段审计
 
 ### 4.1 Parser + Cleaner
 
 当前生产 PG CLI 的主要工作集：
 
 - [`PostgresTrajectorySourceHandle.iter_points`](../services/pipeline/src/track/v2/sources.py)
-  使用 named cursor，fetch size 为 10,000；
-- 当前 PG source query 仍可能是 `SELECT *`；10,000 只限制行数，不限制超宽
-  JSON/`extra` 等字段的 fetch bytes；
+  使用命名游标，读取批量为 10,000；
+- 当前 PG 源数据查询仍可能是 `SELECT *`；10,000 只限制行数，不限制超宽
+  JSON/`extra` 等字段的读取字节数；
 - `StreamVehicleSource` 一次保留一个完整车辆；
 - [`clean_vehicle`](../services/pipeline/src/track/v2/cleaner.py) 在一个车辆内同时创建
-  gap subtracks、stationary set、kept/removed 和 injected lists；
-- [`run_pipeline`](../services/pipeline/src/track/v2/pipeline.py) 的 pending Cleaner
-  输出在约 100,000 points 后、且只在完整车辆边界 flush。
+  时间间隔子轨迹、静止点集合、保留/移除和注入列表；
+- [`run_pipeline`](../services/pipeline/src/track/v2/pipeline.py) 的待处理 Cleaner
+  输出在约 100,000 点后、且只在完整车辆边界批量写出。
 
 生产 PG 路径的内存关系近似为：
 
@@ -196,156 +214,156 @@ M_cleaner ≈ base
 ```
 
 它不是 O(20M)。在“车辆数和每车点数分布保持、只把总体放大 20×”的假设下，
-根据 1M Cleaner 迟到抽样峰值 92.6 MiB，规划值约 0.1–0.25 GiB，建议 Stage
+根据 1M Cleaner 迟到抽样峰值 92.6 MiB，规划值约 0.1–0.25 GiB，建议阶段
 预算为 0.5 GB。
 
-但当前仍不能做硬保证：
+但当前仍不能做严格保证：
 
-- flush 只能在完整车辆之后发生，单个超长车辆可绕过 100k 阈值；
-- 公共 [`clean()`](../services/pipeline/src/track/v2/cleaner.py) 会累积所有 active、
-  excluded 和 subtracks，12,317,500 active points 粗估约 4.5–7 GiB，禁止用于
+- 批量写出只能在完整车辆之后发生，单个超长车辆可绕过 10 万个阈值；
+- 公共 [`clean()`](../services/pipeline/src/track/v2/cleaner.py) 会累积所有有效、
+  剔除和子轨迹，12,317,500 有效点粗估约 4.5–7 GiB，禁止用于
   20M DB Pipeline；
 - [`PostgresPipelineStore.persist_clean_batch`](../services/pipeline/src/track/v2/db/pipeline_store.py)
-  当前直接清空 `pending_excluded` 而没有持久化；1M 的 zero-exclusion 数据恰好掩盖
+  当前直接清空 `pending_excluded` 而没有持久化；1M 的零剔除数据恰好掩盖
   了这个正确性问题；
-- Cleaner flush 还会创建全批 `assigned_subtracks` wrapper list；injected writer 会先
-  创建全批 rows，再由 `_with_stage_id` 创建第二份 tuple list。这些受当前 100k
+- Cleaner 批量写出还会创建全批 `assigned_subtracks` 包装对象列表；注入写入器会先
+  创建全批行，再由 `_with_stage_id` 创建第二份元组列表。这些受当前 100k
   软批次约束，但仍是必须纳入预算的批内物化；
-- CSV 路径还会保留 raw insert ID map；本 Spec 的主合同只覆盖 PG 大表输入。
+- CSV 路径还会保留原始插入标识映射；本 Spec 的验收范围只覆盖 PG 大表输入。
 
 达标改造要求：
 
-- PG 查询改为只投影 parser、排序和 source reference 需要的窄列；同时记录
-  `max_fetched_row_bytes` / `max_fetch_batch_bytes`，不能只依赖 10k 行阈值；
-- 用有状态的固定行/字节 reader 替换或绕过
-  `StreamVehicleSource.iter_vehicle_tracks()` 的整车物化，再把 chunk 交给 Cleaner；
-  reader 只保留 gap、stationary run 和 orthogonal injection 所需的最小
-  look-behind；
-- 超过单车硬上限的 undecided stationary run 写入外存，不允许继续扩大 Python list；
-- kept/injected/excluded 使用生成器直接 COPY，禁止构造第二份 stage-ID row list；
-- 真正写入 `excluded_points`；非零 exclusion 必须有持久化
+- PG 查询改为只投影解析器、排序和源数据引用需要的窄列；同时记录
+  `max_fetched_row_bytes` / `max_fetch_batch_bytes`，不能只依赖 1 万行阈值；
+- 用有状态的固定行/字节读取器替换或绕过
+  `StreamVehicleSource.iter_vehicle_tracks()` 的整车物化，再把数据块交给 Cleaner；
+  读取器只保留时间间隔、连续静止点段和正交点注入所需的最小
+  回看上下文；
+- 超过单车硬上限的待判定连续静止点段写入外存，不允许继续扩大 Python 列表；
+- 保留/注入/剔除使用生成器直接 COPY，禁止构造第二份阶段-ID 行列表；
+- 真正写入 `excluded_points`；非零剔除必须有持久化
   回归测试；
 - 计时外 `COUNT(*)` 必须等于 20,000,000；流结束后 `ReadReport.total_rows` 也必须
-  等于 20,000,000，且 `loaded_rows + skipped_rows = total_rows`。本合同要求 Cleaner
+  等于 20,000,000，且 `loaded_rows + skipped_rows = total_rows`。本验收标准要求 Cleaner
   收到精确 20M 有效输入，因此还要求 `skipped_rows = 0` 和 `total_raw = 20,000,000`；
   `pg_class.reltuples` 只能用于进度。
 
 ### 4.2 Detect
 
-#### 全量轨迹 workspace
+#### 全量轨迹工作区
 
 [`_stream_vehicle_tracks_from_db`](../services/pipeline/src/track/v2/db/queries.py) 本身
-是 named cursor，但
+是命名游标，但
 [`_stream_extract_method_1`](../services/pipeline/src/track/v2/intersect2.py)
-把每个 track 存入全局 `tracks` dict，直到 cross-track 和 topology 都结束才释放。
+把每个轨迹存入全局 `tracks` 字典，直到跨轨迹和拓扑都结束才释放。
 
-Pipeline Python 3.12 容器内，`PointRef + TrajectoryPoint + empty extra + 一个 list
-slot` 的不重复浅层尺寸为 `104 + 112 + 64 + 8 = 288 B/point`：
+Pipeline Python 3.12 容器内，`PointRef + TrajectoryPoint + 空 `extra` + 一个列表
+slot` 的不重复浅层尺寸为 `104 + 112 + 64 + 8 = 288 B/点`：
 
 ```text
-12,317,500 × 288 B ≈ 3.304 GiB > 2.794 GiB contract
+12,317,500 × 288 B ≈ 3.304 GiB > 2.794 GiB memory limit
 ```
 
-它还没有计算每行字符串、float/int、track list/dict 头和 allocator 碎片，已经违反
-合同。同一容器的 100k `tracemalloc` allocation 代理测得约 595.16 B/point：
+它还没有计算每行字符串、浮点数/整数、轨迹列表/字典头和内存分配器碎片，已经超出
+内存上限。同一容器的 10 万个 `tracemalloc` 内存分配代理测得约 595.16 B/点：
 
 ```text
 12,317,500 × 595.16414 B ≈ 6.83 GiB
 ```
 
-这个数还不含 685,620 个 track list、外层 dict、turn/cross events 和算法 scratch，
-单 workspace 已超过合同两倍。
+这个数还不含 685,620 个轨迹列表、外层字典、转向/跨轨迹事件和算法临时工作区，
+单工作区已超过内存上限的两倍。
 
-#### Cross-track guard 与 fallback
+#### 跨轨迹保护阈值与回退路径
 
-1M 全局网格为 2,904,079 memberships；20× 规划为 58,081,580，必然超过当前
-8,000,000 guard。但 guard 在 `_prepare_segments` 全量构造 Segment 对象之后才
-检查，可能在进入 fallback 前已经 OOM。
+1M 全局网格为 2,904,079 归属记录；20× 规划为 58,081,580，必然超过当前
+8,000,000 保护阈值。但保护阈值在 `_prepare_segments` 全量构造 `Segment` 对象之后才
+检查，可能在进入回退路径前已经 OOM。
 
-当前 memory-window fallback 也不是外存路径：它把全量点引用复制到所有重叠
-window buckets，处理后不立即 `pop`，而且原始 `tracks` 仍然驻留。因此调低 guard
-或进入 fallback 都不能证明 3 GB。
+当前内存窗口回退路径也不是外存路径：它把全量点引用复制到所有重叠
+窗口桶，处理后不立即 `pop`，而且原始 `tracks` 仍然驻留。因此调低保护阈值
+或进入回退路径都不能证明 3 GB。
 
-#### G*、DBSCAN、Topology 与 eager result
+#### G*、DBSCAN、拓扑与全量物化结果
 
 20× 时还会同时出现：
 
-- 1,123,400 turn events 的 G* bounds、grid、local counts 和 z-score map；
-- 1,173,380 cross candidates 的 `xs`、`ys`、labels、core flags、point-cell tuples、
-  grid、active sets 和 frontier；
-- 12,317,500 points 的 topology `points` 与 `coordinates` 两个引用数组；
-- `IntersectResult` 中全部 turns、cross candidates、1,368,760 cluster memberships、
-  676,160 crossing points 和 164,860 observations。
+- 1,123,400 转向事件的 G* 边界范围、空间网格、局部计数和标准分数映射；
+- 1,173,380 跨轨迹候选的 `xs`、`ys`、标签、核心点标记、点与网格的元组、
+  空间网格、活动集合和待处理集合；
+- 12,317,500 点的拓扑 `points` 与 `coordinates` 两个引用数组；
+- `IntersectResult` 中全部转向、跨轨迹候选、1,368,760 簇成员归属记录、
+  676,160 穿越点和 164,860 观测。
 
-standalone 对象代理估算中，turn 输出约 0.69 GiB，cross candidate 加 cluster
-包装约 1.12 GiB。它们只表示 eager output 的另一组风险量级，不是 RSS 或严格
-下限，也不能再与 6.83 GiB workspace 代理相加。
+独立对象代理估算中，转向输出约 0.69 GiB，跨轨迹候选加簇
+包装约 1.12 GiB。它们只表示全量物化输出的另一组风险量级，不是 RSS 或严格
+下限，也不能再与 6.83 GiB 工作区代理相加。
 
 #### Detect 持久化
 
-COPY 协议本身逐行，但 writer 调用方先创建全量 row tuple，`_with_stage_id` 再复制
+COPY 协议本身逐行，但写入器调用方先创建全量行元组，`_with_stage_id` 再复制
 一次。20× 转换期浅层临时量级：
 
 | 写入 | 当前转换期临时量级 |
 |---|---:|
 | `tracks_cross` | 约 385 MiB |
 | `turn_events` | 约 454 MiB |
-| candidate events | 约 282 MiB |
-| candidate crossings | 约 232 MiB |
-| complete entry/exit | 约 42 MiB |
+| 候选事件 | 约 282 MiB |
+| 候选穿越点 | 约 232 MiB |
+| 完整进出记录 | 约 42 MiB |
 
-这些值是原 rows list 与 `_with_stage_id` 新 tuple list 转换瞬间的 CPython 浅层
-载荷，未计字段对象和 libpq buffer；五个批次顺序发生，不能彼此相加，转换返回后
-原 list 可释放，但每批都与完整 `IntersectResult` 共存。百万级 turn/crossing
-候选归属 map 只在 Detect 持久化期间临时存在；`DetectPersistenceResult` 已只返回
-计数，不再把这些 map 传给后续 Stage。
+这些值是原行列表与 `_with_stage_id` 新元组列表转换瞬间的 CPython 浅层
+载荷，未计字段对象和 libpq 缓冲区；五个批次顺序发生，不能彼此相加，转换返回后
+原列表可释放，但每批都与完整 `IntersectResult` 共存。百万级转向/穿越
+候选归属映射只在 Detect 持久化期间临时存在；`DetectPersistenceResult` 已只返回
+计数，不再把这些映射传给后续阶段。
 
 #### Detect 结论
 
-当前 Detect 含多个随 active points/events 线性增长的 O(N) 结构，workspace 的
+当前 Detect 含多个随有效点/事件线性增长的 O(N) 结构，工作区的
 不重复浅层下限已经超过 3 GB，足以判定不达标。不能只通过添加 `slots`、`del`、
-`gc.collect()` 或调整 membership guard 修复，必须采用外存分区执行器：
+`gc.collect()` 或调整归属记录数量保护阈值修复，必须采用外存分区执行器：
 
-- 逐车生成 turn、ortho、segment staging rows，并按固定字节批次直接 COPY；
-- segment 按空间 tile + 精确 halo 查询，canonical owner tile 去重；高密 tile 按
-  segment 数/估算 bytes 递归细分，长 segment 进入带 GiST bbox 的 overflow 表；
-- G* 按 home cell + radius halo 两遍处理，DB 聚合 mean/variance；
-- DBSCAN 的 core/edge 按 tile 生成，跨 tile component 用紧凑 union-find 或外存
-  union edge；border point 必须定义稳定归属；
-- cluster membership 写表，不再把 CrossTrackCandidate 再包装成 TurnEvent；
-- topology 按 cluster + vehicle hash shard 查询 segment staging；
-- Detect 直接持久化，只返回 counts 和约 3,500 个 compact intersections。
+- 逐车生成转向、正交、线段中间暂存行，并按固定字节批次直接 COPY；
+- 线段按空间分块 + 精确邻域缓冲区查询，规范归属分块去重；高密空间分块按
+  线段数/估算字节递归细分，长线段进入带 GiST 包围盒的溢出表；
+- G* 按归属网格 + 半径邻域缓冲区两遍处理，DB 聚合均值/方差；
+- DBSCAN 的核心/边按空间分块生成，跨空间分块连通分量用紧凑并查集或外存
+  合并边；边界点必须定义稳定归属；
+- 簇成员归属记录写表，不再把 `CrossTrackCandidate` 再包装成 `TurnEvent`；
+- 拓扑按簇 + 车辆哈希分片查询线段中间暂存；
+- Detect 直接持久化，只返回计数和约 3,500 个紧凑交叉口摘要。
 
 ### 4.3 Clip
 
-[`fetch_clean_points`](../services/pipeline/src/track/v2/db/queries.py) 当前用 unnamed
-client cursor 读取全部 Clean 点；`_group_points` 同时保留：
+[`fetch_clean_points`](../services/pipeline/src/track/v2/db/queries.py) 当前用未命名
+客户端游标读取全部 Clean 点；`_group_points` 同时保留：
 
-- 12,317,500 个 `TrajectoryPoint`、`PointRef` 和 `extra` dict；
-- 每点一个 `(anchor_sequence, point_kind, row_id, point)` tuple；
-- grouped dict/list 与最终 point lists；
+- 12,317,500 个 `TrajectoryPoint`、`PointRef` 和 `extra` 字典；
+- 每点一个 `(anchor_sequence, point_kind, row_id, point)` 元组；
+- 已分组字典/列表与最终点列表；
 - libpq 可能缓存的完整查询结果。
 
 仅 `PointRef + TrajectoryPoint + empty extra + 一个容器引用` 的低估值约
-3.304 GiB；加 grouped tuple 和返回结构的保守下限约 4.54 GiB，计入 floats、
-strings 和 DB client buffer 后预计约 7–8 GiB。
+3.304 GiB；加已分组元组和返回结构的保守下限约 4.54 GiB，计入浮点数、
+字符串和数据库客户端缓冲区后预计约 7–8 GiB。
 
-随后 `extract_clips` 又累积 636,520 个 TrackClip、1,273,040 endpoints，以及约
-8.62M interior point references。Clip output 保守 point graph 估值约 2.31 GiB；
-其中 interior tuple 引用复用输入的 `TrajectoryPoint`，不是在 4.54/7–8 GiB 之上
+随后 `extract_clips` 又累积 636,520 个 `TrackClip`、1,273,040 端点，以及约
+8.62M 内部点引用。Clip 输出保守点对象图估值约 2.31 GiB；
+其中内部点元组引用复用输入的 `TrajectoryPoint`，不是在 4.54/7–8 GiB 之上
 再创建一套点对象，但会让这些点继续存活，因此两组数字不能机械相加。
 
 达标改造要求：
 
-- 使用 server-side named cursor，按 `(vehicle_id, subtrack_index, order)` 流式归并
-  kept/injected，一次只保留一个 subtrack；
-- Clip reader 使用窄 point，只带 timestamp/lon/lat/order，不加载 heading、speed、
-  extra 和 PointRef；
-- boundary clip 只更新计数，不保存对象；eligible clip 连续写入 run-scoped、按
-  pair 建索引的 PostgreSQL/temp-file spool；
-- PostgreSQL spool 缓存归 PostgreSQL 容器单独计量；本地 spool 的 page cache、
-  readahead 和 mmap window 必须计入 Clip Pipeline cgroup 预算；
-- intersection grid 设置全局 membership bytes 上限；单交叉口 4,096-cell cap
+- 使用服务端命名游标，按 `(vehicle_id, subtrack_index, order)` 流式归并
+  保留/注入，一次只保留一个子轨迹；
+- Clip 读取器使用窄点，只带时间戳/经度/纬度/顺序，不加载方向角、速度、
+  `extra` 和 `PointRef`；
+- 边界片段只更新计数，不保存对象；可用片段连续写入运行隔离的、按
+  配对建索引的 PostgreSQL/临时文件暂存；
+- PostgreSQL 磁盘暂存缓存归 PostgreSQL 容器单独计量；本地磁盘暂存的文件页缓存、
+  预读和内存映射窗口必须计入 Clip Pipeline 控制组预算；
+- 交叉口空间网格设置全局归属记录字节上限；单交叉口 4,096 格上限
   不能替代全局预算；
 - 记录 `max_subtrack_points`、`max_live_clip_points`、`clip_grid_memberships`、
   `spool_rows` 和 `spool_bytes`。
@@ -354,110 +372,110 @@ strings 和 DB client buffer 后预计约 7–8 GiB。
 
 当前 Fitting 在完整 `ClipResult` 常驻时又执行：
 
-- 为全部 285,880 eligible clips 创建 oriented lon/lat tuples；按平均点数估算约
-  4.44M coordinate tuples，仅 tuple 和外层引用约 271 MiB；
-- 最大 connected pair 一次性构造 NumPy sample stack，没有字节预算；
-- 持久化先建 `clips_by_id`，再物化 571,760 个 16-field manifest rows，约
+- 为全部 285,880 可用片段创建定向经纬度元组；按平均点数估算约
+  4.44M 坐标元组，仅元组和外层引用约 271 MiB；
+- 最大连通交叉口对一次性构造 NumPy 采样堆叠数组，没有字节预算；
+- 持久化先建 `clips_by_id`，再物化 571,760 个 16 字段清单行，约
   109–115 MiB，最后才进入流式 COPY。
 
 Fitting 自身新增量不是当前最大风险，问题是它与完整 Detect、Clip 对象共存。
 
 达标改造要求：
 
-- 从 clip spool 按 `(from_intersection_id, to_intersection_id)` 一次读取一个 pair；
-- 同一遍生成 combined、A→B、B→A，避免三次全量遍历；
-- 对 `max_clips_per_pair` 和 `max_pair_sample_matrix_bytes` 设置硬预算，超限使用
-  memmap/DB spill，而不是依赖平均 pair 大小；
-- 本地 memmap 的 resident pages 仍计入 Fitting Pipeline cgroup；记录 peak resident
-  window，并用有界 window/顺序访问/reclaim 控制 page cache；
-- centerline 按固定 pair 批次 `INSERT ... RETURNING`；manifest 用一次性 generator
+- 从片段磁盘暂存按 `(from_intersection_id, to_intersection_id)` 一次读取一个配对；
+- 同一遍生成合并、A→B、B→A，避免三次全量遍历；
+- 对 `max_clips_per_pair` 和 `max_pair_sample_matrix_bytes` 设置内存上限，超限使用
+  内存映射数组/DB 外存溢写，而不是依赖平均配对大小；
+- 本地内存映射数组的驻留页仍计入 Fitting Pipeline 控制组；记录峰值驻留
+  窗口，并用有界窗口/顺序访问/回收控制文件页缓存；
+- 中心线按固定配对批次 `INSERT ... RETURNING`；清单用一次性生成器
   直接 COPY，禁止完整 `manifest_rows`；
-- issue 只保留计数和有界样本。
+- 问题记录只保留计数和有界样本。
 
 ### 4.5 Network
 
-20× 规划只有约 3,500 nodes 和 6,200 combined edges，Network 自身预计为数 MiB
+20× 规划只有约 3,500 节点和 6,200 合并边，Network 自身预计为数 MiB
 到几十 MiB，不是主要风险。
 
-当前问题是 Network 为取得 intersections 而迫使完整 `iresult` 活到 Pipeline 最后。
-`build_network` 已支持 `Iterable[ClipIntersection]`，应从持久化 intersections 加载
-轻量对象；combined centerlines 也从持久化结果读取。Detect/Fit 大对象不得跨入
-Network Stage。另记录 `total_centerline_points`、`max_centerline_points` 和
-`max_geometry_bytes`，防止异常超长 centerline 绕过 node/edge 数量预算。
+当前问题是 Network 为取得交叉口而迫使完整 `iresult` 活到 Pipeline 最后。
+`build_network` 已支持 `Iterable[ClipIntersection]`，应从持久化交叉口加载
+轻量对象；合并中心线也从持久化结果读取。Detect/Fit 大对象不得跨入
+Network 阶段。另记录 `total_centerline_points`、`max_centerline_points` 和
+`max_geometry_bytes`，防止异常超长中心线绕过节点/边数量预算。
 
-### 4.6 跨 Stage 生命周期
+### 4.6 跨阶段生命周期
 
 当前 [`run_pipeline`](../services/pipeline/src/track/v2/pipeline.py) 在同一 Python
 函数和进程中保留 `iresult`、`clip_result`、`fit_bundle`，即使局部变量 `del`，
-CPython arena 也不保证把 RSS 归还给 OS。
+CPython 内存分配区域也不保证把 RSS 归还给 OS。
 
-硬合同要求小型 orchestrator 分别启动 Cleaner、Detect、Clip、Fitting 和 Network
-子进程。每个子进程只通过 Run ID/数据库/spool 传递状态；进程退出由 OS 回收全部
-heap 和 native allocator 高水位。`gc.collect()`、`malloc_trim()` 只能是辅助，
+强制约束（hard constraint）要求小型编排器分别启动 Cleaner、Detect、Clip、Fitting 和 Network
+子进程。每个子进程只通过运行批次 ID/数据库/磁盘暂存传递状态；进程退出由 OS 回收全部
+堆内存和原生内存分配器高水位。`gc.collect()`、`malloc_trim()` 只能是辅助，
 不能作为 3 GB 证明。
 
 ## 5. 目标内存预算
 
-五个 Stage 在独立子进程中顺序执行，以下预算不相加：
+五个阶段在独立子进程中顺序执行，以下预算不相加：
 
-以下 MB 均为十进制 MB，与 3,000,000,000-byte 硬门槛口径一致。
-软上限指该 Stage 运行时整个 Pipeline cgroup 的工作集，包含 orchestrator、Python
-heap、NumPy/libpq native buffer、allocator 保留和文件页缓存，不是算法对象净大小。
+以下 MB 均为十进制 MB，与 3,000,000,000-字节内存上限口径一致。
+软上限指该阶段运行时整个 Pipeline 控制组的工作集，包含编排器、Python
+堆内存、NumPy/libpq 原生缓冲区、内存分配器保留和文件页缓存，不是算法对象净大小。
 
-| Stage | 目标软上限 | 硬门槛前余量 | 当前状态 |
+| 阶段 | 目标软上限 | 内存上限前余量 | 当前状态 |
 |---|---:|---:|---|
-| Cleaner | 500 MB | 2.5 GB | 预计可控，但缺超长车辆 spill |
+| Cleaner | 500 MB | 2.5 GB | 预计可控，但缺超长车辆外存溢写 |
 | Detect | 2,500 MB | 500 MB | 不达标，必须外存化 |
-| Clip | 1,500 MB | 1.5 GB | 不达标，必须流式 + spool |
-| Fitting | 1,500 MB | 1.5 GB | 不达标，必须按 pair + spill |
+| Clip | 1,500 MB | 1.5 GB | 不达标，必须流式 + 磁盘暂存 |
+| Fitting | 1,500 MB | 1.5 GB | 不达标，必须按配对 + 外存溢写 |
 | Network | 256 MB | 2.744 GB | 算法可控，需切断上游引用 |
 
 Detect 内部互斥工作区预算：
 
 | 子阶段 | 最大工作集 |
 |---|---:|
-| 逐车 decode / staging COPY | 256 MB |
-| 一个 segment tile + halo | 512 MB |
-| G* / DBSCAN / union scratch | 512 MB |
-| 一个 topology shard | 512 MB |
-| COPY output batch | 128 MB |
-| runtime、allocator、page-cache 预留 | 至少 768 MB |
+| 逐车解码 / 中间暂存 COPY | 256 MB |
+| 一个线段空间分块 + 邻域缓冲区 | 512 MB |
+| G* / DBSCAN / 合并临时工作区 | 512 MB |
+| 一个拓扑分片 | 512 MB |
+| COPY 输出批次 | 128 MB |
+| 运行时、内存分配器、文件页缓存预留 | 至少 768 MB |
 
-触及 2.25–2.5 GB Pipeline 软水位时必须 split/spill，不能继续分配并等待 3 GB
-cgroup OOM。预算必须以 bytes 和实测 high-water 校准，不只配置“多少行”。
+触及 2.25–2.5 GB Pipeline 软水位时必须拆分/外存溢写，不能继续分配并等待 3 GB
+控制组 OOM。预算必须以字节和实测高水位校准，不只配置“多少行”。
 
 ## 6. 改造验收顺序
 
-### Phase A：消除隐式复制
+### 阶段 A：消除隐式复制
 
-- 给 `TrackModel` 增加空 slots，使 `slots=True` 子类真正没有实例 dict；
-- `_copy_insert` 接受一次性 iterable，stage ID 由 generator 附加；
-- 修复 Cleaner exclusion self-copy/跨 subtrack 累积，并持久化 exclusions；
-- Detect 完成后只保留 compact intersections，并及时释放临时候选归属 maps；
-- 新增精确输入行数断言和所有 high-water telemetry。
+- 给 `TrackModel` 增加空槽位，使 `slots=True` 子类真正没有实例字典；
+- `_copy_insert` 接受一次性可迭代对象，阶段 ID 由生成器附加；
+- 修复 Cleaner 剔除自复制/跨子轨迹累积，并持久化剔除记录；
+- Detect 完成后只保留紧凑交叉口摘要，并及时释放临时候选归属映射；
+- 新增精确输入行数断言和所有高水位监测。
 
-这些改动会降低常数，但单独完成 Phase A 仍不能宣称 20M 达标。
+这些改动会降低常数，但单独完成阶段 A 仍不能宣称 20M 达标。
 
-### Phase B：Detect 外存化
+### 阶段 B：Detect 外存化
 
-- 建立 run-scoped event/segment/cluster membership staging；
-- 完成 tile/halo、overflow、G* 两遍、跨 tile DBSCAN union 和 topology shard；
-- 保留当前 eager `IntersectResult` 仅作为小输入/单测 API；DB Pipeline 使用 bounded
-  executor。
+- 建立运行隔离的事件/线段/簇成员归属记录中间暂存；
+- 完成空间分块/邻域缓冲区、溢出、G* 两遍、跨空间分块 DBSCAN 合并和拓扑分片；
+- 保留当前全量物化 `IntersectResult` 仅作为小输入/单测 API；DB Pipeline 使用有界
+  执行器。
 
-### Phase C：Clip/Fitting 外存化
+### 阶段 C：Clip/Fitting 外存化
 
-- 一次一个 subtrack 生成 Clip；
-- eligible clip 写 pair-indexed spool；
-- 一次一个 pair 拟合三个 variant；
-- centerline 与 manifest 边算边持久化。
+- 一次一个子轨迹生成 Clip；
+- 可用片段写按配对索引的磁盘暂存；
+- 一次一个配对拟合三个变体；
+- 中心线与清单边算边持久化。
 
-### Phase D：进程隔离与 20M 验收
+### 阶段 D：进程隔离与 20M 验收
 
-- 独立 Stage 子进程；
-- fresh Pipeline parent cgroup `memory.max=3,000,000,000` bytes、
-  `memory.swap.max=0`；每个 Stage child cgroup 单独计量；
-- 执行精确 20M 实测并归档 stage/cgroup/PostgreSQL 证据。
+- 独立阶段子进程；
+- 新建 Pipeline 父控制组（fresh Pipeline parent cgroup） `memory.max=3,000,000,000` 字节、
+  `memory.swap.max=0`；每个阶段子控制组单独计量；
+- 执行精确 20M 实测并归档阶段/控制组/PostgreSQL 证据。
 
 ## 7. 20M 最终内存报告格式
 
@@ -465,45 +483,1081 @@ cgroup OOM。预算必须以 bytes 和实测 high-water 校准，不只配置“
 
 | 指标 | 必填值 |
 |---|---|
-| exact source rows | 必须为 20,000,000 |
-| planned / actual downstream counts | 同时报告，解释偏差 |
-| 每 Stage child cgroup `memory.peak` | Cleaner、Detect、Clip、Fitting、Network；`VmHWM` 仅作辅助 |
-| Pipeline parent `memory.max` / `memory.peak` | 3,000,000,000 bytes / bytes、MiB、GiB |
+| 精确源数据行数 | 必须为 20,000,000 |
+| 规划 / 实际下游数量 | 同时报告，解释偏差 |
+| 每个阶段子控制组的 `memory.peak` | Cleaner、Detect、Clip、Fitting、Network；`VmHWM` 仅作辅助 |
+| Pipeline 父控制组 `memory.max` / `memory.peak` | 3,000,000,000 字节 / 字节、MiB、GiB |
 | `memory.swap.max` / `memory.swap.current` | 必须为 0 / 0 |
-| `memory.events` | 新 cgroup 或前后差值：`oom=0`、`oom_kill=0` |
-| max group | `max_vehicle_points`、`max_subtrack_points` |
-| Detect partition | max tile rows/bytes、overflow segments、union edges |
-| Clip spool | rows、bytes、max live points、grid memberships |
-| Fitting pair | max clips/pair、max sample matrix bytes、spill count |
-| PostgreSQL | cgroup `memory.peak`（或注明采样周期的近似峰值）、temp files/bytes、database growth |
+| `memory.events` | 新控制组或前后差值：`oom=0`、`oom_kill=0` |
+| 最大分组 | `max_vehicle_points`、`max_subtrack_points` |
+| Detect 分区 | 单个空间分块的最大行数/字节数、溢出线段数、合并边数 |
+| Clip 磁盘暂存 | 行、字节、最大存活点数、网格归属记录 |
+| Fitting 配对 | 每对交叉口的最大片段数、最大采样矩阵字节数、外存溢写次数 |
+| PostgreSQL | 控制组 `memory.peak`（或注明采样周期的近似峰值）、临时文件/字节、数据库增长量 |
 
 验收条件：
 
-1. source `COUNT(*)`、`ReadReport.total_rows`、`loaded_rows` 和 `total_raw` 均为
+1. 源数据 `COUNT(*)`、`ReadReport.total_rows`、`loaded_rows` 和 `total_raw` 均为
    20,000,000，`skipped_rows=0`；
 2. Cleaner、Detect、Clip、Fitting、Network 全部完成；
-3. fresh Pipeline parent cgroup 的 `memory.max=3,000,000,000`、
-   `memory.peak < 3,000,000,000 bytes`、`memory.swap.max=0`，且无 swap/OOM；
-4. 所有分区/单组 hard limit 均有 telemetry，发生超限时进入 split/spill 而不是
+3. 新建 Pipeline 父控制组的 `memory.max=3,000,000,000`、
+   `memory.peak < 3,000,000,000 bytes`、`memory.swap.max=0`，且无交换空间/OOM；
+4. 所有分区/单组硬性上限均有监测，发生超限时进入拆分/外存溢写而不是
    累积或失败；
 5. 输出完整性通过。若算法语义有意变化，必须更新对应差分基线，不能只看行数。
 
-在 Phase B、C、D 完成并跑过真实 20M 前，最终内存占用栏必须写“未验证”，不能
-用本 Spec 的 projected 数字代替实测。
+在阶段 B、C、D 完成并跑过真实 20M 前，最终内存占用栏必须写“未验证”，不能
+用本 Spec 的推算数字代替实测。
 
 ## 8. 测试要求
 
-- poison/lazy iterator 证明 COPY writer 不会预消费全量 rows；
-- 非零 exclusion 跨多个 subtrack 后必须完整持久化，不能 self-copy 或静默丢弃；
-- 超宽 JSON/`extra` source row 必须被窄投影隔离，fetch batch bytes 有硬上限；
-- 单个超长车辆、stationary run 和 subtrack 必须触发 spill；
-- segment 跨 tile 边/角、长 segment overflow、同车过滤和 canonical owner 去重；
-- G* halo、DBSCAN 跨至少三个 tile 的 chain、noise→border、多簇 border；
-- topology 的 vehicle shard、时间块边界、等 timestamp；
-- Clip endpoint、clip ID/order、三个 centerline variant 和 manifest 顺序与小输入
-  eager oracle 差分一致；
-- 一个超大 connected pair 必须触发 sample matrix spill；
-- 一个超长 centerline 必须触发 Network geometry hard limit 或有界流式路径；
-- Stage 子进程结束后，下一 Stage 不保留前一 Stage Python 对象；
-- 1×/2×/4× 分区测试的峰值随最大 partition 而非总 N 增长；
-- 20M cgroup 硬限制集成测试。
+- 提前读取即报错的迭代器/惰性迭代器证明 COPY 写入器不会预消费全量行；
+- 非零剔除跨多个子轨迹后必须完整持久化，不能自复制或静默丢弃；
+- 超宽 JSON/`extra` 源数据行必须被窄投影隔离，批次读取字节数有硬上限；
+- 单个超长车辆、连续静止点段和子轨迹必须触发外存溢写；
+- 线段跨空间分块边/角、长线段溢出、同车过滤和规范归属者去重；
+- G* 邻域缓冲区、DBSCAN 跨至少三个空间分块的链式连接、噪声点→边界点、多簇边界；
+- 拓扑的车辆分片、时间块边界、等时间戳；
+- Clip 端点、片段 ID/顺序、三个中心线变体和清单顺序与小输入
+  全量参考实现差分一致；
+- 一个超大连通交叉口对必须触发采样矩阵外存溢写；
+- 一个超长中心线必须触发 Network 几何硬性上限或有界流式路径；
+- 阶段子进程结束后，下一阶段不保留前一阶段 Python 对象；
+- 1×/2×/4× 分区测试的峰值随最大分区而非总 N 增长；
+- 20M 控制组内存上限集成测试。
+
+## 9. 2026-09-13 流式任务块与多语言并行设计（已确认）
+
+### 9.1 文档归属、背景与记录规则
+
+本轮检索了 `docs/` 下非模板文档的正文，关键词包括流式、任务块、子任务块、
+外存、内存预算、并行。本文已有 Detect 外存分区、Clip/Fitting 磁盘暂存、控制组
+预算和全链路容量验收内容，与本轮问题一致，因此在原文基础上追加，未新建重复 Spec。
+`pipeline-1m-performance-benchmark-spec.md` 是历史基准，
+`schema-v3-cutover-benchmark.md` 是 v3 验证契约；
+`main-projection-query-repair-spec.md` 属于已执行的投影修复范围，作为兼容性背景，
+不在本文覆盖或修改该修复的历史决定。
+
+用户从约 100 万行基线出发，提出每日 2,600 万行以上输入的容量需求（H1），
+随后明确两种任务块规则和只显式指定最大内存的使用方式（H3），并允许性能热点
+使用 C++ 或其他高性能语言（H4）。H1–H4 为附录保留的用户历史原文，不是新设计
+问题，也不占用 Q 编号。用户回答“建议都采纳”，对应最近一轮 Q1–Q4 的推荐；
+不扩大解释为采纳全部历史方案，也不是对完整 Spec 的最终确认或开始实现的指令。
+
+历史问题 Q1–Q4 已在前一次 grilling 回复发出，此次原样补录，不重置编号，
+不重复创建第二套问答。第 2 轮为 Q5–Q10，第 3 轮为 Q11–Q14；
+Q10 是第 2 轮的补充回答，因其确定验收目标而在第 3 轮末尾追加 Q14。
+补充、更正关联原 Q 并保留原文；第 4 轮为 Q15–Q17。Q12 的后续更正独立保留，
+不覆盖第 3 轮合并回答。
+Q18 之后用户提出系统性术语更正，正文和历史审计已统一术语，数值/技术结论不变；
+通用术语现统一维护于[项目术语与写作规范](terminology.md)，本文仅引用；
+历史问答原文保留，更正原文追加在附录。术语调整本身不是最终设计确认；
+用户随后独立回答“Q18通过”，当时仅确认设计；后续另行授权子代理分步实施和小模块提交。
+Q18 后用户进一步更正 9.8：旧版本历史数据可删除，不要求为其保留专门迁移逻辑，
+实施重点转为前后端接口字段一致性；原文见附录。此更正不取消运行中的恢复要求。
+本文所有章节均适用；新增 HTTP 接口/用户界面接口目前无明确需求，不擅自扩大范围。
+
+### 9.2 已知需求、目标与非目标
+
+| 来源 | 用户已明确的输入或要求 | 尚未确定的边界 |
+| --- | --- | --- |
+| H1、Q8、Q10、Q11、Q14–Q16 | 业务每日 26M 以上；首轮精确 26M、< 1 GB、< 1 小时；固定真实分布/环境；Refine/Detect 可恢复，提交不明先核查，兼容续跑/有限重试 | 代表性数据实例及工程实现验证 |
+| H3、Q5 | 按 `subtrack_index` 聚合，优先完整子轨迹；任务块内以子轨迹为计算对象 | 具体逻辑排序/分组接口；不要求全局 `id` 优先 |
+| H3、Q7 | 末组超过 n 留到下一任务块；n 是软目标，预算内超长完整组可独占 | 外存实现与资源最低要求；内存不可突破 |
+| H3 | 按默认空间划分生成根空间网格；超过 `n` 的空间网格细分为子任务块，计算参数继承父任务块 | 空间网格参数、邻域/线段读取规则、细分终止和归并语义 |
+| H3、Q3、Q10、Q14 | 每次运行只显式要求最大内存，自动决定并发和任务块行数；首轮整个 Pipeline < 1 GB；记录硬件和生效参数 | 自动校准机制、运行报告具体字段 |
+| H4 | 计算不限于 Python；热点允许使用 C++ 或其他高性能语言 | 原生语言、绑定方式、线程数、迁移热点均未选定 |
+
+第 1 轮已确认决定（回答原文与对应范围见附录）：
+
+- Q1：首版处理封存批次，每批固定输入版本，内部流式读取；持续增量计算另设分支。
+- Q2：首先保持当前算法语义，忽略自增 ID 差异，核对成员、穿越配对、拓扑及
+  几何容差；原算法问题单独修正，不与性能改造混淆。数值容差已由 Q17 定值。
+- Q3：最大内存覆盖整个 Pipeline 进程组，包括协调器、所有计算进程、C++ 内存和
+  缓冲；PostgreSQL 单独配置并预留资源。具体预算数值不是本题已确认内容。
+- Q4：以真实业务链路为交付验收，框架随之形成；原生迁移按实测热点逐步进行。
+  结合本项目最终路网产出目标，按推荐中的完整链路落实到 Cleaner→Network；
+  这是对 Q4 条件式推荐的执行解释，未扩展到 Backend 长作业或 UI 改造。
+
+第 2 轮已回答决定（原文见附录第 2 轮合并回答）：
+
+- Q5：优先保证子轨迹。按完整组及算法所需逻辑时序读取/分组，不再以全局 `id`
+  连续扫描压倒完整组要求；`id` 仍可作为行身份和排序补充键。
+- Q6：当前不需要修改源数据，记录指纹即可。接受源数据不变作为运行前提，
+  首版不因本方案要求新增强制只读权限、锁表或完整输入快照。
+  指纹是检测手段，不宣称其能够阻止其他连接写入；漂移检测与恢复检查应遵守 Q1。
+- Q7：接受推荐：n 为软目标，内存为强制约束，允许降低并发和语义等价的外存路径；
+  资源仍不足时停止任务并保留阶段可恢复状态，不突破内存、不丢数据、不原样无限重试。
+- Q8：Refine(Clean) 与 Detect 整个阶段必须可恢复；不保存单任务块的内部执行
+  检查点，失败整块重算；失败不得留下业务数据部分提交，半成品不被下游读取。
+  Q11 已澄清业务结果原子提交、控制元数据可独立提交、提交确认丢失先核查；
+  不把 Q8 视为采纳原推荐的全部工作单元租约细节。并行提高吞吐，原子性来自事务。
+- Q9：首版单机多核，多机扩展以后再议。执行器和提交者结构已由 Q12 确认。
+- Q10：补充回答明确内存小于 1 GB、数据量 26M、时间小于 1 小时。
+  按 Q3 解释为整个 Pipeline 峰值内存 < 1,000,000,000 字节（十进制 GB），
+  按 Q4 解释为精确 26,000,000 原始输入行的 Cleaner→Network 全链路 < 3,600 秒。
+  先前 3 GB／24 小时建议未被采纳，保留在历史问答中，不再作为当前门槛。
+  环境选择、计时起止和禁用交换空间已由 Q14 确认；这是目标，不是已验证能力。
+
+第 3 轮已确认决定（原文见附录第 3 轮合并回答）：
+
+- Q11：允许调度、错误及运行批次进度元数据独立提交。完整任务块业务结果与完成记录
+  同事务提交；提交确认丢失先查完成记录，已提交直接复用，未提交整块重算。
+  阶段内部可使用已提交产物恢复/归并，正式下游只能读取已完整发布阶段。
+- Q12（含更正）：用户将工作单元定义为一对多的调度者，负责向进程池指派所有
+  任务块；不是工作单元与池进程一对一绑定。该工作单元承担前述协调器的派发职责，
+  池内实际计算进程统一称 `executor_process`，只读和计算，通过有界结果队列或
+  已写完的文件清单交给受运行批次排他保护的中央提交者。每个计算进程同一时刻执行
+  一个任务块，完成后复用；一个调度工作单元管理整个池，不为每个任务块新建池。
+  “所有任务块”指调度覆盖范围，不代表一次性物化或提交所有任务到无界队列。
+  原生内核可使用受总预算控制的线程。先测单提交者吞吐，
+  仅确认其成为瓶颈后扩展受控写入者，首版不引入 Dask/Ray。
+- Q13：恢复依赖的已提交产物持久保存；未提交尝试的文件可回收并重算。
+  临时文件在 `DATA_ROOT` 下按运行批次隔离，权威状态/必要中间表在 PostgreSQL。
+  项目级外存配额及磁盘安全余量不足时停止派发并保留阶段进度，不新增每次必填参数。
+- Q14：以现有开发部署的固定 CPU、PostgreSQL、磁盘配置和保持真实单日分布的
+  26M 封存数据验收。计时覆盖启动、指纹、调参、分组、暂存、计算和最终提交，
+  仅源数据导入不计时；固定并单列 PostgreSQL 资源/缓存条件，Pipeline 禁用交换空间。
+  极端长轨迹/密集空间网格另外验证有界内存、正确性和可恢复失败，不承诺任意分布
+  一小时完成。用户补充：每次运行记录机器性能、CPU、磁盘及本次参数配置；
+  配置包括用户指定值、默认值和自动选择后的实际生效值，而非只存 CLI 原文。
+
+第 4 轮已确认决定（原文见附录第 4 轮合并回答）：
+
+- Q15：接受续跑兼容性规则，并明确区分影响结果和不影响结果的参数。完整输入
+  指纹、代码/算法版本或语义参数变化则不复用旧运行批次，保留历史并另建运行批次；仅执行
+  环境/资源参数变化且语义不变可续跑，记录新配置。已登记任务范围/身份不随 n
+  改变，新的 n 只作用于尚未规划的任务，旧任务超限采用有记录的拆分。
+- Q16：接受有限自动重试：瞬时故障默认最多 3 次尝试（首次加 2 次重试），带退避；
+  资源故障仅在降低并发、缩小任务或切换外存等改变条件后重试，也受限额。
+  确定性数据/算法错误停止失败分支，重试耗尽保留进度且不发布阶段；修复后显式续跑。
+- Q17：接受初始全链路数值门槛：米制坐标绝对误差 ≤ 1e-6 m、经纬度 ≤ 1e-9°、
+  其他浮点 ≤ 1e-12，拒绝非有限值；成员、配对和拓扑严格一致，自增 ID 按业务身份
+  映射。需实现有界差分比较器，超差先分析，不自动放宽，不用几何接近掩盖拓扑变化。
+
+Q18 后的实施范围更正：不要求保留旧版本历史数据，可删除后按新结构重建；
+不以历史数据迁移成功作为交付条件，实施须核对前后端接口字段（见 9.5、9.7、9.8）。
+Q13–Q16 的保留要求仍适用于新运行的恢复依赖、尝试记录与运行配置，不应解释为
+必须永久保存本次改造之前的旧数据。源输入在一次运行期间仍保持只读和指纹一致。
+
+目标：在固定输入与既有语义下，以 < 1 GB Pipeline 峰值内存和 < 1 小时完成
+精确 26M 原始行的真实路网业务链路（Q10），PostgreSQL 单独计量（Q3）。
+两种模式采用 Q11–Q12 的统一执行/提交边界；进程池已确定，具体内核语言仍按热点选择。
+
+首版非目标：持续追加/修改输入的实时增量与迟到修订（Q1）；为加速任意改变算法
+结果（Q2）；仅完成示例函数框架即宣告业务容量交付（Q4）；首版多机执行（Q9）；
+单任务块内部检查点（Q8）；强制源表权限改造/输入全量复制（Q6）。
+旧版本历史数据的无损迁移与长期留存不作为本次目标（Q18 后更正）。
+Clip/Fitting/Network 仍需完成业务验收，但尚未被要求新增任务块级恢复能力。
+GPU 和全面重写均未选定。当前继续维护 Spec，不依据局部问题的采纳直接启动实现。
+
+### 9.3 设计树与当前问题前沿
+
+```text
+流式并行 patch 设计
+├─ Q1 已确认：封存批次
+│  └─ Q6 已回答：源数据不变前提＋指纹，不另建强制封存设施
+├─ Q2 已确认：保持当前语义
+│  ├─ Q5 已确认：完整 subtrack 优先
+│  └─ Q17 已确认：具体数值容差；邻域/owner/归并保持既有语义，实施时验证
+├─ Q3 已确认：整个 Pipeline 预算，PostgreSQL 单列
+│  ├─ Q7 已确认：n 软目标、内存硬上限、外存与资源不足可恢复失败
+│  │  └─ Q13 已确认：依赖产物保留、未提交文件可回收、配额不足停止派发
+│  └─ Q10 已回答：精确 26M，Pipeline < 1 GB，全链路 < 1 小时
+│     └─ Q14 已确认：固定环境/分布、端到端计时、无 swap、每次记录硬件/配置
+└─ Q4 已确认：真实业务全链路，热点渐进迁移
+   ├─ Q8 已回答：Refine/Detect 续跑；patch 整块重算；半成品不可下游读取
+   │  ├─ Q11 已确认：业务原子提交、元数据独立提交、确认丢失先核查
+   │  ├─ Q15 已确认：语义/执行参数分类、兼容续跑、稳定任务身份
+   │  └─ Q16 已确认：有限重试、资源错误改变条件、耗尽不发布
+   ├─ Q9 已确认：单机多核
+   │  └─ Q12 已更正：worker 一对多调度进程池，计算进程执行 patch，中央提交
+   └─ 原生热点、DDL、具体配额与校准：既定要求下的实施设计/测量，不预承诺数值
+```
+
+Q1–Q18 均已回答，需求与架构取舍已收敛，Q18 已完成最终共享理解确认，访谈结束。
+具体 SQL/数据定义语言、原生热点选择、自动预算比例及设备/数据实例属于既定要求下的工程
+设计和实测，不伪装为已完成实现；若后续证据要求改变已确认要求，另行提出变更确认。
+算法分区、调度和归并的工程实现必须满足既定要求，不因 n 或并发变化改变语义。
+
+第 4 轮已采纳的协议细化（Q15–Q17）：
+
+- Q15：续跑检查完整输入指纹、代码/算法版本和语义配置；不匹配拒绝复用旧运行批次，
+  保留历史并另建运行批次。仅改变机器/内存/W/T 不改变语义时允许续跑，记录新尝试。
+  已登记任务范围/ID 固定；n 变化只用于尚未规划任务，已登记超限任务走可追踪拆分。
+- Q16：瞬时故障默认每任务块最多 3 次尝试（首次加 2 次重试），退避；资源
+  错误只有改变预算/划分后才重试，并受限额。永久数据错误立即停止该失败分支，
+  不跳过数据、不无限重试，保留已完成结果，运行批次不发布，修复后显式续跑。
+- Q17：参考现有局部比较器，将米制坐标绝对误差 1e-6 m、经纬度 1e-9°、其他
+  浮点 1e-12 作为初始全链路门槛；成员/配对/拓扑严格一致，自增 ID 按业务身份映射。
+  需新建有界全链路比较器；几何接近不豁免成员/拓扑差异，超差需分析而非自动放宽。
+
+### 9.4 既定方案边界与待实施工程细节
+
+已确认的需求边界按 9.2 的 Q1–Q17 执行，工程候选方法显式标注。
+具体工程方法仍以对应问答为准，不把“接受建议”扩大为历史方案的全部批准：
+
+- 表视图：将完整子轨迹装箱；已读取但未纳入当前任务块的末组不得丢失。
+  若 `id` 不保证分组连续，应按子轨迹的逻辑顺序读取或使用外存重分组；
+  完整组优先已经 Q5 确认。建议从元数据规划，避免一次缓存整个待放入组。
+- 空间网格：先用固定输入下的计数或有界探测判断规模，再读取/细分，避免全量读取
+  后才发现超限。计算预算包含核心、邻域、长线段和临时工作区；参数继承不等于
+  可省略跨格归并。保留统一 CRS、输入版本及算法阈值。
+- 线段投放规则必须与规范归属者一致；按实际线段穿格投放与包围盒归属者
+  混用可能漏算。高密重合点、长线段和固定邻域可能使递归空间细分无效。
+- 拓扑/穿越必须保留子轨迹起始状态和方向上下文；DBSCAN 跨格连通、
+  全局统计和质心迭代合并不能由简单拼接替代。归并自身也必须有内存预算。
+- 运行内存预算覆盖协调器、所有计算进程、原生堆内存和输入/输出缓冲（Q3），目标总峰值
+  < 1 GB（Q10）。建议以控制组连同计量边界内文件缓存验收（Q14）。候选参数为 W、T、n；
+  按阶段实测校准，避免嵌套线程过量和未完成任务/结果无界排队。
+- 首版单机多核（Q9），中央提交者＋进程池已确认（Q12）。按用户更正，工作单元
+  一对多调度整个池，池内计算进程同时各执行一个任务块；暂不引入 Dask/Ray。
+  Python 编排加 C++ 热点内核只是建议，
+  原生迁移仍按性能剖析决定（Q4/H4），不预定未经测量的热点。
+- 内存上限只能阻止无界占用，不自动保证任何算法在任意小预算内完成。
+  不可拆且超预算的单组、无法有效细分的空间网格采用语义等价外存路径，资源仍不足
+  明确失败并保留阶段进度（Q7）。不做任务块内部恢复，重试从该任务块起点开始（Q8）。
+- 源数据按用户当前不修改的前提使用指纹（Q6）；不额外要求快照或权限改造。
+  读取器和指纹计算仍需有界，不能为每个任务块重复扫描整份源数据。
+
+Q10 对方案的新增约束：不能按逻辑 CPU 数直接启动等量 Python 计算进程；需要先测
+空闲计算进程基础内存，再在所有并发任务、写入器缓冲和原生临时工作区总和内分配预算。
+少量计算进程＋受控原生线程/紧凑列数组为候选，不提前承诺具体 W、T 或加速比。
+本节 W 表示池内计算进程数，不是用户 Q12 更正后的调度工作单元数量。
+空间求交候选、全局归并、持久化与文件缓存都必须计量；不能通过扩大未计量进程或
+无限增加 PostgreSQL 资源来声称同环境性能达标。PostgreSQL 固定资源已由 Q14 确认。
+
+Q2 的语义决定意味着：空间细分只能改变执行划分，不得任意改变算法邻域或聚类
+范围；必要时必须归并才能恢复原算法结果。此项是已确认语义约束的推论，不将
+“子格结果直接拼接”作为等价候选。具体归属者与归并实现仍需设计和验证。
+
+### 9.5 接口、持久状态与架构影响（已确认边界＋候选实现）
+
+已确认的边界是封存输入（Q1）、Pipeline 总预算（Q3）与真实业务链路（Q4）。
+源数据不变前提下记录指纹（Q6），Refine/Detect 需阶段续跑、任务块整块重算（Q8），
+首版单机多核（Q9）、总预算 < 1 GB（Q10）。原子提交边界、中央提交者/进程池、
+外存生命周期和固定性能验收口径已由 Q11–Q14 确认。
+运行元数据应包含 `run_id`、输入版本、算法版本、配置摘要、内存预算、规划状态，
+以及每次运行/续跑的硬件与配置快照（Q14），不能用续跑的新快照覆盖旧记录。
+建议硬件字段：CPU 型号/核心数/可用配额、内存和控制组限制、磁盘型号/介质/
+文件系统/挂载及数据库所在设备、PostgreSQL 版本/资源配置、缓存条件。
+建议配置字段：脱敏后的完整有效算法配置、代码/依赖版本、CRS、实际 W/T/n、
+动态调参事件和各阶段计时/内存/I/O 指标。不能读取的硬件信息注明未知/原因，
+不捏造机器性能，也不将密码/连接凭证写入报告。记录运行性能而非只列 CPU 数量；
+不默认每次运行增加完整硬件压力测试，必要的调参/探测仍纳入 Q14 总计时。
+候选任务元数据：`task_id`、阶段、分区类型、固定输入范围、父任务、状态、
+尝试、预计/实测内存、输出清单、错误及下一次重试时间。需要持久确认哪些完整
+任务块已提交才能让阶段续跑，但不保存任务块内部算到哪一行/哪一步（Q8）。
+前序工作单元租约/到期机制不作为既定要求；单机中央提交者可评估运行批次排他与代次保护，
+防止旧运行器在接管后提交；运行批次排他已由 Q12 确认，具体实现需代码验证。
+候选分区描述为子轨迹集合/范围或空间网格树路径及空间读取规则。
+
+Q11 已确认协议：调度元数据可独立记录 → 只读输入并有界计算 → 完整结果暂存 →
+校验当前提交者身份 → 任务块结果与完成记录同事务提交。
+计算/提交前失败时不保留部分业务结果，失败任务块整块重算；若提交确认丢失，
+先检查持久完成记录，已提交不重复生效，未提交才重算。控制元数据可提前提交已由
+Q11 明确认可，不再将 Q8 的“任何事务”误解为禁止错误/调度状态持久化。
+原始行上的全局已计算标志不能表达多运行批次、多阶段和空间邻域复用；
+建议按任务及业务身份记账。框架重试不能替代提交原子性。
+任务登记后输入范围固定，调整 n 不应悄悄改变已登记或已完成任务的身份。
+
+Q15 参数分类及续跑接口约束：
+
+- `semantic_config` 保存影响输出的有效参数及其摘要，例如 Clean 分段阈值、CRS/
+  投影、检测距离与角度阈值、聚类邻域、Clip/Fitting/Network 算法参数。这些参数
+  改变使旧结果失效，不能在同运行批次混用。
+- `execution_config` 保存仅影响执行的参数及其摘要，例如内存预算、池进程数 W、
+  内核线程数 T、游标读取批量、任务块软目标 n、队列容量和日志设置。这类
+  参数只有在满足 Q2/Q17 等价性与固定任务身份时才能变化后继续旧运行批次。
+- 算法使用的空间网格尺度/邻域属于语义参数；纯调度用空间网格细分属于执行参数，前提是
+  完整保留边界、归属者和归并语义。不能只凭名称含空间网格/批次就归为无影响参数。
+- 实施时建立显式参数分类表并测试；无法证明无影响的新增参数先按语义参数处理。
+  输入指纹、代码/算法版本独立校验；不得因为执行配置可变而忽略版本变化。
+  所有有效参数都写入运行报告，但续跑语义摘要不混入允许变化的执行配置。
+
+Q16 重试与状态约束：计算进程返回结果不等于已完成，只有中央提交者确认完整
+结果和完成记录已提交才能标记完成。计算过程被中断后先核查持久账本；未提交任务可
+重新派发。临时故障最多 3 次尝试；资源不足不能原样重试或通过不断生成子任务
+规避停止条件，细分无进展即进入外存/资源不足处理。永久错误和重试耗尽保留失败
+原因、完成账本和必要产物，阶段不发布；显式续跑保留旧尝试历史。
+
+拆分时原子登记子任务及父任务等待状态；所有必需子任务及归并完成后再完成父任务。
+整个阶段发布还依赖任务清单已封闭。父子结果不能重复计入有效产物。
+正式下游只消费已完整发布阶段，不能读取半成品（Q8/Q11）。阶段内部已提交结果
+支持续跑与内部子阶段计算（Q11）；中间数据库表和文件保留遵循 Q13。
+大结果若分批暂存，未完成尝试不得成为正式结果；文件需写完后通过清单发布。
+v3 最终表的外键依赖和运行批次完成验证必须纳入提交单元设计，不能直接让每个工作单元
+调用全量 Detect 写入器。以上尚未形成最终状态枚举、DDL、迁移或 API。
+
+计算仍放在 `services/pipeline/`；数据库定义属于 `db/postgres/`，运行数据和模型
+不进入仓库，按根 AGENTS.md 使用外部 `DATA_ROOT` / 命名卷。
+CLI 的准确参数名、数据库新结构及前后端字段映射在实施时核对；磁盘暂存策略已按 Q13 确认。
+按 Q18 后更正，不要求为旧数据保留迁移逻辑。前后端涉及字段变更时同步调整并验证，
+不能只修改数据库或 Pipeline 输出而遗漏后端序列化与前端读取。
+字段核对覆盖名称、类型、必填/可空、默认值、标识关联、状态枚举、坐标/时间单位、
+列表顺序与分页，以及空结果和错误响应；具体映射及核对结论属于实施产物，目前未完成。
+Q12 更正后的职责为：工作单元/协调器一对多派发 → 进程池计算 → 中央提交者持久化。
+工作单元统一调度所有任务块，计算进程只读/计算，中央提交者控制业务结果写入；
+在结果队列有界前提下评估吞吐，若成为实测瓶颈再扩展受控写入并行度。
+一个任务块对应一次池任务，进程复用；工作单元是调度角色，不额外推定必须创建
+一个独立 OS 线程/进程。历史问答中工作单元指计算进程的措辞保留，但当前设计
+以本次更正后的 `worker（调度）` / `executor_process（计算）` 区分。
+本轮不执行数据库重置或数据迁移。
+
+### 9.6 代码调研事实与证据边界
+
+以下证据来自代码阅读，未运行容量基准，也未查询实际业务表以证明物理数据分布：
+
+- `services/pipeline/src/track/v2/db/source_table.py::source_order_query` 使用
+  `ORDER BY vehicle_id, timestamp, id::text`，不是仅按 `id`。
+- `services/pipeline/src/track/v2/db/queries.py::_stream_vehicle_tracks_from_db`
+  用命名游标分组，清洗路径的 SQL 按子轨迹 / 锚点 / 类型 / 行排序；
+  不能由此证明用户表视图的 `id` 顺序天然保证子轨迹连续。
+- `services/pipeline/src/track/v2/cross_track.py::_build_grid` 将线段包围盒投放到
+  格子，超长范围另走溢出。这是当前归属者/边界兼容性分析的依据。
+- `services/pipeline/src/track/v2/fitting.py::_fit_pair` 使用 NumPy 堆叠数组和中位数；
+  迁移为 C++ 不等于自动消除采样矩阵物化，也不能任意采用“分批中位数的中位数”。
+- `docs/pipeline-1m-performance-benchmark-spec.md` 明确其版本 3 之前（pre-v3） 历史适用范围；
+  `docs/schema-v3-cutover-benchmark.md` 提供 v3 验证契约，二者都不是 26M 验收结果。
+
+补充只读核查（2026-09-13）：
+
+- `services/pipeline/src/track/v2/cli/init_db.py:137` 的清洗序列唯一键为
+  `(clean_id, subtrack_index, sequence_in_subtrack)`；`:195` 的已解析序列唯一键为
+  `(detect_id, subtrack_index, sequence_in_subtrack)`。子轨迹编号必须带所属运行批次。
+  自增主键和这些唯一约束都不保证按 `id` 读取时分组连续。
+- 在 `services/pipeline`、`apps/backend`、`db`、`infra` 和 Makefile 中检索
+  `memory_budget|memory_limit|max_memory|lease_token|lease_until|processpoolexecutor|multiprocessing|pybind|pyo3|create table.*(task|patch)`，
+  未发现统一运行内存预算、持久任务块队列、租约或自建 C++/Rust 内核实现。
+  此结论限定为本次源码检索，不证明外部系统不存在这些设施。
+- `services/pipeline/src/track/v2/config/pipeline.toml:41`、`:53`、`:67`、`:68`
+  分别有配对、数据流、DB 插入和导入的批量参数，不等于自动内存预算。
+  `cli/init_db.py:36`、`:78`、`:388` 存在 Clean/Detect/Fit 阶段级运行批次表，
+  状态为 `running/completed/failed`，不等于任务块状态。
+- `services/pipeline/pyproject.toml` 使用 setuptools，依赖 NumPy/pyproj 等；
+  文件检索未发现 Pipeline 自建 `.cpp/.cc/.rs/CMake/Cargo` 工程。
+  NumPy/pyproj 本身包含原生计算，不能说当前完全没有原生代码。
+
+当前明确的全量物化证据：
+
+| 环节 | 当前代码来源 | 事实 |
+| --- | --- | --- |
+| Clean 指纹 | `db/source_table.py:146` / `:175` | 全部引用源行查询使用普通客户端游标 |
+| Detect | `intersect2.py:751` 的 `_stream_extract_method_1` | 全局轨迹和 `turn_events` 累积，清理局部批次不释放全局轨迹 |
+| Detect 写入 | `db_writer.py:661` / `:677` | `_load_clean_members` 使用 `list(cur.fetchall())` 后再创建成员 |
+| Clip 输入 | `db/queries.py:813` / `:866` | `fetch_resolved_clip_tracks` 累积全局已分组 |
+| Clip 输出 | `clip.py:35` | `extract_clips` 累积全部片段并返回元组 |
+| Fitting | `fitting.py:34` / `:206` / `:220` | 全局配对分组及单配对全量采样矩阵 |
+
+表中相对路径均以 `services/pipeline/src/track/v2/` 为根；行号对应此次核查版本。
+调研未访问运行时数据库，用户目标表/视图的实际排序与数据分布仍未验证。
+旧章节的错误修复要求和对象结构是历史记录，不自动等同于当前仍存在的问题。
+
+第 2 轮资源/验收事实核查（只读，无业务数据库访问）：
+
+- `/proc/meminfo`、`getconf _NPROCESSORS_ONLN` 及控制组读取显示当前代理执行环境环境
+  可见 12 CPU、7,191,805,952 字节总内存、2 GiB 交换空间；`/proc/self/cgroup` 为
+  `0::/`，未读取到根 `memory.max/cpu.max`。不能把这些当成生产 Pipeline 配额。
+- `infra/docker/compose.dev.yml`、`compose.prod.yml` 和 Makefile 未显式设置
+  Pipeline/PostgreSQL 的 CPU 或内存硬上限。
+- 开发 Compose 第 78 行使用 `${DATA_ROOT:-/data/road-network}:/data`；生产第 70 行
+  要求显式 `DATA_ROOT`；两份 Compose 第 11 行使用 `postgres_data` 命名卷。
+  Pipeline 有 `/data/parquet` 和默认 `/data/logs`，未发现生产磁盘暂存配置或限额。
+- 未发现当前 v3 的真实 26M 容量验收或已确定全链路 SLA。
+  `docs/main-projection-query-repair-acceptance.md:64` 的 126 点完整 CLI 冒烟测试
+  不是容量基准；该文第 69 行的专项 5× 门禁尚未验收，也不是本次全链路指标。
+
+Q10 发问时的 3 GB / 26M 以上 / 少于 24 小时只是历史建议，随后用户明确改为
+< 1 GB / 精确 26M / < 1 小时。两组数字都不是实测结论，现行目标只采用用户回答。
+
+第 3 轮事务事实核查（代码阅读，无运行时数据库访问）：
+
+- `pipeline.py:122` 创建 Clean 运行中运行批次后提交；`_flush_clean_batch` 与
+  `db/pipeline_store.py:206` 只写不提交，整个 Clean 在 `pipeline.py:269–275`
+  与已完成一起提交，异常在 `:277–279` 回滚后另提交已失败。
+  因此现有批次批量写出不是可恢复检查点。
+- `pipeline.py:298` 单独提交 Detect 运行中；`:351–362` 全量结果和已完成
+  一起提交，`:401–407` 防止成功提交后因进度输出异常被改成已失败。
+- `db_writer.py:395` 的 Detect 写入器锁住整个运行批次行并加载全部清洗成员；
+  `cli/init_db.py:318` 和 `:588` 描述穿越 / 已解析双向外键，其中一条延迟检查。
+  无法将现有全量写入器不加改造地用作并行空间网格任务块提交函数。
+- `db/queries.py:819` 的 Clip 加载器、`db_writer.py:110` / `:143` 的下阶段创建，
+  以及 `apps/backend/src/backend/map_api.py:552` 保留已完成可见性屏障。
+- `cli/run.py:63–70` 只提供源表或已完成清洗-`id` 复用入口，没有同运行批次续跑参数；
+  生产代码未检索到可复用的运行批次协作锁/`flock`/租约/心跳机制。
+  手动基准测试的协作锁/续跑不属于生产运行器。
+
+除 Backend 完整路径外，上述代码路径相对 `services/pipeline/src/track/v2/`。
+故阶段续跑需要新增持久完成账本，任务块无内部检查点可以简化实现，但不能
+省掉成功提交结果的判定。原子性由事务/发布协议实现，不由并行本身提供。
+
+容量目标的算术下界：26,000,000 / 3,600 ≈ 7,222.22 原始输入行/秒。
+因此端到端折算平均吞吐必须大于该值；这不是单次扫描或某个算子的速度要求，
+也不考虑空间候选数可能随密度非线性增长。未用版本 3 之前（pre-v3） 1M 耗时线性外推可行性。
+
+第 4 轮等价性与运行报告核查（委派只读检索，未访问业务库）：
+
+- `manual_thin_benchmark/manual_bench_cross_track_inner.py:62` / `:123` 有局部
+  `_compare_records`：XY 1e-6 m、经纬度 1e-9°、其他浮点绝对误差 1e-12，
+  结构/成员/顺序严格一致且拒绝非有限值；对应测试为
+  `services/pipeline/tests/v2/test_cross_track_same_crs_benchmark.py:20`。
+  它只覆盖跨轨迹候选及下游聚类，不代表全链路已确认相同容差。
+- `manual_bench_schema_v3.py:130` / `:164` 的摘要含数据库 ID、`fit_id`、
+  精确 EWKB，且 `:198` 附近有 `fetchall`，不能直接当作新的有界跨运行批次比较器。
+- `cli/init_db.py:34` / `:76` 已有 `parameters` JSONB，但 `pipeline.py:117`
+  Clean 仅传 `cleaner_max_gap_s`，`:293` Detect 传空 `parameters`；现有记录不完整。
+  `cli/run.py:139` 的 `--stats-json` 及 Pipeline 阶段时序可作为报告扩展入口。
+- `db/source_table.py:146` 的 `source_fingerprint` 仅覆盖 Clean 输出引用的源行，
+  且用普通游标，不能直接当作未完成 Clean 的完整封存批次指纹。
+- `manual_bench_windows.py:837` / `:875` 已有源码/未提交差异/依赖锁/输入摘要
+  的来源追溯信息模式可参考；检索未发现生产路径完整采集 CPU/磁盘配置。
+
+除明确给出完整路径的测试外，本组路径相对 `services/pipeline/src/track/v2/`。
+
+### 9.7 验收标准（数值、环境选择与计时口径已确认）
+
+- 规模：日常业务 26M 以上（H1），此次验收精确 26,000,000 原始行（Q10）。
+  按 Q14 固定保持真实单日分布的封存数据集；历史精确 20M 不作为本轮门槛。
+- 功能：封存批次内完整处理（Q1）；按 Q4 的项目路网目标执行到 Network。
+- 内存：覆盖整个 Pipeline，PostgreSQL 单列（Q3）。建议记录控制组峰值、原生
+  工作区、缓冲、磁盘暂存和数据库指标；硬上限、外存及资源不足失败已按 Q7 确认，
+  当前峰值严格 < 1,000,000,000 字节（Q10，十进制 GB 解释），不是 1 GiB。
+  按 Q14 禁用 Pipeline 交换空间，固定数据库资源；具体控制组配置须实现并验证，
+  资源失败不算成功达标。
+- 正确性：保持成员归属、穿越配对、拓扑及几何语义，忽略自增 ID 差异（Q2）。
+  用不同 n、W、T、细分形状做有界差分对照；Q17 已确认绝对容差：米制坐标
+  ≤ 1e-6 m、经纬度 ≤ 1e-9°、其他浮点 ≤ 1e-12，拒绝非有限值；成员/配对/拓扑
+  严格一致。自增 ID 以业务身份映射，不默认精确浮点一致，也不自动放宽超差门槛。
+- 故障：Refine/Detect 阶段可恢复；任务块无内部检查点、失败整块重算，
+  失败无部分业务提交，半成品不可正式下游读取（Q8/Q11）。提交确认丢失先查询
+  完成账本（Q11），仍被依赖的已提交产物保留（Q13）；不将旧的所有工作单元
+  租约机制自动升为验收要求。验证进程崩溃、提交前后中断、磁盘不足和重复交付。
+  Clip/Fitting/Network 仍需完整链路通过，但当前未要求其新增任务块级恢复能力。
+- 恢复兼容性（Q15）：语义参数、输入或代码/算法版本改变时拒绝复用旧运行批次；仅执行
+  参数变化且语义不变可续跑，固定已登记任务身份，保留各次硬件/有效配置与尝试。
+  分类回归覆盖语义参数变化被拒绝、执行参数变化可恢复及空间网格两类尺度不能混淆。
+- 重试（Q16）：瞬时故障默认首次加 2 次重试，资源故障须先改变条件且同样有上限；
+  永久错误和耗尽均不得跳过数据或发布阶段，人工修复后可显式恢复并保留历史。
+- 性能：全链路严格 < 3,600 秒（Q10）；Q14 确认从运行启动到 Network 最终提交，
+  包含指纹、自动调参、分组、暂存和必要数据库写入，源数据导入在计时外。
+  固定现有开发部署机器、数据库/磁盘和缓存口径（Q14），原生迁移收益待测量。
+  不能将阶段完成、自动恢复或单算子达标替代整个性能验收。
+- 可复现性（Q14 补充）：每次运行记录机器性能、CPU/磁盘配置和本次运行完整
+  有效参数；自动决定的 W/T/n 及其变化也记录。续跑保留历次环境，不覆盖原记录。
+  具体设备、CPU 配额与数据库配置值需实际采集，不能用代理执行环境环境代替验收环境。
+  极端分布专项检查正确性/有界性/可恢复失败，不将一小时承诺扩展到任意分布。
+- 前后端一致性（Q18 后更正）：从新结构初始化并生成新结果后，验证数据库/Pipeline
+  输出、后端响应和前端消费字段一致；覆盖正常结果、空结果、运行中/失败状态及错误
+  响应。无需验证旧版本历史数据迁移成功，也不能用“旧数据已清理”代替接口验证。
+
+### 9.8 实施与验证计划（已授权，分步实施中）
+
+Q18 最终设计确认已完成，用户随后明确授权子代理分步实施并按小模块提交。
+每次提交以新增加删除行数合计约 2,000 行为软限制；按职责和验证边界拆分，
+超过时先检查是否能进一步拆分并记录理由。子代理只修改任务卡分配的文件，
+主代理负责集成、测试和提交，不混入其他正在进行的修改。具体任务与状态见
+[分步实施任务卡](pipeline-streaming-implementation.md)。按真实路网链路验收目标（Q4）推进：
+前后端接口字段核对与新结构定义 → 固定输入和语义对照 → 两类分区规则与持久任务协议 → 有界读取器/输出 →
+所需算法的拆分归并 → 调度和内存反馈 → 性能剖析后迁移热点 → 容量及故障验收。
+新增实现约束：完整子轨迹优先（Q5）、源输入不修改并记录指纹（Q6）、超限外存与
+可恢复资源失败（Q7）、Refine/Detect 阶段续跑而任务块整块重算（Q8）、单机多核（Q9）。
+不建设任务块内部检查点，也不默认实现分布式工作单元租约系统。
+按 Q10 将 < 1 GB / 精确 26M / < 1 小时作为硬目标，先测工作单元基础开销、
+读取/指纹、写入与代表性密集分区，检查预算分配和吞吐可行性。达不到时报告实测
+瓶颈并继续在已确认语义内优化；不得自行放宽指标、裁掉算法或将阶段失败当作达标。
+保持语义（Q2）并按实测热点渐进迁移（Q4）。执行结构已确定为一对多调度工作单元、
+计算进程池和中央提交者（Q12 更正），实施纳入 Q11 提交/核查协议、Q13 外存管理
+和 Q14 每次运行的硬件/有效参数报告、Q15 参数分类/续跑校验、Q16 有限重试与
+Q17 全链路差分门槛。具体内核语言、数据库迁移及部署上线/回退属于实施设计验证：
+
+- 按 Q18 后用户更正，旧版本历史数据不重要，允许清理旧数据、旧运行结果及相关
+  中间产物后按新结构重建，不要求无损迁移、历史数据兼容层或专门的数据保留方案。
+  该更正替代原先“不能为本改造重置源库或覆盖旧运行批次”的一概限制。
+- 实施重点是逐项核对前后端对应接口字段：整理 Pipeline/数据库产出、后端响应、
+  前端读取的映射，确认字段定义与状态语义一致，必要时同步修改相关端。
+  新结构初始化、重新计算和前后端联调须通过；历史数据是否保留不作为阻碍。
+- 清理实施时核定具体库表和文件范围，不将“历史数据可删除”扩展为任意删除整个
+  工作区或其他服务数据。当前运行/续跑依赖的输入、完成记录和中间产物仍遵守
+  Q6、Q8、Q11、Q13–Q16；旧数据清理不等于允许运行中破坏恢复状态。
+- 实施授权已收到；旧数据清理只在明确目标后按需执行，不能仅因获得实施授权就
+  预先删除数据。第一批基础模块和测试不需要删除任何业务数据。
+
+实际代码变更后遵守仓库要求运行 `make test`，配置变化涉及 `make dev-config`、
+`make pipeline-check`，并为路径、配置、API、迁移增加行为回归。原生内核需
+构建与语义对照测试。验证结果逐批记录在任务卡文档，未执行的验收不得标记通过。
+
+### 9.9 风险、待决事项与确认记录
+
+风险包括：`id` 顺序与子轨迹分组不一致；单个组超预算；细分无法降低工作量；
+邻域/归属者不一致漏算；全局归并及下游重新物化；父子任务重复发布；旧租约提交；
+输入变化影响恢复；原生内存未计量；并行排序/浮点差异改变输出。
+
+Q1–Q17 已收到回答，Q6/Q8/Q10 按用户实际修正而不是原推荐处理。
+Q8 的业务原子提交与“任何事务”边界已由 Q11 确认；Q12 最新更正为工作单元
+一对多调度整个进程池；Q14 新增每次运行的硬件/性能/参数记录。
+Q15–Q17 已确认：恢复版本与任务身份、影响/无影响参数分类、有限自动重试、具体数值容差。
+新增风险：< 1 GB 并发固定开销与一小时端到端吞吐的可行性尚未实测；
+不固定空间密度、机器和数据库资源会使容量指标不可复现。
+Q18 后更正已纳入：旧版本历史数据允许清理重建，不再作为迁移约束；前后端字段
+一致性成为明确的实施检查项。风险是只改存储结构而遗漏接口消费者，须联调验证。
+当前设为“已确认”：用户于 2026-09-13 回答“Q18通过”，完成共享设计确认。
+执行器已由 Q12 确定；原生语言和其他历史建议没有因局部采纳而一并确定。
+确认原文已进入附录；实施已另行授权，性能目标仍须实施后实测证明，不能视为验收通过。
+Q18 后的术语更正与项目级术语文档拆分已执行，不改变 Q1–Q17 的决定，
+其本身不代替最终确认；最终确认以随后收到的“Q18通过”为依据。
+
+### 9.10 最终共享理解（Q18 已确认）
+
+确认日期：2026-09-13。用户确认原文：“Q18通过”。
+确认范围：第 9 节设计及以下汇总；不把第 1–8 节历史指标改为当前目标。
+实施授权：Q18 后已另行获得，按子代理任务卡和小模块提交推进。
+验收确认：未进行，性能目标未实测。
+
+1. 两类任务共用调度/预算/提交协议，但分区依赖不同：表模式按完整子轨迹
+   装箱、保持逻辑时序；空间网格模式预估规模再细分，并保留必要邻域、长线段上下文与
+   全局归并。n 是软目标，内存是硬上限，不以固定 10% 浮动承诺完整边界。
+2. 工作单元一对多管理进程池；池内计算进程执行任务块；中央提交者原子写入结果与
+   完成记录。派发和结果通道有界；原生热点可渐进迁移，但不预先承诺语言或加速比。
+3. PostgreSQL 保存运行批次/阶段/任务块/尝试权威状态，`DATA_ROOT` 保存隔离外存。
+   Refine/Detect 阶段可恢复，任务块不做内部检查点；失败重算，提交不明先查账，
+   下游仅消费完整发布的阶段。必要中间产物保留，磁盘不足安全停止。
+4. 语义参数、完整输入和代码/算法版本决定旧结果兼容性；仅执行参数变化可在
+   等价性要求下续跑，已登记任务身份不变。默认每任务块共 3 次尝试，永久错误或
+   耗尽不发布，修复后显式续跑。保留新运行恢复依赖的完成记录及每次运行的硬件/有效参数；
+   不要求永久保留本次改造之前的旧版本历史数据（Q18 后更正）。
+5. 初始差分门槛采用 Q17，成员/配对/拓扑不因并行或分区变化而改变；几何近似
+   不代替业务等价。26M 固定真实数据全链路 < 1 小时、Pipeline 峰值 < 十进制 1 GB、
+   禁交换空间，数据库单列固定配置；这是待验证交付目标，不是现有能力声明。
+6. Q18 当时仅确认设计，后续已另行授权实施。具体迁移、预算校准及原生热点按上述要求实施和测试；
+   若事实迫使更改目标/语义/范围，需再确认，不能静默放宽。
+7. 依 Q18 后更正，实施可清理旧版本历史数据后重建，不承担无损迁移要求；重点是
+   数据库/Pipeline 产出、后端响应和前端读取的字段一致。运行期恢复与原子提交要求不变。
+
+## 附录：完整 QA 记录
+
+### 历史输入补录（2026-09-13）
+
+以下为当前会话可恢复的、与本设计直接有关的用户原文。不是对 Q1–Q4 的回答。
+设计问题全文见后续第 1 轮；未将助手历史建议伪记为用户决定。
+
+#### H1 — 初始容量、流式与原子任务需求
+
+用户原文：
+
+> 现在clean，detect，clip三个阶段中，我记得detect和clip是全量读取到内存的，现在的baseline是100w行原始数据，但是我后续的数据量每天有2600w行往上，全量物化肯定是行不通的，我需要做流式计算，也就是拿一个数据库named cursor，每次向后读取n行，用向上10%的浮动保证边界完整覆盖每辆车、每个空间grid被完整的读取。2、实现多核多线程并行计算，同时保证每个线程的计算是原子化的，完整计算后才会标记为compete，返回给全局的数据一致性线程或者一致性数据库，我的思路是，拿最简单的空间分块的读取。
+> 在第二点任务中，其实有两个小点：
+>
+> 1. 你要读取我现在的代码库，分析一下如何实现多线程并行计算，并保证计算的原子性和全局数据统一性
+> 2. 下面是我的一些疑问，或者说这是我的理解，你帮我检查一下我的理解对不对
+> 在线程启动的时候，启动一个临时的数据库或者数据文件，将空间分块的情况、计算情况都记录下来。每个子线程完成计算之前，该空间 grid 标记为 working；完成之后，标记为 complete。如果某一个空间 grid 计算失败，则自动触发重试，直至标记为 complete。
+
+正文关联：9.1、9.2、9.5、9.7。后续 H3 细化读取和分区规则，保留本原文。
+
+#### H2 — 方案复核请求
+
+用户原文：
+
+> 检查刚刚的计划，2分钟后给我结果
+
+记录说明：这是历史方案复核要求，不是对算法、执行器或实现的确认。
+
+#### H3 — 两类 patch、自动内存调参与待回答问题
+
+用户原文：
+
+> 我现在的数据有两种不同的流式计算+并行加速的需求，1、table view，按照table.id进行顺序读取，按照subtrack_index列聚合不同subtrack，每个原子任务(patch)，读取n行数据（可根据subtrack行数浮动，采用之前讨论的结果，如果最后一个subtrack导致这个patch的累积总行数超过n，则放弃这个subtrack，让其成为下一patch的第一个subtrack），对于每个patch，计算任务在subtrack内部，也就是说patch只以subtrack为对象进行计算  2、计算以空间grid为对象，首先按照default设置将空间划分为m个grid，每个patch fetch一个grid内所有数据，并且检测当前grid内数据量是否超过n行，如果超过则grid内部重新划分，分为patch的subpatch，计算参数继承自parentpatch
+> 每次运行的时候只显式要求最大允许内存，自动设置进程数和每个patch的{n}行
+>
+> 回答以下问题，并且如果可以适度自行补充
+> 1、两种任务有无本质区别？2、并行计算单纯用进程池是否就够了？如果不够是否有开源框架实现 3、应该如何维护数据状态，标识以计算过的和没计算过的？
+
+正文关联：9.2–9.5、9.7。H1 的固定向上 10% 想法由此处明确的完整组装箱规则细化；
+不删除 H1，也不推断超长单组或空间边界规则已确认。
+
+#### H4 — 多语言性能内核补充
+
+用户原文：
+
+> 不一定局限为python任务，性能热点可以改用高性能的c++？或者其他高性能语言都可以
+
+正文关联：9.2、9.4、9.6、9.8。允许评估原生语言不等于已选定 C++ 或全量重写。
+
+#### 访谈触发与恢复
+
+首次实际调用原文：
+
+> $grill-me
+
+随后用户提供的 skill 内容：
+
+```text
+<skill>
+<name>grill-me</name>
+<path>/home/reed/.codex/skills/grill-me/SKILL.md</path>
+---
+name: grill-me
+description: A relentless interview to sharpen a plan or design.
+disable-model-invocation: true
+---
+
+Call the Skill tool with "grilling".
+
+</skill>
+```
+
+用户更新项目 grilling → Spec 规则后，再次实际调用原文：
+
+> $grill-me
+
+再次调用后用户提供的 skill 内容：
+
+```text
+<skill>
+<name>grill-me</name>
+<path>/home/reed/.codex/skills/grill-me/SKILL.md</path>
+---
+name: grill-me
+description: A relentless interview to sharpen a plan or design.
+disable-model-invocation: true
+---
+
+Call the Skill tool with "grilling".
+
+</skill>
+```
+
+规则更新属于记录机制，不作为 Q1–Q4 的设计回答；当时问题状态为待回答。
+随后收到的实际回答见第 1 轮合并回答。
+
+### 第 1 轮 — 根决策（已发出，2026-09-13 原样补录）
+
+#### Q1 — “流式”到底指什么？
+
+> 你希望处理一份已经封存的数据，分批读取直到完成；还是处理一张持续追加、甚至修改历史记录的表，并持续更新结果？
+>
+> 这两者的完成条件不同：前者可以宣布一个 Run 完成；后者必须定义时间窗口、迟到数据和结果修订规则。
+
+> **建议：首版处理封存批次。** 每批固定输入版本，内部流式计算。持续增量计算另设分支，避免一开始混在一起。
+
+> 用户回答：建议都采纳
+
+
+正文关联：9.2、9.3、9.5、9.7、9.9。
+
+回答来源（合并原文摘录）：第 1 轮合并回答；该句共同适用于 Q1–Q4，本题采纳上方推荐。
+
+#### Q2 — 什么叫计算结果正确？
+
+> 你要求新实现保持当前算法的结果语义，还是允许为了分区、并行或性能改变聚类、交叉口与路段结果？
+>
+> 例如：把一个父 grid 分成四个子格，各自聚类，可能改变簇成员。这不能仅靠“最后去重”恢复。
+
+> **建议：首先保持当前语义。** 忽略数据库自增 ID 的差异，但核对成员归属、crossing 配对、拓扑和几何容差。发现原算法问题时，单独明确修正，避免与性能改造混淆。
+
+> 用户回答：建议都采纳
+
+
+正文关联：9.2–9.4、9.6–9.9。
+
+回答来源（合并原文摘录）：第 1 轮合并回答；该句共同适用于 Q1–Q4，本题采纳上方推荐。
+
+#### Q3 — “最大允许内存”约束谁？
+
+> 这个数是整个 Pipeline 的预算，包含协调器、所有 worker、C++ 内存和缓冲；还是连 PostgreSQL、共享内存和其他服务都包含的整机预算？
+>
+> 如果只限制单个 worker，进程数增加后总内存仍会失控。
+
+> **建议：对外参数定义为整个 Pipeline 进程组的预算。** PostgreSQL 单独配置并预留资源；如果你的实际目标是限制整台机器，我们就必须一起管理数据库并发和内存。
+
+> 用户回答：建议都采纳
+
+
+正文关联：9.2–9.5、9.7、9.9。第 1–8 节的固定 3 GB / PostgreSQL 单独计量为
+历史验收标准，不冒充本轮回答。
+
+回答来源（合并原文摘录）：第 1 轮合并回答；该句共同适用于 Q1–Q4，本题采纳上方推荐。
+
+#### Q4 — 第一版做到哪里才算交付？
+
+> 你要先得到能运行任意示例函数的通用 patch 框架，还是必须让当前真实业务链路在 2600 万行级输入上完成，才算成功？后者的终点是 Clip，还是包含 Fitting、Network？
+>
+> 如果 Clip 最后仍把全部结果交给一个全量 Fitting，前面的流式改造并没有解决整条链路的容量问题。
+
+> **建议：以真实数据跑通所需业务链路为验收，框架随之形成。** 如果生产需要最终路网，验收就覆盖到 Network；C++ 迁移按实测热点逐步进行。
+
+> 用户回答：建议都采纳
+
+
+正文关联：9.2、9.3、9.5、9.7–9.9。
+
+回答来源（合并原文摘录）：第 1 轮合并回答；该句共同适用于 Q1–Q4，本题采纳上方推荐。
+
+初次补录时记录检查：Q1–Q4 连续且唯一，当时均待回答；当时无用户最终确认。
+再次展示同一轮问题不另建记录，不把再次调用技能当作回答。
+
+### 第 1 轮合并回答 — 对应 Q1、Q2、Q3、Q4
+
+接收日期：2026-09-13。
+
+用户回答原文：
+
+> 建议都采纳
+
+解释范围：采纳最近一轮 Q1–Q4 的全部推荐；不追溯批准历史建议，
+也不表示已完成整个设计树或授权开始实现。Q4 的条件式推荐结合路网项目目标，
+执行解释为完整 Cleaner→Network 验收，正文已显式说明。
+
+正文同步：9.1–9.5、9.7–9.9；9.6 追加独立资源事实，未将用户选择当作实测结果。
+
+### 第 2 轮 — 分区、资源与恢复要求（2026-09-13）
+
+发问时前提：Q1–Q4 推荐已采纳。当时 Q5–Q10 均待回答；当前状态见各题与合并回答。
+
+#### Q5 — 完整 subtrack 与 id 顺序冲突时，优先哪个？
+
+> 代码没有保证按 table.id 读取时 subtrack 连续。如果两者冲突，你是否允许按 subtrack 的逻辑序列读取，或先在数据库/磁盘重分组？还是必须坚持全局 id 顺序，即使需要额外分组存储和扫描？
+
+> 优先保证完整 subtrack 和组内时序。id 保留为稳定行身份及排序补充键，不作为必须遵守的全局计算顺序；已排好的完整组仍按你的规则装箱。
+
+> 用户回答：Q5 优先保证subtrack
+
+
+正文关联：9.2–9.5、9.7–9.9。
+
+回答来源（合并原文摘录）：第 2 轮合并回答中 Q5 对应片段；完整消息保留在原记录中。
+
+#### Q6 — 封存输入由谁保证，是否接受快照成本？
+
+> 首版已确定处理封存批次。你希望直接复用由数据库权限或封存流程保证只读的源表/版本，还是每个 Run 都生成独立输入快照？只记录指纹不能阻止计算期间源数据被修改；普通 view 的底层表也必须纳入约束。
+
+> 优先复用可保证只读的封存输入版本，记录范围、配置和指纹，并验证恢复时输入未变。无法保证只读的数据源先生成独立快照；不允许边改源数据边完成同一 Run。
+
+> 用户回答：Q6 暂时不需要修改源数据，所以记录指纹就好了
+
+
+正文关联：9.2–9.5、9.7–9.9。
+
+回答来源（合并原文摘录）：第 2 轮合并回答中 Q6 对应片段；完整消息保留在原记录中。
+
+#### Q7 — 预算不够时，能否用磁盘换时间？
+
+> 如果一个 subtrack 单独超过目标 n，或一个 grid 细分后仍超预算，你是否接受降低并发、使用有界磁盘暂存和外存算法？如果连最低工作集或磁盘空间都不够，是允许失败后恢复，还是允许临时突破内存上限？
+
+> n 是软目标，最大内存是硬约束。完整组在预算内可以独占并超过 n；否则走保持语义的外存路径。资源仍不足就停止该任务并保留可恢复状态，不突破内存、不丢数据，也不原样无限重试。
+
+> 用户回答：Q7 接受建议
+
+
+正文关联：9.2–9.5、9.7–9.9。
+
+回答来源（合并原文摘录）：第 2 轮合并回答中 Q7 对应片段；完整消息保留在原记录中。
+
+#### Q8 — 恢复要覆盖到什么程度，半成品能否被下游读取？
+
+> 是否要求 worker 崩溃、协调器/容器重启，以及数据库短暂不可用后，都能在持久数据仍完好的前提下继续同一个 Run？恢复时允许重算未提交 patch，但是否要求已提交结果不重复生效，并让正式下游只读取完整发布的阶段结果？
+
+> 这些故障都应可恢复。数据库任务账本为权威，租约防止旧 worker 提交；未提交 patch 可重算，已提交结果幂等。正式下游按阶段完成屏障读取，单独提供任务进度；永久错误或重试耗尽明确失败，不伪装完成。
+
+> 用户回答：Q8 整个refine(clean)、detect需要可恢复，单patch不需要恢复，并行计算的目的本就是保证原子性从而压低patch失败的恢复成本和加速，patch已经把重算成本压低了，如果patch失败，则只需要保证对源数据和数据库没提交任何事务即可，失败就重算；半成品不被下游读取
+
+
+正文关联：9.2–9.5、9.7–9.9。
+
+回答来源（合并原文摘录）：第 2 轮合并回答中 Q8 对应片段；完整消息保留在原记录中。
+
+#### Q9 — 首版必须跨机器扩展吗？
+
+> 在单机多进程与原生多线程之外，你是否要求第一版就支持多台机器共同领取 patch，并处理共享存储和跨机故障？这会直接影响执行器、spool 和部署方案。
+
+> 首版以单机多核为范围，保留与语言无关的任务协议；是否采用进程池或 Dask 在这个范围内评估，不提前承担多机部署要求。
+
+> 用户回答：Q9 单机多核，至于从多进程扩展到多机器，之后再说
+
+
+正文关联：9.2–9.5、9.7–9.9。
+
+回答来源（合并原文摘录）：第 2 轮合并回答中 Q9 对应片段；完整消息保留在原记录中。
+
+#### Q10 — 用什么内存和时限验收 2600 万行？
+
+> 运行时仍只需指定最大内存，但设计验收要有固定档位。你是否接受以 3,000,000,000 bytes 的 Pipeline 总预算，完成至少 2600 万行代表性封存输入的 Cleaner→Network 全链路，并以 24 小时以内作为每日处理的起步门槛？如果业务要求更短，请给出预算和时限。
+
+> 先采用上述 3 GB／26M 以上／少于 24 小时的容量门槛，要求无 OOM、无 swap、无漏算且语义对照通过；记录实际耗时和峰值。3 GB 来自历史规划，24 小时来自日批周期，二者都是待验证目标，不是已有能力；更紧的性能目标在受控实测后制定。
+
+> 用户回答：Q10 内存小于1gb，数据量26M，时间小于1小时
+
+
+正文关联：9.2–9.5、9.7–9.9。
+
+回答来源（合并原文摘录）：第 2 轮合并回答中 Q10 对应片段；完整消息保留在原记录中。
+
+发问时检查：Q1–Q10 连续且唯一；当时 Q1–Q4 已回答，Q5–Q10 待回答；无最终确认。
+
+### 第 2 轮合并回答 — 对应 Q5–Q10
+
+接收日期：2026-09-13。
+
+用户回答原文（完整保留，不以各题摘要替代）：
+
+> Q5 优先保证subtrack Q6 暂时不需要修改源数据，所以记录指纹就好了 Q7 接受建议 Q8 整个refine(clean)、detect需要可恢复，单patch不需要恢复，并行计算的目的本就是保证原子性从而压低patch失败的恢复成本和加速，patch已经把重算成本压低了，如果patch失败，则只需要保证对源数据和数据库没提交任何事务即可，失败就重算；半成品不被下游读取 Q9 单机多核，至于从多进程扩展到多机器，之后再说
+
+用户补充（Q10）：
+
+> Q10 内存小于1gb，数据量26M，时间小于1小时
+
+该补充将验收目标改为 Pipeline 峰值内存 < 1 GB、精确 26M 原始输入行、
+Cleaner→Network 全链路 < 1 小时；GB 按十进制解释。原 Q10 的问题和推荐保留。
+它只影响第 3 轮末尾新增的 Q14，不改变 Q11–Q13。
+Q6、Q8 为对推荐的明确限定，保留原推荐供历史追溯，不覆盖用户本轮措辞。
+正文同步：9.1–9.5、9.7–9.9。
+
+### 第 3 轮 — 提交边界、单机执行与外存生命周期（2026-09-13）
+
+Q11–Q13 为本轮原问题；Q14 因第 2 轮 Q10 补充而追加在本轮末尾。
+
+#### Q11 — “失败不提交”的边界，能否这样定义？
+
+> 一个 patch 算到一半崩溃，其业务结果全部作废；成功后，将该 patch 的完整结果与完成记录放在同一个事务提交。调度、错误和 Run 进度记录可以独立提交。还有一种情况：数据库已提交成功，但确认消息丢失，此时必须先查完成记录，不能直接当作未提交。你是否接受这套定义？
+
+> 接受。patch 不做内部 checkpoint，未提交就从头重算；已提交则直接复用，提交状态不明先核查。原始输入始终只读，阶段内部已提交的 patch 结果仅供该阶段恢复和后续内部计算，正式下游等整个阶段发布后再读取。
+
+> 用户回答：Q11 接受建议
+
+
+正文关联：9.2–9.5、9.7–9.9。
+
+回答来源（合并原文摘录）：第 3 轮合并回答中 Q11 对应片段；完整消息保留在原记录中。
+
+#### Q12 — 首版是否采用中央提交者，而不是让每个 worker 写最终表？
+
+> 既然首版单机多核、patch 失败整块重算，是否采用一个协调器管理 worker，worker 只读取和计算，完整结果交给一个受 Run 排他保护的提交者写库？这样能集中处理事务和一致性，但写入吞吐可能成为上限。
+
+> 首版采用这个结构，以进程池承载独立 patch；C++ 等内核可在 worker 内使用受预算控制的线程。结果通过有界队列或已写完的文件清单交付，不把全部结果堆在主进程。先测单提交者吞吐，只有它成为瓶颈才扩展多个受控写入者；暂不引入 Dask/Ray。
+
+> 用户回答：Q12 接受建议，一个woker指派一个进程池内的进程进行单patch计算
+
+
+用户后续更正原文：
+
+> 修改Q12，woker一对多指派进程池内所有patch的计算，而不是一对一
+
+当前以此更正为准，初次回答保留。
+
+正文关联：9.2–9.5、9.7–9.9。
+
+回答来源（合并原文摘录）：第 3 轮合并回答中 Q12 对应片段；完整消息保留在原记录中。
+
+#### Q13 — 为了阶段恢复，磁盘中间产物应保留多久？
+
+> 你已接受外存，但 Refine/Detect 续跑依赖的中间产物不能在进程退出时一并删除。是否接受成功提交且仍被依赖的阶段产物持久保存、失败 attempt 的临时文件可清理，并在外存达到配置配额或磁盘安全余量时停止派发而不是继续写满？
+
+> 接受。临时文件使用 DATA_ROOT 下按 Run 隔离的目录，权威状态和必要中间表放 PostgreSQL；已提交且仍被依赖的数据保留，未提交 attempt 文件可回收并重算。配额和清理规则使用项目级配置，不增加每次运行必填参数；不足时保留阶段进度并明确报资源不足。
+
+> 用户回答：Q13接受
+
+
+正文关联：9.2–9.5、9.7–9.9。
+
+回答来源（合并原文摘录）：第 3 轮合并回答中 Q13 对应片段；完整消息保留在原记录中。
+
+Q10 的补充确定了验收目标，以下追加对应的验收环境问题。
+
+#### Q14 — 1 GB／1 小时在哪份数据、哪台机器上验收？
+
+> 相同 26M 行，空间密度、轨迹长度以及数据库和磁盘性能不同，耗时可能相差很大。是否以现有开发部署的固定 CPU、PostgreSQL 和磁盘配置，加一份保持真实单日空间分布的 26M 封存数据作为首轮验收？计时是否覆盖运行启动、指纹校验、自动调参、全部阶段计算和最终提交？
+
+> 采用这个可复现口径，源数据导入在计时外，运行必需的准备、分组、暂存和数据库写入均计时；单独记录并固定 PostgreSQL 资源及缓存条件，Pipeline 禁用 swap。极端长轨迹和高密 grid 另外验证有界内存、正确性与可恢复失败，不承诺任意恶劣分布都在一小时完成。
+
+> 用户回答：Q14 接受，但是记录每次运行的机器性能，CPU和磁盘配置，以及本次运行的的参数配置
+
+
+正文关联：9.2–9.4、9.6–9.9。
+
+回答来源（合并原文摘录）：第 3 轮合并回答中 Q14 对应片段；完整消息保留在原记录中。
+
+第 3 轮发问时检查：Q1–Q14 连续且唯一，当时 Q1–Q10 已回答，Q11–Q14 待回答。
+第 2 轮合并回答和其中的 Q10 补充均完整保留；QA 附录仍在文末，无共享理解的最终确认。
+
+### 第 3 轮合并回答 — 对应 Q11、Q12、Q13、Q14
+
+接收日期：2026-09-13。
+
+用户回答原文：
+
+> Q11 接受建议 Q12 接受建议，一个woker指派一个进程池内的进程进行单patch计算  Q13接受 Q14 接受，但是记录每次运行的机器性能，CPU和磁盘配置，以及本次运行的的参数配置
+
+解释范围：Q11/Q13 接受本轮推荐，Q14 接受并新增每次运行记录要求。
+Q12 首次回答被助手解释为 worker 等同池内计算进程；该解释随后被用户更正，
+当前以如下更正为准。局部采纳不是整个 Spec 的最终确认，不授权开始实现。
+
+正文同步：9.1–9.5、9.7–9.9；9.6 追加代码证据。
+
+### Q12 后续更正 — worker 一对多调度进程池
+
+接收日期：2026-09-13；关联第 3 轮 Q12 及其合并回答。
+
+用户更正原文：
+
+> 修改Q12，woker一对多指派进程池内所有patch的计算，而不是一对一
+
+当前解释：worker 是统一调度角色，一对多将所有 patch 分批指派给进程池；
+不与某一个池进程绑定。池内计算进程称 executor_process，每个同时执行一个 patch，
+完成后可继续领任务。中央提交者不变；有界派发/结果背压仍满足 Q3/Q10/Q12。
+这是对 worker 术语和调度关系的更正，不推定新增嵌套进程池或无限并发。
+历史 Q12 问题/推荐和用户初次回答原文保留；正文已同步撤销 worker=计算进程的解释。
+
+### 第 4 轮 — 续跑兼容性、重试与数值等价（2026-09-13）
+
+#### Q15 — 续跑时哪些变化会使旧结果失效？
+
+> Q15 — 续跑时，是否按以下规则判断能否复用已完成 patch？建议：输入指纹、代码/算法版本或影响结果的参数变化时，拒绝续用旧 Run，保留旧记录并另建 Run；仅机器、内存预算或并发变化可续跑并记录新配置。已登记 patch 的范围和身份固定，新的 n 只影响尚未规划的任务，超限旧任务通过有记录的拆分处理。
+
+> 建议：采纳上述兼容性与稳定任务身份规则；已采纳，并补充明确区分参数影响。
+
+> 用户回答：Q15 接受建议，区分影响和无影响参数
+
+
+正文关联：9.2–9.5、9.7–9.9。
+
+回答来源（合并原文摘录）：第 4 轮合并回答中 Q15 对应片段；完整消息保留在原记录中。
+
+#### Q16 — 自动重试到什么程度才停止？
+
+> Q16 — 是否接受有限自动重试，而不是一直重试直到 complete？建议：瞬时故障每 patch 默认最多 3 次尝试（首次加 2 次重试），带退避；内存不足只有降低并发、缩小任务或改走外存后才重试，也受次数限制。确定性数据/算法错误立即记录并停止失败分支；达到上限保留阶段进度，不跳过失败 patch、不发布该阶段，修复原因后显式续跑。
+
+> 建议：采纳上述分类与默认上限，使用项目级配置，不新增每次运行必填参数；已采纳。
+
+> 用户回答：Q16 接受建议
+
+
+正文关联：9.2–9.5、9.7–9.9。
+
+回答来源（合并原文摘录）：第 4 轮合并回答中 Q16 对应片段；完整消息保留在原记录中。
+
+#### Q17 — 数值等价是否先沿用仓库已有局部门槛？
+
+> Q17 — 并行和原生内核改造的数值验收，是否先沿用现有局部比较器的容差并扩展到全链路？建议：成员归属、crossing 配对和拓扑严格一致，自增 ID 映射到业务身份后比较；米制坐标绝对误差不超过 1e-6 m，经纬度不超过 1e-9°，其他浮点不超过 1e-12，拒绝非有限值。几何误差小不能豁免拓扑变化；这些目前不是全链路已验证门槛，出现超差先分析，不自动放宽。
+
+> 建议：采纳为首轮差分门槛，并实现有界比较器；已采纳。
+
+> 用户回答：Q17 采用建议
+
+
+正文关联：9.2–9.4、9.6–9.9。
+
+回答来源（合并原文摘录）：第 4 轮合并回答中 Q17 对应片段；完整消息保留在原记录中。
+
+第 4 轮发问时记录检查：Q1–Q17 连续且唯一，当时 Q1–Q14 已回答，Q12 更正及 Q14
+补充已同步正文，Q15–Q17 待回答；当时状态草稿，未开始实现。
+
+### 第 4 轮合并回答 — 对应 Q15、Q16、Q17
+
+接收日期：2026-09-13。
+
+用户回答原文：
+
+> Q15 接受建议，区分影响和无影响参数 Q16 接受建议 Q17 采用建议
+
+解释范围：采纳本轮三个问题的建议；Q15 明确区分影响计算结果的语义参数与仅影响
+执行的参数。正文采用独立 semantic_config / execution_config 的设计，允许变化的
+执行参数仍受等价性和任务身份不变约束。本回答不是整个设计的最终确认或实施授权。
+
+正文同步：9.1–9.5、9.7–9.10；原问题与推荐保留，未重置编号。
+
+### 第 5 轮 — 最终共享理解确认（2026-09-13）
+
+#### Q18 — 最终设计确认
+
+> 是否确认 Spec 第 9 节（尤其 9.10 的汇总）已准确表达你的设计要求，本轮先完成设计确认、不开始代码实现？
+
+> 建议确认这份设计作为后续实施与验收依据；若还有偏差请指出。性能目标仍需实测证明。
+
+> 用户回答：Q18通过
+
+正文关联：9.1–9.10。
+
+接收日期：2026-09-13；按实际接收顺序在附录末尾另记最终确认。
+当前解释：设计已确认；本题明确不开始代码实现，故本回答不构成实施授权或性能验收通过。
+
+发问时检查：Q1–Q18 连续且唯一；当时 Q1–Q17 已回答，Q12 更正、Q14/Q15 补充和全部
+合并回答原文保留，Q18 待回答；当时 Spec 状态为“待确认”，未开始实现。
+
+### Q18 后补充 — 术语规范更正（2026-09-13）
+
+以下为用户完整原文，仅归档，不作为正文术语示范：
+
+> 社区检索显示：acceptance criteria、verification contract、memory budget 是常见或可接受用法；acceptance contract、memory contract 并非通用标准，只在少数项目中出现。因此文档中“内存合同”“验收合同”属于自行造词，应删除或按语义替换。所有英文术语或通用语首次出现，统一写成“中文翻译（英文原名）”，例如：内存预算（memory budget）、内存上限（memory limit）、验收标准（acceptance criteria）、验证契约（verification contract）、强制约束（hard constraint）、验收确认（acceptance sign-off）。若确要保留 memory contract，只能写“内存契约（memory contract）”并首次定义，且优先级低于 memory budget 和 acceptance criteria。
+>
+> 具体替换：标题“内存合同”改“内存预算与验收标准（memory budget and acceptance criteria）”；第1节“内存合同与当前结论”改“内存预算与验收口径（memory budget and acceptance criteria）：当前结论”；“3 GB 合同”改“3 GB 内存上限（memory limit）”；“不能满足这个合同”改“不满足该验收标准（acceptance criteria）”；“硬合同要求”改“强制约束（hard constraint）”；“合同要求 Pipeline 与 PostgreSQL 合计”改“验收标准（acceptance criteria）要求……合计”；“不能进入 20M 验收签字”改“不能通过 20M 验收确认（acceptance sign-off）”；“fresh Pipeline parent cgroup”改“新建 Pipeline 父控制组（fresh Pipeline parent cgroup）”。接口名 memory.max、memory.peak、memory.swap.max、memory.events、oom、oom_kill 保留原文。
+>
+> 系统性规则：建立术语表，禁止“合同”“签字”“硬合同”等商务或口语词。内存约束统一用“内存预算（memory budget）/内存上限（memory limit）”；验收统一用“验收标准（acceptance criteria）”；只有强调可执行验证时用“验证契约（verification contract）”。不得为易读性随意翻译英文术语，例如 verification contract 不写成“验收契约”，acceptance criteria 不写成“验收契约”。首次出现中英并列，后续可只用中文，但英文原名保留在术语表中。
+
+执行记录：复用本文并建立前置术语表；标题、第 1–8 节历史审计及第 9 节正文按语义
+统一用词，保留数值、技术结论、代码接口与历史问答原文。首次中英并列由前置术语表
+及标题完成，后续叙述优先用中文；产品/库名采用中文类别说明，不杜撰品牌译名。
+本次仅落实写作要求，未对用户所述社区检索作独立验证，也未改变算法、资源或验收指标。
+
+记录检查：Q1–Q18 编号保持不变，Q18 仍待最终确认；本文状态保持“待确认”。
+完整 QA 附录仍在文末，本轮仅修改文档，未开始代码实现。
+
+### Q18 后补充 — 通用术语独立存储（2026-09-13）
+
+用户回答原文：
+
+> 通用术语索引另起一个doc，这种是项目级的doc，不要放在每个spec doc里，单独存储
+
+执行记录：将通用术语索引、核心术语及写作规则迁至项目级文档
+[项目术语与写作规范](terminology.md)，本 Spec 删除重复术语表并保留引用。
+项目级文档区分通用定义与具体方案中的角色用法，不将本方案取舍扩大为全项目要求。
+此前“前置术语表”的执行记录保留为历史记录，当前存储方式以本次调整为准。
+
+记录检查：Q1–Q18 编号不变，Q18 仍待最终确认；正文状态保持“待确认”。
+历史问答原文完整保留，QA 附录仍在文末；仅调整文档组织，未开始代码实现。
+
+### Q18 最终确认 — 设计通过（2026-09-13）
+
+关联原记录：第 5 轮 Q18，在术语规范更正及通用术语独立存储之后收到本回答。
+
+用户回答原文：
+
+> Q18通过
+
+当前解释：确认第 9 节及 9.10 汇总准确表达设计要求，Spec 状态改为“已确认”，
+本次 grilling 访谈结束。依 Q18 原问题，本轮只完成设计确认，不开始代码实现。
+精确 26M 行、Pipeline 峰值内存 < 1 GB、全链路 < 1 小时仍是待实测的验收目标，
+本次回答不是性能验收确认。
+
+正文同步：顶部状态、9.1、9.3、9.8–9.10；Q18 原题下同步展示确认原文。
+最终检查：Q1–Q18 连续且唯一，均已回答，无待回答的设计问题；历史回答及更正保留，
+完整 QA 附录位于文末。设计已确认、实施未授权、验收未进行，三者分别记录。
+
+### Q18 后续更正 — 历史数据可删除，优先核对前后端字段（2026-09-13）
+
+关联原记录：Q18 已确认设计中的 9.8 实施计划，以及 Q13–Q16 的运行期恢复规则。
+
+用户更正原文：
+
+> 修改一点，9.8 实施中不用太考虑过往数据留存问题，数据不重要可以删除，只要把前后端对应接口字段确认好就行
+
+当前解释：放宽实施过程中的旧版本历史数据留存要求，允许清理后重建，不为其增加
+无损迁移或历史兼容负担；实施重点是核对数据库/Pipeline、后端响应与前端消费字段。
+不将这项更正理解为取消运行期恢复、输入一致性或原子提交要求，也不将接口字段
+写入计划误报为已经完成实际代码核对。本次未执行任何数据删除或代码改造。
+
+正文同步：顶部状态说明、9.1、9.2、9.5、9.7–9.10；原 Q18 确认及历史问答保留。
+记录检查：本次是明确的局部更正，不新增问题编号；Q1–Q18 保持连续唯一，状态仍为
+“已确认”。实施尚未启动，验收尚未进行，完整 QA 附录仍在文末。
+
+### Q18 后实施授权 — 子代理任务卡与小模块提交（2026-09-13）
+
+用户原文：
+
+> 给subagent发任务卡，分步实施，把commit按照小模块进行提交，尽量避免超过2k行的大commit(软限制)
+
+当前解释：已授权分步代码实施及本地 Git 提交，使用子代理任务卡分工，主代理统一
+集成验证并按小模块提交；2,000 行是每次提交新增与删除合计的软限制，不把互不相关
+改动合并。未授权推送远端。已存在的视觉工具迁移等无关改动保持不动。
+
+正文同步：顶部状态、9.1、9.8–9.10；任务卡及各批次实测结果另记
+[分步实施任务卡](pipeline-streaming-implementation.md)。Q1–Q18 不变，设计仍为已确认；
+获得实施授权不代表性能验收通过，完整 QA 附录仍在文末。
