@@ -7,6 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 
 _REQUIRED_COLUMNS = {
@@ -147,8 +148,18 @@ def calculate_source_fingerprint(
     conn: Any,
     clean_id: str,
     contract: SourceTableContract,
+    *,
+    fetch_size: int = 10_000,
 ) -> dict[str, object]:
-    """Hash exactly the source rows referenced by kept/excluded Clean output."""
+    """Hash referenced Clean source rows using bounded server-side reads.
+
+    This is not a fingerprint of the entire input table. The caller owns the
+    transaction, which must support a non-holdable named cursor; this function
+    neither commits nor rolls back. ``fetch_size`` bounds rows per fetch, not
+    bytes per row or PostgreSQL's query execution memory.
+    """
+    if type(fetch_size) is not int or fetch_size <= 0:
+        raise ValueError("fetch_size must be a positive integer")
     extra_sql = "source.extra" if contract.has_extra else "'{}'::jsonb"
     query = f"""
         WITH referenced(source_row_key) AS (
@@ -172,7 +183,8 @@ def calculate_source_fingerprint(
     """
     digest = hashlib.sha256()
     row_count = 0
-    with conn.cursor() as cur:
+    with conn.cursor(name=f"source_fingerprint_{uuid4().hex}") as cur:
+        cur.itersize = fetch_size
         cur.execute(query, (clean_id, clean_id))
         for row in cur:
             if not bool(row[1]):
