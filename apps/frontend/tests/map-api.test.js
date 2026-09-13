@@ -3,6 +3,7 @@ import { afterEach, test } from 'node:test';
 
 import {
   listMapLayers,
+  listRuns,
   loadMapLayer,
   MapApiError,
   requestClip,
@@ -120,4 +121,42 @@ test('clip requires exactly two intersections and detect context', async () => {
   };
   await requestClip({ detectId: 7, intersectionIds: [101, 202] });
   assert.deepEqual(body, { detect_id: 7, intersection_ids: [101, 202] });
+});
+
+test('run catalog preserves UUID relationships and empty arrays after rebuild', async () => {
+  const cleanId = '12345678-1234-5678-1234-567812345670';
+  const detectId = '12345678-1234-5678-1234-567812345671';
+  const payload = {
+    clean: [{ id: cleanId, started_at: '2026-09-13T00:00:00Z' }],
+    detect: [{ id: detectId, clean_id: cleanId, started_at: '2026-09-13T00:01:00Z' }],
+    fit: [],
+  };
+  globalThis.fetch = async () => jsonResponse(payload);
+  assert.deepEqual(await listRuns(), payload);
+  globalThis.fetch = async () => jsonResponse({ clean: [], detect: [], fit: [] });
+  assert.deepEqual(await listRuns(), { clean: [], detect: [], fit: [] });
+});
+
+test('layer keeps nullable point properties and completion metadata unchanged', async () => {
+  const detectId = '12345678-1234-5678-1234-567812345671';
+  const feature = {
+    type: 'Feature', id: 41,
+    geometry: { type: 'Point', coordinates: [120.1, 30.2] },
+    properties: {
+      detect_id: detectId, vehicle_id: 'vehicle-1', subtrack_index: 2,
+      resolved_point_id: 41, source_row_key: null, point_kind: 'i',
+      crossing_id: null, intersection_id: null, crossing_type: null,
+    },
+  };
+  globalThis.fetch = async () => jsonResponse({
+    type: 'FeatureCollection', features: [feature],
+    metadata: { detect_id: detectId, count: 1, truncated: false, bbox: null, crs: 'EPSG:4326' },
+  });
+  const result = await loadMapLayer('resolved_subtrack_points', { detectId });
+  assert.deepEqual(result.featureCollection.features, [feature]);
+  assert.equal(result.metadata.detect_id, detectId);
+  assert.equal(result.metadata.count, 1);
+  assert.equal(result.metadata.truncated, false);
+  assert.equal(result.metadata.bbox, null);
+  assert.equal(result.metadata.crs, 'EPSG:4326');
 });
