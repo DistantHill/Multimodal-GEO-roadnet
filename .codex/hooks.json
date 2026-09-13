@@ -1,0 +1,17 @@
+{
+  "description": "Grilling: reuse or create a Spec and persist every QA round.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/scripts/hooks/grilling_spec.py\"",
+            "timeout": 5,
+            "statusMessage": "Loading grilling Spec workflow"
+          }
+        ]
+      }
+    ]
+  }
+}

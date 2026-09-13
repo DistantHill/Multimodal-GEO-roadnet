@@ -38,3 +38,13 @@ This checkout has no valid Git history, so no convention can be inferred. Use co
 ## Security and Configuration
 
 Copy `.env.example` to `.env` and replace placeholder secrets locally. Keep `POSTGRES_PASSWORD` out of Git. Treat `/data` as runtime-only and verify bind-mount paths before starting production Compose.
+
+## 术语与写作
+
+编写或修改本项目文档及技术说明时，读取并遵循 [项目术语与写作规范](docs/terminology.md)。
+
+## Grilling → Spec Hook
+
+用户调用 grilling 或继续其 QA 时，先检索 `docs/`：有相关 Spec 就复用，没有才新建。
+创建或更新前读取 [Spec 模板](docs/templates/grilling-spec.md)，按模板逐轮更新正文并记录全部 QA。
+仅讨论 hook 或引用调用示例不触发访谈。文档维护已获授权，实施仍遵循用户授权与 grilling 流程。
