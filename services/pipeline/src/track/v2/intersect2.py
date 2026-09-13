@@ -64,7 +64,9 @@ from .db.queries import (
     _query_spatial_extent,
     _stream_vehicle_tracks_from_db,
     _tracks_from_points,
+    fetch_clean_run_row,
 )
+from .db.source_table import verify_clean_source_fingerprint
 from .parser0 import TrajectorySourceHandle
 
 
@@ -634,15 +636,36 @@ def detect_intersections(
         uses a capacity-guarded global spatial index.
     """
     cfg = config or IntersectConfig()
-    if spatial_context is None:
-        raise V2Error(
-            "detect_intersections requires the parent Clean Run SpatialContext; "
-            "a first-point or extent-centre projection is not a safe fallback"
-        )
-
     if conn is not None and cfg.query_active_from_db:
-        return _detect_intersections_db(conn, cfg, spatial_context)
+        if cfg.clean_id is None:
+            raise V2Error("formal DB Detect requires clean_id")
+        clean = fetch_clean_run_row(conn, cfg.clean_id)
+        if clean.status != "completed" or not clean.has_source_fingerprint:
+            raise V2Error(
+                f"Clean Run {cfg.clean_id} is not a completed immutable-source run"
+            )
+        if spatial_context is not None and spatial_context != clean.spatial_context:
+            raise V2Error("supplied SpatialContext does not match the parent Clean Run")
+        if cfg.source_table is not None and cfg.source_table != clean.source_table:
+            raise V2Error("configured source_table does not belong to the parent Clean Run")
+        if cfg.db_table != "trajectory_points" and cfg.db_table != clean.source_table:
+            raise V2Error("configured db_table does not belong to the parent Clean Run")
+        if cfg.kept_table not in (None, "kept_trajectory_points"):
+            raise V2Error("formal DB Detect must use kept_trajectory_points")
+        cfg = replace(
+            cfg,
+            db_table=clean.source_table,
+            source_table=clean.source_table,
+            kept_table="kept_trajectory_points",
+        )
+        verify_clean_source_fingerprint(conn, clean.clean_id)
+        return _detect_intersections_db(conn, cfg, clean.spatial_context)
     elif source is not None:
+        if spatial_context is None:
+            raise V2Error(
+                "handle Detect requires an explicit SpatialContext; a first-point "
+                "or extent-centre projection is not a safe fallback"
+            )
         return _detect_intersections_handle(source, cfg, spatial_context)
     else:
         raise V2Error(
@@ -752,6 +775,7 @@ def _stream_extract_method_1(
     track_count = 0
     batch: dict[str, list[TrajectoryPoint]] = {}
     tracks: dict[str, list[TrajectoryPoint]] = {}
+    read_bounds: tuple[float, float, float, float] | None = None
 
     for track in _stream_vehicle_tracks_from_db(
         conn,
@@ -761,6 +785,28 @@ def _stream_extract_method_1(
         clean_id=cfg.clean_id,
         spatial_context=spatial_context,
     ):
+        for point in track:
+            if not (math.isfinite(point.lon) and math.isfinite(point.lat)):
+                raise V2Error("DB point has non-finite longitude/latitude")
+            if (point.x is None) != (point.y is None):
+                raise V2Error("DB point has incomplete processing x/y")
+            if point.x is not None and not (
+                math.isfinite(point.x) and math.isfinite(point.y)  # type: ignore[arg-type]
+            ):
+                raise V2Error("DB point has non-finite processing x/y")
+            if not (-180.0 <= point.lon <= 180.0 and -90.0 <= point.lat <= 90.0):
+                raise V2Error("DB point longitude/latitude is outside EPSG:4326")
+            point_bounds = (point.lon, point.lat, point.lon, point.lat)
+            read_bounds = (
+                point_bounds
+                if read_bounds is None
+                else (
+                    min(read_bounds[0], point.lon),
+                    min(read_bounds[1], point.lat),
+                    max(read_bounds[2], point.lon),
+                    max(read_bounds[3], point.lat),
+                )
+            )
         subtrack_index = (
             track[0].cleaned_point_ref.subtrack_index
             if track[0].cleaned_point_ref is not None
@@ -770,6 +816,12 @@ def _stream_extract_method_1(
         track = _project_tracks(
             {track_key: track}, transformer, trust_existing=True
         )[track_key]
+        if any(
+            point.x is None or point.y is None
+            or not math.isfinite(point.x) or not math.isfinite(point.y)
+            for point in track
+        ):
+            raise V2Error("DB point could not provide finite processing x/y")
         tracks[track_key] = track
         batch[track_key] = track
         track_count += 1
@@ -801,6 +853,8 @@ def _stream_extract_method_1(
                 turn_events.append(replace(
                     te, event_calculate_index=len(turn_events),
                 ))
+    if read_bounds is not None:
+        transformer.validate_bounds(read_bounds)
     log_info(f"── 流式处理: {track_count:,} 轨迹/tracks → "
              f"{len(turn_events):,} 转向事件/turn events "
              f"({time.perf_counter() - t_total:.1f}s)")
@@ -1024,11 +1078,6 @@ def _extract_cross_track_windows(
     seen_segment_pairs: set[tuple[object, ...]] = set()
     if not cfg.use_cross_track_candidates:
         return candidates
-    if candidate_extractor is not None and legacy_origin is None:
-        raise V2Error(
-            "the legacy cross-track benchmark oracle requires an explicit "
-            "legacy_origin; Detect production never derives one"
-        )
     extractor = candidate_extractor or extract_cross_track_candidates
 
     if windows_override is None:
@@ -1108,15 +1157,13 @@ def _extract_cross_track_windows(
             "live_status": live_status,
             "sub_detail": True,
         }
-        if candidate_extractor is None:
-            extractor_kwargs.update(perf=perf, telemetry=telemetry)
-        if candidate_extractor is None:
+        extractor_kwargs.update(perf=perf, telemetry=telemetry)
+        if legacy_origin is None:
             win_cands, w_pairs, w_total = extractor(
                 window_tracks, transformer, cfg, **extractor_kwargs,
             )
         else:
             # Explicit benchmark seam for the legacy local-origin oracle only.
-            assert legacy_origin is not None
             win_cands, w_pairs, w_total = extractor(
                 window_tracks, legacy_origin[0], legacy_origin[1], cfg,
                 **extractor_kwargs,

@@ -22,7 +22,7 @@ from .db.source_table import (
     calculate_source_fingerprint,
     source_order_query,
     validate_source_table,
-    verify_clean_source_fingerprint,
+    verify_clean_source_fingerprint,  # compatibility seam; Detect owns invocation
 )
 from .fitting import fit_centerline_variants
 from .intersect2 import detect_intersections
@@ -97,7 +97,6 @@ def run_pipeline(
             if clean_record.status != "completed":
                 raise ValueError(f"Clean Run {clean_id} is not completed")
             source_table = clean_record.source_table
-            verify_clean_source_fingerprint(conn, str(clean_id))
             spatial_context = clean_record.spatial_context
         else:
             assert source_table is not None
@@ -324,7 +323,6 @@ def run_pipeline(
             iresult = detect_intersections(
                 conn=store.connection,
                 config=icfg,
-                spatial_context=spatial_context,
             )
             detect_compute_elapsed = time.perf_counter() - detect_compute_started
             # psycopg starts a transaction for the Detect SELECTs. The result

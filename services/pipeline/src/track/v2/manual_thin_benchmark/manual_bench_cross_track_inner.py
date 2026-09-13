@@ -4,15 +4,15 @@ Examples::
 
     # Dense-window exploratory comparison (does not claim the merge gate).
     uv run python track/v2/manual_thin_benchmark/manual_bench_cross_track_inner.py \
-        --processing-srid 32650 --window-index 1753
+        --processing-srid 32650 --window-index 1753 --version WORKTREE_ID
 
-    # Required gate: three full-stage legacy/new runs, snapshot under generated/.
+    # Required gate: three full-stage reference/optimized runs.
     uv run python track/v2/manual_thin_benchmark/manual_bench_cross_track_inner.py \
         --processing-srid 32650 --repetitions 3 \
-        --write-baseline cross_track_500k.json --require-target
+        --write-baseline cross_track_500k.json --require-target --version WORKTREE_ID
 
 The script is read-only against the dedicated ``track_test`` database. It
-compares the retained legacy oracle and the bounded-grid implementation across
+compares a dense same-processing-CRS reference and the bounded-grid implementation across
 the entire selected spatial-window stage: DB query, grouping, extraction, and
 cross-window segment-pair de-duplication. It also checks the downstream
 cross-track DBSCAN cluster payload before reporting timing results.
@@ -23,12 +23,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 import ctypes
+import hashlib
 import io
 import json
+import math
 import statistics
 import sys
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -39,7 +40,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from track.v2.cross_track import (
-    extract_cross_track_candidates_legacy as _extract_orthogonal_cross_track_candidates_legacy,
+    extract_cross_track_candidates_reference as _extract_orthogonal_cross_track_candidates_reference,
     extract_cross_track_candidates as _extract_orthogonal_cross_track_candidates,
 )
 from track.v2.intersect2 import (
@@ -49,6 +50,7 @@ from track.v2.intersect2 import (
     _extract_cross_track_windows,
     _query_spatial_extent,
 )
+from track.v2.db.source_table import validate_source_table
 from track.v2.manual_thin_benchmark._thin_bench_helpers import connect_test_db
 from track.v2.models import ProjectionConfig, SpatialContext
 from track.v2.projection import CoordinateTransformer, create_spatial_context
@@ -57,6 +59,8 @@ from track.v2.projection import CoordinateTransformer, create_spatial_context
 _GENERATED_DIR = _PROJECT_ROOT / "generated"
 _TARGET_SPEEDUP = 5.0
 _MIN_GATE_POINTS = 500_000
+_XY_TOLERANCE_M = 1e-6
+_LONLAT_TOLERANCE_DEG = 1e-9
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -114,6 +118,53 @@ def _process_peak_rss_mib() -> float | None:
 
 def _candidate_records(candidates: list[object]) -> list[dict[str, object]]:
     return [candidate.as_dict() for candidate in candidates]  # type: ignore[attr-defined]
+
+
+def _compare_records(
+    reference: object,
+    optimized: object,
+    *,
+    path: str = "",
+    differences: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Strict structure/order comparison with unit-specific numeric budgets."""
+    result = {} if differences is None else differences
+    if isinstance(reference, dict) and isinstance(optimized, dict):
+        if list(reference) != list(optimized):
+            raise ValueError(f"{path}: field structure/order mismatch")
+        for key in reference:
+            _compare_records(
+                reference[key], optimized[key], path=f"{path}.{key}", differences=result,
+            )
+        return result
+    if isinstance(reference, list) and isinstance(optimized, list):
+        if len(reference) != len(optimized):
+            raise ValueError(f"{path}: member count mismatch")
+        for index, (left, right) in enumerate(zip(reference, optimized)):
+            _compare_records(left, right, path=f"{path}[{index}]", differences=result)
+        return result
+    if isinstance(reference, float) or isinstance(optimized, float):
+        left, right = float(reference), float(optimized)  # type: ignore[arg-type]
+        if not math.isfinite(left) or not math.isfinite(right):
+            raise ValueError(f"{path}: non-finite numeric value")
+        field = path.rsplit(".", 1)[-1]
+        tolerance = (
+            _XY_TOLERANCE_M
+            if field in {"x", "y", "centroid_x", "centroid_y", "radius_m"}
+            else _LONLAT_TOLERANCE_DEG
+            if field in {"lon", "lat", "centroid_lon", "centroid_lat"}
+            else 1e-12
+        )
+        delta = abs(left - right)
+        result[field] = max(result.get(field, 0.0), delta)
+        if delta > tolerance:
+            raise ValueError(
+                f"{path}: delta {delta:g} exceeds absolute tolerance {tolerance:g}"
+            )
+        return result
+    if reference != optimized:
+        raise ValueError(f"{path}: identity/member/order mismatch")
+    return result
 
 
 def _cluster_records(
@@ -189,13 +240,32 @@ def _source_point_count(conn: Any, table: str) -> int:
     return int(row[0]) if row is not None else 0
 
 
+def _source_input_sha256(conn: Any, table: str) -> str:
+    """Hash the ordered frozen benchmark inputs without retaining trajectories."""
+    digest = hashlib.sha256()
+    contract = validate_source_table(conn, table)
+    extra = "extra" if contract.has_extra else "'{}'::jsonb"
+    with conn.cursor(name="cross_track_input_hash") as cur:
+        cur.execute(
+            f"SELECT id::text, vehicle_id, timestamp, lon, lat, heading, speed, "
+            f"{extra}, encode(ST_AsEWKB(geom), 'hex') "
+            f"FROM {contract.quoted_table} ORDER BY id::text"
+        )
+        for row in cur:
+            digest.update(json.dumps(
+                list(row), default=str, sort_keys=True, allow_nan=False,
+                separators=(",", ":"),
+            ).encode())
+            digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def _run_stage(
     conn: Any,
     cfg: IntersectConfig,
     extent: tuple[float, float, float, float],
     spatial_context: SpatialContext,
     transformer: CoordinateTransformer,
-    legacy_origin: tuple[float, float],
     extractor: Callable[..., tuple[list[object], int, int]],
     *,
     windows_override: list[object],
@@ -209,16 +279,7 @@ def _run_stage(
         spatial_context,
         transformer,
         live_status=_QuietLiveStatus(),
-        candidate_extractor=(
-            extractor
-            if extractor is _extract_orthogonal_cross_track_candidates_legacy
-            else None
-        ),  # type: ignore[arg-type]
-        legacy_origin=(
-            legacy_origin
-            if extractor is _extract_orthogonal_cross_track_candidates_legacy
-            else None
-        ),
+        candidate_extractor=extractor,  # type: ignore[arg-type]
         windows_override=windows_override,  # type: ignore[arg-type]
         telemetry=telemetry,
     )
@@ -235,7 +296,7 @@ def main() -> int:
         "--max-windows", type=int, default=0,
         help="Maximum windows when --window-index is 0; 0 means every window.",
     )
-    parser.add_argument("--repetitions", type=int, default=3, help="Legacy/new stage repetitions.")
+    parser.add_argument("--repetitions", type=int, default=3, help="Reference/optimized stage repetitions.")
     parser.add_argument(
         "--write-baseline",
         metavar="FILENAME.json",
@@ -251,6 +312,10 @@ def main() -> int:
         type=int,
         required=True,
         help="Projected metre-based EPSG code valid for the complete benchmark data region.",
+    )
+    parser.add_argument(
+        "--version", required=True,
+        help="Code/build identifier recorded in the benchmark report.",
     )
     args = parser.parse_args()
     if args.window_index < 0 or args.max_windows < 0 or args.repetitions < 1:
@@ -271,6 +336,8 @@ def main() -> int:
     cfg = IntersectConfig()
     conn = connect_test_db()
     try:
+        with conn.cursor() as cur:
+            cur.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         extent = _query_spatial_extent(
             conn,
             table=cfg.db_table,
@@ -280,6 +347,7 @@ def main() -> int:
             print("No source points found.", file=sys.stderr)
             return 2
         source_points = _source_point_count(conn, cfg.db_table)
+        source_input_sha256 = _source_input_sha256(conn, cfg.db_table)
         if args.require_target and source_points < _MIN_GATE_POINTS:
             print(
                 f"merge_gate_failed: source point count {source_points:,} "
@@ -287,10 +355,6 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        legacy_origin = transformer.inverse(
-            (extent[0] + extent[2]) / 2.0,
-            (extent[1] + extent[3]) / 2.0,
-        )
         windows = list(SpatialWindowIterator(
             extent,
             size=cfg.spatial_window_size,
@@ -311,16 +375,16 @@ def main() -> int:
             f"repetitions={args.repetitions} "
             f"target_gate={'on' if args.require_target else 'off'}"
         )
-        legacy_times: list[float] = []
+        reference_times: list[float] = []
         optimized_times: list[float] = []
-        legacy_timings: list[dict[str, int | float]] = []
+        reference_timings: list[dict[str, int | float]] = []
         optimized_timings: list[dict[str, int | float]] = []
         peak_rss_mib: list[float] = []
         first_snapshot: dict[str, object] | None = None
 
         for repetition in range(args.repetitions):
             order = (
-                ("legacy", _extract_orthogonal_cross_track_candidates_legacy),
+                ("reference", _extract_orthogonal_cross_track_candidates_reference),
                 ("optimized", _extract_orthogonal_cross_track_candidates),
             )
             if repetition % 2:
@@ -333,55 +397,55 @@ def main() -> int:
                     extent,
                     spatial_context,
                     transformer,
-                    legacy_origin,
                     extractor,
                     windows_override=selected,
                 )
-            legacy, legacy_wall, legacy_timing = results["legacy"]
+            reference, reference_wall, reference_timing = results["reference"]
             optimized, optimized_wall, optimized_timing = results["optimized"]
-            legacy = [
-                replace(candidate, x=x, y=y)
-                for candidate, (x, y) in zip(
-                    legacy,
-                    transformer.forward_many(
-                        [(candidate.lon, candidate.lat) for candidate in legacy]
-                    ),
-                )
-            ]
-            legacy_records = _candidate_records(legacy)
+            reference_records = _candidate_records(reference)
             optimized_records = _candidate_records(optimized)
-            if legacy_records != optimized_records:
-                print(f"repetition={repetition + 1}: candidate/provenance/order mismatch", file=sys.stderr)
+            try:
+                candidate_differences = _compare_records(reference_records, optimized_records)
+            except ValueError as exc:
+                print(f"repetition={repetition + 1}: candidate mismatch: {exc}", file=sys.stderr)
                 return 1
-            legacy_clusters = _cluster_records(legacy, transformer, cfg)
+            reference_clusters = _cluster_records(reference, transformer, cfg)
             optimized_clusters = _cluster_records(optimized, transformer, cfg)
-            if legacy_clusters != optimized_clusters:
-                print(f"repetition={repetition + 1}: downstream cluster mismatch", file=sys.stderr)
+            try:
+                cluster_differences = _compare_records(reference_clusters, optimized_clusters)
+            except ValueError as exc:
+                print(f"repetition={repetition + 1}: downstream cluster mismatch: {exc}", file=sys.stderr)
                 return 1
             if first_snapshot is None:
                 first_snapshot = {
-                    "candidate_records": legacy_records,
-                    "cluster_records": legacy_clusters,
-                    "timing_legacy": legacy_timing,
+                    "candidate_records": reference_records,
+                    "cluster_records": reference_clusters,
+                    "timing_reference": reference_timing,
                     "timing_optimized": optimized_timing,
+                    "absolute_tolerances": {
+                        "xy_m": _XY_TOLERANCE_M,
+                        "lonlat_degree": _LONLAT_TOLERANCE_DEG,
+                    },
+                    "candidate_max_absolute_differences": candidate_differences,
+                    "cluster_max_absolute_differences": cluster_differences,
                 }
-            legacy_times.append(legacy_wall)
+            reference_times.append(reference_wall)
             optimized_times.append(optimized_wall)
-            legacy_timings.append(legacy_timing)
+            reference_timings.append(reference_timing)
             optimized_timings.append(optimized_timing)
             peak_rss = _process_peak_rss_mib()
             if peak_rss is not None:
                 peak_rss_mib.append(peak_rss)
-            speedup = legacy_wall / optimized_wall if optimized_wall else float("inf")
+            speedup = reference_wall / optimized_wall if optimized_wall else float("inf")
             print(
-                f"repetition={repetition + 1} legacy_wall_s={legacy_wall:.3f} "
+                f"repetition={repetition + 1} reference_wall_s={reference_wall:.3f} "
                 f"optimized_wall_s={optimized_wall:.3f} speedup={speedup:.2f}x "
                 f"candidates={len(optimized_records):,} clusters={len(optimized_clusters):,}"
             )
 
-        _print_step_summary("legacy", legacy_times, legacy_timings)
+        _print_step_summary("reference", reference_times, reference_timings)
         _print_step_summary("optimized", optimized_times, optimized_timings)
-        median_speedup = statistics.median(legacy_times) / statistics.median(optimized_times)
+        median_speedup = statistics.median(reference_times) / statistics.median(optimized_times)
         peak_rss_summary = f" process_peak_rss_mib={max(peak_rss_mib):.1f}" if peak_rss_mib else ""
         print(f"median_speedup={median_speedup:.2f}x equivalent=true{peak_rss_summary}")
 
@@ -391,13 +455,19 @@ def main() -> int:
             except ValueError as error:
                 parser.error(str(error))
             _write_json(output_path, {
+                "schema": "track.v2-cross-track-same-crs-benchmark-v1",
+                "review_status": "pending_review",
+                "version": args.version,
+                "processing_srid": spatial_context.processing_srid,
+                "input_sha256": source_input_sha256,
+                "input_snapshot": "postgres_repeatable_read_read_only",
                 "extent": extent,
-                "active_point_count": active_points,
+                "active_point_count": source_points,
                 "window_count": len(windows),
                 "selected_windows": len(selected),
                 "config": cfg.as_dict(),
                 "repetitions": args.repetitions,
-                "legacy_wall_s": legacy_times,
+                "reference_wall_s": reference_times,
                 "optimized_wall_s": optimized_times,
                 "median_speedup": median_speedup,
                 "process_peak_rss_mib": peak_rss_mib,

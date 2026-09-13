@@ -22,7 +22,10 @@ from ._geometry import (
 from ._perf import PerfTracker
 from .models import CrossTrackCandidate, TrajectoryPoint
 from .projection import CoordinateTransformer
-from ._cross_track_legacy import extract_cross_track_candidates_legacy
+from ._cross_track_legacy import (
+    extract_cross_track_candidates_legacy,
+    extract_cross_track_candidates_reference,
+)
 
 
 class CrossTrackCapacityError(RuntimeError):
@@ -35,6 +38,7 @@ class _CrossTrackSegment:
 
     vehicle_id: str
     vehicle_rank: int
+    track_rank: int
     segment_index: int
     start: TrajectoryPoint
     end: TrajectoryPoint
@@ -116,7 +120,7 @@ def extract_cross_track_candidates(
         ) + (time.perf_counter() - array_started)
         telemetry["vehicle_pairs"] = telemetry.get("vehicle_pairs", 0) + total_pairs
 
-    ordered_candidates: list[tuple[tuple[int, int, int, int], CrossTrackCandidate]] = []
+    ordered_candidates: list[tuple[tuple[int, ...], CrossTrackCandidate]] = []
     started = time.perf_counter()
     # ZH: 预计算每段的 vehicle_rank 与 AABB min 角 cell，供 owner 向量化过滤。
     # EN: Precompute per-segment vehicle_rank and AABB min-corner cell for
@@ -219,7 +223,7 @@ def _estimate_grid_capacity(
 
 
 def _append_pair_hits(
-    ordered_candidates: list[tuple[tuple[int, int, int, int], CrossTrackCandidate]],
+    ordered_candidates: list[tuple[tuple[int, ...], CrossTrackCandidate]],
     segments: list[_CrossTrackSegment],
     starts: np.ndarray,
     ends: np.ndarray,
@@ -248,6 +252,8 @@ def _append_pair_hits(
                 segment_b.vehicle_rank,
                 segment_a.segment_index,
                 segment_b.segment_index,
+                segment_a.track_rank,
+                segment_b.track_rank,
             ),
             _candidate_from_segments(
                 segment_a,
@@ -290,9 +296,9 @@ def _prepare_segments(
         vehicle_id: rank for rank, vehicle_id in enumerate(actual_vehicle_ids)
     }
     per_track: list[
-        tuple[str, str, int, list[tuple[int, float, float, float, float]]]
+        tuple[str, str, int, int, list[tuple[int, float, float, float, float]]]
     ] = []
-    for track_key in sorted(tracks):
+    for track_rank, track_key in enumerate(sorted(tracks)):
         track = tracks[track_key]
         if not track:
             continue
@@ -327,17 +333,19 @@ def _prepare_segments(
                 track_key,
                 vehicle_id,
                 vehicle_rank_by_id[vehicle_id],
+                track_rank,
                 raw_segments,
             ))
 
     segments: list[_CrossTrackSegment] = []
-    for track_key, vehicle_id, vehicle_rank, raw_segments in per_track:
+    for track_key, vehicle_id, vehicle_rank, track_rank, raw_segments in per_track:
         track = tracks[track_key]
         for segment_index, x1, y1, x2, y2 in raw_segments:
             start = track[segment_index]
             segments.append(_CrossTrackSegment(
                 vehicle_id=vehicle_id,
                 vehicle_rank=vehicle_rank,
+                track_rank=track_rank,
                 segment_index=segment_index,
                 start=start,
                 end=track[segment_index + 1],

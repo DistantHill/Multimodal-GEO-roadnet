@@ -12,11 +12,15 @@ from track.v2.db.queries import (
     _query_spatial_extent,
     build_active_in_window_sql,
     build_spatial_extent_sql,
+    fetch_clean_run_row,
     fetch_detect_row,
 )
 from track.v2.db.source_table import SourceTableContract
 from track.v2.models import SpatialContext
-from track.v2.projection import CoordinateTransformer, ProjectionError
+from track.v2.projection import (
+    ProjectionError,
+    query_window_from_processing_bounds,
+)
 
 
 _SPATIAL_CONTEXT = SpatialContext(
@@ -101,13 +105,10 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
             has_clean_id=True,
             kept_table="kept_trajectory_points",
             spatial_context=_SPATIAL_CONTEXT,
+            query_srid=32650,
         )
 
-        self.assertIn(
-            "AND ST_Transform(tp.geom, 32650) && "
-            "ST_MakeEnvelope(%s, %s, %s, %s, 32650)",
-            sql,
-        )
+        self.assertIn("ST_X(ST_Transform(tp.geom, 32650)) >= %s", sql)
         self.assertIn(
             "AND tp.geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)",
             sql,
@@ -116,7 +117,7 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
             "WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)",
             sql,
         )
-        self.assertIn("AND x >= %s AND y >= %s AND x <= %s AND y <= %s", sql)
+        self.assertIn("ST_X(ST_Transform(geom, 32650)) >= %s", sql)
         self.assertEqual(sql.count("ST_MakeEnvelope(%s, %s, %s, %s, 4326)"), 2)
         self.assertEqual(sql.count("%s"), 20)
         self.assertNotIn("from_source_row_key", sql)
@@ -129,6 +130,7 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
             "raw_points",
             has_clean_id=False,
             spatial_context=_SPATIAL_CONTEXT,
+            query_srid=32650,
         )
 
         self.assertNotIn("injected_points", sql)
@@ -150,9 +152,12 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
     def test_window_executor_binds_densified_source_prefilter_before_exact_bounds(self) -> None:
         conn = _Connection(None)
         window = SpatialWindow(400000.0, 4300000.0, 402000.0, 4302000.0)
-        expected_source = CoordinateTransformer(_SPATIAL_CONTEXT).inverse_bounds(
-            (window.x_min, window.y_min, window.x_max, window.y_max)
+        query = query_window_from_processing_bounds(
+            (window.x_min, window.y_min, window.x_max, window.y_max),
+            _SPATIAL_CONTEXT,
         )
+        expected_source = query.prefilter_bounds
+        query_bounds = (query.x_min, query.y_min, query.x_max, query.y_max)
 
         with patch(
             "track.v2.db.queries.validate_source_table",
@@ -169,21 +174,18 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
         self.assertEqual(points, [])
         self.assertEqual(
             conn.cursor_instance.params,
-            ["source-1", *expected_source, 400000.0, 4300000.0, 402000.0, 4302000.0],
+            ["source-1", *expected_source, *query_bounds],
         )
 
     def test_kept_window_reuses_source_prefilter_for_injected_geometry(self) -> None:
         conn = _Connection(None)
         window = SpatialWindow(400000.0, 4300000.0, 402000.0, 4302000.0)
-        expected_source = CoordinateTransformer(_SPATIAL_CONTEXT).inverse_bounds(
-            (window.x_min, window.y_min, window.x_max, window.y_max)
+        query = query_window_from_processing_bounds(
+            (window.x_min, window.y_min, window.x_max, window.y_max),
+            _SPATIAL_CONTEXT,
         )
-        projected_bounds = (
-            window.x_min,
-            window.y_min,
-            window.x_max,
-            window.y_max,
-        )
+        expected_source = query.prefilter_bounds
+        projected_bounds = (query.x_min, query.y_min, query.x_max, query.y_max)
 
         with patch(
             "track.v2.db.queries.validate_source_table",
@@ -231,6 +233,18 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
 
 
 class DetectRunSpatialContextQueryTest(unittest.TestCase):
+    def test_clean_run_metadata_is_materialized_before_detect_reads(self) -> None:
+        conn = _Connection((
+            "clean-1", "raw_points", "completed", 4326, 32650,
+            _SPATIAL_CONTEXT.projection_config, True,
+        ))
+
+        row = fetch_clean_run_row(conn, "clean-1")
+
+        self.assertEqual(row.source_table, "raw_points")
+        self.assertEqual(row.spatial_context, _SPATIAL_CONTEXT)
+        self.assertTrue(row.has_source_fingerprint)
+
     def test_detect_run_inherits_validated_clean_run_context(self) -> None:
         conn = _Connection((
             "clean-1",

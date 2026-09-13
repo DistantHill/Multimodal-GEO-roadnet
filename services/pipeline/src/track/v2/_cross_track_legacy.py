@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -15,6 +16,7 @@ from ._geometry import (
 )
 from ._perf import PerfTracker
 from .models import CrossTrackCandidate, TrajectoryPoint
+from .projection import CoordinateTransformer
 
 
 def extract_cross_track_candidates_legacy(
@@ -28,8 +30,15 @@ def extract_cross_track_candidates_legacy(
     perf: PerfTracker | None = None,
     telemetry: dict[str, int | float] | None = None,
     vehicle_aabb_prefilter: bool = True,
+    coordinate_transformer: CoordinateTransformer | None = None,
 ) -> tuple[list[CrossTrackCandidate], int, int]:
-    """Run the historical dense vehicle-pair path as an equivalence oracle."""
+    """Run the dense vehicle-pair reference path.
+
+    ``coordinate_transformer=None`` retains the historical local-origin oracle
+    solely for projection-difference evaluation. Supplying it makes both
+    segment endpoints and result coordinates use the same Run CRS as the
+    optimized implementation, which is the algorithm-equivalence oracle.
+    """
     extraction_started = time.perf_counter() if telemetry is not None else 0.0
     segment_started = time.perf_counter() if telemetry is not None else 0.0
     track_segments: dict[
@@ -45,8 +54,14 @@ def extract_cross_track_candidates_legacy(
             end = track[segment_index + 1]
             if abs(_angle_delta_deg(start.heading, end.heading)) > cfg.cross_track_straightness_deg:
                 continue
-            x1, y1 = _to_xy(start.lon, start.lat, origin_lon, origin_lat)
-            x2, y2 = _to_xy(end.lon, end.lat, origin_lon, origin_lat)
+            if coordinate_transformer is None:
+                x1, y1 = _to_xy(start.lon, start.lat, origin_lon, origin_lat)
+                x2, y2 = _to_xy(end.lon, end.lat, origin_lon, origin_lat)
+            else:
+                if start.x is None or start.y is None or end.x is None or end.y is None:
+                    raise ValueError("same-CRS reference requires projected point x/y")
+                x1, y1 = float(start.x), float(start.y)
+                x2, y2 = float(end.x), float(end.y)
             segments.append((
                 x1, y1, x2, y2, start.heading, start.timestamp, segment_index,
             ))
@@ -89,6 +104,11 @@ def extract_cross_track_candidates_legacy(
         ) + (time.perf_counter() - array_started)
 
     candidates: list[CrossTrackCandidate] = []
+    ordered_candidates: list[tuple[tuple[int, ...], CrossTrackCandidate]] = []
+    actual_vehicle_ids = sorted({
+        track[0].vehicle_id for track in tracks.values() if track
+    })
+    vehicle_rank = {vehicle_id: index for index, vehicle_id in enumerate(actual_vehicle_ids)}
     total_pairs = len(vehicle_ids) * (len(vehicle_ids) - 1) // 2
     pair_count = 0
     started = time.perf_counter()
@@ -105,6 +125,10 @@ def extract_cross_track_candidates_legacy(
         a1, a2, headings_a, timestamps_a = segment_arrays[vehicle_a]
         for index_b in range(index_a + 1, len(vehicle_ids)):
             vehicle_b = vehicle_ids[index_b]
+            actual_a = tracks[vehicle_a][0].vehicle_id
+            actual_b = tracks[vehicle_b][0].vehicle_id
+            if coordinate_transformer is not None and actual_a == actual_b:
+                continue
             segments_b = track_segments[vehicle_b]
             b1, b2, headings_b, timestamps_b = segment_arrays[vehicle_b]
             if telemetry is not None:
@@ -144,12 +168,19 @@ def extract_cross_track_candidates_legacy(
                     end_a = tracks[vehicle_a][segments_a[segment_index_a][6] + 1]
                     start_b = tracks[vehicle_b][segments_b[segment_index_b][6]]
                     end_b = tracks[vehicle_b][segments_b[segment_index_b][6] + 1]
-                    lon, lat = _to_lonlat(float(x), float(y), origin_lon, origin_lat)
-                    candidates.append(CrossTrackCandidate(
+                    if coordinate_transformer is None:
+                        lon, lat = _to_lonlat(float(x), float(y), origin_lon, origin_lat)
+                    else:
+                        lon, lat = coordinate_transformer.inverse(float(x), float(y))
+                    candidate = CrossTrackCandidate(
                         point_ref=start_a.point_ref,
                         from_segment_start_point_ref=start_a.point_ref,
                         to_segment_start_point_ref=start_b.point_ref,
-                        vehicle_id=f"{vehicle_a}|{vehicle_b}",
+                        vehicle_id=(
+                            f"{actual_a}|{actual_b}"
+                            if coordinate_transformer is not None
+                            else f"{vehicle_a}|{vehicle_b}"
+                        ),
                         timestamp=(timestamps_a[segment_index_a] + timestamps_b[segment_index_b]) / 2.0,
                         lon=lon,
                         lat=lat,
@@ -160,7 +191,14 @@ def extract_cross_track_candidates_legacy(
                         from_segment_start=start_a.cleaned_point_ref,
                         to_segment_start=start_b.cleaned_point_ref,
                         cross_track_calculate_index=len(candidates),
-                    ))
+                    )
+                    if coordinate_transformer is None:
+                        candidates.append(candidate)
+                    else:
+                        ordered_candidates.append(((
+                            vehicle_rank[actual_a], vehicle_rank[actual_b],
+                            segment_index_a, segment_index_b, index_a, index_b,
+                        ), candidate))
                 if telemetry is not None:
                     telemetry["payload_seconds"] = telemetry.get("payload_seconds", 0.0) + (
                         time.perf_counter() - payload_started
@@ -180,6 +218,12 @@ def extract_cross_track_candidates_legacy(
                 )
                 last_progress = now
 
+    if coordinate_transformer is not None:
+        ordered_candidates.sort(key=lambda item: item[0])
+        candidates = [
+            replace(candidate, cross_track_calculate_index=index)
+            for index, (_key, candidate) in enumerate(ordered_candidates)
+        ]
     _emit_progress(
         live_status,
         pair_count,
@@ -195,6 +239,25 @@ def extract_cross_track_candidates_legacy(
         ) + (time.perf_counter() - extraction_started)
         telemetry["output_candidates"] = telemetry.get("output_candidates", 0) + len(candidates)
     return candidates, pair_count, total_pairs
+
+
+def extract_cross_track_candidates_reference(
+    tracks: dict[str, list[TrajectoryPoint]],
+    transformer: CoordinateTransformer,
+    cfg: Any,
+    live_status: Any = None,
+    **kwargs: Any,
+) -> tuple[list[CrossTrackCandidate], int, int]:
+    """Dense same-processing-CRS reference for the optimized algorithm gate."""
+    return extract_cross_track_candidates_legacy(
+        tracks,
+        0.0,
+        0.0,
+        cfg,
+        live_status,
+        coordinate_transformer=transformer,
+        **kwargs,
+    )
 
 
 def _emit_progress(

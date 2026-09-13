@@ -25,7 +25,12 @@ from ..models import (
     SpatialContext,
     TrajectoryPoint,
 )
-from ..projection import CoordinateTransformer, spatial_context_from_values
+from ..projection import (
+    CoordinateTransformer,
+    QueryWindow,
+    query_window_from_processing_bounds,
+    spatial_context_from_values,
+)
 from .source_table import quote_table_name, validate_source_table
 
 
@@ -147,6 +152,7 @@ def build_active_in_window_sql(
     has_clean_id: bool = False,
     kept_table: str | None = None,
     spatial_context: SpatialContext,
+    query_srid: int,
     source_key_sql_type: str = "bigint",
     source_has_extra: bool = True,
 ) -> str:
@@ -154,7 +160,7 @@ def build_active_in_window_sql(
 
     ZH: 空间窗口内的 active + injected points UNION ALL 查询。
         原始 Point 先以 4326 ``geom`` bbox 使用现有 GiST 粗筛，再以
-        ``ST_Transform(geom, processing_srid)`` 做精确窗口判断；
+        ``ST_Transform(geom, query_srid)`` 做数值闭区间精确判断；
         若该查询成为热点，可为同一固定转换建立匹配的函数 GiST 索引。
         ``kept_table`` 非空时，trajectory 分支改为 JOIN 清洗结果表
         (``kept_table`` 存 vehicle_id/subtrack 切分，几何列取自 ``table``)，
@@ -168,27 +174,34 @@ def build_active_in_window_sql(
         Raw mode without ``clean_id``:
             1.  %s::text                         — source_id literal
             2-5. source ST_MakeEnvelope          — lon_min, lat_min, lon_max, lat_max
-            6-9. processing ST_MakeEnvelope      — x_min, y_min, x_max, y_max
+            6-9. query-CRS numeric bounds        — x_min, y_min, x_max, y_max
             injected_points are deliberately excluded because their x/y CRS
             cannot be identified without the owning Clean Run.
         Kept mode (``kept_table`` set):
             1.  %s                              — ktp.clean_id
             2-5. raw source ST_MakeEnvelope      — lon_min, lat_min, lon_max, lat_max
-            6-9. raw processing ST_MakeEnvelope  — x_min, y_min, x_max, y_max
+            6-9. raw query-CRS numeric bounds    — x_min, y_min, x_max, y_max
             10. %s::text                         — canonical injected source ID
             11-14. injected source envelope      — lon_min, lat_min, lon_max, lat_max
-            15-18. injected x/y bounds           — x_min, y_min, x_max, y_max
+            15-18. injected query-CRS bounds     — x_min, y_min, x_max, y_max
             19. %s                               — injected_points.clean_id
     """
     if has_clean_id and kept_table is None:
         raise ValueError("clean_id requires kept_table for complete Run isolation")
     processing_srid = int(spatial_context.processing_srid)
+    selected_query_srid = int(query_srid)
     source_envelope = "ST_MakeEnvelope(%s, %s, %s, %s, 4326)"
-    projected_envelope = (
-        f"ST_MakeEnvelope(%s, %s, %s, %s, {processing_srid})"
-    )
     projected_tp = f"ST_Transform(tp.geom, {processing_srid})"
-    injected_window = "x >= %s AND y >= %s AND x <= %s AND y <= %s"
+    query_tp = f"ST_Transform(tp.geom, {selected_query_srid})"
+    query_ip = f"ST_Transform(geom, {selected_query_srid})"
+    tp_window = (
+        f"ST_X({query_tp}) >= %s AND ST_Y({query_tp}) >= %s AND "
+        f"ST_X({query_tp}) <= %s AND ST_Y({query_tp}) <= %s"
+    )
+    injected_window = (
+        f"ST_X({query_ip}) >= %s AND ST_Y({query_ip}) >= %s AND "
+        f"ST_X({query_ip}) <= %s AND ST_Y({query_ip}) <= %s"
+    )
     if kept_table is not None:
         extra = "tp.extra" if source_has_extra else "'{}'::jsonb"
         return (
@@ -207,7 +220,7 @@ def build_active_in_window_sql(
             f"    ON tp.id = ktp.source_row_key::{source_key_sql_type} "
             f"  WHERE ktp.clean_id = %s "
             f"    AND tp.geom && {source_envelope} "
-            f"    AND {projected_tp} && {projected_envelope} "
+            f"    AND {tp_window} "
             f"  UNION ALL "
             f"  SELECT {_IP_UNIFIED_COLS} "
             f"  FROM injected_points "
@@ -220,7 +233,10 @@ def build_active_in_window_sql(
         f"SELECT {_tp_unified_cols(processing_srid)} "
         f"FROM {table} "
         f"WHERE geom && {source_envelope} "
-        f"  AND ST_Transform(geom, {processing_srid}) && {projected_envelope} "
+        f"  AND ST_X(ST_Transform(geom, {selected_query_srid})) >= %s "
+        f"  AND ST_Y(ST_Transform(geom, {selected_query_srid})) >= %s "
+        f"  AND ST_X(ST_Transform(geom, {selected_query_srid})) <= %s "
+        f"  AND ST_Y(ST_Transform(geom, {selected_query_srid})) <= %s "
         f"ORDER BY vehicle_id, timestamp, id::text"
     )
 
@@ -411,7 +427,7 @@ def _query_spatial_extent(
 
 def _query_active_points_in_window(
     conn: Any,
-    window: SpatialWindow,
+    window: SpatialWindow | QueryWindow,
     *,
     table: str = "trajectory_points",
     kept_table: str | None = None,
@@ -436,23 +452,32 @@ def _query_active_points_in_window(
         raise ValueError("kept_table requires clean_id")
     if kept_table is None and clean_id is not None:
         raise ValueError("clean_id requires kept_table for complete Run isolation")
-    transformer = _transformer or CoordinateTransformer(spatial_context)
+    query_window = (
+        window
+        if isinstance(window, QueryWindow)
+        else query_window_from_processing_bounds(
+            (window.x_min, window.y_min, window.x_max, window.y_max),
+            spatial_context,
+        )
+    )
     contract = validate_source_table(conn, table)
-    source_bounds = transformer.inverse_bounds(
-        (window.x_min, window.y_min, window.x_max, window.y_max)
+    source_bounds = query_window.prefilter_bounds
+    query_bounds = (
+        query_window.x_min, query_window.y_min,
+        query_window.x_max, query_window.y_max,
     )
     if kept_table is not None:
         params: list[Any] = [source_table or table, clean_id]
         params.extend(source_bounds)
-        params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
+        params.extend(query_bounds)
         params.append(_INJECTED_SOURCE_ID)
         params.extend(source_bounds)
-        params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
+        params.extend(query_bounds)
         params.append(clean_id)
     else:
         params = [source_table or ""]
         params.extend(source_bounds)
-        params.extend((window.x_min, window.y_min, window.x_max, window.y_max))
+        params.extend(query_bounds)
     query_started = time.perf_counter() if telemetry is not None else 0.0
     with conn.cursor() as cur:
         cur.execute(
@@ -461,6 +486,7 @@ def _query_active_points_in_window(
                 has_clean_id=has_clean_id,
                 kept_table=kept_table,
                 spatial_context=spatial_context,
+                query_srid=query_window.query_srid,
                 source_key_sql_type=contract.key_sql_type,
                 source_has_extra=contract.has_extra,
             ),
@@ -477,11 +503,39 @@ def _query_active_points_in_window(
         telemetry["queried_rows"] = telemetry.get("queried_rows", 0) + len(rows)
         materialization_started = time.perf_counter()
     points = _build_points_from_rows(rows)
+    _validate_materialized_points(points, spatial_context)
     if telemetry is not None:
         telemetry["materialization_seconds"] = telemetry.get(
             "materialization_seconds", 0.0
         ) + (time.perf_counter() - materialization_started)
     return points
+
+
+def _validate_materialized_points(
+    points: list[TrajectoryPoint],
+    spatial_context: SpatialContext,
+) -> None:
+    """Validate exactly the rows read by a raw/diagnostic window query."""
+    if not points:
+        return
+    bounds: tuple[float, float, float, float] | None = None
+    for point in points:
+        if point.x is None or point.y is None or not all(math.isfinite(value) for value in (
+            point.lon, point.lat, point.x, point.y,
+        )):
+            raise ValueError("queried point has non-finite lon/lat/processing x/y")
+        if not (-180.0 <= point.lon <= 180.0 and -90.0 <= point.lat <= 90.0):
+            raise ValueError("queried point longitude/latitude is outside EPSG:4326")
+        bounds = (
+            (point.lon, point.lat, point.lon, point.lat)
+            if bounds is None
+            else (
+                min(bounds[0], point.lon), min(bounds[1], point.lat),
+                max(bounds[2], point.lon), max(bounds[3], point.lat),
+            )
+        )
+    assert bounds is not None
+    CoordinateTransformer(spatial_context).validate_bounds(bounds)
 
 
 def _stream_vehicle_tracks_from_db(
@@ -664,6 +718,38 @@ class _RunRow:
     parameters: dict[str, object]
     status: str
     spatial_context: SpatialContext
+
+
+@dataclass(frozen=True, slots=True)
+class _CleanRunRow:
+    """Authoritative metadata required before a formal DB Detect reads points."""
+
+    clean_id: str
+    source_table: str
+    status: str
+    spatial_context: SpatialContext
+    has_source_fingerprint: bool
+
+
+def fetch_clean_run_row(conn: object, clean_id: str) -> _CleanRunRow:
+    """Fetch and validate one Clean Run's persisted projection context."""
+    with conn.cursor() as cur:  # type: ignore[attr-defined]
+        cur.execute(
+            "SELECT id, source_table, status, source_srid, processing_srid, "
+            "projection_config, source_fingerprint IS NOT NULL "
+            "FROM clean_runs WHERE id = %s",
+            (clean_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise ValueError(f"unknown Clean Run: {clean_id}")
+    return _CleanRunRow(
+        clean_id=str(row[0]),
+        source_table=str(row[1]),
+        status=str(row[2]),
+        spatial_context=spatial_context_from_values(row[3], row[4], row[5]),
+        has_source_fingerprint=bool(row[6]),
+    )
 
 
 def fetch_detect_row(conn: object, detect_id: str) -> _RunRow:

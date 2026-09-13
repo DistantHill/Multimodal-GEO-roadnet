@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Iterable
 
@@ -11,10 +12,88 @@ from .models import ProjectionConfig, SpatialContext
 
 
 COORDINATE_SEMANTICS_VERSION = 2
+QUERY_WINDOW_RULE_VERSION = 1
+QUERY_MAX_SCALE_ERROR = 0.015
 
 
 class ProjectionError(ValueError):
     """Raised when a Run's coordinate context is missing or unsafe."""
+
+
+@dataclass(frozen=True, slots=True)
+class QueryWindowRequest:
+    """Geographic centre plus grid-aligned metric dimensions."""
+
+    center_lon: float
+    center_lat: float
+    width_m: float
+    height_m: float
+
+
+@dataclass(frozen=True, slots=True)
+class QueryWindow:
+    """A validated rectangle in one standard WGS84 / UTM query CRS.
+
+    ``geographic_bounds`` describes the true inverse-projected footprint.
+    ``prefilter_bounds`` is the independently outward-rounded Geometry GiST
+    envelope and must never be used for zone or three-degree-grid decisions.
+    """
+
+    request: QueryWindowRequest
+    query_srid: int
+    x_min: float
+    y_min: float
+    x_max: float
+    y_max: float
+    geographic_bounds: tuple[float, float, float, float]
+    prefilter_bounds: tuple[float, float, float, float]
+    three_degree_cells: tuple[int, ...]
+    rule_version: int = QUERY_WINDOW_RULE_VERSION
+
+
+def build_query_window(request: QueryWindowRequest) -> QueryWindow:
+    """Choose the easternmost entered standard UTM zone and build its window.
+
+    Zone selection is bounded: the centre-zone candidate is evaluated, then a
+    changed eastern-zone candidate is rebuilt once and must be self-consistent.
+    """
+    _validate_query_request(request)
+    selected = _utm_srid(request.center_lon, request.center_lat)
+    visited: set[int] = set()
+    for _attempt in range(2):
+        if selected in visited:
+            raise ProjectionError("query UTM zone selection did not converge")
+        visited.add(selected)
+        window = _query_window_in_srid(request, selected, validate_final=False)
+        required = _easternmost_utm_srid(
+            window.geographic_bounds[0],
+            window.geographic_bounds[2],
+            request.center_lat,
+        )
+        if required == selected:
+            return _query_window_in_srid(request, selected, validate_final=True)
+        selected = required
+    raise ProjectionError("query UTM zone selection has no self-consistent solution")
+
+
+def query_window_from_processing_bounds(
+    bounds: tuple[float, float, float, float],
+    run_context: SpatialContext,
+) -> QueryWindow:
+    """Explicitly adapt an old processing-CRS rectangle for SQL querying.
+
+    The original numeric width and height are retained, while its geographic
+    centre is reprojected and the footprint is rebuilt in the selected query
+    UTM grid. Consequently the geographic outline is intentionally different.
+    """
+    if not all(math.isfinite(value) for value in bounds):
+        raise ProjectionError("processing bounds must be finite")
+    x_min, y_min, x_max, y_max = bounds
+    if x_min >= x_max or y_min >= y_max:
+        raise ProjectionError("processing query bounds must have positive size")
+    transformer = CoordinateTransformer(run_context)
+    lon, lat = transformer.inverse((x_min + x_max) / 2.0, (y_min + y_max) / 2.0)
+    return build_query_window(QueryWindowRequest(lon, lat, x_max - x_min, y_max - y_min))
 
 
 def create_spatial_context(
@@ -150,42 +229,26 @@ class CoordinateTransformer:
         self,
         bounds: tuple[float, float, float, float],
         *,
-        densify_pts: int = 64,
+        densify_pts: int | None = None,
     ) -> tuple[float, float, float, float]:
-        """Return a conservative 4326 bbox for one processing-CRS rectangle.
+        """Return a conservative bbox for a supported standard UTM rectangle.
 
-        Densifying the four edges before transforming preserves the existing
-        4326 GiST prefilter even when projected grid edges are curved in
-        longitude/latitude. The processing-CRS predicate remains the exact
-        authority for window membership.
+        This no longer offers a sampling-based conservatism claim. Standard
+        transverse Mercator is symmetric about its central meridian: over the
+        supported, single-hemisphere local domain longitude is monotone with
+        easting and latitude is monotone with northing on each side; a
+        horizontal edge's only interior latitude extremum is at the central
+        meridian. Thus the four corners plus both horizontal-edge crossings of
+        false easting 500000 contain every boundary extremum. IEEE outward
+        rounding then protects the SQL envelope from final-operation rounding.
+
+        Other projected CRSs are explicitly rejected because no corresponding
+        extremum proof is implemented. ``densify_pts`` remains only to produce
+        a clear migration error for old callers.
         """
-        x_min, y_min, x_max, y_max = bounds
-        if not all(math.isfinite(value) for value in bounds):
-            raise ProjectionError("processing bounds must be finite")
-        if x_min > x_max or y_min > y_max:
-            raise ProjectionError("processing bounds must be ordered")
-        if densify_pts < 2:
-            raise ProjectionError("densify_pts must be at least 2")
-        west, south, east, north = self._inverse.transform_bounds(
-            x_min,
-            y_min,
-            x_max,
-            y_max,
-            densify_pts=densify_pts,
-        )
-        source_bounds = tuple(float(value) for value in (west, south, east, north))
-        if not all(math.isfinite(value) for value in source_bounds):
-            raise ProjectionError("processing bounds could not be transformed to source_srid")
-        # A single ST_MakeEnvelope cannot represent an antimeridian split. A
-        # world-width prefilter is conservative; the projected predicate still
-        # supplies exact membership.
-        if west > east:
-            west, east = -180.0, 180.0
-        west = max(-180.0, math.nextafter(float(west), -math.inf))
-        south = max(-90.0, math.nextafter(float(south), -math.inf))
-        east = min(180.0, math.nextafter(float(east), math.inf))
-        north = min(90.0, math.nextafter(float(north), math.inf))
-        return west, south, east, north
+        if densify_pts is not None:
+            raise ProjectionError("densify_pts is unsupported; conservative UTM bounds are analytic")
+        return _utm_inverse_bounds(self.context.processing_srid, bounds)
 
     def heading_vector(
         self,
@@ -270,6 +333,214 @@ class CoordinateTransformer:
                 raise ProjectionError(
                     f"EPSG:{self.context.processing_srid} scale distortion exceeds "
                     f"configured max_scale_error={allowed:g} at ({lon}, {lat})"
+                )
+
+
+def _validate_query_request(request: QueryWindowRequest) -> None:
+    values = (
+        request.center_lon, request.center_lat, request.width_m, request.height_m,
+    )
+    if not all(math.isfinite(value) for value in values):
+        raise ProjectionError("query window values must be finite")
+    _validate_lonlat_domain((
+        request.center_lon, request.center_lat,
+        request.center_lon, request.center_lat,
+    ))
+    if request.width_m <= 0.0 or request.height_m <= 0.0:
+        raise ProjectionError("query window width and height must be positive")
+    if not -80.0 <= request.center_lat <= 84.0:
+        raise ProjectionError("standard UTM query windows require latitude in [-80, 84]")
+    # The implementation deliberately excludes antimeridian and hemisphere
+    # crossings; neither has a single safe SQL envelope/UTM hemisphere.
+    if abs(request.center_lon) >= 179.0:
+        raise ProjectionError("query windows near the antimeridian are unsupported")
+
+
+def _utm_srid(lon: float, lat: float) -> int:
+    zone = min(60, max(1, int(math.floor((lon + 180.0) / 6.0)) + 1))
+    return (32600 if lat >= 0.0 else 32700) + zone
+
+
+def _utm_zone(srid: int) -> tuple[int, bool]:
+    if 32601 <= srid <= 32660:
+        return srid - 32600, True
+    if 32701 <= srid <= 32760:
+        return srid - 32700, False
+    raise ProjectionError(
+        "conservative inverse bounds are implemented only for standard "
+        "WGS84 / UTM EPSG:32601..32660 and EPSG:32701..32760"
+    )
+
+
+def _easternmost_utm_srid(west: float, east: float, latitude: float) -> int:
+    if west <= -180.0 or east >= 180.0:
+        raise ProjectionError("query window reaches the antimeridian")
+    # ceil(...)-1 is stable at exact boundaries; nextafter before adding 180
+    # can be rounded back onto the boundary at this magnitude.
+    zone = min(60, max(1, int(math.ceil((east + 180.0) / 6.0))))
+    return (32600 if latitude >= 0.0 else 32700) + zone
+
+
+def _entered_three_degree_cells(
+    west: float,
+    east: float,
+    *,
+    enforce_limit: bool = True,
+) -> tuple[int, ...]:
+    first = math.floor((west + 1.5) / 3.0)
+    last = math.ceil((east + 1.5) / 3.0) - 1
+    cells = tuple(range(first, last + 1))
+    if enforce_limit and (
+        not cells
+        or len(cells) > 2
+        or (len(cells) == 2 and cells[1] != cells[0] + 1)
+    ):
+        raise ProjectionError("query window may enter at most two adjacent three-degree grid cells")
+    return cells
+
+
+def _query_window_in_srid(
+    request: QueryWindowRequest,
+    srid: int,
+    *,
+    validate_final: bool,
+) -> QueryWindow:
+    zone, north = _utm_zone(srid)
+    if north != (request.center_lat >= 0.0):
+        raise ProjectionError("query window cannot cross UTM hemispheres")
+    context = SpatialContext(
+        source_srid=4326,
+        processing_srid=srid,
+        projection_config={
+            "coordinate_semantics_version": COORDINATE_SEMANTICS_VERSION,
+            "enforce_area_of_use": False,
+            "max_scale_error": QUERY_MAX_SCALE_ERROR,
+        },
+    )
+    transformer = CoordinateTransformer(context)
+    center_x, center_y = transformer.forward(request.center_lon, request.center_lat)
+    half_width = request.width_m / 2.0
+    half_height = request.height_m / 2.0
+    bounds = (
+        center_x - half_width, center_y - half_height,
+        center_x + half_width, center_y + half_height,
+    )
+    geographic, prefilter = _utm_inverse_bounds_pair(srid, bounds)
+    west, south, east, north_lat = geographic
+    if west <= -180.0 or east >= 180.0:
+        raise ProjectionError("query window reaches the antimeridian")
+    if south < -80.0 or north_lat > 84.0:
+        raise ProjectionError("query footprint falls outside the standard UTM latitude domain")
+    if south < 0.0 < north_lat:
+        raise ProjectionError("query window cannot cross UTM hemispheres")
+    cells = _entered_three_degree_cells(
+        west, east, enforce_limit=validate_final,
+    )
+    if validate_final:
+        _validate_query_scale(srid, geographic)
+    return QueryWindow(
+        request=request,
+        query_srid=srid,
+        x_min=bounds[0], y_min=bounds[1], x_max=bounds[2], y_max=bounds[3],
+        geographic_bounds=geographic,
+        prefilter_bounds=prefilter,
+        three_degree_cells=cells,
+    )
+
+
+def _utm_inverse_bounds_pair(
+    srid: int,
+    bounds: tuple[float, float, float, float],
+) -> tuple[
+    tuple[float, float, float, float],
+    tuple[float, float, float, float],
+]:
+    zone, utm_north = _utm_zone(srid)
+    if not all(math.isfinite(value) for value in bounds):
+        raise ProjectionError("processing bounds must be finite")
+    x_min, y_min, x_max, y_max = bounds
+    if x_min > x_max or y_min > y_max:
+        raise ProjectionError("processing bounds must be ordered")
+    # Bound the inverse-TM branch to the local, single-wrap UTM sheet on which
+    # the monotonic/extremum argument applies. Standard zone use plus the query
+    # policy's adjacent-grid reach is comfortably inside these limits.
+    if x_min < -1_000_000.0 or x_max > 2_000_000.0 or y_min < 0.0 or y_max > 10_000_000.0:
+        raise ProjectionError("UTM rectangle exceeds the supported local projected domain")
+    _CRS, _Proj, Transformer = _pyproj_types()
+    inverse = Transformer.from_crs(srid, 4326, always_xy=True)
+    samples = [(x, y) for x in (x_min, x_max) for y in (y_min, y_max)]
+    if x_min <= 500_000.0 <= x_max:
+        samples.extend(((500_000.0, y_min), (500_000.0, y_max)))
+    transformed = [inverse.transform(x, y) for x, y in samples]
+    if any(not (math.isfinite(float(lon)) and math.isfinite(float(lat))) for lon, lat in transformed):
+        raise ProjectionError("UTM bounds could not be transformed to EPSG:4326")
+    lons = [float(lon) for lon, _lat in transformed]
+    lats = [float(lat) for _lon, lat in transformed]
+    central_meridian = zone * 6.0 - 183.0
+    longitude_offsets = [
+        (lon - central_meridian + 180.0) % 360.0 - 180.0 for lon in lons
+    ]
+    if any(abs(offset) > 15.0 for offset in longitude_offsets):
+        raise ProjectionError("UTM rectangle exceeds the supported central-meridian domain")
+    if max(lons) - min(lons) > 30.0:
+        raise ProjectionError(
+            "UTM rectangle crosses the antimeridian or exceeds the supported local domain"
+        )
+    geographic = (min(lons), min(lats), max(lons), max(lats))
+    if geographic[1] < -80.0 or geographic[3] > 84.0:
+        raise ProjectionError("UTM rectangle falls outside the supported latitude domain")
+    if (utm_north and geographic[1] < 0.0) or (
+        not utm_north and geographic[3] > 0.0
+    ):
+        raise ProjectionError("UTM rectangle crosses or uses the wrong hemisphere")
+    # Two ulps cover min/max selection and the downstream text/binary parameter
+    # conversion without using an arbitrary geographic epsilon.
+    west, south, east, north = geographic
+    for _ in range(2):
+        west = math.nextafter(west, -math.inf)
+        south = math.nextafter(south, -math.inf)
+        east = math.nextafter(east, math.inf)
+        north = math.nextafter(north, math.inf)
+    return geographic, (west, south, east, north)
+
+
+def _utm_inverse_bounds(
+    srid: int,
+    bounds: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    return _utm_inverse_bounds_pair(srid, bounds)[1]
+
+
+def _validate_query_scale(
+    srid: int,
+    bounds: tuple[float, float, float, float],
+) -> None:
+    _CRS, Proj, _Transformer = _pyproj_types()
+    projection = Proj(f"EPSG:{srid}")
+    west, south, east, north = bounds
+    # For UTM, scale magnitude grows with absolute distance from the central
+    # meridian and is largest toward the equator. These combinations therefore
+    # include the extrema over the rectangular geographic enclosure.
+    latitudes = {south, north}
+    if south <= 0.0 <= north:
+        latitudes.add(0.0)
+    else:
+        latitudes.add(south if abs(south) < abs(north) else north)
+    for lon in (west, east):
+        for lat in latitudes:
+            factors = projection.get_factors(lon, lat)
+            scales = (
+                float(factors.meridional_scale), float(factors.parallel_scale),
+                float(factors.tissot_semimajor), float(factors.tissot_semiminor),
+            )
+            if any(
+                not math.isfinite(scale)
+                or abs(scale - 1.0) > QUERY_MAX_SCALE_ERROR
+                for scale in scales
+            ):
+                raise ProjectionError(
+                    f"EPSG:{srid} query scale distortion exceeds "
+                    f"max_scale_error={QUERY_MAX_SCALE_ERROR:g}"
                 )
 
 
