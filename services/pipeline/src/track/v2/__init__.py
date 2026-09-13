@@ -12,49 +12,48 @@ Intersect2 uses two complementary methods:
 Both feed into the same topology verification (entry/exit → branch clustering).
 """
 
-from .cleaner1 import clean
-from .clip import extract_clips, extract_clips_for_detect
-from .fitting import fit_centerlines, fit_centerline_variants
-from .intersect2 import IntersectConfig, IntersectResult, detect_intersections
-from .network import build_network
-from .models import (
-    Centerline,
-    CenterlineFitBundle,
-    CleanerConfig,
-    ClipConfig,
-    ClipEndpoint,
-    ClipInput,
-    ClipIntersection,
-    ClipPoint,
-    ClipReport,
-    ClipResult,
-    ClipTrack,
-    CsvSource,
-    FitIssue,
-    FitReport,
-    FitResult,
-    FittingConfig,
-    NetworkConfig,
-    NetworkEdge,
-    NetworkIssue,
-    NetworkNode,
-    NetworkReport,
-    NetworkResult,
-    PointRef,
-    PostgresSource,
-    ProjectionConfig,
-    ResolvedTrackPoint,
-    SpatialContext,
-    TrackClip,
-    TrajectoryPoint,
-)
-from .parser0 import get_database
-from .projection import (
-    ProjectionError,
-    QueryWindow,
-    QueryWindowRequest,
-    build_query_window,
-    create_spatial_context,
-)
-from .replay import ReplayService, ReplayTarget, replay_centerline_inputs
-from .pipeline import PipelineInput, PipelineResult
+from importlib import import_module as _import_module
+
+
+# Importing a lightweight coordinator must not initialize numerical libraries
+# before its spawned process initializer can configure native thread counts.
+# Public stage functions and model classes retain their original identities.
+_MODULE_EXPORTS = {
+    "cleaner1": ("clean",),
+    "clip": ("extract_clips", "extract_clips_for_detect"),
+    "fitting": ("fit_centerlines", "fit_centerline_variants"),
+    "intersect2": ("IntersectConfig", "IntersectResult", "detect_intersections"),
+    "network": ("build_network",),
+    "models": (
+        "Centerline", "CenterlineFitBundle", "CleanerConfig", "ClipConfig",
+        "ClipEndpoint", "ClipInput", "ClipIntersection", "ClipPoint", "ClipReport",
+        "ClipResult", "ClipTrack", "CsvSource", "FitIssue", "FitReport", "FitResult",
+        "FittingConfig", "NetworkConfig", "NetworkEdge", "NetworkIssue", "NetworkNode",
+        "NetworkReport", "NetworkResult", "PointRef", "PostgresSource", "ProjectionConfig",
+        "ResolvedTrackPoint", "SpatialContext", "TrackClip", "TrajectoryPoint",
+    ),
+    "parser0": ("get_database",),
+    "projection": (
+        "ProjectionError", "QueryWindow", "QueryWindowRequest", "build_query_window",
+        "create_spatial_context",
+    ),
+    "replay": ("ReplayService", "ReplayTarget", "replay_centerline_inputs"),
+    "pipeline": ("PipelineInput", "PipelineResult"),
+}
+_EXPORT_MODULE = {
+    name: module for module, names in _MODULE_EXPORTS.items() for name in names
+}
+__all__ = list(_EXPORT_MODULE)
+
+
+def __getattr__(name: str):
+    module = _EXPORT_MODULE.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(_import_module(f".{module}", __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
