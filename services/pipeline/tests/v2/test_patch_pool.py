@@ -10,12 +10,52 @@ import weakref
 
 import pytest
 
-from track.v2.patch_pool import PatchExecutionError, PatchTask, RemotePatchFailure, run_bounded_patches
+from track.v2.patch_pool import (
+    DispatchPause, PatchExecutionError, PatchTask, PoolShutdownUnconfirmed,
+    RemotePatchFailure, run_bounded_patches,
+)
 
 
 # A child imports this module only after its initializer configured thread counts.
 _IMPORT_THREAD_COUNT = os.environ.get("OPENBLAS_NUM_THREADS")
 _NUMPY_BEFORE_KERNEL_IMPORT = "numpy" in sys.modules
+
+
+def test_admission_pause_drains_work_without_rebuilding_the_pool():
+    pool = FakePool()
+    consumed = []
+
+    def tasks():
+        yield task(1)
+        yield DispatchPause()
+        assert consumed == ["1"]
+        yield task(2)
+
+    assert run(tasks(), pool=pool, max_workers=2, max_inflight=2,
+               consume=lambda task, result: consumed.append(task.task_id)) == 2
+    assert consumed == ["1", "2"]
+    assert len(pool.factory_calls) == 1
+
+
+def test_admission_pause_cannot_wait_on_an_idle_pool():
+    pool = FakePool()
+    with pytest.raises(RuntimeError, match="without in-flight"):
+        run([DispatchPause()], pool=pool)
+    assert pool.shutdown_calls == [{"wait": True, "cancel_futures": True}]
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt(), SystemExit(), OSError("shutdown")])
+def test_shutdown_interruption_is_not_reported_as_a_stopped_pool(error):
+    pool = FakePool()
+
+    def shutdown(**kwargs):
+        raise error
+
+    pool.shutdown = shutdown
+    with pytest.raises(PoolShutdownUnconfirmed) as raised:
+        run([task(1)], pool=pool)
+    assert raised.value.executor is pool
+    assert raised.value.__cause__ is error
 
 
 def spawn_kernel(task):

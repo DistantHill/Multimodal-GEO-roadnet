@@ -57,6 +57,23 @@ class PatchTask:
     descriptor_json: str
 
 
+@dataclass(frozen=True, slots=True)
+class DispatchPause:
+    """Stop refilling until an in-flight result is consumed; not end of input."""
+
+
+class PoolShutdownUnconfirmed(RuntimeError):
+    """The pool may still execute work: retain reservations and working state.
+
+    The owner can retry executor.shutdown(wait=True, cancel_futures=True), but
+    must not start another coordinator until old processes are confirmed stopped.
+    """
+
+    def __init__(self, executor):
+        self.executor = executor
+        super().__init__("Executor shutdown was not confirmed; work may still be running")
+
+
 class PatchExecutionError(RuntimeError):
     """A calculation failed; the coordinator can classify the original cause."""
 
@@ -134,7 +151,7 @@ def _execute_task(entrypoint: str, task: PatchTask, descriptor_limit: int) -> tu
 
 
 def run_bounded_patches(
-    tasks: Iterable[PatchTask],
+    tasks: Iterable[PatchTask | DispatchPause],
     *,
     compute_entrypoint: str,
     consume: Callable[[PatchTask, str], Any],
@@ -166,11 +183,17 @@ def run_bounded_patches(
     that entrypoint before running the initializer. Kernels must honor these
     settings; arbitrary libraries are not forcibly reconfigured or limited.
 
-    On success or any error, queued futures are cancelled and the pool is shut
-    down with ``wait=True``. Already-running tasks cannot be forcibly cancelled;
-    shutdown can therefore wait for them. Source iterators remain caller-owned.
+    On success or any error, queued futures are cancelled and shutdown is attempted
+    with ``wait=True``. Already-running tasks cannot be forcibly cancelled;
+    shutdown can therefore wait for them. If shutdown itself fails or is interrupted,
+    PoolShutdownUnconfirmed retains the executor handle; do not release reservations
+    or reclaim working tasks. Source iterators remain caller-owned.
     Executor/wait injection exists for deterministic tests, not as a way to
     replace process isolation in production.
+
+    A source may yield DispatchPause when admission depends on releasing an
+    in-flight reservation. It is resumed after consumption without rebuilding
+    the pool. Pausing an idle pool is an error: no result could unblock it.
     """
     for name, value in (
         ("max_workers", max_workers), ("max_inflight", max_inflight),
@@ -213,6 +236,10 @@ def run_bounded_patches(
                 except StopIteration:
                     exhausted = True
                     break
+                if isinstance(task, DispatchPause):
+                    if not pending:
+                        raise RuntimeError("Cannot pause dispatch without in-flight work")
+                    break
                 _validate_task(task, max_descriptor_bytes)
                 future = executor.submit(
                     _execute_task, compute_entrypoint, task, max_descriptor_bytes,
@@ -245,6 +272,9 @@ def run_bounded_patches(
             # wait result set or loop locals holding Future/result references.
             del done, future, task, result, acknowledgement
     finally:
-        for future in pending:
-            future.cancel()
-        executor.shutdown(wait=True, cancel_futures=True)
+        try:
+            for future in pending:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+        except BaseException as error:
+            raise PoolShutdownUnconfirmed(executor) from error
