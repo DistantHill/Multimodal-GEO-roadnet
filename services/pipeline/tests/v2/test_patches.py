@@ -274,3 +274,45 @@ def test_invalid_configuration_value_rejected_even_if_allowlisted():
 def test_mapping_values_normalized_without_key_coercion():
     assert canonical_json(MappingProxyType({"nested": MappingProxyType({"a": 1})})) == (
         '{"nested":{"a":1}}')
+
+
+@pytest.mark.parametrize("value", [
+    {}, {"algorithm_threshold": 1}, [{"algorithm_threshold": 1}],
+    [{"algorithm_threshold": 99}], [[1]], [[99]], [[]], [{}],
+    [1, {"algorithm_threshold": 1}], [1, [2, 3]],
+])
+def test_execution_allowlist_cannot_hide_object_or_nested_list_subtrees(value):
+    with pytest.raises(ValueError, match="leaves, not subtrees"):
+        classify_parameters({"runtime": {"n": value}}, execution_paths=[("runtime", "n")])
+
+
+@pytest.mark.parametrize("value", [None, True, False, 3, 1.5, "process", [],
+                                        [1, 2, 3], [None, True, 1.5, "process"]])
+def test_execution_leaves_allow_scalars_and_flat_scalar_lists(value):
+    result = classify_parameters(
+        {"runtime": {"setting": value}, "threshold": 5},
+        execution_paths=[("runtime", "setting")],
+    )
+    assert json.loads(result.execution_json) == {"runtime": {"setting": value}}
+    assert json.loads(result.semantic_json) == {"threshold": 5}
+
+
+def test_flat_scalar_execution_list_changes_do_not_change_resume_semantics():
+    def classify(cores):
+        return classify_parameters(
+            {"runtime": {"cpu_affinity": cores}, "threshold": 5},
+            execution_paths=[("runtime", "cpu_affinity")],
+        )
+
+    first, second = classify([0, 1]), classify([2, 3])
+    assert first.semantic_digest == second.semantic_digest
+    assert first.execution_digest != second.execution_digest
+
+
+@pytest.mark.parametrize("wrap", [lambda value: [{"unknown_threshold": value}],
+                                  lambda value: [[value]]])
+def test_unknown_nested_container_changes_remain_semantic(wrap):
+    first = classify_parameters({"runtime": {"future_setting": wrap(1)}})
+    second = classify_parameters({"runtime": {"future_setting": wrap(99)}})
+    assert first.semantic_digest != second.semantic_digest
+    assert first.execution_json == second.execution_json == "{}"

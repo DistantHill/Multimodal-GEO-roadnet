@@ -253,6 +253,9 @@ def classify_parameters(
     Algorithm grid scale/halo must remain semantic; a separately named scheduling
     subdivision limit may be allowlisted only with equivalent ownership/merging.
     Absent allowlisted paths are allowed so a schema can include optional knobs.
+    An execution leaf is a JSON scalar or a flat list of JSON scalars (including
+    an empty list). Objects, even empty ones, and lists containing objects/lists
+    are subtrees and cannot be excluded as a whole.
     """
     if not isinstance(parameters, Mapping):
         raise ValueError("parameters must be a JSON object")
@@ -272,16 +275,19 @@ def classify_parameters(
         execution: dict[str, Any] = {}
         for key, value in node.items():
             path = (*prefix, key)
-            if isinstance(value, dict) and value:
-                if path in allowed:
+            if path in allowed:
+                if isinstance(value, dict) or (
+                    isinstance(value, list)
+                    and any(isinstance(item, (dict, list)) for item in value)
+                ):
                     raise ValueError("Execution allowlist must name leaves, not subtrees")
+                execution[key] = value
+            elif isinstance(value, dict) and value:
                 child_semantic, child_execution = split(value, path)
                 if child_semantic:
                     semantic[key] = child_semantic
                 if child_execution:
                     execution[key] = child_execution
-            elif path in allowed:
-                execution[key] = value
             else:
                 semantic[key] = value
         return semantic, execution
