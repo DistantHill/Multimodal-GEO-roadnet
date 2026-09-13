@@ -2,14 +2,14 @@
 
 from collections import deque
 from concurrent.futures import Future
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 
 import pytest
 from psycopg.pq import TransactionStatus
 
 from track.v2.db.patch_ledger import (
-    AttemptToken, CommitOutcomeUnknown, LedgerError, PatchLedger, RunLocked, StaleAttempt,
+    AttemptToken, CommitOutcomeUnknown, LedgerError, PatchLedger, RunLocked, StageState, StaleAttempt,
     install_ledger,
 )
 from track.v2.patches import PatchManifest, ResumeSignature
@@ -37,6 +37,10 @@ class Cursor:
         self.conn.fetch_sizes.append(size)
         return [self.conn.rows.popleft() for _ in range(min(size, len(self.conn.rows)))]
 
+    @property
+    def rowcount(self):
+        return self.conn.rowcount
+
 
 class Transaction:
     def __init__(self, conn):
@@ -44,8 +48,10 @@ class Transaction:
 
     def __enter__(self):
         self.conn.transactions += 1
+        self.conn.info.transaction_status = TransactionStatus.INTRANS
 
     def __exit__(self, kind, value, tb):
+        self.conn.info.transaction_status = TransactionStatus.IDLE
         if kind is not None:
             self.conn.rollbacks += 1
         elif self.conn.commit_error:
@@ -65,6 +71,7 @@ class Connection:
         self.commit_error = None
         self.closed = False
         self.fetch_sizes = []
+        self.rowcount = 0
 
     def cursor(self):
         return Cursor(self)
@@ -379,3 +386,169 @@ def test_start_known_lock_refusal_preserves_existing_owner_and_connection(rows):
     assert not conn.closed
     assert ledger._lock_key is None
     assert not any("pg_advisory_unlock" in query for query, _ in conn.statements)
+
+
+@pytest.mark.parametrize("counts", [(0, 0, 0, 0, None), (2, 1, 5, 3, 0),
+                                   (1, 0, 9, 0, 2.25)])
+def test_stage_state_is_one_guarded_bounded_aggregate(counts):
+    ledger, conn = active([(True,), (1, True, False), counts])
+    state = ledger.stage_state()
+    assert state == StageState(True, False, *counts)
+    assert conn.transactions == conn.commits == 1
+    assert len(conn.statements) == 3
+    query, params = conn.statements[-1]
+    assert "count(*) FILTER" in query
+    assert "statement_timestamp()" in query
+    assert "manifest" not in query
+    assert params == ("run", "clean")
+    assert not conn.fetch_sizes
+    with pytest.raises(FrozenInstanceError):
+        state.pending = 9
+
+
+@pytest.mark.parametrize("overrides", [
+    {"sealed": 1}, {"published": "false"}, {"pending": -1}, {"working": True},
+    {"complete": 1.0}, {"failed": "2"}, {"retry_after_seconds": 0},
+    {"pending": 1}, {"pending": 1, "retry_after_seconds": float("nan")},
+    {"pending": 1, "retry_after_seconds": float("inf")},
+    {"pending": 1, "retry_after_seconds": -0.1},
+    {"pending": 1, "retry_after_seconds": True}, {"published": True},
+    {"published": True, "sealed": True, "working": 1},
+    {"published": True, "sealed": True, "failed": 1},
+])
+def test_stage_state_validates_database_summary(overrides):
+    with pytest.raises(ValueError):
+        replace(StageState(False, False, 0, 0, 0, 0, None), **overrides)
+
+
+@pytest.mark.parametrize("method", ["stage_state", "abandon_working", "publish"])
+@pytest.mark.parametrize("rows", [[(False,)], [(True,), (2, False, False)]])
+def test_new_stage_apis_require_current_lock_and_generation(method, rows):
+    ledger, conn = active(rows)
+    with pytest.raises(StaleAttempt):
+        getattr(ledger, method)()
+    assert conn.rollbacks == 1
+    assert not any(query.startswith("UPDATE") for query, _ in conn.statements)
+
+
+@pytest.mark.parametrize("method", ["stage_state", "abandon_working", "publish"])
+def test_new_stage_apis_require_start(method):
+    with pytest.raises(LedgerError, match="No active run"):
+        getattr(PatchLedger(Connection()), method)()
+
+
+def test_abandon_updates_current_working_tasks_and_history_atomically():
+    ledger, conn = active([(True,), (1, True, False)])
+    conn.rowcount = 3
+    assert ledger.abandon_working(message="Pool confirmed stopped") == 3
+    assert conn.transactions == conn.commits == 1
+    updates = [(query, params) for query, params in conn.statements if query.startswith("UPDATE")]
+    assert len(updates) == 2
+    assert "status = 'abandoned'" in updates[0][0]
+    assert updates[0][1] == ("Pool confirmed stopped", "run", "clean", 1)
+    assert "attempt_no < 3" in updates[1][0]
+    assert "THEN 'pending' ELSE 'failed' END" in updates[1][0]
+    assert "attempt_token = NULL, next_retry_at = NULL" in updates[1][0]
+    assert updates[1][1] == ("run", "clean", 1)
+    for query, _ in updates:
+        assert "generation = %s AND status = 'working'" in query
+
+
+@pytest.mark.parametrize("message", [None, "", "  ", "unsafe\x00message", "x" * 4097])
+def test_abandon_rejects_invalid_message_without_sql(message):
+    ledger, conn = active()
+    with pytest.raises(ValueError):
+        ledger.abandon_working(message=message)
+    assert not conn.statements
+
+
+def test_abandon_failure_rolls_back_history_and_task_transition():
+    ledger, conn = active([(True,), (1, True, False)])
+    class FailingCursor(Cursor):
+        def execute(self, query, params=()):
+            result = super().execute(query, params)
+            if "UPDATE" in str(query) and "pipeline_patch_tasks" in str(query):
+                raise OSError("transaction interrupted")
+            return result
+    conn.cursor = lambda: FailingCursor(conn)
+    with pytest.raises(OSError):
+        ledger.abandon_working()
+    assert conn.rollbacks == 1
+    assert conn.commits == 0
+
+
+def test_publish_callback_and_stage_flag_share_transaction():
+    ledger, conn = active([(True,), (1, True, False), (False,)])
+    assert ledger.publish(lambda cur: cur.conn.statements.append(("BUSINESS", ())))
+    assert conn.transactions == conn.commits == 1
+    assert conn.statements[-2] == ("BUSINESS", ())
+    assert "published = true" in conn.statements[-1][0]
+
+
+@pytest.mark.parametrize("rows", [
+    [(True,), (1, False, False)], [(True,), (1, True, False), (True,)],
+])
+def test_publish_ineligible_stage_never_calls_callback(rows):
+    ledger, _ = active(rows)
+    with pytest.raises(LedgerError):
+        ledger.publish(lambda cur: pytest.fail("Ineligible callback"))
+
+
+def test_publish_duplicate_never_calls_callback():
+    ledger, conn = active([(True,), (1, True, True)])
+    assert ledger.publish(lambda cur: pytest.fail("Duplicate callback")) is False
+    assert not any(query.startswith("UPDATE") for query, _ in conn.statements)
+
+
+def test_publish_callback_failure_rolls_back_and_is_not_unknown():
+    ledger, conn = active([(True,), (1, True, False), (False,)])
+    def callback(cur):
+        raise ArithmeticError("Business publication failed")
+    with pytest.raises(ArithmeticError):
+        ledger.publish(callback)
+    assert conn.rollbacks == 1
+    assert not conn.closed
+    assert not any("published = true" in query for query, _ in conn.statements)
+
+
+@pytest.mark.parametrize("result", [Future(), 1, {}])
+def test_publish_rejects_non_synchronous_none_callback_results(result):
+    ledger, conn = active([(True,), (1, True, False), (False,)])
+    with pytest.raises(ValueError, match="synchronously"):
+        ledger.publish(lambda cur: result)
+    assert conn.rollbacks == 1
+
+
+def test_publish_rejects_coroutine_without_execution():
+    ledger, conn = active([(True,), (1, True, False), (False,)])
+    async def callback(cur):
+        pytest.fail("Coroutine cannot execute")
+    with pytest.raises(ValueError, match="synchronously"):
+        ledger.publish(callback)
+    assert conn.rollbacks == 1
+
+
+def test_publish_rejects_transaction_boundary_changed_by_callback():
+    ledger, conn = active([(True,), (1, True, False), (False,)])
+    def callback(cur):
+        conn.info.transaction_status = TransactionStatus.IDLE
+    with pytest.raises(LedgerError, match="changed the owned transaction"):
+        ledger.publish(callback)
+    assert not any("published = true" in query for query, _ in conn.statements)
+
+
+def test_publish_commit_acknowledgement_loss_requires_stage_reconciliation():
+    ledger, conn = active([(True,), (1, True, False), (False,)])
+    conn.commit_error = OSError("COMMIT acknowledgement lost")
+    called = []
+    with pytest.raises(CommitOutcomeUnknown, match="durable stage publication"):
+        ledger.publish(lambda cur: called.append(True))
+    assert called == [True]
+    assert conn.closed
+
+
+def test_publish_invalid_callback_rejected_before_sql():
+    ledger, conn = active()
+    with pytest.raises(ValueError, match="callable"):
+        ledger.publish(42)
+    assert not conn.statements

@@ -4,7 +4,7 @@ The supplied connection must be exclusively owned by this coordinator, including
 its session advisory lock. Executors never receive it. Business callbacks receive
 a cursor inside an owned transaction: they must not commit, roll back, switch
 connections, or produce external side effects. Only transactional database writes
-can be made atomic here. Final stage/API publication is a later integration step.
+can be made atomic here. Stage publication can include a trusted database callback.
 """
 
 from __future__ import annotations
@@ -68,6 +68,40 @@ class TaskState:
     status: str
     attempt_no: int
     generation: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class StageState:
+    """One bounded stage summary; retry delay uses the database server's clock.
+
+    A pending task ready now yields zero; no pending tasks yields None. Counts
+    cover the whole stage, including completions from earlier generations.
+    """
+
+    sealed: bool
+    published: bool
+    pending: int
+    working: int
+    complete: int
+    failed: int
+    retry_after_seconds: float | None
+
+    def __post_init__(self) -> None:
+        for name in ("sealed", "published"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be boolean")
+        for name in ("pending", "working", "complete", "failed"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        delay = self.retry_after_seconds
+        if self.pending:
+            if (type(delay) not in (int, float) or not math.isfinite(delay) or delay < 0):
+                raise ValueError("Pending tasks require a finite nonnegative retry delay")
+        elif delay is not None:
+            raise ValueError("No pending tasks requires retry_after_seconds=None")
+        if self.published and (not self.sealed or self.pending or self.working or self.failed):
+            raise ValueError("Published stage must be sealed with only complete tasks")
 
 
 def _text(value: str, name: str) -> None:
@@ -340,6 +374,52 @@ class PatchLedger:
                 "ORDER BY task_id LIMIT %s", (*self._scope, limit))
             return [PatchManifest.from_dict(row[0]) for row in cur.fetchmany(limit)]
 
+    def stage_state(self) -> StageState:
+        """Read aggregate counts without materializing task rows or manifests."""
+        _idle_connection(self.conn)
+        with self.conn.transaction(), self.conn.cursor() as cur:
+            sealed, published = self._guard(cur)
+            row = self._query(cur,
+                "SELECT count(*) FILTER (WHERE status = 'pending'), "
+                "count(*) FILTER (WHERE status = 'working'), "
+                "count(*) FILTER (WHERE status = 'complete'), "
+                "count(*) FILTER (WHERE status = 'failed'), "
+                "min(CASE WHEN status = 'pending' THEN "
+                "greatest(0, extract(epoch FROM (coalesce(next_retry_at, "
+                "statement_timestamp()) - statement_timestamp()))) END) "
+                "FROM {s}.pipeline_patch_tasks WHERE run_id = %s AND stage = %s",
+                self._scope).fetchone()
+            pending, working, complete, failed, delay = row
+            return StageState(sealed, published, pending, working, complete, failed,
+                              None if delay is None else float(delay))
+
+    def abandon_working(self, *, message: str = "Executor pool stopped") -> int:
+        """Requeue current-generation interrupted attempts after pool shutdown.
+
+        The caller MUST first stop and join the entire old executor pool. This
+        method cannot establish that fact itself and must never race live work.
+        Completed tasks and other generations are untouched. The third failed
+        attempt stays terminal, just as on coordinator restart.
+        """
+        _idle_connection(self.conn)
+        _text(message, "message")
+        if len(message) > 4096:
+            raise ValueError("Error message exceeds 4096 characters; sanitize and summarize it")
+        with self.conn.transaction(), self.conn.cursor() as cur:
+            self._guard(cur)
+            self._query(cur,
+                "UPDATE {s}.pipeline_patch_attempts SET status = 'abandoned', "
+                "failure_kind = 'interrupted', error_message = %s, "
+                "finished_at = clock_timestamp() "
+                "WHERE run_id = %s AND stage = %s AND generation = %s AND status = 'working'",
+                (message, *self._scope, self.generation))
+            self._query(cur,
+                "UPDATE {s}.pipeline_patch_tasks SET status = CASE WHEN attempt_no < 3 "
+                "THEN 'pending' ELSE 'failed' END, attempt_token = NULL, next_retry_at = NULL "
+                "WHERE run_id = %s AND stage = %s AND generation = %s AND status = 'working'",
+                (*self._scope, self.generation))
+            return cur.rowcount
+
     def _attempt(self, cur: Any, token: AttemptToken) -> bool:
         if not isinstance(token, AttemptToken):
             raise ValueError("token must be AttemptToken")
@@ -437,21 +517,44 @@ class PatchLedger:
                 (kind, message, delay, *self._scope, token.task_id, token.attempt_no))
             return status
 
-    def publish(self) -> bool:
-        """Publish the ledger stage only, not existing schema-v3/API stage rows."""
+    def publish(self, write_callback: Callable[[Any], None] | None = None) -> bool:
+        """Publish once, optionally updating business stage rows in the same commit.
+
+        The trusted callback has the same restrictions as commit_result. With no
+        callback only the ledger is published. After an unacknowledged COMMIT,
+        reconnect and inspect stage_state().published before retrying publication.
+        """
         _idle_connection(self.conn)
-        with self.conn.transaction(), self.conn.cursor() as cur:
-            sealed, published = self._guard(cur)
-            if published:
-                return False
-            if not sealed:
-                raise LedgerError("Cannot publish before planning is sealed")
-            incomplete = self._query(cur,
-                "SELECT EXISTS (SELECT 1 FROM {s}.pipeline_patch_tasks "
-                "WHERE run_id = %s AND stage = %s AND status <> 'complete')",
-                self._scope).fetchone()[0]
-            if incomplete:
-                raise LedgerError("Cannot publish an incomplete stage")
-            self._query(cur, "UPDATE {s}.pipeline_patch_runs SET published = true "
-                        "WHERE run_id = %s AND stage = %s", self._scope)
+        if write_callback is not None and not callable(write_callback):
+            raise ValueError("write_callback must be callable or None")
+        ready_to_commit = False
+        try:
+            with self.conn.transaction(), self.conn.cursor() as cur:
+                sealed, published = self._guard(cur)
+                if published:
+                    return False
+                if not sealed:
+                    raise LedgerError("Cannot publish before planning is sealed")
+                incomplete = self._query(cur,
+                    "SELECT EXISTS (SELECT 1 FROM {s}.pipeline_patch_tasks "
+                    "WHERE run_id = %s AND stage = %s AND status <> 'complete')",
+                    self._scope).fetchone()[0]
+                if incomplete:
+                    raise LedgerError("Cannot publish an incomplete stage")
+                if write_callback is not None:
+                    callback_result = write_callback(cur)
+                    if callback_result is not None:
+                        if inspect.iscoroutine(callback_result):
+                            callback_result.close()
+                        raise ValueError("write_callback must finish synchronously and return None")
+                    if self.conn.info.transaction_status != TransactionStatus.INTRANS:
+                        raise LedgerError("write_callback changed the owned transaction")
+                self._query(cur, "UPDATE {s}.pipeline_patch_runs SET published = true "
+                            "WHERE run_id = %s AND stage = %s", self._scope)
+                ready_to_commit = True
             return True
+        except BaseException as exc:
+            if ready_to_commit:
+                self.conn.close()
+                raise CommitOutcomeUnknown("Inspect durable stage publication before retry") from exc
+            raise
