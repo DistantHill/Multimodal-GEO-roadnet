@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from dataclasses import replace
 import json
 
 import pytest
@@ -113,6 +114,7 @@ def fake_probe(files=None, **kwargs):
     resolved = {"/sys/dev/block/8:1": "/sys/devices/pci/block/sda/sda1"}
     return SnapshotProbe(
         read_text=files.__getitem__, cpu_count=kwargs.pop("cpu_count", lambda: 12),
+        read_link=kwargs.pop("read_link", lambda path: "cgroup:[4026531835]"),
         resolve_path=kwargs.pop("resolve_path", resolved.__getitem__),
         affinity=kwargs.pop("affinity", lambda: [0, 1, 2, 3]),
         python_version=lambda: "3.12.0",
@@ -122,10 +124,10 @@ def fake_probe(files=None, **kwargs):
 
 def host_files():
     return {
-        "/proc/self/cgroup": "0::/docker/run/worker\n",
+        "/proc/self/cgroup": "0::/run/worker\n",
         "/proc/self/mountinfo": (
             "1 0 0:1 / / rw - overlay overlay rw,secret=never-log\n"
-            "2 1 0:2 /docker /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+            "2 1 0:2 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
             "3 1 8:1 / /data rw - ext4 /dev/sda1 rw\n"
         ),
         "/proc/cpuinfo": (
@@ -148,7 +150,7 @@ def host_files():
     }
 
 
-def test_snapshot_resolves_container_mount_root_and_ancestor_limits():
+def test_snapshot_resolves_global_mount_root_and_ancestor_limits():
     snapshot = collect_run_environment(
         effective_parameters={"executor_processes": 2, "patch_target_rows": 100},
         runtime_paths=["/data/run-1"], probe=fake_probe(host_files()),
@@ -247,11 +249,11 @@ def test_whole_disk_reads_its_own_metadata():
 
 def test_missing_ancestor_does_not_claim_known_effective_limit():
     files = host_files()
-    del files["/sys/fs/cgroup/cpu.max"]
+    del files["/sys/fs/cgroup/run/cpu.max"]
     snapshot = collect_run_environment(effective_parameters={}, probe=fake_probe(files))
     assert snapshot["cgroup"]["effective_cpu_quota_cores"]["status"] == "unknown"
-    assert snapshot["cgroup"]["observed_cpu_quota_cores"] == 2.5
-    assert snapshot["cpu"]["observed_capacity_cores"] == 2.5
+    assert snapshot["cgroup"]["observed_cpu_quota_cores"] == 4
+    assert snapshot["cpu"]["observed_capacity_cores"] == 4
     assert snapshot["cpu"]["available_cpu_count"]["status"] == "unknown"
 
 
@@ -280,16 +282,142 @@ def test_cgroup_namespace_root_is_resolved_without_host_path_assumptions():
         "/custom/cgroup/memory.max": "max",
         "/custom/cgroup/memory.swap.max": "0",
     }
-    snapshot = collect_run_environment(effective_parameters={}, probe=fake_probe(files))
-    assert snapshot["cpu"]["available_cpu_count"] == 4
-    assert snapshot["cgroup"]["effective_memory_limit_bytes"] == "unlimited"
+    snapshot = collect_run_environment(
+        effective_parameters={},
+        probe=fake_probe(files, read_link=lambda path: "cgroup:[4026532999]"),
+    )
+    assert snapshot["cpu"]["available_cpu_count"]["status"] == "unknown"
+    assert snapshot["cgroup"]["observed_memory_limit_bytes"] == "unlimited"
+    assert snapshot["cgroup"]["effective_memory_limit_bytes"]["status"] == "unknown"
     assert len(snapshot["cgroup"]["ancestors"]) == 1
+
+
+def root_files():
+    return {
+        "/proc/self/cgroup": "0::/",
+        "/proc/self/mountinfo": "2 1 0:2 / /sys/fs/cgroup ro - cgroup2 cgroup2 rw,nsdelegate",
+        "/sys/fs/cgroup/cgroup.controllers": "cpuset cpu io memory pids",
+    }
+
+
+def test_real_global_root_missing_max_interfaces_are_not_applicable():
+    files = root_files()
+
+    def read(path):
+        if path not in files:
+            raise FileNotFoundError(path)
+        return files[path]
+
+    snapshot = collect_run_environment(
+        effective_parameters={}, probe=replace(fake_probe(files), read_text=read),
+    )
+    observed = snapshot["cgroup"]
+    assert observed["initial_namespace"] is True
+    assert observed["whole_hierarchy_visible"] is True
+    assert observed["ancestors"][0]["global_root"] is True
+    for field in ("cpu_quota_cores", "memory_limit_bytes", "swap_limit_bytes"):
+        assert observed[f"effective_{field}"] == "unlimited"
+    assert snapshot["cpu"]["available_cpu_count"] == 4
+
+
+def test_global_root_absence_does_not_obscure_real_child_limits():
+    files = host_files()
+    for name in ("cpu.max", "memory.max", "memory.swap.max"):
+        del files[f"/sys/fs/cgroup/{name}"]
+    snapshot = collect_run_environment(effective_parameters={}, probe=fake_probe(files))
+    assert snapshot["cgroup"]["effective_cpu_quota_cores"] == 2.5
+    assert snapshot["cgroup"]["effective_memory_limit_bytes"] == 1000000
+    assert snapshot["cgroup"]["effective_swap_limit_bytes"] == 0
+    assert snapshot["cpu"]["available_cpu_count"] == 2
+
+
+@pytest.mark.parametrize("name,field", [
+    ("cpu.max", "cpu_quota_cores"), ("memory.max", "memory_limit_bytes"),
+    ("memory.swap.max", "swap_limit_bytes"),
+])
+def test_nonroot_missing_max_interfaces_are_still_unknown(name, field):
+    files = host_files()
+    del files[f"/sys/fs/cgroup/run/worker/{name}"]
+    snapshot = collect_run_environment(effective_parameters={}, probe=fake_probe(files))
+    assert snapshot["cgroup"][f"effective_{field}"]["status"] == "unknown"
+
+
+@pytest.mark.parametrize("name,field", [
+    ("cpu.max", "cpu_quota_cores"), ("memory.max", "memory_limit_bytes"),
+    ("memory.swap.max", "swap_limit_bytes"),
+])
+@pytest.mark.parametrize("error", [PermissionError, OSError, UnicodeError])
+def test_global_root_unreadable_is_not_equivalent_to_absent(name, field, error):
+    files = root_files()
+
+    def read(path):
+        if path == f"/sys/fs/cgroup/{name}":
+            raise error("unreadable")
+        if path not in files:
+            raise FileNotFoundError(path)
+        return files[path]
+
+    snapshot = collect_run_environment(
+        effective_parameters={}, probe=replace(fake_probe(files), read_text=read),
+    )
+    assert snapshot["cgroup"][f"effective_{field}"]["status"] == "unknown"
+
+
+@pytest.mark.parametrize("identity", ["cgroup:[4026532999]", "malformed"])
+def test_unverified_namespace_root_missing_interfaces_remain_unknown(identity):
+    snapshot = collect_run_environment(
+        effective_parameters={},
+        probe=fake_probe(root_files(), read_link=lambda path: identity),
+    )
+    assert snapshot["cgroup"]["whole_hierarchy_visible"] is False
+    assert snapshot["cgroup"]["ancestors"][0]["global_root"] is False
+    assert snapshot["cgroup"]["observed_cpu_quota_cores"]["status"] == "unknown"
+    assert snapshot["cpu"]["available_cpu_count"]["status"] == "unknown"
+
+
+def test_denied_namespace_identity_does_not_guess_from_root_paths():
+    def denied(path):
+        raise PermissionError(path)
+
+    snapshot = collect_run_environment(
+        effective_parameters={}, probe=fake_probe(root_files(), read_link=denied),
+    )
+    assert snapshot["cgroup"]["initial_namespace"]["status"] == "unknown"
+    assert snapshot["cgroup"]["effective_memory_limit_bytes"]["status"] == "unknown"
+
+
+def test_hidden_mount_ancestors_remain_unknown_despite_readable_visible_limits():
+    files = host_files()
+    files["/proc/self/cgroup"] = "0::/docker/run/worker"
+    files["/proc/self/mountinfo"] = files["/proc/self/mountinfo"].replace(
+        "0:2 / /sys/fs/cgroup", "0:2 /docker /sys/fs/cgroup",
+    )
+    snapshot = collect_run_environment(effective_parameters={}, probe=fake_probe(files))
+    assert snapshot["cgroup"]["initial_namespace"] is True
+    assert snapshot["cgroup"]["whole_hierarchy_visible"] is False
+    assert snapshot["cgroup"]["observed_cpu_quota_cores"] == 2.5
+    assert snapshot["cgroup"]["observed_memory_limit_bytes"] == 1000000
+    assert snapshot["cgroup"]["effective_cpu_quota_cores"]["status"] == "unknown"
+    assert snapshot["cgroup"]["effective_memory_limit_bytes"]["status"] == "unknown"
+    assert snapshot["cpu"]["available_cpu_count"]["status"] == "unknown"
+
+
+def test_hybrid_root_does_not_ignore_limits_in_unsupported_v1_controllers():
+    files = root_files()
+    files["/proc/self/cgroup"] += "\n2:cpu,cpuacct:/restricted\n3:memory:/restricted"
+    snapshot = collect_run_environment(effective_parameters={}, probe=fake_probe(files))
+    assert snapshot["cgroup"]["status"] == "unknown"
+    assert "hybrid" in snapshot["cgroup"]["reason"]
+    assert snapshot["cpu"]["available_cpu_count"]["status"] == "unknown"
 
 
 def test_unsupported_cgroup_v1_and_unresolvable_paths_are_unknown():
     for membership in ("2:cpu:/worker", "0::/unmounted/run", "0::/../worker"):
         files = host_files()
         files["/proc/self/cgroup"] = membership
+        files["/proc/self/mountinfo"] = files["/proc/self/mountinfo"].replace(
+            "0:2 / /sys/fs/cgroup", "0:2 /docker /sys/fs/cgroup",
+        )
         snapshot = collect_run_environment(effective_parameters={}, probe=fake_probe(files))
         assert snapshot["cgroup"]["status"] == "unknown"
 

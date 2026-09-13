@@ -151,6 +151,7 @@ class SnapshotProbe:
     """Inject host access for tests or a container-specific inspection view."""
 
     read_text: Callable[[str], str] = _read_text
+    read_link: Callable[[str], str] = os.readlink
     resolve_path: Callable[[str], str] = _resolve_path
     cpu_count: Callable[[], int | None] = os.cpu_count
     affinity: Callable[[], Sequence[int]] = _affinity
@@ -203,9 +204,39 @@ def _limit(value: str | None) -> int | str | dict[str, str]:
     return _unknown("unreadable or invalid limit")
 
 
+def _initial_cgroup_namespace(probe: SnapshotProbe) -> bool | None:
+    # Linux reserves 0xEFFFFFFB for the initial cgroup namespace. Unlike PID 1
+    # comparison, this also distinguishes a container's private cgroup namespace.
+    # https://github.com/torvalds/linux/blob/v6.1/include/linux/proc_ns.h
+    # Now also CGROUP_NS_INIT_INO in include/uapi/linux/nsfs.h.
+    try:
+        target = probe.read_link("/proc/self/ns/cgroup")
+    except (OSError, KeyError, AttributeError, NotImplementedError):
+        return None
+    match = re.fullmatch(r"cgroup:\[(\d+)\]", target)
+    return int(match[1]) == 0xEFFFFFFB if match else None
+
+
+def _controller_limit(
+    probe: SnapshotProbe, path: str, *, global_root: bool, root_default: str,
+) -> str | None:
+    # The three max interfaces do not exist on the global cgroup v2 root.
+    # Only ENOENT is expected there; permission/I/O failures are not unlimited.
+    # KeyError represents a missing path in injected dictionary probes.
+    try:
+        return probe.read_text(path).strip()
+    except (FileNotFoundError, KeyError):
+        return root_default if global_root else None
+    except (OSError, UnicodeError):
+        return None
+
+
 def _cgroup(probe: SnapshotProbe, mounts: list[dict[str, str]]) -> dict:
     group = None
-    for line in (_read(probe, "/proc/self/cgroup") or "").splitlines():
+    memberships = (_read(probe, "/proc/self/cgroup") or "").splitlines()
+    if any(line.strip() and not line.startswith("0::") for line in memberships):
+        return _unknown("cgroup v1 or hybrid membership is not supported")
+    for line in memberships:
         if line.startswith("0::"):
             group = line[3:]
             break
@@ -221,10 +252,16 @@ def _cgroup(probe: SnapshotProbe, mounts: list[dict[str, str]]) -> dict:
     relative = _relative(group, mount["root"])
     leaf = PurePosixPath(mount["mount_point"]) / relative
     root = PurePosixPath(mount["mount_point"])
+    initial_namespace = _initial_cgroup_namespace(probe)
+    whole_hierarchy_visible = initial_namespace is True and mount["root"] == "/"
     limits = []
     current = leaf
     while True:
-        cpu_raw = _read(probe, str(current / "cpu.max"))
+        global_root = whole_hierarchy_visible and current == root
+        cpu_raw = _controller_limit(
+            probe, str(current / "cpu.max"), global_root=global_root,
+            root_default="max 100000",
+        )
         parts = (cpu_raw or "").split()
         cpu: float | str | dict = _unknown("cpu.max unreadable or invalid")
         if len(parts) == 2 and parts[1].isdecimal() and int(parts[1]) > 0:
@@ -234,13 +271,23 @@ def _cgroup(probe: SnapshotProbe, mounts: list[dict[str, str]]) -> dict:
                 cpu = int(parts[0]) / int(parts[1])
         limits.append({
             "path": str(current), "cpu_quota_cores": cpu,
-            "memory_limit_bytes": _limit(_read(probe, str(current / "memory.max"))),
-            "swap_limit_bytes": _limit(_read(probe, str(current / "memory.swap.max"))),
+            "global_root": global_root,
+            "memory_limit_bytes": _limit(_controller_limit(
+                probe, str(current / "memory.max"), global_root=global_root, root_default="max",
+            )),
+            "swap_limit_bytes": _limit(_controller_limit(
+                probe, str(current / "memory.swap.max"), global_root=global_root, root_default="max",
+            )),
         })
         if current == root:
             break
         current = current.parent
-    result = {"status": "observed", "version": 2, "path": group, "ancestors": limits}
+    result = {
+        "status": "observed", "version": 2, "path": group, "ancestors": limits,
+        "initial_namespace": initial_namespace if initial_namespace is not None
+        else _unknown("cgroup namespace identity unavailable"),
+        "whole_hierarchy_visible": whole_hierarchy_visible,
+    }
     for field in ("cpu_quota_cores", "memory_limit_bytes", "swap_limit_bytes"):
         numeric = [entry[field] for entry in limits if isinstance(entry[field], (int, float))]
         known = min(numeric) if numeric else (
@@ -249,10 +296,16 @@ def _cgroup(probe: SnapshotProbe, mounts: list[dict[str, str]]) -> dict:
         )
         result[f"observed_{field}"] = known
         result[f"effective_{field}"] = (
+            _unknown("host ancestors may be hidden; complete hierarchy not verified")
+            if not whole_hierarchy_visible else
             _unknown("one or more visible ancestor limits unreadable")
             if any(isinstance(entry[field], dict) for entry in limits) else known
         )
-    result["visibility_note"] = "Only visible ancestors are inspected; host ancestors may be hidden."
+    result["visibility_note"] = (
+        "Initial cgroup namespace and global mount root verified; absent root max interfaces do not apply."
+        if whole_hierarchy_visible else
+        "Only visible ancestors are inspected; host ancestors may be hidden."
+    )
     return result
 
 
