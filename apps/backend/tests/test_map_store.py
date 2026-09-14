@@ -10,7 +10,7 @@ from backend.map_api import (
     MapDataError,
     MapNotFoundError,
     PostgresMapStore,
-    _CleanContext,
+    _RefineContext,
     _CoordinateTransformer,
     _DetectContext,
     _Intersection,
@@ -32,8 +32,8 @@ _PROJECTION_CONFIG = {
     "enforce_area_of_use": False,
     "max_scale_error": 1.0,
 }
-_CLEAN = _CleanContext(
-    clean_id="clean-1",
+_REFINE = _RefineContext(
+    refine_id="refine-1",
     source_table="public.source_points",
     quoted_source_table='"public"."source_points"',
     source_key_sql_type="bigint",
@@ -41,7 +41,7 @@ _CLEAN = _CleanContext(
 )
 _DETECT = _DetectContext(
     detect_id="detect-1",
-    clean=_CLEAN,
+    refine=_REFINE,
     source_srid=4326,
     processing_srid=3857,
     projection_config=_PROJECTION_CONFIG,
@@ -56,14 +56,14 @@ def _lon(x_m: float) -> float:
 
 def detect_row(
     detect_id: str,
-    clean_id: str,
+    refine_id: str,
     *,
     processing_srid: int | None = 3857,
     projection_config: dict[str, Any] | None = None,
 ) -> list[Any]:
     return [
         detect_id,
-        clean_id,
+        refine_id,
         "public.source_points",
         _EMPTY_FINGERPRINT,
         4326,
@@ -202,7 +202,7 @@ def clip_points() -> list[_TrackPoint]:
 def test_intersection_layer_uses_complete_detect_and_contributor_fields() -> None:
     polygon = {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [0, 0]]]}
     connection = ScriptedConnection(
-        [detect_row("detect-latest", "clean-latest")],
+        [detect_row("detect-latest", "refine-latest")],
         [["int8"]],
         [[101, 120.2, 30.3, 25.0, [0, 90], {"0->90": 4}, 4,
           {"turn": {"count": 4, "ratio": 1.0}}, ["turn"], polygon]],
@@ -231,7 +231,7 @@ def test_intersection_layer_uses_complete_detect_and_contributor_fields() -> Non
 def test_resolved_layer_exposes_both_identity_names_without_vehicle_storage() -> None:
     geometry = {"type": "Point", "coordinates": [120.0, 30.0]}
     connection = ScriptedConnection(
-        [detect_row("detect-1", "clean-1")],
+        [detect_row("detect-1", "refine-1")],
         [["int8"]],
         [[7, "vehicle-1", 91, "external-key", "kept", None, None, None, geometry]],
     )
@@ -256,7 +256,7 @@ def test_resolved_layer_exposes_both_identity_names_without_vehicle_storage() ->
 def test_entry_exit_layer_maps_persisted_crossing_identity() -> None:
     geometry = {"type": "Point", "coordinates": [120.0, 30.0]}
     connection = ScriptedConnection(
-        [detect_row("detect-1", "clean-1")],
+        [detect_row("detect-1", "refine-1")],
         [["int8"]],
         [[8, 101, 91, 7, 1, geometry]],
     )
@@ -290,7 +290,7 @@ def test_centerline_layer_resolves_latest_completed_fit() -> None:
 def test_resolved_replay_reports_missing_ids_and_returns_full_track() -> None:
     detect_id = "12345678-1234-5678-1234-567812345678"
     connection = ScriptedConnection(
-        [detect_row(detect_id, "clean-1")],
+        [detect_row(detect_id, "refine-1")],
         [["int8"]],
         [["vehicle-1", 7, 1]],
         [
@@ -325,7 +325,7 @@ def test_resolved_replay_reports_missing_ids_and_returns_full_track() -> None:
 
 def test_source_key_replay_works_without_detect_context() -> None:
     connection = ScriptedConnection(
-        [["clean-1", "public.source_points", _EMPTY_FINGERPRINT]],
+        [["refine-1", "public.source_points", _EMPTY_FINGERPRINT]],
         [["int8"]],
         [["vehicle-1", 7, "external-1"]],
         [
@@ -350,7 +350,7 @@ def test_source_key_replay_works_without_detect_context() -> None:
 def test_unknown_resolved_ids_are_not_found_after_context_validation() -> None:
     detect_id = "12345678-1234-5678-1234-567812345678"
     connection = ScriptedConnection(
-        [detect_row(detect_id, "clean-1")],
+        [detect_row(detect_id, "refine-1")],
         [["int8"]],
         [],
     )
@@ -381,7 +381,7 @@ def test_store_clip_reads_resolved_crossings_and_returns_between_clip() -> None:
         for point in clip_points()
     ]
     connection = ScriptedConnection(
-        [detect_row(detect_id, "clean-1")],
+        [detect_row(detect_id, "refine-1")],
         [["int8"]],
         [[False]],
         [],
@@ -445,7 +445,7 @@ def test_clip_track_batches_same_position_exit_then_entry_without_false_road() -
 def test_clip_rejects_detect_without_fixed_processing_crs() -> None:
     detect_id = "12345678-1234-5678-1234-567812345678"
     connection = ScriptedConnection(
-        [detect_row(detect_id, "clean-1", processing_srid=None)],
+        [detect_row(detect_id, "refine-1", processing_srid=None)],
         [["int8"]],
     )
     with pytest.raises(MapDataError, match="has no processing CRS"):
@@ -459,7 +459,7 @@ def test_source_fingerprint_rejects_missing_referenced_row() -> None:
                                                   None, None, None, {}]])
     store = PostgresMapStore(connection)
     with pytest.raises(MapDataError, match="missing source row"):
-        store._verify_source_fingerprint(_CLEAN)
+        store._verify_source_fingerprint(_REFINE)
 
 
 def test_coordinate_transformer_rejects_invalid_context_and_distortion() -> None:
@@ -467,7 +467,7 @@ def test_coordinate_transformer_rejects_invalid_context_and_distortion() -> None
         _CoordinateTransformer(
             _DetectContext(
                 "detect",
-                _CLEAN,
+                _REFINE,
                 4326,
                 32650,
                 {
@@ -482,7 +482,7 @@ def test_coordinate_transformer_rejects_invalid_context_and_distortion() -> None
         _CoordinateTransformer(
             _DetectContext(
                 "detect",
-                _CLEAN,
+                _REFINE,
                 4326,
                 3857,
                 {

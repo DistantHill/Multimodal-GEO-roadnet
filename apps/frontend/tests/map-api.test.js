@@ -39,12 +39,12 @@ test('database selection propagates to catalog, layers and analysis', async () =
     return jsonResponse({ type: 'FeatureCollection', features: [], layers: [] });
   };
   await listMapLayers({ databaseName: 'test' });
-  await loadMapLayer('intersections', { databaseName: 'test', cleanId: 'clean-1', detectId: 'detect-1', fitId: 'fit-1' });
+  await loadMapLayer('intersections', { databaseName: 'test', refineId: 'refine-1', detectId: 'detect-1', fitId: 'fit-1' });
   await requestReplay({ databaseName: 'test', sourceRowKeys: ['1'] });
   await requestClip({ databaseName: 'test', detectId: 'run', intersectionIds: [1, 2] });
   assert.match(calls[0].url, /database_name=test/);
   assert.match(calls[1].url, /database_name=test/);
-  assert.match(calls[1].url, /clean_id=clean-1/);
+  assert.match(calls[1].url, /refine_id=refine-1/);
   assert.match(calls[1].url, /detect_id=detect-1/);
   assert.match(calls[1].url, /fit_id=fit-1/);
   assert.equal(calls[2].body.database_name, 'test');
@@ -124,17 +124,17 @@ test('clip requires exactly two intersections and detect context', async () => {
 });
 
 test('run catalog preserves UUID relationships and empty arrays after rebuild', async () => {
-  const cleanId = '12345678-1234-5678-1234-567812345670';
+  const refineId = '12345678-1234-5678-1234-567812345670';
   const detectId = '12345678-1234-5678-1234-567812345671';
   const payload = {
-    clean: [{ id: cleanId, started_at: '2026-09-13T00:00:00Z' }],
-    detect: [{ id: detectId, clean_id: cleanId, started_at: '2026-09-13T00:01:00Z' }],
+    refine: [{ id: refineId, started_at: '2026-09-13T00:00:00Z' }],
+    detect: [{ id: detectId, refine_id: refineId, started_at: '2026-09-13T00:01:00Z' }],
     fit: [],
   };
   globalThis.fetch = async () => jsonResponse(payload);
   assert.deepEqual(await listRuns(), payload);
-  globalThis.fetch = async () => jsonResponse({ clean: [], detect: [], fit: [] });
-  assert.deepEqual(await listRuns(), { clean: [], detect: [], fit: [] });
+  globalThis.fetch = async () => jsonResponse({ refine: [], detect: [], fit: [] });
+  assert.deepEqual(await listRuns(), { refine: [], detect: [], fit: [] });
 });
 
 test('layer keeps nullable point properties and completion metadata unchanged', async () => {

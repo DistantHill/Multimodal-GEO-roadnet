@@ -1,4 +1,4 @@
-"""Cleaner 1 tests."""
+"""Refine tests."""
 
 from __future__ import annotations
 
@@ -7,22 +7,23 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from track.v2.cleaner import clean_vehicle
-from track.v2.cleaner1 import (
-    CleanerConfig,
-    CleanerResult,
-    clean,
+from track.v2.refine import refine_vehicle
+from track.v2.refine import (
+    RefineConfig,
+    RefineResult,
+    refine,
     _split_by_gaps,
     _exclude_stationary,
-    _ray_intersection,
+    ray_intersection,
+    heading_vector,
 )
 from track.v2.models import (
-    CleanReport,
+    RefineReport,
     PointRef,
     SpatialContext,
     TrajectoryPoint,
 )
-from track.v2.parser0 import CsvSource, get_database
+from track.v2.parser import CsvSource, get_database
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -69,9 +70,9 @@ def _make_point(
 
 
 class ActiveExcludedSeparationTest(unittest.TestCase):
-    """C1-01: Cleaner separates active and excluded points."""
+    """C1-01: Refine separates active and excluded points."""
 
-    def test_cleaner_separates_active_excluded(self):
+    def test_refine_separates_active_excluded(self):
         with tempfile.TemporaryDirectory() as td:
             csv_path = _make_csv(
                 td, "test.csv",
@@ -81,8 +82,8 @@ class ActiveExcludedSeparationTest(unittest.TestCase):
             )
             source = CsvSource(csv_path)
             handle = get_database(source)
-            result = clean(handle, spatial_context=_SPATIAL_CONTEXT)
-            self.assertIsInstance(result, CleanerResult)
+            result = refine(handle, spatial_context=_SPATIAL_CONTEXT)
+            self.assertIsInstance(result, RefineResult)
             active = list(result.active.iter_points())
             self.assertEqual(len(active), 2)
             self.assertEqual(result.report.active_count, 2)
@@ -102,7 +103,7 @@ class ActiveExcludedSeparationTest(unittest.TestCase):
             )
             handle.close()
 
-    def test_clean_vehicle_reprojects_unscoped_kept_xy_and_carries_context(self):
+    def test_refine_vehicle_reprojects_unscoped_kept_xy_and_carries_context(self):
         points = [
             replace(
                 _make_point("v1", "1", 1000.0, 116.0, 39.0, 90.0, 10.0),
@@ -116,7 +117,7 @@ class ActiveExcludedSeparationTest(unittest.TestCase):
             ),
         ]
 
-        result = clean_vehicle(points, spatial_context=_SPATIAL_CONTEXT)
+        result = refine_vehicle(points, spatial_context=_SPATIAL_CONTEXT)
 
         self.assertEqual(result.spatial_context, _SPATIAL_CONTEXT)
         self.assertNotEqual((result.kept[0].x, result.kept[0].y), (1.0, 2.0))
@@ -146,8 +147,8 @@ class GapSplittingTest(unittest.TestCase):
         self.assertEqual(len(sub_tracks), 1)
 
 
-class CleanVehicleAggregationTest(unittest.TestCase):
-    """Cleaner retains every split subtrack and each exclusion exactly once."""
+class RefineVehicleAggregationTest(unittest.TestCase):
+    """Refine retains every split subtrack and each exclusion exactly once."""
 
     def test_accumulates_kept_points_across_gap_subtracks(self):
         points = [
@@ -157,9 +158,9 @@ class CleanVehicleAggregationTest(unittest.TestCase):
             _make_point("v1", "4", 1260.0, 116.0, 39.3, 90.0, 10.0),
         ]
 
-        result = clean_vehicle(
+        result = refine_vehicle(
             points,
-            config=CleanerConfig(max_gap_s=120.0),
+            config=RefineConfig(max_gap_s=120.0),
             spatial_context=_SPATIAL_CONTEXT,
         )
 
@@ -189,13 +190,13 @@ class CleanVehicleAggregationTest(unittest.TestCase):
             _make_point("v1", "5", 1105.0, 116.1, 39.0, 90.0, 0.1),
             _make_point("v1", "6", 1115.0, 116.1, 39.0, 90.0, 0.1),
         ]
-        cfg = CleanerConfig(
+        cfg = RefineConfig(
             max_gap_s=50.0,
             min_speed_mps=0.3,
             max_stationary_duration_s=10.0,
         )
 
-        result = clean_vehicle(points, config=cfg, spatial_context=_SPATIAL_CONTEXT)
+        result = refine_vehicle(points, config=cfg, spatial_context=_SPATIAL_CONTEXT)
 
         self.assertEqual(
             [point.point_ref.source_row_key for point in result.kept],
@@ -219,7 +220,7 @@ class StationaryExclusionTest(unittest.TestCase):
             _make_point("v1", "4", 1400.0, 116.0, 39.0, 90.0, 0.1),
             _make_point("v1", "5", 1430.0, 116.0, 39.1, 90.0, 10.0),  # moving now
         ]
-        cfg = CleanerConfig(min_speed_mps=0.3, max_stationary_duration_s=300.0)
+        cfg = RefineConfig(min_speed_mps=0.3, max_stationary_duration_s=300.0)
         active, excluded = _exclude_stationary(points, cfg)
         # Duration of stationary: 1400 - 1000 = 400s > 300 → exclude interior
         self.assertGreaterEqual(len(excluded), 1)
@@ -230,17 +231,17 @@ class StationaryExclusionTest(unittest.TestCase):
             _make_point("v1", "2", 1030.0, 116.0, 39.0, 90.0, 0.1),
             _make_point("v1", "3", 1060.0, 116.0, 39.0, 90.0, 10.0),
         ]
-        cfg = CleanerConfig(min_speed_mps=0.3, max_stationary_duration_s=300.0)
+        cfg = RefineConfig(min_speed_mps=0.3, max_stationary_duration_s=300.0)
         active, excluded = _exclude_stationary(points, cfg)
         # Duration: 1060 - 1000 = 60s < 300 → not excluded
         self.assertEqual(len(excluded), 0)
 
 
-class CleanReportSerializationTest(unittest.TestCase):
-    """C1-08: CleanReport serializable via as_dict()."""
+class RefineReportSerializationTest(unittest.TestCase):
+    """C1-08: RefineReport serializable via as_dict()."""
 
-    def test_clean_report_as_dict(self):
-        report = CleanReport(
+    def test_refine_report_as_dict(self):
+        report = RefineReport(
             active_count=100,
             excluded_count=5,
             injected_count=3,
@@ -253,21 +254,21 @@ class CleanReportSerializationTest(unittest.TestCase):
         self.assertEqual(d["injected_count"], 3)
 
 
-class TrackModelFormatPrintCleanerTest(unittest.TestCase):
-    """C1-09: TrackModel.format_print() works for cleaner models."""
+class TrackModelFormatPrintRefineTest(unittest.TestCase):
+    """C1-09: TrackModel.format_print() works for refine models."""
 
-    def test_clean_config_format_print(self):
+    def test_refine_config_format_print(self):
         import io
-        cfg = CleanerConfig(max_gap_s=120.0, min_speed_mps=0.3)
+        cfg = RefineConfig(max_gap_s=120.0, min_speed_mps=0.3)
         buf = io.StringIO()
-        cfg.format_print(title="Cleaner Config", file=buf)
-        self.assertIn("Cleaner Config", buf.getvalue())
+        cfg.format_print(title="Refine Config", file=buf)
+        self.assertIn("Refine Config", buf.getvalue())
 
 
 class NoSourceModificationTest(unittest.TestCase):
-    """C1-10: Cleaner does not modify source data."""
+    """C1-10: Refine does not modify source data."""
 
-    def test_cleaner_no_modify_source(self):
+    def test_refine_no_modify_source(self):
         with tempfile.TemporaryDirectory() as td:
             csv_path = _make_csv(
                 td, "test.csv",
@@ -278,7 +279,7 @@ class NoSourceModificationTest(unittest.TestCase):
             original = csv_path.read_text(encoding="utf-8")
             source = CsvSource(csv_path)
             handle = get_database(source)
-            result = clean(handle, spatial_context=_SPATIAL_CONTEXT)
+            result = refine(handle, spatial_context=_SPATIAL_CONTEXT)
             # Consume active points
             list(result.active.iter_points())
             # Source file unchanged
@@ -291,34 +292,36 @@ class NoSourceModificationTest(unittest.TestCase):
 
 
 class RayIntersectionTest(unittest.TestCase):
-    """Test _ray_intersection geometry — covers orthogonal, parallel, origin, and diverging."""
+    """Test ray geometry using the canonical vector-based interface."""
 
     def test_orthogonal_intersection(self):
         # A at (10,5) heading east (90°) → reverse ray west: (10-t, 5) t>=0
         # B at (5,10) heading north (0°) → reverse ray south: (5, 10-s) s>=0
         # Intersection at (5, 5)
-        hit = _ray_intersection((10, 5), 90.0, (5, 10), 0.0)
+        hit = ray_intersection((10, 5), heading_vector(270.0), (5, 10), heading_vector(180.0))
         self.assertIsNotNone(hit)
-        x, y = hit
+        x, y, ta, tb = hit
+        self.assertGreaterEqual(ta, 0.0)
+        self.assertGreaterEqual(tb, 0.0)
         self.assertAlmostEqual(x, 5.0, delta=0.05)
         self.assertAlmostEqual(y, 5.0, delta=0.05)
 
     def test_parallel_no_hit(self):
         # Both heading north → reverse south — parallel
-        hit = _ray_intersection((0, 0), 0.0, (10, 0), 0.0)
+        hit = ray_intersection((0, 0), heading_vector(180.0), (10, 0), heading_vector(180.0))
         self.assertIsNone(hit)
 
     def test_same_origin_orthogonal(self):
         # Same starting point, heading 90° vs 0° → intersection at origin (t=0, s=0)
-        hit = _ray_intersection((0, 0), 90.0, (0, 0), 0.0)
+        hit = ray_intersection((0, 0), heading_vector(270.0), (0, 0), heading_vector(180.0))
         self.assertIsNotNone(hit)
-        x, y = hit
+        x, y, _ta, _tb = hit
         self.assertAlmostEqual(x, 0.0)
         self.assertAlmostEqual(y, 0.0)
 
     def test_near_parallel_but_intersecting(self):
         # Slight angle divergence — should still find intersection
-        hit = _ray_intersection((10, 5), 90.0, (5, 10), 1.0)
+        hit = ray_intersection((10, 5), heading_vector(270.0), (5, 10), heading_vector(181.0))
         self.assertIsNotNone(hit)
 
 

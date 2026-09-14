@@ -2,7 +2,7 @@
 
 薄壳脚本 / Thin benchmark script — validates the hierarchical performance-timing
 framework in ``track/v2/_perf.py``, which is now wired into
-``track/v2/intersect2.py`` (handle mode builds ``PerfTracker("intersect2_handle")``
+``track/v2/detect.py`` (handle mode builds ``PerfTracker("detect_handle")``
 and emits the report via ``log_info(tracker.report())``).
 
 Test dimensions / 测试维度:
@@ -13,7 +13,7 @@ Test dimensions / 测试维度:
                               默认 N=100,000, 输出 per-iteration us + 百分比
   3. Nested depth behavior    5 层嵌套 —— 仅追踪迭代深度 1/2, 深度 >= 3 直通,
                               深度提醒只记在 depth-1 节点
-  4. End-to-end intersect2    真实流水线跑通, 捕获 PerfTracker 报告,
+  4. End-to-end detect    真实流水线跑通, 捕获 PerfTracker 报告,
                               验证功能不破坏
 
 用法 / Usage::
@@ -56,9 +56,9 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from track.v2._perf import PerfTracker, _DEFAULT_MAX_ITER_DEPTH
-from track.v2.intersect2 import IntersectConfig, detect_intersections
+from track.v2.detect import IntersectConfig, detect_intersections
 from track.v2.models import IntersectReport, PointRef, ProjectionConfig, TrajectoryPoint
-from track.v2.parser0 import CsvSource, get_database
+from track.v2.parser import CsvSource, get_database
 from track.v2.projection import create_spatial_context
 
 VERBOSE = True
@@ -353,7 +353,7 @@ def test_overhead(N: int) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 4. End-to-end with intersect2
+# 4. End-to-end with detect
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -385,7 +385,7 @@ def _build_track_through_intersection(
     approach_bearing: float,
     exit_bearing: float,
 ) -> list[TrajectoryPoint]:
-    """在原点做一次 90° 转弯的合成轨迹 (与 tests/v2/test_intersect2.py 一致)."""
+    """在原点做一次 90° 转弯的合成轨迹 (与 tests/v2/test_detect.py 一致)."""
     points: list[TrajectoryPoint] = []
     ts = 1000.0
     app_rad = math.radians(approach_bearing + 180)
@@ -434,7 +434,7 @@ def _build_cross_csv(tmpdir: Path) -> Path:
 def _e2e_run(csv_path: Path, source_label: str, processing_srid: int) -> dict:
     cfg = IntersectConfig(
         use_turn_events=True,
-        use_cross_track_candidates=False,  # 只用 Method 1 (与 test_intersect2 I2-23 一致)
+        use_cross_track_candidates=False,  # 只用 Method 1 (与 test_detect I2-23 一致)
         turn_window=2,
         min_turn_deg=45.0,
         max_turn_deg=170.0,
@@ -453,7 +453,7 @@ def _e2e_run(csv_path: Path, source_label: str, processing_srid: int) -> dict:
         ProjectionConfig(processing_srid=processing_srid)
     )
     # _detect_intersections_handle 内部调用 log_info(tracker.report()) —— 捕获它
-    with patch("track.v2.intersect2.log_info") as mock_log:
+    with patch("track.v2.detect.log_info") as mock_log:
         handle = get_database(CsvSource(csv_path))
         result = detect_intersections(
             handle,
@@ -463,7 +463,7 @@ def _e2e_run(csv_path: Path, source_label: str, processing_srid: int) -> dict:
         handle.close()
         for call in mock_log.call_args_list:
             arg = call.args[0] if call.args else ""
-            if isinstance(arg, str) and arg.startswith("[perf] intersect2_handle"):
+            if isinstance(arg, str) and arg.startswith("[perf] detect_handle"):
                 report_lines.append(arg)
 
     # ── 功能未被破坏 ──
@@ -478,7 +478,7 @@ def _e2e_run(csv_path: Path, source_label: str, processing_srid: int) -> dict:
     # ── PerfTracker 报告已生成且层级正确 ──
     assert report_lines, "PerfTracker report was not emitted via log_info(tracker.report())"
     report = report_lines[0]
-    assert report.startswith("[perf] intersect2_handle")
+    assert report.startswith("[perf] detect_handle")
     for stage in ("extract_methods_123", "cluster_pipeline", "topology"):
         assert stage in report, f"report missing stage node {stage!r}"
     assert "tracks_turn" in report, "report missing tracks_turn (depth-1) node"
@@ -502,7 +502,7 @@ def _e2e_run(csv_path: Path, source_label: str, processing_srid: int) -> dict:
     }
 
 
-def test_with_intersect2(data_path: str | None, processing_srid: int) -> dict:
+def test_with_detect(data_path: str | None, processing_srid: int) -> dict:
     """E2E: 真实流水线跑通 + 捕获内部 PerfTracker 报告."""
     if data_path:
         csv_path = Path(data_path)
@@ -570,8 +570,8 @@ def main() -> int:
         ("report_parseable", test_report_parseable, {}),
         ("overhead", test_overhead, {"N": args.iterations}),
         (
-            "e2e_intersect2",
-            test_with_intersect2,
+            "e2e_detect",
+            test_with_detect,
             {
                 "data_path": args.data or None,
                 "processing_srid": args.processing_srid,

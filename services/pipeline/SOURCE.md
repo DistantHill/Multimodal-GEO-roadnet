@@ -30,7 +30,7 @@ an exhaustive description of the current implementation and is not a promise
 of output, ordering, persistence, or replay equivalence with the source branch.
 
 After the import, the repository adopted explicit
-`clean_runs → detect_runs → fit_runs` lineage, a shared Detect track workspace,
+`refine_runs → detect_runs → fit_runs` lineage, a shared Detect track workspace,
 a capacity-guarded global cross-track index, indexed DBSCAN and topology
 verification, COPY/batched persistence, bounded Clip indexing, phase-level
 Fitting telemetry, Detect failure-state handling, destructive schema-v3

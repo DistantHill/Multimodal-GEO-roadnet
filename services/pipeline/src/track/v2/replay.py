@@ -1,4 +1,4 @@
-"""Semantic replay over schema-v3 source and resolved-point identities."""
+"""Semantic replay over schema-v4 source and resolved-point identities."""
 
 from __future__ import annotations
 
@@ -8,17 +8,17 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .db.queries import fetch_detect_row, fetch_resolved_clip_tracks
-from .db.source_table import validate_source_table, verify_clean_source_fingerprint
+from .db.source_table import validate_source_table, verify_refine_source_fingerprint
 from .models import (
     CenterlineInputReplay,
-    CleanerResult,
+    RefineResult,
     ClipEndpoint,
     ClipPoint,
     CrossingPoint,
     HotspotCluster,
     InOutIntersectionPoint,
     PointRef,
-    ReplayCleanResult,
+    ReplayRefineResult,
     ReplayFitClip,
     ReplayFitEndpoint,
     TrackModel,
@@ -38,9 +38,9 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
             "JOIN fit_runs AS fit ON fit.id = centerline.fit_id "
             "AND fit.detect_id = centerline.detect_id "
             "JOIN detect_runs AS detect ON detect.id = centerline.detect_id "
-            "JOIN clean_runs AS clean ON clean.id = detect.clean_id "
+            "JOIN refine_runs AS refine ON refine.id = detect.refine_id "
             "WHERE centerline.id = %s AND fit.status = 'completed' "
-            "AND detect.status = 'completed' AND clean.status = 'completed'",
+            "AND detect.status = 'completed' AND refine.status = 'completed'",
             (centerline_id,),
         )
         centerline_row = cur.fetchone()
@@ -71,7 +71,7 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
     detect = fetch_detect_row(conn, str(detect_id))
     if detect.status != "completed":
         raise ValueError(f"Detect Run {detect_id} is not completed")
-    verify_clean_source_fingerprint(conn, detect.clean_id)
+    verify_refine_source_fingerprint(conn, detect.refine_id)
     tracks = fetch_resolved_clip_tracks(conn, str(detect_id))
     crossing_index: dict[int, tuple[int, int]] = {}
     for track_index, track in enumerate(tracks):
@@ -119,7 +119,7 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
         centerline_id=centerline_id,
         fit_id=str(fit_id),
         detect_id=str(detect_id),
-        clean_id=detect.clean_id,
+        refine_id=detect.refine_id,
         variant=str(variant),
         from_intersection_id=int(from_id),
         to_intersection_id=int(to_id),
@@ -149,11 +149,11 @@ def _replay_fit_endpoint(point: Any, *, expected_type: int) -> ReplayFitEndpoint
 
 @dataclass(frozen=True)
 class ReplayTarget(TrackModel):
-    """One stable schema-v3 entity identity."""
+    """One stable schema-v4 entity identity."""
 
     kind: str
     id: int | str
-    clean_id: str | None = None
+    refine_id: str | None = None
     detect_id: str | None = None
 
 
@@ -215,7 +215,7 @@ class ReplayService:
             key = (
                 current.kind,
                 str(current.id),
-                current.clean_id,
+                current.refine_id,
                 current.detect_id,
             )
             if key in visited:
@@ -274,7 +274,7 @@ _ENTITY_TABLES = {
     "intersection": "intersections",
     "entry_exit_point": "entry_exit_points",
 }
-CLEAN_REPLAY_KINDS = frozenset(
+REFINE_REPLAY_KINDS = frozenset(
     {"source_point", "excluded_point", "kept_trajectory_point", "injected_point"}
 )
 DETECT_REPLAY_KINDS = frozenset(
@@ -291,31 +291,31 @@ DETECT_REPLAY_KINDS = frozenset(
 
 
 class PostgresReplayStore:
-    """Read the concrete schema-v3 lineage graph from PostgreSQL."""
+    """Read the concrete schema-v4 lineage graph from PostgreSQL."""
 
     def __init__(self, conn: Any) -> None:
         self._conn = conn
-        self._verified_clean_ids: set[str] = set()
-        self._detect_clean_ids: dict[str, str] = {}
+        self._verified_refine_ids: set[str] = set()
+        self._detect_refine_ids: dict[str, str] = {}
 
     def get_entity(self, target: ReplayTarget) -> dict[str, Any] | None:
         if target.kind == "centerline":
             return self._get_centerline(target)
-        if target.kind in CLEAN_REPLAY_KINDS:
-            clean_id = self._require_clean_target(target)
+        if target.kind in REFINE_REPLAY_KINDS:
+            refine_id = self._require_refine_target(target)
             if target.kind == "source_point":
-                return self._get_source_point(clean_id, str(target.id))
+                return self._get_source_point(refine_id, str(target.id))
             if target.kind == "excluded_point":
                 return self._get_json_row(
                     "excluded_points",
-                    "clean_id = %s AND source_row_key = %s",
-                    (clean_id, str(target.id)),
+                    "refine_id = %s AND source_row_key = %s",
+                    (refine_id, str(target.id)),
                 )
             table = _ENTITY_TABLES[target.kind]
             return self._get_json_row(
                 table,
-                "id = %s AND clean_id = %s",
-                (int(target.id), clean_id),
+                "id = %s AND refine_id = %s",
+                (int(target.id), refine_id),
             )
         if target.kind in DETECT_REPLAY_KINDS:
             detect_id = self._require_detect_target(target)
@@ -333,7 +333,7 @@ class PostgresReplayStore:
         row: dict[str, Any],
     ) -> list[tuple[str, ReplayTarget]]:
         kind = target.kind
-        clean_id = target.clean_id
+        refine_id = target.refine_id
         detect_id = target.detect_id
         parents: list[tuple[str, ReplayTarget]] = []
 
@@ -342,7 +342,7 @@ class PostgresReplayStore:
             entity_id: Any,
             relation: str,
             *,
-            clean: str | None = clean_id,
+            refine: str | None = refine_id,
             detect: str | None = detect_id,
         ) -> None:
             if entity_id is None:
@@ -353,7 +353,7 @@ class PostgresReplayStore:
                     ReplayTarget(
                         kind_,
                         entity_id,
-                        clean_id=clean if kind_ in CLEAN_REPLAY_KINDS else None,
+                        refine_id=refine if kind_ in REFINE_REPLAY_KINDS else None,
                         detect_id=detect if kind_ in DETECT_REPLAY_KINDS else None,
                     ),
                 )
@@ -365,19 +365,19 @@ class PostgresReplayStore:
         elif kind == "kept_trajectory_point":
             add("source_point", row.get("source_row_key"), "kept_source")
         elif kind == "injected_point":
-            parents.extend(self._injected_brackets(row, str(clean_id)))
+            parents.extend(self._injected_brackets(row, str(refine_id)))
         elif kind == "resolved_point":
             add(
                 "kept_trajectory_point",
                 row.get("kept_point_id"),
                 "resolved_kept",
-                clean=self._clean_for_detect(str(detect_id)),
+                refine=self._refine_for_detect(str(detect_id)),
             )
             add(
                 "injected_point",
                 row.get("injected_point_id"),
                 "resolved_injected",
-                clean=self._clean_for_detect(str(detect_id)),
+                refine=self._refine_for_detect(str(detect_id)),
             )
             add(
                 "candidate_entry_exit_point",
@@ -520,20 +520,20 @@ class PostgresReplayStore:
                 "JOIN fit_runs AS fit ON fit.id = centerline.fit_id "
                 "AND fit.detect_id = centerline.detect_id "
                 "JOIN detect_runs AS detect ON detect.id = centerline.detect_id "
-                "JOIN clean_runs AS clean ON clean.id = detect.clean_id "
+                "JOIN refine_runs AS refine ON refine.id = detect.refine_id "
                 "WHERE centerline.id = %s AND fit.status = 'completed' "
-                "AND detect.status = 'completed' AND clean.status = 'completed'",
+                "AND detect.status = 'completed' AND refine.status = 'completed'",
                 (int(target.id),),
             )
             value = cur.fetchone()
         if value is None:
             return None
         result = _decode_row(value[0])
-        self._verify_clean(str(result["detect_id"]), detect=True)
+        self._verify_refine(str(result["detect_id"]), detect=True)
         return result
 
-    def _get_source_point(self, clean_id: str, source_row_key: str) -> dict[str, Any] | None:
-        source_table, _ = self._clean_context(clean_id)
+    def _get_source_point(self, refine_id: str, source_row_key: str) -> dict[str, Any] | None:
+        source_table, _ = self._refine_context(refine_id)
         contract = validate_source_table(self._conn, source_table)
         with self._conn.cursor() as cur:
             cur.execute(
@@ -558,68 +558,68 @@ class PostgresReplayStore:
             row = cur.fetchone()
         return None if row is None else _decode_row(row[0])
 
-    def _require_clean_target(self, target: ReplayTarget) -> str:
-        if target.clean_id is None:
-            raise ValueError(f"{target.kind} requires clean_id")
-        self._verify_clean(target.clean_id, detect=False)
-        return target.clean_id
+    def _require_refine_target(self, target: ReplayTarget) -> str:
+        if target.refine_id is None:
+            raise ValueError(f"{target.kind} requires refine_id")
+        self._verify_refine(target.refine_id, detect=False)
+        return target.refine_id
 
     def _require_detect_target(self, target: ReplayTarget) -> str:
         if target.detect_id is None:
             raise ValueError(f"{target.kind} requires detect_id")
-        self._verify_clean(target.detect_id, detect=True)
+        self._verify_refine(target.detect_id, detect=True)
         return target.detect_id
 
-    def _verify_clean(self, run_id: str, *, detect: bool) -> None:
-        clean_id = self._clean_for_detect(run_id) if detect else run_id
-        if clean_id in self._verified_clean_ids:
+    def _verify_refine(self, run_id: str, *, detect: bool) -> None:
+        refine_id = self._refine_for_detect(run_id) if detect else run_id
+        if refine_id in self._verified_refine_ids:
             return
-        verify_clean_source_fingerprint(self._conn, clean_id)
-        self._verified_clean_ids.add(clean_id)
+        verify_refine_source_fingerprint(self._conn, refine_id)
+        self._verified_refine_ids.add(refine_id)
 
-    def _clean_for_detect(self, detect_id: str) -> str:
-        cached = self._detect_clean_ids.get(detect_id)
+    def _refine_for_detect(self, detect_id: str) -> str:
+        cached = self._detect_refine_ids.get(detect_id)
         if cached is not None:
             return cached
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT detect.clean_id::text FROM detect_runs AS detect "
-                "JOIN clean_runs AS clean ON clean.id = detect.clean_id "
+                "SELECT detect.refine_id::text FROM detect_runs AS detect "
+                "JOIN refine_runs AS refine ON refine.id = detect.refine_id "
                 "WHERE detect.id = %s AND detect.status = 'completed' "
-                "AND clean.status = 'completed'",
+                "AND refine.status = 'completed'",
                 (detect_id,),
             )
             row = cur.fetchone()
         if row is None:
             raise ValueError(f"unknown completed Detect Run: {detect_id}")
-        clean_id = str(row[0])
-        self._detect_clean_ids[detect_id] = clean_id
-        return clean_id
+        refine_id = str(row[0])
+        self._detect_refine_ids[detect_id] = refine_id
+        return refine_id
 
-    def _clean_context(self, clean_id: str) -> tuple[str, dict[str, Any]]:
+    def _refine_context(self, refine_id: str) -> tuple[str, dict[str, Any]]:
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT source_table, source_fingerprint FROM clean_runs "
+                "SELECT source_table, source_fingerprint FROM refine_runs "
                 "WHERE id = %s AND status = 'completed'",
-                (clean_id,),
+                (refine_id,),
             )
             row = cur.fetchone()
         if row is None:
-            raise ValueError(f"unknown completed Clean Run: {clean_id}")
+            raise ValueError(f"unknown completed Refine Run: {refine_id}")
         return str(row[0]), _decode_row(row[1])
 
     def _injected_brackets(
         self,
         row: dict[str, Any],
-        clean_id: str,
+        refine_id: str,
     ) -> list[tuple[str, ReplayTarget]]:
         with self._conn.cursor() as cur:
             cur.execute(
                 "SELECT id, sequence_in_subtrack FROM kept_trajectory_points "
-                "WHERE clean_id = %s AND subtrack_index = %s "
+                "WHERE refine_id = %s AND subtrack_index = %s "
                 "AND sequence_in_subtrack IN (%s, %s) ORDER BY sequence_in_subtrack",
                 (
-                    clean_id,
+                    refine_id,
                     int(row["subtrack_index"]),
                     int(row["after_sequence_in_subtrack"]),
                     int(row["after_sequence_in_subtrack"]) + 1,
@@ -631,7 +631,7 @@ class PostgresReplayStore:
         return [
             (
                 labels[int(sequence)],
-                ReplayTarget("kept_trajectory_point", int(point_id), clean_id=clean_id),
+                ReplayTarget("kept_trajectory_point", int(point_id), refine_id=refine_id),
             )
             for point_id, sequence in rows
         ]
@@ -771,29 +771,29 @@ def replay_inout_points(
     ]
 
 
-def replay_cleaner(
+def replay_refine(
     vehicle_id: str,
     tracks: dict[str, list[TrajectoryPoint]],
     *,
-    cleaner_result: CleanerResult | None = None,
-) -> ReplayCleanResult:
+    refine_result: RefineResult | None = None,
+) -> ReplayRefineResult:
     all_points = tracks.get(vehicle_id, [])
     if not all_points:
-        return ReplayCleanResult(vehicle_id, [], [], [], [])
+        return ReplayRefineResult(vehicle_id, [], [], [], [])
     original = sorted(all_points, key=lambda point: point.timestamp)
     index = _build_replay_index(tracks)
     excluded: list[tuple[TrajectoryPoint, str]] = []
-    if cleaner_result is not None:
+    if refine_result is not None:
         original_refs = {point.point_ref for point in all_points}
-        for item in cleaner_result.excluded:
+        for item in refine_result.excluded:
             if item.point_ref not in original_refs:
                 continue
             point = _resolve_point(vehicle_id, item.point_ref, index, tracks)
             if point is not None:
                 excluded.append((point, item.reason))
     injected: list[tuple[TrajectoryPoint, TrajectoryPoint, TrajectoryPoint]] = []
-    if cleaner_result is not None:
-        for point in cleaner_result.active.iter_points():
+    if refine_result is not None:
+        for point in refine_result.active.iter_points():
             if point.vehicle_id != vehicle_id or not point.point_ref.generated_reason:
                 continue
             left = _resolve_point(
@@ -821,23 +821,23 @@ def replay_cleaner(
     active = (
         [
             point
-            for point in cleaner_result.active.iter_points()
+            for point in refine_result.active.iter_points()
             if point.vehicle_id == vehicle_id
         ]
-        if cleaner_result is not None
+        if refine_result is not None
         else list(original)
     )
-    return ReplayCleanResult(vehicle_id, original, excluded, injected, active)
+    return ReplayRefineResult(vehicle_id, original, excluded, injected, active)
 
 
-def replay_cleaner_all(
+def replay_refine_all(
     tracks: dict[str, list[TrajectoryPoint]],
     *,
-    cleaner_result: CleanerResult,
-) -> dict[str, ReplayCleanResult]:
+    refine_result: RefineResult,
+) -> dict[str, ReplayRefineResult]:
     return {
-        vehicle_id: replay_cleaner(
-            vehicle_id, tracks, cleaner_result=cleaner_result
+        vehicle_id: replay_refine(
+            vehicle_id, tracks, refine_result=refine_result
         )
         for vehicle_id in tracks
     }

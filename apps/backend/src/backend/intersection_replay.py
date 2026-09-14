@@ -24,9 +24,9 @@ def replay_intersection(store: "PostgresMapStore", request: "ReplayRequest") -> 
     if request.detect_id is not None and str(request.detect_id) != detect_id:
         raise MapNotFoundError("intersection does not belong to the requested Detect Run")
     detect = store._resolve_detect(detect_id)
-    clean = detect.clean
+    refine = detect.refine
 
-    # Segment endpoints use cleaned order: final order may contain subsequently
+    # Segment endpoints use refined order: final order may contain subsequently
     # inserted crossing points which were not part of the detection segment.
     rows = store._fetchall(
         "WITH event_points AS ("
@@ -43,7 +43,7 @@ def replay_intersection(store: "PostgresMapStore", request: "ReplayRequest") -> 
         " LEFT JOIN LATERAL (SELECT successor.id FROM resolved_subtrack_points successor"
         " WHERE successor.detect_id = start.detect_id"
         " AND successor.subtrack_index = start.subtrack_index"
-        " AND successor.cleaned_sequence_in_subtrack = start.cleaned_sequence_in_subtrack + 1 LIMIT 1) AS successor ON TRUE"
+        " AND successor.refined_sequence_in_subtrack = start.refined_sequence_in_subtrack + 1 LIMIT 1) AS successor ON TRUE"
         " WHERE event.segment"
         ") SELECT point.id, kept.source_row_key, injected.id,"
         " COALESCE(kept.vehicle_id, injected.vehicle_id),"
@@ -52,15 +52,15 @@ def replay_intersection(store: "PostgresMapStore", request: "ReplayRequest") -> 
         " COALESCE(source.heading, injected.heading), COALESCE(source.speed, injected.speed),"
         " jsonb_agg(DISTINCT jsonb_build_object('kind', members.kind, 'id', members.event_id))"
         " FROM members LEFT JOIN LATERAL (SELECT * FROM resolved_subtrack_points WHERE id = members.id AND detect_id = %s LIMIT 1) AS point ON TRUE"
-        " LEFT JOIN LATERAL (SELECT * FROM kept_trajectory_points WHERE id = point.kept_point_id AND clean_id = %s LIMIT 1) AS kept ON TRUE"
-        " LEFT JOIN LATERAL (SELECT * FROM injected_points WHERE id = point.injected_point_id AND clean_id = %s LIMIT 1) AS injected ON TRUE"
-        f" LEFT JOIN LATERAL (SELECT * FROM {clean.quoted_source_table} WHERE id = kept.source_row_key::{clean.source_key_sql_type} LIMIT 1) AS source ON TRUE"
+        " LEFT JOIN LATERAL (SELECT * FROM kept_trajectory_points WHERE id = point.kept_point_id AND refine_id = %s LIMIT 1) AS kept ON TRUE"
+        " LEFT JOIN LATERAL (SELECT * FROM injected_points WHERE id = point.injected_point_id AND refine_id = %s LIMIT 1) AS injected ON TRUE"
+        f" LEFT JOIN LATERAL (SELECT * FROM {refine.quoted_source_table} WHERE id = kept.source_row_key::{refine.source_key_sql_type} LIMIT 1) AS source ON TRUE"
         " GROUP BY point.id, kept.source_row_key, injected.id, kept.vehicle_id, injected.vehicle_id,"
         " source.timestamp, injected.timestamp, source.lon, injected.lon, source.lat, injected.lat,"
         " source.heading, injected.heading, source.speed, injected.speed"
         " ORDER BY point.id LIMIT %s",
         (detect_id, candidate_id, detect_id, candidate_id, detect_id, detect_id,
-         clean.clean_id, clean.clean_id, request.max_points + 1),
+         refine.refine_id, refine.refine_id, request.max_points + 1),
     )
     if len(rows) > request.max_points:
         raise MapDataError("交叉口构成点超过 max_points 上限，请提高上限后重试；未返回部分结果。")
@@ -72,7 +72,7 @@ def replay_intersection(store: "PostgresMapStore", request: "ReplayRequest") -> 
             raise MapDataError("交叉口事件引用的构成点缺失，无法完整回放。")
         # Separate kept/injected namespaces avoid collisions with source keys.
         reference = PointRef(
-            source_id=f"{clean.clean_id}:" + ("injected" if injected_id is not None else "source"),
+            source_id=f"{refine.refine_id}:" + ("injected" if injected_id is not None else "source"),
             source_row_key=str(injected_id if injected_id is not None else source_key),
             stable=True,
         )

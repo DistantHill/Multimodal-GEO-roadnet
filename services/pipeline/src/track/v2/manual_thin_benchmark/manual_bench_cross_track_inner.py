@@ -43,7 +43,7 @@ from track.v2.cross_track import (
     extract_cross_track_candidates_reference as _extract_orthogonal_cross_track_candidates_reference,
     extract_cross_track_candidates as _extract_orthogonal_cross_track_candidates,
 )
-from track.v2.intersect2 import (
+from track.v2.detect import (
     IntersectConfig,
     SpatialWindowIterator,
     _cluster_orthogonal_cross_track_candidates,

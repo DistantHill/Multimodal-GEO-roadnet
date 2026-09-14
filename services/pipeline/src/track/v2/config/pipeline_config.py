@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import ConfigError
-from ..intersect2 import IntersectConfig
+from ..detect import IntersectConfig
 from ..models import (
-    CleanerConfig,
+    RefineConfig,
     ClipConfig,
     FittingConfig,
     NetworkConfig,
@@ -35,7 +35,7 @@ DEFAULT_PIPELINE_CONFIG_PATH = Path(__file__).resolve().parent / "pipeline.toml"
 # ZH: 顶层 TOML 节名白名单，防止 section 名打错字被静默忽略。
 # EN: Top-level section whitelist, so a typo'd section name is not silently ignored.
 _SECTIONS = (
-    "projection", "cleaner", "detect", "clip", "fitting", "network", "runtime",
+    "projection", "refine", "detect", "clip", "fitting", "network", "runtime",
 )
 _REMOVED_DETECT_KEYS = {
     "use_orthogonal_candidates": "use_cross_track_candidates",
@@ -49,7 +49,7 @@ class PipelineConfig:
     """Composite of all per-stage configs plus the cross-cutting runtime config."""
 
     projection: ProjectionConfig
-    cleaner: CleanerConfig
+    refine: RefineConfig
     detect: IntersectConfig
     clip: ClipConfig
     fitting: FittingConfig
@@ -144,7 +144,7 @@ def load_pipeline_config(path: str | Path | None = None) -> PipelineConfig:
 
     return PipelineConfig(
         projection=_build_section(ProjectionConfig(), payload.get("projection", {})),
-        cleaner=_build_section(CleanerConfig(), payload.get("cleaner", {})),
+        refine=_build_section(RefineConfig(), payload.get("refine", {})),
         detect=_build_section(IntersectConfig(), payload.get("detect", {})),
         clip=_build_section(ClipConfig(), payload.get("clip", {})),
         fitting=_build_section(FittingConfig(), payload.get("fitting", {})),

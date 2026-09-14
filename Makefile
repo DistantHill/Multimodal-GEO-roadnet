@@ -19,9 +19,13 @@ dev-config:
 build:
 	$(COMPOSE_DEV) build
 
-test:
+test: compose-test
 	$(COMPOSE_DEV) run --rm backend pytest
 	$(COMPOSE_DEV) run --rm pipeline python -m pytest tests scripts/cv_human_check/tests
+
+.PHONY: compose-test
+compose-test:
+	python3 -m unittest discover -s infra/docker/tests -v
 
 frontend-test:
 	cd apps/frontend && npm test && npm run build

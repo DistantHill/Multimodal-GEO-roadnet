@@ -1,4 +1,4 @@
-"""Runtime guard for the destructive track.v2 schema-v3 API."""
+"""Runtime guard for the destructive track.v2 schema-v4 API."""
 
 from __future__ import annotations
 
@@ -6,11 +6,11 @@ from typing import Any
 
 
 SCHEMA_COMPONENT = "track.v2"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
-def require_schema_v3(conn: Any) -> None:
-    """Fail before doing work when the connected database is not schema v3."""
+def require_schema_v4(conn: Any) -> None:
+    """Fail before doing work when the connected database is not schema v4."""
     with conn.cursor() as cur:
         cur.execute("SELECT to_regclass('pipeline_schema_versions')")
         if cur.fetchone()[0] is None:
@@ -26,5 +26,5 @@ def require_schema_v3(conn: Any) -> None:
         actual = "missing" if row is None else f"v{int(row[0])}"
         raise RuntimeError(
             f"track.v2 schema mismatch: expected v{SCHEMA_VERSION}, got {actual}; "
-            "run init_db --reset"
+            "for v3 run init-db --migrate-refine; older schemas require --reset"
         )

@@ -1,12 +1,12 @@
-# Schema v3 cutover
+# Schema v4 Refine migration
 
-本目录不再包含可执行的历史迁移。`track.v2` 数据库结构（schema）v3 是一次明确的破坏性
-接口与数据库结构切换：停止写入器（writer），核对数据库、用户和数据库结构，执行
-`python -m pipeline init-db --database roadnet --reset`，再一起部署 v3 Pipeline、
-Backend、Frontend 和 QGIS 客户端。
+`track.v2` 数据库结构（schema）v4 将 Clean 统一改名为 Refine。v3 可执行
+`python -m pipeline init-db --database roadnet --migrate-refine`，在一个事务内
+保留数据、改名并重建关系保护函数。执行前停止相关读写服务，完成后一起部署
+v4 Pipeline、Backend 和客户端。具体步骤见[迁移说明](../../../docs/refine-migration-and-performance.md)。
 
-无 `--reset` 时初始化器只接受空库或已登记为 v3 的库。检测到 v1、v2 或未版本化
-Pipeline 表会失败，不补列、不回填，也不猜测历史血缘。v3 业务表的权威数据定义语言
+无迁移选项时初始化器只接受空库或已登记为 v4 的库。v1、v2 或未版本化
+Pipeline 表仍需另行处理；`--reset` 会破坏性重建。v4 业务表的权威数据定义语言
 （data definition language，DDL）位于
 `services/pipeline/src/track/v2/cli/init_db.py`。
 
@@ -19,5 +19,5 @@ Pipeline 表会失败，不补列、不回填，也不猜测历史血缘。v3 �
 安装操作自身在一个事务内执行；应先在隔离测试结构验证，再于业务接入时显式部署。
 
 任务状态与业务运行状态是两个边界：任务全部完成不能绕过清单封闭与阶段发布检查，
-当前扩展不会自动更新 `clean_runs`、`detect_runs` 或前后端字段。
+当前扩展不会自动更新 `refine_runs`、`detect_runs` 或前后端字段。
 实现进度、限制与验证证据见[实施任务卡](../../../docs/pipeline-streaming-implementation.md)。

@@ -1,4 +1,4 @@
-"""Validation and immutable-source fingerprints for schema-v3 source tables."""
+"""Validation and immutable-source fingerprints for schema-v4 source tables."""
 
 from __future__ import annotations
 
@@ -170,7 +170,7 @@ def calculate_input_fingerprint(
     *,
     fetch_size: int = 10_000,
 ) -> dict[str, object]:
-    """Hash all source rows, including rows not referenced by any Clean Run.
+    """Hash all source rows, including rows not referenced by any Refine Run.
 
     Version 2 with scope ``full_input`` is separate from the referenced-row v1
     digest. Its domain header binds the table name, key type, version and scope.
@@ -226,12 +226,12 @@ def calculate_input_fingerprint(
 
 def calculate_source_fingerprint(
     conn: Any,
-    clean_id: str,
+    refine_id: str,
     contract: SourceTableContract,
     *,
     fetch_size: int = 10_000,
 ) -> dict[str, object]:
-    """Hash referenced Clean source rows using bounded server-side reads.
+    """Hash referenced Refine source rows using bounded server-side reads.
 
     This is not a fingerprint of the entire input table. The caller owns the
     transaction, which must support a non-holdable named cursor; this function
@@ -243,9 +243,9 @@ def calculate_source_fingerprint(
     extra_sql = "source.extra" if contract.has_extra else "'{}'::jsonb"
     query = f"""
         WITH referenced(source_row_key) AS (
-            SELECT source_row_key FROM kept_trajectory_points WHERE clean_id = %s
+            SELECT source_row_key FROM kept_trajectory_points WHERE refine_id = %s
             UNION
-            SELECT source_row_key FROM excluded_points WHERE clean_id = %s
+            SELECT source_row_key FROM excluded_points WHERE refine_id = %s
         )
         SELECT referenced.source_row_key,
                source.id IS NOT NULL,
@@ -265,11 +265,11 @@ def calculate_source_fingerprint(
     row_count = 0
     with conn.cursor(name=f"source_fingerprint_{uuid4().hex}") as cur:
         cur.itersize = fetch_size
-        cur.execute(query, (clean_id, clean_id))
+        cur.execute(query, (refine_id, refine_id))
         for row in cur:
             if not bool(row[1]):
                 raise ValueError(
-                    f"Clean Run {clean_id} references missing source row {row[0]!r}"
+                    f"Refine Run {refine_id} references missing source row {row[0]!r}"
                 )
             encoded = _fingerprint_row(row)
             digest.update(len(encoded).to_bytes(8, "big"))
@@ -282,23 +282,23 @@ def calculate_source_fingerprint(
     }
 
 
-def verify_clean_source_fingerprint(conn: Any, clean_id: str) -> None:
+def verify_refine_source_fingerprint(conn: Any, refine_id: str) -> None:
     """Reject replay when any referenced immutable source row has drifted."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT source_table, source_fingerprint, status "
-            "FROM clean_runs WHERE id = %s",
-            (clean_id,),
+            "FROM refine_runs WHERE id = %s",
+            (refine_id,),
         )
         row = cur.fetchone()
     if row is None:
-        raise ValueError(f"unknown Clean Run: {clean_id}")
+        raise ValueError(f"unknown Refine Run: {refine_id}")
     if str(row[2]) != "completed":
-        raise ValueError(f"Clean Run {clean_id} is not completed")
+        raise ValueError(f"Refine Run {refine_id} is not completed")
     expected = row[1] if isinstance(row[1], dict) else json.loads(str(row[1]))
     contract = validate_source_table(conn, str(row[0]))
-    actual = calculate_source_fingerprint(conn, clean_id, contract)
+    actual = calculate_source_fingerprint(conn, refine_id, contract)
     if actual != expected:
         raise ValueError(
-            f"source rows for Clean Run {clean_id} changed; replay is refused"
+            f"source rows for Refine Run {refine_id} changed; replay is refused"
         )

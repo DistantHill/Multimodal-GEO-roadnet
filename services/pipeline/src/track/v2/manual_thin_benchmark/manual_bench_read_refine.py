@@ -1,14 +1,16 @@
-"""Read-only v3 benchmark for the PostgreSQL source → Cleaner hot loop.
+"""Read-only v4 benchmark for the PostgreSQL source → Refine hot loop.
 
 The v3 Pipeline no longer copies raw rows into an internal working table and
 does not mutate ``trajectory_points.is_active``. This benchmark therefore
 measures only the live work that remains: ordered source fetch/parsing and the
-three Cleaner computations.
+full Refine computation, including projection and point copying. The run-wide
+transformer is reused exactly as in Pipeline. Persistence and fingerprints are
+outside this benchmark; read/parse residual also includes loop/report overhead.
 
 Usage::
 
     TRACK_BENCH_PROCESSING_SRID=32650 \
-      python -m track.v2.manual_thin_benchmark.manual_bench_read_clean
+      python -m track.v2.manual_thin_benchmark.manual_bench_read_refine
 """
 
 from __future__ import annotations
@@ -17,16 +19,16 @@ import os
 import time
 
 from track.v2 import get_database
-from track.v2.cleaner import _exclude_stationary, _inject_orthogonal, _split_by_gaps
-from track.v2.db.schema import require_schema_v3
+from track.v2.refine import refine_vehicle
+from track.v2.db.schema import require_schema_v4
 from track.v2.db.source_table import source_order_query, validate_source_table
 from track.v2.manual_thin_benchmark._thin_bench_helpers import (
     TEST_DB_NAME,
     connect_test_db,
 )
-from track.v2.models import CleanerConfig, PostgresSource, ProjectionConfig
-from track.v2.projection import create_spatial_context
-from track.v2.sources import StreamVehicleSource
+from track.v2.models import RefineConfig, PostgresSource, ProjectionConfig
+from track.v2.projection import CoordinateTransformer, create_spatial_context
+from track.v2.parser import StreamVehicleSource
 
 
 SOURCE_TABLE = os.environ.get("TRACK_BENCH_SOURCE_TABLE", "trajectory_points")
@@ -52,10 +54,10 @@ def main() -> None:
     spatial_context = create_spatial_context(
         ProjectionConfig(processing_srid=PROCESSING_SRID)
     )
-    config = CleanerConfig()
+    config = RefineConfig()
 
     print("=" * 72)
-    print("  manual_bench_read_clean — schema-v3 Read→Clean benchmark")
+    print("  manual_bench_read_refine — schema-v4 Read→Refine benchmark")
     print(f"  DB: {TEST_DB_NAME}")
     print(f"  Source table: {SOURCE_TABLE}")
     print(f"  Max vehicles: {MAX_VEHICLES if MAX_VEHICLES > 0 else 'ALL'}")
@@ -68,7 +70,7 @@ def main() -> None:
     try:
         conn.execute("SET TRANSACTION READ ONLY")
         conn.execute("SET LOCAL statement_timeout TO '10min'")
-        require_schema_v3(conn)
+        require_schema_v4(conn)
         contract = validate_source_table(conn, SOURCE_TABLE)
         source = PostgresSource(
             config=None,  # type: ignore[arg-type] -- factory owns connections
@@ -87,9 +89,8 @@ def main() -> None:
             f"({time.perf_counter() - count_started:.3f}s)"
         )
 
-        split_s = 0.0
-        exclude_s = 0.0
-        inject_s = 0.0
+        refine_s = 0.0
+        transformer = CoordinateTransformer(spatial_context)
         total_points = 0
         total_excluded = 0
         total_injected = 0
@@ -102,29 +103,14 @@ def main() -> None:
             total_points += len(vehicle_points)
 
             started = time.perf_counter()
-            subtracks = _split_by_gaps(vehicle_points, config.max_gap_s)
-            split_s += time.perf_counter() - started
-
-            started = time.perf_counter()
-            kept_subtracks: list[list] = []
-            excluded_count = 0
-            for subtrack in subtracks:
-                kept, excluded = _exclude_stationary(subtrack, config)
-                kept_subtracks.append(kept)
-                excluded_count += len(excluded)
-                total_kept += len(kept)
-            exclude_s += time.perf_counter() - started
-
-            started = time.perf_counter()
-            injected_count = 0
-            for subtrack in kept_subtracks:
-                _resolved, count, _derived = _inject_orthogonal(
-                    subtrack,
-                    config,
-                    spatial_context=spatial_context,
-                )
-                injected_count += count
-            inject_s += time.perf_counter() - started
+            result = refine_vehicle(
+                vehicle_points, config=config, spatial_context=spatial_context,
+                _transformer=transformer,
+            )
+            refine_s += time.perf_counter() - started
+            excluded_count = len(result.excluded)
+            injected_count = sum(result.derived_counts.values())
+            total_kept += len(result.kept)
 
             total_excluded += excluded_count
             total_injected += injected_count
@@ -140,8 +126,7 @@ def main() -> None:
                 break
 
         loop_s = time.perf_counter() - loop_started
-        cleaner_s = split_s + exclude_s + inject_s
-        read_parse_s = max(0.0, loop_s - cleaner_s)
+        read_parse_s = max(0.0, loop_s - refine_s)
 
         print("\n" + "=" * 72)
         print("SUMMARY / 汇总")
@@ -157,16 +142,8 @@ def main() -> None:
             f"({_percentage(read_parse_s, loop_s):5.1f}%)"
         )
         print(
-            f"  Split by gaps:          {split_s:8.3f}s "
-            f"({_percentage(split_s, loop_s):5.1f}%)"
-        )
-        print(
-            f"  Exclude stationary:     {exclude_s:8.3f}s "
-            f"({_percentage(exclude_s, loop_s):5.1f}%)"
-        )
-        print(
-            f"  Inject orthogonal:      {inject_s:8.3f}s "
-            f"({_percentage(inject_s, loop_s):5.1f}%)"
+            f"  Refine (full compute):  {refine_s:8.3f}s "
+            f"({_percentage(refine_s, loop_s):5.1f}%)"
         )
         if total_points:
             print(f"  Throughput:             {total_points / loop_s:,.0f} points/s")

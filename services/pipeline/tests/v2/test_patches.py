@@ -21,11 +21,11 @@ from track.v2.patches import (
 
 CONTEXT = {
     "run_id": "output-run",
-    "stage": "clean",
+    "stage": "refine",
     "input_fingerprint": "full-source-fingerprint",
     "semantic_config_digest": json_digest({"threshold": 5}),
     "code_version": "revision-one",
-    "algorithm_version": "clean-one",
+    "algorithm_version": "refine-one",
 }
 
 

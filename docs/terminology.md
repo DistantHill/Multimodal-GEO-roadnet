@@ -70,7 +70,7 @@
 | --- | --- |
 | 数据处理流水线（Pipeline） | 项目数据处理运行单元 |
 | 解析阶段（Parser） | 项目阶段名称 |
-| 清洗阶段（Cleaner；亦称 Clean、Refine） | 保留阶段名，关联原代码 |
+| 精炼阶段（Refine） | 原 Cleaner / Clean；当前代码、配置和数据库统一使用 Refine，历史问答保留原名 |
 | 检测阶段（Detect） | 项目阶段名称 |
 | 片段提取阶段（Clip） | 大写为阶段名，小写 clip 指片段 |
 | 拟合阶段（Fitting） | 项目阶段名称 |

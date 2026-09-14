@@ -74,7 +74,7 @@ predicate for each cluster, and materializes only the current query window.
 Duplicate-timestamp tracks retain stream order instead of acquiring a new
 adjacency from the spatial sort.
 
-Implementation: [`intersect2.py`](../services/pipeline/src/track/v2/intersect2.py),
+Implementation: [`intersect2.py`](../services/pipeline/src/track/v2/detect.py),
 [`cross_track.py`](../services/pipeline/src/track/v2/cross_track.py), and
 [`queries.py`](../services/pipeline/src/track/v2/db/queries.py).
 
@@ -147,7 +147,7 @@ upgrade path: v1/v2 or unversioned tables require an explicitly confirmed
 not match. Pipeline itself accepts only `source_table` (or a completed
 `clean_id`); CSV remains a separate parser/importer facility.
 
-Implementation: [`sources.py`](../services/pipeline/src/track/v2/sources.py) and
+Implementation: [`sources.py`](../services/pipeline/src/track/v2/parser.py) and
 [`init_db.py`](../services/pipeline/src/track/v2/cli/init_db.py).
 
 The schema-v3 cutover audit and repeatable A65 commands are recorded in

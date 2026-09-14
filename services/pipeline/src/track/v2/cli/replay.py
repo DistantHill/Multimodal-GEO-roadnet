@@ -1,6 +1,6 @@
-"""Replay one persisted schema-v3 result back to verified source rows.
+"""Replay one persisted schema-v4 result back to verified source rows.
 
-Clean artifacts use ``--clean-id``; Detect artifacts use ``--detect-id``;
+Refine artifacts use ``--refine-id``; Detect artifacts use ``--detect-id``;
 Centerlines carry their own completed Fit/Detect context.
 """
 
@@ -11,11 +11,11 @@ import getpass
 import uuid
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
-from ..db.schema import require_schema_v3
+from ..db.schema import require_schema_v4
 from ..logger import init_logger, shutdown_logger
 from ..output import error_payload, print_json
 from ..replay import (
-    CLEAN_REPLAY_KINDS,
+    REFINE_REPLAY_KINDS,
     DETECT_REPLAY_KINDS,
     PostgresReplayStore,
     ReplayService,
@@ -33,18 +33,18 @@ def _uuid_arg(value: str) -> str:
 
 def _target_from_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> ReplayTarget:
     if args.kind == "centerline":
-        if args.clean_id or args.detect_id:
+        if args.refine_id or args.detect_id:
             parser.error("centerline does not take a stage ID")
         return ReplayTarget(args.kind, _internal_id(parser, args.id))
-    if args.kind in CLEAN_REPLAY_KINDS:
-        if args.clean_id is None:
-            parser.error(f"{args.kind} requires --clean-id")
+    if args.kind in REFINE_REPLAY_KINDS:
+        if args.refine_id is None:
+            parser.error(f"{args.kind} requires --refine-id")
         target_id: int | str = (
             args.id
             if args.kind in {"source_point", "excluded_point"}
             else _internal_id(parser, args.id)
         )
-        return ReplayTarget(args.kind, target_id, clean_id=args.clean_id)
+        return ReplayTarget(args.kind, target_id, refine_id=args.refine_id)
     if args.kind in DETECT_REPLAY_KINDS:
         if args.detect_id is None:
             parser.error(f"{args.kind} requires --detect-id")
@@ -70,10 +70,10 @@ def _internal_id(parser: argparse.ArgumentParser, value: str) -> int:
 def main() -> int:
     defaults = default_postgres_config()
     parser = argparse.ArgumentParser(
-        description="Replay one persisted schema-v3 entity to verified source rows."
+        description="Replay one persisted schema-v4 entity to verified source rows."
     )
     stage_group = parser.add_mutually_exclusive_group()
-    stage_group.add_argument("--clean-id", type=_uuid_arg, help="Clean Run UUID.")
+    stage_group.add_argument("--refine-id", type=_uuid_arg, help="Refine Run UUID.")
     stage_group.add_argument("--detect-id", type=_uuid_arg, help="Detect Run UUID.")
     parser.add_argument("--kind", required=True, help="Persisted entity kind.")
     parser.add_argument(
@@ -104,7 +104,7 @@ def main() -> int:
     try:
         try:
             with pg_connect(config) as conn:
-                require_schema_v3(conn)
+                require_schema_v4(conn)
                 service = ReplayService(PostgresReplayStore(conn))
                 trace = service.replay(target)
         except (RuntimeError, ValueError) as exc:

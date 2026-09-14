@@ -1,6 +1,6 @@
-"""Create the destructive track.v2 schema-v3 PostgreSQL contract.
+"""Create track.v2 schema v4 or migrate the v3 Refine naming in place.
 
-Schema v3 deliberately has no in-place upgrade path.  An existing v1/v2
+Schema v3 supports ``--migrate-refine``. An existing v1/v2
 database must be recreated with ``--reset`` so an old column can never retain
 an ambiguous meaning behind a new API.
 """
@@ -16,7 +16,7 @@ from ..logger import init_logger, shutdown_logger
 
 
 SCHEMA_COMPONENT = "track.v2"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 DDL_STATEMENTS: list[tuple[str, str]] = [
@@ -31,9 +31,9 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         """,
     ),
     (
-        "clean_runs",
+        "refine_runs",
         """
-        CREATE TABLE IF NOT EXISTS clean_runs (
+        CREATE TABLE IF NOT EXISTS refine_runs (
             id                  UUID PRIMARY KEY,
             source_table        TEXT NOT NULL,
             source_srid         INTEGER NOT NULL DEFAULT 4326,
@@ -45,18 +45,18 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
                                 CHECK (status IN ('running', 'completed', 'failed')),
             started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             finished_at         TIMESTAMPTZ,
-            CONSTRAINT clean_runs_source_table_not_blank
+            CONSTRAINT refine_runs_source_table_not_blank
                 CHECK (BTRIM(source_table) <> ''),
-            CONSTRAINT clean_runs_projection_config_object
+            CONSTRAINT refine_runs_projection_config_object
                 CHECK (jsonb_typeof(projection_config) = 'object'),
-            CONSTRAINT clean_runs_parameters_object
+            CONSTRAINT refine_runs_parameters_object
                 CHECK (jsonb_typeof(parameters) = 'object'),
-            CONSTRAINT clean_runs_source_fingerprint_object
+            CONSTRAINT refine_runs_source_fingerprint_object
                 CHECK (
                     source_fingerprint IS NULL
                     OR jsonb_typeof(source_fingerprint) = 'object'
                 ),
-            CONSTRAINT clean_runs_fixed_crs
+            CONSTRAINT refine_runs_fixed_crs
                 CHECK (
                     source_srid = 4326
                     AND (
@@ -77,7 +77,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         """
         CREATE TABLE IF NOT EXISTS detect_runs (
             id              UUID PRIMARY KEY,
-            clean_id        UUID NOT NULL REFERENCES clean_runs(id) ON DELETE CASCADE,
+            refine_id        UUID NOT NULL REFERENCES refine_runs(id) ON DELETE CASCADE,
             parameters      JSONB NOT NULL DEFAULT '{}'
                             CHECK (jsonb_typeof(parameters) = 'object'),
             status          TEXT NOT NULL
@@ -110,11 +110,11 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         "excluded_points",
         """
         CREATE TABLE IF NOT EXISTS excluded_points (
-            clean_id        UUID NOT NULL REFERENCES clean_runs(id) ON DELETE CASCADE,
+            refine_id        UUID NOT NULL REFERENCES refine_runs(id) ON DELETE CASCADE,
             source_row_key  TEXT NOT NULL,
             reason          TEXT NOT NULL,
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (clean_id, source_row_key)
+            PRIMARY KEY (refine_id, source_row_key)
         )
         """,
     ),
@@ -123,8 +123,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         """
         CREATE TABLE IF NOT EXISTS kept_trajectory_points (
             id                      BIGSERIAL PRIMARY KEY,
-            clean_id                UUID NOT NULL
-                                    REFERENCES clean_runs(id) ON DELETE CASCADE,
+            refine_id                UUID NOT NULL
+                                    REFERENCES refine_runs(id) ON DELETE CASCADE,
             source_row_key          TEXT NOT NULL,
             vehicle_id              TEXT NOT NULL,
             subtrack_index          INTEGER NOT NULL CHECK (subtrack_index >= 1),
@@ -132,9 +132,9 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
                                     CHECK (sequence_in_subtrack >= 0),
             created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             CONSTRAINT kept_points_source_member_key
-                UNIQUE (clean_id, source_row_key),
+                UNIQUE (refine_id, source_row_key),
             CONSTRAINT kept_points_sequence_key
-                UNIQUE (clean_id, subtrack_index, sequence_in_subtrack)
+                UNIQUE (refine_id, subtrack_index, sequence_in_subtrack)
         )
         """,
     ),
@@ -143,8 +143,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         """
         CREATE TABLE IF NOT EXISTS injected_points (
             id                          BIGSERIAL PRIMARY KEY,
-            clean_id                    UUID NOT NULL
-                                        REFERENCES clean_runs(id) ON DELETE CASCADE,
+            refine_id                    UUID NOT NULL
+                                        REFERENCES refine_runs(id) ON DELETE CASCADE,
             vehicle_id                  TEXT NOT NULL,
             subtrack_index              INTEGER NOT NULL CHECK (subtrack_index >= 1),
             after_sequence_in_subtrack  INTEGER NOT NULL
@@ -162,7 +162,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             generated_reason            TEXT NOT NULL DEFAULT 'orthogonal_heading',
             created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             CONSTRAINT injected_points_anchor_key
-                UNIQUE (clean_id, subtrack_index, after_sequence_in_subtrack)
+                UNIQUE (refine_id, subtrack_index, after_sequence_in_subtrack)
         )
         """,
     ),
@@ -174,8 +174,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             detect_id                       UUID NOT NULL
                                             REFERENCES detect_runs(id) ON DELETE CASCADE,
             subtrack_index                  INTEGER NOT NULL CHECK (subtrack_index >= 1),
-            cleaned_sequence_in_subtrack    INTEGER
-                                            CHECK (cleaned_sequence_in_subtrack >= 0),
+            refined_sequence_in_subtrack    INTEGER
+                                            CHECK (refined_sequence_in_subtrack >= 0),
             sequence_in_subtrack            INTEGER NOT NULL
                                             CHECK (sequence_in_subtrack >= 0),
             kept_point_id                   BIGINT REFERENCES kept_trajectory_points(id),
@@ -187,14 +187,14 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
                 CHECK (num_nonnulls(kept_point_id, injected_point_id, crossing_point_id) = 1),
             CONSTRAINT resolved_points_sequence_kind_check
                 CHECK (
-                    (crossing_point_id IS NOT NULL AND cleaned_sequence_in_subtrack IS NULL)
+                    (crossing_point_id IS NOT NULL AND refined_sequence_in_subtrack IS NULL)
                     OR
-                    (crossing_point_id IS NULL AND cleaned_sequence_in_subtrack IS NOT NULL)
+                    (crossing_point_id IS NULL AND refined_sequence_in_subtrack IS NOT NULL)
                 ),
             CONSTRAINT resolved_points_final_sequence_key
                 UNIQUE (detect_id, subtrack_index, sequence_in_subtrack),
-            CONSTRAINT resolved_points_cleaned_sequence_key
-                UNIQUE (detect_id, subtrack_index, cleaned_sequence_in_subtrack),
+            CONSTRAINT resolved_points_refined_sequence_key
+                UNIQUE (detect_id, subtrack_index, refined_sequence_in_subtrack),
             CONSTRAINT resolved_points_kept_key UNIQUE (detect_id, kept_point_id),
             CONSTRAINT resolved_points_injected_key UNIQUE (detect_id, injected_point_id),
             CONSTRAINT resolved_points_crossing_key UNIQUE (detect_id, crossing_point_id)
@@ -472,14 +472,14 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
 
 INDEX_STATEMENTS: list[tuple[str, str]] = [
     (
-        "idx_clean_runs_source_table",
-        "CREATE INDEX IF NOT EXISTS idx_clean_runs_source_table "
-        "ON clean_runs(source_table, started_at DESC)",
+        "idx_refine_runs_source_table",
+        "CREATE INDEX IF NOT EXISTS idx_refine_runs_source_table "
+        "ON refine_runs(source_table, started_at DESC)",
     ),
     (
-        "idx_detect_runs_clean",
-        "CREATE INDEX IF NOT EXISTS idx_detect_runs_clean "
-        "ON detect_runs(clean_id, started_at DESC)",
+        "idx_detect_runs_refine",
+        "CREATE INDEX IF NOT EXISTS idx_detect_runs_refine "
+        "ON detect_runs(refine_id, started_at DESC)",
     ),
     (
         "idx_fit_runs_detect",
@@ -499,17 +499,17 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
     (
         "idx_excluded_points_reason",
         "CREATE INDEX IF NOT EXISTS idx_excluded_points_reason "
-        "ON excluded_points(clean_id, reason)",
+        "ON excluded_points(refine_id, reason)",
     ),
     (
         "idx_kept_points_subtrack",
         "CREATE INDEX IF NOT EXISTS idx_kept_points_subtrack "
-        "ON kept_trajectory_points(clean_id, subtrack_index, sequence_in_subtrack)",
+        "ON kept_trajectory_points(refine_id, subtrack_index, sequence_in_subtrack)",
     ),
     (
         "idx_injected_points_subtrack",
         "CREATE INDEX IF NOT EXISTS idx_injected_points_subtrack "
-        "ON injected_points(clean_id, subtrack_index, after_sequence_in_subtrack)",
+        "ON injected_points(refine_id, subtrack_index, after_sequence_in_subtrack)",
     ),
     (
         "idx_injected_points_geom",
@@ -606,12 +606,22 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
         DROP TRIGGER IF EXISTS centerline_source_clip_check
             ON centerline_source_clips;
 
-        DROP FUNCTION IF EXISTS validate_resolved_point_membership();
-        DROP FUNCTION IF EXISTS validate_resolved_segment_start();
-        DROP FUNCTION IF EXISTS validate_tracks_cross_segments();
-        DROP FUNCTION IF EXISTS validate_turn_event_point();
-        DROP FUNCTION IF EXISTS validate_entry_exit_observation();
-        DROP FUNCTION IF EXISTS validate_centerline_source_clip();
+        DO $ddl$
+        DECLARE function_name TEXT;
+        BEGIN
+            FOREACH function_name IN ARRAY ARRAY[
+                'validate_resolved_point_membership',
+                'validate_resolved_segment_start',
+                'validate_tracks_cross_segments',
+                'validate_turn_event_point',
+                'validate_entry_exit_observation',
+                'validate_centerline_source_clip'
+            ] LOOP
+                EXECUTE format('DROP FUNCTION IF EXISTS %I.%I()',
+                               current_schema(), function_name);
+            END LOOP;
+        END
+        $ddl$;
         """,
     ),
     (
@@ -651,9 +661,9 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
     (
         "run_initial_status_triggers",
         """
-        DROP TRIGGER IF EXISTS clean_run_initial_status_guard ON clean_runs;
-        CREATE TRIGGER clean_run_initial_status_guard
-        BEFORE INSERT ON clean_runs
+        DROP TRIGGER IF EXISTS refine_run_initial_status_guard ON refine_runs;
+        CREATE TRIGGER refine_run_initial_status_guard
+        BEFORE INSERT ON refine_runs
         FOR EACH ROW EXECUTE FUNCTION enforce_pipeline_run_initial_status();
         DROP TRIGGER IF EXISTS detect_run_initial_status_guard ON detect_runs;
         CREATE TRIGGER detect_run_initial_status_guard
@@ -666,11 +676,11 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
         """,
     ),
     (
-        "clean_run_state_trigger",
+        "refine_run_state_trigger",
         """
-        DROP TRIGGER IF EXISTS clean_run_state_guard ON clean_runs;
-        CREATE TRIGGER clean_run_state_guard
-        BEFORE UPDATE ON clean_runs
+        DROP TRIGGER IF EXISTS refine_run_state_guard ON refine_runs;
+        CREATE TRIGGER refine_run_state_guard
+        BEFORE UPDATE ON refine_runs
         FOR EACH ROW EXECUTE FUNCTION enforce_pipeline_run_state_transition()
         """,
     ),
@@ -715,9 +725,9 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
     (
         "run_delete_guard_triggers",
         """
-        DROP TRIGGER IF EXISTS clean_run_delete_guard ON clean_runs;
-        CREATE TRIGGER clean_run_delete_guard
-        BEFORE DELETE ON clean_runs
+        DROP TRIGGER IF EXISTS refine_run_delete_guard ON refine_runs;
+        CREATE TRIGGER refine_run_delete_guard
+        BEFORE DELETE ON refine_runs
         FOR EACH STATEMENT EXECUTE FUNCTION guard_pipeline_run_delete();
         DROP TRIGGER IF EXISTS detect_run_delete_guard ON detect_runs;
         CREATE TRIGGER detect_run_delete_guard
@@ -741,20 +751,20 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
         BEGIN
             IF NOT EXISTS (
                 SELECT 1
-                  FROM clean_runs
-                 WHERE id = NEW.clean_id
+                  FROM refine_runs
+                 WHERE id = NEW.refine_id
                    AND status = 'completed'
             ) THEN
                 RAISE EXCEPTION
-                    'completed Detect Run requires a completed parent Clean Run';
+                    'completed Detect Run requires a completed parent Refine Run';
             END IF;
 
             -- This is intentionally one aggregate scan, not one query per
-            -- resolved row.  It validates parent-Clean membership, subtrack
+            -- resolved row.  It validates parent-Refine membership, subtrack
             -- membership, and the A80 single-vehicle contract together.
             WITH point_sources AS MATERIALIZED (
                 SELECT resolved.subtrack_index,
-                       resolved.cleaned_sequence_in_subtrack,
+                       resolved.refined_sequence_in_subtrack,
                        CASE
                            WHEN resolved.kept_point_id IS NOT NULL
                                THEN 'kept'::TEXT
@@ -764,7 +774,7 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                            resolved.kept_point_id,
                            resolved.injected_point_id
                        ) AS source_point_id,
-                       COALESCE(kept.clean_id, injected.clean_id) AS clean_id,
+                       COALESCE(kept.refine_id, injected.refine_id) AS refine_id,
                        COALESCE(
                            kept.subtrack_index,
                            injected.subtrack_index
@@ -784,7 +794,7 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                        ROW_NUMBER() OVER (
                            PARTITION BY subtrack_index
                            ORDER BY anchor_sequence, kind_order, source_point_id
-                       ) - 1 AS expected_cleaned_sequence
+                       ) - 1 AS expected_refined_sequence
                   FROM (
                         SELECT 'kept'::TEXT AS source_kind,
                                id AS source_point_id,
@@ -792,7 +802,7 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                                sequence_in_subtrack AS anchor_sequence,
                                0 AS kind_order
                           FROM kept_trajectory_points
-                         WHERE clean_id = NEW.clean_id
+                         WHERE refine_id = NEW.refine_id
                         UNION ALL
                         SELECT 'injected'::TEXT,
                                id,
@@ -800,12 +810,12 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                                after_sequence_in_subtrack,
                                1
                           FROM injected_points
-                         WHERE clean_id = NEW.clean_id
-                       ) AS clean_members
+                         WHERE refine_id = NEW.refine_id
+                       ) AS refine_members
             ), subtrack_checks AS (
                 SELECT subtrack_index,
                        BOOL_OR(
-                           clean_id IS DISTINCT FROM NEW.clean_id
+                           refine_id IS DISTINCT FROM NEW.refine_id
                            OR source_subtrack IS DISTINCT FROM subtrack_index
                        ) AS has_bad_membership,
                        MIN(vehicle_id) AS first_vehicle,
@@ -819,9 +829,9 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                     SELECT CASE
                                WHEN expected.source_point_id IS NULL
                                     OR actual.source_point_id IS NULL THEN
-                                   'resolved p/i set must exactly equal the Detect parent Clean p/i set'
+                                   'resolved p/i set must exactly equal the Detect parent Refine p/i set'
                                ELSE
-                                   'resolved cleaned sequence must equal the derived Clean p/i order'
+                                   'resolved refined sequence must equal the derived Refine p/i order'
                            END AS issue
                       FROM expected_sources AS expected
                       FULL JOIN point_sources AS actual
@@ -831,12 +841,12 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                         OR actual.source_point_id IS NULL
                         OR actual.subtrack_index IS DISTINCT FROM
                            expected.subtrack_index
-                        OR actual.cleaned_sequence_in_subtrack IS DISTINCT FROM
-                           expected.expected_cleaned_sequence
+                        OR actual.refined_sequence_in_subtrack IS DISTINCT FROM
+                           expected.expected_refined_sequence
                     UNION ALL
                     SELECT CASE
                                WHEN has_bad_membership THEN
-                                   'resolved p/i point must belong to the Detect parent Clean Run and subtrack'
+                                   'resolved p/i point must belong to the Detect parent Refine Run and subtrack'
                                ELSE 'resolved subtrack contains multiple vehicles'
                            END
                       FROM subtrack_checks
@@ -850,35 +860,35 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
 
             -- UNIQUE constraints prevent duplicates; min/max/count therefore
             -- prove that both snapshots are dense zero-based sequences.
-            SELECT 'resolved subtrack cleaned/final sequence must be contiguous from zero'
+            SELECT 'resolved subtrack refined/final sequence must be contiguous from zero'
               INTO violation
               FROM resolved_subtrack_points AS resolved
              WHERE resolved.detect_id = NEW.id
              GROUP BY resolved.subtrack_index
             HAVING MIN(resolved.sequence_in_subtrack) <> 0
                 OR MAX(resolved.sequence_in_subtrack) <> COUNT(*) - 1
-                OR COUNT(resolved.cleaned_sequence_in_subtrack) = 0
-                OR MIN(resolved.cleaned_sequence_in_subtrack) <> 0
-                OR MAX(resolved.cleaned_sequence_in_subtrack) <>
-                   COUNT(resolved.cleaned_sequence_in_subtrack) - 1
+                OR COUNT(resolved.refined_sequence_in_subtrack) = 0
+                OR MIN(resolved.refined_sequence_in_subtrack) <> 0
+                OR MAX(resolved.refined_sequence_in_subtrack) <>
+                   COUNT(resolved.refined_sequence_in_subtrack) - 1
              LIMIT 1;
             IF violation IS NOT NULL THEN
                 RAISE EXCEPTION '%', violation;
             END IF;
 
             SELECT
-                'resolved p/i final sequence must strictly increase with cleaned sequence'
+                'resolved p/i final sequence must strictly increase with refined sequence'
               INTO violation
               FROM (
                     SELECT resolved.sequence_in_subtrack,
                            LAG(resolved.sequence_in_subtrack) OVER (
                                PARTITION BY resolved.subtrack_index
-                               ORDER BY resolved.cleaned_sequence_in_subtrack
+                               ORDER BY resolved.refined_sequence_in_subtrack
                            ) AS previous_final_sequence
                       FROM resolved_subtrack_points AS resolved
                      WHERE resolved.detect_id = NEW.id
-                       AND resolved.cleaned_sequence_in_subtrack IS NOT NULL
-                   ) AS ordered_cleaned
+                       AND resolved.refined_sequence_in_subtrack IS NOT NULL
+                   ) AS ordered_refined
              WHERE sequence_in_subtrack <= previous_final_sequence
              LIMIT 1;
             IF violation IS NOT NULL THEN
@@ -887,7 +897,7 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
 
             -- The resolved crossing set must exactly equal the crossing set
             -- of complete intersections.  The same join also validates that
-            -- every crossing inherits its cleaned segment's subtrack.
+            -- every crossing inherits its refined segment's subtrack.
             WITH actual_crossings AS MATERIALIZED (
                 SELECT resolved.id AS resolved_id,
                        resolved.crossing_point_id,
@@ -908,8 +918,8 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                   LEFT JOIN resolved_subtrack_points AS successor
                     ON successor.detect_id = segment_start.detect_id
                    AND successor.subtrack_index = segment_start.subtrack_index
-                   AND successor.cleaned_sequence_in_subtrack =
-                       segment_start.cleaned_sequence_in_subtrack + 1
+                   AND successor.refined_sequence_in_subtrack =
+                       segment_start.refined_sequence_in_subtrack + 1
                   LEFT JOIN intersections AS complete_intersection
                     ON complete_intersection.detect_id = crossing.detect_id
                    AND complete_intersection.candidate_intersection_id =
@@ -937,7 +947,7 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                                    segment_start_sequence < sequence_in_subtrack
                                    AND sequence_in_subtrack < successor_sequence
                                ) THEN
-                                   'resolved crossing must lie between its cleaned segment endpoints'
+                                   'resolved crossing must lie between its refined segment endpoints'
                                ELSE 'resolved crossing belongs to the wrong subtrack'
                            END AS issue
                       FROM actual_crossings
@@ -975,7 +985,7 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                  WHERE track_cross.detect_id = NEW.id
             )
             SELECT FORMAT(
-                       '%s endpoint %s is not a valid cleaned segment start',
+                       '%s endpoint %s is not a valid refined segment start',
                        segment_use.kind,
                        segment_use.point_id
                    )
@@ -987,9 +997,9 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
               LEFT JOIN resolved_subtrack_points AS successor
                 ON successor.detect_id = segment_start.detect_id
                AND successor.subtrack_index = segment_start.subtrack_index
-               AND successor.cleaned_sequence_in_subtrack =
-                   segment_start.cleaned_sequence_in_subtrack + 1
-             WHERE segment_start.cleaned_sequence_in_subtrack IS NULL
+               AND successor.refined_sequence_in_subtrack =
+                   segment_start.refined_sequence_in_subtrack + 1
+             WHERE segment_start.refined_sequence_in_subtrack IS NULL
                 OR successor.id IS NULL
              LIMIT 1;
             IF violation IS NOT NULL THEN
@@ -1026,14 +1036,14 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                 RAISE EXCEPTION '%', violation;
             END IF;
 
-            SELECT 'turn event point must be a cleaned p/i resolved point'
+            SELECT 'turn event point must be a refined p/i resolved point'
               INTO violation
               FROM turn_events AS turn_event
               LEFT JOIN resolved_subtrack_points AS resolved
                 ON resolved.id = turn_event.resolved_point_id
                AND resolved.detect_id = turn_event.detect_id
              WHERE turn_event.detect_id = NEW.id
-               AND resolved.cleaned_sequence_in_subtrack IS NULL
+               AND resolved.refined_sequence_in_subtrack IS NULL
              LIMIT 1;
             IF violation IS NOT NULL THEN
                 RAISE EXCEPTION '%', violation;
@@ -1106,14 +1116,14 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
         """,
     ),
     (
-        "guard_clean_artifact_mutation_function",
+        "guard_refine_artifact_mutation_function",
         """
-        CREATE OR REPLACE FUNCTION guard_clean_artifact_mutation()
+        CREATE OR REPLACE FUNCTION guard_refine_artifact_mutation()
         RETURNS trigger
         LANGUAGE plpgsql
         AS $function$
         DECLARE
-            changed_clean_id UUID;
+            changed_refine_id UUID;
             run_status TEXT;
         BEGIN
             IF TG_OP = 'DELETE'
@@ -1124,53 +1134,53 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
             END IF;
 
             IF TG_OP = 'INSERT' THEN
-                FOR changed_clean_id IN
-                    SELECT clean_id FROM new_rows
-                     GROUP BY clean_id ORDER BY clean_id
+                FOR changed_refine_id IN
+                    SELECT refine_id FROM new_rows
+                     GROUP BY refine_id ORDER BY refine_id
                 LOOP
                     SELECT status INTO run_status
-                      FROM clean_runs
-                     WHERE id = changed_clean_id
+                      FROM refine_runs
+                     WHERE id = changed_refine_id
                      FOR SHARE;
                     IF run_status = 'completed' THEN
                         RAISE EXCEPTION
-                            'completed Clean Run % artifacts are immutable',
-                            changed_clean_id;
+                            'completed Refine Run % artifacts are immutable',
+                            changed_refine_id;
                     END IF;
                 END LOOP;
             ELSIF TG_OP = 'DELETE' THEN
-                FOR changed_clean_id IN
-                    SELECT clean_id FROM old_rows
-                     GROUP BY clean_id ORDER BY clean_id
+                FOR changed_refine_id IN
+                    SELECT refine_id FROM old_rows
+                     GROUP BY refine_id ORDER BY refine_id
                 LOOP
                     SELECT status INTO run_status
-                      FROM clean_runs
-                     WHERE id = changed_clean_id
+                      FROM refine_runs
+                     WHERE id = changed_refine_id
                      FOR SHARE;
                     IF run_status = 'completed' THEN
                         RAISE EXCEPTION
-                            'completed Clean Run % artifacts are immutable',
-                            changed_clean_id;
+                            'completed Refine Run % artifacts are immutable',
+                            changed_refine_id;
                     END IF;
                 END LOOP;
             ELSE
-                FOR changed_clean_id IN
-                    SELECT clean_id
+                FOR changed_refine_id IN
+                    SELECT refine_id
                       FROM (
-                            SELECT clean_id FROM old_rows
+                            SELECT refine_id FROM old_rows
                             UNION
-                            SELECT clean_id FROM new_rows
+                            SELECT refine_id FROM new_rows
                            ) AS changed
-                     ORDER BY clean_id
+                     ORDER BY refine_id
                 LOOP
                     SELECT status INTO run_status
-                      FROM clean_runs
-                     WHERE id = changed_clean_id
+                      FROM refine_runs
+                     WHERE id = changed_refine_id
                      FOR SHARE;
                     IF run_status = 'completed' THEN
                         RAISE EXCEPTION
-                            'completed Clean Run % artifacts are immutable',
-                            changed_clean_id;
+                            'completed Refine Run % artifacts are immutable',
+                            changed_refine_id;
                     END IF;
                 END LOOP;
             END IF;
@@ -1181,7 +1191,7 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
         """,
     ),
     (
-        "clean_artifact_mutation_triggers",
+        "refine_artifact_mutation_triggers",
         """
         DO $ddl$
         DECLARE
@@ -1193,37 +1203,37 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                 'injected_points'
             ] LOOP
                 EXECUTE FORMAT(
-                    'DROP TRIGGER IF EXISTS guard_completed_clean_insert ON %I',
+                    'DROP TRIGGER IF EXISTS guard_completed_refine_insert ON %I',
                     artifact_table
                 );
                 EXECUTE FORMAT(
-                    'CREATE TRIGGER guard_completed_clean_insert '
+                    'CREATE TRIGGER guard_completed_refine_insert '
                     'AFTER INSERT ON %I REFERENCING NEW TABLE AS new_rows '
                     'FOR EACH STATEMENT '
-                    'EXECUTE FUNCTION guard_clean_artifact_mutation()',
+                    'EXECUTE FUNCTION guard_refine_artifact_mutation()',
                     artifact_table
                 );
                 EXECUTE FORMAT(
-                    'DROP TRIGGER IF EXISTS guard_completed_clean_update ON %I',
+                    'DROP TRIGGER IF EXISTS guard_completed_refine_update ON %I',
                     artifact_table
                 );
                 EXECUTE FORMAT(
-                    'CREATE TRIGGER guard_completed_clean_update '
+                    'CREATE TRIGGER guard_completed_refine_update '
                     'AFTER UPDATE ON %I '
                     'REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows '
                     'FOR EACH STATEMENT '
-                    'EXECUTE FUNCTION guard_clean_artifact_mutation()',
+                    'EXECUTE FUNCTION guard_refine_artifact_mutation()',
                     artifact_table
                 );
                 EXECUTE FORMAT(
-                    'DROP TRIGGER IF EXISTS guard_completed_clean_delete ON %I',
+                    'DROP TRIGGER IF EXISTS guard_completed_refine_delete ON %I',
                     artifact_table
                 );
                 EXECUTE FORMAT(
-                    'CREATE TRIGGER guard_completed_clean_delete '
+                    'CREATE TRIGGER guard_completed_refine_delete '
                     'AFTER DELETE ON %I REFERENCING OLD TABLE AS old_rows '
                     'FOR EACH STATEMENT '
-                    'EXECUTE FUNCTION guard_clean_artifact_mutation()',
+                    'EXECUTE FUNCTION guard_refine_artifact_mutation()',
                     artifact_table
                 );
             END LOOP;
@@ -1690,6 +1700,7 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
 
 
 LEGACY_TABLES = (
+    "clean_runs",
     "candidate_intersection_events",
     "pipeline_runs",
 )
@@ -1723,14 +1734,14 @@ def _existing_pipeline_tables(cur: Any) -> list[str]:
     return [str(row[0]) for row in cur.fetchall()]
 
 
-def _require_empty_or_v3(cur: Any) -> None:
+def _require_empty_or_v4(cur: Any) -> None:
     version = _schema_version(cur)
     if version == SCHEMA_VERSION:
         return
     if version is not None:
         raise RuntimeError(
             f"database schema is v{version}; track.v2 requires v{SCHEMA_VERSION}. "
-            "Run init_db --reset to perform the destructive v3 switch."
+            "For v3 use init-db --migrate-refine; older schemas require --reset."
         )
     existing = _existing_pipeline_tables(cur)
     if existing:
@@ -1738,13 +1749,13 @@ def _require_empty_or_v3(cur: Any) -> None:
         suffix = " ..." if len(existing) > 8 else ""
         raise RuntimeError(
             "unversioned/legacy pipeline tables exist "
-            f"({preview}{suffix}); schema v3 has no in-place migration. "
+            f"({preview}{suffix}); schema v4 has no in-place migration. "
             "Run init_db --reset."
         )
 
 
 def reset_tables(config: PostgresConfig) -> int:
-    """Drop every known pipeline table; schema v3 intentionally has no migration."""
+    """Explicitly discard all known Pipeline tables, including legacy names."""
     current_names = [name for name, _ in reversed(DDL_STATEMENTS)]
     drop_names = [*current_names, *LEGACY_TABLES]
     with pg_connect(config) as conn:
@@ -1768,7 +1779,7 @@ def reset_tables(config: PostgresConfig) -> int:
                 "enforce_pipeline_run_initial_status",
                 "guard_pipeline_run_delete",
                 "validate_detect_run_completion",
-                "guard_clean_artifact_mutation",
+                "guard_refine_artifact_mutation",
                 "guard_detect_artifact_mutation",
                 "validate_fit_run_completion",
                 "guard_centerline_mutation",
@@ -1780,11 +1791,15 @@ def reset_tables(config: PostgresConfig) -> int:
     return 0
 
 
-def create_tables(config: PostgresConfig) -> int:
-    """Create schema v3 in one transaction, refusing every legacy schema."""
+def create_tables(config: PostgresConfig, *, migrate: bool = False) -> int:
+    """Create schema v4 in one transaction, optionally migrating v3 first."""
     with pg_connect(config) as conn:
         with conn.cursor() as cur:
-            _require_empty_or_v3(cur)
+            if migrate:
+                from ..db.refine_migration import migrate_refine
+
+                migrate_refine(cur)
+            _require_empty_or_v4(cur)
 
             print("\n── 创建数据表 / Creating Tables ──")
             for name, ddl in DDL_STATEMENTS:
@@ -1832,7 +1847,7 @@ def create_tables(config: PostgresConfig) -> int:
 def main() -> int:
     defaults = default_postgres_config()
     parser = argparse.ArgumentParser(
-        description="Initialize the destructive track.v2 PostgreSQL schema v3."
+        description="Initialize the destructive track.v2 PostgreSQL schema v4."
     )
     parser.add_argument("--host", default=defaults.host)
     parser.add_argument("--port", type=int, default=defaults.port)
@@ -1845,10 +1860,15 @@ def main() -> int:
     )
     parser.add_argument("--connect-timeout", type=int, default=defaults.connect_timeout)
     parser.add_argument("--sslmode", default=defaults.sslmode)
-    parser.add_argument(
+    migration = parser.add_mutually_exclusive_group()
+    migration.add_argument(
         "--reset",
         action="store_true",
-        help="Destructively drop all known Pipeline tables before creating v3.",
+        help="Destructively drop all known Pipeline tables before creating v4.",
+    )
+    migration.add_argument(
+        "--migrate-refine", action="store_true",
+        help="Preserve v3 data and rename Clean objects to Refine (schema v4).",
     )
     args = parser.parse_args()
 
@@ -1872,7 +1892,7 @@ def main() -> int:
     try:
         if args.reset:
             reset_tables(config)
-        return create_tables(config)
+        return create_tables(config, migrate=args.migrate_refine)
     except RuntimeError as exc:
         print(f"[FAIL] {exc}")
         return 2

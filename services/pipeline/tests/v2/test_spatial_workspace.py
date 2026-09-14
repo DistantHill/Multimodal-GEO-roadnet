@@ -10,7 +10,7 @@ import pytest
 from track.v2._geometry import _to_lonlat
 from track.v2.cross_track import CrossTrackCapacityError, extract_cross_track_candidates
 from track.v2.db.queries import SpatialWindowIterator
-from track.v2.intersect2 import (
+from track.v2.detect import (
     IntersectConfig,
     _cross_track_candidate_key,
     _extract_cross_track_db_workspace,
@@ -121,10 +121,10 @@ def test_db_workspace_prefers_capacity_guarded_global_index() -> None:
     extent = _projected_bounds(115.99, 38.99, 116.01, 39.01)
 
     with patch(
-        "track.v2.intersect2.extract_cross_track_candidates",
+        "track.v2.detect.extract_cross_track_candidates",
         return_value=([], 1, 1),
     ) as global_extract, patch(
-        "track.v2.intersect2._extract_cross_track_memory_windows",
+        "track.v2.detect._extract_cross_track_memory_windows",
         side_effect=AssertionError("fallback must not run"),
     ):
         assert _extract_cross_track_db_workspace(
@@ -148,10 +148,10 @@ def test_db_workspace_capacity_failure_uses_memory_not_sql() -> None:
     sentinel = [object()]
 
     with patch(
-        "track.v2.intersect2.extract_cross_track_candidates",
+        "track.v2.detect.extract_cross_track_candidates",
         side_effect=CrossTrackCapacityError("too dense"),
     ), patch(
-        "track.v2.intersect2._extract_cross_track_memory_windows",
+        "track.v2.detect._extract_cross_track_memory_windows",
         return_value=sentinel,
     ) as fallback:
         assert _extract_cross_track_db_workspace(
@@ -172,7 +172,7 @@ def test_db_workspace_respects_disabled_cross_track_method() -> None:
     cfg = IntersectConfig(use_cross_track_candidates=False)
 
     with patch(
-        "track.v2.intersect2.extract_cross_track_candidates",
+        "track.v2.detect.extract_cross_track_candidates",
         side_effect=AssertionError("Method 3 must stay disabled"),
     ):
         assert _extract_cross_track_db_workspace(
@@ -204,7 +204,7 @@ def test_memory_windows_match_legacy_window_queries() -> None:
             and window.y_min <= point.y <= window.y_max
         ]
 
-    with patch("track.v2.intersect2._query_active_points_in_window", side_effect=query):
+    with patch("track.v2.detect._query_active_points_in_window", side_effect=query):
         legacy = _extract_cross_track_windows(
             object(),
             cfg,

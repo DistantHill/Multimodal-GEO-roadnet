@@ -13,9 +13,9 @@ class RunCliV3Test(unittest.TestCase):
             host="localhost", port=5432, database="track", user="track", password="",
         )
 
-    def test_main_forwards_reused_clean_run(self) -> None:
+    def test_main_forwards_reused_refine_run(self) -> None:
         with (
-            patch("sys.argv", ["track.v2.cli.run", "--clean-id", "11111111-1111-1111-1111-111111111111"]),
+            patch("sys.argv", ["track.v2.cli.run", "--refine-id", "11111111-1111-1111-1111-111111111111"]),
             patch("track.v2.cli.run.default_postgres_config", return_value=self.config),
             patch("track.v2.cli.run.init_logger"),
             patch("track.v2.cli.run.shutdown_logger") as shutdown_logger,
@@ -27,7 +27,7 @@ class RunCliV3Test(unittest.TestCase):
         run_pipeline.assert_called_once_with(
             self.config,
             source_table=None,
-            clean_id="11111111-1111-1111-1111-111111111111",
+            refine_id="11111111-1111-1111-1111-111111111111",
             config_path=None,
             processing_srid=None,
         )
@@ -49,13 +49,13 @@ class RunCliV3Test(unittest.TestCase):
 
         self.assertEqual(run_pipeline.call_args.kwargs["processing_srid"], 32650)
 
-    def test_main_rejects_projection_override_for_reused_clean_run(self) -> None:
+    def test_main_rejects_projection_override_for_reused_refine_run(self) -> None:
         with (
             patch(
                 "sys.argv",
                 [
                     "track.v2.cli.run",
-                    "--clean-id", "11111111-1111-1111-1111-111111111111",
+                    "--refine-id", "11111111-1111-1111-1111-111111111111",
                     "--processing-srid", "32650",
                 ],
             ),
@@ -67,7 +67,7 @@ class RunCliV3Test(unittest.TestCase):
 
     def test_main_preserves_exit_code_and_cleanup_on_wrapper_failure(self) -> None:
         with (
-            patch("sys.argv", ["track.v2.cli.run", "--clean-id", "11111111-1111-1111-1111-111111111111"]),
+            patch("sys.argv", ["track.v2.cli.run", "--refine-id", "11111111-1111-1111-1111-111111111111"]),
             patch("track.v2.cli.run.default_postgres_config", return_value=self.config),
             patch("track.v2.cli.run.init_logger"),
             patch("track.v2.cli.run.shutdown_logger") as shutdown_logger,

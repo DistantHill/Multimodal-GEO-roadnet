@@ -1,4 +1,4 @@
-"""Thin in-memory benchmark for schema-v3 resolved active-set Clip assembly.
+"""Thin in-memory benchmark for schema-v4 resolved active-set Clip assembly.
 
 Detect owns geometric root solving in v3. This fixture supplies a final p/i/c
 sequence and measures Clip validation, active-set updates, minimal

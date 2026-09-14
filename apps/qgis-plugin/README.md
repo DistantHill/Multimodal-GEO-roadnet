@@ -76,7 +76,7 @@ Then choose one of the toolbar/menu actions:
   and the feature's `detect_id` when available. The Backend resolves the
   intersection's candidate within that Detect Run, selects matching `turn_events`
   and `tracks_cross`, and calls Pipeline's `replay_points` to return constituent
-  points into `tmp`. Crossing events include both endpoints of both cleaned
+  points into `tmp`. Crossing events include both endpoints of both refined
   segments; turn events include their referenced point. Points are deduplicated.
   This mode does not limit vehicles. Exceeding `max_points` (default 10,000,
   maximum 50,000) returns an error instead of silently returning partial data.
@@ -114,21 +114,21 @@ the request handler and results are not persisted.
 }
 ```
 
-For original/Clean source rows, the alternative request is
+For original/Refine source rows, the alternative request is
 `{"source_row_keys": ["101", "external-key"]}`; `detect_id` is optional.
 
 Replay is ID-driven only: bbox requests are rejected, including from Web clients.
 Point IDs identify selected subtracks; only those tracks are hydrated through
 their source foreign keys. Intersection Replay follows candidate/event endpoint
-references. Replay does not load all Clean source rows or recompute a full-source
+references. Replay does not load all Refine source rows or recompute a full-source
 fingerprint; unrelated source changes are not validated by this request.
 
 Point Replay returns individual source segments tagged `replay_role=highlight`
-or `context`. Entry/exit points highlight their referenced cleaned segment;
+or `context`. Entry/exit points highlight their referenced refined segment;
 ordinary points highlight adjacent segments. Other segments of the same selected
 subtracks are grey context only. Web and QGIS automatically zoom to highlighted
 segments, not the extent of the whole subtrack. Context still requires bounded
-reading of the selected subtracks; no full Clean scan is performed.
+reading of the selected subtracks; no full Refine scan is performed.
 
 Clip request:
 

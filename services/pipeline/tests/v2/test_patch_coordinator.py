@@ -24,7 +24,7 @@ class Ledger:
         self.abandoned = 0
         self.unknown_commit = False
         for index in range(count):
-            manifest = PatchManifest("run", "clean", "subtrack", canonical_json({"group": index}),
+            manifest = PatchManifest("run", "refine", "subtrack", canonical_json({"group": index}),
                                      "input", "a" * 64, "code", "algorithm", 1)
             self.rows[manifest.task_id] = [manifest, "pending", 0]
 
@@ -41,7 +41,7 @@ class Ledger:
         row = self.rows[task_id]
         assert row[1] == "pending"
         row[1], row[2] = "working", row[2] + 1
-        return AttemptToken("run", "clean", task_id, 1, row[2], str(uuid4()))
+        return AttemptToken("run", "refine", task_id, 1, row[2], str(uuid4()))
 
     def commit_result(self, attempt, write):
         if self.unknown_commit:

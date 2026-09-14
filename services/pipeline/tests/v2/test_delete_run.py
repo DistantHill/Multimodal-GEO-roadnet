@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from track.v2.delete_run import (
-    CLEAN_ARTIFACT_TABLES,
+    REFINE_ARTIFACT_TABLES,
     DETECT_ARTIFACT_TABLES,
     DeleteImpact,
     DeleteRunService,
@@ -13,7 +13,7 @@ from track.v2.delete_run import (
 )
 
 
-CLEAN_ID = "11111111-1111-1111-1111-111111111111"
+REFINE_ID = "11111111-1111-1111-1111-111111111111"
 DETECT_ID = "22222222-2222-2222-2222-222222222222"
 
 
@@ -40,7 +40,7 @@ class _Cursor:
             self.rows = []
             return
         if sql.endswith("FOR UPDATE") and not sql.startswith((
-            "SELECT id FROM clean_runs", "SELECT id FROM detect_runs",
+            "SELECT id FROM refine_runs", "SELECT id FROM detect_runs",
         )):
             self.rows = []
             return
@@ -74,30 +74,30 @@ def _detect_preview_responses(*, count: int = 1) -> list[list[tuple[object, ...]
     return [[(DETECT_ID,)]] + [[(count,)] for _ in DETECT_ARTIFACT_TABLES]
 
 
-def _clean_preview_responses(*, count: int = 1) -> list[list[tuple[object, ...]]]:
+def _refine_preview_responses(*, count: int = 1) -> list[list[tuple[object, ...]]]:
     return (
-        [[(CLEAN_ID,)]]
+        [[(REFINE_ID,)]]
         + [[(DETECT_ID,)]]
-        + [[(count,)] for _ in CLEAN_ARTIFACT_TABLES]
+        + [[(count,)] for _ in REFINE_ARTIFACT_TABLES]
         + [[(count,)] for _ in DETECT_ARTIFACT_TABLES]
     )
 
 
 class DeleteRunServiceTest(unittest.TestCase):
-    def test_clean_preview_has_clean_tables_and_each_child_detect_tree(self) -> None:
+    def test_refine_preview_has_refine_tables_and_each_child_detect_tree(self) -> None:
         responses = (
-            [[(CLEAN_ID,)]]
+            [[(REFINE_ID,)]]
             + [[(DETECT_ID,)]]
-            + [[(index,)] for index, _ in enumerate(CLEAN_ARTIFACT_TABLES, start=1)]
+            + [[(index,)] for index, _ in enumerate(REFINE_ARTIFACT_TABLES, start=1)]
             + [[(index,)] for index, _ in enumerate(DETECT_ARTIFACT_TABLES, start=10)]
         )
         service = DeleteRunService(_Connection(responses))
 
-        impact = service.preview_clean(CLEAN_ID)
+        impact = service.preview_refine(REFINE_ID)
 
         self.assertEqual(
             [(row.table, row.count) for row in impact.own_rows],
-            list(zip(CLEAN_ARTIFACT_TABLES, range(1, 4))),
+            list(zip(REFINE_ARTIFACT_TABLES, range(1, 4))),
         )
         self.assertEqual(impact.detects[0].target_id, DETECT_ID)
         self.assertEqual(
@@ -171,12 +171,12 @@ class DeleteRunServiceTest(unittest.TestCase):
         self.assertLess(bypass_index, first_delete)
         self.assertLess(last_table_lock, first_delete)
 
-    def test_clean_delete_removes_children_then_clean_artifacts_and_registry(self) -> None:
-        conn = _Connection(_clean_preview_responses() * 3)
-        answers = iter(("y", CLEAN_ID))
+    def test_refine_delete_removes_children_then_refine_artifacts_and_registry(self) -> None:
+        conn = _Connection(_refine_preview_responses() * 3)
+        answers = iter(("y", REFINE_ID))
 
-        deleted = DeleteRunService(conn).confirm_and_delete_clean(
-            CLEAN_ID,
+        deleted = DeleteRunService(conn).confirm_and_delete_refine(
+            REFINE_ID,
             input_fn=lambda _prompt: next(answers),
             output_fn=lambda _line: None,
         )
@@ -190,11 +190,11 @@ class DeleteRunServiceTest(unittest.TestCase):
             f"DELETE FROM {table} WHERE detect_id = %s"
             for table in DETECT_ARTIFACT_TABLES[1:]
         ] + ["DELETE FROM detect_runs WHERE id = %s"]
-        expected_clean = [
-            f"DELETE FROM {table} WHERE clean_id = %s"
-            for table in CLEAN_ARTIFACT_TABLES
-        ] + ["DELETE FROM clean_runs WHERE id = %s"]
-        self.assertEqual(deletes, expected_detect + expected_clean)
+        expected_refine = [
+            f"DELETE FROM {table} WHERE refine_id = %s"
+            for table in REFINE_ARTIFACT_TABLES
+        ] + ["DELETE FROM refine_runs WHERE id = %s"]
+        self.assertEqual(deletes, expected_detect + expected_refine)
         self.assertFalse(any(sql.startswith("DELETE FROM trajectory_points ") for sql in deletes))
         self.assertEqual(
             sum(
@@ -203,19 +203,19 @@ class DeleteRunServiceTest(unittest.TestCase):
             ),
             1,
         )
-        final_clean_lock = max(
+        final_refine_lock = max(
             index for index, (sql, _) in enumerate(conn.executions)
             if sql == "LOCK TABLE tracks_cross IN SHARE ROW EXCLUSIVE MODE"
         )
-        final_clean_count = max(
+        final_refine_count = max(
             index for index, (sql, _) in enumerate(conn.executions)
-            if sql == "SELECT COUNT(*) FROM excluded_points WHERE clean_id = %s"
+            if sql == "SELECT COUNT(*) FROM excluded_points WHERE refine_id = %s"
         )
-        self.assertLess(final_clean_lock, final_clean_count)
+        self.assertLess(final_refine_lock, final_refine_count)
         self.assertFalse(any(
             sql.startswith("SELECT id FROM ") and "FOR UPDATE" in sql
             and not sql.startswith((
-                "SELECT id FROM clean_runs", "SELECT id FROM detect_runs",
+                "SELECT id FROM refine_runs", "SELECT id FROM detect_runs",
             ))
             for sql, _ in conn.executions
         ))
@@ -227,7 +227,7 @@ class DeleteRunServiceTest(unittest.TestCase):
         self.assertFalse(any(sql.startswith("DELETE") for sql, _ in cancel_conn.executions))
 
         wrong_conn = _Connection(_detect_preview_responses() * 2)
-        answers = iter(("y", CLEAN_ID))
+        answers = iter(("y", REFINE_ID))
         self.assertFalse(DeleteRunService(wrong_conn).confirm_and_delete_detect(
             DETECT_ID, input_fn=lambda _prompt: next(answers), output_fn=lambda _line: None,
         ))

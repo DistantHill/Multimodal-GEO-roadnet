@@ -7,7 +7,7 @@ from track.v2.cli.init_db import (
     POST_DDL_STATEMENTS,
     SCHEMA_COMPONENT,
     SCHEMA_VERSION,
-    _require_empty_or_v3,
+    _require_empty_or_v4,
 )
 
 
@@ -15,25 +15,25 @@ def _ddl(table: str) -> str:
     return dict(DDL_STATEMENTS)[table]
 
 
-def test_schema_v3_is_an_explicit_destructive_contract() -> None:
+def test_schema_v4_is_an_explicit_destructive_contract() -> None:
     assert SCHEMA_COMPONENT == "track.v2"
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 4
     assert "pipeline_schema_versions" in dict(DDL_STATEMENTS)
 
 
-def test_clean_tables_store_only_v3_source_membership() -> None:
-    clean = _ddl("clean_runs")
+def test_refine_tables_store_only_v3_source_membership() -> None:
+    refine = _ddl("refine_runs")
     kept = _ddl("kept_trajectory_points")
     excluded = _ddl("excluded_points")
     injected = _ddl("injected_points")
 
-    assert "source_table" in clean
-    assert "source_fingerprint" in clean
-    assert "source_kind" not in clean
-    assert "target_table" not in clean
+    assert "source_table" in refine
+    assert "source_fingerprint" in refine
+    assert "source_kind" not in refine
+    assert "target_table" not in refine
     assert "source_row_key          TEXT NOT NULL" in kept
     assert "trajectory_point_id" not in kept
-    assert "PRIMARY KEY (clean_id, source_row_key)" in excluded
+    assert "PRIMARY KEY (refine_id, source_row_key)" in excluded
     assert "after_sequence_in_subtrack" in injected
     assert "from_source" not in injected
     assert "to_source" not in injected
@@ -44,10 +44,10 @@ def test_resolved_sequence_has_one_stable_source_and_two_snapshots() -> None:
 
     assert "vehicle_id" not in ddl
     assert "sequence_in_subtrack            INTEGER NOT NULL" in ddl
-    assert "cleaned_sequence_in_subtrack    INTEGER" in ddl
+    assert "refined_sequence_in_subtrack    INTEGER" in ddl
     assert "num_nonnulls(kept_point_id, injected_point_id, crossing_point_id) = 1" in ddl
     assert "UNIQUE (detect_id, subtrack_index, sequence_in_subtrack)" in ddl
-    assert "UNIQUE (detect_id, subtrack_index, cleaned_sequence_in_subtrack)" in ddl
+    assert "UNIQUE (detect_id, subtrack_index, refined_sequence_in_subtrack)" in ddl
 
 
 def test_detect_artifacts_use_internal_ids_and_do_not_repeat_derived_fields() -> None:
@@ -107,12 +107,12 @@ def test_post_ddl_validates_semantics_once_when_runs_complete() -> None:
     post = dict(POST_DDL_STATEMENTS)
     assert "DEFERRABLE INITIALLY DEFERRED" in post["resolved_points_crossing_fkey"]
     detect = post["validate_detect_completion_function"]
-    assert "completed Detect Run requires a completed parent Clean Run" in detect
-    assert "Detect parent Clean Run" in detect
+    assert "completed Detect Run requires a completed parent Refine Run" in detect
+    assert "Detect parent Refine Run" in detect
     assert "complete intersection" in detect
     assert "contains multiple vehicles" in detect
     assert "different vehicles/subtracks" in detect
-    assert "cleaned p/i resolved point" in detect
+    assert "refined p/i resolved point" in detect
     assert "entry/exit crossing types must be 1/0" in detect
     assert "entry crossing must precede exit crossing" in detect
     assert "WITH point_sources AS" in detect
@@ -120,11 +120,11 @@ def test_post_ddl_validates_semantics_once_when_runs_complete() -> None:
     assert "resolved p/i set must exactly equal" in detect
     assert "ROW_NUMBER() OVER" in detect
     assert "ORDER BY anchor_sequence, kind_order, source_point_id" in detect
-    assert "resolved cleaned sequence must equal the derived Clean p/i order" in detect
-    assert "cleaned/final sequence must be contiguous from zero" in detect
+    assert "resolved refined sequence must equal the derived Refine p/i order" in detect
+    assert "refined/final sequence must be contiguous from zero" in detect
     assert "LAG(resolved.sequence_in_subtrack) OVER" in detect
-    assert "final sequence must strictly increase with cleaned sequence" in detect
-    assert "resolved crossing must lie between its cleaned segment endpoints" in detect
+    assert "final sequence must strictly increase with refined sequence" in detect
+    assert "resolved crossing must lie between its refined segment endpoints" in detect
     assert "segment_start_sequence < sequence_in_subtrack" in detect
     assert "sequence_in_subtrack < successor_sequence" in detect
     assert "FOR EACH ROW" not in detect
@@ -147,20 +147,20 @@ def test_post_ddl_validates_semantics_once_when_runs_complete() -> None:
 
 def test_artifact_immutability_guards_are_statement_level() -> None:
     post = dict(POST_DDL_STATEMENTS)
-    clean_triggers = post["clean_artifact_mutation_triggers"]
+    refine_triggers = post["refine_artifact_mutation_triggers"]
     detect_triggers = post["detect_artifact_mutation_triggers"]
     fit_triggers = post["fit_artifact_mutation_triggers"]
 
-    assert "FOR EACH STATEMENT" in clean_triggers
+    assert "FOR EACH STATEMENT" in refine_triggers
     assert "FOR EACH STATEMENT" in detect_triggers
     assert "FOR EACH STATEMENT" in fit_triggers
     assert "CREATE CONSTRAINT TRIGGER" not in detect_triggers
     assert "CREATE CONSTRAINT TRIGGER" not in fit_triggers
-    assert "FOR EACH ROW" not in clean_triggers
+    assert "FOR EACH ROW" not in refine_triggers
     assert "FOR EACH ROW" not in detect_triggers
     assert "FOR EACH ROW" not in fit_triggers
-    assert "completed Clean Run % artifacts are immutable" in post[
-        "guard_clean_artifact_mutation_function"
+    assert "completed Refine Run % artifacts are immutable" in post[
+        "guard_refine_artifact_mutation_function"
     ]
     assert "FOR SHARE" in post["guard_detect_artifact_mutation_function"]
     assert "completed Detect Run % artifacts are immutable" in post[
@@ -182,7 +182,7 @@ def test_all_run_deletes_require_the_confirmation_gated_service() -> None:
     assert "track_v2.allow_completed_run_delete" in function
     assert "IS DISTINCT FROM 'on'" in function
     assert "DeleteRunService" in function
-    for table in ("clean_runs", "detect_runs", "fit_runs"):
+    for table in ("refine_runs", "detect_runs", "fit_runs"):
         assert f"BEFORE DELETE ON {table}" in triggers
     assert triggers.count("FOR EACH STATEMENT") == 3
 
@@ -193,10 +193,10 @@ def test_all_runs_must_start_running_and_are_frozen_after_completion() -> None:
     insert_triggers = post["run_initial_status_triggers"]
 
     assert "NEW.status <> 'running'" in initial
-    for table in ("clean_runs", "detect_runs", "fit_runs"):
+    for table in ("refine_runs", "detect_runs", "fit_runs"):
         assert f"BEFORE INSERT ON {table}" in insert_triggers
     for trigger_name in (
-        "clean_run_state_trigger",
+        "refine_run_state_trigger",
         "detect_run_state_trigger",
         "fit_run_state_trigger",
     ):
@@ -236,8 +236,8 @@ class _VersionCursor:
 
 def test_unversioned_legacy_schema_is_refused_without_reset() -> None:
     with pytest.raises(RuntimeError, match="no in-place migration"):
-        _require_empty_or_v3(_VersionCursor(None, ["clean_runs"]))
+        _require_empty_or_v4(_VersionCursor(None, ["refine_runs"]))
 
 
 def test_existing_v3_schema_is_accepted() -> None:
-    _require_empty_or_v3(_VersionCursor(3, ["clean_runs"]))
+    _require_empty_or_v4(_VersionCursor(4, ["refine_runs"]))

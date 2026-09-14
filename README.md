@@ -10,7 +10,7 @@
 
 - `apps/frontend`：独立前端开发容器；仅负责 UI 和 Backend API 调用。
 - `apps/backend`：独立 FastAPI API 容器；提供健康检查，以及只读、限量的地图图层、Replay 和 Clip GeoJSON API。
-- `services/pipeline`：Pipeline 独立运行单元，包含 Cleaner、Detect、Clip、Fitting、Network、持久化、回放和数据库初始化逻辑。Detect 的 DB 模式只构建一次 Clean 轨迹 workspace，并由转向/正交检测、跨车求交和拓扑验证共享；Backend request process 不执行这些耗时阶段。
+- `services/pipeline`：Pipeline 独立运行单元，包含 Refine、Detect、Clip、Fitting、Network、持久化、回放和数据库初始化逻辑。Detect 的 DB 模式只构建一次 Refine 轨迹 workspace，并由转向/正交检测、跨车求交和拓扑验证共享；Backend request process 不执行这些耗时阶段。
 - `services/vision`：可选 YOLOv8 CUDA 11.7 离线推理/跟踪运行单元，通过 Compose `vision` profile 启用。
 - `db/postgres`、`db/qdrant`：数据库定义、初始化和迁移逻辑，不保存运行时数据。
 - `infra/docker`：开发和生产 Compose 文件。
@@ -50,9 +50,9 @@ QGIS 3.44 LTR 插件源码位于 `apps/qgis-plugin/roadnet_tools/`。开发机�
 - `POST /api/v1/map/replay`：按 `source_row_keys`、`resolved_point_ids` 或
   `intersection_id`（三选一）回放。Replay 拒绝 `bbox`；前端框选只提交已加载要素的准确 ID。
   Detect 产物使用内部 `resolved_point_ids` 并要求
-  `detect_id`；原始/Clean 来源使用字符串化的 `source_row_keys`。
+  `detect_id`；原始/Refine 来源使用字符串化的 `source_row_keys`。
   点 ID 先定位命中子轨迹，再有界读取其来源点；交叉口 ID 沿候选交叉口及事件外键读取构成点。
-  Replay 不再全量读取 Clean 源表计算指纹，仅读取所选溯源链，并检查读取到的来源记录是否缺失。
+  Replay 不再全量读取 Refine 源表计算指纹，仅读取所选溯源链，并检查读取到的来源记录是否缺失。
   这不等价于全库不可变性校验：与选择无关的源行变更不会在 Replay 中检测。
 - `POST /api/v1/map/clip`：按 `detect_id` 与两个 `intersection_ids` 截取交叉口间轨迹；ID 值是 PostgreSQL `intersections.id`，不再接受 Detect 运行时的 cluster 计算序号。
 
@@ -64,7 +64,17 @@ QGIS 3.44 LTR 插件源码位于 `apps/qgis-plugin/roadnet_tools/`。开发机�
 
 Raw trajectory、Parquet、中间文件、导出文件和模型权重属于 Runtime Data。开发/生产通过 `DATA_ROOT` 挂载到容器 `/data`，例如宿主机 `/data/road-network` 对应容器 `/data`；代码仓库不创建 `data/raw` 或 `data/parquet`。
 
-Pipeline 日志默认写入容器内 `/data/logs/<timestamp>_pid-<pid>_log.txt`，即宿主机 `${DATA_ROOT}/logs/`。每个进程使用独立文件；每个 stage 都记录带关联 run ID 的 `[stage-start]` 和 `[stage-finish]`，结束记录中的 `elapsed_s` 是单调时钟测得的阶段耗时。Fitting 另记录 `phase=fit_compute` 与 `phase=fit_persist` 的 `[stage-phase]`；Detect 会记录全局空间索引的 membership、overflow 和候选数量，用于区分计算、持久化和资源回退耗时。可用 `PIPELINE_LOG_DIR` 修改目录；仅在确实需要共享固定文件时设置 `PIPELINE_LOG_PATH`，且不要指向源码目录。
+`.env` 的目录配置均为宿主机路径，容器内目录由 Compose 固定，通过绑定挂载（bind mount）连接，不使用跨容器软链接。
+
+| 宿主机目录配置 | 默认宿主机目录 | Pipeline 容器内目录 |
+| --- | --- | --- |
+| `DATA_ROOT` | 开发环境 `/data/road-network`；生产环境必填 | `/data` |
+| `PARQUET_ROOT` | `${DATA_ROOT}/parquet` | `/data/parquet` |
+| `PIPELINE_LOG_DIR` | `${DATA_ROOT}/logs` | `/data/logs` |
+
+Pipeline 日志文件名为 `<timestamp>_pid-<pid>_log.txt`，每个进程使用独立文件；`PIPELINE_LOG_DIR` 可指向 `DATA_ROOT` 之外的宿主机目录。Compose 不再读取 `PIPELINE_LOG_PATH`。旧配置中若将 `PIPELINE_LOG_DIR` 写成容器路径 `/data/logs`，需删掉该项使用默认值，或改成所需宿主机目录。挂载变更对新建容器生效；常驻服务需重新创建容器，已有日志不会自动搬移。
+
+每个 stage 都记录带关联 run ID 的 `[stage-start]` 和 `[stage-finish]`，结束记录中的 `elapsed_s` 是单调时钟测得的阶段耗时。Fitting 另记录 `phase=fit_compute` 与 `phase=fit_persist` 的 `[stage-phase]`；Detect 会记录全局空间索引的 membership、overflow 和候选数量，用于区分计算、持久化和资源回退耗时。
 
 YOLO 模型在容器内挂载到 `/models`，输入和输出分别使用 `/data/vision/input` 与 `/data/vision/output`。本地迁移权重位于被 Git 忽略的 `models/yolo/yolov8n.pt`；生产环境必须通过外部 `MODEL_ROOT` 挂载。
 
@@ -74,18 +84,22 @@ Pipeline 的数据库配置优先读取进程中的来源兼容变量 `TRACK_PG_
 
 ## Pipeline 运行
 
-Schema v3 是破坏性切换，不提供旧数据迁移。首次切换必须先停止 Pipeline 写入，
-核对连接目标，然后显式全量重建：
+空库直接执行 `init-db`。已有 v3 数据库使用 `--migrate-refine` 保留数据升级。
+仅在明确需要丢弃旧业务结果时，停止 Pipeline 写入、核对连接目标后执行全量重建：
 
 ```sh
 docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm pipeline \
   python -m pipeline init-db --database roadnet --reset
 ```
 
-初始化器只创建 `track.v2` schema version 3。无 `--reset` 时，它只接受空库或
-已经标记为 v3 的数据库；检测到未版本化表、v1 或 v2 会立即失败。Pipeline 与
+初始化器创建 `track.v2` schema version 4。无迁移选项时，它只接受空库或
+已经标记为 v4 的数据库；v3 使用 `init-db --migrate-refine` 保留数据升级，
+检测到未版本化表、v1 或 v2 会失败。Pipeline 与
 Backend 启动时同样校验版本。`--reset` 会删除全部 Pipeline 业务数据，因此每次
 执行前都要核对输出的 database、user 与 schema。
+
+Refine 改名涉及数据库、CLI、配置和前后端字段；升级步骤、兼容入口与性能验证见
+[Refine 迁移与加速说明](docs/refine-migration-and-performance.md)。
 
 地图 Clip 请求的值语义也随之改变：仓内 Frontend 与 QGIS 插件已改传 `intersections.id`，仍传旧 `cluster_id` 的外部客户端必须同步升级。
 
@@ -98,19 +112,19 @@ docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm pipeline
   --processing-srid 32650
 ```
 
-输入使用 `--source-table` 或 `--clean-id` 二选一。来源表接受
+输入使用 `--source-table` 或 `--refine-id` 二选一。来源表接受
 `public.day01` 这类 schema-qualified 名称，并必须提供唯一非空的 `id` 以及
 `vehicle_id/timestamp/lon/lat/heading/speed/geom`；`extra` 可选。Pipeline 不再把
-CSV 当作运行入口，需要时先用独立 importer 导入 PostgreSQL。`--clean-id UUID`
-只复用已完成且来源指纹仍一致的 Clean Run，并始终创建新的 Detect Run；Detect
+CSV 当作运行入口，需要时先用独立 importer 导入 PostgreSQL。`--refine-id UUID`
+只复用已完成且来源指纹仍一致的 Refine Run，并始终创建新的 Detect Run；Detect
 完成后再创建 Fit Run。Pipeline 是独立批处理进程，不经由 Backend 请求启动。
 
-当前 Run lineage 为 `clean_runs → detect_runs → fit_runs`。Detect 的完整
+当前 Run lineage 为 `refine_runs → detect_runs → fit_runs`。Detect 的完整
 `resolved_subtrack_points` 序列与所有 Detect 子产物在一个最终事务中落盘；失败
 会回滚子表并单独标记 Run 为 `failed`。只有 completed Detect 可供 Clip/Replay
 消费。同一 Detect/Fit Run 不支持重复落库，重新计算应创建新 Run。
 
-`32650` 仅是北京所在 UTM 分区的命令示例，不是项目默认值。新 Clean Run 必须按完整数据范围明确选择米制投影；也可在自定义 `pipeline.toml` 的 `[projection]` 中配置。使用 `--clean-id UUID` 时会继承原 Run 的投影，不能覆盖。选择与迁移规则见 [Run 级投影上下文](docs/run-projection-context.md)。
+`32650` 仅是北京所在 UTM 分区的命令示例，不是项目默认值。新 Refine Run 必须按完整数据范围明确选择米制投影；也可在自定义 `pipeline.toml` 的 `[projection]` 中配置。使用 `--refine-id UUID` 时会继承原 Run 的投影，不能覆盖。选择与迁移规则见 [Run 级投影上下文](docs/run-projection-context.md)。
 
 ## 常用命令
 

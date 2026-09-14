@@ -9,7 +9,7 @@ import pytest
 from backend.map_api import PostgresMapStore, run_catalog
 
 
-CLEAN_ID = "12345678-1234-5678-1234-567812345670"
+REFINE_ID = "12345678-1234-5678-1234-567812345670"
 DETECT_ID = "12345678-1234-5678-1234-567812345671"
 FIT_ID = "12345678-1234-5678-1234-567812345672"
 POINT = {"type": "Point", "coordinates": [120.1, 30.2]}
@@ -27,10 +27,10 @@ class RunCatalogStore:
         assert "WHERE status = 'completed'" in sql
         if self.empty:
             return []
-        if "FROM clean_runs" in sql:
-            return [(CLEAN_ID, "2026-09-13T00:00:00+00:00")]
+        if "FROM refine_runs" in sql:
+            return [(REFINE_ID, "2026-09-13T00:00:00+00:00")]
         if "FROM detect_runs" in sql:
-            return [(DETECT_ID, CLEAN_ID, "2026-09-13T00:01:00+00:00")]
+            return [(DETECT_ID, REFINE_ID, "2026-09-13T00:01:00+00:00")]
         if "FROM fit_runs" in sql:
             return [(FIT_ID, DETECT_ID, "2026-09-13T00:02:00+00:00")]
         raise AssertionError(sql)
@@ -38,9 +38,9 @@ class RunCatalogStore:
 
 def test_run_catalog_keeps_frontend_linked_uuid_fields() -> None:
     result = run_catalog(store=RunCatalogStore())
-    assert set(result) == {"clean", "detect", "fit"}
-    assert result["clean"][0]["id"] == CLEAN_ID
-    assert result["detect"][0]["clean_id"] == CLEAN_ID
+    assert set(result) == {"refine", "detect", "fit"}
+    assert result["refine"][0]["id"] == REFINE_ID
+    assert result["detect"][0]["refine_id"] == REFINE_ID
     assert result["detect"][0]["id"] == DETECT_ID
     assert result["fit"][0]["detect_id"] == DETECT_ID
     assert result["fit"][0]["id"] == FIT_ID
@@ -49,7 +49,7 @@ def test_run_catalog_keeps_frontend_linked_uuid_fields() -> None:
 
 def test_rebuilt_empty_database_has_all_run_selector_arrays() -> None:
     assert run_catalog(store=RunCatalogStore(empty=True)) == {
-        "clean": [], "detect": [], "fit": [],
+        "refine": [], "detect": [], "fit": [],
     }
 
 

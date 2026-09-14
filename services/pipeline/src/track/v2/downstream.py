@@ -9,4 +9,4 @@ from .network import build_network
 
 
 def detect_intersections(active: TrajectorySourceHandle, *, config: Any) -> Any:
-    raise NotImplementedError("intersection detection is outside Parser 0 + Cleaner 1 scope")
+    raise NotImplementedError("intersection detection is outside Parser + Refine scope")

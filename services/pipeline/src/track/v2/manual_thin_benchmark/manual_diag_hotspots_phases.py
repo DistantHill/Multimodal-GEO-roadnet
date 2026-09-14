@@ -23,7 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from track.v2.intersect2 import (
+from track.v2.detect import (
     IntersectConfig,
     _compute_getis_ord_g_star,
     _getis_local_counts_grid,
@@ -196,7 +196,7 @@ def _main(args: argparse.Namespace) -> int:
     sidecar_path = result_dir / "real_turn_events_snapshot.json"
     compact_path = result_dir / "benchmark_compact.json"
     formal_path = Path(formal.__file__).resolve()
-    source_path = root / "track" / "v2" / "intersect2.py"
+    source_path = root / "track" / "v2" / "detect.py"
     lock_path = root / "uv.lock"
     required = (manifest_path, sidecar_path, compact_path, formal_path, source_path, lock_path)
     missing = [str(path) for path in required if not path.is_file()]

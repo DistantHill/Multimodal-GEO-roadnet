@@ -7,7 +7,7 @@ import pytest
 
 from track.v2.cli.replay import _target_from_args
 from track.v2.replay import (
-    CLEAN_REPLAY_KINDS,
+    REFINE_REPLAY_KINDS,
     DETECT_REPLAY_KINDS,
     PostgresReplayStore,
     ReplayService,
@@ -56,7 +56,7 @@ def test_replay_walks_v3_ids_and_stops_cycles() -> None:
 
 def test_source_point_supports_non_integer_external_key() -> None:
     store = _Store()
-    target = ReplayTarget("source_point", "92b9f2b4-key", clean_id="clean")
+    target = ReplayTarget("source_point", "92b9f2b4-key", refine_id="refine")
     store.rows[(target.kind, str(target.id))] = {"id": "92b9f2b4-key"}
 
     trace = ReplayService(store).replay(target)
@@ -131,18 +131,18 @@ def _parse_target(**values: object) -> ReplayTarget:
     namespace = SimpleNamespace(
         kind=values.get("kind"),
         id=values.get("id"),
-        clean_id=values.get("clean_id"),
+        refine_id=values.get("refine_id"),
         detect_id=values.get("detect_id"),
     )
     return _target_from_args(parser, namespace)
 
 
 def test_cli_scopes_external_and_internal_ids_explicitly() -> None:
-    assert "source_point" in CLEAN_REPLAY_KINDS
+    assert "source_point" in REFINE_REPLAY_KINDS
     assert "resolved_point" in DETECT_REPLAY_KINDS
     assert _parse_target(
-        kind="source_point", id="uuid-or-text", clean_id="clean"
-    ) == ReplayTarget("source_point", "uuid-or-text", clean_id="clean")
+        kind="source_point", id="uuid-or-text", refine_id="refine"
+    ) == ReplayTarget("source_point", "uuid-or-text", refine_id="refine")
     assert _parse_target(
         kind="resolved_point", id="42", detect_id="detect"
     ) == ReplayTarget("resolved_point", 42, detect_id="detect")

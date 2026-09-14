@@ -1,4 +1,4 @@
-"""Behavior tests for schema-v3 resolved-sequence clipping."""
+"""Behavior tests for schema-v4 resolved-sequence clipping."""
 
 from __future__ import annotations
 
@@ -237,24 +237,24 @@ class DetectClipLoadTest(unittest.TestCase):
     def test_completed_detect_loads_final_resolved_sequence(self) -> None:
         run = SimpleNamespace(
             status="completed",
-            clean_id="clean-1",
+            refine_id="refine-1",
             spatial_context=_CONTEXT,
         )
         tracks = (ClipTrack("v", "s", (_point(1, -10.0), _point(2, 10.0)), 1),)
         with (
             patch("track.v2.clip.fetch_detect_row", return_value=run),
-            patch("track.v2.clip.verify_clean_source_fingerprint") as verify,
+            patch("track.v2.clip.verify_refine_source_fingerprint") as verify,
             patch("track.v2.clip.fetch_intersections", return_value=[]),
             patch("track.v2.clip.fetch_resolved_clip_tracks", return_value=list(tracks)),
         ):
             result = extract_clips_for_detect(object(), "detect-1")
 
-        verify.assert_called_once_with(ANY, "clean-1")
+        verify.assert_called_once_with(ANY, "refine-1")
         self.assertEqual(result.detect_id, "detect-1")
         self.assertEqual(result.report.full_track_clips, 1)
 
     def test_incomplete_detect_is_rejected_before_child_queries(self) -> None:
-        run = SimpleNamespace(status="running", clean_id="clean-1")
+        run = SimpleNamespace(status="running", refine_id="refine-1")
         with (
             patch("track.v2.clip.fetch_detect_row", return_value=run),
             patch("track.v2.clip.fetch_intersections") as fetch,

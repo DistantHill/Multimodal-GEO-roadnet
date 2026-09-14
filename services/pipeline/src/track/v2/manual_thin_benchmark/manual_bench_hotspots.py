@@ -167,12 +167,12 @@ def _manifest_case_ids() -> list[str]:
 
 
 def _source_digest(source: Path) -> str:
-    return _sha256_bytes((source / "track" / "v2" / "intersect2.py").read_bytes())
+    return _sha256_bytes((source / "track" / "v2" / "detect.py").read_bytes())
 
 
 def _structural_memory_guard(source: Path) -> dict[str, Any]:
     """Fail closed if O(n) storage or the four-cells-per-axis bound disappears."""
-    text = (source / "track" / "v2" / "intersect2.py").read_text(encoding="utf-8")
+    text = (source / "track" / "v2" / "detect.py").read_text(encoding="utf-8")
     start = text.index("def _getis_local_counts_grid(")
     end = text.index("\ndef _select_hotspot_events(", start)
     grid = text[start:end]
@@ -224,7 +224,7 @@ def _child(source: Path, source_commit: str, lock_digest: str, expected_python: 
     if not _same_executable(sys.executable, expected_python):
         raise RuntimeError(f"child interpreter mismatch: {sys.executable} != {expected_python}")
     sys.path[:] = [str(source)] + [entry for entry in sys.path if entry not in ("", str(source))]
-    from track.v2.intersect2 import IntersectConfig, _compute_getis_ord_g_star, _select_hotspot_events
+    from track.v2.detect import IntersectConfig, _compute_getis_ord_g_star, _select_hotspot_events
     from track.v2.models import TurnEvent
 
     # Archived baselines use an older name for TurnEvent's first, transient
@@ -267,7 +267,7 @@ def _child(source: Path, source_commit: str, lock_digest: str, expected_python: 
             "peak_working_set_bytes": _peak_working_set_bytes(),
         }
     try:
-        from track.v2.intersect2 import _getis_local_counts_grid
+        from track.v2.detect import _getis_local_counts_grid
     except ImportError:
         _getis_local_counts_grid = None
     phase_timings: dict[str, float] | None = None
@@ -452,14 +452,14 @@ def _freeze_real_snapshot(
     """Freeze real TurnEvents through the project CSV source entrypoint."""
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
-    from track.v2.intersect2 import (
+    from track.v2.detect import (
         IntersectConfig,
         _detect_turn_events,
         _group_by_vehicle,
         _project_tracks,
     )
     from track.v2.models import ProjectionConfig
-    from track.v2.parser0 import CsvSource, get_database
+    from track.v2.parser import CsvSource, get_database
     from track.v2.projection import CoordinateTransformer, create_spatial_context
 
     raw = csv_path.read_bytes()

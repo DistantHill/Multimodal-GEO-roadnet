@@ -45,7 +45,7 @@ def peak_working_set() -> int:
 
 def child(manifest_path: Path) -> dict:
     start = time.perf_counter()
-    import track.v2.intersect2 as intersect2
+    import track.v2.detect as detect
     import track.v2._geometry as geometry
     from track.v2.models import PointRef, TrajectoryPoint
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -67,7 +67,7 @@ def child(manifest_path: Path) -> dict:
             TrajectoryPoint(PointRef("windows_gate_v1", f"{vehicle}-1", stable=True), vehicle, row * 2.0 + 1.0, b_lon, b_lat, segment["heading"], 10.0),
         ]
     return {"sys_executable": sys.executable, "python_version": sys.version, "wall_seconds": time.perf_counter() - start,
-            "peak_working_set_bytes": peak_working_set(), "source": {"intersect2": str(Path(intersect2.__file__).resolve()), "intersect2_sha256": digest(Path(intersect2.__file__)), "geometry": str(Path(geometry.__file__).resolve()), "geometry_sha256": digest(Path(geometry.__file__))},
+            "peak_working_set_bytes": peak_working_set(), "source": {"detect": str(Path(detect.__file__).resolve()), "detect_sha256": digest(Path(detect.__file__)), "geometry": str(Path(geometry.__file__).resolve()), "geometry_sha256": digest(Path(geometry.__file__))},
             "frozen_input": {"manifest_sha256": digest(manifest_path).upper(), "input_snapshot_sha256": manifest["input_snapshot_sha256"], "vehicles": len(tracks), "points": sum(map(len, tracks.values())), "algorithm_called": False}}
 
 

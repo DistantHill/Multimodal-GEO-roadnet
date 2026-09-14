@@ -1,7 +1,7 @@
 """Schema-v3 CLI for the database-backed track.v2 Pipeline.
 
 The implementation lives in :mod:`track.v2.pipeline`; this module provides
-the PostgreSQL ``source_table``/Clean replay entrypoint and reporting seam.
+the PostgreSQL ``source_table``/Refine replay entrypoint and reporting seam.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ def run_pipeline(
     db_config: PostgresConfig,
     *,
     source_table: str | None = None,
-    clean_id: str | None = None,
+    refine_id: str | None = None,
     config_path: str | Path | None = None,
     processing_srid: int | None = None,
 ) -> dict[str, float | int | str | list[int]]:
@@ -31,7 +31,7 @@ def run_pipeline(
     pipeline_input = PipelineInput(
         db_config=db_config,
         source_table=source_table,
-        clean_id=clean_id,
+        refine_id=refine_id,
         config_path=config_path,
         processing_srid=processing_srid,
     )
@@ -66,8 +66,8 @@ def main() -> int:
         help="从 PostgreSQL 表读取输入轨迹点 / Read input trajectory points from a PostgreSQL table."
     )
     source_group.add_argument(
-        "--clean-id", metavar="UUID", type=_uuid_arg,
-        help="复用一个已完成 Clean Run，只创建新的 Detect Run / Reuse one completed Clean Run."
+        "--refine-id", metavar="UUID", type=_uuid_arg,
+        help="复用一个已完成 Refine Run，只创建新的 Detect Run / Reuse one completed Refine Run."
     )
     parser.add_argument("--host", default=_env.host)
     parser.add_argument("--port", type=int, default=_env.port)
@@ -86,7 +86,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--processing-srid", type=int, default=None, metavar="EPSG",
-        help="本次新 Clean Run 的固定米制投影 EPSG / projected metre CRS for a new Clean Run.",
+        help="本次新 Refine Run 的固定米制投影 EPSG / projected metre CRS for a new Refine Run.",
     )
     parser.add_argument(
         "--stats-json",
@@ -97,10 +97,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.clean_id and args.processing_srid is not None:
+    if args.refine_id and args.processing_srid is not None:
         parser.error(
-            "--clean-id 继承已有投影，不可覆盖 --processing-srid / "
-            "a reused Clean Run inherits its projection"
+            "--refine-id 继承已有投影，不可覆盖 --processing-srid / "
+            "a reused Refine Run inherits its projection"
         )
 
     if args.ask_password:
@@ -119,7 +119,7 @@ def main() -> int:
     )
 
     source_label = (
-        f"clean:{args.clean_id}" if args.clean_id
+        f"refine:{args.refine_id}" if args.refine_id
         else f"postgresql://{db_config.database}/{args.source_table}"
     )
     log_path = init_logger()
@@ -131,7 +131,7 @@ def main() -> int:
         stats = run_pipeline(
             db_config,
             source_table=args.source_table,
-            clean_id=str(args.clean_id) if args.clean_id else None,
+            refine_id=str(args.refine_id) if args.refine_id else None,
             config_path=args.config,
             processing_srid=args.processing_srid,
         )

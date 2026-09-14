@@ -32,7 +32,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from track.v2.manual_thin_benchmark._thin_bench_helpers import connect_test_db, TEST_DB_NAME
-from track.v2.intersect2 import (
+from track.v2.detect import (
     IntersectConfig,
     _query_spatial_extent,
     _stream_vehicle_tracks_from_db,
@@ -270,7 +270,7 @@ def _print_diagnosis(stats, sample_turns, sample_rejects, verbose):
         print("  ** NO CANDIDATE WINDOWS CHECKED **")
         print("  所有轨迹都因长度不足被跳过，或数据集中根本没有足够多的点。")
         print("  可能原因：")
-        print("    1. 清洗阶段把所有长轨迹都切成了 <5 点的短段")
+        print("    1. 精炼阶段把所有长轨迹都切成了 <5 点的短段")
         print("    2. 数据集中车辆轨迹本身就极短")
         print("    3. 时间间隙切分 (max_gap_s) 过小导致过度切分")
         return
@@ -309,7 +309,7 @@ def _print_diagnosis(stats, sample_turns, sample_rejects, verbose):
     print(f"  ── 诊断建议 / Recommendations ──")
     if stats["too_short"] == total:
         print(f"  !! 全部 {total} 条轨迹点数均 < {2*2+1} → 无候选可选。")
-        print(f"  !! 检查 CleanerConfig.max_gap_s（默认 300s）是否切得太碎。")
+        print(f"  !! 检查 RefineConfig.max_gap_s（默认 300s）是否切得太碎。")
     elif stats["reject_in_leg"] > candidates * 0.5:
         print(f"  !! {stats['reject_in_leg']/candidates*100:.0f}% 候选因 in_leg < 35m 被拒。")
         print(f"  !! 可能原因：点太密（GPS 1Hz→w=2 时 2 点间距仅 ~10-30m）")
@@ -320,7 +320,7 @@ def _print_diagnosis(stats, sample_turns, sample_rejects, verbose):
         print(f"  !! 尝试：降低 min_turn_deg（如 30°）")
     elif stats["reject_speed"] > candidates * 0.5:
         print(f"  !! {stats['reject_speed']/candidates*100:.0f}% 候选因速度过低被拒。")
-        print(f"  !! 可能原因：城市拥堵数据或清洗后注入点速度=0")
+        print(f"  !! 可能原因：城市拥堵数据或精炼后注入点速度=0")
         print(f"  !! 尝试：降低 min_movement_speed_mps（如 0.5 m/s）")
     elif stats["accepted"] == 0:
         print(f"  !! 候选被多种条件分散拦截，无单一主导原因。")

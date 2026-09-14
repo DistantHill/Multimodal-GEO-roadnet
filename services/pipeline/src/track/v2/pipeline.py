@@ -1,6 +1,6 @@
 """Database-backed orchestration for the track.v2 pipeline.
 
-The pipeline entry point owns the existing Parser/Cleaner, Intersect2, Clip,
+The pipeline entry point owns the existing Parser/Refine, Detect, Clip,
 Fitting, and Network ordering and transaction boundaries.  The CLI delegates to
 this module and remains responsible only for command-line concerns.
 """
@@ -13,19 +13,19 @@ from pathlib import Path
 
 import psycopg
 
-from .cleaner import clean_vehicle
+from .refine import refine_vehicle
 from .config import PostgresConfig, connect as pg_connect
 from .config.pipeline_config import load_pipeline_config
 from .db.pipeline_store import PipelineStore, PostgresPipelineStore
-from .db.schema import require_schema_v3
+from .db.schema import require_schema_v4
 from .db.source_table import (
     calculate_source_fingerprint,
     source_order_query,
     validate_source_table,
-    verify_clean_source_fingerprint,  # compatibility seam; Detect owns invocation
+    verify_refine_source_fingerprint,  # compatibility seam; Detect owns invocation
 )
 from .fitting import fit_centerline_variants
-from .intersect2 import detect_intersections
+from .detect import detect_intersections
 from .logger import log_info
 from .models import (
     ClipResult,
@@ -38,10 +38,10 @@ from .models import (
     SpatialContext,
 )
 from .network import build_network
-from .parser0 import get_database
+from .parser import get_database
 from .pipeline_events import EventProgressAdapter, EventSink, PipelineEvent
 from .projection import CoordinateTransformer, create_spatial_context
-from .sources import StreamVehicleSource
+from .parser import StreamVehicleSource
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +50,7 @@ class PipelineInput:
 
     db_config: PostgresConfig
     source_table: str | None = None
-    clean_id: str | None = None
+    refine_id: str | None = None
     config_path: str | Path | None = None
     processing_srid: int | None = None
 
@@ -75,29 +75,29 @@ def run_pipeline(
     sink: EventSink = _noop_event_sink if emit is None else emit
     db_config = pipeline_input.db_config
     source_table = pipeline_input.source_table
-    clean_id = pipeline_input.clean_id
+    refine_id = pipeline_input.refine_id
     config_path = pipeline_input.config_path
 
     pc = load_pipeline_config(config_path)
 
-    if sum(value is not None for value in (source_table, clean_id)) != 1:
-        raise ValueError("exactly one of source_table or clean_id is required")
-    if clean_id is not None and pipeline_input.processing_srid is not None:
-        raise ValueError("a reused Clean Run inherits processing_srid and cannot override it")
+    if sum(value is not None for value in (source_table, refine_id)) != 1:
+        raise ValueError("exactly one of source_table or refine_id is required")
+    if refine_id is not None and pipeline_input.processing_srid is not None:
+        raise ValueError("a reused Refine Run inherits processing_srid and cannot override it")
 
     stats: dict[str, float | int | str | list[int]] = {}
     t_start = time.perf_counter()
-    reuse_clean = clean_id is not None
+    reuse_refine = refine_id is not None
 
     with pg_connect(db_config) as conn:
-        require_schema_v3(conn)
+        require_schema_v4(conn)
         store: PipelineStore = PostgresPipelineStore(conn)
-        if reuse_clean:
-            clean_record = store.get_clean_run(str(clean_id))
-            if clean_record.status != "completed":
-                raise ValueError(f"Clean Run {clean_id} is not completed")
-            source_table = clean_record.source_table
-            spatial_context = clean_record.spatial_context
+        if reuse_refine:
+            refine_record = store.get_refine_run(str(refine_id))
+            if refine_record.status != "completed":
+                raise ValueError(f"Refine Run {refine_id} is not completed")
+            source_table = refine_record.source_table
+            spatial_context = refine_record.spatial_context
         else:
             assert source_table is not None
             source_contract = validate_source_table(conn, source_table)
@@ -112,32 +112,32 @@ def run_pipeline(
                 pc.projection,
                 processing_srid=pipeline_input.processing_srid,
             )
-            clean_id = store.start_clean_run(
+            refine_id = store.start_refine_run(
                 source_table=source_table,
                 parameters={
-                    "cleaner_max_gap_s": pc.cleaner.max_gap_s,
+                    "refine_max_gap_s": pc.refine.max_gap_s,
                 },
                 spatial_context=spatial_context,
             )
             store.commit()
-        stats["clean_id"] = str(clean_id)
+        stats["refine_id"] = str(refine_id)
         stats["source_srid"] = spatial_context.source_srid
         stats["processing_srid"] = spatial_context.processing_srid
 
-        if reuse_clean:
+        if reuse_refine:
             total_raw = 0
             total_injected = 0
             total_excluded = 0
             total_kept = 0
         else:
-            assert clean_id is not None
+            assert refine_id is not None
             handle = None
             stream = None
             try:
-                clean_started = _log_stage_start("cleaner", clean_id=clean_id)
-                clean_stage = "Parser 0 + Cleaner 1: 流式读取&清洗 / Streaming read & clean"
-                live_clean = EventProgressAdapter(clean_stage, sink)
-                live_clean.start()
+                refine_started = _log_stage_start("refine", refine_id=refine_id)
+                refine_stage = "Parser + Refine: 流式读取&精炼 / Streaming read & refine"
+                live_refine = EventProgressAdapter(refine_stage, sink)
+                live_refine.start()
                 _emit_message(sink, f"  数据源 / Source: {source_label}")
                 handle = get_database(source, runtime=pc.runtime)
                 try:
@@ -180,9 +180,9 @@ def run_pipeline(
                             )
                         total_raw += len(vehicle_points)
                         vehicle_count += 1
-                        vresult = clean_vehicle(
+                        vresult = refine_vehicle(
                             vehicle_points,
-                            config=pc.cleaner,
+                            config=pc.refine,
                             spatial_context=spatial_context,
                             _transformer=run_transformer,
                         )
@@ -193,15 +193,15 @@ def run_pipeline(
                         _pending_point_count += len(vresult.excluded) + sum(
                             len(subtrack.points) for subtrack in vresult.subtracks
                         )
-                        if _should_flush_clean_batch(
+                        if _should_flush_refine_batch(
                             pending_excluded_count=len(_pending_excluded),
                             pending_point_count=_pending_point_count,
                             vehicle_count=vehicle_count,
                             runtime=pc.runtime,
                         ):
-                            subtrack_index, batch_kept = _flush_clean_batch(
+                            subtrack_index, batch_kept = _flush_refine_batch(
                                 store,
-                                clean_id=clean_id,
+                                refine_id=refine_id,
                                 pending_excluded=_pending_excluded,
                                 pending_subtracks=_pending_subtracks,
                                 subtrack_index=subtrack_index,
@@ -216,7 +216,7 @@ def run_pipeline(
                             elapsed = now - t_read
                             rate = total_raw / elapsed if elapsed > 0 else 0
                             pct = total_raw / total_rows if total_rows > 0 else 0
-                            live_clean.update(
+                            live_refine.update(
                                 progress=pct,
                                 detail=f"{total_raw:,}/{total_rows:,} 点, {vehicle_count:,} 车辆",
                                 elapsed=elapsed,
@@ -227,9 +227,9 @@ def run_pipeline(
                     if run_bounds is not None:
                         run_transformer.validate_bounds(run_bounds)
 
-                    subtrack_index, batch_kept = _flush_clean_batch(
+                    subtrack_index, batch_kept = _flush_refine_batch(
                         store,
-                        clean_id=clean_id,
+                        refine_id=refine_id,
                         pending_excluded=_pending_excluded,
                         pending_subtracks=_pending_subtracks,
                         subtrack_index=subtrack_index,
@@ -238,7 +238,7 @@ def run_pipeline(
                     )
                     total_kept += batch_kept
                     elapsed_read = time.perf_counter() - t_read
-                    live_clean.update(
+                    live_refine.update(
                         progress=1.0,
                         detail=f"{total_raw:,}/{total_rows:,} 点, {vehicle_count:,} 车辆",
                         elapsed=elapsed_read,
@@ -252,7 +252,7 @@ def run_pipeline(
 
                 _emit_message(
                     sink,
-                    f"  读取&清洗 / Read&Clean: {total_raw:,} 点/points, "
+                    f"  读取&精炼 / Read&Refine: {total_raw:,} 点/points, "
                     f"{vehicle_count:,} 车辆/vehicles ({elapsed_read:.1f}s)",
                 )
                 stats["source_points"] = total_raw
@@ -264,46 +264,46 @@ def run_pipeline(
                 _emit_message(sink, f"  injected_points: {total_injected:,} rows")
                 source_fingerprint = calculate_source_fingerprint(
                     conn,
-                    clean_id,
+                    refine_id,
                     source_contract,
                 )
-                store.finish_clean(
-                    clean_id,
+                store.finish_refine(
+                    refine_id,
                     status="completed",
                     source_fingerprint=source_fingerprint,
                 )
                 store.commit()
             except Exception:
                 store.rollback()
-                store.finish_clean(clean_id, status="failed")
+                store.finish_refine(refine_id, status="failed")
                 store.commit()
                 raise
 
-            clean_elapsed = _log_stage_finish(
-                "cleaner",
-                clean_started,
-                clean_id=clean_id,
+            refine_elapsed = _log_stage_finish(
+                "refine",
+                refine_started,
+                refine_id=refine_id,
             )
-            live_clean.stop(elapsed=clean_elapsed)
+            live_refine.stop(elapsed=refine_elapsed)
 
-        if reuse_clean:
+        if reuse_refine:
             _emit_message(sink, f"  排除 / Excluded: {total_excluded:,}")
             _emit_message(sink, f"  注入 / Injected: {total_injected:,}")
 
         detect_id = store.start_detect_run(
-            clean_id=clean_id,
+            refine_id=refine_id,
             parameters={},
         )
         stats["detect_id"] = detect_id
         store.commit()
 
         detect_stage = (
-            "Intersect2: 交叉口检测 / Intersection Detection "
+            "Detect: 交叉口检测 / Intersection Detection "
             "(单次加载 + 全局索引 / Shared workspace + global index)"
         )
         intersect_started = _log_stage_start(
-            "intersect2",
-            clean_id=clean_id,
+            "detect",
+            refine_id=refine_id,
             detect_id=detect_id,
         )
         live_intersect = EventProgressAdapter(detect_stage, sink)
@@ -314,7 +314,7 @@ def run_pipeline(
             db_table=source_table,
             kept_table="kept_trajectory_points",
             source_table=source_table,
-            clean_id=clean_id,
+            refine_id=refine_id,
             live_status=live_intersect,
         )
         detect_completed = False
@@ -331,7 +331,7 @@ def run_pipeline(
             store.rollback()
             stats["detect_compute_s"] = round(detect_compute_elapsed, 6)
             log_info(
-                "[stage-phase] stage=intersect2 phase=detect_compute "
+                "[stage-phase] stage=detect phase=detect_compute "
                 f"elapsed_s={detect_compute_elapsed:.3f}"
             )
             live_intersect.update(
@@ -367,7 +367,7 @@ def run_pipeline(
                 6,
             )
             log_info(
-                "[stage-phase] stage=intersect2 phase=detect_persist "
+                "[stage-phase] stage=detect phase=detect_persist "
                 f"elapsed_s={detect_persist_elapsed:.3f} "
                 "resolved_sequence_s="
                 f"{persisted_detect.resolved_sequence_elapsed_s:.3f}"
@@ -407,16 +407,16 @@ def run_pipeline(
                 store.commit()
             raise
         intersect_elapsed = _log_stage_finish(
-            "intersect2",
+            "detect",
             intersect_started,
-            clean_id=clean_id,
+            refine_id=refine_id,
             detect_id=detect_id,
         )
         live_intersect.stop(elapsed=intersect_elapsed)
 
         clip_started = _log_stage_start(
             "clip",
-            clean_id=clean_id,
+            refine_id=refine_id,
             detect_id=detect_id,
         )
         sink(PipelineEvent.stage_start("Clip: 路段切分 / Track clipping"))
@@ -432,7 +432,7 @@ def run_pipeline(
         clip_elapsed = _log_stage_finish(
             "clip",
             clip_started,
-            clean_id=clean_id,
+            refine_id=refine_id,
             detect_id=detect_id,
         )
         sink(
@@ -452,7 +452,7 @@ def run_pipeline(
         store.commit()
         fitting_started = _log_stage_start(
             "fitting",
-            clean_id=clean_id,
+            refine_id=refine_id,
             detect_id=detect_id,
             fit_id=fit_id,
         )
@@ -521,7 +521,7 @@ def run_pipeline(
         fitting_elapsed = _log_stage_finish(
             "fitting",
             fitting_started,
-            clean_id=clean_id,
+            refine_id=refine_id,
             detect_id=detect_id,
             fit_id=fit_id,
         )
@@ -534,7 +534,7 @@ def run_pipeline(
 
         network_started = _log_stage_start(
             "network",
-            clean_id=clean_id,
+            refine_id=refine_id,
             detect_id=detect_id,
             fit_id=fit_id,
         )
@@ -553,7 +553,7 @@ def run_pipeline(
         network_elapsed = _log_stage_finish(
             "network",
             network_started,
-            clean_id=clean_id,
+            refine_id=refine_id,
             detect_id=detect_id,
             fit_id=fit_id,
         )
@@ -572,19 +572,19 @@ def run_pipeline(
     return PipelineResult(stats=stats)
 
 
-def _flush_clean_batch(
+def _flush_refine_batch(
     store: PipelineStore,
     *,
-    clean_id: str,
+    refine_id: str,
     pending_excluded: list,
     pending_subtracks: list[RefinementSubtrack],
     subtrack_index: int,
     batch_size: int,
     spatial_context: SpatialContext,
 ) -> tuple[int, int]:
-    """Flush one batch of frozen Cleaner outputs."""
-    result = store.persist_clean_batch(
-        clean_id,
+    """Flush one batch of frozen Refine outputs."""
+    result = store.persist_refine_batch(
+        refine_id,
         pending_excluded,
         pending_subtracks,
         subtrack_index,
@@ -594,17 +594,17 @@ def _flush_clean_batch(
     return result.next_subtrack_index, result.kept_count
 
 
-def _should_flush_clean_batch(
+def _should_flush_refine_batch(
     *,
     pending_excluded_count: int,
     pending_point_count: int,
     vehicle_count: int,
     runtime: RuntimeConfig,
 ) -> bool:
-    """Bound Cleaner pending output between complete vehicle groups."""
+    """Bound Refine pending output between complete vehicle groups."""
     return (
         pending_excluded_count >= runtime.excluded_flush_threshold
-        or pending_point_count >= runtime.cleaner_flush_point_threshold
+        or pending_point_count >= runtime.refine_flush_point_threshold
         or vehicle_count % runtime.mark_flush_every_n == 0
     )
 

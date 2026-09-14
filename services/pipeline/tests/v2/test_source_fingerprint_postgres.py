@@ -48,11 +48,11 @@ def fingerprint_connection() -> Iterator[Any]:
                     extra jsonb
                 ) ON COMMIT DROP;
                 CREATE TEMP TABLE kept_trajectory_points (
-                    clean_id text NOT NULL,
+                    refine_id text NOT NULL,
                     source_row_key text COLLATE "C" NOT NULL
                 ) ON COMMIT DROP;
                 CREATE TEMP TABLE excluded_points (
-                    clean_id text NOT NULL,
+                    refine_id text NOT NULL,
                     source_row_key text COLLATE "C" NOT NULL
                 ) ON COMMIT DROP;
                 INSERT INTO pg_temp.fingerprint_source VALUES
@@ -60,9 +60,9 @@ def fingerprint_connection() -> Iterator[Any]:
                     (10, 'truck', 10, 120, 30, 90, 2, NULL),
                     (99, 'unreferenced', 99, 100, 20, 0, 1, '{}');
                 INSERT INTO pg_temp.kept_trajectory_points VALUES
-                    ('clean-1', '2'), ('clean-1', '2'), ('other-clean', '99');
+                    ('refine-1', '2'), ('refine-1', '2'), ('other-refine', '99');
                 INSERT INTO pg_temp.excluded_points VALUES
-                    ('clean-1', '2'), ('clean-1', '10')
+                    ('refine-1', '2'), ('refine-1', '10')
             """)
             yield conn
         finally:
@@ -73,7 +73,7 @@ def fingerprint_connection() -> Iterator[Any]:
 
 def _expected_fingerprint() -> dict[str, object]:
     # Independent literal v1 encoding: text-key order is "10", then "2".
-    # Duplicate references must count once; another Clean's row is excluded.
+    # Duplicate references must count once; another Refine's row is excluded.
     records = (
         '{"extra":{},"heading":90.0,"lat":30.0,"lon":120.0,'
         '"source_row_key":"10","speed":2.0,"timestamp":10.0,"vehicle_id":"truck"}',
@@ -107,14 +107,14 @@ def test_postgres_fingerprint_v1_scope_fetch_size_and_cursor_lifetime(
     fingerprint_connection: Any,
 ) -> None:
     conn = fingerprint_connection
-    first = calculate_source_fingerprint(conn, "clean-1", _CONTRACT, fetch_size=1)
+    first = calculate_source_fingerprint(conn, "refine-1", _CONTRACT, fetch_size=1)
     _assert_caller_transaction_is_intact(conn)
-    second = calculate_source_fingerprint(conn, "clean-1", _CONTRACT, fetch_size=2)
+    second = calculate_source_fingerprint(conn, "refine-1", _CONTRACT, fetch_size=2)
     _assert_caller_transaction_is_intact(conn)
     assert first == second == _expected_fingerprint()
 
     conn.execute("UPDATE pg_temp.fingerprint_source SET speed = 123 WHERE id = 99")
-    assert calculate_source_fingerprint(conn, "clean-1", _CONTRACT, fetch_size=1) == first
+    assert calculate_source_fingerprint(conn, "refine-1", _CONTRACT, fetch_size=1) == first
     _assert_caller_transaction_is_intact(conn)
     # Also check that the function did not undo the caller's pending change.
     assert conn.execute(
@@ -122,7 +122,7 @@ def test_postgres_fingerprint_v1_scope_fetch_size_and_cursor_lifetime(
     ).fetchone() == (123.0,)
 
     conn.execute("UPDATE pg_temp.fingerprint_source SET speed = 7 WHERE id = 10")
-    changed = calculate_source_fingerprint(conn, "clean-1", _CONTRACT, fetch_size=2)
+    changed = calculate_source_fingerprint(conn, "refine-1", _CONTRACT, fetch_size=2)
     assert changed["version"] == 1
     assert changed["row_count"] == 2
     assert changed["sha256"] != first["sha256"]
@@ -134,10 +134,10 @@ def test_postgres_missing_reference_closes_cursor_without_aborting_transaction(
 ) -> None:
     conn = fingerprint_connection
     conn.execute(
-        "INSERT INTO pg_temp.excluded_points VALUES ('clean-1', '404')"
+        "INSERT INTO pg_temp.excluded_points VALUES ('refine-1', '404')"
     )
     with pytest.raises(ValueError, match="references missing source row '404'"):
-        calculate_source_fingerprint(conn, "clean-1", _CONTRACT, fetch_size=1)
+        calculate_source_fingerprint(conn, "refine-1", _CONTRACT, fetch_size=1)
     _assert_caller_transaction_is_intact(conn)
     assert conn.execute(
         "SELECT count(*) FROM pg_temp.excluded_points WHERE source_row_key = '404'"
@@ -146,7 +146,7 @@ def test_postgres_missing_reference_closes_cursor_without_aborting_transaction(
     # Recovery is the caller's choice; a Python validation error must not leave
     # PostgreSQL INERROR or silently roll back earlier work in this transaction.
     conn.execute("DELETE FROM pg_temp.excluded_points WHERE source_row_key = '404'")
-    recovered = calculate_source_fingerprint(conn, "clean-1", _CONTRACT, fetch_size=2)
+    recovered = calculate_source_fingerprint(conn, "refine-1", _CONTRACT, fetch_size=2)
     assert recovered == _expected_fingerprint()
     _assert_caller_transaction_is_intact(conn)
 
@@ -163,13 +163,13 @@ def test_postgres_input_fingerprint_includes_unreferenced_rows_and_preserves_v1(
     assert first["key_sql_type"] == "bigint"
     assert first["row_count"] == 3
     _assert_caller_transaction_is_intact(conn)
-    assert calculate_source_fingerprint(conn, "clean-1", _CONTRACT) == _expected_fingerprint()
+    assert calculate_source_fingerprint(conn, "refine-1", _CONTRACT) == _expected_fingerprint()
 
     conn.execute("UPDATE pg_temp.fingerprint_source SET speed = 123 WHERE id = 99")
     changed = calculate_input_fingerprint(conn, _CONTRACT, fetch_size=1)
     assert changed["sha256"] != first["sha256"]
     assert changed["row_count"] == 3
-    assert calculate_source_fingerprint(conn, "clean-1", _CONTRACT) == _expected_fingerprint()
+    assert calculate_source_fingerprint(conn, "refine-1", _CONTRACT) == _expected_fingerprint()
     _assert_caller_transaction_is_intact(conn)
     assert conn.execute(
         "SELECT speed FROM pg_temp.fingerprint_source WHERE id = 99"
@@ -244,5 +244,5 @@ def test_postgres_input_null_vehicle_cannot_collide_with_valid_text(
     conn.execute("UPDATE pg_temp.fingerprint_source SET vehicle_id = 'None' WHERE id = 99")
     text_fingerprint = calculate_input_fingerprint(conn, _CONTRACT, fetch_size=1)
     assert null_fingerprint["sha256"] != text_fingerprint["sha256"]
-    assert calculate_source_fingerprint(conn, "clean-1", _CONTRACT) == _expected_fingerprint()
+    assert calculate_source_fingerprint(conn, "refine-1", _CONTRACT) == _expected_fingerprint()
     _assert_caller_transaction_is_intact(conn)

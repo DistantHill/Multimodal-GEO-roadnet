@@ -31,7 +31,7 @@ class FakeLiveStatus:
 class PipelineEventTest(unittest.TestCase):
     def test_events_are_frozen_and_typed(self) -> None:
         event = PipelineEvent.stage_progress(
-            "clean",
+            "refine",
             progress=0.5,
             detail="10/20 points",
             elapsed=1.2,
@@ -39,7 +39,7 @@ class PipelineEventTest(unittest.TestCase):
         )
 
         self.assertEqual(event.kind, PipelineEventKind.STAGE_PROGRESS)
-        self.assertEqual(event.stage, "clean")
+        self.assertEqual(event.stage, "refine")
         self.assertEqual(event.progress, 0.5)
         self.assertEqual(event.detail, "10/20 points")
         self.assertEqual(event.elapsed, 1.2)
@@ -117,10 +117,10 @@ class PipelineReporterTest(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_single_stage_lifecycle_updates_and_finishes(self) -> None:
-        self.reporter.emit(PipelineEvent.stage_start("clean"))
+        self.reporter.emit(PipelineEvent.stage_start("refine"))
         self.reporter.emit(
             PipelineEvent.stage_progress(
-                "clean",
+                "refine",
                 progress=0.5,
                 detail="10/20 points",
                 sub_detail="vehicle 2",
@@ -130,65 +130,65 @@ class PipelineReporterTest(unittest.TestCase):
         )
         self.reporter.emit(
             PipelineEvent.stage_finish(
-                "clean",
+                "refine",
                 progress=1.0,
                 detail="20/20 points",
                 elapsed=2.5,
             )
         )
 
-        self.assertEqual(self.outputs, ["\n── clean ──"])
+        self.assertEqual(self.outputs, ["\n── refine ──"])
         self.assertEqual(
             self.calls,
             [
-                ("start", "clean"),
+                ("start", "refine"),
                 (
                     "update",
-                    "clean",
+                    "refine",
                     {
                         "progress": 0.5,
                         "detail": "10/20 points",
                         "sub_detail": "vehicle 2",
                         "elapsed": 1.25,
                         "throughput": "8 points/s",
-                        "stage": "clean",
+                        "stage": "refine",
                     },
                 ),
                 (
                     "update",
-                    "clean",
+                    "refine",
                     {
                         "progress": 1.0,
                         "detail": "20/20 points",
                         "sub_detail": "",
                         "elapsed": 2.5,
                         "throughput": "",
-                        "stage": "clean",
+                        "stage": "refine",
                     },
                 ),
-                ("stop", "clean"),
+                ("stop", "refine"),
             ],
         )
 
     def test_stage_switch_stops_old_panel_before_starting_new_one(self) -> None:
-        self.reporter.emit(PipelineEvent.stage_start("clean"))
+        self.reporter.emit(PipelineEvent.stage_start("refine"))
         self.reporter.emit(PipelineEvent.stage_start("detect"))
 
-        self.assertEqual(self.outputs, ["\n── clean ──", "\n── detect ──"])
+        self.assertEqual(self.outputs, ["\n── refine ──", "\n── detect ──"])
         self.assertEqual(
             self.calls,
             [
-                ("start", "clean"),
-                ("stop", "clean"),
+                ("start", "refine"),
+                ("stop", "refine"),
                 ("start", "detect"),
             ],
         )
 
     def test_close_is_idempotent_and_stop_errors_propagate(self) -> None:
-        self.reporter.emit(PipelineEvent.stage_start("clean"))
+        self.reporter.emit(PipelineEvent.stage_start("refine"))
         self.reporter.close()
         self.reporter.close()
-        self.assertEqual(self.calls, [("start", "clean"), ("stop", "clean")])
+        self.assertEqual(self.calls, [("start", "refine"), ("stop", "refine")])
 
         class FailingStatus(FakeLiveStatus):
             def stop(self) -> None:
@@ -205,24 +205,24 @@ class PipelineReporterTest(unittest.TestCase):
 
     def test_progress_without_stage_fails_fast(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "without an active stage"):
-            self.reporter.emit(PipelineEvent.stage_progress("clean", progress=0.5))
+            self.reporter.emit(PipelineEvent.stage_progress("refine", progress=0.5))
 
     def test_finish_stops_panel_when_final_update_fails(self) -> None:
         class FailingUpdateStatus(FakeLiveStatus):
             def update(self, **kwargs: object) -> None:
                 raise RuntimeError("update failed")
 
-        status = FailingUpdateStatus("clean", self.calls)
+        status = FailingUpdateStatus("refine", self.calls)
         reporter = PipelineReporter(
             live_status_factory=lambda _stage: status,
             output=self.outputs.append,
         )
-        reporter.emit(PipelineEvent.stage_start("clean"))
+        reporter.emit(PipelineEvent.stage_start("refine"))
 
         with self.assertRaisesRegex(RuntimeError, "update failed"):
-            reporter.emit(PipelineEvent.stage_finish("clean", progress=1.0))
+            reporter.emit(PipelineEvent.stage_finish("refine", progress=1.0))
 
-        self.assertEqual(self.calls, [("start", "clean"), ("stop", "clean")])
+        self.assertEqual(self.calls, [("start", "refine"), ("stop", "refine")])
 
 
 if __name__ == "__main__":

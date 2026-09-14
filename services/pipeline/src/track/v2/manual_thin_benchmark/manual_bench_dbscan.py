@@ -92,8 +92,8 @@ def _sha256_path(path: Path) -> str:
 
 def _dirty_digest(worktree: Path) -> str:
     """Bind measurements to both tracked and untracked implementation bytes."""
-    tracked = subprocess.run(["git", "diff", "--binary", "HEAD", "--", "track/v2/intersect2.py"], cwd=worktree, capture_output=True, check=True).stdout
-    return _sha256_bytes(tracked + (worktree / "track/v2/intersect2.py").read_bytes())
+    tracked = subprocess.run(["git", "diff", "--binary", "HEAD", "--", "track/v2/detect.py"], cwd=worktree, capture_output=True, check=True).stdout
+    return _sha256_bytes(tracked + (worktree / "track/v2/detect.py").read_bytes())
 
 
 def _gate_manifest(case: Case) -> dict[str, object]:
@@ -113,9 +113,9 @@ _CHILD = r'''
 import ctypes, ctypes.wintypes, hashlib, json, os, sys, time, io, contextlib
 from dataclasses import asdict, fields
 from pathlib import Path
-from track.v2.intersect2 import _cluster_dbscan, _neighbors_indices, _run_dbscan
+from track.v2.detect import _cluster_dbscan, _neighbors_indices, _run_dbscan
 try:
-    from track.v2.intersect2 import _build_dbscan_grid, _grid_neighbors_indices
+    from track.v2.detect import _build_dbscan_grid, _grid_neighbors_indices
 except ImportError:
     _build_dbscan_grid = _grid_neighbors_indices = None
 from track.v2.models import PointRef, TurnEvent
@@ -172,7 +172,7 @@ else:
         for _ in range(repeats):
             labels=_run_dbscan(request["xs"], request["ys"], eps_m=request["eps_m"], min_samples=request["min_samples"])
 wall=time.perf_counter()-t0
-digest=hashlib.sha256((tree / "track/v2/intersect2.py").read_bytes()).hexdigest()
+digest=hashlib.sha256((tree / "track/v2/detect.py").read_bytes()).hexdigest()
 print(json.dumps({"labels": labels, "wall_s": wall, "per_call_wall_s": wall / request.get("repeats", 1), "repeats": request.get("repeats", 1), "peak_working_set_size": peak_working_set_size(), "source_tree": str(tree), "source_digest": digest, "sys_executable": sys.executable, "sys_version": sys.version, "source_commit": request["source_commit"], "lock_digest": request["lock_digest"], "diagnostic": diagnostic}, separators=(",", ":")))
 '''
 
@@ -270,7 +270,7 @@ def main() -> int:
         "frozen_manifest_sha256": _sha256_path(frozen_manifest_path),
         "input_sha256": manifest["input_sha256"], "lock_digest": lock_digest,
         "generator_contract": GATE_CONTRACT,
-        "harness_digest": _sha256_path(Path(__file__)), "optimized_source_digest": _sha256_path(worktree / "track/v2/intersect2.py"),
+        "harness_digest": _sha256_path(Path(__file__)), "optimized_source_digest": _sha256_path(worktree / "track/v2/detect.py"),
         "optimized_dirty_digest": _dirty_digest(worktree), "interpreter": sys.executable,
         "python_version": sys.version, "warmups": args.warmups, "runs": args.runs,
         "alternate": args.alternate, "rss": args.rss,

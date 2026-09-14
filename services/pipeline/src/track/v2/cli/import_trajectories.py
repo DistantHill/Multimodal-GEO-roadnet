@@ -1,9 +1,9 @@
 """Import CSV trajectory data into the ``trajectory_points`` table.
 
-ZH: 独立的 CSV → trajectory_points 导入 CLI。只做 Parser 0 解析 + 入库，
-    不运行后续清洗/交叉口检测阶段。
+ZH: 独立的 CSV → trajectory_points 导入 CLI。只做 Parser 解析 + 入库，
+    不运行后续精炼/交叉口检测阶段。
 
-EN: Standalone CSV → trajectory_points import CLI. Runs only Parser 0 parsing +
+EN: Standalone CSV → trajectory_points import CLI. Runs only Parser parsing +
     insert, without downstream cleaning/intersection stages.
 
 Usage / 用法::
@@ -80,7 +80,7 @@ def main() -> int:
     try:
         t_start = time.perf_counter()
 
-        # ── Parser 0: read CSV ──
+        # ── Parser: read CSV ──
         source = CsvSource(path=args.csv)
         handle = get_database(source, runtime=pc.runtime)
 

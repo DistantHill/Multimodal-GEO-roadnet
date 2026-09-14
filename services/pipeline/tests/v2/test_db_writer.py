@@ -5,18 +5,18 @@ from dataclasses import replace
 import pytest
 
 from track.v2.db_writer import (
-    _CleanMember,
+    _RefineMember,
     _build_resolved_rows,
-    _clean_key,
-    finish_clean_run,
+    _refine_key,
+    finish_refine_run,
 )
-from track.v2.models import CleanedPointRef, CrossingPoint, HotspotCluster, PointRef
+from track.v2.models import RefinedPointRef, CrossingPoint, HotspotCluster, PointRef
 
 
 def _crossing(
     calculation_index: int,
     *,
-    segment_start: CleanedPointRef,
+    segment_start: RefinedPointRef,
     fraction: float,
     is_entry: bool,
 ) -> CrossingPoint:
@@ -37,10 +37,10 @@ def _crossing(
     )
 
 
-def test_resolved_rows_order_four_crossings_on_one_cleaned_segment() -> None:
-    start = CleanedPointRef("kept", 101, 1, 0)
-    end = CleanedPointRef("kept", 102, 1, 1)
-    members = [_CleanMember(start, "v1"), _CleanMember(end, "v1")]
+def test_resolved_rows_order_four_crossings_on_one_refined_segment() -> None:
+    start = RefinedPointRef("kept", 101, 1, 0)
+    end = RefinedPointRef("kept", 102, 1, 1)
+    members = [_RefineMember(start, "v1"), _RefineMember(end, "v1")]
     cluster_a = HotspotCluster(0, 0, 0, 0, 0, 1)
     cluster_b = replace(cluster_a, cluster_calculate_index=1)
     crossings = [
@@ -67,12 +67,12 @@ def test_resolved_rows_order_four_crossings_on_one_cleaned_segment() -> None:
 
 
 def test_resolved_rows_place_t1_before_endpoint_and_t0_after_start() -> None:
-    start = CleanedPointRef("kept", 1, 7, 0)
-    end = CleanedPointRef("kept", 2, 7, 1)
+    start = RefinedPointRef("kept", 1, 7, 0)
+    end = RefinedPointRef("kept", 2, 7, 1)
     cluster = HotspotCluster(0, 0, 0, 0, 0, 1)
     rows = _build_resolved_rows(
         "detect",
-        [_CleanMember(start, "v"), _CleanMember(end, "v")],
+        [_RefineMember(start, "v"), _RefineMember(end, "v")],
         (10, 11),
         [
             (cluster, _crossing(0, segment_start=start, fraction=0.0, is_entry=True)),
@@ -86,12 +86,12 @@ def test_resolved_rows_place_t1_before_endpoint_and_t0_after_start() -> None:
 
 
 def test_same_progress_crossings_sort_exit_before_entry() -> None:
-    start = CleanedPointRef("kept", 1, 1, 0)
-    end = CleanedPointRef("kept", 2, 1, 1)
+    start = RefinedPointRef("kept", 1, 1, 0)
+    end = RefinedPointRef("kept", 2, 1, 1)
     base = HotspotCluster(0, 0, 0, 0, 0, 1)
     rows = _build_resolved_rows(
         "detect",
-        [_CleanMember(start, "v"), _CleanMember(end, "v")],
+        [_RefineMember(start, "v"), _RefineMember(end, "v")],
         (1, 2),
         [
             (replace(base, cluster_calculate_index=1), _crossing(0, segment_start=start, fraction=0.5, is_entry=True)),
@@ -104,12 +104,12 @@ def test_same_progress_crossings_sort_exit_before_entry() -> None:
     assert [row[7] for row in rows] == [None, 30, 31, None]
 
 
-def test_clean_key_uses_stable_internal_identity_not_sequence() -> None:
-    left = CleanedPointRef("injected", 8, 4, 2)
-    right = replace(left, cleaned_sequence_in_subtrack=99)
-    assert _clean_key(left) == _clean_key(right) == ("injected", 8, 4)
+def test_refine_key_uses_stable_internal_identity_not_sequence() -> None:
+    left = RefinedPointRef("injected", 8, 4, 2)
+    right = replace(left, refined_sequence_in_subtrack=99)
+    assert _refine_key(left) == _refine_key(right) == ("injected", 8, 4)
 
 
-def test_completed_clean_requires_a_source_fingerprint() -> None:
+def test_completed_refine_requires_a_source_fingerprint() -> None:
     with pytest.raises(ValueError, match="requires source_fingerprint"):
-        finish_clean_run(object(), "clean", status="completed")
+        finish_refine_run(object(), "refine", status="completed")

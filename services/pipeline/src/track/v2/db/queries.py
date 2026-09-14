@@ -1,7 +1,7 @@
 """Database queries for Pipeline intersection, Clip, and Replay stages.
 
 This module owns SQL builders, DB execution, row materialization, spatial-window
-iteration, and persisted Clean/Detect Run reads. Business modules import query
+iteration, and persisted Refine/Detect Run reads. Business modules import query
 operations from this single infrastructure boundary.
 """
 
@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from ..models import (
-    CleanedPointRef,
+    RefinedPointRef,
     ClipIntersection,
     ClipTrack,
     HotspotCluster,
@@ -38,7 +38,7 @@ from .source_table import quote_table_name, validate_source_table
 # Column select fragments
 # ═══════════════════════════════════════════════════════════════════════
 # Source rows and injected points are mapped into one p/i row shape.  Parent
-# source pairs were removed in v3: order is the stable Clean sequence contract.
+# source pairs were removed in v3: order is the stable Refine sequence contract.
 
 _IP_UNIFIED_COLS = (
     "vehicle_id, timestamp, lon, lat, heading, speed, "
@@ -70,10 +70,10 @@ def _tp_unified_cols(processing_srid: int, *, alias: str = "") -> str:
 # Row mapping helper
 # ═══════════════════════════════════════════════════════════════════════
 def row_to_dict(row: Any) -> dict[str, Any]:
-    """Convert a DB cursor row (unified schema-v3 p/i format) to a dict.
+    """Convert a DB cursor row (unified schema-v4 p/i format) to a dict.
 
     ZH: 将统一 14 列格式的 DB 游标行转为 dict。
-        替代 intersect2.py 中重复的 ``rows.append({...})``。
+        替代 detect.py 中重复的 ``rows.append({...})``。
     """
     return {
         "vehicle_id": row[0],
@@ -101,7 +101,7 @@ def row_to_dict(row: Any) -> dict[str, Any]:
 def build_spatial_extent_sql(
     table: str = "trajectory_points",
     *,
-    has_clean_id: bool = False,
+    has_refine_id: bool = False,
     kept_table: str | None = None,
     spatial_context: SpatialContext,
     source_key_sql_type: str = "bigint",
@@ -109,18 +109,18 @@ def build_spatial_extent_sql(
     """MIN/MAX processing-CRS x/y of active points.
 
     ZH: 查询 active points 的空间范围 (lon_min, lat_min, lon_max, lat_max)。
-        ``kept_table`` 非空时 JOIN 清洗结果表（几何列取自 ``table``），
-        按 ``ktp.clean_id`` 只读本次 Clean Run 的 kept 结果。
-    EN: When ``kept_table`` is set, JOIN the clean-result table against
-        ``table`` for the geometry columns, filtered by ``ktp.clean_id``.
+        ``kept_table`` 非空时 JOIN 精炼结果表（几何列取自 ``table``），
+        按 ``ktp.refine_id`` 只读本次 Refine Run 的 kept 结果。
+    EN: When ``kept_table`` is set, JOIN the refine-result table against
+        ``table`` for the geometry columns, filtered by ``ktp.refine_id``.
 
     Parameter placeholders (in order, caller must bind):
         Kept mode only:
-            1. %s — ktp.clean_id
-            2. %s — injected_points.clean_id
+            1. %s — ktp.refine_id
+            2. %s — injected_points.refine_id
     """
-    if has_clean_id and kept_table is None:
-        raise ValueError("clean_id requires kept_table for complete Run isolation")
+    if has_refine_id and kept_table is None:
+        raise ValueError("refine_id requires kept_table for complete Run isolation")
     processing_srid = int(spatial_context.processing_srid)
     if kept_table is not None:
         return (
@@ -130,10 +130,10 @@ def build_spatial_extent_sql(
             f"  FROM {kept_table} AS ktp "
             f"  JOIN {table} AS tp "
             f"    ON tp.id = ktp.source_row_key::{source_key_sql_type} "
-            f"  WHERE ktp.clean_id = %s "
+            f"  WHERE ktp.refine_id = %s "
             "  UNION ALL "
             "  SELECT ip.x, ip.y FROM injected_points AS ip "
-            "  WHERE ip.clean_id = %s"
+            "  WHERE ip.refine_id = %s"
             ") AS projected_points"
         )
     raw_extent = (
@@ -149,7 +149,7 @@ def build_spatial_extent_sql(
 def build_active_in_window_sql(
     table: str = "trajectory_points",
     *,
-    has_clean_id: bool = False,
+    has_refine_id: bool = False,
     kept_table: str | None = None,
     spatial_context: SpatialContext,
     query_srid: int,
@@ -162,32 +162,32 @@ def build_active_in_window_sql(
         原始 Point 先以 4326 ``geom`` bbox 使用现有 GiST 粗筛，再以
         ``ST_Transform(geom, query_srid)`` 做数值闭区间精确判断；
         若该查询成为热点，可为同一固定转换建立匹配的函数 GiST 索引。
-        ``kept_table`` 非空时，trajectory 分支改为 JOIN 清洗结果表
+        ``kept_table`` 非空时，trajectory 分支改为 JOIN 精炼结果表
         (``kept_table`` 存 vehicle_id/subtrack 切分，几何列取自 ``table``)，
-        且 ``ktp.clean_id`` 必填，只读本次 Clean Run 的 kept 结果。
+        且 ``ktp.refine_id`` 必填，只读本次 Refine Run 的 kept 结果。
 
-    EN: When ``kept_table`` is set, the trajectory branch JOINs the clean-result
+    EN: When ``kept_table`` is set, the trajectory branch JOINs the refine-result
         table (which carries the _seg-suffixed vehicle_id / subtrack splits)
-        against ``table`` for geometry columns, filtered by ``ktp.clean_id``.
+        against ``table`` for geometry columns, filtered by ``ktp.refine_id``.
 
     Parameter placeholders (in order, caller must bind):
-        Raw mode without ``clean_id``:
+        Raw mode without ``refine_id``:
             1.  %s::text                         — source_id literal
             2-5. source ST_MakeEnvelope          — lon_min, lat_min, lon_max, lat_max
             6-9. query-CRS numeric bounds        — x_min, y_min, x_max, y_max
             injected_points are deliberately excluded because their x/y CRS
-            cannot be identified without the owning Clean Run.
+            cannot be identified without the owning Refine Run.
         Kept mode (``kept_table`` set):
-            1.  %s                              — ktp.clean_id
+            1.  %s                              — ktp.refine_id
             2-5. raw source ST_MakeEnvelope      — lon_min, lat_min, lon_max, lat_max
             6-9. raw query-CRS numeric bounds    — x_min, y_min, x_max, y_max
             10. %s::text                         — canonical injected source ID
             11-14. injected source envelope      — lon_min, lat_min, lon_max, lat_max
             15-18. injected query-CRS bounds     — x_min, y_min, x_max, y_max
-            19. %s                               — injected_points.clean_id
+            19. %s                               — injected_points.refine_id
     """
-    if has_clean_id and kept_table is None:
-        raise ValueError("clean_id requires kept_table for complete Run isolation")
+    if has_refine_id and kept_table is None:
+        raise ValueError("refine_id requires kept_table for complete Run isolation")
     processing_srid = int(spatial_context.processing_srid)
     selected_query_srid = int(query_srid)
     source_envelope = "ST_MakeEnvelope(%s, %s, %s, %s, 4326)"
@@ -218,14 +218,14 @@ def build_active_in_window_sql(
             f"  FROM {kept_table} AS ktp "
             f"  JOIN {table} AS tp "
             f"    ON tp.id = ktp.source_row_key::{source_key_sql_type} "
-            f"  WHERE ktp.clean_id = %s "
+            f"  WHERE ktp.refine_id = %s "
             f"    AND tp.geom && {source_envelope} "
             f"    AND {tp_window} "
             f"  UNION ALL "
             f"  SELECT {_IP_UNIFIED_COLS} "
             f"  FROM injected_points "
             f"  WHERE geom && {source_envelope} "
-            f"    AND {injected_window} AND clean_id = %s "
+            f"    AND {injected_window} AND refine_id = %s "
             f") AS combined "
             f"ORDER BY subtrack_index, anchor_sequence, point_kind, row_id"
         )
@@ -244,35 +244,35 @@ def build_active_in_window_sql(
 def build_stream_all_sql(
     table: str = "trajectory_points",
     *,
-    has_clean_id: bool = False,
+    has_refine_id: bool = False,
     kept_table: str | None = None,
     spatial_context: SpatialContext,
     source_key_sql_type: str = "bigint",
     source_has_extra: bool = True,
 ) -> str:
-    """Stream raw or one Clean Run's kept + injected points without a bbox.
+    """Stream raw or one Refine Run's kept + injected points without a bbox.
 
-    ZH: 全量来源点，或指定 Clean Run 的 kept + injected UNION ALL 查询。
+    ZH: 全量来源点，或指定 Refine Run 的 kept + injected UNION ALL 查询。
         用于 server-side named cursor 逐车流式读取。
-        未提供 ``clean_id`` 时不读取 injected_points，避免混入其它 Run。
-        ``kept_table`` 非空时，trajectory 分支改为 JOIN 清洗结果表
+        未提供 ``refine_id`` 时不读取 injected_points，避免混入其它 Run。
+        ``kept_table`` 非空时，trajectory 分支改为 JOIN 精炼结果表
         (``kept_table`` 的 vehicle_id 带 _seg 后缀，几何列取自 ``table``)，
-        并按 ``ktp.clean_id`` 只读本次 Clean Run。
+        并按 ``ktp.refine_id`` 只读本次 Refine Run。
 
-    EN: When ``kept_table`` is set, the trajectory branch JOINs the clean-result
+    EN: When ``kept_table`` is set, the trajectory branch JOINs the refine-result
         table (suffixed vehicle_id) against ``table`` for geometry columns,
-        filtered by ``ktp.clean_id``.
+        filtered by ``ktp.refine_id``.
 
     Parameter placeholders (in order, caller must bind):
         Raw mode (``kept_table`` is None):
             no parameters
         Kept mode (``kept_table`` set):
             1.  %s::text         — source table label for the in-memory PointRef
-            2.  %s               — ktp.clean_id
-            3.  %s               — injected_points.clean_id
+            2.  %s               — ktp.refine_id
+            3.  %s               — injected_points.refine_id
     """
-    if has_clean_id and kept_table is None:
-        raise ValueError("clean_id requires kept_table for complete Run isolation")
+    if has_refine_id and kept_table is None:
+        raise ValueError("refine_id requires kept_table for complete Run isolation")
     processing_srid = int(spatial_context.processing_srid)
     projected_tp = f"ST_Transform(tp.geom, {processing_srid})"
     if kept_table is not None:
@@ -287,10 +287,10 @@ def build_stream_all_sql(
             f"FROM {kept_table} AS ktp "
             f"JOIN {table} AS tp "
             f"  ON tp.id = ktp.source_row_key::{source_key_sql_type} "
-            f"WHERE ktp.clean_id = %s "
+            f"WHERE ktp.refine_id = %s "
             f"UNION ALL "
             f"SELECT {_IP_UNIFIED_COLS} "
-            f"FROM injected_points WHERE clean_id = %s "
+            f"FROM injected_points WHERE refine_id = %s "
             f"ORDER BY subtrack_index, anchor_sequence, point_kind, row_id"
         )
     return (
@@ -390,30 +390,30 @@ def _query_spatial_extent(
     table: str = "trajectory_points",
     kept_table: str | None = None,
     source_table: str | None = None,
-    clean_id: str | None = None,
+    refine_id: str | None = None,
     spatial_context: SpatialContext,
 ) -> tuple[float, float, float, float] | None:
     """Query MIN/MAX processing-CRS x/y of active trajectory points.
 
-    ZH: kept 模式 (``kept_table`` 非空) 时 JOIN 清洗结果表并绑定
-        ``ktp.clean_id``。
+    ZH: kept 模式 (``kept_table`` 非空) 时 JOIN 精炼结果表并绑定
+        ``ktp.refine_id``。
     Returns ``(x_min, y_min, x_max, y_max)`` compatible with
     ``SpatialWindowIterator``.
     """
-    if kept_table is not None and clean_id is None:
-        raise ValueError("kept_table requires clean_id")
-    if kept_table is None and clean_id is not None:
-        raise ValueError("clean_id requires kept_table for complete Run isolation")
+    if kept_table is not None and refine_id is None:
+        raise ValueError("kept_table requires refine_id")
+    if kept_table is None and refine_id is not None:
+        raise ValueError("refine_id requires kept_table for complete Run isolation")
     contract = validate_source_table(conn, table)
     sql = build_spatial_extent_sql(
         contract.quoted_table,
-        has_clean_id=clean_id is not None,
+        has_refine_id=refine_id is not None,
         kept_table=kept_table,
         spatial_context=spatial_context,
         source_key_sql_type=contract.key_sql_type,
     )
     if kept_table is not None:
-        params: tuple[Any, ...] = (clean_id, clean_id)
+        params: tuple[Any, ...] = (refine_id, refine_id)
     else:
         params = ()
     with conn.cursor() as cur:
@@ -432,7 +432,7 @@ def _query_active_points_in_window(
     table: str = "trajectory_points",
     kept_table: str | None = None,
     source_table: str | None = None,
-    clean_id: str | None = None,
+    refine_id: str | None = None,
     spatial_context: SpatialContext,
     telemetry: dict[str, int | float] | None = None,
     _transformer: CoordinateTransformer | None = None,
@@ -443,15 +443,15 @@ def _query_active_points_in_window(
         再在 processing CRS 中对 Point 执行精确窗口判断，并以 UNION ALL
         合并两表、一次往返。只有性能分析确认热点后，才应为完全相同的
         ST_Transform 表达式建立函数索引。
-        kept 模式 (``kept_table`` 非空) 时 trajectory 分支 JOIN 清洗结果表，
-        首参绑定 ``ktp.clean_id``（而非 raw 模式的 source_id）。
+        kept 模式 (``kept_table`` 非空) 时 trajectory 分支 JOIN 精炼结果表，
+        首参绑定 ``ktp.refine_id``（而非 raw 模式的 source_id）。
     """
     rows: list[dict[str, Any]] = []
-    has_clean_id = clean_id is not None
-    if kept_table is not None and clean_id is None:
-        raise ValueError("kept_table requires clean_id")
-    if kept_table is None and clean_id is not None:
-        raise ValueError("clean_id requires kept_table for complete Run isolation")
+    has_refine_id = refine_id is not None
+    if kept_table is not None and refine_id is None:
+        raise ValueError("kept_table requires refine_id")
+    if kept_table is None and refine_id is not None:
+        raise ValueError("refine_id requires kept_table for complete Run isolation")
     query_window = (
         window
         if isinstance(window, QueryWindow)
@@ -467,13 +467,13 @@ def _query_active_points_in_window(
         query_window.x_max, query_window.y_max,
     )
     if kept_table is not None:
-        params: list[Any] = [source_table or table, clean_id]
+        params: list[Any] = [source_table or table, refine_id]
         params.extend(source_bounds)
         params.extend(query_bounds)
         params.append(_INJECTED_SOURCE_ID)
         params.extend(source_bounds)
         params.extend(query_bounds)
-        params.append(clean_id)
+        params.append(refine_id)
     else:
         params = [source_table or ""]
         params.extend(source_bounds)
@@ -483,7 +483,7 @@ def _query_active_points_in_window(
         cur.execute(
             build_active_in_window_sql(
                 contract.quoted_table,
-                has_clean_id=has_clean_id,
+                has_refine_id=has_refine_id,
                 kept_table=kept_table,
                 spatial_context=spatial_context,
                 query_srid=query_window.query_srid,
@@ -544,7 +544,7 @@ def _stream_vehicle_tracks_from_db(
     table: str = "trajectory_points",
     kept_table: str | None = None,
     source_table: str | None = None,
-    clean_id: str | None = None,
+    refine_id: str | None = None,
     spatial_context: SpatialContext,
 ) -> Iterator[list[TrajectoryPoint]]:
     """Stream tracks one vehicle at a time from DB (global, no spatial filter).
@@ -552,20 +552,20 @@ def _stream_vehicle_tracks_from_db(
     ZH: 从 DB 逐车流式读取轨迹点。使用 UNION ALL 合并 active points 和
         injected_points，按 (vehicle_id, timestamp) 排序后检测 vehicle_id
         变化来分组。内存占用 = 单车辆最大点数。
-        kept 模式 (``kept_table`` 非空) 时 trajectory 分支 JOIN 清洗结果表，
-        绑定 ``ktp.clean_id`` 与 ``injected_points.clean_id``。
+        kept 模式 (``kept_table`` 非空) 时 trajectory 分支 JOIN 精炼结果表，
+        绑定 ``ktp.refine_id`` 与 ``injected_points.refine_id``。
     """
-    has_clean_id = clean_id is not None
-    if kept_table is not None and clean_id is None:
-        raise ValueError("kept_table requires clean_id")
-    if kept_table is None and clean_id is not None:
-        raise ValueError("clean_id requires kept_table for complete Run isolation")
+    has_refine_id = refine_id is not None
+    if kept_table is not None and refine_id is None:
+        raise ValueError("kept_table requires refine_id")
+    if kept_table is None and refine_id is not None:
+        raise ValueError("refine_id requires kept_table for complete Run isolation")
     if kept_table is not None:
         params: list[Any] = [
             source_table or table,
-            clean_id,
+            refine_id,
             _INJECTED_SOURCE_ID,
-            clean_id,
+            refine_id,
         ]
     else:
         params = [source_table or ""]
@@ -578,7 +578,7 @@ def _stream_vehicle_tracks_from_db(
         cur.execute(
             build_stream_all_sql(
                 contract.quoted_table,
-                has_clean_id=has_clean_id,
+                has_refine_id=has_refine_id,
                 kept_table=kept_table,
                 spatial_context=spatial_context,
                 source_key_sql_type=contract.key_sql_type,
@@ -588,14 +588,14 @@ def _stream_vehicle_tracks_from_db(
         )
         current_subtrack: int | None = None
         current_track: list[TrajectoryPoint] = []
-        cleaned_sequence = 0
+        refined_sequence = 0
         for row in cur:
             vid = str(row[0])
             subtrack_index = int(row[14])
             if current_subtrack is not None and subtrack_index != current_subtrack:
                 yield current_track
                 current_track = []
-                cleaned_sequence = 0
+                refined_sequence = 0
             current_subtrack = subtrack_index
             is_injected = int(row[12]) == 1
             current_track.append(TrajectoryPoint(
@@ -614,14 +614,14 @@ def _stream_vehicle_tracks_from_db(
                 extra=row[8] if isinstance(row[8], dict) else {},
                 x=float(row[10]),
                 y=float(row[11]),
-                cleaned_point_ref=CleanedPointRef(
+                refined_point_ref=RefinedPointRef(
                     point_kind="injected" if is_injected else "kept",
                     point_id=int(row[13]),
                     subtrack_index=subtrack_index,
-                    cleaned_sequence_in_subtrack=cleaned_sequence,
+                    refined_sequence_in_subtrack=refined_sequence,
                 ),
             ))
-            cleaned_sequence += 1
+            refined_sequence += 1
         if current_track:
             yield current_track
 
@@ -634,7 +634,7 @@ def _query_active_points_near_cluster(
     table: str = "trajectory_points",
     kept_table: str | None = None,
     source_table: str | None = None,
-    clean_id: str | None = None,
+    refine_id: str | None = None,
     spatial_context: SpatialContext,
 ) -> list[TrajectoryPoint]:
     """Query active points within *radius_m* of a cluster centroid.
@@ -655,7 +655,7 @@ def _query_active_points_near_cluster(
         table=table,
         kept_table=kept_table,
         source_table=source_table,
-        clean_id=clean_id,
+        refine_id=refine_id,
         spatial_context=spatial_context,
     )
 
@@ -663,10 +663,10 @@ def _query_active_points_near_cluster(
 def _build_points_from_rows(rows: list[dict[str, Any]]) -> list[TrajectoryPoint]:
     """Convert DB row dicts to TrajectoryPoint objects."""
     points: list[TrajectoryPoint] = []
-    cleaned_sequences: dict[int, int] = {}
+    refined_sequences: dict[int, int] = {}
     for r in rows:
         subtrack_index = int(r["subtrack_index"])
-        cleaned_sequence = cleaned_sequences.get(subtrack_index, 0)
+        refined_sequence = refined_sequences.get(subtrack_index, 0)
         is_injected = int(r["point_kind"]) == 1
         points.append(TrajectoryPoint(
             point_ref=PointRef(
@@ -684,24 +684,24 @@ def _build_points_from_rows(rows: list[dict[str, Any]]) -> list[TrajectoryPoint]
             extra=r["extra"],
             x=r["x"],
             y=r["y"],
-            cleaned_point_ref=CleanedPointRef(
+            refined_point_ref=RefinedPointRef(
                 point_kind="injected" if is_injected else "kept",
                 point_id=int(r["row_id"]),
                 subtrack_index=subtrack_index,
-                cleaned_sequence_in_subtrack=cleaned_sequence,
+                refined_sequence_in_subtrack=refined_sequence,
             ),
         ))
-        cleaned_sequences[subtrack_index] = cleaned_sequence + 1
+        refined_sequences[subtrack_index] = refined_sequence + 1
     return points
 
 
 def _tracks_from_points(points: list[TrajectoryPoint]) -> dict[str, list[TrajectoryPoint]]:
-    """Group points by globally unique Clean subtrack, retaining vehicle IDs."""
+    """Group points by globally unique Refine subtrack, retaining vehicle IDs."""
     tracks: dict[str, list[TrajectoryPoint]] = {}
     for tp in points:
         subtrack_index = (
-            tp.cleaned_point_ref.subtrack_index
-            if tp.cleaned_point_ref is not None
+            tp.refined_point_ref.subtrack_index
+            if tp.refined_point_ref is not None
             else 1
         )
         key = f"{tp.vehicle_id}\x00{subtrack_index}"
@@ -711,9 +711,9 @@ def _tracks_from_points(points: list[TrajectoryPoint]) -> dict[str, list[Traject
 
 @dataclass(frozen=True, slots=True)
 class _RunRow:
-    """One Detect Run together with its parent Clean Run metadata."""
+    """One Detect Run together with its parent Refine Run metadata."""
 
-    clean_id: str
+    refine_id: str
     source_table: str
     parameters: dict[str, object]
     status: str
@@ -721,30 +721,30 @@ class _RunRow:
 
 
 @dataclass(frozen=True, slots=True)
-class _CleanRunRow:
+class _RefineRunRow:
     """Authoritative metadata required before a formal DB Detect reads points."""
 
-    clean_id: str
+    refine_id: str
     source_table: str
     status: str
     spatial_context: SpatialContext
     has_source_fingerprint: bool
 
 
-def fetch_clean_run_row(conn: object, clean_id: str) -> _CleanRunRow:
-    """Fetch and validate one Clean Run's persisted projection context."""
+def fetch_refine_run_row(conn: object, refine_id: str) -> _RefineRunRow:
+    """Fetch and validate one Refine Run's persisted projection context."""
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(
             "SELECT id, source_table, status, source_srid, processing_srid, "
             "projection_config, source_fingerprint IS NOT NULL "
-            "FROM clean_runs WHERE id = %s",
-            (clean_id,),
+            "FROM refine_runs WHERE id = %s",
+            (refine_id,),
         )
         row = cur.fetchone()
     if row is None:
-        raise ValueError(f"unknown Clean Run: {clean_id}")
-    return _CleanRunRow(
-        clean_id=str(row[0]),
+        raise ValueError(f"unknown Refine Run: {refine_id}")
+    return _RefineRunRow(
+        refine_id=str(row[0]),
         source_table=str(row[1]),
         status=str(row[2]),
         spatial_context=spatial_context_from_values(row[3], row[4], row[5]),
@@ -753,21 +753,21 @@ def fetch_clean_run_row(conn: object, clean_id: str) -> _CleanRunRow:
 
 
 def fetch_detect_row(conn: object, detect_id: str) -> _RunRow:
-    """Fetch a Detect Run and the source metadata of its parent Clean Run."""
+    """Fetch a Detect Run and the source metadata of its parent Refine Run."""
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(
-            "SELECT d.clean_id, c.source_table, c.parameters, d.status, "
+            "SELECT d.refine_id, c.source_table, c.parameters, d.status, "
             "c.source_srid, c.processing_srid, c.projection_config "
-            "FROM detect_runs AS d JOIN clean_runs AS c ON c.id = d.clean_id "
+            "FROM detect_runs AS d JOIN refine_runs AS c ON c.id = d.refine_id "
             "WHERE d.id = %s",
             (detect_id,),
         )
         row = cur.fetchone()
     if row is None:
         raise ValueError(f"unknown Detect Run: {detect_id}")
-    clean_id, source_table, raw_parameters, status, source_srid, processing_srid, projection_config = row
+    refine_id, source_table, raw_parameters, status, source_srid, processing_srid, projection_config = row
     return _RunRow(
-        clean_id=str(clean_id),
+        refine_id=str(refine_id),
         source_table=str(source_table),
         parameters=_decode_json_object(raw_parameters),
         status=str(status),
@@ -902,14 +902,14 @@ def fetch_resolved_clip_tracks(
     ]
 
 
-def fetch_clean_points(
+def fetch_refine_points(
     conn: object,
     table: str,
-    clean_id: str,
+    refine_id: str,
     *,
     spatial_context: SpatialContext,
 ) -> dict[tuple[str, int], list[TrajectoryPoint]]:
-    """Load one Clean Run's frozen kept members and injected points."""
+    """Load one Refine Run's frozen kept members and injected points."""
     contract = validate_source_table(conn, table)
     processing_srid = int(spatial_context.processing_srid)
     extra = "tp.extra" if contract.has_extra else "'{}'::jsonb"
@@ -928,33 +928,33 @@ def fetch_clean_points(
         "  FROM kept_trajectory_points AS ktp "
         f"  JOIN {contract.quoted_table} AS tp "
         f"    ON tp.id = ktp.source_row_key::{contract.key_sql_type} "
-        "  WHERE ktp.clean_id = %s "
+        "  WHERE ktp.refine_id = %s "
         "  UNION ALL "
         "  SELECT ip.vehicle_id, ip.subtrack_index, ip.after_sequence_in_subtrack, "
         "         1 AS point_kind, ip.id AS row_id, "
         "         %s::text AS source_id, ip.id::text AS source_row_key, "
         "         ip.timestamp, ip.lon, ip.lat, ip.heading, ip.speed, '{}'::jsonb, "
         "         ip.generated_reason, ip.x, ip.y "
-        "  FROM injected_points AS ip WHERE ip.clean_id = %s"
-        ") AS clean_points"
+        "  FROM injected_points AS ip WHERE ip.refine_id = %s"
+        ") AS refine_points"
     )
     return _group_points(
         conn,
         sql,
-        (table, clean_id, _INJECTED_SOURCE_ID, clean_id),
-        clean_id,
+        (table, refine_id, _INJECTED_SOURCE_ID, refine_id),
+        refine_id,
     )
 
 
-def fetch_clean_points_for_subtracks(
+def fetch_refine_points_for_subtracks(
     conn: object,
     table: str,
-    clean_id: str,
+    refine_id: str,
     subtracks: set[tuple[str, int]],
     *,
     spatial_context: SpatialContext,
 ) -> dict[tuple[str, int], list[TrajectoryPoint]]:
-    """Load only the frozen Clean Run subtracks named by a replay manifest."""
+    """Load only the frozen Refine Run subtracks named by a replay manifest."""
     if not subtracks:
         return {}
     requested = sorted(subtracks)
@@ -982,7 +982,7 @@ def fetch_clean_points_for_subtracks(
         "  JOIN requested AS r USING (vehicle_id, subtrack_index) "
         f"  JOIN {contract.quoted_table} AS tp "
         f"    ON tp.id = ktp.source_row_key::{contract.key_sql_type} "
-        "  WHERE ktp.clean_id = %s "
+        "  WHERE ktp.refine_id = %s "
         "  UNION ALL "
         "  SELECT ip.vehicle_id, ip.subtrack_index, ip.after_sequence_in_subtrack, "
         "         1 AS point_kind, ip.id AS row_id, "
@@ -991,8 +991,8 @@ def fetch_clean_points_for_subtracks(
         "         ip.generated_reason, ip.x, ip.y "
         "  FROM injected_points AS ip "
         "  JOIN requested AS r USING (vehicle_id, subtrack_index) "
-        "  WHERE ip.clean_id = %s"
-        ") AS clean_points"
+        "  WHERE ip.refine_id = %s"
+        ") AS refine_points"
     )
     return _group_points(
         conn,
@@ -1001,11 +1001,11 @@ def fetch_clean_points_for_subtracks(
             vehicle_ids,
             subtrack_indexes,
             table,
-            clean_id,
+            refine_id,
             _INJECTED_SOURCE_ID,
-            clean_id,
+            refine_id,
         ),
-        clean_id,
+        refine_id,
     )
 
 
@@ -1013,11 +1013,11 @@ def _group_points(
     conn: object,
     sql: str,
     params: tuple[object, ...],
-    clean_id: str,
+    refine_id: str,
 ) -> dict[tuple[str, int], list[TrajectoryPoint]]:
     """Execute *sql* and locally order points within each subtrack.
 
-    Avoiding a global PostgreSQL sort is material for large Clean runs: the join
+    Avoiding a global PostgreSQL sort is material for large Refine runs: the join
     rows are wide and routinely spill hundreds of megabytes to temporary files.
     Subtracks are small, so ordering their members independently in Python has
     the same semantics with much lower sort pressure.
@@ -1033,11 +1033,11 @@ def _group_points(
             subtrack_index = int(row[1])
             if row[5] is None or row[6] is None:
                 raise ValueError(
-                    f"Clean Run {clean_id} has missing source references"
+                    f"Refine Run {refine_id} has missing source references"
                 )
             if any(row[index] is None for index in range(7, 12)):
                 raise ValueError(
-                    f"Clean Run {clean_id} references a missing source row"
+                    f"Refine Run {refine_id} references a missing source row"
                 )
             generated_reason = str(row[13])
             is_injected = int(row[3]) == 1
@@ -1076,11 +1076,11 @@ def _group_points(
                 extra=item[3].extra,
                 x=item[3].x,
                 y=item[3].y,
-                cleaned_point_ref=CleanedPointRef(
+                refined_point_ref=RefinedPointRef(
                     point_kind="injected" if item[1] == 1 else "kept",
                     point_id=item[2],
                     subtrack_index=key[1],
-                    cleaned_sequence_in_subtrack=sequence,
+                    refined_sequence_in_subtrack=sequence,
                 ),
             )
             for sequence, item in enumerate(ordered)
@@ -1096,7 +1096,7 @@ def _decode_json_object(value: object) -> dict[str, object]:
         decoded = json.loads(value)
         if isinstance(decoded, dict):
             return decoded
-    raise ValueError("Clean Run parameters must be a JSON object")
+    raise ValueError("Refine Run parameters must be a JSON object")
 
 
 def _quoted_identifier(value: str) -> str:

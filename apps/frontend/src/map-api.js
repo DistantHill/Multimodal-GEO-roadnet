@@ -148,11 +148,11 @@ export async function listMapLayers({ signal, databaseName } = {}) {
 
 export async function loadMapLayer(
   layerId,
-  { bbox, detectId, fitId, cleanId, databaseName, limit = 5_000, signal } = {},
+  { bbox, detectId, fitId, refineId, databaseName, limit = 5_000, signal } = {},
 ) {
   const query = buildQuery({
     database_name: databaseName,
-    clean_id: cleanId,
+    refine_id: refineId,
     bbox,
     detect_id: detectId,
     fit_id: fitId,

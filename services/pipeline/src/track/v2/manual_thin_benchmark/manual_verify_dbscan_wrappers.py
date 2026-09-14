@@ -16,7 +16,7 @@ _CHILD = r'''
 import hashlib, inspect, json, os, sys
 from dataclasses import asdict, fields
 from pathlib import Path
-from track.v2.intersect2 import (
+from track.v2.detect import (
     _cluster_dbscan, _cluster_orthogonal_cross_track_candidates,
 )
 from track.v2.models import CrossTrackCandidate, PointRef, TurnEvent
@@ -115,7 +115,7 @@ print(json.dumps({"snapshot": value, "source_tree": str(tree),
 
 
 _SOURCE_ROOT = Path("services/pipeline/src")
-_SOURCE_FILE = _SOURCE_ROOT / "track/v2/intersect2.py"
+_SOURCE_FILE = _SOURCE_ROOT / "track/v2/detect.py"
 _DEPENDENCY_MANIFEST = Path("services/pipeline/pyproject.toml")
 
 

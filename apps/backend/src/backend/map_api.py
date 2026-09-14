@@ -1,4 +1,4 @@
-"""Read-only map, replay, and Clip projections for schema v3.
+"""Read-only map, replay, and Clip projections for schema v4.
 
 The Backend never reconstructs Detect geometry. In particular, Clip consumes
 the final ``resolved_subtrack_points`` order and its persisted crossing rows.
@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 import psycopg
 from pyproj import CRS, Proj, Transformer
 
-from .database import get_read_connection, open_read_connection, require_schema_v3
+from .database import get_read_connection, open_read_connection, require_schema_v4
 from .map_schemas import BBox, ClipRequest, FeatureCollection, ReplayRequest, parse_bbox
 
 
@@ -90,8 +90,8 @@ class MapStore(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class _CleanContext:
-    clean_id: str
+class _RefineContext:
+    refine_id: str
     source_table: str
     quoted_source_table: str
     source_key_sql_type: str
@@ -101,7 +101,7 @@ class _CleanContext:
 @dataclass(frozen=True, slots=True)
 class _DetectContext:
     detect_id: str
-    clean: _CleanContext
+    refine: _RefineContext
     source_srid: int
     processing_srid: int
     projection_config: dict[str, Any]
@@ -291,7 +291,7 @@ _LAYER_DEFINITIONS = (
 
 
 class PostgresMapStore:
-    """Bounded, read-only projections over Pipeline schema v3."""
+    """Bounded, read-only projections over Pipeline schema v4."""
 
     def __init__(self, connection: Any) -> None:
         self.connection = connection
@@ -333,7 +333,7 @@ class PostgresMapStore:
                 self._resolved_point_feature(row, context.detect_id)
                 for row in rows[:limit]
             ]
-            metadata = {"detect_id": context.detect_id, "clean_id": context.clean.clean_id}
+            metadata = {"detect_id": context.detect_id, "refine_id": context.refine.refine_id}
         elif layer_id == "intersections":
             context = self._resolve_detect(detect_id)
             rows = self._intersection_layer(context.detect_id, bbox, limit + 1)
@@ -341,7 +341,7 @@ class PostgresMapStore:
                 self._intersection_feature(row, context.detect_id)
                 for row in rows[:limit]
             ]
-            metadata = {"detect_id": context.detect_id, "clean_id": context.clean.clean_id}
+            metadata = {"detect_id": context.detect_id, "refine_id": context.refine.refine_id}
         elif layer_id == "entry_exit_points":
             context = self._resolve_detect(detect_id)
             rows = self._entry_exit_layer(context.detect_id, bbox, limit + 1)
@@ -349,7 +349,7 @@ class PostgresMapStore:
                 self._entry_exit_feature(row, context.detect_id)
                 for row in rows[:limit]
             ]
-            metadata = {"detect_id": context.detect_id, "clean_id": context.clean.clean_id}
+            metadata = {"detect_id": context.detect_id, "refine_id": context.refine.refine_id}
         elif layer_id == "centerlines":
             resolved_fit_id, resolved_detect_id = self._resolve_fit(fit_id)
             if detect_id is not None and str(detect_id) != resolved_detect_id:
@@ -383,7 +383,7 @@ class PostgresMapStore:
             if request.detect_id is not None
             else None
         )
-        clean = detect.clean if detect is not None else self._resolve_clean(None)
+        refine = detect.refine if detect is not None else self._resolve_refine(None)
         if request.resolved_point_ids is not None:
             assert detect is not None
             selection = "resolved_point_ids"
@@ -408,8 +408,8 @@ class PostgresMapStore:
                     max_vehicles=request.max_vehicles,
                 )
             else:
-                selected, found, vehicles_truncated = self._select_clean_tracks(
-                    clean,
+                selected, found, vehicles_truncated = self._select_refine_tracks(
+                    refine,
                     source_row_keys=request.source_row_keys,
                     bbox=None,
                     max_vehicles=request.max_vehicles,
@@ -423,7 +423,7 @@ class PostgresMapStore:
         rows = (
             self._fetch_resolved_tracks(detect, selected, request.max_points + 1)
             if detect is not None
-            else self._fetch_clean_tracks(clean, selected, request.max_points + 1)
+            else self._fetch_refine_tracks(refine, selected, request.max_points + 1)
         )
         if any(row[1] is None or row[4] is None or row[5] is None for row in rows):
             raise MapDataError("所选轨迹的溯源记录缺失，无法完整回放。")
@@ -436,7 +436,7 @@ class PostgresMapStore:
             operation="replay",
             selection=selection,
             detect_id=detect.detect_id if detect else None,
-            clean_id=clean.clean_id,
+            refine_id=refine.refine_id,
             selected_track_count=len(selected),
             returned_track_count=len(grouped),
             highlight_segment_count=sum(f["properties"]["replay_role"] == "highlight" for f in features),
@@ -454,7 +454,7 @@ class PostgresMapStore:
             return self._query_database("clip", request)
         self._validate_database(request.database_name)
         context = self._resolve_detect(str(request.detect_id))
-        self._verify_source_fingerprint(context.clean)
+        self._verify_source_fingerprint(context.refine)
         requested = [int(value) for value in request.intersection_ids]
         all_intersections = self._fetch_intersections(context.detect_id)
         existing = {item.intersection_id for item in all_intersections}
@@ -492,7 +492,7 @@ class PostgresMapStore:
             features,
             operation="clip",
             detect_id=context.detect_id,
-            clean_id=context.clean.clean_id,
+            refine_id=context.refine.refine_id,
             intersection_ids=requested,
             selected_track_count=len(selected),
             returned_clip_count=len(features),
@@ -528,11 +528,11 @@ class PostgresMapStore:
         try:
             with open_read_connection(request.database_name) as connection:
                 try:
-                    require_schema_v3(connection)
+                    require_schema_v4(connection)
                 except RuntimeError as exc:
                     raise HTTPException(status_code=409, detail={
                         "error": "database_schema_mismatch",
-                        "message": "所选数据库不是兼容的 schema v3，请确认 QGIS 图层的 database 是否对应。",
+                        "message": "所选数据库不是兼容的 schema v4，请确认 QGIS 图层的 database 是否对应。",
                     }) from exc
                 result = getattr(PostgresMapStore(connection), operation)(
                     request.model_copy(update={"database_name": None})
@@ -548,7 +548,7 @@ class PostgresMapStore:
         row = self._fetchone(
             "SELECT d.id::text, c.id::text, c.source_table, c.source_fingerprint, "
             "c.source_srid, c.processing_srid, c.projection_config "
-            "FROM detect_runs AS d JOIN clean_runs AS c ON c.id = d.clean_id "
+            "FROM detect_runs AS d JOIN refine_runs AS c ON c.id = d.refine_id "
             f"WHERE d.status = 'completed' AND c.status = 'completed' AND {clause}"
             + order
             + " LIMIT 1",
@@ -558,35 +558,35 @@ class PostgresMapStore:
             if detect_id:
                 raise MapNotFoundError(f"unknown completed Detect Run: {detect_id}")
             raise MapNotFoundError("no completed Detect Run is available")
-        clean = self._clean_context(str(row[1]), str(row[2]), row[3])
+        refine = self._refine_context(str(row[1]), str(row[2]), row[3])
         if row[5] is None:
             raise MapDataError(f"Detect Run {row[0]} has no processing CRS")
         return _DetectContext(
             detect_id=str(row[0]),
-            clean=clean,
+            refine=refine,
             source_srid=int(row[4]),
             processing_srid=int(row[5]),
             projection_config=_json_object(row[6], "projection_config"),
         )
 
-    def _resolve_clean(self, clean_id: str | None) -> _CleanContext:
-        clause = "id = %s" if clean_id else "TRUE"
-        order = "" if clean_id else " ORDER BY finished_at DESC NULLS LAST, started_at DESC"
+    def _resolve_refine(self, refine_id: str | None) -> _RefineContext:
+        clause = "id = %s" if refine_id else "TRUE"
+        order = "" if refine_id else " ORDER BY finished_at DESC NULLS LAST, started_at DESC"
         row = self._fetchone(
-            "SELECT id::text, source_table, source_fingerprint FROM clean_runs "
+            "SELECT id::text, source_table, source_fingerprint FROM refine_runs "
             f"WHERE status = 'completed' AND {clause}" + order + " LIMIT 1",
-            (clean_id,) if clean_id else (),
+            (refine_id,) if refine_id else (),
         )
         if row is None:
-            raise MapNotFoundError("no completed Clean Run is available")
-        return self._clean_context(str(row[0]), str(row[1]), row[2])
+            raise MapNotFoundError("no completed Refine Run is available")
+        return self._refine_context(str(row[0]), str(row[1]), row[2])
 
-    def _clean_context(
+    def _refine_context(
         self,
-        clean_id: str,
+        refine_id: str,
         source_table: str,
         source_fingerprint: Any,
-    ) -> _CleanContext:
+    ) -> _RefineContext:
         quoted = _quoted_identifier(source_table)
         row = self._fetchone(
             "SELECT type.typname FROM pg_attribute AS attribute "
@@ -597,8 +597,8 @@ class PostgresMapStore:
         )
         if row is None or str(row[0]) not in _SOURCE_KEY_TYPES:
             raise MapDataError(f"unsupported source key type for {source_table}")
-        return _CleanContext(
-            clean_id=clean_id,
+        return _RefineContext(
+            refine_id=refine_id,
             source_table=source_table,
             quoted_source_table=quoted,
             source_key_sql_type=_SOURCE_KEY_TYPES[str(row[0])],
@@ -619,38 +619,38 @@ class PostgresMapStore:
             raise MapNotFoundError("no completed Fit Run is available")
         return str(row[0]), str(row[1])
 
-    def _verify_source_fingerprint(self, clean: _CleanContext) -> None:
-        expected = clean.source_fingerprint
+    def _verify_source_fingerprint(self, refine: _RefineContext) -> None:
+        expected = refine.source_fingerprint
         if not expected:
-            raise MapDataError(f"Clean Run {clean.clean_id} has no source fingerprint")
+            raise MapDataError(f"Refine Run {refine.refine_id} has no source fingerprint")
         extra_row = self._fetchone(
             "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE "
             "attrelid = %s::regclass AND attname = 'extra' "
             "AND attnum > 0 AND NOT attisdropped)",
-            (clean.source_table,),
+            (refine.source_table,),
         )
         has_extra = bool(extra_row[0])
         extra_sql = "source.extra" if has_extra else "'{}'::jsonb"
         sql = f"""
             WITH referenced(source_row_key) AS (
-                SELECT source_row_key FROM kept_trajectory_points WHERE clean_id = %s
+                SELECT source_row_key FROM kept_trajectory_points WHERE refine_id = %s
                 UNION
-                SELECT source_row_key FROM excluded_points WHERE clean_id = %s
+                SELECT source_row_key FROM excluded_points WHERE refine_id = %s
             )
             SELECT referenced.source_row_key, source.id IS NOT NULL,
                    source.vehicle_id, source.timestamp, source.lon, source.lat,
                    source.heading, source.speed, {extra_sql}
               FROM referenced
-              LEFT JOIN {clean.quoted_source_table} AS source
-                ON source.id = referenced.source_row_key::{clean.source_key_sql_type}
+              LEFT JOIN {refine.quoted_source_table} AS source
+                ON source.id = referenced.source_row_key::{refine.source_key_sql_type}
              ORDER BY referenced.source_row_key
         """
         digest = hashlib.sha256()
         count = 0
-        for row in self._fetchall(sql, (clean.clean_id, clean.clean_id)):
+        for row in self._fetchall(sql, (refine.refine_id, refine.refine_id)):
             if not bool(row[1]):
                 raise MapDataError(
-                    f"Clean Run {clean.clean_id} references a missing source row"
+                    f"Refine Run {refine.refine_id} references a missing source row"
                 )
             canonical = {
                 "source_row_key": str(row[0]),
@@ -675,7 +675,7 @@ class PostgresMapStore:
         actual = {"version": 1, "row_count": count, "sha256": digest.hexdigest()}
         if actual != expected:
             raise MapDataError(
-                f"source rows for Clean Run {clean.clean_id} changed; replay is refused"
+                f"source rows for Refine Run {refine.refine_id} changed; replay is refused"
             )
 
     def _resolved_point_layer(
@@ -684,7 +684,7 @@ class PostgresMapStore:
         bbox: BBox | None,
         limit: int,
     ) -> list[Any]:
-        base = self._resolved_base_sql(context.clean)
+        base = self._resolved_base_sql(context.refine)
         bbox_clause, bbox_params = _bbox_clause("resolved.geom", bbox)
         return self._fetchall(
             base
@@ -775,16 +775,16 @@ class PostgresMapStore:
                 "SELECT kept.vehicle_id, point.subtrack_index, kept.source_row_key"
                 " FROM kept_trajectory_points kept JOIN resolved_subtrack_points point"
                 " ON point.kept_point_id = kept.id AND point.detect_id = %s"
-                " WHERE kept.clean_id = %s AND kept.source_row_key = ANY(%s::text[])"
+                " WHERE kept.refine_id = %s AND kept.source_row_key = ANY(%s::text[])"
                 " ORDER BY kept.vehicle_id, point.subtrack_index",
-                (context.detect_id, context.clean.clean_id, source_row_keys),
+                (context.detect_id, context.refine.refine_id, source_row_keys),
             )
             return _limit_selected_tracks(rows, max_vehicles)
         raise MapDataError("Replay 必须使用准确 ID，不允许范围查询。")
 
-    def _select_clean_tracks(
+    def _select_refine_tracks(
         self,
-        clean: _CleanContext,
+        refine: _RefineContext,
         *,
         source_row_keys: list[str] | None,
         bbox: BBox | None,
@@ -793,10 +793,10 @@ class PostgresMapStore:
         if source_row_keys is not None:
             rows = self._fetchall(
                 "SELECT DISTINCT kept.vehicle_id, kept.subtrack_index, kept.source_row_key "
-                "FROM kept_trajectory_points AS kept WHERE kept.clean_id = %s "
+                "FROM kept_trajectory_points AS kept WHERE kept.refine_id = %s "
                 "AND kept.source_row_key = ANY(%s::text[]) "
                 "ORDER BY kept.vehicle_id, kept.subtrack_index",
-                (clean.clean_id, source_row_keys),
+                (refine.refine_id, source_row_keys),
             )
         else:
             raise MapDataError("Replay 必须使用准确来源键，不允许范围查询。")
@@ -840,7 +840,7 @@ class PostgresMapStore:
     ) -> list[Any]:
         if not subtrack_indexes:
             return []
-        clean = context.clean
+        refine = context.refine
         return self._fetchall(
             "WITH selected AS MATERIALIZED ("
             " SELECT * FROM resolved_subtrack_points WHERE detect_id = %s"
@@ -853,9 +853,9 @@ class PostgresMapStore:
             " WHEN point.injected_point_id IS NOT NULL THEN 'injected' ELSE 'crossing' END,"
             " crossing.id, intersection.id, crossing.crossing_type"
             " FROM selected point"
-            " LEFT JOIN LATERAL (SELECT * FROM kept_trajectory_points WHERE id = point.kept_point_id AND clean_id = %s LIMIT 1) kept ON TRUE"
-            f" LEFT JOIN LATERAL (SELECT * FROM {clean.quoted_source_table} WHERE id = kept.source_row_key::{clean.source_key_sql_type} LIMIT 1) source ON TRUE"
-            " LEFT JOIN LATERAL (SELECT * FROM injected_points WHERE id = point.injected_point_id AND clean_id = %s LIMIT 1) injected ON TRUE"
+            " LEFT JOIN LATERAL (SELECT * FROM kept_trajectory_points WHERE id = point.kept_point_id AND refine_id = %s LIMIT 1) kept ON TRUE"
+            f" LEFT JOIN LATERAL (SELECT * FROM {refine.quoted_source_table} WHERE id = kept.source_row_key::{refine.source_key_sql_type} LIMIT 1) source ON TRUE"
+            " LEFT JOIN LATERAL (SELECT * FROM injected_points WHERE id = point.injected_point_id AND refine_id = %s LIMIT 1) injected ON TRUE"
             " LEFT JOIN candidate_entry_exit_points crossing ON crossing.id = point.crossing_point_id AND crossing.detect_id = point.detect_id"
             " LEFT JOIN intersections intersection ON intersection.detect_id = crossing.detect_id"
             " AND intersection.candidate_intersection_id = crossing.candidate_intersection_id"
@@ -867,12 +867,12 @@ class PostgresMapStore:
             " AND (anchor.kept_point_id IS NOT NULL OR anchor.injected_point_id IS NOT NULL)"
             " ORDER BY anchor.sequence_in_subtrack LIMIT 1) vehicle"
             " ORDER BY point.subtrack_index, point.sequence_in_subtrack",
-            (context.detect_id, subtrack_indexes, limit, clean.clean_id, clean.clean_id),
+            (context.detect_id, subtrack_indexes, limit, refine.refine_id, refine.refine_id),
         )
 
-    def _fetch_clean_tracks(
+    def _fetch_refine_tracks(
         self,
-        clean: _CleanContext,
+        refine: _RefineContext,
         subtrack_indexes: list[int],
         limit: int,
     ) -> list[Any]:
@@ -884,18 +884,18 @@ class PostgresMapStore:
             " SELECT kept.subtrack_index, kept.vehicle_id, kept.source_row_key, "
             " source.lon, source.lat, 'kept'::text AS point_kind, "
             " kept.sequence_in_subtrack AS anchor_sequence, 0 AS kind_order, kept.id AS row_id "
-            f" FROM kept_trajectory_points AS kept JOIN {clean.quoted_source_table} AS source "
-            f" ON source.id = kept.source_row_key::{clean.source_key_sql_type} "
-            " WHERE kept.clean_id = %s AND kept.subtrack_index = ANY(%s::integer[]) "
+            f" FROM kept_trajectory_points AS kept JOIN {refine.quoted_source_table} AS source "
+            f" ON source.id = kept.source_row_key::{refine.source_key_sql_type} "
+            " WHERE kept.refine_id = %s AND kept.subtrack_index = ANY(%s::integer[]) "
             " UNION ALL SELECT injected.subtrack_index, injected.vehicle_id, NULL::text, "
             " injected.lon, injected.lat, 'injected', injected.after_sequence_in_subtrack, "
-            " 1, injected.id FROM injected_points AS injected WHERE injected.clean_id = %s "
+            " 1, injected.id FROM injected_points AS injected WHERE injected.refine_id = %s "
             " AND injected.subtrack_index = ANY(%s::integer[])"
-            ") AS clean_points ORDER BY subtrack_index, anchor_sequence, kind_order, row_id LIMIT %s",
-            (clean.clean_id, subtrack_indexes, clean.clean_id, subtrack_indexes, limit),
+            ") AS refine_points ORDER BY subtrack_index, anchor_sequence, kind_order, row_id LIMIT %s",
+            (refine.refine_id, subtrack_indexes, refine.refine_id, subtrack_indexes, limit),
         )
 
-    def _resolved_base_sql(self, clean: _CleanContext) -> str:
+    def _resolved_base_sql(self, refine: _RefineContext) -> str:
         return f"""
             WITH subtrack_vehicle AS (
                 SELECT resolved.subtrack_index,
@@ -924,8 +924,8 @@ class PostgresMapStore:
                   JOIN subtrack_vehicle AS vehicle USING (subtrack_index)
                   LEFT JOIN kept_trajectory_points AS kept
                     ON kept.id = point.kept_point_id
-                  LEFT JOIN {clean.quoted_source_table} AS source
-                    ON source.id = kept.source_row_key::{clean.source_key_sql_type}
+                  LEFT JOIN {refine.quoted_source_table} AS source
+                    ON source.id = kept.source_row_key::{refine.source_key_sql_type}
                   LEFT JOIN injected_points AS injected
                     ON injected.id = point.injected_point_id
                   LEFT JOIN candidate_entry_exit_points AS crossing
@@ -1040,9 +1040,9 @@ def get_map_store(
     try:
         with open_read_connection(database_name) as target:
             try:
-                require_schema_v3(target)
+                require_schema_v4(target)
             except RuntimeError as exc:
-                raise HTTPException(409, detail="所选数据库不兼容 schema v3，请选择业务数据库。") from exc
+                raise HTTPException(409, detail="所选数据库不兼容 schema v4，请选择业务数据库。") from exc
             yield PostgresMapStore(target)
     except psycopg.Error as exc:
         raise database_query_error(exc) from exc
@@ -1056,11 +1056,11 @@ def layer_catalog(store: MapStore = Depends(get_map_store)) -> dict[str, Any]:
 @router.get("/runs")
 def run_catalog(store: Any = Depends(get_map_store)) -> dict[str, Any]:
     return {
-        "clean": [{"id": row[0], "started_at": row[1]} for row in store._fetchall(
-            "SELECT id::text, started_at FROM clean_runs WHERE status = 'completed' ORDER BY finished_at DESC NULLS LAST, started_at DESC", ()
+        "refine": [{"id": row[0], "started_at": row[1]} for row in store._fetchall(
+            "SELECT id::text, started_at FROM refine_runs WHERE status = 'completed' ORDER BY finished_at DESC NULLS LAST, started_at DESC", ()
         )],
-        "detect": [{"id": row[0], "clean_id": row[1], "started_at": row[2]} for row in store._fetchall(
-            "SELECT id::text, clean_id::text, started_at FROM detect_runs WHERE status = 'completed' ORDER BY finished_at DESC NULLS LAST, started_at DESC", ()
+        "detect": [{"id": row[0], "refine_id": row[1], "started_at": row[2]} for row in store._fetchall(
+            "SELECT id::text, refine_id::text, started_at FROM detect_runs WHERE status = 'completed' ORDER BY finished_at DESC NULLS LAST, started_at DESC", ()
         )],
         "fit": [{"id": row[0], "detect_id": row[1], "started_at": row[2]} for row in store._fetchall(
             "SELECT id::text, detect_id::text, started_at FROM fit_runs WHERE status = 'completed' ORDER BY finished_at DESC NULLS LAST, started_at DESC", ()
@@ -1074,17 +1074,17 @@ def read_layer(
     bbox: str | None = Query(default=None, description="minLon,minLat,maxLon,maxLat"),
     detect_id: UUID | None = None,
     fit_id: UUID | None = None,
-    clean_id: UUID | None = None,
+    refine_id: UUID | None = None,
     limit: int = Query(default=_LAYER_LIMIT_DEFAULT, ge=1, le=_LAYER_LIMIT_MAX),
     store: MapStore = Depends(get_map_store),
 ) -> dict[str, Any]:
     try:
-        if clean_id is not None:
+        if refine_id is not None:
             if detect_id is None or store._fetchone(
-                "SELECT 1 FROM detect_runs WHERE id = %s AND clean_id = %s",
-                (str(detect_id), str(clean_id)),
+                "SELECT 1 FROM detect_runs WHERE id = %s AND refine_id = %s",
+                (str(detect_id), str(refine_id)),
             ) is None:
-                raise MapDataError("Detect ID 不属于所选 Clean ID。")
+                raise MapDataError("Detect ID 不属于所选 Refine ID。")
             if fit_id is not None and store._fetchone(
                 "SELECT 1 FROM fit_runs WHERE id = %s AND detect_id = %s",
                 (str(fit_id), str(detect_id)),
@@ -1345,7 +1345,7 @@ def _quoted_identifier(value: str) -> str:
     if not parts or any(
         re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) is None for part in parts
     ):
-        raise MapDataError(f"invalid source table name in Clean Run: {value!r}")
+        raise MapDataError(f"invalid source table name in Refine Run: {value!r}")
     return ".".join(f'"{part}"' for part in parts)
 
 

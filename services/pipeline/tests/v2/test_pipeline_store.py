@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from track.v2.db.pipeline_store import (
-    CleanBatchResult,
+    RefineBatchResult,
     DetectPersistenceResult,
     PostgresPipelineStore,
 )
@@ -70,20 +70,20 @@ def test_transaction_methods_are_transparent() -> None:
     assert connection.events == ["commit", "rollback"]
 
 
-def test_clean_lifecycle_uses_source_table_and_fingerprint() -> None:
+def test_refine_lifecycle_uses_source_table_and_fingerprint() -> None:
     connection = object()
     store = PostgresPipelineStore(connection)
     with (
-        patch("track.v2.db.pipeline_store.create_clean_run", return_value="clean") as start,
-        patch("track.v2.db.pipeline_store.finish_clean_run") as finish,
+        patch("track.v2.db.pipeline_store.create_refine_run", return_value="refine") as start,
+        patch("track.v2.db.pipeline_store.finish_refine_run") as finish,
     ):
-        assert store.start_clean_run(
+        assert store.start_refine_run(
             source_table="public.day01",
             parameters={},
             spatial_context=CONTEXT,
-        ) == "clean"
+        ) == "refine"
         fingerprint = {"version": 1, "row_count": 2, "sha256": "a" * 64}
-        store.finish_clean("clean", status="completed", source_fingerprint=fingerprint)
+        store.finish_refine("refine", status="completed", source_fingerprint=fingerprint)
 
     start.assert_called_once_with(
         connection,
@@ -93,13 +93,13 @@ def test_clean_lifecycle_uses_source_table_and_fingerprint() -> None:
     )
     finish.assert_called_once_with(
         connection,
-        "clean",
+        "refine",
         status="completed",
         source_fingerprint=fingerprint,
     )
 
 
-def test_clean_batch_assigns_globally_increasing_subtrack_ids() -> None:
+def test_refine_batch_assigns_globally_increasing_subtrack_ids() -> None:
     store = PostgresPipelineStore(object())
     excluded = [ExcludedPoint(PointRef("source", "9", True), "stationary", 116, 39)]
     subtracks = [
@@ -109,7 +109,7 @@ def test_clean_batch_assigns_globally_increasing_subtrack_ids() -> None:
     calls: list[str] = []
     with (
         patch(
-            "track.v2.db.pipeline_store.fetch_clean_run",
+            "track.v2.db.pipeline_store.fetch_refine_run",
             return_value=SimpleNamespace(status="running", spatial_context=CONTEXT),
         ),
         patch(
@@ -125,8 +125,8 @@ def test_clean_batch_assigns_globally_increasing_subtrack_ids() -> None:
             side_effect=lambda *args, **kwargs: calls.append("injected"),
         ) as injected,
     ):
-        result = store.persist_clean_batch(
-            "clean",
+        result = store.persist_refine_batch(
+            "refine",
             excluded,
             subtracks,
             3,
@@ -134,7 +134,7 @@ def test_clean_batch_assigns_globally_increasing_subtrack_ids() -> None:
             batch_size=17,
         )
 
-    assert result == CleanBatchResult(next_subtrack_index=5, kept_count=2)
+    assert result == RefineBatchResult(next_subtrack_index=5, kept_count=2)
     assert calls == ["excluded", "kept", "injected"]
     assigned = kept.call_args.args[1]
     assert [subtrack.subtrack_index for subtrack in assigned] == [3, 4]
@@ -143,12 +143,12 @@ def test_clean_batch_assigns_globally_increasing_subtrack_ids() -> None:
     assert subtracks == []
 
 
-def test_clean_batch_does_not_clear_pending_data_after_failed_write() -> None:
+def test_refine_batch_does_not_clear_pending_data_after_failed_write() -> None:
     store = PostgresPipelineStore(object())
     subtracks = [RefinementSubtrack("v1", 1, [_point("1")])]
     with (
         patch(
-            "track.v2.db.pipeline_store.fetch_clean_run",
+            "track.v2.db.pipeline_store.fetch_refine_run",
             return_value=SimpleNamespace(status="running", spatial_context=CONTEXT),
         ),
         patch(
@@ -157,8 +157,8 @@ def test_clean_batch_does_not_clear_pending_data_after_failed_write() -> None:
         ),
     ):
         with pytest.raises(ValueError, match="write failed"):
-            store.persist_clean_batch(
-                "clean", [], subtracks, 1, spatial_context=CONTEXT
+            store.persist_refine_batch(
+                "refine", [], subtracks, 1, spatial_context=CONTEXT
             )
     assert len(subtracks) == 1
 

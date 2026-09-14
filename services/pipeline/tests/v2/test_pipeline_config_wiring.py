@@ -6,10 +6,10 @@ from unittest.mock import MagicMock, patch
 from track.v2.config import PostgresConfig
 from track.v2.config.pipeline_config import PipelineConfig
 from track.v2.db.pipeline_store import DetectPersistenceResult
-from track.v2.db_writer import CleanRunRecord
-from track.v2.intersect2 import IntersectConfig, IntersectResult
+from track.v2.db_writer import RefineRunRecord
+from track.v2.detect import IntersectConfig, IntersectResult
 from track.v2.models import (
-    CleanerConfig,
+    RefineConfig,
     ClipConfig,
     FittingConfig,
     IntersectReport,
@@ -21,7 +21,7 @@ from track.v2.pipeline import PipelineInput, run_pipeline
 from track.v2.projection import create_spatial_context
 
 
-CLEAN_ID = "11111111-1111-1111-1111-111111111111"
+REFINE_ID = "11111111-1111-1111-1111-111111111111"
 _PROJECTION_CONFIG = ProjectionConfig(processing_srid=3857)
 _SPATIAL_CONTEXT = create_spatial_context(_PROJECTION_CONFIG)
 
@@ -59,8 +59,8 @@ class _Connection:
 class _ConfigRecordingStore:
     def __init__(self) -> None:
         self.connection = object()
-        self.clean_record = CleanRunRecord(
-            id=CLEAN_ID,
+        self.refine_record = RefineRunRecord(
+            id=REFINE_ID,
             source_table="raw_points",
             parameters={},
             status="completed",
@@ -83,8 +83,8 @@ class _ConfigRecordingStore:
     def rollback(self) -> None:
         return None
 
-    def get_clean_run(self, clean_id: str) -> CleanRunRecord:
-        return self.clean_record
+    def get_refine_run(self, refine_id: str) -> RefineRunRecord:
+        return self.refine_record
 
     def start_detect_run(self, **kwargs: object) -> str:
         return "detect-1"
@@ -135,7 +135,7 @@ class PipelineConfigWiringTest(unittest.TestCase):
         network_config = NetworkConfig(include_isolated_nodes=False)
         pipeline_config = PipelineConfig(
             projection=_PROJECTION_CONFIG,
-            cleaner=CleanerConfig(),
+            refine=RefineConfig(),
             detect=IntersectConfig(),
             clip=clip_config,
             fitting=fitting_config,
@@ -149,8 +149,8 @@ class PipelineConfigWiringTest(unittest.TestCase):
             patch("track.v2.pipeline.load_pipeline_config", return_value=pipeline_config),
             patch("track.v2.pipeline.pg_connect", return_value=_Connection()),
             patch("track.v2.pipeline.PostgresPipelineStore", return_value=store),
-            patch("track.v2.pipeline.require_schema_v3"),
-            patch("track.v2.pipeline.verify_clean_source_fingerprint"),
+            patch("track.v2.pipeline.require_schema_v4"),
+            patch("track.v2.pipeline.verify_refine_source_fingerprint"),
             patch("track.v2.pipeline.detect_intersections", return_value=intersections),
             patch("track.v2.pipeline.fit_centerline_variants", return_value=store.fit_bundle) as fit,
             patch("track.v2.pipeline.build_network", return_value=MagicMock()) as network,
@@ -158,7 +158,7 @@ class PipelineConfigWiringTest(unittest.TestCase):
             patch("track.v2.pipeline._add_fit_stats"),
             patch("track.v2.pipeline._add_network_stats"),
         ):
-            run_pipeline(PipelineInput(db_config, clean_id=CLEAN_ID))
+            run_pipeline(PipelineInput(db_config, refine_id=REFINE_ID))
 
         self.assertIs(store.loaded_clip_config, clip_config)
         self.assertIs(store.fit_clip_config, clip_config)

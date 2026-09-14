@@ -1,4 +1,4 @@
-"""Intersect2 — Intersection candidate detection and topology extraction.
+"""Detect — Intersection candidate detection and topology extraction.
 
 detect_intersections(source, *, config=None, spatial_context=...) → IntersectResult
 
@@ -64,10 +64,10 @@ from .db.queries import (
     _query_spatial_extent,
     _stream_vehicle_tracks_from_db,
     _tracks_from_points,
-    fetch_clean_run_row,
+    fetch_refine_run_row,
 )
-from .db.source_table import verify_clean_source_fingerprint
-from .parser0 import TrajectorySourceHandle
+from .db.source_table import verify_refine_source_fingerprint
+from .parser import BaseTrajectorySourceHandle as TrajectorySourceHandle
 
 
 _DB_GLOBAL_GRID_MEMBERSHIP_LIMIT = 8_000_000
@@ -94,9 +94,9 @@ def _perf_iter(perf, iterable, *, name, total=None, track=True):
 
 @dataclass(frozen=True)
 class IntersectConfig(TrackModel):
-    """Intersect2 configuration for turn and cross-track detection.
+    """Detect configuration for turn and cross-track detection.
 
-    PRD v2 Intersect2 §7
+    PRD v2 Detect §7
     """
 
     # ── Mode toggles ───────────────────────────────────────────────
@@ -146,7 +146,7 @@ class IntersectConfig(TrackModel):
     db_table: str = "trajectory_points"
     kept_table: str | None = None
     source_table: str | None = None
-    clean_id: str | None = None
+    refine_id: str | None = None
     spatial_window_size: tuple[float, float] = (2000.0, 2000.0)
     spatial_window_overlap: float = 0.15
     stream_batch_size: int = 100
@@ -160,7 +160,7 @@ class IntersectConfig(TrackModel):
 
 @dataclass(frozen=True)
 class IntersectResult(TrackModel):
-    """Output of Intersect2 stage.
+    """Output of Detect stage.
 
     All fields populated eagerly during detect_intersections().
     """
@@ -364,7 +364,7 @@ def _annotate_source_ablation(
                     detail=f"消融/Ablated {source}:\t{len(reclustered_without[source])}\t簇/clusters",
                     progress=(idx + 1) / len(all_sources),
                     elapsed=time.perf_counter() - t_abl,
-                    stage="Intersect2: 源消融 / Source Ablation",
+                    stage="Detect: 源消融 / Source Ablation",
                 )
 
     annotated: list[HotspotCluster] = []
@@ -563,7 +563,7 @@ def _cluster_pipeline(
                 perf=perf,
             ))
 
-    # Cleaner-injected points participate in Method 1 through the ordered
+    # Refine-injected points participate in Method 1 through the ordered
     # trajectory only; they are never promoted directly into DBSCAN here.
 
     # ── Method 3: Cross-track → DBSCAN ─────────────────────────────
@@ -625,7 +625,7 @@ def detect_intersections(
 ) -> IntersectResult:
     """Run intersection detection and topology extraction.
 
-    PRD v2 Intersect2 §2
+    PRD v2 Detect §2
 
     Two modes:
       - **Handle mode**: ``source`` is a ``TrajectorySourceHandle``.
@@ -637,29 +637,29 @@ def detect_intersections(
     """
     cfg = config or IntersectConfig()
     if conn is not None and cfg.query_active_from_db:
-        if cfg.clean_id is None:
-            raise V2Error("formal DB Detect requires clean_id")
-        clean = fetch_clean_run_row(conn, cfg.clean_id)
-        if clean.status != "completed" or not clean.has_source_fingerprint:
+        if cfg.refine_id is None:
+            raise V2Error("formal DB Detect requires refine_id")
+        refine = fetch_refine_run_row(conn, cfg.refine_id)
+        if refine.status != "completed" or not refine.has_source_fingerprint:
             raise V2Error(
-                f"Clean Run {cfg.clean_id} is not a completed immutable-source run"
+                f"Refine Run {cfg.refine_id} is not a completed immutable-source run"
             )
-        if spatial_context is not None and spatial_context != clean.spatial_context:
-            raise V2Error("supplied SpatialContext does not match the parent Clean Run")
-        if cfg.source_table is not None and cfg.source_table != clean.source_table:
-            raise V2Error("configured source_table does not belong to the parent Clean Run")
-        if cfg.db_table != "trajectory_points" and cfg.db_table != clean.source_table:
-            raise V2Error("configured db_table does not belong to the parent Clean Run")
+        if spatial_context is not None and spatial_context != refine.spatial_context:
+            raise V2Error("supplied SpatialContext does not match the parent Refine Run")
+        if cfg.source_table is not None and cfg.source_table != refine.source_table:
+            raise V2Error("configured source_table does not belong to the parent Refine Run")
+        if cfg.db_table != "trajectory_points" and cfg.db_table != refine.source_table:
+            raise V2Error("configured db_table does not belong to the parent Refine Run")
         if cfg.kept_table not in (None, "kept_trajectory_points"):
             raise V2Error("formal DB Detect must use kept_trajectory_points")
         cfg = replace(
             cfg,
-            db_table=clean.source_table,
-            source_table=clean.source_table,
+            db_table=refine.source_table,
+            source_table=refine.source_table,
             kept_table="kept_trajectory_points",
         )
-        verify_clean_source_fingerprint(conn, clean.clean_id)
-        return _detect_intersections_db(conn, cfg, clean.spatial_context)
+        verify_refine_source_fingerprint(conn, refine.refine_id)
+        return _detect_intersections_db(conn, cfg, refine.spatial_context)
     elif source is not None:
         if spatial_context is None:
             raise V2Error(
@@ -697,12 +697,12 @@ def _detect_intersections_handle(
         # EN: If no external LiveStatus in handle mode, create our own.
         try:
             from .logger import LiveStatus
-            live = LiveStatus("Intersect2: 交叉口检测 / Intersection Detection")
+            live = LiveStatus("Detect: 交叉口检测 / Intersection Detection")
             live.start()
             own_live = True
         except Exception:
             live = None
-    tracker = PerfTracker("intersect2_handle")
+    tracker = PerfTracker("detect_handle")
     try:
         with tracker.stage("extract_methods_1_3"):
             turn_events, cross_candidates = _extract_methods_1_3(
@@ -782,7 +782,7 @@ def _stream_extract_method_1(
         table=cfg.db_table,
         kept_table=cfg.kept_table,
         source_table=cfg.source_table,
-        clean_id=cfg.clean_id,
+        refine_id=cfg.refine_id,
         spatial_context=spatial_context,
     ):
         for point in track:
@@ -808,8 +808,8 @@ def _stream_extract_method_1(
                 )
             )
         subtrack_index = (
-            track[0].cleaned_point_ref.subtrack_index
-            if track[0].cleaned_point_ref is not None
+            track[0].refined_point_ref.subtrack_index
+            if track[0].refined_point_ref is not None
             else 1
         )
         track_key = f"{track[0].vehicle_id}\x00{subtrack_index}"
@@ -842,7 +842,7 @@ def _stream_extract_method_1(
                         detail=f"流式/Streaming:\t{track_count:,}\t轨迹/tracks,\t"
                                f"{len(turn_events):,}\t转向/turn",
                         elapsed=now - t_total,
-                        stage="Intersect2: 流式 / Stream M1",
+                        stage="Detect: 流式 / Stream M1",
                     )
                 last_progress_t = now
 
@@ -969,7 +969,7 @@ def _extract_cross_track_memory_windows(
                     "内存窗口/In-memory windows:\t"
                     f"{processed:,}/{len(populated):,} populated"
                 ),
-                stage="Intersect2: 内存分窗 / In-memory Windows",
+                stage="Detect: 内存分窗 / In-memory Windows",
             )
         window_candidates, _, _ = extract_cross_track_candidates(
             buckets[window_index],
@@ -1113,7 +1113,7 @@ def _extract_cross_track_windows(
                        f"{total_points:,}\tpts in window",
                 sub_detail=last_cross_sub,
                 elapsed=now - t0,
-                stage="Intersect2: 空间滑窗 / Spatial Windows",
+                stage="Detect: 空间滑窗 / Spatial Windows",
             )
         else:
             # print fallback (tests/benchmarks): keep old throttle
@@ -1129,7 +1129,7 @@ def _extract_cross_track_windows(
             table=cfg.db_table,
             kept_table=cfg.kept_table,
             source_table=cfg.source_table,
-            clean_id=cfg.clean_id,
+            refine_id=cfg.refine_id,
             spatial_context=spatial_context,
             telemetry=telemetry,
             _transformer=transformer,
@@ -1403,7 +1403,7 @@ def _build_topologies_from_tracks(
             detail=f"簇/Cluster:\t{cluster_index + 1:,}/{total_clusters:,}",
             progress=(cluster_index + 1) / total_clusters,
             elapsed=time.perf_counter() - t0,
-            stage="Intersect2: 拓扑验证 / Topology",
+            stage="Detect: 拓扑验证 / Topology",
         )
         radius = max(
             cfg.min_intersection_radius_m,
@@ -1454,7 +1454,7 @@ def _detect_intersections_db(
         table=cfg.db_table,
         kept_table=cfg.kept_table,
         source_table=cfg.source_table,
-        clean_id=cfg.clean_id,
+        refine_id=cfg.refine_id,
         spatial_context=spatial_context,
     )
     if extent is None:
@@ -1464,11 +1464,11 @@ def _detect_intersections_db(
 
     live = cfg.live_status
 
-    tracker = PerfTracker("intersect2_db")
+    tracker = PerfTracker("detect_db")
 
     # ── Method 1: stream per-vehicle (DB-specific) ──────────────────
     if live is not None:
-        live.update(stage="Intersect2: 流式 / Stream M1",
+        live.update(stage="Detect: 流式 / Stream M1",
                     detail="Method 1: turn events...")
     t_stage = time.perf_counter()
     with tracker.stage("stream_m1"):
@@ -1496,7 +1496,7 @@ def _detect_intersections_db(
 
     # ── Shared: cluster pipeline (G* + DBSCAN + merge + ablation) ───
     if live is not None:
-        live.update(stage="Intersect2: 聚类 / Clustering",
+        live.update(stage="Detect: 聚类 / Clustering",
                     detail="G* + DBSCAN + merge + ablation...")
     t_stage = time.perf_counter()
     with tracker.stage("cluster_pipeline"):
@@ -1513,7 +1513,7 @@ def _detect_intersections_db(
 
     # ── DB-mode topology: reuse the single-pass tracks workspace ────
     if live is not None:
-        live.update(stage="Intersect2: 拓扑验证 / Topology",
+        live.update(stage="Detect: 拓扑验证 / Topology",
                     detail="Topology verification (single-pass workspace)...")
     t_stage = time.perf_counter()
     with tracker.stage("topology_index"):
@@ -1636,7 +1636,7 @@ def _detect_turn_events(
                         score=abs_turn,
                         source="turn",
                         point_ref=p.point_ref,
-                        cleaned_point_ref=p.cleaned_point_ref,
+                        refined_point_ref=p.refined_point_ref,
                         source_ids=(p.point_ref.source_id,),
                     )
                 )
@@ -1649,7 +1649,7 @@ def _detect_turn_events(
                 detail=f"已处理/Processed:\t{track_count:,}/{total_tracks:,}\t轨迹/tracks",
                 progress=track_count / total_tracks,
                 elapsed=now - t0,
-                stage="Intersect2: 转向事件 / Turn Events",
+                stage="Detect: 转向事件 / Turn Events",
             )
             last_t = now
 
@@ -1749,7 +1749,7 @@ def _getis_local_counts_scan(
         if (i + 1) % 500 == 0 or (now - last_t) >= 3.0:
             _route_progress(live_status, detail=f"G*:\t{i + 1:,}/{len(events):,}\t事件/events",
                             progress=(i + 1) / len(events), elapsed=now - begin,
-                            stage="Intersect2: G* 热点 / Hotspot G*")
+                            stage="Detect: G* 热点 / Hotspot G*")
             last_t = now
     return local_counts
 
@@ -1847,7 +1847,7 @@ def _getis_local_counts_grid(
                 detail=f"G*:\t{i + 1:,}/{len(events):,}\t事件/events",
                 progress=(i + 1) / len(events),
                 elapsed=now - (started or now),
-                stage="Intersect2: G* 热点 / Hotspot G*",
+                stage="Detect: G* 热点 / Hotspot G*",
             )
             last_t = now
     if phase_timings is not None:
@@ -2153,7 +2153,7 @@ def _run_dbscan_large_dispatch(
                 detail=f"DBSCAN:\t{i + 1:,}/{n:,}\t点/points,\t{cluster_label}\t簇/clusters",
                 progress=(i + 1) / n,
                 elapsed=now - t0,
-                stage=f"Intersect2: DBSCAN ({stage})",
+                stage=f"Detect: DBSCAN ({stage})",
             )
             last_t = now
 
@@ -2212,7 +2212,7 @@ def _run_dbscan_scan(
                 detail=f"DBSCAN:\t{i + 1:,}/{n:,}\t点/points,\t{cluster_label}\t簇/clusters",
                 progress=(i + 1) / n,
                 elapsed=now - t0,
-                stage=f"Intersect2: DBSCAN ({stage})",
+                stage=f"Detect: DBSCAN ({stage})",
             )
             last_t = now
     log_info(f"    DBSCAN: {n:,} 点/points → {cluster_label:,} 簇/clusters ({time.perf_counter() - t0:.1f}s)")
@@ -2670,7 +2670,7 @@ def _build_intersection_topologies(
             detail=f"簇/Cluster:\t{cluster_idx:,}/{total_clusters:,}",
             progress=cluster_idx / total_clusters,
             elapsed=time.perf_counter() - t0,
-            stage="Intersect2: 拓扑验证 / Topology",
+            stage="Detect: 拓扑验证 / Topology",
         )
         radius = max(
             cfg.min_intersection_radius_m,
@@ -2803,16 +2803,16 @@ def _extract_entry_exit_observations_batch(
             root = min(batch, key=lambda item: (item[2] != 0.0, item[1]))
             _progress, segment_index, fraction, _kind, crossing_xy = root
             segment_start = track[segment_index]
-            cleaned_ref = segment_start.cleaned_point_ref
+            refined_ref = segment_start.refined_point_ref
             subtrack_index = (
-                cleaned_ref.subtrack_index if cleaned_ref is not None else 1
+                refined_ref.subtrack_index if refined_ref is not None else 1
             )
             crossing_lon, crossing_lat = transformer.inverse(*crossing_xy)
             crossing = CrossingPoint(
                 crossing_calculate_index=crossing_counter,
                 cluster_ref=cluster.cluster_ref,
                 vehicle_id=track[0].vehicle_id,
-                segment_start=cleaned_ref,
+                segment_start=refined_ref,
                 subtrack_index=subtrack_index,
                 point_ref=segment_start.point_ref,
                 crossing_x=crossing_xy[0],

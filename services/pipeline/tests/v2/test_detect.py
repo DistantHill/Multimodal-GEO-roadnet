@@ -1,4 +1,4 @@
-"""Intersect2 turn/cross-track detection and topology verification tests."""
+"""Detect turn/cross-track detection and topology verification tests."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from track.v2.cross_track import (
 )
 from track.v2 import _cross_track_legacy as cross_track_legacy_module
 from track.v2.exceptions import V2Error
-from track.v2.intersect2 import (
+from track.v2.detect import (
     IntersectConfig,
     IntersectResult,
     SpatialWindow,
@@ -63,7 +63,7 @@ from track.v2.intersect2 import (
     detect_intersections,
 )
 from track.v2.models import (
-    CleanedPointRef,
+    RefinedPointRef,
     CrossTrackCandidate,
     EntryExitObservation,
     GeneratedReason,
@@ -76,7 +76,7 @@ from track.v2.models import (
     TurnEvent,
 )
 from track.v2.db.source_table import SourceTableContract
-from track.v2.parser0 import CsvSource, get_database
+from track.v2.parser import CsvSource, get_database
 from track.v2.projection import (
     CoordinateTransformer,
     ProjectionError,
@@ -144,7 +144,7 @@ def _make_point(
     )
 
 
-def _make_xy_cleaned_point(
+def _make_xy_refined_point(
     vehicle_id: str,
     point_id: int,
     timestamp: float,
@@ -154,7 +154,7 @@ def _make_xy_cleaned_point(
     subtrack_index: int,
     sequence_in_subtrack: int,
 ) -> TrajectoryPoint:
-    """Build one already-projected p/i point with a stable Clean identity."""
+    """Build one already-projected p/i point with a stable Refine identity."""
     lon, lat = _TEST_TRANSFORMER.inverse(x, y)
     return replace(
         _make_point(
@@ -168,11 +168,11 @@ def _make_xy_cleaned_point(
         ),
         x=x,
         y=y,
-        cleaned_point_ref=CleanedPointRef(
+        refined_point_ref=RefinedPointRef(
             point_kind="kept",
             point_id=point_id,
             subtrack_index=subtrack_index,
-            cleaned_sequence_in_subtrack=sequence_in_subtrack,
+            refined_sequence_in_subtrack=sequence_in_subtrack,
         ),
     )
 
@@ -266,10 +266,10 @@ class IntersectReportTest(unittest.TestCase):
 
 
 class IntersectConfigStageIdentityTest(unittest.TestCase):
-    def test_config_uses_clean_id_without_run_id_alias(self):
-        config = IntersectConfig(clean_id="clean-9")
+    def test_config_uses_refine_id_without_run_id_alias(self):
+        config = IntersectConfig(refine_id="refine-9")
 
-        self.assertEqual(config.clean_id, "clean-9")
+        self.assertEqual(config.refine_id, "refine-9")
         self.assertFalse(hasattr(config, "run_id"))
 
 
@@ -736,7 +736,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
         self.assertEqual(point.point_ref, PointRef("source-A", "row-7", stable=True))
         self.assertEqual(point.extra, {"tag": "kept"})
 
-    def test_query_kept_mode_joins_frozen_clean_members_without_active_filter(self):
+    def test_query_kept_mode_joins_frozen_refine_members_without_active_filter(self):
         conn = self._Connection(self._ROWS)
         window = self.window
 
@@ -746,7 +746,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             table="tp",
             kept_table="ktp",
             source_table="source-A",
-            clean_id="clean-9",
+            refine_id="refine-9",
             spatial_context=_TEST_SPATIAL_CONTEXT,
             telemetry=None,
         )
@@ -754,7 +754,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
         self.assertIn("FROM ktp AS ktp", conn.cursor_instance.query)
         self.assertIn('JOIN "custom_points" AS tp', conn.cursor_instance.query)
         self.assertIn("ON tp.id = ktp.source_row_key::bigint", conn.cursor_instance.query)
-        self.assertIn("ktp.clean_id = %s", conn.cursor_instance.query)
+        self.assertIn("ktp.refine_id = %s", conn.cursor_instance.query)
         self.assertNotIn("is_active", conn.cursor_instance.query)
         self.assertIn(
             "FROM injected_points   WHERE geom && "
@@ -765,18 +765,18 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             conn.cursor_instance.params,
             [
                 "source-A",
-                "clean-9",
+                "refine-9",
                 *window.prefilter_bounds,
                 window.x_min, window.y_min, window.x_max, window.y_max,
                 "public.injected_points",
                 *window.prefilter_bounds,
                 window.x_min, window.y_min, window.x_max, window.y_max,
-                "clean-9",
+                "refine-9",
             ],
         )
         self.assertEqual(len(points), 1)
 
-    def test_query_kept_mode_requires_clean_id(self):
+    def test_query_kept_mode_requires_refine_id(self):
         conn = self._Connection(self._ROWS)
 
         with self.assertRaises(ValueError):
@@ -784,7 +784,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
                 conn,
                 SpatialWindow(-1.0, -2.0, 3.0, 4.0),
                 kept_table="ktp",
-                clean_id=None,
+                refine_id=None,
                 spatial_context=_TEST_SPATIAL_CONTEXT,
             )
 
@@ -802,7 +802,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             table="tp",
             kept_table="ktp",
             source_table="source-A",
-            clean_id="clean-9",
+            refine_id="refine-9",
             spatial_context=_TEST_SPATIAL_CONTEXT,
         )
 
@@ -834,13 +834,13 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             conn,
             table="tp",
             kept_table="ktp",
-            clean_id="clean-9",
+            refine_id="refine-9",
             spatial_context=_TEST_SPATIAL_CONTEXT,
         ))
 
         self.assertEqual(
             conn.cursor_instance.params,
-            ["tp", "clean-9", "public.injected_points", "clean-9"],
+            ["tp", "refine-9", "public.injected_points", "refine-9"],
         )
         self.assertEqual(len(tracks), 1)
         self.assertEqual(len(tracks[0]), 1)
@@ -938,7 +938,7 @@ class CrossTrackWindowProgressTest(unittest.TestCase):
             spatial_window_size=(1_000.0, 1_000.0),
             spatial_window_overlap=0.0,
         )
-        with patch("track.v2.intersect2._query_active_points_in_window", return_value=[]), \
+        with patch("track.v2.detect._query_active_points_in_window", return_value=[]), \
              patch("builtins.print") as print_mock:
             _extract_cross_track_windows(
                 object(), cfg,
@@ -963,7 +963,7 @@ class CrossTrackWindowProgressTest(unittest.TestCase):
             spatial_window_overlap=0.15,
             cross_track_dbscan_min_samples=1,
         )
-        with patch("track.v2.intersect2._query_active_points_in_window", return_value=points), \
+        with patch("track.v2.detect._query_active_points_in_window", return_value=points), \
               patch("builtins.print"):
             centre_x, centre_y = _TEST_TRANSFORMER.forward(origin_lon, origin_lat)
             candidates = _extract_cross_track_windows(
@@ -1023,7 +1023,7 @@ class ProjectionContextContractTest(unittest.TestCase):
 
         self.assertEqual(result.spatial_context, _TEST_SPATIAL_CONTEXT)
 
-    def test_cleaner_handle_context_must_match_detect_context(self):
+    def test_refine_handle_context_must_match_detect_context(self):
         with self.assertRaisesRegex(V2Error, "does not match"):
             detect_intersections(
                 self._Handle(spatial_context=object()),
@@ -1055,9 +1055,9 @@ class ProjectionContextContractTest(unittest.TestCase):
             self.assertAlmostEqual(actual[0], expected[0], places=7)
             self.assertAlmostEqual(actual[1], expected[1], places=7)
 
-    def test_formal_db_detect_requires_clean_before_any_data_query(self):
-        with patch("track.v2.intersect2._query_spatial_extent") as extent:
-            with self.assertRaisesRegex(V2Error, "requires clean_id"):
+    def test_formal_db_detect_requires_refine_before_any_data_query(self):
+        with patch("track.v2.detect._query_spatial_extent") as extent:
+            with self.assertRaisesRegex(V2Error, "requires refine_id"):
                 detect_intersections(
                     conn=object(),
                     config=IntersectConfig(query_active_from_db=True),
@@ -1065,67 +1065,67 @@ class ProjectionContextContractTest(unittest.TestCase):
         extent.assert_not_called()
 
     def test_formal_db_detect_inherits_context_and_checks_empty_source(self):
-        clean = SimpleNamespace(
-            clean_id="clean-1", source_table="raw_points", status="completed",
+        refine = SimpleNamespace(
+            refine_id="refine-1", source_table="raw_points", status="completed",
             spatial_context=_TEST_SPATIAL_CONTEXT, has_source_fingerprint=True,
         )
         with (
-            patch("track.v2.intersect2.fetch_clean_run_row", return_value=clean),
-            patch("track.v2.intersect2.verify_clean_source_fingerprint") as fingerprint,
-            patch("track.v2.intersect2._query_spatial_extent", return_value=None) as extent,
+            patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
+            patch("track.v2.detect.verify_refine_source_fingerprint") as fingerprint,
+            patch("track.v2.detect._query_spatial_extent", return_value=None) as extent,
         ):
             result = detect_intersections(
                 conn=object(),
-                config=IntersectConfig(query_active_from_db=True, clean_id="clean-1"),
+                config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
             )
 
-        fingerprint.assert_called_once_with(ANY, "clean-1")
+        fingerprint.assert_called_once_with(ANY, "refine-1")
         self.assertEqual(extent.call_args.kwargs["table"], "raw_points")
         self.assertEqual(result.spatial_context, _TEST_SPATIAL_CONTEXT)
 
     def test_formal_db_detect_rejects_assertion_and_source_mismatch(self):
-        clean = SimpleNamespace(
-            clean_id="clean-1", source_table="raw_points", status="completed",
+        refine = SimpleNamespace(
+            refine_id="refine-1", source_table="raw_points", status="completed",
             spatial_context=_TEST_SPATIAL_CONTEXT, has_source_fingerprint=True,
         )
         different = SpatialContext(
             4326, 32649,
             {"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": .01},
         )
-        with patch("track.v2.intersect2.fetch_clean_run_row", return_value=clean):
+        with patch("track.v2.detect.fetch_refine_run_row", return_value=refine):
             with self.assertRaisesRegex(V2Error, "does not match"):
                 detect_intersections(
-                    conn=object(), config=IntersectConfig(query_active_from_db=True, clean_id="clean-1"),
+                    conn=object(), config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
                     spatial_context=different,
                 )
             with self.assertRaisesRegex(V2Error, "source_table"):
                 detect_intersections(
                     conn=object(),
                     config=IntersectConfig(
-                        query_active_from_db=True, clean_id="clean-1", source_table="wrong",
+                        query_active_from_db=True, refine_id="refine-1", source_table="wrong",
                     ),
                 )
 
-    def test_formal_db_detect_rejects_unready_clean_and_table_overrides_before_reads(self):
+    def test_formal_db_detect_rejects_unready_refine_and_table_overrides_before_reads(self):
         for status, fingerprint in (("running", True), ("completed", False)):
-            clean = SimpleNamespace(
-                clean_id="clean-1", source_table="raw_points", status=status,
+            refine = SimpleNamespace(
+                refine_id="refine-1", source_table="raw_points", status=status,
                 spatial_context=_TEST_SPATIAL_CONTEXT, has_source_fingerprint=fingerprint,
             )
             with (
                 self.subTest(status=status, fingerprint=fingerprint),
-                patch("track.v2.intersect2.fetch_clean_run_row", return_value=clean),
-                patch("track.v2.intersect2._query_spatial_extent") as extent,
+                patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
+                patch("track.v2.detect._query_spatial_extent") as extent,
             ):
                 with self.assertRaisesRegex(V2Error, "completed immutable-source"):
                     detect_intersections(
                         conn=object(),
-                        config=IntersectConfig(query_active_from_db=True, clean_id="clean-1"),
+                        config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
                     )
                 extent.assert_not_called()
 
-        clean = SimpleNamespace(
-            clean_id="clean-1", source_table="raw_points", status="completed",
+        refine = SimpleNamespace(
+            refine_id="refine-1", source_table="raw_points", status="completed",
             spatial_context=_TEST_SPATIAL_CONTEXT, has_source_fingerprint=True,
         )
         for override in (
@@ -1134,13 +1134,13 @@ class ProjectionContextContractTest(unittest.TestCase):
         ):
             with (
                 self.subTest(override=override),
-                patch("track.v2.intersect2.fetch_clean_run_row", return_value=clean),
+                patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
             ):
                 with self.assertRaisesRegex(V2Error, "does not belong|must use"):
                     detect_intersections(
                         conn=object(),
                         config=IntersectConfig(
-                            query_active_from_db=True, clean_id="clean-1", **override,
+                            query_active_from_db=True, refine_id="refine-1", **override,
                         ),
                     )
     def test_in_memory_handle_does_not_trust_unscoped_existing_xy(self):
@@ -1183,7 +1183,7 @@ class ProjectionContextContractTest(unittest.TestCase):
             x=float("nan"), y=valid_y,
         )
         with patch(
-            "track.v2.intersect2._stream_vehicle_tracks_from_db",
+            "track.v2.detect._stream_vehicle_tracks_from_db",
             return_value=iter([[bad_xy]]),
         ):
             with self.assertRaisesRegex(V2Error, "non-finite processing"):
@@ -1196,7 +1196,7 @@ class ProjectionContextContractTest(unittest.TestCase):
             x=valid_x, y=valid_y,
         )
         with patch(
-            "track.v2.intersect2._stream_vehicle_tracks_from_db",
+            "track.v2.detect._stream_vehicle_tracks_from_db",
             return_value=iter([[outside]]),
         ):
             strict_context = SpatialContext(
@@ -1347,7 +1347,7 @@ class TurnDetectionTest(unittest.TestCase):
         expected = _detect_turn_events(projected, cfg)
 
         with patch(
-            "track.v2.intersect2._stream_vehicle_tracks_from_db",
+            "track.v2.detect._stream_vehicle_tracks_from_db",
             return_value=iter([track]),
         ):
             actual, workspace = _stream_extract_method_1(
@@ -1515,7 +1515,7 @@ class GetisOrdGStarTest(unittest.TestCase):
         ]
         # If the threshold/fallback regresses, this mock makes the test fail:
         # successful computation proves the actual grid path was exercised.
-        with patch("track.v2.intersect2._getis_local_counts_scan", side_effect=AssertionError("scan fallback used")):
+        with patch("track.v2.detect._getis_local_counts_scan", side_effect=AssertionError("scan fallback used")):
             actual_counts = _getis_local_counts_grid(events, radius)
             actual_z = _compute_getis_ord_g_star(events, radius)
             actual_selected = [
@@ -1578,7 +1578,7 @@ class GetisOrdGStarTest(unittest.TestCase):
         """Huge finite quotient ULPs cannot create an unbounded cell range."""
         events = self._large_events([(1e308, float(index * 3)) for index in range(257)])
         expected_counts = _getis_local_counts_scan(events, 1.0)
-        with patch("track.v2.intersect2._getis_local_counts_scan", wraps=_getis_local_counts_scan) as fallback:
+        with patch("track.v2.detect._getis_local_counts_scan", wraps=_getis_local_counts_scan) as fallback:
             actual_counts = _getis_local_counts_grid(events, 1.0)
         self.assertEqual(actual_counts, expected_counts)
         fallback.assert_called_once()
@@ -1784,7 +1784,7 @@ class DBSCANTest(unittest.TestCase):
         xs = [-1e-300, 1.0, math.nextafter(1.0, math.inf)] + [1000.0 + i * 10.0 for i in range(254)]
         ys = [0.0] * len(xs)
         expected = self._historical_scan_oracle(xs, ys, 1.0, 1)
-        with patch("track.v2.intersect2._neighbors_indices", side_effect=AssertionError("full scan fallback forbidden")):
+        with patch("track.v2.detect._neighbors_indices", side_effect=AssertionError("full scan fallback forbidden")):
             actual = _run_dbscan(xs, ys, eps_m=1.0, min_samples=1)
         self.assertEqual(actual, expected)
 
@@ -1808,7 +1808,7 @@ class DBSCANTest(unittest.TestCase):
 
     def test_dense_grid_enqueues_each_point_at_most_once(self):
         """Dense clusters do not re-materialise N neighbours for every core."""
-        from track.v2.intersect2 import _take_grid_frontier_neighbors
+        from track.v2.detect import _take_grid_frontier_neighbors
 
         taken = 0
 
@@ -1820,7 +1820,7 @@ class DBSCANTest(unittest.TestCase):
 
         count = 2_000
         with patch(
-            "track.v2.intersect2._take_grid_frontier_neighbors",
+            "track.v2.detect._take_grid_frontier_neighbors",
             side_effect=observe,
         ):
             labels = _run_dbscan(
@@ -1877,7 +1877,7 @@ class DBSCANTest(unittest.TestCase):
             value = _build_dbscan_grid(*args)
             build_results.append(value)
             return value
-        with patch("track.v2.intersect2._build_dbscan_grid", side_effect=observe_build) as build_grid:
+        with patch("track.v2.detect._build_dbscan_grid", side_effect=observe_build) as build_grid:
             actual = _run_dbscan(xs, ys, eps_m=1.0, min_samples=1)
         build_grid.assert_called_once_with(xs, ys, 1.0)
         self.assertEqual(build_results, [None])
@@ -2203,7 +2203,7 @@ class TopologyExtractionTest(unittest.TestCase):
         ]})["v1"]
 
         with patch(
-            "track.v2.intersect2._extract_entry_exit_observations_batch",
+            "track.v2.detect._extract_entry_exit_observations_batch",
             return_value=([], []),
         ) as extract:
             topologies, annotated, observations = _build_topologies_from_tracks(
@@ -2237,15 +2237,15 @@ class TopologyExtractionTest(unittest.TestCase):
             source="turn",
         )
         track = [
-            _make_xy_cleaned_point(
+            _make_xy_refined_point(
                 "v1", 1, 0.0, -250.0, 0.0,
                 subtrack_index=1, sequence_in_subtrack=0,
             ),
-            _make_xy_cleaned_point(
+            _make_xy_refined_point(
                 "v1", 2, 1.0, 0.0, 0.0,
                 subtrack_index=1, sequence_in_subtrack=1,
             ),
-            _make_xy_cleaned_point(
+            _make_xy_refined_point(
                 "v1", 3, 2.0, 250.0, 0.0,
                 subtrack_index=1, sequence_in_subtrack=2,
             ),
@@ -2282,21 +2282,21 @@ class TopologyExtractionTest(unittest.TestCase):
         )
         tracks = {
             "v1\x001": [
-                _make_xy_cleaned_point(
+                _make_xy_refined_point(
                     "v1", 1, 0.0, -90.0, 0.0,
                     subtrack_index=1, sequence_in_subtrack=0,
                 ),
-                _make_xy_cleaned_point(
+                _make_xy_refined_point(
                     "v1", 2, 1.0, -80.0, 0.0,
                     subtrack_index=1, sequence_in_subtrack=1,
                 ),
             ],
             "v1\x002": [
-                _make_xy_cleaned_point(
+                _make_xy_refined_point(
                     "v1", 3, 2.0, 80.0, 0.0,
                     subtrack_index=2, sequence_in_subtrack=0,
                 ),
-                _make_xy_cleaned_point(
+                _make_xy_refined_point(
                     "v1", 4, 3.0, 90.0, 0.0,
                     subtrack_index=2, sequence_in_subtrack=1,
                 ),
@@ -2331,11 +2331,11 @@ class TopologyExtractionTest(unittest.TestCase):
             source="turn",
         )
         track = [
-            _make_xy_cleaned_point(
+            _make_xy_refined_point(
                 "v1", 1, 0.0, -250.0, 0.0,
                 subtrack_index=1, sequence_in_subtrack=0,
             ),
-            _make_xy_cleaned_point(
+            _make_xy_refined_point(
                 "v1", 2, 1.0, 250.0, 0.0,
                 subtrack_index=1, sequence_in_subtrack=1,
             ),
@@ -2410,40 +2410,40 @@ class TopologyExtractionTest(unittest.TestCase):
 
         with (
             patch(
-                "track.v2.intersect2._query_spatial_extent",
+                "track.v2.detect._query_spatial_extent",
                 return_value=(115.0, 38.0, 117.0, 40.0),
             ),
             patch(
-                "track.v2.intersect2.fetch_clean_run_row",
+                "track.v2.detect.fetch_refine_run_row",
                 return_value=SimpleNamespace(
-                    clean_id="clean-1",
+                    refine_id="refine-1",
                     source_table="trajectory_points",
                     status="completed",
                     spatial_context=_TEST_SPATIAL_CONTEXT,
                     has_source_fingerprint=True,
                 ),
             ),
-            patch("track.v2.intersect2.verify_clean_source_fingerprint"),
+            patch("track.v2.detect.verify_refine_source_fingerprint"),
             patch(
-                "track.v2.intersect2._stream_extract_method_1",
+                "track.v2.detect._stream_extract_method_1",
                 return_value=([], tracks),
             ),
             patch(
-                "track.v2.intersect2._extract_cross_track_db_workspace",
+                "track.v2.detect._extract_cross_track_db_workspace",
                 return_value=[],
             ),
             patch(
-                "track.v2.intersect2._cluster_pipeline",
+                "track.v2.detect._cluster_pipeline",
                 return_value=([], [cluster]),
             ),
             patch(
-                "track.v2.intersect2._build_topologies_from_tracks",
+                "track.v2.detect._build_topologies_from_tracks",
                 return_value=([topology], [cluster], []),
             ) as build_topologies,
         ):
             result = detect_intersections(
                 conn=object(),
-                config=IntersectConfig(query_active_from_db=True, clean_id="clean-1"),
+                config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
             )
 
         self.assertIs(build_topologies.call_args.args[1], tracks)

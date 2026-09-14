@@ -24,7 +24,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from track.v2.manual_thin_benchmark._thin_bench_helpers import connect_test_db, TEST_DB_NAME
-from track.v2.intersect2 import (
+from track.v2.detect import (
     IntersectConfig,
     SpatialWindowIterator,
     _query_active_points_in_window,

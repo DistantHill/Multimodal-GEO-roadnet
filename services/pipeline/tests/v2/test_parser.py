@@ -1,4 +1,4 @@
-"""Parser 0 tests — PRD §10.1 (22 items)."""
+"""Parser tests — PRD §10.1 (22 items)."""
 
 from __future__ import annotations
 
@@ -26,16 +26,15 @@ from track.v2.models import (
     TrajectoryPoint,
     TrackModel,
 )
-from track.v2.parser0 import (
+from track.v2.field_config import build_field_mapping, load_field_config
+from track.v2.parser import (
     CsvSource,
     PostgresSource,
-    _build_field_mapping,
-    _detect_csv_encoding,
-    _load_field_specs,
+    detect_encoding,
     _parse_timestamp,
     get_database,
 )
-from track.v2.sources import PostgresTrajectorySourceHandle
+from track.v2.parser import PostgresTrajectorySourceHandle
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -74,7 +73,7 @@ class DefaultTomlLoadingTest(unittest.TestCase):
     """P0-01: Default TOML loads and parses correctly."""
 
     def test_default_toml_loads(self):
-        specs = _load_field_specs(None)
+        specs = load_field_config(None).specs
         self.assertIsInstance(specs, list)
         self.assertTrue(len(specs) > 0)
         canonicals = {s.canonical for s in specs}
@@ -98,7 +97,7 @@ type = "str"
 """,
                 encoding="utf-8",
             )
-            specs = _load_field_specs(toml_path)
+            specs = load_field_config(toml_path).specs
             self.assertEqual(len(specs), 1)
             self.assertEqual(specs[0].canonical, "vehicle_id")
             self.assertEqual(list(specs[0].aliases), ["custom_vid"])
@@ -109,7 +108,7 @@ class TomlMissingTest(unittest.TestCase):
 
     def test_custom_toml_not_found(self):
         with self.assertRaises(ConfigError):
-            _load_field_specs(Path("/nonexistent/path.toml"))
+            load_field_config(Path("/nonexistent/path.toml")).specs
 
 
 class Utf8BomCsvTest(unittest.TestCase):
@@ -118,7 +117,7 @@ class Utf8BomCsvTest(unittest.TestCase):
     def test_utf8_bom_csv(self):
         with tempfile.TemporaryDirectory() as td:
             csv_path = _make_csv(td, "test.csv", "﻿vid,lng,lat,included_angle,gps_speed,gps_time_a\n", encoding="utf-8-sig")
-            encoding = _detect_csv_encoding(csv_path, None)
+            encoding = detect_encoding(csv_path, hint_encoding=None)
             self.assertIn(encoding, ("utf-8-sig", "utf-8"))
 
 
@@ -130,7 +129,7 @@ class GbkEncodingTest(unittest.TestCase):
             header = "vid,lng,lat,included_angle,gps_speed,gps_time_a\n"
             for enc, name in [("gbk", "GBK"), ("gb18030", "GB18030")]:
                 csv_path = _make_csv(td, f"test_{name}.csv", header, encoding=enc)
-                detected = _detect_csv_encoding(csv_path, None)
+                detected = detect_encoding(csv_path, hint_encoding=None)
                 # Should be recognized as CJK
                 self.assertIsNotNone(detected)
 
@@ -141,8 +140,8 @@ class Hfm130CsvTest(unittest.TestCase):
     def test_hfm_aliases(self):
         # Hfm_130pts.csv has columns: vid, lng, lat, included_angle, gps_speed, gps_time_a
         # The default TOML should match these via aliases
-        specs = _load_field_specs(None)
-        mapping = _build_field_mapping(
+        specs = load_field_config(None).specs
+        mapping = build_field_mapping(
             specs,
             ["vid", "lng", "lat", "included_angle", "gps_speed", "gps_time_a"],
             None,
@@ -166,8 +165,8 @@ class GuijiTop10wCsvTest(unittest.TestCase):
             "terminal_status", "vehicle_status", "alarm_status", "acc_status",
             "included_angle", "gps_time", "sim_number",
         ]
-        specs = _load_field_specs(None)
-        mapping = _build_field_mapping(specs, columns, None)
+        specs = load_field_config(None).specs
+        mapping = build_field_mapping(specs, columns, None)
         for core in ("vehicle_id", "lon", "lat", "heading", "timestamp"):
             self.assertIn(core, mapping.canonical_to_source, f"missing {core}")
 
@@ -182,7 +181,7 @@ class FieldSelectionRequiredTest(unittest.TestCase):
             FieldSpec(canonical="lat", aliases=("lat",), required=True, type="float"),
         ]
         with self.assertRaises(FieldSelectionRequired) as ctx:
-            _build_field_mapping(specs, ["vehicle_id", "lng"], None)  # missing "lat"
+            build_field_mapping(specs, ["vehicle_id", "lng"], None)  # missing "lat"
         self.assertIn("lat", ctx.exception.missing)
         self.assertIn("vehicle_id", ctx.exception.available)
 
@@ -191,8 +190,8 @@ class FakeSelectorTest(unittest.TestCase):
     """P0-09: Fake selector resolves missing field mapping."""
 
     def test_fake_selector_binds_fields(self):
-        specs = _load_field_specs(None)
-        mapping = _build_field_mapping(
+        specs = load_field_config(None).specs
+        mapping = build_field_mapping(
             specs,
             ["custom_id", "custom_lng", "custom_lat", "custom_angle", "custom_speed", "custom_time"],
             lambda cols: {
@@ -485,7 +484,7 @@ class ExtraFieldTest(unittest.TestCase):
     """P0-21: TOML extra=true fields appear in TrajectoryPoint.extra."""
 
     def test_extra_fields_present(self):
-        specs = _load_field_specs(None)
+        specs = load_field_config(None).specs
         # Check that road_id and altitude have extra=True in spec
         extra_specs = [s for s in specs if s.extra]
         self.assertTrue(len(extra_specs) > 0, "should have extra fields defined")

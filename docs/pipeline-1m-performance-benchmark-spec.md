@@ -216,7 +216,7 @@ Pipeline cgroup 精确峰值为 1,232.7 MiB。Pipeline 抽样峰值时 PostgreSQ
 - 改动：`_stream_extract_method_1` 在流式检测时构建一次
   `dict[vehicle_id, list[TrajectoryPoint]]`，由转向检测、全局跨车计算和拓扑
   验证共享。实现见
-  [`intersect2.py`](../services/pipeline/src/track/v2/intersect2.py)。
+  [`intersect2.py`](../services/pipeline/src/track/v2/detect.py)。
 - 效果：它是 PERF-02 和 PERF-04 的架构前提。组合后 Detect 计算由 633.628s
   降到 49.951s；该收益不能与全局网格、DBSCAN、拓扑索引拆开单独归因。
 - 内存：常驻 615,875 个有效点和 34,281 个轨迹列表，是 Detect 的主要内存来源，
@@ -232,7 +232,7 @@ Pipeline cgroup 精确峰值为 1,232.7 MiB。Pipeline 抽样峰值时 PostgreSQ
   20,000,000 overflow pair-space 两个全局路径预算；超限时进入不发起逐窗口 SQL
   的内存 point-window 回退路径，该回退自身没有独立的硬容量上限。
   实现见 [`cross_track.py`](../services/pipeline/src/track/v2/cross_track.py) 和
-  [`intersect2.py`](../services/pipeline/src/track/v2/intersect2.py)。
+  [`intersect2.py`](../services/pipeline/src/track/v2/detect.py)。
 - 效果：跨车空间计算从 348.775s 降到 26.925s，约 13.0×。当前路径发现
   58,669 个候选，历史窗口路径为 53,549 个；候选簇由 390 变为 394，完整
   交叉口仍为 175。候选增加与更完整的窗口边界覆盖一致，但未逐候选归因；当前
@@ -251,7 +251,7 @@ Pipeline cgroup 精确峰值为 1,232.7 MiB。Pipeline 抽样峰值时 PostgreSQ
   当前簇维护 active frontier，点入队时即从可用 cell set 删除，后续扩张只取得
   尚未入队的邻居，避免密集簇内重复物化和遍历。小输入及不能安全索引的非有限
   边界输入继续使用扫描路径。
-  实现见 [`intersect2.py`](../services/pipeline/src/track/v2/intersect2.py)。
+  实现见 [`intersect2.py`](../services/pipeline/src/track/v2/detect.py)。
 - 效果：跨车 DBSCAN 在候选增加到 58,669 点的情况下约 2.0s，观察到约 72×
   加速；包含 G*、两类 DBSCAN、合并和消融的聚类流程由 150.468s 降到
   4.512s，约 33.3×。

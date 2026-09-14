@@ -28,20 +28,20 @@ def test_every_existing_public_export_preserves_identity():
     import track.v2 as v2
 
     expected = {
-        "cleaner1": "clean",
+        "refine": "refine_vehicle",
         "clip": "extract_clips extract_clips_for_detect",
         "fitting": "fit_centerlines fit_centerline_variants",
-        "intersect2": "IntersectConfig IntersectResult detect_intersections",
+        "detect": "IntersectConfig IntersectResult detect_intersections",
         "network": "build_network",
         "models": (
-            "Centerline CenterlineFitBundle CleanerConfig ClipConfig ClipEndpoint "
+            "Centerline CenterlineFitBundle RefineConfig ClipConfig ClipEndpoint "
             "ClipInput ClipIntersection ClipPoint ClipReport ClipResult ClipTrack "
             "CsvSource FitIssue FitReport FitResult FittingConfig NetworkConfig "
             "NetworkEdge NetworkIssue NetworkNode NetworkReport NetworkResult "
             "PointRef PostgresSource ProjectionConfig ResolvedTrackPoint SpatialContext "
             "TrackClip TrajectoryPoint"
         ),
-        "parser0": "get_database",
+        "parser": "get_database",
         "projection": (
             "ProjectionError QueryWindow QueryWindowRequest build_query_window create_spatial_context"
         ),
@@ -61,7 +61,7 @@ def test_every_existing_public_export_preserves_identity():
 def test_star_import_exposes_documented_names():
     namespace = {}
     exec("from track.v2 import *", namespace)
-    assert callable(namespace["clean"])
+    assert callable(namespace["refine_vehicle"])
     assert callable(namespace["fit_centerlines"])
     assert "PipelineResult" in namespace
     assert "_MODULE_EXPORTS" not in namespace

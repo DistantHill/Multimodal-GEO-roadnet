@@ -15,12 +15,12 @@ from typing import Any, Protocol
 from ..clip import extract_clips_for_detect
 from .queries import fetch_detect_row
 from ..db_writer import (
-    CleanRunRecord,
-    create_clean_run,
+    RefineRunRecord,
+    create_refine_run,
     create_detect_run,
     create_fit_run,
-    fetch_clean_run,
-    finish_clean_run,
+    fetch_refine_run,
+    finish_refine_run,
     finish_detect_run,
     finish_fit_run,
     insert_centerline_bundle,
@@ -29,7 +29,7 @@ from ..db_writer import (
     insert_kept_trajectory_points,
     persist_detect_result,
 )
-from ..intersect2 import IntersectResult
+from ..detect import IntersectResult
 from ..models import (
     CenterlineFitBundle,
     ClipConfig,
@@ -46,8 +46,8 @@ _DEFAULT_BATCH_SIZE = 5000
 
 
 @dataclass(frozen=True, slots=True)
-class CleanBatchResult:
-    """Counts and cursor state produced by one persisted Clean batch."""
+class RefineBatchResult:
+    """Counts and cursor state produced by one persisted Refine batch."""
 
     next_subtrack_index: int
     kept_count: int
@@ -78,9 +78,9 @@ class PipelineStore(Protocol):
 
     def rollback(self) -> None: ...
 
-    def get_clean_run(self, clean_id: str) -> CleanRunRecord: ...
+    def get_refine_run(self, refine_id: str) -> RefineRunRecord: ...
 
-    def start_clean_run(
+    def start_refine_run(
         self,
         *,
         source_table: str,
@@ -88,29 +88,29 @@ class PipelineStore(Protocol):
         spatial_context: SpatialContext,
     ) -> str: ...
 
-    def finish_clean(
+    def finish_refine(
         self,
-        clean_id: str,
+        refine_id: str,
         *,
         status: str,
         source_fingerprint: dict[str, object] | None = None,
     ) -> None: ...
 
-    def persist_clean_batch(
+    def persist_refine_batch(
         self,
-        clean_id: str,
+        refine_id: str,
         pending_excluded: list[ExcludedPoint],
         pending_subtracks: list[RefinementSubtrack],
         subtrack_index: int,
         *,
         spatial_context: SpatialContext,
         batch_size: int = _DEFAULT_BATCH_SIZE,
-    ) -> CleanBatchResult: ...
+    ) -> RefineBatchResult: ...
 
     def start_detect_run(
         self,
         *,
-        clean_id: str,
+        refine_id: str,
         parameters: dict[str, Any],
     ) -> str: ...
 
@@ -172,59 +172,59 @@ class PostgresPipelineStore:
     def rollback(self) -> None:
         self._conn.rollback()
 
-    def get_clean_run(self, clean_id: str) -> CleanRunRecord:
-        return fetch_clean_run(self._conn, clean_id)
+    def get_refine_run(self, refine_id: str) -> RefineRunRecord:
+        return fetch_refine_run(self._conn, refine_id)
 
-    def start_clean_run(
+    def start_refine_run(
         self,
         *,
         source_table: str,
         parameters: dict[str, Any],
         spatial_context: SpatialContext,
     ) -> str:
-        return create_clean_run(
+        return create_refine_run(
             self._conn,
             source_table=source_table,
             parameters=parameters,
             spatial_context=spatial_context,
         )
 
-    def finish_clean(
+    def finish_refine(
         self,
-        clean_id: str,
+        refine_id: str,
         *,
         status: str,
         source_fingerprint: dict[str, object] | None = None,
     ) -> None:
-        finish_clean_run(
+        finish_refine_run(
             self._conn,
-            clean_id,
+            refine_id,
             status=status,
             source_fingerprint=source_fingerprint,
         )
 
-    def persist_clean_batch(
+    def persist_refine_batch(
         self,
-        clean_id: str,
+        refine_id: str,
         pending_excluded: list[ExcludedPoint],
         pending_subtracks: list[RefinementSubtrack],
         subtrack_index: int,
         *,
         spatial_context: SpatialContext,
         batch_size: int = _DEFAULT_BATCH_SIZE,
-    ) -> CleanBatchResult:
-        run_row = fetch_clean_run(self._conn, clean_id)
+    ) -> RefineBatchResult:
+        run_row = fetch_refine_run(self._conn, refine_id)
         if run_row.status != "running":
-            raise ValueError(f"Clean Run {clean_id} is not running")
+            raise ValueError(f"Refine Run {refine_id} is not running")
         if run_row.spatial_context != spatial_context:
             raise ValueError(
-                f"Clean Run {clean_id} SpatialContext does not match the batch"
+                f"Refine Run {refine_id} SpatialContext does not match the batch"
             )
         if pending_excluded:
             insert_excluded_points(
                 self._conn,
                 ExcludedIndex(items=list(pending_excluded)),
-                clean_id=clean_id,
+                refine_id=refine_id,
                 batch_size=batch_size,
             )
             pending_excluded.clear()
@@ -238,19 +238,19 @@ class PostgresPipelineStore:
             kept_count = insert_kept_trajectory_points(
                 self._conn,
                 assigned_subtracks,
-                clean_id=clean_id,
+                refine_id=refine_id,
             )
             insert_injected_points(
                 self._conn,
                 assigned_subtracks,
-                clean_id=clean_id,
+                refine_id=refine_id,
                 spatial_context=spatial_context,
                 batch_size=batch_size,
             )
             subtrack_index += len(assigned_subtracks)
             pending_subtracks.clear()
 
-        return CleanBatchResult(
+        return RefineBatchResult(
             next_subtrack_index=subtrack_index,
             kept_count=kept_count,
         )
@@ -258,12 +258,12 @@ class PostgresPipelineStore:
     def start_detect_run(
         self,
         *,
-        clean_id: str,
+        refine_id: str,
         parameters: dict[str, Any],
     ) -> str:
         return create_detect_run(
             self._conn,
-            clean_id=clean_id,
+            refine_id=refine_id,
             parameters=parameters,
         )
 
@@ -280,7 +280,7 @@ class PostgresPipelineStore:
             raise ValueError(f"Detect Run {detect_id} is not running")
         if run_row.spatial_context != spatial_context:
             raise ValueError(
-                f"Detect Run {detect_id} SpatialContext does not match its Clean Run"
+                f"Detect Run {detect_id} SpatialContext does not match its Refine Run"
             )
         counts = persist_detect_result(
             self._conn,

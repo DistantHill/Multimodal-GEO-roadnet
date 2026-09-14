@@ -11,7 +11,7 @@ source_srid = 4326
 enforce_area_of_use = true
 max_scale_error = 0.01
 
-[cleaner]
+[refine]
 max_extension_m = 80.0
 min_heading_delta_deg = 80.0
 max_heading_delta_deg = 100.0
@@ -73,6 +73,6 @@ default_text_encoding = "utf-8-sig"
 fallback_encodings = ["gb18030", "gbk", "cp936", "big5"]
 mark_flush_every_n = 2000
 excluded_flush_threshold = 2000
-cleaner_flush_point_threshold = 100000
+refine_flush_point_threshold = 100000
 progress_interval = 500
 progress_time_threshold_s = 2.0

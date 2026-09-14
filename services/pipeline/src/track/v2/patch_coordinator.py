@@ -1,6 +1,6 @@
 """Durable flat-stage coordination over an already sealed task manifest.
 
-This is a programmatic integration point, not the production Cleaner entrypoint.
+This is a programmatic integration point, not the production Refine entrypoint.
 The caller owns input fingerprint verification, measured budget calibration,
 exclusive runtime directory accounting and the ledger's start/close lifecycle.
 No DB connection or materialized rows are sent to calculation processes.

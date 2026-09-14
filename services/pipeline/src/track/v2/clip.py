@@ -13,7 +13,7 @@ from .db.queries import (
     fetch_intersections,
     fetch_resolved_clip_tracks,
 )
-from .db.source_table import verify_clean_source_fingerprint
+from .db.source_table import verify_refine_source_fingerprint
 from .models import (
     ClipConfig,
     ClipEndpoint,
@@ -94,7 +94,7 @@ def extract_clips_for_detect(
     run = fetch_detect_row(conn, detect_id)
     if run.status != "completed":
         raise ValueError(f"Detect Run {detect_id} is not completed")
-    verify_clean_source_fingerprint(conn, run.clean_id)
+    verify_refine_source_fingerprint(conn, run.refine_id)
     source = ClipInput(
         intersections=tuple(fetch_intersections(conn, detect_id)),
         tracks=tuple(fetch_resolved_clip_tracks(conn, detect_id)),

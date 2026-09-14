@@ -87,16 +87,16 @@ class Connection:
 
 
 SIGNATURE = ResumeSignature("input-v1", "code-v1", "algorithm-v1", "a" * 64)
-MANIFEST = PatchManifest("run", "clean", "subtrack", '{"group":1}',
+MANIFEST = PatchManifest("run", "refine", "subtrack", '{"group":1}',
                          SIGNATURE.input_fingerprint, SIGNATURE.semantic_config_digest,
                          SIGNATURE.code_version, SIGNATURE.algorithm_version, 5)
-TOKEN = AttemptToken("run", "clean", MANIFEST.task_id, 1, 1, "attempt-1")
+TOKEN = AttemptToken("run", "refine", MANIFEST.task_id, 1, 1, "attempt-1")
 
 
 def active(rows=()):
     conn = Connection(rows)
     ledger = PatchLedger(conn, schema='isolated"schema')
-    ledger.run_id, ledger.stage, ledger.generation = "run", "clean", 1
+    ledger.run_id, ledger.stage, ledger.generation = "run", "refine", 1
     ledger.signature, ledger._lock_key = SIGNATURE, 42
     return ledger, conn
 
@@ -132,13 +132,13 @@ def test_installer_quotes_schema_and_owns_transaction():
 def test_start_records_generation_and_sanitized_supplied_metadata():
     conn = Connection([(False,), (True,), None])
     ledger = PatchLedger(conn)
-    assert ledger.start("run", "clean", SIGNATURE,
+    assert ledger.start("run", "refine", SIGNATURE,
                         execution_config={"n": 10}, environment={"cpu": "unknown"}) == 1
     inserts = [params for query, params in conn.statements if "pipeline_patch_executions" in query]
-    assert inserts == [("run", "clean", 1, '{"n":10}', '{"cpu":"unknown"}')]
+    assert inserts == [("run", "refine", 1, '{"n":10}', '{"cpu":"unknown"}')]
     assert conn.commits == 1
     with pytest.raises(LedgerError, match="Close"):
-        ledger.start("other", "clean", SIGNATURE, execution_config={}, environment={})
+        ledger.start("other", "refine", SIGNATURE, execution_config={}, environment={})
 
 
 @pytest.mark.parametrize("field,value", [("generation", True), ("generation", 0),
@@ -287,7 +287,7 @@ def test_lookup_is_one_bounded_query_and_uses_quoted_schema():
     assert state.status == "complete"
     assert len(conn.statements) == 1
     assert '"isolated""schema".pipeline_patch_tasks' in conn.statements[0][0]
-    assert conn.statements[0][1] == ("run", "clean", MANIFEST.task_id)
+    assert conn.statements[0][1] == ("run", "refine", MANIFEST.task_id)
 
 
 def test_close_healthy_connection_releases_only_our_lock():
@@ -325,7 +325,7 @@ def test_pending_manifest_page_restores_fixed_manifest_with_bounded_fetch():
     assert "status = 'pending'" in query
     assert "next_retry_at <= clock_timestamp()" in query
     assert "ORDER BY task_id LIMIT %s" in query
-    assert params == ("run", "clean", 2)
+    assert params == ("run", "refine", 2)
     assert not any(query.startswith(("UPDATE", "INSERT")) for query, _ in conn.statements)
 
 
@@ -370,7 +370,7 @@ def test_start_closes_session_when_lock_acquisition_acknowledgement_fails(failur
     conn.cursor = lambda: FailedCursor(conn)
     ledger = PatchLedger(conn)
     with pytest.raises(OSError):
-        ledger.start("run", "clean", SIGNATURE, execution_config={}, environment={})
+        ledger.start("run", "refine", SIGNATURE, execution_config={}, environment={})
     assert conn.closed
     assert ledger._lock_key is None
     assert ledger.run_id is None
@@ -382,7 +382,7 @@ def test_start_known_lock_refusal_preserves_existing_owner_and_connection(rows):
     conn = Connection(rows)
     ledger = PatchLedger(conn)
     with pytest.raises(RunLocked):
-        ledger.start("run", "clean", SIGNATURE, execution_config={}, environment={})
+        ledger.start("run", "refine", SIGNATURE, execution_config={}, environment={})
     assert not conn.closed
     assert ledger._lock_key is None
     assert not any("pg_advisory_unlock" in query for query, _ in conn.statements)
@@ -400,7 +400,7 @@ def test_stage_state_is_one_guarded_bounded_aggregate(counts):
     assert "count(*) FILTER" in query
     assert "statement_timestamp()" in query
     assert "manifest" not in query
-    assert params == ("run", "clean")
+    assert params == ("run", "refine")
     assert not conn.fetch_sizes
     with pytest.raises(FrozenInstanceError):
         state.pending = 9
@@ -445,11 +445,11 @@ def test_abandon_updates_current_working_tasks_and_history_atomically():
     updates = [(query, params) for query, params in conn.statements if query.startswith("UPDATE")]
     assert len(updates) == 2
     assert "status = 'abandoned'" in updates[0][0]
-    assert updates[0][1] == ("Pool confirmed stopped", "run", "clean", 1)
+    assert updates[0][1] == ("Pool confirmed stopped", "run", "refine", 1)
     assert "attempt_no < 3" in updates[1][0]
     assert "THEN 'pending' ELSE 'failed' END" in updates[1][0]
     assert "attempt_token = NULL, next_retry_at = NULL" in updates[1][0]
-    assert updates[1][1] == ("run", "clean", 1)
+    assert updates[1][1] == ("run", "refine", 1)
     for query, _ in updates:
         assert "generation = %s AND status = 'working'" in query
 
@@ -583,7 +583,7 @@ def test_start_failure_preserves_original_when_cleanup_is_interrupted(unlock_err
     conn.execute, conn.close = execute, close
     ledger = PatchLedger(conn)
     with pytest.raises(ArithmeticError) as raised:
-        ledger.start("run", "clean", SIGNATURE, execution_config={}, environment={})
+        ledger.start("run", "refine", SIGNATURE, execution_config={}, environment={})
     assert raised.value is original
     assert close_calls == [True]
     assert conn.closed is (close_error is None)
@@ -611,7 +611,7 @@ def test_failed_acquisition_close_interruption_preserves_original_and_clears_ide
     conn.cursor, conn.close = lambda: FailedAcquisition(conn), close
     ledger = PatchLedger(conn)
     with pytest.raises(OSError) as raised:
-        ledger.start("run", "clean", SIGNATURE, execution_config={}, environment={})
+        ledger.start("run", "refine", SIGNATURE, execution_config={}, environment={})
     assert raised.value is original
     assert "Connection close was not confirmed" in raised.value.__notes__[0]
     assert ledger._lock_key is None

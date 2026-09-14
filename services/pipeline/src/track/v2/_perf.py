@@ -1,4 +1,4 @@
-"""Lightweight performance timing framework for the v2 intersect2 pipeline.
+"""Lightweight performance timing framework for the v2 detect pipeline.
 
 Private helper module — mirrors ``_geometry.py`` style (underscore-private
 internals, bilingual docstrings). Provides three zero-friction timing hooks:
@@ -10,7 +10,7 @@ internals, bilingual docstrings). Provides three zero-friction timing hooks:
 All timers feed one hierarchical tree; ``PerfTracker.report()`` renders a
 nested breakdown with per-node totals, averages, min/max and parent shares.
 
-ZH: v2 intersect2 流水线的轻量性能计时框架。私有辅助模块，风格对齐
+ZH: v2 detect 流水线的轻量性能计时框架。私有辅助模块，风格对齐
     ``_geometry.py``。提供三个零摩擦计时入口：函数装饰器 ``@timed``、
     上下文管理器 ``TimedStage``、逐迭代遍历钩子 ``timed_iter``。所有计时
     汇总到同一棵层级树，``PerfTracker.report()`` 输出嵌套占比报告。
@@ -92,7 +92,7 @@ class PerfTracker:
         node stack and iteration-depth counter. Thread-safety not required.
     """
 
-    def __init__(self, name: str = "intersect2") -> None:
+    def __init__(self, name: str = "detect") -> None:
         self.name = name
         self._root = _PerfNode(name=name, depth=-1)
         self._stack: list[_PerfNode] = []

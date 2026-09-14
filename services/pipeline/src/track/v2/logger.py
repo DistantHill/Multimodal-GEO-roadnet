@@ -342,14 +342,14 @@ class LiveStatus:
     Usage / 用法::
 
         # 有进度条 / With progress bar
-        status = LiveStatus("清洗 / Cleaning")
+        status = LiveStatus("精炼 / Refining")
         status.start()
         for batch in batches:
             status.update(progress=0.52, detail="1,203 / 2,314 车辆", elapsed=45.2)
         status.stop()
 
         # 无进度条（流式，总量未知）/ Stats-only (streaming, unknown total)
-        status = LiveStatus("清洗 / Cleaning")
+        status = LiveStatus("精炼 / Refining")
         status.start()
         for vehicle in stream:
             status.update(detail=f"{n:,} 车辆, {pts:,} 点", elapsed=t, throughput=f"{rate:.1f} 车辆/s")
@@ -361,7 +361,7 @@ class LiveStatus:
         EN: Create a LiveStatus panel.
 
         Args:
-            stage_name: 阶段名称（建议中英双语，如 "清洗 / Cleaning"）
+            stage_name: 阶段名称（建议中英双语，如 "精炼 / Refining"）
         """
         self._stage_name = stage_name
         self._progress: float | None = None       # None = no progress bar

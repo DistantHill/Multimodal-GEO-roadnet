@@ -105,7 +105,7 @@ def create_spatial_context(
     selected = config.processing_srid if processing_srid is None else processing_srid
     if selected is None:
         raise ProjectionError(
-            "processing_srid is required for a new Clean Run; choose a projected "
+            "processing_srid is required for a new Refine Run; choose a projected "
             "metre-based CRS that is valid for the complete data region"
         )
     context = SpatialContext(
@@ -130,10 +130,10 @@ def spatial_context_from_values(
     processing_srid: object,
     projection_config: object,
 ) -> SpatialContext:
-    """Materialize and validate a context inherited from ``clean_runs``."""
+    """Materialize and validate a context inherited from ``refine_runs``."""
     if processing_srid is None:
         raise ProjectionError(
-            "Clean Run has no processing_srid; legacy Run coordinates cannot be "
+            "Refine Run has no processing_srid; legacy Run coordinates cannot be "
             "silently treated as fixed-CRS metres"
         )
     if isinstance(projection_config, dict):

@@ -56,7 +56,7 @@ def main() -> None:
     best = min(weighted.values())
     chosen = min(item for item, value in weighted.items() if value <= best * 1.05)
     results["weighted_medians_seconds"] = weighted; results["chosen_threshold"] = chosen
-    results["source_hashes"] = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in ("track/v2/_geometry.py", "track/v2/intersect2.py", __file__)}
+    results["source_hashes"] = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in ("track/v2/_geometry.py", "track/v2/detect.py", __file__)}
     output = Path("generated/perf_windows/manual_diag_windows_hybrid_threshold.json")
     output.parent.mkdir(parents=True, exist_ok=True); output.write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
     print(json.dumps({"output": str(output), "chosen_threshold": chosen, "sha256": hashlib.sha256(output.read_bytes()).hexdigest()}))

@@ -1,4 +1,4 @@
-"""Read-only A65 audit for the destructive track.v2 schema-v3 cutover.
+"""Read-only A65 audit for the track.v2 schema-v4 cutover.
 
 The report keeps storage, Clip query/assembly latency, persisted behavior, and
 optional end-to-end Pipeline phase timings in one machine-readable document.
@@ -7,7 +7,7 @@ greater-than-10x timing/bytes-per-row increase or a behavior mismatch fails.
 
 Example::
 
-    python -m track.v2.manual_thin_benchmark.manual_bench_schema_v3 \
+    python -m track.v2.manual_thin_benchmark.manual_bench_schema_v4 \
       --database roadnet --detect-id UUID \
       --pipeline-stats /tmp/roadnet-v3-run.json \
       --output /tmp/roadnet-v3-benchmark.json
@@ -32,13 +32,13 @@ from ..db.queries import (
     fetch_intersections,
     fetch_resolved_clip_tracks,
 )
-from ..db.schema import require_schema_v3
-from ..db.source_table import verify_clean_source_fingerprint
+from ..db.schema import require_schema_v4
+from ..db.source_table import verify_refine_source_fingerprint
 from ..models import ClipInput
 
 
 CORE_TABLES = (
-    "clean_runs",
+    "refine_runs",
     "detect_runs",
     "fit_runs",
     "trajectory_points",
@@ -207,7 +207,7 @@ def _benchmark_clip(
         raise ValueError(f"Detect Run {detect_id} is not completed")
 
     fingerprint_started = time.perf_counter()
-    verify_clean_source_fingerprint(conn, run.clean_id)
+    verify_refine_source_fingerprint(conn, run.refine_id)
     fingerprint_elapsed = time.perf_counter() - fingerprint_started
 
     query_samples: list[float] = []
@@ -291,7 +291,7 @@ def _find_regressions(current: dict[str, Any], baseline: dict[str, Any]) -> list
 
 def build_parser() -> argparse.ArgumentParser:
     defaults = default_postgres_config()
-    parser = argparse.ArgumentParser(description="Audit schema-v3 storage and A65 timings")
+    parser = argparse.ArgumentParser(description="Audit schema-v4 storage and A65 timings")
     parser.add_argument("--host", default=defaults.host)
     parser.add_argument("--port", type=int, default=defaults.port)
     parser.add_argument("--database", default=defaults.database)
@@ -326,13 +326,13 @@ def main() -> int:
         sslmode=args.sslmode,
     )
     report: dict[str, Any] = {
-        "schema": "track.v2-schema-v3-a65-benchmark",
+        "schema": "track.v2-schema-v4-a65-benchmark",
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "database": args.database,
     }
     with connect(config) as conn:
         conn.execute("SET TRANSACTION READ ONLY")
-        require_schema_v3(conn)
+        require_schema_v4(conn)
         report["tables"] = _table_metrics(conn)
         detect_id = args.detect_id or _latest_completed_detect(conn)
         report["detect_id"] = detect_id

@@ -74,7 +74,7 @@ def test_producer_is_lazy_and_final_name_only_visible_after_rename(tmp_path, mon
 
 
 @pytest.mark.parametrize("error", [RuntimeError("producer failed"), KeyboardInterrupt()])
-def test_producer_failure_cleans_only_owned_files_and_fences_identity(tmp_path, error):
+def test_producer_failure_refines_only_owned_files_and_fences_identity(tmp_path, error):
     other = write(tmp_path, attempt_id="attempt-other")
 
     def chunks():
@@ -159,7 +159,7 @@ def test_empty_artifact_also_checks_disk_reserve(tmp_path, monkeypatch):
     assert list(attempt_path(tmp_path).iterdir()) == []
 
 
-def test_external_disk_exhaustion_propagates_and_cleans_partial(tmp_path, monkeypatch):
+def test_external_disk_exhaustion_propagates_and_refines_partial(tmp_path, monkeypatch):
     def fail(fd, data):
         raise OSError(errno.ENOSPC, "disk full")
 

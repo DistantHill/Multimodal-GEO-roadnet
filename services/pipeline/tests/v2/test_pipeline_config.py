@@ -8,16 +8,16 @@ from pathlib import Path
 
 from track.v2.config.pipeline_config import load_pipeline_config
 from track.v2.errors import ConfigError
-from track.v2.intersect2 import IntersectConfig
+from track.v2.detect import IntersectConfig
 from track.v2.models import (
-    CleanerConfig,
+    RefineConfig,
     ClipConfig,
     FittingConfig,
     NetworkConfig,
     ProjectionConfig,
     RuntimeConfig,
 )
-from track.v2.pipeline import _should_flush_clean_batch
+from track.v2.pipeline import _should_flush_refine_batch
 
 
 class DefaultPipelineConfigTest(unittest.TestCase):
@@ -25,7 +25,7 @@ class DefaultPipelineConfigTest(unittest.TestCase):
         """The checked-in TOML must reproduce every dataclass default exactly."""
         pc = load_pipeline_config()
         self.assertEqual(pc.projection, ProjectionConfig())
-        self.assertEqual(pc.cleaner, CleanerConfig())
+        self.assertEqual(pc.refine, RefineConfig())
         self.assertEqual(pc.detect, IntersectConfig())
         self.assertEqual(pc.clip, ClipConfig())
         self.assertEqual(pc.fitting, FittingConfig())
@@ -37,10 +37,10 @@ class PipelineConfigOverrideTest(unittest.TestCase):
     def test_section_key_override_keeps_other_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "pipeline.toml"
-            path.write_text("[cleaner]\nmax_gap_s = 999.0\n", encoding="utf-8")
+            path.write_text("[refine]\nmax_gap_s = 999.0\n", encoding="utf-8")
             pc = load_pipeline_config(path)
-            self.assertEqual(pc.cleaner.max_gap_s, 999.0)
-            self.assertEqual(pc.cleaner.min_speed_mps, CleanerConfig().min_speed_mps)
+            self.assertEqual(pc.refine.max_gap_s, 999.0)
+            self.assertEqual(pc.refine.min_speed_mps, RefineConfig().min_speed_mps)
             self.assertEqual(pc.detect, IntersectConfig())
 
     def test_array_field_coerced_to_tuple(self):
@@ -64,20 +64,20 @@ class PipelineConfigOverrideTest(unittest.TestCase):
             pc = load_pipeline_config(path)
             self.assertEqual(pc.projection.processing_srid, 32650)
 
-    def test_cleaner_point_threshold_flushes_before_vehicle_limit(self):
+    def test_refine_point_threshold_flushes_before_vehicle_limit(self):
         runtime = RuntimeConfig(
             mark_flush_every_n=2000,
             excluded_flush_threshold=2000,
-            cleaner_flush_point_threshold=10,
+            refine_flush_point_threshold=10,
         )
 
-        self.assertFalse(_should_flush_clean_batch(
+        self.assertFalse(_should_flush_refine_batch(
             pending_excluded_count=0,
             pending_point_count=9,
             vehicle_count=1,
             runtime=runtime,
         ))
-        self.assertTrue(_should_flush_clean_batch(
+        self.assertTrue(_should_flush_refine_batch(
             pending_excluded_count=0,
             pending_point_count=10,
             vehicle_count=1,
@@ -99,7 +99,7 @@ class PipelineConfigErrorTest(unittest.TestCase):
             load_pipeline_config(path)
 
     def test_unknown_key_raises(self):
-        path = self._write("[cleaner]\nnot_a_field = 1\n")
+        path = self._write("[refine]\nnot_a_field = 1\n")
         with self.assertRaises(ConfigError):
             load_pipeline_config(path)
 

@@ -7,12 +7,12 @@ from unittest.mock import MagicMock, patch
 
 from track.v2.config import PostgresConfig
 from track.v2.config.pipeline_config import PipelineConfig
-from track.v2.db.pipeline_store import CleanBatchResult, DetectPersistenceResult
+from track.v2.db.pipeline_store import RefineBatchResult, DetectPersistenceResult
 from track.v2.db.source_table import SourceTableContract
-from track.v2.db_writer import CleanRunRecord
-from track.v2.intersect2 import IntersectConfig, IntersectResult
+from track.v2.db_writer import RefineRunRecord
+from track.v2.detect import IntersectConfig, IntersectResult
 from track.v2.models import (
-    CleanerConfig,
+    RefineConfig,
     ClipConfig,
     FittingConfig,
     IntersectReport,
@@ -25,13 +25,13 @@ from track.v2.pipeline_events import PipelineEvent, PipelineEventKind
 from track.v2.projection import create_spatial_context
 
 
-CLEAN_ID = "11111111-1111-1111-1111-111111111111"
+REFINE_ID = "11111111-1111-1111-1111-111111111111"
 DETECT_ID = "22222222-2222-2222-2222-222222222222"
 _PROJECTION_CONFIG = ProjectionConfig(processing_srid=3857)
 _SPATIAL_CONTEXT = create_spatial_context(_PROJECTION_CONFIG)
 _PIPELINE_CONFIG = PipelineConfig(
     projection=_PROJECTION_CONFIG,
-    cleaner=CleanerConfig(),
+    refine=RefineConfig(),
     detect=IntersectConfig(),
     clip=ClipConfig(),
     fitting=FittingConfig(),
@@ -100,8 +100,8 @@ class _RecordingStore:
         self.connection = conn
         self.events = events
         self.detect_ids = iter((DETECT_ID, "33333333-3333-3333-3333-333333333333"))
-        self.clean_record = CleanRunRecord(
-            id=CLEAN_ID,
+        self.refine_record = RefineRunRecord(
+            id=REFINE_ID,
             source_table="raw_points",
             parameters={},
             status="completed",
@@ -124,26 +124,26 @@ class _RecordingStore:
     def rollback(self) -> None:
         self.events.append("rollback")
 
-    def get_clean_run(self, clean_id: str) -> CleanRunRecord:
-        self.events.append("get_clean")
-        return self.clean_record
+    def get_refine_run(self, refine_id: str) -> RefineRunRecord:
+        self.events.append("get_refine")
+        return self.refine_record
 
-    def start_clean_run(self, **kwargs: object) -> str:
-        self.events.append("start_clean")
-        return CLEAN_ID
+    def start_refine_run(self, **kwargs: object) -> str:
+        self.events.append("start_refine")
+        return REFINE_ID
 
-    def finish_clean(
+    def finish_refine(
         self,
-        clean_id: str,
+        refine_id: str,
         *,
         status: str,
         source_fingerprint: dict[str, object] | None = None,
     ) -> None:
-        self.events.append(f"finish_clean:{status}")
+        self.events.append(f"finish_refine:{status}")
 
-    def persist_clean_batch(self, *args: object, **kwargs: object) -> CleanBatchResult:
-        self.events.append("persist_clean_batch")
-        return CleanBatchResult(next_subtrack_index=1, kept_count=0)
+    def persist_refine_batch(self, *args: object, **kwargs: object) -> RefineBatchResult:
+        self.events.append("persist_refine_batch")
+        return RefineBatchResult(next_subtrack_index=1, kept_count=0)
 
     def start_detect_run(self, **kwargs: object) -> str:
         self.events.append("start_detect")
@@ -203,8 +203,8 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.stack.enter_context(
             patch("track.v2.pipeline.PostgresPipelineStore", return_value=self.store)
         )
-        self.stack.enter_context(patch("track.v2.pipeline.require_schema_v3"))
-        self.stack.enter_context(patch("track.v2.pipeline.verify_clean_source_fingerprint"))
+        self.stack.enter_context(patch("track.v2.pipeline.require_schema_v4"))
+        self.stack.enter_context(patch("track.v2.pipeline.verify_refine_source_fingerprint"))
         self.stack.enter_context(
             patch(
                 "track.v2.pipeline.validate_source_table",
@@ -246,11 +246,11 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             emit=emitted.append,
         ).stats
 
-        self.assertEqual((result["clean_id"], result["detect_id"]), (CLEAN_ID, DETECT_ID))
+        self.assertEqual((result["refine_id"], result["detect_id"]), (REFINE_ID, DETECT_ID))
         self.assertEqual(
             self.events,
             [
-                "start_clean", "commit", "persist_clean_batch", "finish_clean:completed", "commit",
+                "start_refine", "commit", "persist_refine_batch", "finish_refine:completed", "commit",
                 "start_detect", "commit", "rollback",
                 "persist_detect", "finish_detect:completed", "commit",
                 "load_clip", "start_fit", "commit", "persist_fit", "finish_fit:completed", "commit",
@@ -277,11 +277,11 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertEqual(
             [message for message in log_messages if message.startswith("[stage-start]")],
             [
-                f"[stage-start] stage=cleaner clean_id={CLEAN_ID}",
-                f"[stage-start] stage=intersect2 clean_id={CLEAN_ID} detect_id={DETECT_ID}",
-                f"[stage-start] stage=clip clean_id={CLEAN_ID} detect_id={DETECT_ID}",
-                f"[stage-start] stage=fitting clean_id={CLEAN_ID} detect_id={DETECT_ID} fit_id=fit-1",
-                f"[stage-start] stage=network clean_id={CLEAN_ID} detect_id={DETECT_ID} fit_id=fit-1",
+                f"[stage-start] stage=refine refine_id={REFINE_ID}",
+                f"[stage-start] stage=detect refine_id={REFINE_ID} detect_id={DETECT_ID}",
+                f"[stage-start] stage=clip refine_id={REFINE_ID} detect_id={DETECT_ID}",
+                f"[stage-start] stage=fitting refine_id={REFINE_ID} detect_id={DETECT_ID} fit_id=fit-1",
+                f"[stage-start] stage=network refine_id={REFINE_ID} detect_id={DETECT_ID} fit_id=fit-1",
             ],
         )
         finish_messages = [
@@ -289,7 +289,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         ]
         self.assertEqual(len(finish_messages), 5)
         for stage, message in zip(
-            ("cleaner", "intersect2", "clip", "fitting", "network"),
+            ("refine", "detect", "clip", "fitting", "network"),
             finish_messages,
             strict=True,
         ):
@@ -322,22 +322,22 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             phase_messages,
             strict=True,
         ):
-            stage = "intersect2" if phase.startswith("detect_") else "fitting"
+            stage = "detect" if phase.startswith("detect_") else "fitting"
             self.assertIn(f"stage={stage} phase={phase}", message)
             self.assertRegex(message, r"elapsed_s=\d+\.\d{3}")
 
-    def test_completed_clean_reuses_store_record_without_clean_stage(self) -> None:
-        first = run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID)).stats
-        second = run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID)).stats
+    def test_completed_refine_reuses_store_record_without_refine_stage(self) -> None:
+        first = run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID)).stats
+        second = run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID)).stats
 
         self.assertEqual(
             (first["detect_id"], second["detect_id"]),
             (DETECT_ID, "33333333-3333-3333-3333-333333333333"),
         )
-        self.assertEqual(self.events.count("start_clean"), 0)
-        self.assertEqual(self.events.count("get_clean"), 2)
+        self.assertEqual(self.events.count("start_refine"), 0)
+        self.assertEqual(self.events.count("get_refine"), 2)
 
-    def test_clean_stream_failure_closes_source_and_marks_run_failed(self) -> None:
+    def test_refine_stream_failure_closes_source_and_marks_run_failed(self) -> None:
         class _FailingStream(_EmptyStream):
             def iter_vehicle_tracks(self):
                 raise RuntimeError("stream failed")
@@ -355,7 +355,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
 
         self.assertEqual(
             self.events[-3:],
-            ["rollback", "finish_clean:failed", "commit"],
+            ["rollback", "finish_refine:failed", "commit"],
         )
         self.assertEqual(self.handle.close_calls, 1)
         self.assertNotIn("start_detect", self.events)
@@ -369,7 +369,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
 
         transformer = MagicMock()
         transformer.validate_bounds.side_effect = ValueError("outside projection bounds")
-        clean_result = SimpleNamespace(
+        refine_result = SimpleNamespace(
             derived_counts={},
             excluded=[],
             subtracks=[],
@@ -377,7 +377,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         with (
             patch("track.v2.pipeline.StreamVehicleSource", _OneTrackStream),
             patch("track.v2.pipeline.CoordinateTransformer", return_value=transformer),
-            patch("track.v2.pipeline.clean_vehicle", return_value=clean_result),
+            patch("track.v2.pipeline.refine_vehicle", return_value=refine_result),
             self.assertRaisesRegex(ValueError, "outside projection bounds"),
         ):
             run_pipeline(
@@ -390,17 +390,17 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         transformer.validate_bounds.assert_called_once_with((116.0, 39.0, 116.0, 39.0))
         self.assertEqual(
             self.events[-3:],
-            ["rollback", "finish_clean:failed", "commit"],
+            ["rollback", "finish_refine:failed", "commit"],
         )
         self.assertEqual(self.handle.close_calls, 1)
-        self.assertNotIn("persist_clean_batch", self.events)
+        self.assertNotIn("persist_refine_batch", self.events)
         self.assertNotIn("start_detect", self.events)
 
     def test_clip_failure_does_not_undo_completed_detect(self) -> None:
         self.store.clip_error = RuntimeError("clip failed")
 
         with self.assertRaisesRegex(RuntimeError, "clip failed"):
-            run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID))
+            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
 
         self.assertEqual(self.events[-5:], [
             "rollback", "persist_detect", "finish_detect:completed", "commit", "load_clip",
@@ -411,7 +411,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.store.persist_detect_error = RuntimeError("detect write failed")
 
         with self.assertRaisesRegex(RuntimeError, "detect write failed"):
-            run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID))
+            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
 
         self.assertEqual(self.events[-5:], [
             "rollback", "persist_detect", "rollback", "finish_detect:failed", "commit",
@@ -426,7 +426,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             ),
             self.assertRaisesRegex(RuntimeError, "detect compute failed"),
         ):
-            run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID))
+            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
 
         self.assertEqual(
             self.events[-4:],
@@ -438,7 +438,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.store.fit_bundle_error = RuntimeError("write failed")
 
         with self.assertRaisesRegex(RuntimeError, "write failed"):
-            run_pipeline(PipelineInput(self.config, clean_id=CLEAN_ID))
+            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
 
         self.assertEqual(self.events[-5:], [
             "commit", "persist_fit", "rollback", "finish_fit:failed", "commit",

@@ -72,7 +72,7 @@ def _signature():
 
 def _manifest(run_id="run-1", group=1):
     return PatchManifest(
-        run_id=run_id, stage="clean", partition_kind="subtrack",
+        run_id=run_id, stage="refine", partition_kind="subtrack",
         input_descriptor_json=canonical_json({"group": group}),
         input_fingerprint="input-v1", semantic_config_digest="a" * 64,
         code_version="code-v1", algorithm_version="algorithm-v1", row_count=1,
@@ -98,7 +98,7 @@ def _results(conn, schema):
 
 def _start(ledger, run_id="run-1", *, signature=None, execution=None):
     return ledger.start(
-        run_id, "clean", signature or _signature(),
+        run_id, "refine", signature or _signature(),
         execution_config=execution or {"executor_processes": 1},
         environment={"test_environment": True},
     )
@@ -220,7 +220,7 @@ def test_disconnect_resume_retains_complete_tasks_and_rejects_old_generation(led
     observer = connect()
     history = observer.execute(sql.SQL(
         "SELECT generation, execution_config FROM {}.pipeline_patch_executions "
-        "WHERE run_id='run-1' AND stage='clean' ORDER BY generation"
+        "WHERE run_id='run-1' AND stage='refine' ORDER BY generation"
     ).format(sql.Identifier(schema))).fetchall()
     assert history == [(1, {"executor_processes": 1}), (2, {"executor_processes": 2})]
     attempts = observer.execute(sql.SQL(

@@ -26,7 +26,7 @@ def test_source_table_name_is_schema_qualified_and_safely_quoted() -> None:
 
 @pytest.mark.parametrize(
     "value",
-    ("", "public.", "public.day-01", "public.day01;DROP TABLE clean_runs"),
+    ("", "public.", "public.day-01", "public.day01;DROP TABLE refine_runs"),
 )
 def test_source_table_name_rejects_non_identifiers(value: str) -> None:
     with pytest.raises(ValueError, match="invalid source table name"):
@@ -137,16 +137,16 @@ def _legacy_expected() -> dict[str, object]:
 def test_fingerprint_preserves_v1_digest_with_bounded_named_cursor(fetch_size: int) -> None:
     conn = _StreamingConnection(_rows())
 
-    actual = calculate_source_fingerprint(conn, "clean-1", _contract(), fetch_size=fetch_size)
+    actual = calculate_source_fingerprint(conn, "refine-1", _contract(), fetch_size=fetch_size)
 
     assert actual == _legacy_expected()
     assert conn.stream.closed
     assert max(conn.stream.batch_sizes) <= fetch_size
     assert sum(conn.stream.batch_sizes) == 3
-    assert conn.stream.params == ("clean-1", "clean-1")
+    assert conn.stream.params == ("refine-1", "refine-1")
     query = " ".join(conn.stream.query.split())
-    assert "SELECT source_row_key FROM kept_trajectory_points WHERE clean_id = %s UNION" in query
-    assert "SELECT source_row_key FROM excluded_points WHERE clean_id = %s" in query
+    assert "SELECT source_row_key FROM kept_trajectory_points WHERE refine_id = %s UNION" in query
+    assert "SELECT source_row_key FROM excluded_points WHERE refine_id = %s" in query
     assert 'LEFT JOIN "public"."day01" AS source' in query
     assert "source.id = referenced.source_row_key::bigint" in query
     assert query.endswith("ORDER BY referenced.source_row_key")
@@ -154,8 +154,8 @@ def test_fingerprint_preserves_v1_digest_with_bounded_named_cursor(fetch_size: i
 
 def test_fingerprint_defaults_to_bounded_fetch_and_unique_cursor_names() -> None:
     conn = _StreamingConnection([])
-    first = calculate_source_fingerprint(conn, "clean-1", _contract())
-    second = calculate_source_fingerprint(conn, "clean-1", _contract())
+    first = calculate_source_fingerprint(conn, "refine-1", _contract())
+    second = calculate_source_fingerprint(conn, "refine-1", _contract())
     assert first == second == {
         "version": 1, "row_count": 0, "sha256": hashlib.sha256().hexdigest(),
     }
@@ -181,7 +181,7 @@ def test_fingerprint_hashes_each_batch_before_reading_more(monkeypatch: pytest.M
 
     monkeypatch.setattr(source_table.json, "dumps", counted_dumps)
     conn = _StreamingConnection(guarded_rows())
-    actual = calculate_source_fingerprint(conn, "clean-1", _contract(), fetch_size=fetch_size)
+    actual = calculate_source_fingerprint(conn, "refine-1", _contract(), fetch_size=fetch_size)
     assert actual["row_count"] == encoded_rows == 103
     assert max(conn.stream.batch_sizes) == fetch_size
 
@@ -189,15 +189,15 @@ def test_fingerprint_hashes_each_batch_before_reading_more(monkeypatch: pytest.M
 @pytest.mark.parametrize("has_extra", (True, False))
 def test_fingerprint_keeps_optional_extra_projection(has_extra: bool) -> None:
     conn = _StreamingConnection([])
-    calculate_source_fingerprint(conn, "clean-1", _contract(has_extra=has_extra))
+    calculate_source_fingerprint(conn, "refine-1", _contract(has_extra=has_extra))
     assert ("source.extra" in conn.stream.query) is has_extra
     assert ("'{}'::jsonb" in conn.stream.query) is not has_extra
 
 
 def test_fingerprint_missing_source_row_closes_cursor() -> None:
     conn = _StreamingConnection([("gone", False)])
-    with pytest.raises(ValueError, match="Clean Run clean-1 references missing source row 'gone'"):
-        calculate_source_fingerprint(conn, "clean-1", _contract())
+    with pytest.raises(ValueError, match="Refine Run refine-1 references missing source row 'gone'"):
+        calculate_source_fingerprint(conn, "refine-1", _contract())
     assert conn.stream.closed
 
 
@@ -221,7 +221,7 @@ def test_fingerprint_failure_closes_cursor_without_transaction_changes(failure_a
     if failure_at == "execute":
         conn.stream.execute_error = RuntimeError("execute failed")
     with pytest.raises(RuntimeError, match=f"{failure_at} failed"):
-        calculate_source_fingerprint(conn, "clean-1", _contract(), fetch_size=1)
+        calculate_source_fingerprint(conn, "refine-1", _contract(), fetch_size=1)
     assert conn.stream.closed
 
 
@@ -229,7 +229,7 @@ def test_fingerprint_failure_closes_cursor_without_transaction_changes(failure_a
 def test_fingerprint_rejects_invalid_fetch_size_before_opening_cursor(fetch_size: Any) -> None:
     conn = _StreamingConnection([])
     with pytest.raises(ValueError, match="fetch_size must be a positive integer"):
-        calculate_source_fingerprint(conn, "clean-1", _contract(), fetch_size=fetch_size)
+        calculate_source_fingerprint(conn, "refine-1", _contract(), fetch_size=fetch_size)
     assert not conn.names
 
 
@@ -364,5 +364,5 @@ def test_input_distinguishes_null_vehicle_from_literal_none_without_changing_v1(
     assert null_fingerprint["sha256"] != text_fingerprint["sha256"]
     # Preserve the old replay fingerprint's representation, even its known
     # normalization; the new scope/version is the corrected recovery boundary.
-    assert calculate_source_fingerprint(_StreamingConnection([null_row]), "clean", _contract()) == (
-        calculate_source_fingerprint(_StreamingConnection([text_row]), "clean", _contract()))
+    assert calculate_source_fingerprint(_StreamingConnection([null_row]), "refine", _contract()) == (
+        calculate_source_fingerprint(_StreamingConnection([text_row]), "refine", _contract()))

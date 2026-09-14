@@ -8,12 +8,12 @@ from track.v2.cross_track import (
     extract_cross_track_candidates_reference,
 )
 from track.v2.db.queries import SpatialWindow
-from track.v2.intersect2 import IntersectConfig
+from track.v2.detect import IntersectConfig
 from track.v2.manual_thin_benchmark.manual_bench_cross_track_inner import (
     _compare_records,
     _run_stage,
 )
-from track.v2.models import CleanedPointRef, PointRef, SpatialContext, TrajectoryPoint
+from track.v2.models import RefinedPointRef, PointRef, SpatialContext, TrajectoryPoint
 from track.v2.projection import CoordinateTransformer
 
 
@@ -57,7 +57,7 @@ def test_complete_stage_reference_matches_db_subtrack_keys_and_vehicle_identity(
         return TrajectoryPoint(
             PointRef("fixture", str(identity), True), vehicle, float(identity), lon, lat,
             heading, 8.0, x=x, y=y,
-            cleaned_point_ref=CleanedPointRef("kept", identity, subtrack, identity),
+            refined_point_ref=RefinedPointRef("kept", identity, subtrack, identity),
         )
 
     points = [
@@ -71,7 +71,7 @@ def test_complete_stage_reference_matches_db_subtrack_keys_and_vehicle_identity(
     cfg = IntersectConfig(use_turn_events=False, cross_track_grid_cell_m=100.0)
     window = SpatialWindow(499000.0, 4319000.0, 501000.0, 4321000.0)
     results = []
-    with patch("track.v2.intersect2._query_active_points_in_window", return_value=points):
+    with patch("track.v2.detect._query_active_points_in_window", return_value=points):
         for extractor in (extract_cross_track_candidates_reference, extract_cross_track_candidates):
             candidates, _wall, _telemetry = _run_stage(
                 object(), cfg,

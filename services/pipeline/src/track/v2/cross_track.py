@@ -490,8 +490,8 @@ def _candidate_from_segments(
         y=y,
         heading=segment_a.heading,
         speed=segment_a.start.speed,
-        from_segment_start=segment_a.start.cleaned_point_ref,
-        to_segment_start=segment_b.start.cleaned_point_ref,
+        from_segment_start=segment_a.start.refined_point_ref,
+        to_segment_start=segment_b.start.refined_point_ref,
     )
 
 

@@ -15,10 +15,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from .db.source_table import quote_table_name
-from .intersect2 import IntersectResult
+from .detect import IntersectResult
 from .models import (
     CenterlineFitBundle,
-    CleanedPointRef,
+    RefinedPointRef,
     ClipConfig,
     ClipResult,
     ExcludedIndex,
@@ -42,7 +42,7 @@ _SEQUENCE_TABLES = frozenset({
 
 
 @dataclass(frozen=True, slots=True)
-class CleanRunRecord:
+class RefineRunRecord:
     id: str
     source_table: str
     parameters: dict[str, Any]
@@ -64,12 +64,12 @@ class DetectWriteCounts:
 
 
 @dataclass(frozen=True, slots=True)
-class _CleanMember:
-    identity: CleanedPointRef
+class _RefineMember:
+    identity: RefinedPointRef
     vehicle_id: str
 
 
-def create_clean_run(
+def create_refine_run(
     conn: Any,
     *,
     source_table: str,
@@ -77,15 +77,15 @@ def create_clean_run(
     spatial_context: SpatialContext,
 ) -> str:
     CoordinateTransformer(spatial_context)
-    clean_id = str(uuid.uuid4())
+    refine_id = str(uuid.uuid4())
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO clean_runs "
+            "INSERT INTO refine_runs "
             "(id, source_table, source_srid, processing_srid, "
             "projection_config, parameters, status) "
             "VALUES (%s, %s, %s, %s, %s, %s, 'running')",
             (
-                clean_id,
+                refine_id,
                 source_table,
                 spatial_context.source_srid,
                 spatial_context.processing_srid,
@@ -93,30 +93,30 @@ def create_clean_run(
                 json.dumps(parameters, ensure_ascii=False),
             ),
         )
-    return clean_id
+    return refine_id
 
 
 def create_detect_run(
     conn: Any,
     *,
-    clean_id: str,
+    refine_id: str,
     parameters: dict[str, Any],
 ) -> str:
     detect_id = str(uuid.uuid4())
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO detect_runs (id, clean_id, parameters, status) "
-            "SELECT %s, c.id, %s, 'running' FROM clean_runs AS c "
+            "INSERT INTO detect_runs (id, refine_id, parameters, status) "
+            "SELECT %s, c.id, %s, 'running' FROM refine_runs AS c "
             "WHERE c.id = %s AND c.status = 'completed' "
             "AND c.source_fingerprint IS NOT NULL "
             "AND c.processing_srid IS NOT NULL "
             "AND c.projection_config->>'coordinate_semantics_version' = '2' "
             "RETURNING id",
-            (detect_id, json.dumps(parameters, ensure_ascii=False), clean_id),
+            (detect_id, json.dumps(parameters, ensure_ascii=False), refine_id),
         )
         if cur.fetchone() is None:
             raise ValueError(
-                f"Clean Run {clean_id} is not a completed immutable-source run"
+                f"Refine Run {refine_id} is not a completed immutable-source run"
             )
     return detect_id
 
@@ -148,18 +148,18 @@ def create_fit_run(
     return fit_id
 
 
-def finish_clean_run(
+def finish_refine_run(
     conn: Any,
-    clean_id: str,
+    refine_id: str,
     *,
     status: str,
     source_fingerprint: dict[str, object] | None = None,
 ) -> None:
     if status == "completed" and source_fingerprint is None:
-        raise ValueError("a completed Clean Run requires source_fingerprint")
+        raise ValueError("a completed Refine Run requires source_fingerprint")
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE clean_runs SET status = %s, source_fingerprint = %s, "
+            "UPDATE refine_runs SET status = %s, source_fingerprint = %s, "
             "finished_at = NOW() WHERE id = %s AND status = 'running'",
             (
                 status,
@@ -168,11 +168,11 @@ def finish_clean_run(
                     if source_fingerprint is not None
                     else None
                 ),
-                clean_id,
+                refine_id,
             ),
         )
         if cur.rowcount != 1:
-            raise ValueError(f"Clean Run {clean_id} is not running")
+            raise ValueError(f"Refine Run {refine_id} is not running")
 
 
 def finish_detect_run(conn: Any, detect_id: str, *, status: str) -> None:
@@ -207,22 +207,22 @@ def finish_fit_run(
             raise ValueError(f"Fit Run {fit_id} is not running")
 
 
-def fetch_clean_run(conn: Any, clean_id: str) -> CleanRunRecord:
+def fetch_refine_run(conn: Any, refine_id: str) -> RefineRunRecord:
     with conn.cursor() as cur:
         cur.execute(
             "SELECT id, source_table, parameters, status, source_srid, "
             "processing_srid, projection_config, source_fingerprint "
-            "FROM clean_runs WHERE id = %s",
-            (clean_id,),
+            "FROM refine_runs WHERE id = %s",
+            (refine_id,),
         )
         row = cur.fetchone()
     if row is None:
-        raise ValueError(f"unknown Clean Run: {clean_id}")
-    parameters = _json_object(row[2], "Clean Run parameters")
+        raise ValueError(f"unknown Refine Run: {refine_id}")
+    parameters = _json_object(row[2], "Refine Run parameters")
     fingerprint = (
         None if row[7] is None else _json_object(row[7], "source fingerprint")
     )
-    return CleanRunRecord(
+    return RefineRunRecord(
         id=str(row[0]),
         source_table=str(row[1]),
         parameters=parameters,
@@ -270,18 +270,18 @@ def insert_excluded_points(
     conn: Any,
     excluded: ExcludedIndex,
     *,
-    clean_id: str,
+    refine_id: str,
     batch_size: int = _BATCH,
 ) -> int:
     rows = [
-        (clean_id, item.point_ref.source_row_key, item.reason)
+        (refine_id, item.point_ref.source_row_key, item.reason)
         for item in excluded.items
     ]
     with conn.cursor() as cur:
         _chunked_insert(
             cur,
             "excluded_points",
-            ["clean_id", "source_row_key", "reason"],
+            ["refine_id", "source_row_key", "reason"],
             rows,
             batch_size=batch_size,
         )
@@ -292,7 +292,7 @@ def insert_kept_trajectory_points(
     conn: Any,
     subtracks: list[RefinementSubtrack],
     *,
-    clean_id: str,
+    refine_id: str,
 ) -> int:
     rows: list[tuple[Any, ...]] = []
     for subtrack in subtracks:
@@ -301,7 +301,7 @@ def insert_kept_trajectory_points(
             if point.point_ref.generated_reason:
                 continue
             rows.append((
-                clean_id,
+                refine_id,
                 point.point_ref.source_row_key,
                 point.vehicle_id,
                 subtrack.subtrack_index,
@@ -313,7 +313,7 @@ def insert_kept_trajectory_points(
             cur,
             "kept_trajectory_points",
             [
-                "clean_id",
+                "refine_id",
                 "source_row_key",
                 "vehicle_id",
                 "subtrack_index",
@@ -328,7 +328,7 @@ def insert_injected_points(
     conn: Any,
     subtracks: list[RefinementSubtrack],
     *,
-    clean_id: str,
+    refine_id: str,
     spatial_context: SpatialContext,
     batch_size: int = _BATCH,
 ) -> int:
@@ -345,7 +345,7 @@ def insert_injected_points(
     transformer = CoordinateTransformer(spatial_context)
     xy = transformer.forward_many((point.lon, point.lat) for _, _, point in injected)
     rows = [(
-        clean_id,
+        refine_id,
         point.vehicle_id,
         subtrack.subtrack_index,
         anchor,
@@ -363,7 +363,7 @@ def insert_injected_points(
             cur,
             "injected_points",
             [
-                "clean_id",
+                "refine_id",
                 "vehicle_id",
                 "subtrack_index",
                 "after_sequence_in_subtrack",
@@ -392,16 +392,16 @@ def persist_detect_result(
     """Persist the complete Detect graph and resolved p/i/c sequence."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT clean_id, status FROM detect_runs WHERE id = %s FOR UPDATE",
+            "SELECT refine_id, status FROM detect_runs WHERE id = %s FOR UPDATE",
             (detect_id,),
         )
         run = cur.fetchone()
     if run is None or str(run[1]) != "running":
         raise ValueError(f"Detect Run {detect_id} is not running")
-    clean_id = str(run[0])
+    refine_id = str(run[0])
 
-    clean_members = _load_clean_members(conn, clean_id)
-    _validate_clean_member_vehicles(clean_members)
+    refine_members = _load_refine_members(conn, refine_id)
+    _validate_refine_member_vehicles(refine_members)
     ordered_clusters = sorted(
         result.clusters,
         key=lambda cluster: cluster.cluster_calculate_index,
@@ -458,24 +458,24 @@ def persist_detect_result(
     ]
 
     resolved_sequence_started = time.perf_counter()
-    resolved_source_count = len(clean_members) + len(complete_crossings)
+    resolved_source_count = len(refine_members) + len(complete_crossings)
     with conn.cursor() as cur:
         resolved_ids = _reserve_ids(cur, "resolved_subtrack_points", resolved_source_count)
-    cleaned_resolved_ids = resolved_ids[:len(clean_members)]
-    resolved_by_clean_key = {
-        _clean_key(member.identity): resolved_id
+    refined_resolved_ids = resolved_ids[:len(refine_members)]
+    resolved_by_refine_key = {
+        _refine_key(member.identity): resolved_id
         for member, resolved_id in zip(
-            clean_members,
-            cleaned_resolved_ids,
+            refine_members,
+            refined_resolved_ids,
             strict=True,
         )
     }
-    complete_crossing_resolved_ids = resolved_ids[len(clean_members):]
+    complete_crossing_resolved_ids = resolved_ids[len(refine_members):]
 
     resolved_rows = _build_resolved_rows(
         detect_id,
-        clean_members,
-        cleaned_resolved_ids,
+        refine_members,
+        refined_resolved_ids,
         complete_crossings,
         complete_crossing_resolved_ids,
         crossing_id_by_calculation,
@@ -488,7 +488,7 @@ def persist_detect_result(
                 "id",
                 "detect_id",
                 "subtrack_index",
-                "cleaned_sequence_in_subtrack",
+                "refined_sequence_in_subtrack",
                 "sequence_in_subtrack",
                 "kept_point_id",
                 "injected_point_id",
@@ -514,14 +514,14 @@ def persist_detect_result(
         conn,
         detect_id,
         result,
-        resolved_by_clean_key,
+        resolved_by_refine_key,
         cross_membership,
     )
     turn_event_count = _insert_turn_events(
         conn,
         detect_id,
         result,
-        resolved_by_clean_key,
+        resolved_by_refine_key,
         turn_membership,
     )
     _insert_candidate_crossings(
@@ -530,7 +530,7 @@ def persist_detect_result(
         pending_crossings,
         crossing_ids,
         candidate_by_calculation,
-        resolved_by_clean_key,
+        resolved_by_refine_key,
     )
     _insert_intersections(
         conn,
@@ -658,24 +658,24 @@ def insert_centerline_bundle(
     return ordered_ids
 
 
-def _load_clean_members(conn: Any, clean_id: str) -> list[_CleanMember]:
+def _load_refine_members(conn: Any, refine_id: str) -> list[_RefineMember]:
     with conn.cursor() as cur:
         cur.execute(
             "SELECT point_kind, point_id, vehicle_id, subtrack_index, anchor_sequence "
             "FROM ("
             " SELECT 'kept'::text AS point_kind, id AS point_id, vehicle_id, "
             "        subtrack_index, sequence_in_subtrack AS anchor_sequence, 0 AS kind_order "
-            " FROM kept_trajectory_points WHERE clean_id = %s "
+            " FROM kept_trajectory_points WHERE refine_id = %s "
             " UNION ALL "
             " SELECT 'injected', id, vehicle_id, subtrack_index, "
             "        after_sequence_in_subtrack, 1 "
-            " FROM injected_points WHERE clean_id = %s"
+            " FROM injected_points WHERE refine_id = %s"
             ") AS members "
             "ORDER BY subtrack_index, anchor_sequence, kind_order, point_id",
-            (clean_id, clean_id),
+            (refine_id, refine_id),
         )
         raw_rows = list(cur.fetchall())
-    members: list[_CleanMember] = []
+    members: list[_RefineMember] = []
     current_subtrack: int | None = None
     sequence = 0
     for kind, point_id, vehicle, subtrack, _anchor in raw_rows:
@@ -683,12 +683,12 @@ def _load_clean_members(conn: Any, clean_id: str) -> list[_CleanMember]:
         if subtrack != current_subtrack:
             current_subtrack = subtrack
             sequence = 0
-        members.append(_CleanMember(
-            identity=CleanedPointRef(
+        members.append(_RefineMember(
+            identity=RefinedPointRef(
                 point_kind=str(kind),  # type: ignore[arg-type]
                 point_id=int(point_id),
                 subtrack_index=subtrack,
-                cleaned_sequence_in_subtrack=sequence,
+                refined_sequence_in_subtrack=sequence,
             ),
             vehicle_id=str(vehicle),
         ))
@@ -696,7 +696,7 @@ def _load_clean_members(conn: Any, clean_id: str) -> list[_CleanMember]:
     return members
 
 
-def _validate_clean_member_vehicles(members: list[_CleanMember]) -> None:
+def _validate_refine_member_vehicles(members: list[_RefineMember]) -> None:
     vehicles_by_subtrack: dict[int, set[str]] = {}
     for member in members:
         vehicles_by_subtrack.setdefault(
@@ -714,20 +714,20 @@ def _validate_clean_member_vehicles(members: list[_CleanMember]) -> None:
 
 def _build_resolved_rows(
     detect_id: str,
-    clean_members: list[_CleanMember],
-    cleaned_ids: tuple[int, ...],
+    refine_members: list[_RefineMember],
+    refined_ids: tuple[int, ...],
     complete_crossings: list[tuple[HotspotCluster, Any]],
     crossing_resolved_ids: tuple[int, ...],
     crossing_id_by_calculation: dict[tuple[int, int], int],
 ) -> list[tuple[Any, ...]]:
     by_subtrack: dict[int, list[tuple[tuple[Any, ...], tuple[Any, ...]]]] = {}
-    for member, resolved_id in zip(clean_members, cleaned_ids, strict=True):
+    for member, resolved_id in zip(refine_members, refined_ids, strict=True):
         identity = member.identity
         kept_id = identity.point_id if identity.point_kind == "kept" else None
         injected_id = identity.point_id if identity.point_kind == "injected" else None
         by_subtrack.setdefault(identity.subtrack_index, []).append((
             (
-                float(identity.cleaned_sequence_in_subtrack),
+                float(identity.refined_sequence_in_subtrack),
                 1,
                 -1,
                 -1,
@@ -737,7 +737,7 @@ def _build_resolved_rows(
                 resolved_id,
                 detect_id,
                 identity.subtrack_index,
-                identity.cleaned_sequence_in_subtrack,
+                identity.refined_sequence_in_subtrack,
                 kept_id,
                 injected_id,
                 None,
@@ -755,12 +755,12 @@ def _build_resolved_rows(
         crossing_id = crossing_id_by_calculation[key]
         # A root at t=1 belongs immediately before the segment endpoint; a
         # t=0 root belongs immediately after its segment start. Interior roots
-        # cannot tie a cleaned point. Within one event batch, exits precede
+        # cannot tie a refined point. Within one event batch, exits precede
         # entries as required by the active-set sequence contract.
         endpoint_placement = 0 if crossing.segment_fraction >= 1.0 - 1e-12 else 2
         by_subtrack.setdefault(identity.subtrack_index, []).append((
             (
-                identity.cleaned_sequence_in_subtrack + crossing.segment_fraction,
+                identity.refined_sequence_in_subtrack + crossing.segment_fraction,
                 endpoint_placement,
                 0 if not crossing.is_entry else 1,
                 cluster.cluster_calculate_index,
@@ -867,7 +867,7 @@ def _insert_tracks_cross(
     conn: Any,
     detect_id: str,
     result: IntersectResult,
-    resolved_by_clean_key: dict[tuple[str, int, int], int],
+    resolved_by_refine_key: dict[tuple[str, int, int], int],
     membership: dict[int, int],
 ) -> int:
     rows: list[tuple[Any, ...]] = []
@@ -875,8 +875,8 @@ def _insert_tracks_cross(
     for candidate in result.cross_track_candidates:
         if candidate.from_segment_start is None or candidate.to_segment_start is None:
             raise ValueError("a persisted track cross requires stable segment starts")
-        from_id = resolved_by_clean_key[_clean_key(candidate.from_segment_start)]
-        to_id = resolved_by_clean_key[_clean_key(candidate.to_segment_start)]
+        from_id = resolved_by_refine_key[_refine_key(candidate.from_segment_start)]
+        to_id = resolved_by_refine_key[_refine_key(candidate.to_segment_start)]
         from_id, to_id = sorted((from_id, to_id))
         if from_id == to_id or (from_id, to_id) in seen_pairs:
             raise ValueError("duplicate/degenerate track cross segment pair")
@@ -909,7 +909,7 @@ def _insert_turn_events(
     conn: Any,
     detect_id: str,
     result: IntersectResult,
-    resolved_by_clean_key: dict[tuple[str, int, int], int],
+    resolved_by_refine_key: dict[tuple[str, int, int], int],
     membership: dict[int, int],
 ) -> int:
     hotspot_z = {
@@ -918,12 +918,12 @@ def _insert_turn_events(
     }
     rows: list[tuple[Any, ...]] = []
     for event in result.turn_events:
-        if event.cleaned_point_ref is None:
+        if event.refined_point_ref is None:
             raise ValueError("a persisted turn event requires a stable resolved point")
         rows.append((
             detect_id,
             membership.get(event.event_calculate_index),
-            resolved_by_clean_key[_clean_key(event.cleaned_point_ref)],
+            resolved_by_refine_key[_refine_key(event.refined_point_ref)],
             event.entry_bearing,
             event.exit_bearing,
             event.turn_deg,
@@ -949,7 +949,7 @@ def _insert_candidate_crossings(
     pending: list[tuple[HotspotCluster, Any]],
     crossing_ids: tuple[int, ...],
     candidate_ids: dict[int, int],
-    resolved_by_clean_key: dict[tuple[str, int, int], int],
+    resolved_by_refine_key: dict[tuple[str, int, int], int],
 ) -> None:
     rows: list[tuple[Any, ...]] = []
     for (cluster, crossing), crossing_id in zip(pending, crossing_ids, strict=True):
@@ -959,7 +959,7 @@ def _insert_candidate_crossings(
             crossing_id,
             detect_id,
             candidate_ids[cluster.cluster_calculate_index],
-            resolved_by_clean_key[_clean_key(crossing.segment_start)],
+            resolved_by_refine_key[_refine_key(crossing.segment_start)],
             1 if crossing.is_entry else 0,
             crossing.crossing_x,
             crossing.crossing_y,
@@ -1076,11 +1076,11 @@ def _insert_entry_exit_points(
         if entry.segment_start is None or exit.segment_start is None:
             raise ValueError("entry/exit observation requires stable segment starts")
         entry_progress = (
-            entry.segment_start.cleaned_sequence_in_subtrack
+            entry.segment_start.refined_sequence_in_subtrack
             + entry.segment_fraction
         )
         exit_progress = (
-            exit.segment_start.cleaned_sequence_in_subtrack
+            exit.segment_start.refined_sequence_in_subtrack
             + exit.segment_fraction
         )
         if entry_progress >= exit_progress:
@@ -1106,7 +1106,7 @@ def _insert_entry_exit_points(
     return len(rows)
 
 
-def _clean_key(identity: CleanedPointRef) -> tuple[str, int, int]:
+def _refine_key(identity: RefinedPointRef) -> tuple[str, int, int]:
     return identity.point_kind, identity.point_id, identity.subtrack_index
 
 

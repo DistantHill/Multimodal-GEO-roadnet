@@ -62,7 +62,7 @@ app.innerHTML = `
       </div>
       <div class="header-context" aria-label="当前数据上下文">
         <label class="context-chip">Database <select id="database-select" aria-label="选择数据库"><option value="">Backend 默认库</option></select></label>
-        <label class="context-chip run-context">Clean <select id="clean-id" aria-label="Clean ID"></select><small class="run-time" id="clean-id-time" title="创建时间（started_at，北京时间）">—</small></label>
+        <label class="context-chip run-context">Refine <select id="refine-id" aria-label="Refine ID"></select><small class="run-time" id="refine-id-time" title="创建时间（started_at，北京时间）">—</small></label>
         <label class="context-chip run-context">Detect <select id="detect-id" aria-label="Detect ID"></select><small class="run-time" id="detect-id-time" title="创建时间（started_at，北京时间）">—</small></label>
         <label class="context-chip run-context">Fit <select id="fit-id" aria-label="Fit ID"></select><small class="run-time" id="fit-id-time" title="创建时间（started_at，北京时间）">—</small></label>
       </div>
@@ -300,8 +300,8 @@ const map = new OlMap({
 });
 
 const state = {
-  runs: { clean: [], detect: [], fit: [] },
-  cleanId: null,
+  runs: { refine: [], detect: [], fit: [] },
+  refineId: null,
   runsAbortController: null,
   databaseName: null,
   activeLayerId: null,
@@ -435,7 +435,7 @@ function updateContext(metadata = {}) {
   dom.fitId.value = state.context.fitId || '';
   dom.detectId.title = state.context.detectId === null ? '未解析' : String(state.context.detectId);
   dom.fitId.title = state.context.fitId === null ? '未解析' : String(state.context.fitId);
-  for (const id of ['clean-id', 'detect-id', 'fit-id']) updateRunTime(document.getElementById(id));
+  for (const id of ['refine-id', 'detect-id', 'fit-id']) updateRunTime(document.getElementById(id));
 }
 
 function firstValue(...values) {
@@ -521,8 +521,8 @@ async function loadLayers() {
 
   try {
     if (!state.context.detectId) {
-      setServiceState('warning', '所选 Clean 暂无已完成 Detect');
-      setStatus('请选择具有已完成 Detect 的 Clean ID');
+      setServiceState('warning', '所选 Refine 暂无已完成 Detect');
+      setStatus('请选择具有已完成 Detect 的 Refine ID');
       dom.mapNotice.hidden = false;
       return;
     }
@@ -554,7 +554,7 @@ async function loadLayers() {
         }
         const result = await loadMapLayer(descriptor.id, {
           databaseName,
-          cleanId: state.cleanId,
+          refineId: state.refineId,
           detectId: state.context.detectId,
           fitId: requiredContext.includes('fit_id') ? state.context.fitId : undefined,
           signal,
@@ -1172,12 +1172,12 @@ function updateRunTime(select) {
   document.getElementById(`${select.id}-time`).textContent = time;
   select.title = `${select.value || '暂无运行'} · ${time}（北京时间）`;
 }
-const cleanSelect = document.querySelector('#clean-id');
-function syncRuns(level = 'clean') {
-  if (level === 'clean') {
-    state.cleanId = cleanSelect.value || null;
+const refineSelect = document.querySelector('#refine-id');
+function syncRuns(level = 'refine') {
+  if (level === 'refine') {
+    state.refineId = refineSelect.value || null;
     state.context.detectId = setRunOptions(dom.detectId,
-      state.runs.detect.filter((row) => row.clean_id === state.cleanId), null);
+      state.runs.detect.filter((row) => row.refine_id === state.refineId), null);
   } else state.context.detectId = dom.detectId.value || null;
   state.context.fitId = setRunOptions(dom.fitId,
     state.runs.fit.filter((row) => row.detect_id === state.context.detectId), null);
@@ -1189,7 +1189,7 @@ function reloadRunLayers() {
   updateContext();
   loadLayers();
 }
-cleanSelect.addEventListener('change', () => syncRuns());
+refineSelect.addEventListener('change', () => syncRuns());
 dom.detectId.addEventListener('change', () => syncRuns('detect'));
 dom.fitId.addEventListener('change', () => {
   state.context.fitId = dom.fitId.value || null;
@@ -1203,14 +1203,14 @@ async function refreshRuns() {
   clearResult();
   removeBusinessLayers();
   state.context = { detectId: null, fitId: null };
-  for (const select of [cleanSelect, dom.detectId, dom.fitId]) setRunOptions(select, [], null);
+  for (const select of [refineSelect, dom.detectId, dom.fitId]) setRunOptions(select, [], null);
   const controller = new AbortController();
   state.runsAbortController = controller;
   try {
     const runs = await listRuns({ databaseName: state.databaseName, signal: controller.signal });
     if (controller.signal.aborted) return;
     state.runs = runs;
-    setRunOptions(cleanSelect, runs.clean, null);
+    setRunOptions(refineSelect, runs.refine, null);
     syncRuns();
   } catch (error) {
     if (controller.signal.aborted) return;

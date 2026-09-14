@@ -49,12 +49,12 @@ def test_postgis_prefilter_matches_exact_oracle_and_returns_run_xy() -> None:
                 ) ON COMMIT DROP;
                 CREATE INDEX ON projection_raw USING gist (geom);
                 CREATE TEMP TABLE kept_trajectory_points (
-                    id bigint PRIMARY KEY, clean_id text NOT NULL, vehicle_id text NOT NULL,
+                    id bigint PRIMARY KEY, refine_id text NOT NULL, vehicle_id text NOT NULL,
                     source_row_key text NOT NULL, subtrack_index integer NOT NULL,
                     sequence_in_subtrack integer NOT NULL
                 ) ON COMMIT DROP;
                 CREATE TEMP TABLE injected_points (
-                    id bigint PRIMARY KEY, clean_id text NOT NULL, vehicle_id text NOT NULL,
+                    id bigint PRIMARY KEY, refine_id text NOT NULL, vehicle_id text NOT NULL,
                     timestamp double precision NOT NULL, lon double precision NOT NULL,
                     lat double precision NOT NULL, heading double precision NOT NULL,
                     speed double precision NOT NULL, generated_reason text NOT NULL,
@@ -73,19 +73,19 @@ def test_postgis_prefilter_matches_exact_oracle_and_returns_run_xy() -> None:
             )
             cur.execute(
                 "INSERT INTO kept_trajectory_points VALUES "
-                "(11, 'clean-1', 'raw-inner', '1', 1, 0), "
-                "(12, 'clean-1', 'raw-outside', '2', 2, 0)"
+                "(11, 'refine-1', 'raw-inner', '1', 1, 0), "
+                "(12, 'refine-1', 'raw-outside', '2', 2, 0)"
             )
             cur.execute(
                 "INSERT INTO injected_points VALUES "
-                "(21, 'clean-1', 'injected-inner', 1, %s, %s, 0, 1, 'fixture', "
+                "(21, 'refine-1', 'injected-inner', 1, %s, %s, 0, 1, 'fixture', "
                 "%s, %s, ST_SetSRID(ST_Point(%s,%s),4326), 3, 0)",
                 (inner_lon, inner_lat, injected_x, injected_y, inner_lon, inner_lat),
             )
 
         points = _query_active_points_in_window(
             conn, window, table="projection_raw", kept_table="kept_trajectory_points",
-            source_table="projection_raw", clean_id="clean-1", spatial_context=run_context,
+            source_table="projection_raw", refine_id="refine-1", spatial_context=run_context,
         )
         with conn.cursor() as cur:
             cur.execute(

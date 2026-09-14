@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import track.v2 as v2
+from track.v2.refine import refine
 from track.v2.errors import DataSourceCorrupted
 
 
@@ -20,9 +21,9 @@ def _make_csv(tmpdir: str, content: str) -> Path:
 
 
 class PublicApiTest(unittest.TestCase):
-    def test_track_v2_exports_parser_and_cleaner_entrypoints(self) -> None:
-        self.assertIs(v2.get_database, __import__("track.v2.sources", fromlist=["get_database"]).get_database)
-        self.assertTrue(callable(v2.clean))
+    def test_track_v2_exports_parser_and_refine_entrypoints(self) -> None:
+        self.assertIs(v2.get_database, __import__("track.v2.parser", fromlist=["get_database"]).get_database)
+        self.assertTrue(callable(refine))
         self.assertTrue(hasattr(v2, "CsvSource"))
         self.assertTrue(hasattr(v2, "TrajectoryPoint"))
 
@@ -111,7 +112,7 @@ class FakePostgresStreamingTest(unittest.TestCase):
         self.assertTrue(all(not cursor.fetchall_called for conn in connections for cursor in conn.cursors))
 
 
-class CleanerContractTest(unittest.TestCase):
+class RefineContractTest(unittest.TestCase):
     def test_gap_split_rewrites_vehicle_id_to_subtrack_ids(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             csv_path = _make_csv(
@@ -122,9 +123,9 @@ class CleanerContractTest(unittest.TestCase):
             )
             handle = v2.get_database(v2.CsvSource(csv_path))
             try:
-                result = v2.clean(
+                result = refine(
                     handle,
-                    config=v2.CleanerConfig(max_gap_s=120.0),
+                    config=v2.RefineConfig(max_gap_s=120.0),
                     spatial_context=_SPATIAL_CONTEXT,
                 )
                 vehicle_ids = [point.vehicle_id for point in result.active.iter_points()]
@@ -172,7 +173,7 @@ class _FakeCursor:
 
     def fetchall(self):
         self.fetchall_called = True
-        raise AssertionError("fetchall() is forbidden in Parser 0")
+        raise AssertionError("fetchall() is forbidden in Parser")
 
     def close(self) -> None:
         self.closed = True

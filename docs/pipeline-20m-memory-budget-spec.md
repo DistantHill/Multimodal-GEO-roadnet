@@ -194,7 +194,7 @@ Python 对象的 `bytes_per_row` 不只是数据类浅尺寸，还包括：
 
 当前生产 PG CLI 的主要工作集：
 
-- [`PostgresTrajectorySourceHandle.iter_points`](../services/pipeline/src/track/v2/sources.py)
+- [`PostgresTrajectorySourceHandle.iter_points`](../services/pipeline/src/track/v2/parser.py)
   使用命名游标，读取批量为 10,000；
 - 当前 PG 源数据查询仍可能是 `SELECT *`；10,000 只限制行数，不限制超宽
   JSON/`extra` 等字段的读取字节数；
@@ -254,7 +254,7 @@ M_cleaner ≈ base
 
 [`_stream_vehicle_tracks_from_db`](../services/pipeline/src/track/v2/db/queries.py) 本身
 是命名游标，但
-[`_stream_extract_method_1`](../services/pipeline/src/track/v2/intersect2.py)
+[`_stream_extract_method_1`](../services/pipeline/src/track/v2/detect.py)
 把每个轨迹存入全局 `tracks` 字典，直到跨轨迹和拓扑都结束才释放。
 
 Pipeline Python 3.12 容器内，`PointRef + TrajectoryPoint + 空 `extra` + 一个列表

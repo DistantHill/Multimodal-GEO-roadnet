@@ -1,7 +1,7 @@
 """Unified base class for all v2 output models.
 
 All output models inherit from TrackModel, which provides as_dict() and
-format_print(). Parser 0 and Cleaner 1 models (TrajectoryPoint, PointRef,
+format_print(). Parser and Refine models (TrajectoryPoint, PointRef,
 FieldSpec, ReadReport, etc.) are defined here per the v2 PRD §3.
 """
 
@@ -109,7 +109,7 @@ def _format_scalar(value: object) -> str:
     return str(value)
 
 
-# ── Parser 0 + Cleaner 1 output models ──────────────────────────────
+# ── Parser + Refine output models ──────────────────────────────
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,8 +129,8 @@ class PointRef(TrackModel):
 
 
 @dataclass(frozen=True, slots=True)
-class CleanedPointRef(TrackModel):
-    """Stable identity of one p/i point in the frozen Clean result.
+class RefinedPointRef(TrackModel):
+    """Stable identity of one p/i point in the frozen Refine result.
 
     ``point_id`` is either ``kept_trajectory_points.id`` or
     ``injected_points.id``.  Detect uses this identity while calculating; the
@@ -140,12 +140,12 @@ class CleanedPointRef(TrackModel):
     point_kind: Literal["kept", "injected"]
     point_id: int
     subtrack_index: int
-    cleaned_sequence_in_subtrack: int
+    refined_sequence_in_subtrack: int
 
 
 @dataclass(frozen=True, slots=True)
 class TrajectoryPoint(TrackModel):
-    """Normalized trajectory point emitted by Parser 0 iter_points().
+    """Normalized trajectory point emitted by Parser iter_points().
 
     PRD §3.1
     """
@@ -160,7 +160,7 @@ class TrajectoryPoint(TrackModel):
     extra: dict[str, Any] = field(default_factory=dict)
     x: float | None = None
     y: float | None = None
-    cleaned_point_ref: CleanedPointRef | None = None
+    refined_point_ref: RefinedPointRef | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,7 +178,7 @@ class DerivedPoint(TrajectoryPoint):
     extra: dict[str, Any] = field(default_factory=dict)
     x: float | None = None
     y: float | None = None
-    cleaned_point_ref: CleanedPointRef | None = None
+    refined_point_ref: RefinedPointRef | None = None
 
 @dataclass(frozen=True)
 class FieldSpec(TrackModel):
@@ -216,7 +216,7 @@ class FieldMapping(TrackModel):
 
 @dataclass(frozen=True)
 class FieldConfig(TrackModel):
-    """Parser 0 field specs plus data-quality thresholds."""
+    """Parser field specs plus data-quality thresholds."""
 
     specs: list[FieldSpec]
     sample_errors_max: int = 50
@@ -254,7 +254,7 @@ class ParseIssue(TrackModel):
 
 @dataclass(frozen=True)
 class ReadReport(TrackModel):
-    """Parser 0 statistics and error samples.
+    """Parser statistics and error samples.
 
     PRD §3.4
     """
@@ -271,8 +271,8 @@ class ReadReport(TrackModel):
 
 
 @dataclass(frozen=True)
-class CleanReport(TrackModel):
-    """Cleaner 1 statistics and excluded-point samples.
+class RefineReport(TrackModel):
+    """Refine statistics and excluded-point samples.
 
     PRD §3.4
     """
@@ -286,7 +286,7 @@ class CleanReport(TrackModel):
 
 @dataclass(frozen=True)
 class ExcludedPoint(TrackModel):
-    """One point removed by Cleaner 1."""
+    """One point removed by Refine."""
 
     point_ref: PointRef
     reason: str
@@ -317,8 +317,8 @@ class ExcludedIndex(TrackModel):
 
 
 @dataclass(frozen=True)
-class CleanerConfig(TrackModel):
-    """Cleaner 1 configuration."""
+class RefineConfig(TrackModel):
+    """Refine configuration."""
 
     max_extension_m: float = 80.0
     min_heading_delta_deg: float = 80.0
@@ -345,7 +345,7 @@ class ProjectionConfig(TrackModel):
 
 @dataclass(frozen=True, slots=True)
 class SpatialContext(TrackModel):
-    """Concrete coordinate context inherited by every stage of one Clean Run."""
+    """Concrete coordinate context inherited by every stage of one Refine Run."""
 
     source_srid: int
     processing_srid: int
@@ -371,7 +371,7 @@ class RuntimeConfig(TrackModel):
     fallback_encodings: tuple[str, ...] = ("gb18030", "gbk", "cp936", "big5")
     mark_flush_every_n: int = 2000
     excluded_flush_threshold: int = 2000
-    cleaner_flush_point_threshold: int = 100_000
+    refine_flush_point_threshold: int = 100_000
     progress_interval: int = 500
     progress_time_threshold_s: float = 2.0
 
@@ -403,25 +403,25 @@ class GeneratedReason(StrEnum):
 
     
 @dataclass(frozen=True)
-class CleanerResult(TrackModel):
+class RefineResult(TrackModel):
     active: TrajectorySourceHandle
     excluded: ExcludedIndex
-    report: CleanReport
+    report: RefineReport
     spatial_context: SpatialContext
     kept_subtracks: list[list[TrajectoryPoint]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class RefinementSubtrack(TrackModel):
-    """One Cleaner subtrack with kept and derived points in deterministic order."""
+    """One Refine subtrack with kept and derived points in deterministic order."""
 
     vehicle_id: str
     subtrack_index: int
     points: list[TrajectoryPoint | DerivedPoint] = field(default_factory=list)
 
 @dataclass(frozen=True)
-class CleanerIncrementalResult(TrackModel):
-    """Cleaner 1 result for one incremental run. """
+class RefineIncrementalResult(TrackModel):
+    """Refine result for one incremental run. """
     kept: list[TrajectoryPoint]
     excluded: list[ExcludedPoint]
     derived: list[DerivedPoint]
@@ -446,8 +446,8 @@ class PostgresSource(TrackModel):
     primary_key_field: str = "point_id"
 
 
-# ── Intersect2 output models ──────────────────────────────────────────
-# PRD v2 Intersect2 §3, §7
+# ── Detect output models ──────────────────────────────────────────
+# PRD v2 Detect §3, §7
 
 
 @dataclass(frozen=True)
@@ -472,7 +472,7 @@ class TurnEvent(TrackModel):
     score: float  # = abs(turn_deg) for ranking
     source: str = "turn"
     point_ref: PointRef | None = None
-    cleaned_point_ref: CleanedPointRef | None = None
+    refined_point_ref: RefinedPointRef | None = None
     cross_track_calculate_index: int | None = None
     g_star_z: float | None = None
     # Transient algorithm provenance.  Schema v3 does not persist these fields.
@@ -483,8 +483,8 @@ class TurnEvent(TrackModel):
 class CrossTrackCandidate(TrackModel):
     """One orthogonal intersection between segments from two vehicles.
 
-    The two stable Clean point references identify the start of each source
-    segment.  The segment end is the next cleaned sequence member.
+    The two stable Refine point references identify the start of each source
+    segment.  The segment end is the next refined sequence member.
     """
 
     point_ref: PointRef
@@ -498,8 +498,8 @@ class CrossTrackCandidate(TrackModel):
     y: float
     heading: float
     speed: float
-    from_segment_start: CleanedPointRef | None = None
-    to_segment_start: CleanedPointRef | None = None
+    from_segment_start: RefinedPointRef | None = None
+    to_segment_start: RefinedPointRef | None = None
     cross_track_calculate_index: int = -1
 
 
@@ -557,7 +557,7 @@ class CrossingPoint(TrackModel):
     crossing_calculate_index: int   # unique within one transient cluster
     cluster_ref: str                # FK → HotspotCluster.cluster_ref
     vehicle_id: str
-    segment_start: CleanedPointRef | None
+    segment_start: RefinedPointRef | None
     subtrack_index: int
     point_ref: PointRef             # transient segment-start provenance
     crossing_x: float               # processing-CRS metres
@@ -606,7 +606,7 @@ class IntersectionTopology(TrackModel):
 
 @dataclass(frozen=True)
 class IntersectReport(TrackModel):
-    """Intersect2 aggregated statistics."""
+    """Detect aggregated statistics."""
 
     track_count: int
     turn_event_count: int
@@ -891,7 +891,7 @@ class CenterlineInputReplay(TrackModel):
     centerline_id: int
     fit_id: str
     detect_id: str
-    clean_id: str
+    refine_id: str
     variant: str
     from_intersection_id: int
     to_intersection_id: int
@@ -904,12 +904,12 @@ class CenterlineInputReplay(TrackModel):
 
 
 @dataclass(frozen=True)
-class ReplayCleanResult(TrackModel):
-    """Replay output for one vehicle's cleaner stage."""
+class ReplayRefineResult(TrackModel):
+    """Replay output for one vehicle's refine stage."""
 
     vehicle_id: str
     original: list[TrajectoryPoint]     # 原始点（时间序）
     excluded: list[tuple[TrajectoryPoint, str]]   # 被排除 + 原因
     injected: list[tuple[TrajectoryPoint, TrajectoryPoint, TrajectoryPoint]]
     #              ↑ injected_pt,      from_original_pt,  to_original_pt
-    active: list[TrajectoryPoint]       # 清洗后
+    active: list[TrajectoryPoint]       # 精炼后

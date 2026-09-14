@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from track.v2.manual_thin_benchmark.manual_bench_schema_v3 import (
+from track.v2.manual_thin_benchmark.manual_bench_schema_v4 import (
     PIPELINE_TIMING_KEYS,
     _clip_digest,
     _find_regressions,

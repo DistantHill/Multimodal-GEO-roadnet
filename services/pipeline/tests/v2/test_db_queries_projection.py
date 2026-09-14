@@ -12,7 +12,7 @@ from track.v2.db.queries import (
     _query_spatial_extent,
     build_active_in_window_sql,
     build_spatial_extent_sql,
-    fetch_clean_run_row,
+    fetch_refine_run_row,
     fetch_detect_row,
 )
 from track.v2.db.source_table import SourceTableContract
@@ -81,7 +81,7 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
         self.assertEqual(sql.count("%s"), 2)
         self.assertNotIn("geom_projected", sql)
 
-    def test_extent_executor_binds_clean_id_to_kept_and_injected_branches(self) -> None:
+    def test_extent_executor_binds_refine_id_to_kept_and_injected_branches(self) -> None:
         conn = _Connection((100.0, 900.0, 200.0, 1000.0))
 
         with patch(
@@ -92,17 +92,17 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
                 conn,
                 table="raw_points",
                 kept_table="kept_trajectory_points",
-                clean_id="clean-1",
+                refine_id="refine-1",
                 spatial_context=_SPATIAL_CONTEXT,
             )
 
         self.assertEqual(extent, (100.0, 200.0, 900.0, 1000.0))
-        self.assertEqual(conn.cursor_instance.params, ("clean-1", "clean-1"))
+        self.assertEqual(conn.cursor_instance.params, ("refine-1", "refine-1"))
 
     def test_window_query_uses_raw_and_injected_gist_prefilters(self) -> None:
         sql = build_active_in_window_sql(
             "raw_points",
-            has_clean_id=True,
+            has_refine_id=True,
             kept_table="kept_trajectory_points",
             spatial_context=_SPATIAL_CONTEXT,
             query_srid=32650,
@@ -125,10 +125,10 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
         self.assertIn("ST_X(ST_Transform(tp.geom, 32650)) AS x", sql)
         self.assertNotIn("geom_projected", sql)
 
-    def test_raw_query_without_clean_id_excludes_unscoped_injected_xy(self) -> None:
+    def test_raw_query_without_refine_id_excludes_unscoped_injected_xy(self) -> None:
         sql = build_active_in_window_sql(
             "raw_points",
-            has_clean_id=False,
+            has_refine_id=False,
             spatial_context=_SPATIAL_CONTEXT,
             query_srid=32650,
         )
@@ -138,14 +138,14 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
         self.assertIn("geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)", sql)
         self.assertEqual(sql.count("%s"), 9)
 
-    def test_raw_mode_with_clean_id_is_rejected_as_incomplete_run_isolation(self) -> None:
+    def test_raw_mode_with_refine_id_is_rejected_as_incomplete_run_isolation(self) -> None:
         conn = _Connection((100.0, 900.0, 200.0, 1000.0))
 
         with self.assertRaisesRegex(ValueError, "requires kept_table"):
             _query_spatial_extent(
                 conn,
                 table="raw_points",
-                clean_id="clean-1",
+                refine_id="refine-1",
                 spatial_context=_SPATIAL_CONTEXT,
             )
 
@@ -197,7 +197,7 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
                 table="raw_points",
                 source_table="raw_points",
                 kept_table="kept_trajectory_points",
-                clean_id="clean-1",
+                refine_id="refine-1",
                 spatial_context=_SPATIAL_CONTEXT,
             )
 
@@ -206,13 +206,13 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
             conn.cursor_instance.params,
             [
                 "raw_points",
-                "clean-1",
+                "refine-1",
                 *expected_source,
                 *projected_bounds,
                 "public.injected_points",
                 *expected_source,
                 *projected_bounds,
-                "clean-1",
+                "refine-1",
             ],
         )
 
@@ -233,21 +233,21 @@ class ProjectedSpatialQueryTest(unittest.TestCase):
 
 
 class DetectRunSpatialContextQueryTest(unittest.TestCase):
-    def test_clean_run_metadata_is_materialized_before_detect_reads(self) -> None:
+    def test_refine_run_metadata_is_materialized_before_detect_reads(self) -> None:
         conn = _Connection((
-            "clean-1", "raw_points", "completed", 4326, 32650,
+            "refine-1", "raw_points", "completed", 4326, 32650,
             _SPATIAL_CONTEXT.projection_config, True,
         ))
 
-        row = fetch_clean_run_row(conn, "clean-1")
+        row = fetch_refine_run_row(conn, "refine-1")
 
         self.assertEqual(row.source_table, "raw_points")
         self.assertEqual(row.spatial_context, _SPATIAL_CONTEXT)
         self.assertTrue(row.has_source_fingerprint)
 
-    def test_detect_run_inherits_validated_clean_run_context(self) -> None:
+    def test_detect_run_inherits_validated_refine_run_context(self) -> None:
         conn = _Connection((
-            "clean-1",
+            "refine-1",
             "raw_points",
             {"target_table": "raw_points"},
             "completed",
@@ -259,12 +259,12 @@ class DetectRunSpatialContextQueryTest(unittest.TestCase):
         row = fetch_detect_row(conn, "detect-1")
 
         self.assertEqual(row.spatial_context, _SPATIAL_CONTEXT)
-        self.assertIn("JOIN clean_runs AS c", conn.cursor_instance.sql)
+        self.assertIn("JOIN refine_runs AS c", conn.cursor_instance.sql)
         self.assertEqual(conn.cursor_instance.params, ("detect-1",))
 
     def test_detect_run_rejects_legacy_null_processing_srid(self) -> None:
         conn = _Connection((
-            "clean-legacy", "raw_points", {}, "completed", 4326, None, {},
+            "refine-legacy", "raw_points", {}, "completed", 4326, None, {},
         ))
 
         with self.assertRaisesRegex(ProjectionError, "no processing_srid"):

@@ -1,3 +1,5 @@
+"""Parser stage: source reading, field parsing and vehicle streaming."""
+
 from __future__ import annotations
 
 import csv
@@ -976,8 +978,8 @@ def _row_to_dict(row: Any, columns: list[str]) -> dict[str, Any]:
 def source_row_hash(row: dict[str, Any]) -> str:
     """Return a stable identity hash used by the standalone CSV parser.
 
-    This remains part of ``CsvSource``/importer identity handling; schema-v3
-    database replay validates ``clean_runs.source_fingerprint`` instead.
+    This remains part of ``CsvSource``/importer identity handling; schema-v4
+    database replay validates ``refine_runs.source_fingerprint`` instead.
     """
     normalized = {
         str(key): "" if value is None else str(value)

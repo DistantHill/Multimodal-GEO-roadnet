@@ -49,7 +49,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from track.v2.models import CsvSource, PostgresSource
-from track.v2.sources import (
+from track.v2.parser import (
     StreamVehicleSource,
     get_database,
     source_row_hash,

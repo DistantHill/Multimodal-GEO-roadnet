@@ -26,12 +26,12 @@ TORCH_PYTHON = Path(os.environ.get("TRACK_BENCH_PYTHON", sys.executable))
 _CHILD = r'''
 import contextlib, io, json, time
 from dataclasses import asdict, fields
-from track.v2.intersect2 import (
+from track.v2.detect import (
     _NOISE, _UNVISITED, _cluster_dbscan, _distance_m, _neighbors_indices,
     _run_dbscan, _to_lonlat, _with_source_provenance,
 )
 try:
-    from track.v2.intersect2 import _build_dbscan_grid, _grid_neighbors_indices
+    from track.v2.detect import _build_dbscan_grid, _grid_neighbors_indices
 except ImportError:
     _build_dbscan_grid = _grid_neighbors_indices = None
 from track.v2.models import HotspotCluster, PointRef, TurnEvent
@@ -184,10 +184,10 @@ def _sha256_bytes(value: bytes) -> str:
 def _current_dirty_digest(worktree: Path) -> str:
     """Match manual_bench_dbscan.py's formal dirty-digest contract exactly."""
     tracked = subprocess.run(
-        ["git", "diff", "--binary", "HEAD", "--", "track/v2/intersect2.py"],
+        ["git", "diff", "--binary", "HEAD", "--", "track/v2/detect.py"],
         cwd=worktree, capture_output=True, check=True,
     ).stdout
-    return _sha256_bytes(tracked + (worktree / "track/v2/intersect2.py").read_bytes())
+    return _sha256_bytes(tracked + (worktree / "track/v2/detect.py").read_bytes())
 
 
 def _baseline_source_digest(worktree: Path) -> str:
@@ -196,7 +196,7 @@ def _baseline_source_digest(worktree: Path) -> str:
     # produce different bytes, so hash the identical archive route.
     with tempfile.TemporaryDirectory(prefix="perf-dbscan-baseline-digest-") as temporary:
         tree = _archive(worktree, Path(temporary))
-        return _sha256(tree / "track/v2/intersect2.py")
+        return _sha256(tree / "track/v2/detect.py")
 
 
 def _gate_case() -> dict[str, object]:
@@ -260,7 +260,7 @@ def _validate_formal_provenance(
         header = comparison["header"]
     except (json.JSONDecodeError, KeyError, TypeError) as error:
         _fail_closed(f"unparseable comparison/header: {error}")
-    source_digest = _sha256(worktree / "track/v2/intersect2.py")
+    source_digest = _sha256(worktree / "track/v2/detect.py")
     dirty_digest = _current_dirty_digest(worktree)
     optimized_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=worktree, text=True).strip()
     expected_header = {
@@ -386,7 +386,7 @@ def main() -> int:
             "formal_rss_ratio": comparison["rss_ratio"],
             "formal_rss_pass": comparison.get("rss_pass") is True,
         },
-        "optimized_source_sha256": _sha256(worktree / "track/v2/intersect2.py"),
+        "optimized_source_sha256": _sha256(worktree / "track/v2/detect.py"),
         "diagnostic_helper_sha256": _sha256(Path(__file__)),
         "gate_input_sha256": input_digest,
         "timing_contract": {

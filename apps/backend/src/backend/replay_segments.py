@@ -26,7 +26,7 @@ def segment_features(store, grouped, request, detect_id):
 
     features = []
     for key, points in grouped.items():
-        # Detection segments join consecutive cleaned points; persisted crossing
+        # Detection segments join consecutive refined points; persisted crossing
         # points inside them do not turn the rest of the subtrack into participants.
         anchors = [index for index, point in enumerate(points) if point.point_kind != "crossing"]
         if not anchors:

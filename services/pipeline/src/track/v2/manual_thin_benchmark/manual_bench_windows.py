@@ -400,7 +400,7 @@ class _NullProgress:
 
 @contextmanager
 def _legacy_phase_capture(
-    intersect2: Any,
+    detect: Any,
     telemetry: dict[str, int | float],
 ) -> Iterator[None]:
     """Collect disjoint baseline phase samples through reversible seams.
@@ -418,7 +418,7 @@ def _legacy_phase_capture(
         originals.append((obj, name, getattr(obj, name)))
         setattr(obj, name, wrapper)
 
-    original_build = intersect2._build_points_from_rows
+    original_build = detect._build_points_from_rows
 
     def build_points(*args: Any, **kwargs: Any) -> Any:
         started = time.perf_counter()
@@ -429,9 +429,9 @@ def _legacy_phase_capture(
                 "materialization_seconds", 0.0
             ) + (time.perf_counter() - started)
 
-    replace(intersect2, "_build_points_from_rows", build_points)
+    replace(detect, "_build_points_from_rows", build_points)
 
-    original_query = intersect2._query_active_points_in_window
+    original_query = detect._query_active_points_in_window
 
     def query(*args: Any, **kwargs: Any) -> Any:
         materialization_before = float(telemetry.get("materialization_seconds", 0.0))
@@ -445,10 +445,10 @@ def _legacy_phase_capture(
                 0.0, total - nested
             )
 
-    replace(intersect2, "_query_active_points_in_window", query)
+    replace(detect, "_query_active_points_in_window", query)
 
     def timed_wrapper(name: str, bucket: str) -> None:
-        original = getattr(intersect2, name)
+        original = getattr(detect, name)
 
         def wrapped(*args: Any, **kwargs: Any) -> Any:
             started = time.perf_counter()
@@ -459,14 +459,14 @@ def _legacy_phase_capture(
                     time.perf_counter() - started
                 )
 
-        replace(intersect2, name, wrapped)
+        replace(detect, name, wrapped)
 
     timed_wrapper("_tracks_from_points", "group_sort_seconds")
     timed_wrapper("_to_xy", "segment_build_seconds")
     timed_wrapper("_batch_segment_intersections", "exact_seconds")
     timed_wrapper("_cross_track_candidate_key", "dedupe_seconds")
 
-    original_candidate = intersect2.CrossTrackCandidate
+    original_candidate = detect.CrossTrackCandidate
 
     def candidate(*args: Any, **kwargs: Any) -> Any:
         started = time.perf_counter()
@@ -477,11 +477,11 @@ def _legacy_phase_capture(
                 time.perf_counter() - started
             )
 
-    replace(intersect2, "CrossTrackCandidate", candidate)
+    replace(detect, "CrossTrackCandidate", candidate)
 
     # Baseline creates NumPy input arrays inside the vehicle-pair loop.  The
     # module holds the shared numpy object, so restore it before leaving.
-    original_array = intersect2.np.array
+    original_array = detect.np.array
 
     def array(*args: Any, **kwargs: Any) -> Any:
         started = time.perf_counter()
@@ -492,7 +492,7 @@ def _legacy_phase_capture(
                 "array_build_seconds", 0.0
             ) + (time.perf_counter() - started)
 
-    replace(intersect2.np, "array", array)
+    replace(detect.np, "array", array)
     try:
         yield
     finally:
@@ -627,7 +627,7 @@ def _dense_tracks() -> dict[str, list[Any]]:
 
 
 def _projection_context_for_source(
-    intersect2: Any,
+    detect: Any,
 ) -> tuple[Any, Any] | None:
     """Build the explicit fixed CRS only for sources exposing the v2 API.
 
@@ -636,7 +636,7 @@ def _projection_context_for_source(
     source must never infer or default its processing CRS.
     """
     if "spatial_context" not in inspect.signature(
-        intersect2._extract_cross_track_windows
+        detect._extract_cross_track_windows
     ).parameters:
         return None
     parameters = json.loads(os.environ["PERF_WINDOWS_PARAMETERS"])
@@ -652,22 +652,22 @@ def _projection_context_for_source(
     return spatial_context, CoordinateTransformer(spatial_context)
 
 
-def _extractor_name(intersect2: Any) -> str:
+def _extractor_name(detect: Any) -> str:
     """Return the candidate-extractor global used by this source version."""
-    if hasattr(intersect2, "extract_cross_track_candidates"):
+    if hasattr(detect, "extract_cross_track_candidates"):
         return "extract_cross_track_candidates"
     return "_extract_orthogonal_cross_track_candidates"
 
 
 def _call_spatial_window_extraction(
-    intersect2: Any,
+    detect: Any,
     conn: Any,
     cfg: Any,
     extent: tuple[float, float, float, float],
     projection: tuple[Any, Any] | None,
     **kwargs: Any,
 ) -> list[Any]:
-    function = intersect2._extract_cross_track_windows
+    function = detect._extract_cross_track_windows
     if "spatial_context" in inspect.signature(function).parameters:
         if projection is None:
             raise RuntimeError("current benchmark source requires processing_srid")
@@ -685,7 +685,7 @@ def _call_spatial_window_extraction(
 
 
 def _capture_real_windows(
-    intersect2: Any,
+    detect: Any,
     conn: Any,
     cfg: Any,
     extent: tuple[float, float, float, float],
@@ -701,9 +701,9 @@ def _capture_real_windows(
     """
     raw_records: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
-    original_query = intersect2._query_active_points_in_window
-    extractor_name = _extractor_name(intersect2)
-    original_extract = getattr(intersect2, extractor_name)
+    original_query = detect._query_active_points_in_window
+    extractor_name = _extractor_name(detect)
+    original_extract = getattr(detect, extractor_name)
 
     def query(*args: Any, **kwargs: Any) -> list[Any]:
         nonlocal current
@@ -729,17 +729,17 @@ def _capture_real_windows(
         current["window_candidates"] = candidates
         return candidates, pair_count, total_pairs
 
-    intersect2._query_active_points_in_window = query
-    setattr(intersect2, extractor_name, extract)
+    detect._query_active_points_in_window = query
+    setattr(detect, extractor_name, extract)
     recorder = _ProgressRecorder()
     try:
         kwargs: dict[str, Any] = {"live_status": recorder}
         if telemetry is not None and "telemetry" in inspect.signature(
-            intersect2._extract_cross_track_windows
+            detect._extract_cross_track_windows
         ).parameters:
             kwargs["telemetry"] = telemetry
         candidates = _call_spatial_window_extraction(
-            intersect2,
+            detect,
             conn,
             cfg,
             extent,
@@ -747,8 +747,8 @@ def _capture_real_windows(
             **kwargs,
         )
     finally:
-        intersect2._query_active_points_in_window = original_query
-        setattr(intersect2, extractor_name, original_extract)
+        detect._query_active_points_in_window = original_query
+        setattr(detect, extractor_name, original_extract)
 
     records: list[dict[str, Any]] = []
     seen: set[tuple[str, ...]] = set()
@@ -794,7 +794,7 @@ def _capture_real_windows(
 
 
 def _measure_real_windows(
-    intersect2: Any,
+    detect: Any,
     conn: Any,
     cfg: Any,
     extent: tuple[float, float, float, float],
@@ -804,8 +804,8 @@ def _measure_real_windows(
     """Run the real pipeline while retaining only aggregate pair semantics."""
     pair_count = 0
     total_pairs = 0
-    extractor_name = _extractor_name(intersect2)
-    original_extract = getattr(intersect2, extractor_name)
+    extractor_name = _extractor_name(detect)
+    original_extract = getattr(detect, extractor_name)
 
     def extract(*args: Any, **kwargs: Any) -> tuple[list[Any], int, int]:
         nonlocal pair_count, total_pairs
@@ -814,15 +814,15 @@ def _measure_real_windows(
         total_pairs += window_total
         return candidates, window_pairs, window_total
 
-    setattr(intersect2, extractor_name, extract)
+    setattr(detect, extractor_name, extract)
     try:
         kwargs: dict[str, Any] = {"live_status": _NullProgress()}
         if telemetry is not None and "telemetry" in inspect.signature(
-            intersect2._extract_cross_track_windows
+            detect._extract_cross_track_windows
         ).parameters:
             kwargs["telemetry"] = telemetry
         candidates = _call_spatial_window_extraction(
-            intersect2,
+            detect,
             conn,
             cfg,
             extent,
@@ -830,15 +830,15 @@ def _measure_real_windows(
             **kwargs,
         )
     finally:
-        setattr(intersect2, extractor_name, original_extract)
+        setattr(detect, extractor_name, original_extract)
     return candidates, pair_count, total_pairs
 
 
-def _child_provenance(intersect2: Any) -> dict[str, Any]:
+def _child_provenance(detect: Any) -> dict[str, Any]:
     import track.v2._geometry as geometry
 
     source_root = Path(os.environ["PERF_WINDOWS_EXPECTED_SOURCE_ROOT"]).resolve()
-    intersect_path = Path(intersect2.__file__).resolve()
+    intersect_path = Path(detect.__file__).resolve()
     geometry_path = Path(geometry.__file__).resolve()
     for path in (intersect_path, geometry_path):
         try:
@@ -852,7 +852,7 @@ def _child_provenance(intersect2: Any) -> dict[str, Any]:
         raise RuntimeError("child interpreter mismatch")
     expected_source_hashes = json.loads(os.environ["PERF_WINDOWS_SOURCE_HASHES"])
     actual_source_hashes = {
-        "track/v2/intersect2.py": _file_sha256(intersect_path),
+        "track/v2/detect.py": _file_sha256(intersect_path),
         "track/v2/_geometry.py": _file_sha256(geometry_path),
     }
     if actual_source_hashes != expected_source_hashes:
@@ -876,8 +876,8 @@ def _child_provenance(intersect2: Any) -> dict[str, Any]:
         "source_label": os.environ["PERF_WINDOWS_SOURCE_LABEL"],
         "source_root": str(source_root),
         "source_commit": os.environ["PERF_WINDOWS_SOURCE_COMMIT"],
-        "intersect2_path": str(intersect_path),
-        "intersect2_sha256": actual_source_hashes["track/v2/intersect2.py"],
+        "detect_path": str(intersect_path),
+        "detect_sha256": actual_source_hashes["track/v2/detect.py"],
         "geometry_path": str(geometry_path),
         "geometry_sha256": actual_source_hashes["track/v2/_geometry.py"],
         "dirty_diff_sha256": os.environ["PERF_WINDOWS_DIRTY_DIFF_SHA256"],
@@ -894,13 +894,13 @@ def _child_provenance(intersect2: Any) -> dict[str, Any]:
 
 
 def _child(case: str, run_kind: str) -> dict[str, Any]:
-    from track.v2.intersect2 import (
+    from track.v2.detect import (
         IntersectConfig,
         _query_spatial_extent,
     )
-    import track.v2.intersect2 as intersect2
-    extractor = getattr(intersect2, _extractor_name(intersect2))
-    projection = _projection_context_for_source(intersect2)
+    import track.v2.detect as detect
+    extractor = getattr(detect, _extractor_name(detect))
+    projection = _projection_context_for_source(detect)
     if run_kind not in {"measurement", "semantic", "phase"}:
         raise ValueError(f"unsupported child run kind: {run_kind}")
     collect_phase = run_kind == "phase"
@@ -911,7 +911,7 @@ def _child(case: str, run_kind: str) -> dict[str, Any]:
     phase_context = (
         nullcontext()
         if not collect_phase or native_telemetry
-        else _legacy_phase_capture(intersect2, telemetry)
+        else _legacy_phase_capture(detect, telemetry)
     )
     semantic_snapshot: dict[str, Any] | None = None
     progress_events: list[dict[str, Any]] = []
@@ -1018,13 +1018,13 @@ def _child(case: str, run_kind: str) -> dict[str, Any]:
                 start = time.perf_counter()
                 if run_kind == "semantic":
                     candidates, window_records, progress_events = _capture_real_windows(
-                        intersect2, conn, cfg, extent, telemetry, projection
+                        detect, conn, cfg, extent, telemetry, projection
                     )
                     pair_count = sum(record["pair_count"] for record in window_records)
                     total_pairs = sum(record["total_pairs"] for record in window_records)
                 else:
                     candidates, pair_count, total_pairs = _measure_real_windows(
-                        intersect2, conn, cfg, extent, telemetry, projection
+                        detect, conn, cfg, extent, telemetry, projection
                     )
                 elapsed = time.perf_counter() - start
                 peak_working_set = _peak_working_set()
@@ -1083,7 +1083,7 @@ def _child(case: str, run_kind: str) -> dict[str, Any]:
         "result_snapshot": result_snapshot,
         "result_snapshot_sha256": _sha(result_snapshot),
         "phase_metrics": phase_metrics,
-        "provenance": _child_provenance(intersect2),
+        "provenance": _child_provenance(detect),
     }
 
 
@@ -1221,7 +1221,7 @@ def _git_output(worktree: Path, *args: str) -> bytes:
 def _source_hashes(source_root: Path) -> dict[str, str]:
     return {
         relative: _file_sha256(source_root / relative)
-        for relative in ("track/v2/intersect2.py", "track/v2/_geometry.py")
+        for relative in ("track/v2/detect.py", "track/v2/_geometry.py")
     }
 
 
@@ -1604,8 +1604,8 @@ def main() -> None:
     lock_sha256 = _file_sha256(lock_path)
     dirty_diff = _git_output(
         worktree, "diff", "--binary", args.baseline_commit, "--",
-        "track/v2/intersect2.py", "track/v2/_geometry.py",
-        "tests/v2/test_intersect2.py",
+        "track/v2/detect.py", "track/v2/_geometry.py",
+        "tests/v2/test_detect.py",
     )
     dirty_diff_sha256 = hashlib.sha256(dirty_diff).hexdigest()
     dirty_paths = _git_output(worktree, "status", "--short").decode(

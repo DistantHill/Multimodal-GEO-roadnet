@@ -1,12 +1,12 @@
 """track.v2 — Step-based trajectory pipeline.
 
 Architecture (linear):
-    Parser 0  →  Cleaner 1  →  Intersect2  →  Clip  →  Fitting  →  Network
+    Parser  →  Refine  →  Detect  →  Clip  →  Fitting  →  Network
 
 Each stage has a single public entry point and produces frozen intermediate
 artifacts. No stage mutates another stage's output.
 
-Intersect2 uses two complementary methods:
+Detect uses two complementary methods:
   1. Turn events: bearing-change detection → Getis-Ord G* → DBSCAN
   3. Cross-track candidates: cross-vehicle segment intersections → DBSCAN
 Both feed into the same topology verification (entry/exit → branch clustering).
@@ -19,20 +19,20 @@ from importlib import import_module as _import_module
 # before its spawned process initializer can configure native thread counts.
 # Public stage functions and model classes retain their original identities.
 _MODULE_EXPORTS = {
-    "cleaner1": ("clean",),
+    "refine": ("refine_vehicle",),
     "clip": ("extract_clips", "extract_clips_for_detect"),
     "fitting": ("fit_centerlines", "fit_centerline_variants"),
-    "intersect2": ("IntersectConfig", "IntersectResult", "detect_intersections"),
+    "detect": ("IntersectConfig", "IntersectResult", "detect_intersections"),
     "network": ("build_network",),
     "models": (
-        "Centerline", "CenterlineFitBundle", "CleanerConfig", "ClipConfig",
+        "Centerline", "CenterlineFitBundle", "RefineConfig", "ClipConfig",
         "ClipEndpoint", "ClipInput", "ClipIntersection", "ClipPoint", "ClipReport",
         "ClipResult", "ClipTrack", "CsvSource", "FitIssue", "FitReport", "FitResult",
         "FittingConfig", "NetworkConfig", "NetworkEdge", "NetworkIssue", "NetworkNode",
         "NetworkReport", "NetworkResult", "PointRef", "PostgresSource", "ProjectionConfig",
         "ResolvedTrackPoint", "SpatialContext", "TrackClip", "TrajectoryPoint",
     ),
-    "parser0": ("get_database",),
+    "parser": ("get_database",),
     "projection": (
         "ProjectionError", "QueryWindow", "QueryWindowRequest", "build_query_window",
         "create_spatial_context",

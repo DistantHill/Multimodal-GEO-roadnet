@@ -1,4 +1,4 @@
-"""Explicit, confirmation-gated deletion of Clean and Detect Runs."""
+"""Explicit, confirmation-gated deletion of Refine and Detect Runs."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 
-CLEAN_ARTIFACT_TABLES = (
+REFINE_ARTIFACT_TABLES = (
     "excluded_points",
     "kept_trajectory_points",
     "injected_points",
@@ -57,27 +57,27 @@ class DeleteRunService:
             self._lock_artifact_tables(DETECT_ARTIFACT_TABLES)
         return self._detect_counts(detect_id)
 
-    def preview_clean(self, clean_id: str, *, lock: bool = False) -> DeleteImpact:
+    def preview_refine(self, refine_id: str, *, lock: bool = False) -> DeleteImpact:
         with self._conn.cursor() as cur:  # type: ignore[attr-defined]
             suffix = " FOR UPDATE" if lock else ""
-            cur.execute(f"SELECT id FROM clean_runs WHERE id = %s{suffix}", (clean_id,))
+            cur.execute(f"SELECT id FROM refine_runs WHERE id = %s{suffix}", (refine_id,))
             if cur.fetchone() is None:
-                raise ValueError(f"unknown Clean Run: {clean_id}")
+                raise ValueError(f"unknown Refine Run: {refine_id}")
         with self._conn.cursor() as cur:  # type: ignore[attr-defined]
             suffix = " FOR UPDATE" if lock else ""
             cur.execute(
-                "SELECT id FROM detect_runs WHERE clean_id = %s ORDER BY id" + suffix,
-                (clean_id,),
+                "SELECT id FROM detect_runs WHERE refine_id = %s ORDER BY id" + suffix,
+                (refine_id,),
             )
             detect_ids = [str(row[0]) for row in cur.fetchall()]
         if lock:
             self._lock_artifact_tables(
-                CLEAN_ARTIFACT_TABLES + DETECT_ARTIFACT_TABLES
+                REFINE_ARTIFACT_TABLES + DETECT_ARTIFACT_TABLES
             )
-        own_rows = self._counts(CLEAN_ARTIFACT_TABLES, "clean_id", clean_id)
+        own_rows = self._counts(REFINE_ARTIFACT_TABLES, "refine_id", refine_id)
         return DeleteImpact(
-            target_kind="clean",
-            target_id=clean_id,
+            target_kind="refine",
+            target_id=refine_id,
             own_rows=own_rows,
             detects=tuple(self._detect_counts(detect_id) for detect_id in detect_ids),
         )
@@ -96,16 +96,16 @@ class DeleteRunService:
             output_fn=output_fn,
         )
 
-    def confirm_and_delete_clean(
+    def confirm_and_delete_refine(
         self,
-        clean_id: str,
+        refine_id: str,
         *,
         input_fn: Callable[[str], str] = input,
         output_fn: Callable[[str], None] = print,
     ) -> bool:
         return self._confirm_and_delete(
-            self.preview_clean,
-            clean_id,
+            self.preview_refine,
+            refine_id,
             input_fn=input_fn,
             output_fn=output_fn,
         )
@@ -152,9 +152,9 @@ class DeleteRunService:
         else:
             for detect in locked.detects:
                 self._delete_detect(detect.target_id)
-            for table in CLEAN_ARTIFACT_TABLES:
-                self._delete_rows(table, "clean_id", locked.target_id)
-            self._delete_rows("clean_runs", "id", locked.target_id)
+            for table in REFINE_ARTIFACT_TABLES:
+                self._delete_rows(table, "refine_id", locked.target_id)
+            self._delete_rows("refine_runs", "id", locked.target_id)
         self._conn.commit()  # type: ignore[attr-defined]
         return True
 

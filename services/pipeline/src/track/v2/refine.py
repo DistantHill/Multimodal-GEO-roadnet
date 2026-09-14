@@ -1,3 +1,5 @@
+"""Refine stage: split trajectories, exclude stationary points and derive points."""
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -7,13 +9,13 @@ from collections.abc import Iterator
 from dataclasses import replace
 
 from .models import (
-    CleanReport,
-    CleanerConfig,
-    CleanerIncrementalResult,
+    RefineReport,
+    RefineConfig,
+    RefineIncrementalResult,
     DerivedPoint,
     GeneratedReason,
     RefinementSubtrack,
-    CleanerResult,
+    RefineResult,
     ExcludedIndex,
     ExcludedPoint,
     FieldMapping,
@@ -27,19 +29,19 @@ from .models import (
 from .projection import CoordinateTransformer
 
 
-def clean_vehicle(
+def refine_vehicle(
     vehicle_points: list[TrajectoryPoint],
     *,
     spatial_context: SpatialContext,
-    config: CleanerConfig | None = None,
+    config: RefineConfig | None = None,
     _transformer: CoordinateTransformer | None = None,
-) -> CleanerIncrementalResult:
-    """Clean one vehicle's trajectory points.
+) -> RefineIncrementalResult:
+    """Refine one vehicle's trajectory points.
 
     ZH: 处理单辆车的轨迹点：按时间间隙切分子轨迹、去除静止段、注入正交候选点。
-        返回该车辆的全部清洗结果，不累积全局状态。
+        返回该车辆的全部精炼结果，不累积全局状态。
     """
-    cfg = config or CleanerConfig()
+    cfg = config or RefineConfig()
     kept_points: list[TrajectoryPoint] = []
     excluded_points: list[ExcludedPoint] = []
     derived_points: list[DerivedPoint] = []
@@ -50,14 +52,15 @@ def clean_vehicle(
     subtracks = _split_by_gaps(vehicle_points, cfg.max_gap_s)
     rename = len(subtracks) > 1
     for index, subtrack in enumerate(subtracks, start=1):
-        if rename:
-            subtrack = [_with_vehicle_id(point, f"{point.vehicle_id}_seg{index:02d}") for point in subtrack]
         subtrack_kept, subtrack_excluded = _exclude_stationary(subtrack, cfg)
         kept_xy = transformer.forward_many(
             (point.lon, point.lat) for point in subtrack_kept
         )
         subtrack_kept = [
-            replace(point, x=x, y=y)
+            _projected_point(
+                point, x, y,
+                f"{point.vehicle_id}_seg{index:02d}" if rename else point.vehicle_id,
+            )
             for point, (x, y) in zip(subtrack_kept, kept_xy)
         ]
         kept_points.extend(subtrack_kept)
@@ -80,7 +83,7 @@ def clean_vehicle(
                 )
             )
 
-    return CleanerIncrementalResult(
+    return RefineIncrementalResult(
         kept=kept_points,
         excluded=excluded_points,
         derived=derived_points,
@@ -90,18 +93,31 @@ def clean_vehicle(
     )
 
 
-def clean(
+def _projected_point(
+    point: TrajectoryPoint, x: float, y: float, vehicle_id: str,
+) -> TrajectoryPoint:
+    """Copy the parsed point once, reusing its immutable source reference."""
+    if type(point) is not TrajectoryPoint:
+        # Retain dataclass subclass fields and construction behavior.
+        return replace(point, vehicle_id=vehicle_id, x=x, y=y)
+    return TrajectoryPoint(
+        point.point_ref, vehicle_id, point.timestamp, point.lon, point.lat,
+        point.heading, point.speed, point.extra, x, y, point.refined_point_ref,
+    )
+
+
+def refine(
     source: TrajectorySourceHandle,
     *,
     spatial_context: SpatialContext,
-    config: CleanerConfig | None = None,
-) -> CleanerResult:
-    """Clean all trajectories from a source handle.
+    config: RefineConfig | None = None,
+) -> RefineResult:
+    """Refine all trajectories from a source handle.
 
-    ZH: 对数据源中的全部车辆轨迹执行清洗。内部调用 ``clean_vehicle()`` 逐车处理，
+    ZH: 对数据源中的全部车辆轨迹执行精炼。内部调用 ``refine_vehicle()`` 逐车处理，
         累积全局统计和输出。
     """
-    cfg = config or CleanerConfig()
+    cfg = config or RefineConfig()
     active: list[TrajectoryPoint] = []
     excluded: list[ExcludedPoint] = []
     kept_subtracks: list[list[TrajectoryPoint]] = []
@@ -110,11 +126,11 @@ def clean(
     t0 = time.perf_counter()
     last_t = t0
     group_count = 0
-    print("  ── 清洗 / Cleaning ...")
+    print("  ── 精炼 / Refining ...")
     transformer = CoordinateTransformer(spatial_context)
 
     for vehicle_points in _group_by_vehicle(source.iter_points()):
-        result = clean_vehicle(
+        result = refine_vehicle(
             vehicle_points,
             config=cfg,
             spatial_context=spatial_context,
@@ -132,17 +148,17 @@ def clean(
             print(f"    ... 已处理 / Processed {group_count} 车辆组/groups ({now - t0:.1f}s)")
             last_t = now
 
-    print(f"  ── 清洗 / Cleaning: {len(active):,} 点/points ({time.perf_counter() - t0:.1f}s)")
+    print(f"  ── 精炼 / Refining: {len(active):,} 点/points ({time.perf_counter() - t0:.1f}s)")
 
     excluded_index = ExcludedIndex(excluded)
-    report = CleanReport(
+    report = RefineReport(
         active_count=len(active),
         excluded_count=len(excluded),
         injected_count=injected_count,
         excluded_reasons=excluded_index.reason_counts(),
         sample_excluded=[(item.point_ref, item.reason) for item in excluded[:cfg.excluded_sample_max]],
     )
-    return CleanerResult(
+    return RefineResult(
         active=ListTrajectorySourceHandle(
             active,
             source_info=source.source_info,
@@ -248,7 +264,7 @@ def _split_by_gaps(points: list[TrajectoryPoint], max_gap_s: float) -> list[list
 
 def _exclude_stationary(
     points: list[TrajectoryPoint],
-    cfg: CleanerConfig,
+    cfg: RefineConfig,
 ) -> tuple[list[TrajectoryPoint], list[ExcludedPoint]]:
     if len(points) < 3:
         return list(points), []
@@ -268,6 +284,9 @@ def _exclude_stationary(
                 excluded_refs.add(point.point_ref)
         index += 1
 
+    if not excluded_refs:
+        return list(points), []
+
     kept: list[TrajectoryPoint] = []
     removed: list[ExcludedPoint] = []
     for point in points:
@@ -280,7 +299,7 @@ def _exclude_stationary(
 
 def _inject_orthogonal(
     points: list[TrajectoryPoint],
-    cfg: CleanerConfig,
+    cfg: RefineConfig,
     *,
     spatial_context: SpatialContext,
     _transformer: CoordinateTransformer | None = None,
@@ -314,7 +333,7 @@ def _inject_orthogonal(
 def _orthogonal_candidate(
     a: TrajectoryPoint,
     b: TrajectoryPoint,
-    cfg: CleanerConfig,
+    cfg: RefineConfig,
     *,
     spatial_context: SpatialContext,
     _transformer: CoordinateTransformer | None = None,

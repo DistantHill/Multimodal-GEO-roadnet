@@ -1,4 +1,4 @@
-"""Delete one Clean or Detect Run after preview and two confirmations."""
+"""Delete one Refine or Detect Run after preview and two confirmations."""
 
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ def _uuid_arg(value: str) -> str:
 def main() -> int:
     defaults = default_postgres_config()
     parser = argparse.ArgumentParser(
-        description="Preview and explicitly delete one Clean or Detect Run."
+        description="Preview and explicitly delete one Refine or Detect Run."
     )
     target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument("--clean-id", type=_uuid_arg)
+    target.add_argument("--refine-id", type=_uuid_arg)
     target.add_argument("--detect-id", type=_uuid_arg)
     parser.add_argument("--host", default=defaults.host)
     parser.add_argument("--port", type=int, default=defaults.port)
@@ -50,8 +50,8 @@ def main() -> int:
             with pg_connect(config) as conn:
                 service = DeleteRunService(conn)
                 deleted = (
-                    service.confirm_and_delete_clean(args.clean_id)
-                    if args.clean_id
+                    service.confirm_and_delete_refine(args.refine_id)
+                    if args.refine_id
                     else service.confirm_and_delete_detect(args.detect_id)
                 )
         except (RuntimeError, ValueError) as exc:

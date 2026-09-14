@@ -15,8 +15,8 @@ def make_store(rows=()):
     store = PostgresMapStore(Mock())
     store._fetchone = Mock(return_value=(DETECT_ID, 42))
     store._fetchall = Mock(return_value=list(rows))
-    store._resolve_detect = Mock(return_value=SimpleNamespace(clean=SimpleNamespace(
-        clean_id="clean-1", quoted_source_table='"public"."source_points"',
+    store._resolve_detect = Mock(return_value=SimpleNamespace(refine=SimpleNamespace(
+        refine_id="refine-1", quoted_source_table='"public"."source_points"',
         source_key_sql_type="bigint",
     )))
     store._verify_source_fingerprint = Mock()
@@ -42,7 +42,7 @@ def test_intersection_reuses_pipeline_helper_and_preserves_injected_identity(mon
     assert result["features"][0]["properties"]["candidate_intersection_id"] == 42
     sql, params = store._fetchall.call_args.args
     assert "FROM turn_events" in sql and "FROM tracks_cross" in sql
-    assert "successor.cleaned_sequence_in_subtrack = start.cleaned_sequence_in_subtrack + 1" in sql
+    assert "successor.refined_sequence_in_subtrack = start.refined_sequence_in_subtrack + 1" in sql
     assert params[:4] == (DETECT_ID, 42, DETECT_ID, 42)
 
 

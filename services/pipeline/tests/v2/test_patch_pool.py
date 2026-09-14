@@ -281,7 +281,7 @@ def test_structured_remote_failure_finishing_during_commit_prevents_refill():
     assert len(pool.submissions) == 3
 
 
-def test_source_failure_cleans_up_already_submitted_work():
+def test_source_failure_refines_up_already_submitted_work():
     pool = FakePool()
 
     def source():
@@ -295,7 +295,7 @@ def test_source_failure_cleans_up_already_submitted_work():
     assert pool.shutdown_calls == [{"wait": True, "cancel_futures": True}]
 
 
-def test_submit_failure_stops_and_cleans_up():
+def test_submit_failure_stops_and_refines_up():
     pool = FakePool(submit_failure="1")
     with pytest.raises(RuntimeError, match="submit failed"):
         run((task(index) for index in range(10)), pool=pool)
@@ -376,7 +376,7 @@ def test_accepted_futures_are_released_before_next_input_batch():
     ) == 3
 
 
-def test_wait_failure_cleans_up():
+def test_wait_failure_refines_up():
     pool = FakePool()
 
     def waiter(*args, **kwargs):

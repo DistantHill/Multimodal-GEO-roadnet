@@ -188,8 +188,8 @@ def extract_cross_track_candidates_legacy(
                         y=float(y),
                         heading=segments_a[segment_index_a][4],
                         speed=start_a.speed,
-                        from_segment_start=start_a.cleaned_point_ref,
-                        to_segment_start=start_b.cleaned_point_ref,
+                        from_segment_start=start_a.refined_point_ref,
+                        to_segment_start=start_b.refined_point_ref,
                         cross_track_calculate_index=len(candidates),
                     )
                     if coordinate_transformer is None:

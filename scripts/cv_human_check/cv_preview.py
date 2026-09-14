@@ -16,7 +16,7 @@ import numpy as np
 from track.v2.config import connect, default_postgres_config
 from .preview import fit_profile, split_tiles, write_report
 from track.v2.db.queries import fetch_detect_row, fetch_intersections
-from track.v2.db.source_table import validate_source_table, verify_clean_source_fingerprint
+from track.v2.db.source_table import validate_source_table, verify_refine_source_fingerprint
 from track.v2.projection import CoordinateTransformer
 
 
@@ -83,16 +83,16 @@ def main() -> int:
         run = fetch_detect_row(conn, str(args.detect_id))
         if run.status != "completed":
             raise ValueError("preview requires a completed Detect Run")
-        verify_clean_source_fingerprint(conn, run.clean_id)
+        verify_refine_source_fingerprint(conn, run.refine_id)
         contract = validate_source_table(conn, run.source_table)
         with conn.cursor() as cur:
-            cur.execute("SELECT source_fingerprint FROM clean_runs WHERE id = %s", (run.clean_id,))
+            cur.execute("SELECT source_fingerprint FROM refine_runs WHERE id = %s", (run.refine_id,))
             fingerprint = cur.fetchone()[0]
             cur.execute(f"SELECT count(*), min(timestamp), max(timestamp), ST_Extent(geom)::text "
                         f"FROM {contract.quoted_table}")
             source_count, time_min, time_max, extent = cur.fetchone()
         if source_count != fingerprint["row_count"]:
-            raise ValueError("source row count differs from Clean snapshot; select a matching run/source")
+            raise ValueError("source row count differs from Refine snapshot; select a matching run/source")
         pixels = read_pixels(conn, contract.quoted_table, run.spatial_context.processing_srid,
                              args.pixel_size, args.max_pixels)
         transformer = CoordinateTransformer(run.spatial_context)
@@ -116,9 +116,9 @@ def main() -> int:
         "version": 1, "created_at": datetime.now(timezone.utc).isoformat(),
         "purpose": "normalization preview; provisional spatial split, not a reviewed dataset",
         "database": config.database, "source_table": run.source_table,
-        "detect_id": str(args.detect_id), "clean_id": run.clean_id,
-        "clean_source_fingerprint": fingerprint,
-        "source_scope": "all original rows of source_table, including points excluded by Clean",
+        "detect_id": str(args.detect_id), "refine_id": run.refine_id,
+        "refine_source_fingerprint": fingerprint,
+        "source_scope": "all original rows of source_table, including points excluded by Refine",
         "source_points": source_count, "timestamp_range": [time_min, time_max],
         "raster_sha256": hashlib.sha256(pixels.astype("<i8").tobytes()).hexdigest(),
         "source_extent_4326": extent, "processing_srid": run.spatial_context.processing_srid,
