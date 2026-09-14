@@ -10,6 +10,8 @@ from typing import Any
 from uuid import uuid4
 
 
+from ..heartbeat import observed_operation, heartbeat_progress
+
 _REQUIRED_COLUMNS = {
     "id",
     "vehicle_id",
@@ -164,6 +166,7 @@ def _fingerprint_row(row: tuple[Any, ...], *, preserve_vehicle_null: bool = Fals
     })
 
 
+@observed_operation("计算输入数据指纹")
 def calculate_input_fingerprint(
     conn: Any,
     contract: SourceTableContract,
@@ -221,9 +224,12 @@ def calculate_input_fingerprint(
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
             row_count += 1
+            if row_count % fetch_size == 0:
+                heartbeat_progress(row_count)
     return {**metadata, "row_count": row_count, "sha256": digest.hexdigest()}
 
 
+@observed_operation("校验源数据指纹")
 def calculate_source_fingerprint(
     conn: Any,
     refine_id: str,
@@ -275,6 +281,8 @@ def calculate_source_fingerprint(
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
             row_count += 1
+            if row_count % fetch_size == 0:
+                heartbeat_progress(row_count)
     return {
         "version": 1,
         "row_count": row_count,

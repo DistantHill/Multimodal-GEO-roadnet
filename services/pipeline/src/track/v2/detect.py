@@ -777,6 +777,7 @@ def _stream_extract_method_1(
     tracks: dict[str, list[TrajectoryPoint]] = {}
     read_bounds: tuple[float, float, float, float] | None = None
 
+    log_info("── 流式处理 / Streaming tracks and turn events ...")
     for track in _stream_vehicle_tracks_from_db(
         conn,
         table=cfg.db_table,
@@ -1586,7 +1587,6 @@ def _detect_turn_events(
     t0 = time.perf_counter()
     last_t = t0
     track_count = 0
-    log_info(f"── 转向事件检测 / Turn event detection ({total_tracks:,} 轨迹/tracks) ...")
 
     for _track_key, track in _perf_iter(perf, tracks.items(), name="tracks_turn"):
         if len(track) < 2 * w + 1:
@@ -1653,7 +1653,6 @@ def _detect_turn_events(
             )
             last_t = now
 
-    log_info(f"── 转向事件检测: {len(events):,} 事件/events ({time.perf_counter() - t0:.1f}s)")
     return events
 
 

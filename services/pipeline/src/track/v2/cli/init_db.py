@@ -745,6 +745,11 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
         CREATE OR REPLACE FUNCTION validate_detect_run_completion()
         RETURNS trigger
         LANGUAGE plpgsql
+        -- Completion inspects an entire newly written run. Its statistics
+        -- may still estimate one row: nested joins can then repeatedly scan
+        -- that run even when unique indexes exist. Prefer set-based joins
+        -- only inside this function; PostgreSQL restores the caller setting.
+        SET enable_nestloop = off
         AS $function$
         DECLARE
             violation TEXT;
@@ -758,6 +763,8 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                 RAISE EXCEPTION
                     'completed Detect Run requires a completed parent Refine Run';
             END IF;
+
+            RAISE NOTICE 'track_v2 validation: Detect：校验 Refine 点集合与车辆归属';
 
             -- This is intentionally one aggregate scan, not one query per
             -- resolved row.  It validates parent-Refine membership, subtrack
@@ -783,8 +790,10 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                   FROM resolved_subtrack_points AS resolved
                   LEFT JOIN kept_trajectory_points AS kept
                     ON kept.id = resolved.kept_point_id
+                   AND kept.refine_id = NEW.refine_id
                   LEFT JOIN injected_points AS injected
                     ON injected.id = resolved.injected_point_id
+                   AND injected.refine_id = NEW.refine_id
                  WHERE resolved.detect_id = NEW.id
                    AND resolved.crossing_point_id IS NULL
             ), expected_sources AS (
@@ -858,6 +867,8 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                 RAISE EXCEPTION '%', violation;
             END IF;
 
+            RAISE NOTICE 'track_v2 validation: Detect：校验连续点序列';
+
             -- UNIQUE constraints prevent duplicates; min/max/count therefore
             -- prove that both snapshots are dense zero-based sequences.
             SELECT 'resolved subtrack refined/final sequence must be contiguous from zero'
@@ -875,6 +886,8 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
             IF violation IS NOT NULL THEN
                 RAISE EXCEPTION '%', violation;
             END IF;
+
+            RAISE NOTICE 'track_v2 validation: Detect：校验精炼点顺序';
 
             SELECT
                 'resolved p/i final sequence must strictly increase with refined sequence'
@@ -895,10 +908,27 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                 RAISE EXCEPTION '%', violation;
             END IF;
 
+            RAISE NOTICE 'track_v2 validation: Detect：校验交叉点集合与线段位置';
+
             -- The resolved crossing set must exactly equal the crossing set
             -- of complete intersections.  The same join also validates that
             -- every crossing inherits its refined segment's subtrack.
-            WITH actual_crossings AS MATERIALIZED (
+            -- Use the indexed base table for missing crossings. Rejoining a materialized CTE here
+            -- can repeatedly scan the entire unindexed crossing set when a
+            -- freshly inserted run is underestimated by the planner.
+            -- Derive successors in one ordered pass. A self join on
+            -- (subtrack, refined_sequence + 1) can become a merge join on
+            -- subtrack alone, comparing every pair in long subtracks.
+            WITH refined_segments AS (
+                SELECT id, subtrack_index, sequence_in_subtrack,
+                       LEAD(sequence_in_subtrack) OVER (
+                           PARTITION BY subtrack_index
+                           ORDER BY refined_sequence_in_subtrack
+                       ) AS successor_sequence
+                  FROM resolved_subtrack_points
+                 WHERE detect_id = NEW.id
+                   AND refined_sequence_in_subtrack IS NOT NULL
+            ), actual_crossings AS (
                 SELECT resolved.id AS resolved_id,
                        resolved.crossing_point_id,
                        resolved.subtrack_index,
@@ -906,20 +936,14 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                        crossing.id AS crossing_id,
                        segment_start.subtrack_index AS source_subtrack,
                        segment_start.sequence_in_subtrack AS segment_start_sequence,
-                       successor.sequence_in_subtrack AS successor_sequence,
+                       segment_start.successor_sequence,
                        complete_intersection.id AS complete_intersection_id
                   FROM resolved_subtrack_points AS resolved
                   LEFT JOIN candidate_entry_exit_points AS crossing
                     ON crossing.id = resolved.crossing_point_id
                    AND crossing.detect_id = resolved.detect_id
-                  LEFT JOIN resolved_subtrack_points AS segment_start
+                  LEFT JOIN refined_segments AS segment_start
                     ON segment_start.id = crossing.segment_start_point_id
-                   AND segment_start.detect_id = crossing.detect_id
-                  LEFT JOIN resolved_subtrack_points AS successor
-                    ON successor.detect_id = segment_start.detect_id
-                   AND successor.subtrack_index = segment_start.subtrack_index
-                   AND successor.refined_sequence_in_subtrack =
-                       segment_start.refined_sequence_in_subtrack + 1
                   LEFT JOIN intersections AS complete_intersection
                     ON complete_intersection.detect_id = crossing.detect_id
                    AND complete_intersection.candidate_intersection_id =
@@ -943,10 +967,10 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                                    THEN 'resolved crossing does not exist'
                                WHEN complete_intersection_id IS NULL
                                    THEN 'resolved crossing is not attached to a complete intersection'
-                               WHEN NOT (
+                               WHEN (
                                    segment_start_sequence < sequence_in_subtrack
                                    AND sequence_in_subtrack < successor_sequence
-                               ) THEN
+                               ) IS NOT TRUE THEN
                                    'resolved crossing must lie between its refined segment endpoints'
                                ELSE 'resolved crossing belongs to the wrong subtrack'
                            END AS issue
@@ -954,23 +978,37 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                      WHERE crossing_id IS NULL
                         OR complete_intersection_id IS NULL
                         OR source_subtrack IS DISTINCT FROM subtrack_index
-                        OR NOT (
+                        OR (
                             segment_start_sequence < sequence_in_subtrack
                             AND sequence_in_subtrack < successor_sequence
-                        )
+                        ) IS NOT TRUE
                     UNION ALL
                     SELECT 'complete-intersection crossing is absent from resolved sequence'
                       FROM expected_crossings AS expected
-                      LEFT JOIN actual_crossings AS actual
-                        ON actual.crossing_point_id = expected.id
-                     WHERE actual.resolved_id IS NULL
+                     WHERE NOT EXISTS (
+                         SELECT 1
+                           FROM resolved_subtrack_points AS actual
+                          WHERE actual.detect_id = NEW.id
+                            AND actual.crossing_point_id = expected.id
+                     )
                    ) AS invalid
              LIMIT 1;
             IF violation IS NOT NULL THEN
                 RAISE EXCEPTION '%', violation;
             END IF;
 
-            WITH segment_uses AS (
+            RAISE NOTICE 'track_v2 validation: Detect：校验线段端点';
+
+            WITH refined_segments AS (
+                SELECT id,
+                       LEAD(id) OVER (
+                           PARTITION BY subtrack_index
+                           ORDER BY refined_sequence_in_subtrack
+                       ) AS successor_id
+                  FROM resolved_subtrack_points
+                 WHERE detect_id = NEW.id
+                   AND refined_sequence_in_subtrack IS NOT NULL
+            ), segment_uses AS (
                 SELECT 'candidate crossing'::TEXT AS kind,
                        crossing.segment_start_point_id AS point_id
                   FROM candidate_entry_exit_points AS crossing
@@ -991,20 +1029,15 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                    )
               INTO violation
               FROM segment_uses AS segment_use
-              LEFT JOIN resolved_subtrack_points AS segment_start
+              LEFT JOIN refined_segments AS segment_start
                 ON segment_start.id = segment_use.point_id
-               AND segment_start.detect_id = NEW.id
-              LEFT JOIN resolved_subtrack_points AS successor
-                ON successor.detect_id = segment_start.detect_id
-               AND successor.subtrack_index = segment_start.subtrack_index
-               AND successor.refined_sequence_in_subtrack =
-                   segment_start.refined_sequence_in_subtrack + 1
-             WHERE segment_start.refined_sequence_in_subtrack IS NULL
-                OR successor.id IS NULL
+             WHERE segment_start.successor_id IS NULL
              LIMIT 1;
             IF violation IS NOT NULL THEN
                 RAISE EXCEPTION '%', violation;
             END IF;
+
+            RAISE NOTICE 'track_v2 validation: Detect：校验跨轨迹车辆归属';
 
             SELECT 'track cross segments must belong to different vehicles/subtracks'
               INTO violation
@@ -1017,12 +1050,16 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                AND to_point.detect_id = track_cross.detect_id
               LEFT JOIN kept_trajectory_points AS from_kept
                 ON from_kept.id = from_point.kept_point_id
+               AND from_kept.refine_id = NEW.refine_id
               LEFT JOIN injected_points AS from_injected
                 ON from_injected.id = from_point.injected_point_id
+               AND from_injected.refine_id = NEW.refine_id
               LEFT JOIN kept_trajectory_points AS to_kept
                 ON to_kept.id = to_point.kept_point_id
+               AND to_kept.refine_id = NEW.refine_id
               LEFT JOIN injected_points AS to_injected
                 ON to_injected.id = to_point.injected_point_id
+               AND to_injected.refine_id = NEW.refine_id
              WHERE track_cross.detect_id = NEW.id
                AND (
                    from_point.subtrack_index IS NOT DISTINCT FROM
@@ -1035,6 +1072,8 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
             IF violation IS NOT NULL THEN
                 RAISE EXCEPTION '%', violation;
             END IF;
+
+            RAISE NOTICE 'track_v2 validation: Detect：校验转向事件';
 
             SELECT 'turn event point must be a refined p/i resolved point'
               INTO violation
@@ -1049,7 +1088,11 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                 RAISE EXCEPTION '%', violation;
             END IF;
 
+            RAISE NOTICE 'track_v2 validation: Detect：校验进出观测';
+
             SELECT CASE
+                       WHEN entry_resolved.id IS NULL OR exit_resolved.id IS NULL
+                           THEN 'entry/exit endpoints must exist in resolved sequence'
                        WHEN entry_crossing.crossing_type IS DISTINCT FROM 1
                             OR exit_crossing.crossing_type IS DISTINCT FROM 0
                            THEN 'entry/exit crossing types must be 1/0'
@@ -1088,6 +1131,8 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                         IS DISTINCT FROM intersection.candidate_intersection_id
                    OR exit_crossing.candidate_intersection_id
                         IS DISTINCT FROM intersection.candidate_intersection_id
+                   OR entry_resolved.id IS NULL
+                   OR exit_resolved.id IS NULL
                    OR entry_resolved.subtrack_index
                         IS DISTINCT FROM exit_resolved.subtrack_index
                    OR entry_resolved.sequence_in_subtrack >=
@@ -1377,6 +1422,11 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
         CREATE OR REPLACE FUNCTION validate_fit_run_completion()
         RETURNS trigger
         LANGUAGE plpgsql
+        -- Completion inspects an entire newly written run. Its statistics
+        -- may still estimate one row: nested joins can then repeatedly scan
+        -- that run even when unique indexes exist. Prefer set-based joins
+        -- only inside this function; PostgreSQL restores the caller setting.
+        SET enable_nestloop = off
         AS $function$
         DECLARE
             violation TEXT;
@@ -1391,6 +1441,8 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                     'completed Fit Run requires a completed Detect Run';
             END IF;
 
+            RAISE NOTICE 'track_v2 validation: Fitting：校验来源片段数量';
+
             -- Counts are relative to the persisted centerline direction:
             -- false manifests are forward evidence and true manifests are
             -- reverse evidence.  LEFT JOIN also exposes a missing manifest.
@@ -1402,6 +1454,7 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                 ON manifest.centerline_id = centerline.id
                AND manifest.detect_id = centerline.detect_id
              WHERE centerline.fit_id = NEW.id
+               AND centerline.detect_id = NEW.detect_id
              GROUP BY centerline.id,
                       centerline.forward_clip_count,
                       centerline.reverse_clip_count
@@ -1416,7 +1469,11 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                 RAISE EXCEPTION '%', violation;
             END IF;
 
+            RAISE NOTICE 'track_v2 validation: Fitting：校验来源片段端点';
+
             SELECT CASE
+                       WHEN start_resolved.id IS NULL OR end_resolved.id IS NULL
+                           THEN 'centerline clip endpoints must exist in resolved sequence'
                        WHEN start_crossing.crossing_type IS DISTINCT FROM 0
                             OR end_crossing.crossing_type IS DISTINCT FROM 1
                            THEN 'centerline clip must start at exit and end at entry'
@@ -1454,9 +1511,12 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                 ON end_resolved.crossing_point_id = end_crossing.id
                AND end_resolved.detect_id = manifest.detect_id
              WHERE centerline.fit_id = NEW.id
+               AND centerline.detect_id = NEW.detect_id
                AND (
                    start_crossing.crossing_type IS DISTINCT FROM 0
                    OR end_crossing.crossing_type IS DISTINCT FROM 1
+                   OR start_resolved.id IS NULL
+                   OR end_resolved.id IS NULL
                    OR start_resolved.subtrack_index
                         IS DISTINCT FROM end_resolved.subtrack_index
                    OR start_resolved.sequence_in_subtrack >=

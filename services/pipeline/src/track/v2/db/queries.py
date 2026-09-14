@@ -15,6 +15,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Iterator
 
+from ..heartbeat import observed_operation, heartbeat_progress
+
 from ..models import (
     RefinedPointRef,
     ClipIntersection,
@@ -384,6 +386,7 @@ class SpatialWindowIterator:
         return x_count * y_count
 
 
+@observed_operation("查询轨迹空间范围")
 def _query_spatial_extent(
     conn: Any,
     *,
@@ -425,6 +428,7 @@ def _query_spatial_extent(
     return float(row[0]), float(row[2]), float(row[1]), float(row[3])
 
 
+@observed_operation("查询窗口内轨迹点")
 def _query_active_points_in_window(
     conn: Any,
     window: SpatialWindow | QueryWindow,
@@ -492,7 +496,9 @@ def _query_active_points_in_window(
             ),
             params,
         )
-        for row in cur:
+        for row_count, row in enumerate(cur, 1):
+            if row_count % 10_000 == 0:
+                heartbeat_progress(row_count)
             rows.append(row_to_dict(row))
 
     # DB ORDER BY 已保证 (vehicle_id, timestamp) 有序，无需 Python 侧再排
@@ -538,6 +544,7 @@ def _validate_materialized_points(
     CoordinateTransformer(spatial_context).validate_bounds(bounds)
 
 
+@observed_operation("读取轨迹与逐车处理")
 def _stream_vehicle_tracks_from_db(
     conn: Any,
     *,
@@ -589,7 +596,9 @@ def _stream_vehicle_tracks_from_db(
         current_subtrack: int | None = None
         current_track: list[TrajectoryPoint] = []
         refined_sequence = 0
-        for row in cur:
+        for row_count, row in enumerate(cur, 1):
+            if row_count % 10_000 == 0:
+                heartbeat_progress(row_count)
             vid = str(row[0])
             subtrack_index = int(row[14])
             if current_subtrack is not None and subtrack_index != current_subtrack:
@@ -810,6 +819,7 @@ def fetch_intersections(conn: object, detect_id: str) -> list[ClipIntersection]:
     return intersections
 
 
+@observed_operation("读取 Clip 解析轨迹")
 def fetch_resolved_clip_tracks(
     conn: object,
     detect_id: str,
@@ -866,7 +876,9 @@ def fetch_resolved_clip_tracks(
     grouped: dict[int, tuple[str, list[ResolvedTrackPoint]]] = {}
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(query, (detect_id, detect_id))
-        for row in cur:
+        for row_count, row in enumerate(cur, 1):
+            if row_count % 10_000 == 0:
+                heartbeat_progress(row_count)
             if row[3] is None or row[4] is None or row[5] is None:
                 raise ValueError(
                     f"Detect Run {detect_id} has missing resolved point data"
@@ -902,6 +914,7 @@ def fetch_resolved_clip_tracks(
     ]
 
 
+@observed_operation("读取 Refine 点序列")
 def fetch_refine_points(
     conn: object,
     table: str,
@@ -946,6 +959,7 @@ def fetch_refine_points(
     )
 
 
+@observed_operation("批量读取 Refine 子轨迹")
 def fetch_refine_points_for_subtracks(
     conn: object,
     table: str,
@@ -1028,7 +1042,9 @@ def _group_points(
     ] = {}
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(sql, params)
-        for row in cur:
+        for row_count, row in enumerate(cur, 1):
+            if row_count % 10_000 == 0:
+                heartbeat_progress(row_count)
             vehicle_id = str(row[0])
             subtrack_index = int(row[1])
             if row[5] is None or row[6] is None:

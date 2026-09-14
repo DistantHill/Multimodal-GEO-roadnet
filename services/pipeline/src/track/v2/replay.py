@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from .heartbeat import observed_operation, heartbeat_progress
 from .db.queries import fetch_detect_row, fetch_resolved_clip_tracks
 from .db.source_table import validate_source_table, verify_refine_source_fingerprint
 from .models import (
@@ -205,6 +206,7 @@ class ReplayService:
     def __init__(self, store: ReplayStore) -> None:
         self._store = store
 
+    @observed_operation("遍历来源追溯关系")
     def replay(self, target: ReplayTarget) -> ReplayTrace:
         nodes: list[ReplayNode] = []
         edges: list[ReplayEdge] = []
@@ -212,6 +214,7 @@ class ReplayService:
         visited: set[tuple[str, str, str | None, str | None]] = set()
 
         def visit(current: ReplayTarget, depth: int) -> None:
+            heartbeat_progress(len(nodes), unit="个节点")
             key = (
                 current.kind,
                 str(current.id),

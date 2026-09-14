@@ -26,8 +26,8 @@ class PipelineEvent:
     """One typed pipeline message or stage lifecycle update.
 
     ``stage`` is populated for stage events.  ``progress`` is a fraction in
-    the range understood by a console adapter; ``None`` leaves the current
-    progress unchanged.  The remaining stage fields are intentionally
+    the range understood by a console adapter; ``None`` hides the progress
+    bar for operations whose remaining work is unknown.  The remaining stage fields are intentionally
     explicit rather than an untyped context dictionary.
     """
 
@@ -111,7 +111,11 @@ class EventSink(Protocol):
 class EventProgressAdapter:
     """Adapt the legacy live-status calls to typed pipeline events."""
 
-    def __init__(self, stage: str, emit: Callable[[PipelineEvent], None]) -> None:
+    def __init__(
+        self, stage: str, emit: Callable[[PipelineEvent], None],
+        *, completion_pending: bool = False,
+    ) -> None:
+        self._completion_pending = completion_pending
         self._stage = stage
         self._emit = emit
 
@@ -131,6 +135,8 @@ class EventProgressAdapter:
     ) -> None:
         """Preserve the ``LiveStatus.update`` call shape at the core seam."""
 
+        if self._completion_pending and progress is not None:
+            progress = min(progress, 0.99)
         event_stage = stage or self._stage
         self._emit(
             PipelineEvent.stage_progress(
@@ -146,4 +152,7 @@ class EventProgressAdapter:
     def stop(self, *, elapsed: float | None = None) -> None:
         """Emit the stage-finish event expected by a console reporter."""
 
-        self._emit(PipelineEvent.stage_finish(self._stage, elapsed=elapsed))
+        self._emit(PipelineEvent.stage_finish(
+            self._stage, elapsed=elapsed,
+            progress=1.0 if self._completion_pending else None,
+        ))

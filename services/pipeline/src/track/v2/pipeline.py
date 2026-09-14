@@ -27,6 +27,7 @@ from .db.source_table import (
 from .fitting import fit_centerline_variants
 from .detect import detect_intersections
 from .logger import log_info
+from .heartbeat import operation_heartbeat
 from .models import (
     ClipResult,
     FitResult,
@@ -306,7 +307,7 @@ def run_pipeline(
             refine_id=refine_id,
             detect_id=detect_id,
         )
-        live_intersect = EventProgressAdapter(detect_stage, sink)
+        live_intersect = EventProgressAdapter(detect_stage, sink, completion_pending=True)
         live_intersect.start()
         icfg = replace(
             pc.detect,
@@ -348,17 +349,29 @@ def run_pipeline(
             )
 
             detect_persist_started = time.perf_counter()
-            persisted_detect = store.persist_detect(
-                detect_id,
-                iresult,
-                batch_size=pc.runtime.db_insert_batch,
-            )
+            with operation_heartbeat(
+                "Detect：写入结果",
+                emit=lambda message: live_intersect.update(
+                    detail=message, elapsed=time.perf_counter() - intersect_started,
+                ),
+            ):
+                persisted_detect = store.persist_detect(
+                    detect_id,
+                    iresult,
+                    batch_size=pc.runtime.db_insert_batch,
+                )
             # Persistence is not complete until the run-level validator and
             # every deferred FK/constraint have passed at COMMIT.  Keep that
             # work inside ``detect_persist_s``; measuring only the writer made
             # large deferred-trigger regressions invisible in A65 reports.
-            store.finish_detect(detect_id, status="completed")
-            store.commit()
+            with operation_heartbeat(
+                "Detect：完整性校验与事务提交",
+                emit=lambda message: live_intersect.update(
+                    detail=message, elapsed=time.perf_counter() - intersect_started,
+                ),
+            ):
+                store.finish_detect(detect_id, status="completed")
+                store.commit()
             detect_completed = True
             detect_persist_elapsed = time.perf_counter() - detect_persist_started
             stats["detect_persist_s"] = round(detect_persist_elapsed, 6)
@@ -458,6 +471,7 @@ def run_pipeline(
         )
         fitting_stage = "Fitting: 中心线拟合 / Centerline fitting"
         sink(PipelineEvent.stage_start(fitting_stage))
+        fit_completed = False
         try:
             fit_compute_started = time.perf_counter()
             fit_bundle = fit_centerline_variants(clip_result, config=fitting_config)
@@ -479,16 +493,6 @@ def run_pipeline(
                 fit_bundle,
                 clip_result,
             )
-            fit_persist_elapsed = time.perf_counter() - fit_persist_started
-            log_info(
-                "[stage-phase] stage=fitting phase=fit_persist "
-                f"elapsed_s={fit_persist_elapsed:.3f}"
-            )
-            sink(PipelineEvent.stage_progress(
-                fitting_stage,
-                detail="fit_persist",
-                elapsed=fit_persist_elapsed,
-            ))
             report = {
                 "combined": {
                     "report": fit_bundle.combined.report.as_dict(),
@@ -503,12 +507,31 @@ def run_pipeline(
                     "issues": [issue.as_dict() for issue in fit_bundle.b_to_a.issues],
                 },
             }
-            store.finish_fit(fit_id, status="completed", report=report)
-            store.commit()
+            with operation_heartbeat(
+                "Fitting：完整性校验与事务提交",
+                emit=lambda message: sink(PipelineEvent.stage_progress(
+                    fitting_stage, detail=message,
+                    elapsed=time.perf_counter() - fitting_started,
+                )),
+            ):
+                store.finish_fit(fit_id, status="completed", report=report)
+                store.commit()
+            fit_completed = True
+            fit_persist_elapsed = time.perf_counter() - fit_persist_started
+            log_info(
+                "[stage-phase] stage=fitting phase=fit_persist "
+                f"elapsed_s={fit_persist_elapsed:.3f}"
+            )
+            sink(PipelineEvent.stage_progress(
+                fitting_stage,
+                detail="fit_persist",
+                elapsed=fit_persist_elapsed,
+            ))
         except (psycopg.Error, RuntimeError, ValueError):
             store.rollback()
-            store.finish_fit(fit_id, status="failed")
-            store.commit()
+            if not fit_completed:
+                store.finish_fit(fit_id, status="failed")
+                store.commit()
             raise
         stats["centerlines"] = len(centerline_ids)
         stats["centerline_ids"] = list(centerline_ids)

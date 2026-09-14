@@ -307,12 +307,14 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             event for event in emitted
             if event.kind == PipelineEventKind.STAGE_PROGRESS
             and event.stage == "Fitting: 中心线拟合 / Centerline fitting"
+            and event.detail in {"fit_compute", "fit_persist"}
         ]
         self.assertEqual(
             [event.detail for event in fitting_phases],
             ["fit_compute", "fit_persist"],
         )
         self.assertTrue(all(event.elapsed is not None for event in fitting_phases))
+        self.assertTrue(any("完整性校验与事务提交" in event.detail for event in emitted))
         phase_messages = [
             message for message in log_messages if message.startswith("[stage-phase]")
         ]
@@ -325,6 +327,32 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             stage = "detect" if phase.startswith("detect_") else "fitting"
             self.assertIn(f"stage={stage} phase={phase}", message)
             self.assertRegex(message, r"elapsed_s=\d+\.\d{3}")
+
+    def test_detect_commit_failure_does_not_publish_completion(self) -> None:
+        emitted = []
+        original = self.store.commit
+
+        def commit():
+            if self.events[-1] == "finish_detect:completed":
+                raise RuntimeError("validation failed")
+            original()
+
+        self.store.commit = commit
+        with self.assertRaisesRegex(RuntimeError, "validation failed"):
+            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID), emit=emitted.append)
+        self.assertIn("finish_detect:failed", self.events)
+        self.assertFalse(any(event.kind == PipelineEventKind.STAGE_FINISH for event in emitted))
+        self.assertFalse(any(event.progress == 1.0 for event in emitted))
+
+    def test_fit_output_failure_does_not_rewrite_committed_run(self) -> None:
+        def emit(event):
+            if event.detail == "fit_persist":
+                raise RuntimeError("output failed")
+
+        with self.assertRaisesRegex(RuntimeError, "output failed"):
+            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID), emit=emit)
+        self.assertIn("finish_fit:completed", self.events)
+        self.assertNotIn("finish_fit:failed", self.events)
 
     def test_completed_refine_reuses_store_record_without_refine_stage(self) -> None:
         first = run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID)).stats

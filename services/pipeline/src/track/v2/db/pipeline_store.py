@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
+from ..heartbeat import validation_notices
 from ..clip import extract_clips_for_detect
 from .queries import fetch_detect_row
 from ..db_writer import (
@@ -167,7 +168,8 @@ class PostgresPipelineStore:
         return self._conn
 
     def commit(self) -> None:
-        self._conn.commit()
+        with validation_notices(self._conn):
+            self._conn.commit()
 
     def rollback(self) -> None:
         self._conn.rollback()

@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from .heartbeat import observed_operation, heartbeat_progress, operation_heartbeat
 from .db.source_table import quote_table_name
 from .detect import IntersectResult
 from .models import (
@@ -382,6 +383,7 @@ def insert_injected_points(
     return len(rows)
 
 
+@observed_operation("写入 Detect 结果")
 def persist_detect_result(
     conn: Any,
     detect_id: str,
@@ -561,6 +563,7 @@ def persist_detect_result(
     )
 
 
+@observed_operation("写入中心线与来源片段")
 def insert_centerline_bundle(
     conn: Any,
     bundle: CenterlineFitBundle,
@@ -1144,11 +1147,15 @@ def _copy_insert(
     columns: list[str],
     rows: list[tuple[Any, ...]],
 ) -> None:
-    if not rows:
-        return
-    with cur.copy(f"COPY {table} ({', '.join(columns)}) FROM STDIN") as copy:
-        for row in rows:
-            copy.write_row(row)
+    with operation_heartbeat(f"写入 {table}"):
+        if not rows:
+            return
+        with cur.copy(f"COPY {table} ({', '.join(columns)}) FROM STDIN") as copy:
+            for index, row in enumerate(rows, 1):
+                copy.write_row(row)
+                if index % 10_000 == 0:
+                    heartbeat_progress(index, total=len(rows))
+            heartbeat_progress(len(rows), total=len(rows))
 
 
 def _chunked_insert(
@@ -1159,18 +1166,20 @@ def _chunked_insert(
     *,
     batch_size: int,
 ) -> None:
-    if not rows:
-        return
-    size = min(batch_size, max(1, 65_535 // len(columns)))
-    for offset in range(0, len(rows), size):
-        batch = rows[offset:offset + size]
-        placeholders = ", ".join(
-            f"({', '.join(['%s'] * len(columns))})" for _ in batch
-        )
-        cur.execute(
-            f"INSERT INTO {table} ({', '.join(columns)}) VALUES {placeholders}",
-            [value for row in batch for value in row],
-        )
+    with operation_heartbeat(f"写入 {table}"):
+        if not rows:
+            return
+        size = min(batch_size, max(1, 65_535 // len(columns)))
+        for offset in range(0, len(rows), size):
+            heartbeat_progress(offset, total=len(rows))
+            batch = rows[offset:offset + size]
+            placeholders = ", ".join(
+                f"({', '.join(['%s'] * len(columns))})" for _ in batch
+            )
+            cur.execute(
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES {placeholders}",
+                [value for row in batch for value in row],
+            )
 
 
 def _chunked_insert_returning(
@@ -1182,22 +1191,24 @@ def _chunked_insert_returning(
     *,
     batch_size: int,
 ) -> list[tuple[Any, ...]]:
-    if not rows:
-        return []
-    size = min(batch_size, max(1, 65_535 // len(columns)))
-    returned: list[tuple[Any, ...]] = []
-    for offset in range(0, len(rows), size):
-        batch = rows[offset:offset + size]
-        placeholders = ", ".join(
-            f"({', '.join(['%s'] * len(columns))})" for _ in batch
-        )
-        cur.execute(
-            f"INSERT INTO {table} ({', '.join(columns)}) VALUES {placeholders} "
-            f"RETURNING {', '.join(returning)}",
-            [value for row in batch for value in row],
-        )
-        returned.extend(cur.fetchall())
-    return returned
+    with operation_heartbeat(f"写入 {table}"):
+        if not rows:
+            return []
+        size = min(batch_size, max(1, 65_535 // len(columns)))
+        returned: list[tuple[Any, ...]] = []
+        for offset in range(0, len(rows), size):
+            heartbeat_progress(offset, total=len(rows))
+            batch = rows[offset:offset + size]
+            placeholders = ", ".join(
+                f"({', '.join(['%s'] * len(columns))})" for _ in batch
+            )
+            cur.execute(
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES {placeholders} "
+                f"RETURNING {', '.join(returning)}",
+                [value for row in batch for value in row],
+            )
+            returned.extend(cur.fetchall())
+        return returned
 
 
 def _chunked_template(
@@ -1209,17 +1220,19 @@ def _chunked_template(
     *,
     batch_size: int,
 ) -> None:
-    if not rows:
-        return
-    params_per_row = len(rows[0])
-    size = min(batch_size, max(1, 65_535 // params_per_row))
-    for offset in range(0, len(rows), size):
-        batch = rows[offset:offset + size]
-        cur.execute(
-            f"INSERT INTO {table} ({', '.join(columns)}) VALUES "
-            + ", ".join(f"({value_template})" for _ in batch),
-            [value for row in batch for value in row],
-        )
+    with operation_heartbeat(f"写入 {table}"):
+        if not rows:
+            return
+        params_per_row = len(rows[0])
+        size = min(batch_size, max(1, 65_535 // params_per_row))
+        for offset in range(0, len(rows), size):
+            heartbeat_progress(offset, total=len(rows))
+            batch = rows[offset:offset + size]
+            cur.execute(
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES "
+                + ", ".join(f"({value_template})" for _ in batch),
+                [value for row in batch for value in row],
+            )
 
 
 def _chunked_template_returning(
@@ -1230,21 +1243,23 @@ def _chunked_template_returning(
     value_template: str,
     returning: list[str],
 ) -> list[tuple[Any, ...]]:
-    if not rows:
-        return []
-    returned: list[tuple[Any, ...]] = []
-    params_per_row = len(rows[0])
-    size = max(1, 65_535 // params_per_row)
-    for offset in range(0, len(rows), size):
-        batch = rows[offset:offset + size]
-        cur.execute(
-            f"INSERT INTO {table} ({', '.join(columns)}) VALUES "
-            + ", ".join(f"({value_template})" for _ in batch)
-            + f" RETURNING {', '.join(returning)}",
-            [value for row in batch for value in row],
-        )
-        returned.extend(cur.fetchall())
-    return returned
+    with operation_heartbeat(f"写入 {table}"):
+        if not rows:
+            return []
+        returned: list[tuple[Any, ...]] = []
+        params_per_row = len(rows[0])
+        size = max(1, 65_535 // params_per_row)
+        for offset in range(0, len(rows), size):
+            heartbeat_progress(offset, total=len(rows))
+            batch = rows[offset:offset + size]
+            cur.execute(
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES "
+                + ", ".join(f"({value_template})" for _ in batch)
+                + f" RETURNING {', '.join(returning)}",
+                [value for row in batch for value in row],
+            )
+            returned.extend(cur.fetchall())
+        return returned
 
 
 def _json_object(value: Any, label: str) -> dict[str, Any]:

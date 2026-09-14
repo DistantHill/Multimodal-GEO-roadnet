@@ -392,8 +392,7 @@ class LiveStatus:
             throughput: 吞吐描述，如 "26.6 车辆/s"
             stage: 动态阶段名；非 None 时覆盖 __init__ 的 stage_name
         """
-        if progress is not None:
-            self._progress = max(0.0, min(1.0, progress))
+        self._progress = None if progress is None else max(0.0, min(1.0, progress))
         if detail:
             self._detail = detail
         # sub_detail: always assign — empty string clears the row

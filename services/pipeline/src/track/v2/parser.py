@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
 
+from .heartbeat import observed_operation, heartbeat_progress
 from .errors import (
     DataSourceCorrupted,
     EncodingDetectionError,
@@ -316,6 +317,7 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
         mapping = build_field_mapping(config.specs, columns, selector)
         super().__init__(source_info, config, mapping)
 
+    @observed_operation("读取源数据与逐车精炼")
     def iter_points(self) -> Iterator[TrajectoryPoint]:
         self._state = self._new_state()
         previous: TrajectoryPoint | None = None
@@ -356,6 +358,8 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
 
             for ordinal, row in enumerate(cur, start=1):
                 self._state.total_rows += 1
+                if ordinal % 10_000 == 0:
+                    heartbeat_progress(ordinal)
                 try:
                     point, issues = _parse_row_from_tuple(
                         row, ordinal, _fast_col_index, specs, source_id, pk_idx,
@@ -377,6 +381,7 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
             _close_quietly(cur)
             _close_quietly(conn)
 
+    @observed_operation("统计源数据车辆数")
     def count_vehicle_ids(self) -> int:
         """ZH: 通过 COUNT(DISTINCT vehicle_id) 查询统计车辆数。
         EN: Query COUNT(DISTINCT vehicle_id) for vehicle count."""
@@ -937,34 +942,16 @@ def _guess_with_chardet(raw: bytes) -> tuple[str | None, float]:
 
 
 def _configure_postgres_session(conn: Any) -> None:
-    """ZH: 配置 PostgreSQL 会话——禁用超时以适应 named cursor 的长事务。
+    """Allow pauses between FETCH calls only for this reader transaction.
 
-    Named cursor (DECLARE CURSOR) 会持有一个事务直到游标关闭。如果
-    idle_in_transaction_session_timeout 有值，服务器会在 FETCH 间隔空闲超时后
-    杀死连接。对于数百万行的迭代，禁用超时是正确做法——这不是意外僵死事务，
-    而是故意的长事务。
-
-    EN: Configure PostgreSQL session — disable timeouts for named-cursor
-    long transactions. A named cursor holds a transaction open until the
-    cursor closes. With idle_in_transaction_session_timeout set, the server
-    kills the connection when idle between FETCH calls. For multi-million-row
-    iteration, disabling the timeout is correct — this is a deliberate
-    long transaction, not a stuck one.
+    statement_timeout remains under the caller/database configuration: it
+    limits executing SQL, not the idle time spent processing fetched rows.
+    SET LOCAL prevents this exception leaking into later write transactions.
     """
     cur = None
     try:
         cur = conn.cursor()
-        # ZH: statement_timeout=0 禁用它——每个 FETCH 非常快，但 system load 下可能波动。
-        # EN: Disable statement_timeout=0 — each FETCH is fast but may spike under load.
-        cur.execute("SET statement_timeout TO '0'")
-        # ZH: 关键修复：禁用 idle_in_transaction_session_timeout。
-        #     Named cursor 的事务贯穿整个迭代（可能 30+ 分钟），
-        #     有超时的话 PG server 会在空闲间隙杀死连接。
-        # EN: Key fix: disable idle_in_transaction_session_timeout.
-        #     The named cursor's transaction spans the entire iteration
-        #     (potentially 30+ min); with a timeout the PG server kills
-        #     the connection during idle gaps between FETCH calls.
-        cur.execute("SET idle_in_transaction_session_timeout TO '0'")
+        cur.execute("SET LOCAL idle_in_transaction_session_timeout TO '0'")
     finally:
         _close_quietly(cur)
 
