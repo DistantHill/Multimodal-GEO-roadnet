@@ -50,7 +50,7 @@ min_directed_transitions = 3
 bearing_window = 2
 spatial_window_size = [2000.0, 2000.0]
 spatial_window_overlap = 0.15
-stream_batch_size = 100
+stream_batch_size = 1000
 
 [clip]
 include_boundary_clips = true

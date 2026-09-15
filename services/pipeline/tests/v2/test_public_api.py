@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 import track.v2 as v2
@@ -108,6 +109,8 @@ class FakePostgresStreamingTest(unittest.TestCase):
         finally:
             handle.close()
         self.assertEqual(len(points), 1)
+        self.assertEqual([fraction for conn in connections for fraction in conn.declared_fractions], ["0.37"])
+        self.assertTrue(all(conn.fraction == "0.37" for conn in connections))
         self.assertFalse(points[0].point_ref.stable)
         self.assertTrue(all(not cursor.fetchall_called for conn in connections for cursor in conn.cursors))
 
@@ -148,11 +151,24 @@ class _FakeConnection:
         self.rows = rows
         self.cursors: list[_FakeCursor] = []
         self.closed = False
+        self.fraction = "0.37"
+        self.declared_fractions = []
 
     def cursor(self, **_kwargs):
         cursor = _FakeCursor(self.columns, self.rows)
+        cursor.connection = self
+        cursor.name = _kwargs.get("name")
         self.cursors.append(cursor)
         return cursor
+
+    @contextmanager
+    def transaction(self):
+        previous = self.fraction
+        try:
+            yield
+        except BaseException:
+            self.fraction = previous
+            raise
 
     def close(self) -> None:
         self.closed = True
@@ -165,8 +181,22 @@ class _FakeCursor:
         self.fetchall_called = False
         self.closed = False
 
-    def execute(self, _query: str, _params=()) -> None:
-        return None
+    def execute(self, query: str, params=()) -> None:
+        if query.startswith("SET LOCAL cursor_tuple_fraction"):
+            self.connection.fraction = "1"
+        elif "set_config" in query:
+            self.connection.fraction = params[0]
+        elif self.name:
+            self.connection.declared_fractions.append(self.connection.fraction)
+
+    def fetchone(self):
+        return (self.connection.fraction,)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
     def __iter__(self):
         return iter(self.rows)

@@ -4,8 +4,10 @@ import pytest
 from unittest.mock import patch
 
 from track.v2.cross_track import (
-    extract_cross_track_candidates,
     extract_cross_track_candidates_reference,
+)
+from track.v2.candidate_extraction import (
+    extract_cross_track_candidates,
 )
 from track.v2.db.queries import SpatialWindow
 from track.v2.detect import IntersectConfig

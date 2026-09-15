@@ -24,6 +24,7 @@ class OperationStatus:
     completed: int = 0
     total: int | None = None
     unit: str = ''
+    detail: str = ''
 
     def message(self) -> str:
         elapsed = time.monotonic() - self.started
@@ -31,7 +32,8 @@ class OperationStatus:
         if self.unit:
             total = '' if self.total is None else f'/{self.total:,}'
             counts = f'，{self.completed:,}{total} {self.unit}'
-        return f'{self.operation}，已用 {elapsed:.1f} 秒{counts}，仍在执行'
+        detail = f'，{self.detail}' if self.detail else ''
+        return f'{self.operation}，已用 {elapsed:.1f} 秒{counts}{detail}，仍在执行'
 
 
 class _Monitor:
@@ -98,12 +100,16 @@ def operation_heartbeat(
         _current.reset(token)
 
 
-def heartbeat_progress(completed: int, *, total: int | None = None, unit: str = '行') -> None:
+def heartbeat_progress(
+    completed: int, *, total: int | None = None, unit: str = '行', detail: str = '',
+) -> None:
     """Publish counts at batch boundaries, without logging once per row."""
     monitor = _current.get()
     if monitor is not None:
         with monitor.lock:
-            monitor.status = replace(monitor.status, completed=completed, total=total, unit=unit)
+            monitor.status = replace(
+                monitor.status, completed=completed, total=total, unit=unit, detail=detail,
+            )
 
 
 def observed_operation(operation: str):

@@ -31,7 +31,7 @@ from track.v2.detect import (
     _query_spatial_extent,
     _tracks_from_points,
 )
-from track.v2.cross_track import (
+from track.v2.candidate_extraction import (
     extract_cross_track_candidates as _extract_orthogonal_cross_track_candidates,
 )
 from track.v2.db.queries import _build_points_from_rows

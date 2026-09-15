@@ -73,3 +73,24 @@ def test_indeterminate_operation_clears_previous_percentage():
     status.update(progress=1.0)
     status.update(detail='校验与提交')
     assert status._progress is None
+
+
+def test_optional_progress_detail_reports_hits_and_default_call_remains_compatible():
+    messages = []
+    tick = Event()
+
+    def emit(message):
+        messages.append(message)
+        tick.set()
+
+    with patch('track.v2.heartbeat.log_info'):
+        with operation_heartbeat('跨轨迹', emit=emit, interval=.01):
+            heartbeat_progress(1234, unit='线段对', detail='候选命中 56')
+            tick.clear()
+            assert tick.wait(2)
+            assert '1,234 线段对，候选命中 56，仍在执行' in messages[-1]
+            heartbeat_progress(2345)
+            tick.clear()
+            assert tick.wait(2)
+            assert '2,345 行，仍在执行' in messages[-1]
+            assert '候选命中' not in messages[-1]

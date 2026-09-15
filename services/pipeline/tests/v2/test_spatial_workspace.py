@@ -8,7 +8,8 @@ from unittest.mock import patch
 import pytest
 
 from track.v2._geometry import _to_lonlat
-from track.v2.cross_track import CrossTrackCapacityError, extract_cross_track_candidates
+from track.v2.candidate_patches import CrossTrackCapacityError
+from track.v2.candidate_extraction import extract_cross_track_candidates
 from track.v2.db.queries import SpatialWindowIterator
 from track.v2.detect import (
     IntersectConfig,
@@ -103,7 +104,7 @@ def test_capacity_guard_runs_before_grid_allocation() -> None:
     cfg = IntersectConfig(cross_track_max_grid_cells_per_segment=1)
 
     with patch(
-        "track.v2.cross_track._build_grid",
+        "track.v2.candidate_patches._build_grid",
         side_effect=AssertionError("grid must not be allocated"),
     ):
         with pytest.raises(CrossTrackCapacityError, match="overflow fallback"):

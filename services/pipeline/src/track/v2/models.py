@@ -7,6 +7,7 @@ FieldSpec, ReadReport, etc.) are defined here per the v2 PRD §3.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import StrEnum
 import json
 import sys
@@ -88,7 +89,7 @@ def _to_output_value(value: object) -> object:
         return str(value)
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
-    if isinstance(value, (list, tuple)) and not isinstance(value, (bytes, bytearray, str)):
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
         return [_to_output_value(v) for v in value]
     # numpy array
     tolist = getattr(value, "tolist", None)
@@ -508,8 +509,8 @@ class HotspotCluster(TrackModel):
     """A DBSCAN cluster of turn or cross-track candidate events.
 
     ``cluster_calculate_index`` is a transient Detect-stage association key and
-    is never persisted. Uses ``tuple`` for events to preserve frozen-dataclass
-    immutability.
+    is never persisted. Events are immutable tuples or repeatable read-only
+    disk views whose owning Detect result controls their lifetime.
     """
 
     cluster_calculate_index: int
@@ -519,13 +520,13 @@ class HotspotCluster(TrackModel):
     centroid_lat: float
     radius_m: float
     cluster_ref: str = ""        # stable ref → "cluster_{source}_{id}"
-    events: tuple[TurnEvent, ...] = ()
+    events: Sequence[TurnEvent] = ()
     source: str = "turn"
     algorithm_sources: tuple[str, ...] = ()
     source_ids: tuple[str, ...] = ()
     source_counts: dict[str, int] = field(default_factory=dict)
     source_ratios: dict[str, float] = field(default_factory=dict)
-    source_point_refs: dict[str, tuple[PointRef, ...]] = field(default_factory=dict)
+    source_point_refs: dict[str, Sequence[PointRef]] = field(default_factory=dict)
     critical_sources: tuple[str, ...] = ()
     # ── topology intermediate products ──
     crossing_points: tuple[CrossingPoint, ...] = ()
@@ -725,7 +726,7 @@ class ClipReport(TrackModel):
 
 @dataclass(frozen=True, slots=True)
 class ClipResult(TrackModel):
-    clips: tuple[TrackClip, ...]
+    clips: Sequence[TrackClip]
     report: ClipReport
     spatial_context: SpatialContext
     detect_id: str | None = None

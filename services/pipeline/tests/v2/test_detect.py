@@ -22,11 +22,15 @@ from track.v2._geometry import (
 )
 from track.v2._perf import PerfTracker
 from track.v2.cross_track import (
-    _build_grid as _cross_track_grid,
     extract_cross_track_candidates_legacy as _extract_orthogonal_cross_track_candidates_legacy,
+    _prepare_segments as _prepare_cross_track_segments,
+)
+from track.v2.candidate_patches import (
+    build_cross_track_index,
     _iter_cross_vehicle_pair_batches,
     _iter_pair_batches as _iter_cross_track_pair_batches,
-    _prepare_segments as _prepare_cross_track_segments,
+)
+from track.v2.candidate_extraction import (
     extract_cross_track_candidates as _extract_orthogonal_cross_track_candidates,
 )
 from track.v2 import _cross_track_legacy as cross_track_legacy_module
@@ -55,7 +59,7 @@ from track.v2.detect import (
     _nearest_angle_id,
     _project_tracks,
     _run_dbscan,
-    _stream_extract_method_1,
+    _load_tracks_and_turn_candidates,
     _stream_vehicle_tracks_from_db,
     _topology_point_windows,
     _query_active_points_in_window,
@@ -1187,7 +1191,7 @@ class ProjectionContextContractTest(unittest.TestCase):
             return_value=iter([[bad_xy]]),
         ):
             with self.assertRaisesRegex(V2Error, "non-finite processing"):
-                _stream_extract_method_1(
+                _load_tracks_and_turn_candidates(
                     object(), IntersectConfig(), _TEST_SPATIAL_CONTEXT, _TEST_TRANSFORMER,
                 )
 
@@ -1204,7 +1208,7 @@ class ProjectionContextContractTest(unittest.TestCase):
                 {"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": .01},
             )
             with self.assertRaisesRegex(ProjectionError, "area of use|scale distortion"):
-                _stream_extract_method_1(
+                _load_tracks_and_turn_candidates(
                     object(), IntersectConfig(), strict_context, CoordinateTransformer(strict_context),
                 )
 
@@ -1350,7 +1354,7 @@ class TurnDetectionTest(unittest.TestCase):
             "track.v2.detect._stream_vehicle_tracks_from_db",
             return_value=iter([track]),
         ):
-            actual, workspace = _stream_extract_method_1(
+            actual, workspace = _load_tracks_and_turn_candidates(
                 object(), cfg, _TEST_SPATIAL_CONTEXT, _TEST_TRANSFORMER,
             )
 
@@ -2022,7 +2026,10 @@ class CrossTrackCandidateTest(unittest.TestCase):
             tracks, _TEST_TRANSFORMER, IntersectConfig(),
         )
         max_grid_cells = IntersectConfig().cross_track_max_grid_cells_per_segment
-        grid, overflow_ids = _cross_track_grid(segments, max_grid_cells)
+        index = build_cross_track_index(
+            segments, cell_m=IntersectConfig().cross_track_grid_cell_m, max_cells=max_grid_cells,
+        )
+        grid, overflow_ids = index.grid, index.overflow_segment_ids
         self.assertEqual(overflow_ids, [0, 1])
         self.assertLessEqual(
             sum(len(ids) for ids in grid.values()),
@@ -2425,7 +2432,7 @@ class TopologyExtractionTest(unittest.TestCase):
             ),
             patch("track.v2.detect.verify_refine_source_fingerprint"),
             patch(
-                "track.v2.detect._stream_extract_method_1",
+                "track.v2.detect._load_tracks_and_turn_candidates",
                 return_value=([], tracks),
             ),
             patch(

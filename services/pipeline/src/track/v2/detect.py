@@ -13,9 +13,14 @@ verified via entry/exit circle-crossing analysis + branch-angle clustering.
 from __future__ import annotations
 
 import math
+import heapq
+import os
 import time
+from array import array
 from bisect import bisect_right
 from collections import defaultdict
+from collections.abc import Iterator, MutableMapping, Sequence
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -25,6 +30,7 @@ if TYPE_CHECKING:
     from .logger import LiveStatus
 
 from .logger import log_info
+from .heartbeat import heartbeat_progress, observed_operation, operation_heartbeat
 
 from ._perf import PerfTracker, TimedStage, timed_iter, track_for_loops
 
@@ -35,12 +41,23 @@ from ._geometry import (
     _branch_angle_from_center,
     _circular_mean_deg,
     _distance_m,
+    _point_xy,
     _segment_bearings,
     _segment_circle_crossing,
     _segment_circle_crossings_batch,
 )
 from .exceptions import V2Error
-from .cross_track import CrossTrackCapacityError, extract_cross_track_candidates
+from .candidate_patches import CrossTrackCapacityError, iter_track_patches
+from .candidate_extraction import (
+    extract_cross_track_candidates, extract_turn_candidates, extract_disk_cross_track_candidates,
+)
+from .detect_workspace import DetectWorkspace
+from .dbscan_storage import ActiveGridLinks, index_typecode
+from .clip_spool import DiskSequence
+from .cross_member_store import (
+    CandidateStore, ConcatSequence, MemberPass, PointRefSequence,
+    reference_source_ids, summarize_events,
+)
 
 from .models import (
     CrossTrackCandidate,
@@ -56,6 +73,7 @@ from .models import (
     TrajectoryPoint,
     TurnEvent,
 )
+from .turn_events import detect_turn_patch as _detect_turn_events
 from .projection import CoordinateTransformer
 from .db.queries import (
     SpatialWindow,
@@ -124,7 +142,7 @@ class IntersectConfig(TrackModel):
     cross_track_max_angle_deg: float = 100.0
     cross_track_dbscan_eps_m: float = 100.0
     cross_track_dbscan_min_samples: int = 3
-    # Structural memory bounds owned by cross_track.py's implementation.
+    # Structural memory bounds owned by candidate_patches.py.
     cross_track_grid_cell_m: float = 100.0
     cross_track_pair_batch_size: int = 65_536
     cross_track_max_grid_cells_per_segment: int = 25
@@ -149,7 +167,7 @@ class IntersectConfig(TrackModel):
     refine_id: str | None = None
     spatial_window_size: tuple[float, float] = (2000.0, 2000.0)
     spatial_window_overlap: float = 0.15
-    stream_batch_size: int = 100
+    stream_batch_size: int = 1000
 
     # ── Live status display (optional, set by CLI for dynamic terminal output) ──
     live_status: Any = None
@@ -162,17 +180,29 @@ class IntersectConfig(TrackModel):
 class IntersectResult(TrackModel):
     """Output of Detect stage.
 
-    All fields populated eagerly during detect_intersections().
+    DB runs keep original turns and cross candidates in caller-owned temporary storage.
+    Call close() after persistence, including failure/cancellation paths.
     """
 
-    turn_events: list[TurnEvent]
+    turn_events: Sequence[TurnEvent]
     hotspot_events: list[TurnEvent]
     clusters: list[HotspotCluster]
     topologies: list[IntersectionTopology]
     report: IntersectReport
     spatial_context: SpatialContext
     observations: list[EntryExitObservation] = field(default_factory=list)
-    cross_track_candidates: list[CrossTrackCandidate] = field(default_factory=list)
+    cross_track_candidates: Sequence[CrossTrackCandidate] = field(default_factory=list)
+
+    def close(self) -> None:
+        """Release owned temporary output; in-memory results need no cleanup."""
+        try:
+            close = getattr(self.turn_events, "close", None)
+            if close is not None:
+                close()
+        finally:
+            close = getattr(self.cross_track_candidates, "close", None)
+            if close is not None:
+                close()
 
     def get_report(self) -> IntersectReport:
         return self.report
@@ -216,12 +246,20 @@ def _cluster_source_counts(cluster: HotspotCluster) -> dict[str, int]:
     return counts
 
 
-def _cluster_source_point_refs(cluster: HotspotCluster) -> dict[str, tuple[PointRef, ...]]:
+def _cluster_source_point_refs(cluster: HotspotCluster) -> dict[str, Sequence[PointRef]]:
     if cluster.source_point_refs:
         return dict(cluster.source_point_refs)
     refs: dict[str, list[PointRef]] = defaultdict(list)
     fallback_sources = _cluster_sources(cluster)
     fallback = fallback_sources[0] if len(fallback_sources) == 1 else cluster.source
+    if not isinstance(cluster.events, (list, tuple)):
+        # Member passes already summarized candidates in global input order.
+        # Discover reference sources without a second payload read per cluster.
+        summary = summarize_events(cluster.events, fallback_source=fallback)
+        return {
+            source: PointRefSequence(cluster.events, source=source, fallback_source=fallback)
+            for source, count in summary.ref_counts.items() if count
+        }
     for event in cluster.events:
         source = event.source or fallback
         if event.point_ref is not None:
@@ -233,7 +271,7 @@ def _with_source_provenance(
     cluster: HotspotCluster,
     *,
     source_counts: dict[str, int] | None = None,
-    source_point_refs: dict[str, tuple[PointRef, ...]] | None = None,
+    source_point_refs: dict[str, Sequence[PointRef]] | None = None,
     critical_sources: tuple[str, ...] | None = None,
 ) -> HotspotCluster:
     counts = source_counts if source_counts is not None else _cluster_source_counts(cluster)
@@ -241,10 +279,11 @@ def _with_source_provenance(
     sources = tuple(sorted(counts))
     refs = source_point_refs if source_point_refs is not None else _cluster_source_point_refs(cluster)
     source_ids = set(cluster.source_ids)
-    for event in cluster.events:
-        source_ids.update(source_id for source_id in event.source_ids if source_id)
+    source_ids.update(summarize_events(cluster.events).event_source_ids)
     for point_refs in refs.values():
-        source_ids.update(ref.source_id for ref in point_refs if ref.source_id)
+        # References can be manually supplied and contain source IDs absent
+        # from every event. Their own summaries must participate independently.
+        source_ids.update(reference_source_ids(point_refs))
     return replace(
         cluster,
         source=_source_label(sources),
@@ -252,7 +291,8 @@ def _with_source_provenance(
         source_ids=tuple(sorted(source_ids)),
         source_counts=counts,
         source_ratios=_ratio_dict(counts),
-        source_point_refs={source: tuple(items) for source, items in refs.items()},
+        source_point_refs={source: tuple(items) if isinstance(items, (list, tuple)) else items
+                           for source, items in refs.items()},
         critical_sources=tuple(sorted(critical_sources or cluster.critical_sources)),
     )
 
@@ -275,12 +315,13 @@ def _extend_ref_lists(
 
 def _build_candidate_clusters(
     hotspot_events: list[TurnEvent],
-    cross_track_candidates: list[CrossTrackCandidate],
+    cross_track_candidates: Sequence[CrossTrackCandidate],
     cfg: IntersectConfig,
     transformer: CoordinateTransformer,
     *,
     disabled_sources: set[str] | None = None,
     perf: PerfTracker | None = None,
+    member_passes: list[MemberPass] | None = None,
 ) -> list[HotspotCluster]:
     disabled = disabled_sources or set()
     clusters: list[HotspotCluster] = []
@@ -302,7 +343,7 @@ def _build_candidate_clusters(
                 transformer,
                 eps_m=cfg.cross_track_dbscan_eps_m,
                 min_samples=cfg.cross_track_dbscan_min_samples,
-                perf=perf,
+                perf=perf, member_passes=member_passes,
             )
         )
     return _merge_clusters(
@@ -310,9 +351,17 @@ def _build_candidate_clusters(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _ClusterCentroid:
+    """Only the location survives a source-ablation reclustering pass."""
+
+    centroid_x: float
+    centroid_y: float
+
+
 def _is_cluster_rediscovered(
     cluster: HotspotCluster,
-    candidates: list[HotspotCluster],
+    candidates: list[HotspotCluster] | list[_ClusterCentroid],
     *,
     distance_m: float,
 ) -> bool:
@@ -328,7 +377,7 @@ def _is_cluster_rediscovered(
 def _annotate_source_ablation(
     clusters: list[HotspotCluster],
     hotspot_events: list[TurnEvent],
-    cross_track_candidates: list[CrossTrackCandidate],
+    cross_track_candidates: Sequence[CrossTrackCandidate],
     cfg: IntersectConfig,
     transformer: CoordinateTransformer,
     *,
@@ -343,19 +392,25 @@ def _annotate_source_ablation(
     if report_ablation:
         log_info(f"    源消融分析 / Source ablation ({len(all_sources)} 源/sources) ...")
         t_abl = time.perf_counter()
-    reclustered_without: dict[str, list[HotspotCluster]] = {}
+    reclustered_without: dict[str, list[_ClusterCentroid]] = {}
     for idx, source in enumerate(_perf_iter(perf, all_sources, name="ablation_sources")):
         if report_ablation:
             log_info(f"      消融 / Ablating: {source} ...")
             t1 = time.perf_counter()
-        reclustered_without[source] = _build_candidate_clusters(
-            hotspot_events,
-            cross_track_candidates,
-            cfg,
-            transformer,
-            disabled_sources={source},
-            perf=perf,
-        )
+        # Rediscovery compares only centroids. Release the reclustered
+        # events/provenance before starting the next source's full pass.
+        member_passes: list[MemberPass] = []
+        try:
+            reclustered_without[source] = [
+                _ClusterCentroid(candidate.centroid_x, candidate.centroid_y)
+                for candidate in _build_candidate_clusters(
+                    hotspot_events, cross_track_candidates, cfg, transformer,
+                    disabled_sources={source}, perf=perf, member_passes=member_passes,
+                )
+            ]
+        finally:
+            for member_pass in member_passes:
+                member_pass.close()
         if report_ablation:
             log_info(f"      消融 / Ablated {source}: {len(reclustered_without[source])} 簇/clusters ({time.perf_counter() - t1:.1f}s)")
             if live_status is not None:
@@ -423,16 +478,6 @@ def _complete_source_report(
 
 
 # ── Shared pipeline helpers (used by both handle and DB modes) ──────────
-
-
-def _point_xy(point: TrajectoryPoint) -> tuple[float, float]:
-    """Return one point's Run-scoped processing coordinates."""
-    if point.x is None or point.y is None:
-        raise V2Error(
-            "trajectory point is missing processing-CRS x/y; project the track "
-            "with the Run SpatialContext before running Detect"
-        )
-    return float(point.x), float(point.y)
 
 
 def _project_tracks(
@@ -512,9 +557,9 @@ def _empty_intersect_result(spatial_context: SpatialContext) -> IntersectResult:
 def _build_intersect_report(
     annotated_clusters: list[HotspotCluster],
     topologies: list[IntersectionTopology],
-    turn_events: list[TurnEvent],
+    turn_events: Sequence[TurnEvent],
     hotspot_events: list[TurnEvent],
-    cross_candidates: list[CrossTrackCandidate],
+    cross_candidates: Sequence[CrossTrackCandidate],
     track_count: int,
 ) -> IntersectReport:
     """Shared report construction for both modes."""
@@ -538,8 +583,8 @@ def _build_intersect_report(
 
 
 def _cluster_pipeline(
-    turn_events: list[TurnEvent],
-    cross_candidates: list[CrossTrackCandidate],
+    turn_events: Sequence[TurnEvent],
+    cross_candidates: Sequence[CrossTrackCandidate],
     transformer: CoordinateTransformer,
     cfg: IntersectConfig,
     *,
@@ -591,26 +636,6 @@ def _cluster_pipeline(
         perf=perf,
     )
     return hotspot_events, annotated
-
-
-def _extract_methods_1_3(
-    tracks: dict[str, list[TrajectoryPoint]],
-    cfg: IntersectConfig,
-    transformer: CoordinateTransformer,
-    *,
-    live_status: Any = None,
-    perf: PerfTracker | None = None,
-) -> tuple[list[TurnEvent], list[CrossTrackCandidate]]:
-    """Run turn and cross-track extraction on a tracks dict (handle mode)."""
-    turn_events = _detect_turn_events(
-        tracks, cfg, live_status=live_status, perf=perf
-    ) if cfg.use_turn_events else []
-    cross_candidates: list[CrossTrackCandidate] = []
-    if cfg.use_cross_track_candidates:
-        cross_candidates, _, _ = extract_cross_track_candidates(
-            tracks, transformer, cfg, live_status=live_status, perf=perf
-        )
-    return turn_events, cross_candidates
 
 
 # ── Public entry point ─────────────────────────────────────────────────
@@ -704,11 +729,17 @@ def _detect_intersections_handle(
             live = None
     tracker = PerfTracker("detect_handle")
     try:
-        with tracker.stage("extract_methods_1_3"):
-            turn_events, cross_candidates = _extract_methods_1_3(
-                tracks, cfg, transformer,
-                live_status=live, perf=tracker,
+        with tracker.stage("turn_candidates"):
+            turn_events = extract_turn_candidates(
+                iter_track_patches(tracks.items(), cfg.stream_batch_size),
+                cfg, live_status=live, perf=tracker,
             )
+        cross_candidates: Sequence[CrossTrackCandidate] = []
+        if cfg.use_cross_track_candidates:
+            with tracker.stage("cross_track_candidates"):
+                cross_candidates, _, _ = extract_cross_track_candidates(
+                    tracks, transformer, cfg, live_status=live, perf=tracker,
+                )
 
         with tracker.stage("cluster_pipeline"):
             hotspot_events, annotated_clusters = _cluster_pipeline(
@@ -748,117 +779,90 @@ def _detect_intersections_handle(
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def _stream_extract_method_1(
-    conn: Any, cfg: IntersectConfig,
+def _iter_prepared_db_tracks(
+    conn: Any,
+    cfg: IntersectConfig,
     spatial_context: SpatialContext,
     transformer: CoordinateTransformer,
-    *,
-    live_status: Any = None,
-    perf: PerfTracker | None = None,
-) -> tuple[
-    list[TurnEvent],
-    dict[str, list[TrajectoryPoint]],
-]:
-    """Load each DB track once and batch Method 1 calculations.
-
-    ZH: 外层 ``for track in _stream_vehicle_tracks_from_db(...)`` 是生成器流，
-        逐迭代计时噪声大，整体由调用方 ``tracker.stage("stream_m1")`` 计时。
-        返回的 ``tracks`` workspace 会由 Method 3 和拓扑验证复用，避免各阶段
-        重新扫描数据库。
-    EN: The outer per-track generator stream is timed as a whole by the caller's
-        ``tracker.stage("stream_m1")`` — per-iteration timing would be noisy.
-        The returned workspace is reused by Method 3 and topology verification.
-    """
-    turn_events: list[TurnEvent] = []
-    t_total = time.perf_counter()
-    last_progress_t = t_total
-    track_count = 0
-    batch: dict[str, list[TrajectoryPoint]] = {}
-    tracks: dict[str, list[TrajectoryPoint]] = {}
+    workspace: MutableMapping[str, list[TrajectoryPoint]],
+) -> Iterator[tuple[str, list[TrajectoryPoint]]]:
+    """Read/project tracks once and publish them to the caller-owned workspace."""
     read_bounds: tuple[float, float, float, float] | None = None
-
-    log_info("── 流式处理 / Streaming tracks and turn events ...")
-    for track in _stream_vehicle_tracks_from_db(
+    source = _stream_vehicle_tracks_from_db(
         conn,
         table=cfg.db_table,
         kept_table=cfg.kept_table,
         source_table=cfg.source_table,
         refine_id=cfg.refine_id,
         spatial_context=spatial_context,
-    ):
-        for point in track:
-            if not (math.isfinite(point.lon) and math.isfinite(point.lat)):
-                raise V2Error("DB point has non-finite longitude/latitude")
-            if (point.x is None) != (point.y is None):
-                raise V2Error("DB point has incomplete processing x/y")
-            if point.x is not None and not (
-                math.isfinite(point.x) and math.isfinite(point.y)  # type: ignore[arg-type]
-            ):
-                raise V2Error("DB point has non-finite processing x/y")
-            if not (-180.0 <= point.lon <= 180.0 and -90.0 <= point.lat <= 90.0):
-                raise V2Error("DB point longitude/latitude is outside EPSG:4326")
-            point_bounds = (point.lon, point.lat, point.lon, point.lat)
-            read_bounds = (
-                point_bounds
-                if read_bounds is None
-                else (
-                    min(read_bounds[0], point.lon),
-                    min(read_bounds[1], point.lat),
-                    max(read_bounds[2], point.lon),
-                    max(read_bounds[3], point.lat),
-                )
-            )
-        subtrack_index = (
-            track[0].refined_point_ref.subtrack_index
-            if track[0].refined_point_ref is not None
-            else 1
-        )
-        track_key = f"{track[0].vehicle_id}\x00{subtrack_index}"
-        track = _project_tracks(
-            {track_key: track}, transformer, trust_existing=True
-        )[track_key]
-        if any(
-            point.x is None or point.y is None
-            or not math.isfinite(point.x) or not math.isfinite(point.y)
-            for point in track
-        ):
-            raise V2Error("DB point could not provide finite processing x/y")
-        tracks[track_key] = track
-        batch[track_key] = track
-        track_count += 1
-
-        if len(batch) >= cfg.stream_batch_size:
-            # ── Flush batch ──
-            if cfg.use_turn_events:
-                for te in _detect_turn_events(batch, cfg, perf=perf):
-                    turn_events.append(replace(
-                        te, event_calculate_index=len(turn_events),
-                    ))
-            batch.clear()
-
-            now = time.perf_counter()
-            if (now - last_progress_t) >= 3.0:
-                if live_status is not None:
-                    live_status.update(
-                        detail=f"流式/Streaming:\t{track_count:,}\t轨迹/tracks,\t"
-                               f"{len(turn_events):,}\t转向/turn",
-                        elapsed=now - t_total,
-                        stage="Detect: 流式 / Stream M1",
+    )
+    try:
+        for track in source:
+            for point in track:
+                if not (math.isfinite(point.lon) and math.isfinite(point.lat)):
+                    raise V2Error("DB point has non-finite longitude/latitude")
+                if (point.x is None) != (point.y is None):
+                    raise V2Error("DB point has incomplete processing x/y")
+                if point.x is not None and not (
+                    math.isfinite(point.x) and math.isfinite(point.y)  # type: ignore[arg-type]
+                ):
+                    raise V2Error("DB point has non-finite processing x/y")
+                if not (-180.0 <= point.lon <= 180.0 and -90.0 <= point.lat <= 90.0):
+                    raise V2Error("DB point longitude/latitude is outside EPSG:4326")
+                point_bounds = (point.lon, point.lat, point.lon, point.lat)
+                read_bounds = (
+                    point_bounds
+                    if read_bounds is None
+                    else (
+                        min(read_bounds[0], point.lon),
+                        min(read_bounds[1], point.lat),
+                        max(read_bounds[2], point.lon),
+                        max(read_bounds[3], point.lat),
                     )
-                last_progress_t = now
+                )
+            subtrack_index = (
+                track[0].refined_point_ref.subtrack_index
+                if track[0].refined_point_ref is not None
+                else 1
+            )
+            track_key = f"{track[0].vehicle_id}\x00{subtrack_index}"
+            track = _project_tracks(
+                {track_key: track}, transformer, trust_existing=True
+            )[track_key]
+            if any(
+                point.x is None or point.y is None
+                or not math.isfinite(point.x) or not math.isfinite(point.y)
+                for point in track
+            ):
+                raise V2Error("DB point could not provide finite processing x/y")
+            workspace[track_key] = track
+            yield track_key, track
+        if read_bounds is not None:
+            transformer.validate_bounds(read_bounds)
+    finally:
+        close = getattr(source, "close", None)
+        if close is not None:
+            close()
 
-    # ── Flush remaining ──
-    if batch:
-        if cfg.use_turn_events:
-            for te in _detect_turn_events(batch, cfg, perf=perf):
-                turn_events.append(replace(
-                    te, event_calculate_index=len(turn_events),
-                ))
-    if read_bounds is not None:
-        transformer.validate_bounds(read_bounds)
-    log_info(f"── 流式处理: {track_count:,} 轨迹/tracks → "
-             f"{len(turn_events):,} 转向事件/turn events "
-             f"({time.perf_counter() - t_total:.1f}s)")
+
+def _load_tracks_and_turn_candidates(
+    conn: Any,
+    cfg: IntersectConfig,
+    spatial_context: SpatialContext,
+    transformer: CoordinateTransformer,
+    *,
+    live_status: Any = None,
+    perf: PerfTracker | None = None,
+    workspace: MutableMapping[str, list[TrajectoryPoint]] | None = None,
+    event_store: DiskSequence[TurnEvent] | None = None,
+) -> tuple[Sequence[TurnEvent], MutableMapping[str, list[TrajectoryPoint]]]:
+    """Wire the DB reader, track scheduler and candidate collector together."""
+    tracks: MutableMapping[str, list[TrajectoryPoint]] = workspace if workspace is not None else {}
+    with closing(_iter_prepared_db_tracks(conn, cfg, spatial_context, transformer, tracks)) as source:
+        turn_events = extract_turn_candidates(
+            iter_track_patches(source, cfg.stream_batch_size),
+            cfg, live_status=live_status, perf=perf, event_store=event_store,
+        )
     return turn_events, tracks
 
 
@@ -1006,10 +1010,16 @@ def _extract_cross_track_db_workspace(
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
-) -> list[CrossTrackCandidate]:
-    """Prefer one global broad phase, with a no-SQL memory-window fallback."""
+    candidate_store: CandidateStore | None = None,
+) -> Sequence[CrossTrackCandidate]:
+    """Use bounded disk broad phase for DB runs; retain handle benchmark seams."""
     if not cfg.use_cross_track_candidates:
         return []
+    if isinstance(tracks, DetectWorkspace):
+        return extract_disk_cross_track_candidates(
+            tracks, transformer, cfg, live_status=live_status, perf=perf,
+            candidate_store=candidate_store,
+        )
     global_cfg = replace(
         cfg,
         cross_track_max_grid_cells_per_segment=_db_global_grid_cell_cap(cfg),
@@ -1368,6 +1378,7 @@ def _build_topology_point_index(
     )
 
 
+@observed_operation("拓扑候选验证")
 def _build_topologies_from_tracks(
     clusters: list[HotspotCluster],
     tracks: dict[str, list[TrajectoryPoint]],
@@ -1377,17 +1388,19 @@ def _build_topologies_from_tracks(
     live_status: Any = None,
     perf: PerfTracker | None = None,
 ) -> tuple[list[IntersectionTopology], list[HotspotCluster], list[EntryExitObservation]]:
-    """Verify DB-mode topologies from the already-streamed global tracks.
+    """Verify topologies from real adjacent segments and complete subtracks.
 
-    The old architecture issued and sorted one spatial SQL query per cluster.
-    This path routes the single ordered stream through all equivalent query
-    boxes once, then reuses the existing exact circle-crossing implementation.
+    DB runs query the temporary disk index and process one complete subtrack at
+    a time; handle/reference callers retain their existing in-memory index.
     """
     total_clusters = len(clusters)
+    heartbeat_progress(0, total=total_clusters, unit="候选交叉口")
     log_info(f"── 拓扑验证 / Topology verification ({total_clusters:,} 簇/clusters) ...")
     t0 = time.perf_counter()
     windows = _topology_point_windows(clusters, cfg)
-    if perf is None:
+    if isinstance(tracks, DetectWorkspace):
+        point_index = None
+    elif perf is None:
         point_index = _build_topology_point_index(tracks)
     else:
         with perf.stage("topology_index_points"):
@@ -1410,18 +1423,24 @@ def _build_topologies_from_tracks(
             cfg.min_intersection_radius_m,
             cluster.radius_m + cfg.topology_radius_padding_m,
         )
-        if perf is None:
-            nearby_tracks = point_index.tracks_in(windows[cluster_index])
+        if isinstance(tracks, DetectWorkspace):
+            observations, crossing_points = _extract_disk_entry_exit_observations(
+                tracks, windows[cluster_index], cluster=cluster,
+                transformer=transformer, radius_m=radius, bearing_window=cfg.bearing_window,
+            )
         else:
-            with perf.stage("topology_route_window"):
+            if perf is None:
                 nearby_tracks = point_index.tracks_in(windows[cluster_index])
-        observations, crossing_points = _extract_entry_exit_observations_batch(
-            nearby_tracks,
-            cluster=cluster,
-            transformer=transformer,
-            radius_m=radius,
-            bearing_window=cfg.bearing_window,
-        )
+            else:
+                with perf.stage("topology_route_window"):
+                    nearby_tracks = point_index.tracks_in(windows[cluster_index])
+            observations, crossing_points = _extract_entry_exit_observations_batch(
+                nearby_tracks,
+                cluster=cluster,
+                transformer=transformer,
+                radius_m=radius,
+                bearing_window=cfg.bearing_window,
+            )
         cluster = replace(cluster, crossing_points=tuple(crossing_points))
         topology, annotated, cluster_observations = _build_topology_for_cluster(
             cluster, observations, cfg,
@@ -1429,6 +1448,7 @@ def _build_topologies_from_tracks(
         topologies.append(topology)
         annotated_clusters.append(annotated)
         all_observations.extend(cluster_observations)
+        heartbeat_progress(cluster_index + 1, total=total_clusters, unit="候选交叉口")
 
     log_info(
         f"── 拓扑验证: {len(topologies):,} 拓扑/topologies "
@@ -1437,18 +1457,71 @@ def _build_topologies_from_tracks(
     return topologies, annotated_clusters, all_observations
 
 
+
+def _extract_disk_entry_exit_observations(
+    workspace: DetectWorkspace,
+    window: SpatialWindow,
+    **kwargs: Any,
+) -> tuple[list[EntryExitObservation], list[CrossingPoint]]:
+    observations: list[EntryExitObservation] = []
+    crossings: list[CrossingPoint] = []
+    for key, track in workspace.iter_nearby_tracks(window):
+        track_observations, track_crossings = _extract_entry_exit_observations_batch(
+            {key: track}, **kwargs,
+        )
+        offset = len(crossings)
+        crossings.extend(replace(point, crossing_calculate_index=offset + point.crossing_calculate_index)
+                         for point in track_crossings)
+        observations.extend(replace(
+            item,
+            entry_crossing_calculate_index=(None if item.entry_crossing_calculate_index is None
+                                            else offset + item.entry_crossing_calculate_index),
+            exit_crossing_calculate_index=(None if item.exit_crossing_calculate_index is None
+                                           else offset + item.exit_crossing_calculate_index),
+        ) for item in track_observations)
+    return observations, crossings
+
+
 def _detect_intersections_db(
     conn: Any,
     cfg: IntersectConfig,
     spatial_context: SpatialContext,
 ) -> IntersectResult:
-    """DB-mode intersection detection.
+    """Close track storage after Detect; transfer event storage to its result."""
+    event_store = DiskSequence[TurnEvent](directory=os.environ.get("DATA_ROOT") or None)
+    candidate_store = None
+    try:
+        candidate_store = CandidateStore(directory=os.environ.get("DATA_ROOT") or None)
+        with DetectWorkspace(cfg) as workspace:
+            result = _detect_intersections_db_workspace(
+                conn, cfg, spatial_context, workspace, event_store=event_store,
+                candidate_store=candidate_store,
+            )
+        if result.turn_events is not event_store:
+            # Empty input and test/reference seams can return in-memory output.
+            event_store.close()
+        if result.cross_track_candidates is not candidate_store:
+            candidate_store.close()
+        return result
+    except BaseException:
+        try:
+            event_store.close()
+        finally:
+            if candidate_store is not None:
+                candidate_store.close()
+        raise
 
-    ZH: DB 模式交叉口检测。
-        - Method 1: 一次加载全局逐车处理（单车操作，无需空间窗）
-        - Method 3: 复用同一 tracks workspace 的全局空间索引
-        - 共享 _cluster_pipeline + _build_intersect_report
-    """
+
+def _detect_intersections_db_workspace(
+    conn: Any,
+    cfg: IntersectConfig,
+    spatial_context: SpatialContext,
+    workspace: DetectWorkspace,
+    *,
+    event_store: DiskSequence[TurnEvent] | None = None,
+    candidate_store: CandidateStore | None = None,
+) -> IntersectResult:
+    """DB Detect stages share a disk workspace and unchanged global clustering."""
     # ── Spatial extent ──────────────────────────────────────────────
     extent = _query_spatial_extent(
         conn,
@@ -1467,15 +1540,15 @@ def _detect_intersections_db(
 
     tracker = PerfTracker("detect_db")
 
-    # ── Method 1: stream per-vehicle (DB-specific) ──────────────────
+    # ── Read tracks to disk and extract turn candidates ────────────
     if live is not None:
-        live.update(stage="Detect: 流式 / Stream M1",
-                    detail="Method 1: turn events...")
+        live.update(stage="Detect: 轨迹读取与转向候选",
+                    detail="读取轨迹并提取转向候选...")
     t_stage = time.perf_counter()
-    with tracker.stage("stream_m1"):
-        turn_events, tracks = _stream_extract_method_1(
+    with tracker.stage("load_tracks_and_turn_candidates"):
+        turn_events, tracks = _load_tracks_and_turn_candidates(
             conn, cfg, spatial_context, transformer,
-            live_status=live, perf=tracker,
+            live_status=live, perf=tracker, workspace=workspace, event_store=event_store,
         )
     if live is not None:
         live.update(
@@ -1483,7 +1556,7 @@ def _detect_intersections_db(
             elapsed=time.perf_counter() - t_stage,
         )
 
-    # ── Method 3: one global in-memory broad phase (DB-specific) ────
+    # ── Stream globally indexed disk segment pairs ────────────────
     t_stage = time.perf_counter()
     with tracker.stage("cross_track_global"):
         cross_candidates = _extract_cross_track_db_workspace(
@@ -1493,6 +1566,7 @@ def _detect_intersections_db(
             transformer,
             live_status=live,
             perf=tracker,
+            candidate_store=candidate_store,
         )
 
     # ── Shared: cluster pipeline (G* + DBSCAN + merge + ablation) ───
@@ -1515,7 +1589,7 @@ def _detect_intersections_db(
     # ── DB-mode topology: reuse the single-pass tracks workspace ────
     if live is not None:
         live.update(stage="Detect: 拓扑验证 / Topology",
-                    detail="Topology verification (single-pass workspace)...")
+                    detail="Topology verification (disk workspace)...")
     t_stage = time.perf_counter()
     with tracker.stage("topology_index"):
         topologies, annotated_clusters, observations = _build_topologies_from_tracks(
@@ -1563,101 +1637,12 @@ def _group_by_vehicle(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Method 1: Turn event detection + Getis-Ord G* hotspot scoring
+# Turn-candidate Getis-Ord G* hotspot scoring
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def _detect_turn_events(
-    tracks: dict[str, list[TrajectoryPoint]],
-    cfg: IntersectConfig,
-    *,
-    live_status: Any = None,
-    perf: PerfTracker | None = None,
-) -> list[TurnEvent]:
-    """Multi-point window bearing-change detection for all tracks.
-
-    For each track, slides a window of ``turn_window`` points before and
-    after each candidate index. Computes in/out bearings via circular mean
-    of segment bearings, then detects a turn if the absolute angle delta
-    falls within ``[min_turn_deg, max_turn_deg]``.
-    """
-    events: list[TurnEvent] = []
-    w = cfg.turn_window
-    total_tracks = len(tracks)
-    t0 = time.perf_counter()
-    last_t = t0
-    track_count = 0
-
-    for _track_key, track in _perf_iter(perf, tracks.items(), name="tracks_turn"):
-        if len(track) < 2 * w + 1:
-            continue
-
-        xy = [_point_xy(p) for p in track]
-        # 直接使用 GPS heading 作为逐段方位角，避免 O(w*(n-2w)) 次 atan2
-        headings = [p.heading for p in track]
-
-        for i in range(w, len(track) - w):
-            in_leg = _distance_m(xy[i - w], xy[i])
-            out_leg = _distance_m(xy[i], xy[i + w])
-            elapsed = track[i + w].timestamp - track[i - w].timestamp
-            if elapsed <= 0.0:
-                continue  # degenerate or duplicate timestamps — skip
-            movement_speed = (in_leg + out_leg) / elapsed
-
-            if (
-                in_leg < cfg.min_leg_m
-                or out_leg < cfg.min_leg_m
-                or movement_speed < cfg.min_movement_speed_mps
-            ):
-                continue
-
-            in_angles = headings[i - w : i]
-            out_angles = headings[i : i + w]
-
-            in_bearing = _circular_mean_deg(in_angles)
-            out_bearing = _circular_mean_deg(out_angles)
-            turn = _angle_delta_deg(in_bearing, out_bearing)
-            abs_turn = abs(turn)
-
-            if cfg.min_turn_deg <= abs_turn <= cfg.max_turn_deg:
-                p = track[i]
-                events.append(
-                    TurnEvent(
-                        event_calculate_index=len(events),
-                        vehicle_id=p.vehicle_id,
-                        timestamp=p.timestamp,
-                        lon=p.lon,
-                        lat=p.lat,
-                        x=xy[i][0],
-                        y=xy[i][1],
-                        entry_bearing=in_bearing,
-                        exit_bearing=out_bearing,
-                        turn_deg=turn,
-                        score=abs_turn,
-                        source="turn",
-                        point_ref=p.point_ref,
-                        refined_point_ref=p.refined_point_ref,
-                        source_ids=(p.point_ref.source_id,),
-                    )
-                )
-
-        track_count += 1
-        now = time.perf_counter()
-        if track_count % 10000 == 0 or (now - last_t) >= 3.0:
-            _route_progress(
-                live_status,
-                detail=f"已处理/Processed:\t{track_count:,}/{total_tracks:,}\t轨迹/tracks",
-                progress=track_count / total_tracks,
-                elapsed=now - t0,
-                stage="Detect: 转向事件 / Turn Events",
-            )
-            last_t = now
-
-    return events
-
-
 def _compute_getis_ord_g_star(
-    events: list[TurnEvent], radius_m: float,
+    events: Sequence[TurnEvent | _GStarCoordinate], radius_m: float,
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
@@ -1705,7 +1690,7 @@ def _compute_getis_ord_g_star(
 
 
 def _getis_local_counts_scan(
-    events: list[TurnEvent], radius_m: float, *, live_status: Any = None,
+    events: Sequence[TurnEvent | _GStarCoordinate], radius_m: float, *, live_status: Any = None,
     perf: PerfTracker | None = None, started: float | None = None,
 ) -> list[float]:
     """Historical exact comparison path for non-representable grid inputs."""
@@ -1754,8 +1739,8 @@ def _getis_local_counts_scan(
 
 
 def _count_getis_grid_candidates(
-    event: TurnEvent,
-    events: list[TurnEvent],
+    event: TurnEvent | _GStarCoordinate,
+    events: Sequence[TurnEvent | _GStarCoordinate],
     cells: dict[tuple[int, int], list[int]],
     bounds: tuple[int, int, int, int],
     radius_sq: float,
@@ -1775,7 +1760,7 @@ def _count_getis_grid_candidates(
 
 
 def _getis_local_counts_grid(
-    events: list[TurnEvent], radius_m: float, *, live_status: Any = None,
+    events: Sequence[TurnEvent | _GStarCoordinate], radius_m: float, *, live_status: Any = None,
     perf: PerfTracker | None = None, started: float | None = None,
     phase_timings: dict[str, float] | None = None,
 ) -> list[float]:
@@ -1854,8 +1839,15 @@ def _getis_local_counts_grid(
     return local_counts
 
 
+@dataclass(frozen=True, slots=True)
+class _GStarCoordinate:
+    event_calculate_index: int
+    x: float
+    y: float
+
+
 def _select_hotspot_events(
-    events: list[TurnEvent], cfg: IntersectConfig,
+    events: Sequence[TurnEvent], cfg: IntersectConfig,
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
@@ -1866,13 +1858,37 @@ def _select_hotspot_events(
 
     log_info(f"── 热点筛选 / Hotspot selection ({len(events):,} 事件/events) ...")
     t0 = time.perf_counter()
-    z_scores = _compute_getis_ord_g_star(events, cfg.g_star_radius_m, live_status=live_status, perf=perf)
-    result = [
-        replace(e, g_star_z=z_scores.get(e.event_calculate_index, 0.0))
-        for e in events
-        if z_scores.get(e.event_calculate_index, 0.0) >= cfg.g_star_min_z
-        and abs(e.turn_deg) >= cfg.min_turn_deg
-    ]
+    if isinstance(events, DiskSequence):
+        # Neighbour lookup must never deserialize full event payloads. Keep
+        # only the fields G* reads, then release them before hotspot decoding.
+        with operation_heartbeat("G*：读取紧凑事件坐标"), closing(iter(events)) as event_iterator:
+            coordinates = [
+                _GStarCoordinate(event.event_calculate_index, event.x, event.y)
+                for event in event_iterator
+            ]
+        try:
+            z_scores = _compute_getis_ord_g_star(
+                coordinates, cfg.g_star_radius_m, live_status=live_status, perf=perf,
+            )
+        finally:
+            del coordinates
+    else:
+        z_scores = _compute_getis_ord_g_star(
+            events, cfg.g_star_radius_m, live_status=live_status, perf=perf,
+        )
+    with operation_heartbeat("G*：还原热点事件"):
+        event_iterator = iter(events)
+        try:
+            result = [
+                replace(e, g_star_z=z_scores.get(e.event_calculate_index, 0.0))
+                for e in event_iterator
+                if z_scores.get(e.event_calculate_index, 0.0) >= cfg.g_star_min_z
+                and abs(e.turn_deg) >= cfg.min_turn_deg
+            ]
+        finally:
+            close = getattr(event_iterator, "close", None)
+            if close is not None:
+                close()
     log_info(f"── 热点筛选: {len(result):,} 事件/events ({time.perf_counter() - t0:.1f}s)")
     return result
 
@@ -1911,7 +1927,7 @@ def _build_dbscan_grid(
     xs: list[float],
     ys: list[float],
     eps_m: float,
-) -> dict[tuple[int, int], list[int]] | None:
+) -> dict[tuple[int, int], array] | None:
     """Build an exact, bounded-per-query spatial index for DBSCAN.
 
     ``None`` deliberately selects the historical full scan for invalid/private
@@ -1924,7 +1940,8 @@ def _build_dbscan_grid(
     if (eps_m <= 0.0 or not math.isfinite(eps_m) or not math.isfinite(eps_m * eps_m)
             or len(xs) != len(ys)):
         return None
-    grid: dict[tuple[int, int], list[int]] = {}
+    grid: dict[tuple[int, int], array] = {}
+    code = index_typecode(len(xs))
     for index, (x, y) in enumerate(zip(xs, ys)):
         if not math.isfinite(x) or not math.isfinite(y):
             return None
@@ -1940,7 +1957,10 @@ def _build_dbscan_grid(
             cell = (math.floor(x / eps_m), math.floor(y / eps_m))
         except OverflowError:
             return None
-        grid.setdefault(cell, []).append(index)
+        indices = grid.get(cell)
+        if indices is None:
+            indices = grid[cell] = array(code)
+        indices.append(index)
     return grid
 
 
@@ -1961,7 +1981,7 @@ def _grid_neighbors_indices(
     ys: list[float],
     index: int,
     eps_m: float,
-    grid: dict[tuple[int, int], list[int]],
+    grid: dict[tuple[int, int], Sequence[int]],
 ) -> list[int]:
     """Return exact neighbours in original-index order from all overlapping cells.
 
@@ -1997,7 +2017,7 @@ def _grid_has_min_neighbors(
     index: int,
     eps_m: float,
     min_samples: int,
-    grid: dict[tuple[int, int], list[int]],
+    grid: dict[tuple[int, int], Sequence[int]],
 ) -> bool:
     """Return whether ``index`` is core without materialising its neighbours.
 
@@ -2029,21 +2049,18 @@ def _grid_has_min_neighbors(
 
 
 def _take_grid_frontier_neighbors(
-    xs: list[float],
-    ys: list[float],
+    xs: Sequence[float],
+    ys: Sequence[float],
     index: int,
     eps_m: float,
-    grid: dict[tuple[int, int], list[int]],
-    available: dict[tuple[int, int], set[int]],
-    point_cells: list[tuple[int, int]],
-) -> list[int]:
-    """Take exact, not-yet-queued neighbours in historical index order.
+    grid: dict[tuple[int, int], array],
+    available: ActiveGridLinks,
+) -> array:
+    """Consume the same exact frontier, ascending globally before LIFO expansion.
 
-    Removing a point from ``available`` when it enters the current expansion
-    queue is equivalent to the old per-cluster ``queued_epoch`` check.  The
-    difference is that later core points inspect only the shrinking frontier,
-    rather than repeatedly walking every already-labelled member of a dense
-    cluster.
+    Cell chains are already index-ordered. Merge their filtered streams without
+    an all-neighbour Python-int list or a full sort. Every matched node is removed
+    while its cell is known; no N-element point-to-cell vector is needed.
     """
     base_x, base_y = xs[index], ys[index]
     eps_sq = eps_m * eps_m
@@ -2051,18 +2068,22 @@ def _take_grid_frontier_neighbors(
     y_bounds = _dbscan_grid_axis_bounds(base_y, eps_m)
     if x_bounds is None or y_bounds is None:
         raise RuntimeError("DBSCAN grid invariant violated after construction")
-    result: list[int] = []
-    for grid_x in range(x_bounds[0], x_bounds[1] + 1):
-        for grid_y in range(y_bounds[0], y_bounds[1] + 1):
-            for candidate in available.get((grid_x, grid_y), ()):
-                dx = xs[candidate] - base_x
-                dy = ys[candidate] - base_y
-                if dx * dx + dy * dy <= eps_sq:
-                    result.append(candidate)
-    result.sort()
-    for candidate in result:
-        available[point_cells[candidate]].remove(candidate)
-    return result
+
+    def matching(cell: tuple[int, int]) -> Iterator[int]:
+        for candidate in available.iter_cell(cell):
+            dx = xs[candidate] - base_x
+            dy = ys[candidate] - base_y
+            if dx * dx + dy * dy <= eps_sq:
+                available.remove(cell, candidate)
+                yield candidate
+
+    streams = [
+        matching((grid_x, grid_y))
+        for grid_x in range(x_bounds[0], x_bounds[1] + 1)
+        for grid_y in range(y_bounds[0], y_bounds[1] + 1)
+        if available.heads.get((grid_x, grid_y), -1) >= 0
+    ]
+    return array(available.typecode, heapq.merge(*streams))
 
 
 def _run_dbscan_large_dispatch(
@@ -2095,13 +2116,9 @@ def _run_dbscan_large_dispatch(
 
     labels = [_UNVISITED] * n
     cluster_label = 0
-    core_flags: list[bool | None] = [None] * n
-    point_cells: list[tuple[int, int]] = [(0, 0)] * n
-    available: dict[tuple[int, int], set[int]] = {}
-    for cell, indexes in grid.items():
-        available[cell] = set(indexes)
-        for index in indexes:
-            point_cells[index] = cell
+    # 0: unknown, 1: non-core, 2: core. Preserve all three old states.
+    core_flags = bytearray(n)
+    available = ActiveGridLinks(grid, n)
     t0 = time.perf_counter()
     last_t = t0
 
@@ -2111,15 +2128,15 @@ def _run_dbscan_large_dispatch(
         is_core = _grid_has_min_neighbors(
             xs, ys, i, eps_m, min_samples, grid,
         )
-        core_flags[i] = is_core
+        core_flags[i] = 2 if is_core else 1
         if not is_core:
             labels[i] = _NOISE
             continue
 
         labels[i] = cluster_label
-        available[point_cells[i]].remove(i)
+        available.remove((math.floor(xs[i] / eps_m), math.floor(ys[i] / eps_m)), i)
         seeds = _take_grid_frontier_neighbors(
-            xs, ys, i, eps_m, grid, available, point_cells,
+            xs, ys, i, eps_m, grid, available,
         )
         while seeds:
             current = seeds.pop()
@@ -2128,21 +2145,23 @@ def _run_dbscan_large_dispatch(
             if labels[current] != _UNVISITED:
                 continue
             labels[current] = cluster_label
-            is_core = core_flags[current]
-            if is_core is None:
+            state = core_flags[current]
+            if state == 0:
                 is_core = _grid_has_min_neighbors(
                     xs, ys, current, eps_m, min_samples, grid,
                 )
-                core_flags[current] = is_core
+                core_flags[current] = 2 if is_core else 1
+            else:
+                is_core = state == 2
             if is_core:
                 if perf is None:
                     seeds.extend(_take_grid_frontier_neighbors(
-                        xs, ys, current, eps_m, grid, available, point_cells,
+                        xs, ys, current, eps_m, grid, available,
                     ))
                 else:
                     with perf.stage("dbscan_seed_neighbors"):
                         seeds.extend(_take_grid_frontier_neighbors(
-                            xs, ys, current, eps_m, grid, available, point_cells,
+                            xs, ys, current, eps_m, grid, available,
                         ))
         cluster_label += 1
         now = time.perf_counter()
@@ -2306,13 +2325,14 @@ def _cluster_dbscan(
 
 
 def _cluster_orthogonal_cross_track_candidates(
-    candidates: list[CrossTrackCandidate],
+    candidates: Sequence[CrossTrackCandidate],
     transformer: CoordinateTransformer,
     *,
     eps_m: float,
     min_samples: int,
     live_status: Any = None,
     perf: PerfTracker | None = None,
+    member_passes: list[MemberPass] | None = None,
 ) -> list[HotspotCluster]:
     """DBSCAN-cluster orthogonal_cross_track candidates, wrapping as TurnEvents.
 
@@ -2323,11 +2343,45 @@ def _cluster_orthogonal_cross_track_candidates(
     if n == 0:
         return []
 
-    xs = [c.x for c in candidates]
-    ys = [c.y for c in candidates]
+    if isinstance(candidates, CandidateStore):
+        xs, ys = array("d"), array("d")
+        with closing(candidates.iter_coordinates()) as coordinates:
+            for x, y in coordinates:
+                xs.append(x)
+                ys.append(y)
+    else:
+        xs = [c.x for c in candidates]
+        ys = [c.y for c in candidates]
     log_info(f"    DBSCAN 聚类 (orthogonal_cross_track) / DBSCAN clustering ({n:,} 点/points) ...")
     labels = _run_dbscan(xs, ys, eps_m=eps_m, min_samples=min_samples,
                           live_status=live_status, stage="orthogonal_cross_track", perf=perf)
+
+    if isinstance(candidates, CandidateStore):
+        member_pass = candidates.create_members(labels)
+        if member_passes is not None:
+            member_passes.append(member_pass)
+        try:
+            clusters = []
+            for cid, events in member_pass.iter_groups():
+                # Retain the original ordered Python sums, including rounding.
+                cx = sum(xs[i] for i in events.iter_ordinals()) / len(events)
+                cy = sum(ys[i] for i in events.iter_ordinals()) / len(events)
+                radius = max(_distance_m((cx, cy), (xs[i], ys[i]))
+                             for i in events.iter_ordinals())
+                lon, lat = transformer.inverse(cx, cy)
+                cluster = HotspotCluster(
+                    cluster_calculate_index=cid, centroid_x=cx, centroid_y=cy,
+                    centroid_lon=lon, centroid_lat=lat, radius_m=radius,
+                    cluster_ref=f"cluster_orthogonal_cross_track_{cid}",
+                    events=events, source="orthogonal_cross_track",
+                )
+                clusters.append(_with_source_provenance(
+                    cluster, source_counts={"orthogonal_cross_track": len(events)},
+                ))
+            return clusters
+        except BaseException:
+            member_pass.close()
+            raise
 
     clusters: list[HotspotCluster] = []
     for cid, cluster_items in _group_cluster_items(candidates, labels):
@@ -2410,6 +2464,7 @@ def _merge_clusters(
         clusters, key=lambda c: len(c.events), reverse=True
     )
     kept: list[HotspotCluster] = []
+    lazy = any(not isinstance(cluster.events, (list, tuple)) for cluster in clusters)
 
     # ZH: ``while remaining`` 不是可迭代对象，跳过逐迭代计时；仅内部扫描循环
     #     用 ``merge_scan`` 计时（每个外层 while 迭代各计时一轮）。
@@ -2417,10 +2472,10 @@ def _merge_clusters(
     #     the inner scan ``for cj in remaining`` is timed as ``merge_scan``.
     while remaining:
         ci = remaining.pop(0)
-        merged_events = list(ci.events)
+        merged_events = [ci.events] if lazy else list(ci.events)
         merged_source_counts = _cluster_source_counts(ci)
         merged_source_refs = {
-            source: list(items)
+            source: [items] if lazy else list(items)
             for source, items in _cluster_source_point_refs(ci).items()
         }
         cx_sum = ci.centroid_x * len(ci.events)
@@ -2443,15 +2498,19 @@ def _merge_clusters(
                 dist = _distance_m((cur_cx, cur_cy), (cj.centroid_x, cj.centroid_y))
                 if dist <= merge_distance_m:
                     # Absorb cj
-                    merged_events.extend(cj.events)
+                    if lazy:
+                        merged_events.append(cj.events)
+                    else:
+                        merged_events.extend(cj.events)
                     merged_source_counts = _merge_count_dicts(
                         merged_source_counts,
                         _cluster_source_counts(cj),
                     )
-                    _extend_ref_lists(
-                        merged_source_refs,
-                        _cluster_source_point_refs(cj),
-                    )
+                    if lazy:
+                        for source, items in _cluster_source_point_refs(cj).items():
+                            merged_source_refs.setdefault(source, []).append(items)
+                    else:
+                        _extend_ref_lists(merged_source_refs, _cluster_source_point_refs(cj))
                     # Update radius: new_radius = max(old_radius, dist + cj.radius_m)
                     candidate_r = dist + cj.radius_m
                     if candidate_r * candidate_r > max_sq:
@@ -2482,7 +2541,7 @@ def _merge_clusters(
             centroid_lat=new_lat,
             radius_m=merged_radius,
             cluster_ref=ci.cluster_ref,  # keep absorbing cluster's ref
-            events=tuple(merged_events),
+            events=ConcatSequence(merged_events) if lazy else tuple(merged_events),
             source=_source_label(tuple(sorted(merged_source_counts))),
         )
         kept.append(
@@ -2490,7 +2549,7 @@ def _merge_clusters(
                 merged_cluster,
                 source_counts=merged_source_counts,
                 source_point_refs={
-                    source: tuple(items)
+                    source: ConcatSequence(items) if lazy else tuple(items)
                     for source, items in merged_source_refs.items()
                 },
             )
