@@ -1,5 +1,7 @@
 # Detect 提交校验查询审查（2026-09-14）
 
+> 后续决定：用户授权在 `test`、`roadnet` 停用两个完成校验触发器。来源审查、精确新旧差异和停用测试见 [完成校验函数审查](detect-fit-completion-validators.md)。以下保留此前优化及测试记录，不作为重新启用函数的操作指令。
+
 本次审查由 `test/public.day01` 百万行冒烟测试触发：Detect 已完成计算，但提交事务时的交叉点完整性校验超过 4 分钟。新运行尚无有效统计信息，多表连接的估算行数为 1，实际包含几十万条记录。
 
 | 审查位置 | 风险与处理 |
@@ -14,7 +16,7 @@
 | Pipeline 来源追溯 | 按实体关系读取，存在逐实体往返；`visited` 避免重复遍历，源数据指纹已有运行级缓存。未发现本次的成对扫描结构；添加遍历心跳和节点数量，未改为批量图查询。 |
 | Backend 交叉口回放、解析点读取 | 后继点读取已有 `LATERAL ... LIMIT 1`，点读取保留明确的运行、实体或子轨迹范围条件；本次未修改其查询及接口。 |
 
-函数局部设置会在退出函数时恢复调用者配置，成功与异常路径均有数据库测试。`enable_nestloop=off` 是规划偏好，不保证所有情况下完全消除嵌套循环；它仅用于必须校验整个新运行的两个函数，不更改数据库全局规划参数。批量连接仍消耗排序或哈希工作区，本次没有提高 `work_mem`。参见 PostgreSQL 的[连接规划参数](https://www.postgresql.org/docs/16/runtime-config-query.html#GUC-ENABLE-NESTLOOP)和[函数局部设置](https://www.postgresql.org/docs/16/sql-createfunction.html)。
+函数局部设置会在退出函数时恢复调用者配置，成功与异常路径均有数据库测试。`enable_nestloop=off` 是规划偏好，不保证所有情况下完全消除嵌套循环；它仅用于当时实现整批校验的两个函数，不更改数据库全局规划参数。批量连接仍消耗排序或哈希工作区，本次没有提高 `work_mem`。参见 PostgreSQL 的[连接规划参数](https://www.postgresql.org/docs/16/runtime-config-query.html#GUC-ENABLE-NESTLOOP)和[函数局部设置](https://www.postgresql.org/docs/16/sql-createfunction.html)。
 
 读取器保留调用者的 `statement_timeout`。仅对当前读取事务设置 `SET LOCAL idle_in_transaction_session_timeout=0`，允许 FETCH 之间的计算暂停，事务结束后恢复。
 
