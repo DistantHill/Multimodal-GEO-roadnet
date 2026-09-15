@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 import math
+import mmap
+from collections.abc import Callable, Iterator
+from tempfile import TemporaryDirectory
+
+from .clip_spool import DiskSequence
+from .heartbeat import observed_operation, heartbeat_progress, operation_heartbeat
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -31,6 +37,7 @@ class _OrientedClip:
     was_reversed: bool
 
 
+@observed_operation("Fitting：中心线拟合")
 def fit_centerlines(
     clips: ClipResult,
     *,
@@ -45,60 +52,76 @@ def fit_centerlines(
     cfg = config or FittingConfig()
     _validate_config(cfg)
     transformer = CoordinateTransformer(clips.spatial_context)
-    grouped: dict[tuple[int, int], list[_OrientedClip]] = {}
+    grouped: dict[tuple[int, int], int] = {}
+    spool = DiskSequence[_OrientedClip]()
     issues: list[FitIssue] = []
     eligible_count = 0
 
-    for clip in clips.clips:
-        if clip.clip_type in _BOUNDARY_CLIP_TYPES:
-            continue
-        if clip.clip_type != "between_intersection":
-            issues.append(FitIssue(None, None, "unsupported_clip_type", clip.clip_id))
-            continue
-        eligible_count += 1
-        start_id = clip.start.intersection_id
-        end_id = clip.end.intersection_id
-        pair = None
-        if start_id is not None and end_id is not None and start_id != end_id:
-            pair = (min(start_id, end_id), max(start_id, end_id))
-            grouped.setdefault(pair, [])
-        oriented, issue = _orient_clip(clip, transformer)
-        if issue is not None:
-            issues.append(issue)
-            continue
-        assert oriented is not None
-        assert pair is not None
-        grouped.setdefault(pair, []).append(oriented)
+    try:
+        with operation_heartbeat("Fitting：准备片段"):
+            heartbeat_progress(0, total=len(clips.clips), unit="片段")
+            for clip_index, clip in enumerate(clips.clips, 1):
+                try:
+                    if clip.clip_type in _BOUNDARY_CLIP_TYPES:
+                        continue
+                    if clip.clip_type != "between_intersection":
+                        issues.append(FitIssue(None, None, "unsupported_clip_type", clip.clip_id))
+                        continue
+                    eligible_count += 1
+                    start_id = clip.start.intersection_id
+                    end_id = clip.end.intersection_id
+                    pair = None
+                    if start_id is not None and end_id is not None and start_id != end_id:
+                        pair = (min(start_id, end_id), max(start_id, end_id))
+                        grouped.setdefault(pair, 0)
+                    oriented, issue = _orient_clip(clip, transformer)
+                    if issue is not None:
+                        issues.append(issue)
+                        continue
+                    assert oriented is not None
+                    assert pair is not None
+                    grouped[pair] += 1
+                    spool.append(oriented, key=clip.clip_id, pair=pair)
+                finally:
+                    heartbeat_progress(clip_index, total=len(clips.clips), unit="片段")
 
-    centerlines: list[Centerline] = []
-    skipped_pairs = 0
-    for pair in sorted(grouped):
-        pair_clips = sorted(grouped[pair], key=lambda item: item.value.clip_id)
-        if len(pair_clips) < cfg.min_clips_per_pair:
-            skipped_pairs += 1
-            issues.append(FitIssue(pair[0], pair[1], "insufficient_clips"))
-            continue
-        centerline = _fit_pair(pair, pair_clips, cfg, transformer)
-        if centerline is None:
-            skipped_pairs += 1
-            issues.append(FitIssue(pair[0], pair[1], "degenerate_centerline"))
-            continue
-        centerlines.append(centerline)
+        centerlines: list[Centerline] = []
+        skipped_pairs = 0
+        with operation_heartbeat("Fitting：按交叉口对拟合"):
+            heartbeat_progress(0, total=len(grouped), unit="交叉口对")
+            for pair_index, pair in enumerate(sorted(grouped), 1):
+                try:
+                    if grouped[pair] < cfg.min_clips_per_pair:
+                        skipped_pairs += 1
+                        issues.append(FitIssue(pair[0], pair[1], "insufficient_clips"))
+                        continue
+                    centerline = _fit_pair_stream(
+                        pair, lambda: spool.iter_pair(pair), grouped[pair], cfg, transformer,
+                    )
+                    if centerline is None:
+                        skipped_pairs += 1
+                        issues.append(FitIssue(pair[0], pair[1], "degenerate_centerline"))
+                        continue
+                    centerlines.append(centerline)
+                finally:
+                    heartbeat_progress(pair_index, total=len(grouped), unit="交叉口对")
 
-    return FitResult(
-        centerlines=tuple(centerlines),
-        issues=tuple(issues),
-        report=FitReport(
-            input_clip_count=len(clips.clips),
-            eligible_clip_count=eligible_count,
-            connected_pair_count=len(grouped),
-            fitted_centerline_count=len(centerlines),
-            skipped_clip_count=sum(issue.clip_id is not None for issue in issues),
-            skipped_pair_count=skipped_pairs,
-        ),
-        spatial_context=clips.spatial_context,
-        detect_id=clips.detect_id,
-    )
+        return FitResult(
+            centerlines=tuple(centerlines),
+            issues=tuple(issues),
+            report=FitReport(
+                input_clip_count=len(clips.clips),
+                eligible_clip_count=eligible_count,
+                connected_pair_count=len(grouped),
+                fitted_centerline_count=len(centerlines),
+                skipped_clip_count=sum(issue.clip_id is not None for issue in issues),
+                skipped_pair_count=skipped_pairs,
+            ),
+            spatial_context=clips.spatial_context,
+            detect_id=clips.detect_id,
+        )
+    finally:
+        spool.close()
 
 
 def fit_centerline_variants(
@@ -119,19 +142,21 @@ def _fit_direction(
     reverse: bool,
     config: FittingConfig | None,
 ) -> FitResult:
-    selected = tuple(
-        clip
-        for clip in clips.clips
-        if clip.clip_type == "between_intersection"
-        and clip.start.intersection_id is not None
-        and clip.end.intersection_id is not None
-        and clip.start.intersection_id != clip.end.intersection_id
-        and ((clip.start.intersection_id > clip.end.intersection_id) == reverse)
-    )
-    fitted = fit_centerlines(
-        replace(clips, clips=selected),
-        config=config,
-    )
+    with DiskSequence[TrackClip]() as selected:
+        direction = "反向" if reverse else "正向"
+        with operation_heartbeat(f"Fitting：筛选{direction}片段"):
+            heartbeat_progress(0, total=len(clips.clips), unit="片段")
+            for clip_index, clip in enumerate(clips.clips, 1):
+                if (
+                    clip.clip_type == "between_intersection"
+                    and clip.start.intersection_id is not None
+                    and clip.end.intersection_id is not None
+                    and clip.start.intersection_id != clip.end.intersection_id
+                    and ((clip.start.intersection_id > clip.end.intersection_id) == reverse)
+                ):
+                    selected.append(clip, key=clip.clip_id)
+                heartbeat_progress(clip_index, total=len(clips.clips), unit="片段")
+        fitted = fit_centerlines(replace(clips, clips=selected), config=config)
     centerlines = tuple(
         replace(
             centerline,
@@ -200,44 +225,64 @@ def _orient_clip(
     points_xy = tuple(transformer.forward_many(points))
     if _xy_polyline_length(np.asarray(points_xy)) <= _EPS:
         return None, FitIssue(min(start_id, end_id), max(start_id, end_id), "zero_length_geometry", clip.clip_id)
-    return _OrientedClip(clip, points_xy, was_reversed), None
+    return _OrientedClip(replace(clip, points=()), points_xy, was_reversed), None
 
 
-def _fit_pair(
+def _fit_pair_stream(
     pair: tuple[int, int],
-    clips: list[_OrientedClip],
+    read_clips: Callable[[], Iterator[_OrientedClip]],
+    count: int,
     config: FittingConfig,
     transformer: CoordinateTransformer,
 ) -> Centerline | None:
-    tracks_xy = [np.asarray(clip.points_xy) for clip in clips]
-    lengths = [_xy_polyline_length(track) for track in tracks_xy]
+    lengths = np.fromiter(
+        (_xy_polyline_length(np.asarray(clip.points_xy)) for clip in read_clips()),
+        dtype=np.float64, count=count,
+    )
     median_length = float(np.median(lengths))
     if median_length <= _EPS:
         return None
-
     sample_count = max(2, int(math.ceil(median_length / config.fit_sample_spacing_m)) + 1)
     progress = np.linspace(0.0, 1.0, sample_count)
-    sampled = np.stack([_resample_at_progress(track, progress) for track in tracks_xy])
-    fitted_xy = np.median(sampled, axis=0)
+    source_ids: list[str] = []
+    forward = 0
+    with TemporaryDirectory(prefix="roadnet-fit-") as directory:
+        sampled = np.memmap(f"{directory}/samples", dtype=np.float64, mode="w+",
+                            shape=(count, sample_count, 2))
+        try:
+            for index, clip in enumerate(read_clips()):
+                sampled[index] = _resample_at_progress(np.asarray(clip.points_xy), progress)
+                if (index + 1) % max(1, (16 * 1024 * 1024) // (sample_count * 16)) == 0:
+                    sampled.flush()
+                    if hasattr(sampled._mmap, "madvise"):
+                        sampled._mmap.madvise(mmap.MADV_DONTNEED)
+                source_ids.append(clip.value.clip_id)
+                forward += not clip.was_reversed
+            sampled.flush()
+            if hasattr(sampled._mmap, "madvise"):
+                sampled._mmap.madvise(mmap.MADV_DONTNEED)
+            fitted_xy = np.empty((sample_count, 2), dtype=np.float64)
+            # Exact median, bounded scratch across sample positions. No
+            # np.stack of every projected track or full sample matrix copy.
+            block = max(1, (16 * 1024 * 1024) // max(16 * count, 1))
+            for start in range(0, sample_count, block):
+                end = min(start + block, sample_count)
+                fitted_xy[start:end] = np.median(sampled[:, start:end], axis=0)
+                if hasattr(sampled._mmap, "madvise"):
+                    sampled._mmap.madvise(mmap.MADV_DONTNEED)
+        finally:
+            sampled._mmap.close()
     if _xy_polyline_length(fitted_xy) <= _EPS:
         return None
     spaced_xy = _resample_at_spacing(fitted_xy, config.point_spacing_m)
     if len(spaced_xy) < 2:
         return None
-    points = tuple(
-        transformer.inverse(float(x), float(y))
-        for x, y in spaced_xy
-    )
     return Centerline(
-        from_intersection_id=pair[0],
-        to_intersection_id=pair[1],
-        points=points,
-        length_m=_xy_polyline_length(spaced_xy),
-        source_clip_ids=tuple(clip.value.clip_id for clip in clips),
-        forward_clip_count=sum(not clip.was_reversed for clip in clips),
-        reverse_clip_count=sum(clip.was_reversed for clip in clips),
+        from_intersection_id=pair[0], to_intersection_id=pair[1],
+        points=tuple(transformer.inverse(float(x), float(y)) for x, y in spaced_xy),
+        length_m=_xy_polyline_length(spaced_xy), source_clip_ids=tuple(source_ids),
+        forward_clip_count=forward, reverse_clip_count=count-forward,
     )
-
 
 def _resample_at_progress(points: np.ndarray, progress: np.ndarray) -> np.ndarray:
     points, cumulative = _deduplicate_xy(points)

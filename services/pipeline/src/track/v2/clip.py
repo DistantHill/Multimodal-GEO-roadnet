@@ -7,6 +7,10 @@ p/i/c order and never solves segment/circle intersections again.
 from __future__ import annotations
 
 import math
+from collections import Counter
+
+from .clip_spool import DiskSequence
+from .heartbeat import observed_operation, heartbeat_progress
 
 from .db.queries import (
     fetch_detect_row,
@@ -84,6 +88,7 @@ def extract_clips(
     )
 
 
+@observed_operation("Clip：流式构建片段")
 def extract_clips_for_detect(
     conn: object,
     detect_id: str,
@@ -95,13 +100,58 @@ def extract_clips_for_detect(
     if run.status != "completed":
         raise ValueError(f"Detect Run {detect_id} is not completed")
     verify_refine_source_fingerprint(conn, run.refine_id)
-    source = ClipInput(
-        intersections=tuple(fetch_intersections(conn, detect_id)),
-        tracks=tuple(fetch_resolved_clip_tracks(conn, detect_id)),
-        spatial_context=run.spatial_context,
-        detect_id=detect_id,
-    )
-    return extract_clips(source, config=config)
+    intersections = tuple(fetch_intersections(conn, detect_id))
+    cfg = config or ClipConfig()
+    transformer = CoordinateTransformer(run.spatial_context)
+    circles = _project_intersections(intersections, transformer)
+    _validate_input(ClipInput(intersections, (), run.spatial_context, detect_id))
+    spool = DiskSequence[TrackClip]()
+    vehicles: set[str] = set()
+    seen_subtracks: set[int] = set()
+    counts: Counter[str] = Counter()
+    skipped = point_count = 0
+    tracks = iter(fetch_resolved_clip_tracks(conn, detect_id))
+    try:
+        for track in tracks:
+            if track.subtrack_index in seen_subtracks:
+                raise ValueError(f"duplicate ClipTrack subtrack {track.subtrack_index}")
+            seen_subtracks.add(track.subtrack_index)
+            vehicles.add(track.vehicle_id)
+            _validate_input(ClipInput((), (track,), run.spatial_context, detect_id))
+            if len(track.points) < 2:
+                skipped += 1
+                continue
+            track_clips, track_skipped = _extract_track_clips(
+                track, circles, transformer,
+                include_boundaries=cfg.include_boundary_clips, detect_id=detect_id,
+            )
+            skipped += track_skipped
+            for clip in track_clips:
+                spool.append(clip, key=clip.clip_id)
+                counts[clip.clip_type] += 1
+                point_count += clip.point_count
+            heartbeat_progress(len(seen_subtracks))
+        return ClipResult(
+            clips=spool,
+            report=ClipReport(
+                total_vehicles=len(vehicles), total_subtracks=len(seen_subtracks),
+                total_clips=len(spool),
+                between_intersection_clips=counts["between_intersection"],
+                boundary_start_clips=counts["boundary_start"],
+                boundary_end_clips=counts["boundary_end"],
+                full_track_clips=counts["full_track"],
+                total_points_in_clips=point_count, skipped_degenerate_count=skipped,
+            ),
+            spatial_context=run.spatial_context, detect_id=detect_id,
+            intersections=intersections,
+        )
+    except BaseException:
+        spool.close()
+        raise
+    finally:
+        close = getattr(tracks, "close", None)
+        if close is not None:
+            close()
 
 
 def _project_intersections(

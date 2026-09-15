@@ -8,6 +8,7 @@ this module and remains responsible only for command-line concerns.
 from __future__ import annotations
 
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -90,7 +91,7 @@ def run_pipeline(
     t_start = time.perf_counter()
     reuse_refine = refine_id is not None
 
-    with pg_connect(db_config) as conn:
+    with ExitStack() as resources, pg_connect(db_config) as conn:
         require_schema_v4(conn)
         store: PipelineStore = PostgresPipelineStore(conn)
         if reuse_refine:
@@ -319,6 +320,7 @@ def run_pipeline(
             live_status=live_intersect,
         )
         detect_completed = False
+        iresult = None
         try:
             detect_compute_started = time.perf_counter()
             iresult = detect_intersections(
@@ -327,7 +329,7 @@ def run_pipeline(
             )
             detect_compute_elapsed = time.perf_counter() - detect_compute_started
             # psycopg starts a transaction for the Detect SELECTs. The result
-            # is fully materialized now, so discard that read snapshot before
+            # no longer depends on that DB cursor, so discard its snapshot before
             # opening the short, atomic Detect persistence transaction.
             store.rollback()
             stats["detect_compute_s"] = round(detect_compute_elapsed, 6)
@@ -373,6 +375,8 @@ def run_pipeline(
                 store.finish_detect(detect_id, status="completed")
                 store.commit()
             detect_completed = True
+            iresult.close()
+            iresult = None
             detect_persist_elapsed = time.perf_counter() - detect_persist_started
             stats["detect_persist_s"] = round(detect_persist_elapsed, 6)
             stats["resolved_sequence_s"] = round(
@@ -410,7 +414,7 @@ def run_pipeline(
             _emit_message(sink, f"  intersections: {persisted_detect.intersection_count:,} rows")
             _emit_message(sink, f"  entry_exit_points: {persisted_detect.entry_exit_point_count:,} rows")
 
-        except Exception:
+        except (Exception, KeyboardInterrupt):
             store.rollback()
             # Once the atomic Detect transaction has committed, later output
             # or progress-rendering failures must not rewrite an immutable
@@ -419,6 +423,9 @@ def run_pipeline(
                 store.finish_detect(detect_id, status="failed")
                 store.commit()
             raise
+        finally:
+            if iresult is not None:
+                iresult.close()
         intersect_elapsed = _log_stage_finish(
             "detect",
             intersect_started,
@@ -436,6 +443,9 @@ def run_pipeline(
         clip_config = pc.clip
         clip_assembly_started = time.perf_counter()
         clip_result = store.load_clip(detect_id, config=clip_config)
+        close_clips = getattr(clip_result.clips, "close", None)
+        if close_clips is not None:
+            resources.callback(close_clips)
         stats["clip_assembly_s"] = round(
             time.perf_counter() - clip_assembly_started,
             6,

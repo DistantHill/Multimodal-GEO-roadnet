@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from itertools import islice
@@ -57,6 +58,8 @@ class _StreamingCursor:
         self.params: tuple[str, ...] = ()
         self.batch_sizes: list[int] = []
         self.execute_error: Exception | None = None
+        self.connection = None
+        self.planned_fraction = None
 
     def __enter__(self) -> _StreamingCursor:
         return self
@@ -68,6 +71,7 @@ class _StreamingCursor:
         assert self.itersize > 0, "set the fetch bound before executing"
         self.query = query
         self.params = params
+        self.planned_fraction = self.connection.fraction
         if self.execute_error is not None:
             raise self.execute_error
 
@@ -84,18 +88,53 @@ class _StreamingCursor:
 class _StreamingConnection:
     def __init__(self, rows: Iterable[tuple[Any, ...]]) -> None:
         self.stream = _StreamingCursor(rows)
+        self.stream.connection = self
+        self.fraction = "0.37"
         self.names: list[str] = []
 
-    def cursor(self, *, name: str) -> _StreamingCursor:
+    def cursor(self, *, name: str | None = None):
+        if name is None:
+            return _SettingCursor(self)
         assert name, "fingerprinting must use a server-side named cursor"
         self.names.append(name)
         return self.stream
+
+    @contextmanager
+    def transaction(self):
+        previous = self.fraction
+        try:
+            yield
+        except BaseException:
+            self.fraction = previous
+            raise
 
     def commit(self) -> None:
         raise AssertionError("the caller owns the transaction")
 
     def rollback(self) -> None:
         raise AssertionError("the caller owns the transaction")
+
+
+class _SettingCursor:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def execute(self, query, params=()):
+        if query.startswith("SET LOCAL cursor_tuple_fraction"):
+            self.connection.fraction = "1"
+        elif "set_config" in query:
+            self.connection.fraction = params[0]
+        else:
+            assert query == "SELECT current_setting('cursor_tuple_fraction')"
+
+    def fetchone(self):
+        return (self.connection.fraction,)
 
 
 def _contract(*, has_extra: bool = True) -> SourceTableContract:
@@ -141,6 +180,7 @@ def test_fingerprint_preserves_v1_digest_with_bounded_named_cursor(fetch_size: i
 
     assert actual == _legacy_expected()
     assert conn.stream.closed
+    assert conn.fraction == "0.37"
     assert max(conn.stream.batch_sizes) <= fetch_size
     assert sum(conn.stream.batch_sizes) == 3
     assert conn.stream.params == ("refine-1", "refine-1")
@@ -199,6 +239,7 @@ def test_fingerprint_missing_source_row_closes_cursor() -> None:
     with pytest.raises(ValueError, match="Refine Run refine-1 references missing source row 'gone'"):
         calculate_source_fingerprint(conn, "refine-1", _contract())
     assert conn.stream.closed
+    assert conn.fraction == "0.37"
 
 
 @pytest.mark.parametrize("failure_at", ("execute", "fetch", "encode"))
@@ -223,6 +264,7 @@ def test_fingerprint_failure_closes_cursor_without_transaction_changes(failure_a
     with pytest.raises(RuntimeError, match=f"{failure_at} failed"):
         calculate_source_fingerprint(conn, "refine-1", _contract(), fetch_size=1)
     assert conn.stream.closed
+    assert conn.fraction == "0.37"
 
 
 @pytest.mark.parametrize("fetch_size", (0, -1, True, False, 1.5, "10", None))
@@ -265,6 +307,7 @@ def test_input_fingerprint_has_separate_scope_header_and_explicit_c_order(fetch_
     assert actual == _input_expected()
     assert actual["sha256"] != _legacy_expected()["sha256"]
     assert conn.stream.closed
+    assert conn.fraction == "0.37"
     assert max(conn.stream.batch_sizes) <= fetch_size
     assert sum(conn.stream.batch_sizes) == 3
     query = " ".join(conn.stream.query.split())
@@ -346,6 +389,7 @@ def test_input_failure_closes_cursor_and_preserves_caller_transaction(failure_at
     with pytest.raises(RuntimeError, match=f"{failure_at} failed"):
         calculate_input_fingerprint(conn, _contract(), fetch_size=1)
     assert conn.stream.closed
+    assert conn.fraction == "0.37"
 
 
 @pytest.mark.parametrize("fetch_size", (0, -1, True, False, 1.5, "10", None))
@@ -366,3 +410,14 @@ def test_input_distinguishes_null_vehicle_from_literal_none_without_changing_v1(
     # normalization; the new scope/version is the corrected recovery boundary.
     assert calculate_source_fingerprint(_StreamingConnection([null_row]), "refine", _contract()) == (
         calculate_source_fingerprint(_StreamingConnection([text_row]), "refine", _contract()))
+
+
+def test_both_fingerprints_preserve_callers_cursor_planning():
+    referenced = _StreamingConnection(_rows())
+    calculate_source_fingerprint(referenced, "refine-1", _contract())
+    assert referenced.stream.planned_fraction == "0.37"
+    assert referenced.fraction == "0.37"
+    full_input = _StreamingConnection(_rows())
+    calculate_input_fingerprint(full_input, _contract())
+    assert full_input.stream.planned_fraction == "0.37"
+    assert full_input.fraction == "0.37"

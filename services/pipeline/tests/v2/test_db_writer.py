@@ -1,16 +1,89 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Any
 
 import pytest
 
 from track.v2.db_writer import (
     _RefineMember,
-    _build_resolved_rows,
     _refine_key,
     finish_refine_run,
 )
 from track.v2.models import RefinedPointRef, CrossingPoint, HotspotCluster, PointRef
+
+
+# Materialized pre-streaming writer retained only as a regression oracle.
+def _build_resolved_rows(
+    detect_id: str,
+    refine_members: list[_RefineMember],
+    refined_ids: tuple[int, ...],
+    complete_crossings: list[tuple[HotspotCluster, Any]],
+    crossing_resolved_ids: tuple[int, ...],
+    crossing_id_by_calculation: dict[tuple[int, int], int],
+) -> list[tuple[Any, ...]]:
+    by_subtrack: dict[int, list[tuple[tuple[Any, ...], tuple[Any, ...]]]] = {}
+    for member, resolved_id in zip(refine_members, refined_ids, strict=True):
+        identity = member.identity
+        kept_id = identity.point_id if identity.point_kind == "kept" else None
+        injected_id = identity.point_id if identity.point_kind == "injected" else None
+        by_subtrack.setdefault(identity.subtrack_index, []).append((
+            (
+                float(identity.refined_sequence_in_subtrack),
+                1,
+                -1,
+                -1,
+                resolved_id,
+            ),
+            (
+                resolved_id,
+                detect_id,
+                identity.subtrack_index,
+                identity.refined_sequence_in_subtrack,
+                kept_id,
+                injected_id,
+                None,
+            ),
+        ))
+    for (cluster, crossing), resolved_id in zip(
+        complete_crossings,
+        crossing_resolved_ids,
+        strict=True,
+    ):
+        if crossing.segment_start is None:
+            raise ValueError("a persisted crossing requires a stable segment start")
+        identity = crossing.segment_start
+        key = (cluster.cluster_calculate_index, crossing.crossing_calculate_index)
+        crossing_id = crossing_id_by_calculation[key]
+        # A root at t=1 belongs immediately before the segment endpoint; a
+        # t=0 root belongs immediately after its segment start. Interior roots
+        # cannot tie a refined point. Within one event batch, exits precede
+        # entries as required by the active-set sequence contract.
+        endpoint_placement = 0 if crossing.segment_fraction >= 1.0 - 1e-12 else 2
+        by_subtrack.setdefault(identity.subtrack_index, []).append((
+            (
+                identity.refined_sequence_in_subtrack + crossing.segment_fraction,
+                endpoint_placement,
+                0 if not crossing.is_entry else 1,
+                cluster.cluster_calculate_index,
+                crossing_id,
+            ),
+            (
+                resolved_id,
+                detect_id,
+                identity.subtrack_index,
+                None,
+                None,
+                None,
+                crossing_id,
+            ),
+        ))
+    rows: list[tuple[Any, ...]] = []
+    for subtrack_index in sorted(by_subtrack):
+        ordered = sorted(by_subtrack[subtrack_index], key=lambda item: item[0])
+        for sequence, (_sort_key, row) in enumerate(ordered):
+            rows.append((*row[:4], sequence, *row[4:]))
+    return rows
 
 
 def _crossing(

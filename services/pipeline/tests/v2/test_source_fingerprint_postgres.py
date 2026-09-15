@@ -64,6 +64,7 @@ def fingerprint_connection() -> Iterator[Any]:
                 INSERT INTO pg_temp.excluded_points VALUES
                     ('refine-1', '2'), ('refine-1', '10')
             """)
+            conn.execute("SET LOCAL cursor_tuple_fraction=0.37; SET LOCAL statement_timeout='5s'")
             yield conn
         finally:
             # Explicit caller rollback also covers failed assertions and makes
@@ -93,6 +94,8 @@ def _assert_caller_transaction_is_intact(conn: Any) -> None:
 
     # Both an internal commit and a rollback would remove these temp tables.
     assert conn.info.transaction_status == TransactionStatus.INTRANS
+    assert conn.execute("SHOW cursor_tuple_fraction").fetchone() == ("0.37",)
+    assert conn.execute("SHOW statement_timeout").fetchone() == ("5s",)
     assert conn.execute("SELECT count(*) FROM pg_temp.fingerprint_source").fetchone() == (3,)
     assert conn.execute(
         "SELECT count(*) FROM pg_temp.kept_trajectory_points"
@@ -197,6 +200,8 @@ def test_postgres_input_fingerprint_detects_append_delete_and_empty_source(
     assert empty == calculate_input_fingerprint(conn, _CONTRACT, fetch_size=1)
     from psycopg.pq import TransactionStatus
     assert conn.info.transaction_status == TransactionStatus.INTRANS
+    assert conn.execute("SHOW cursor_tuple_fraction").fetchone() == ("0.37",)
+    assert conn.execute("SHOW statement_timeout").fetchone() == ("5s",)
     assert conn.execute("SELECT count(*) FROM pg_temp.kept_trajectory_points").fetchone() == (3,)
 
 

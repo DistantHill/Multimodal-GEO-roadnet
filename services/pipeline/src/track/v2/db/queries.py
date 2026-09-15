@@ -34,6 +34,7 @@ from ..projection import (
     spatial_context_from_values,
 )
 from .source_table import quote_table_name, validate_source_table
+from .cursors import declare_full_scan_cursor
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -823,40 +824,31 @@ def fetch_intersections(conn: object, detect_id: str) -> list[ClipIntersection]:
 def fetch_resolved_clip_tracks(
     conn: object,
     detect_id: str,
-) -> list[ClipTrack]:
-    """Load the final p/i/c sequence for Clip without reconstructing roots."""
+) -> Iterator[ClipTrack]:
+    """Stream complete subtracks from the final p/i/c sequence for Clip without reconstructing roots."""
     run = fetch_detect_row(conn, detect_id)
     if run.status != "completed":
         raise ValueError(f"Detect Run {detect_id} is not completed")
     contract = validate_source_table(conn, run.source_table)
-    query = f"""
-        WITH subtrack_vehicles AS (
-            SELECT resolved.subtrack_index,
-                   MIN(COALESCE(kept.vehicle_id, injected.vehicle_id)) AS vehicle_id,
-                   COUNT(DISTINCT COALESCE(kept.vehicle_id, injected.vehicle_id))
-                       AS vehicle_count
-              FROM resolved_subtrack_points AS resolved
-              LEFT JOIN kept_trajectory_points AS kept
-                ON kept.id = resolved.kept_point_id
-              LEFT JOIN injected_points AS injected
-                ON injected.id = resolved.injected_point_id
-             WHERE resolved.detect_id = %s
-               AND resolved.crossing_point_id IS NULL
-             GROUP BY resolved.subtrack_index
+    # Completed intersection metadata is small; avoid joining it once per
+    # resolved point when a newly written Run is estimated as one row.
+    with conn.cursor() as metadata:
+        metadata.execute(
+            "SELECT candidate_intersection_id, id FROM intersections WHERE detect_id = %s",
+            (detect_id,),
         )
+        intersection_ids = {int(candidate): int(intersection) for candidate, intersection in metadata}
+    query = f"""
         SELECT resolved.id,
                resolved.subtrack_index,
                resolved.sequence_in_subtrack,
-               vehicles.vehicle_id,
+               COALESCE(kept.vehicle_id, injected.vehicle_id) AS vehicle_id,
                COALESCE(source.lon, injected.lon, crossing.crossing_lon) AS lon,
                COALESCE(source.lat, injected.lat, crossing.crossing_lat) AS lat,
                crossing.id AS crossing_id,
-               intersection.id AS intersection_id,
+               crossing.candidate_intersection_id,
                crossing.crossing_type
           FROM resolved_subtrack_points AS resolved
-          JOIN subtrack_vehicles AS vehicles
-            ON vehicles.subtrack_index = resolved.subtrack_index
-           AND vehicles.vehicle_count = 1
           LEFT JOIN kept_trajectory_points AS kept
             ON kept.id = resolved.kept_point_id
           LEFT JOIN {contract.quoted_table} AS source
@@ -866,52 +858,56 @@ def fetch_resolved_clip_tracks(
           LEFT JOIN candidate_entry_exit_points AS crossing
             ON crossing.id = resolved.crossing_point_id
            AND crossing.detect_id = resolved.detect_id
-          LEFT JOIN intersections AS intersection
-            ON intersection.detect_id = crossing.detect_id
-           AND intersection.candidate_intersection_id =
-               crossing.candidate_intersection_id
          WHERE resolved.detect_id = %s
          ORDER BY resolved.subtrack_index, resolved.sequence_in_subtrack
     """
-    grouped: dict[int, tuple[str, list[ResolvedTrackPoint]]] = {}
-    with conn.cursor() as cur:  # type: ignore[attr-defined]
-        cur.execute(query, (detect_id, detect_id))
+    current_subtrack: int | None = None
+    current_vehicle = ""
+    points: list[ResolvedTrackPoint] = []
+    with conn.cursor(name=f"clip_tracks_{uuid.uuid4().hex}") as cur:
+        cur.itersize = 2000
+        declare_full_scan_cursor(conn, cur, query, (detect_id,))
         for row_count, row in enumerate(cur, 1):
             if row_count % 10_000 == 0:
                 heartbeat_progress(row_count)
-            if row[3] is None or row[4] is None or row[5] is None:
-                raise ValueError(
-                    f"Detect Run {detect_id} has missing resolved point data"
-                )
+            if row[4] is None or row[5] is None or (row[3] is None and row[6] is None):
+                raise ValueError(f"Detect Run {detect_id} has missing resolved point data")
             subtrack_index = int(row[1])
-            vehicle_id = str(row[3])
-            previous = grouped.get(subtrack_index)
-            if previous is None:
-                points: list[ResolvedTrackPoint] = []
-                grouped[subtrack_index] = (vehicle_id, points)
-            else:
-                if previous[0] != vehicle_id:
-                    raise ValueError(
-                        f"subtrack {subtrack_index} contains multiple vehicles"
-                    )
-                points = previous[1]
+            vehicle_id = None if row[3] is None else str(row[3])
+            if current_subtrack is not None and subtrack_index != current_subtrack:
+                if not current_vehicle:
+                    raise ValueError(f"subtrack {current_subtrack} has no source vehicle")
+                yield ClipTrack(
+                    vehicle_id=current_vehicle,
+                    trip_id=f"{current_vehicle}:subtrack-{current_subtrack:04d}",
+                    points=tuple(points), subtrack_index=current_subtrack,
+                )
+                points = []
+                current_vehicle = ""
+            elif (
+                current_subtrack is not None
+                and vehicle_id is not None
+                and current_vehicle
+                and current_vehicle != vehicle_id
+            ):
+                raise ValueError(f"subtrack {subtrack_index} contains multiple vehicles")
+            current_subtrack = subtrack_index
+            if vehicle_id is not None:
+                current_vehicle = vehicle_id
             points.append(ResolvedTrackPoint(
-                resolved_point_id=int(row[0]),
-                lon=float(row[4]),
-                lat=float(row[5]),
+                resolved_point_id=int(row[0]), lon=float(row[4]), lat=float(row[5]),
                 crossing_id=None if row[6] is None else int(row[6]),
-                intersection_id=None if row[7] is None else int(row[7]),
+                intersection_id=intersection_ids.get(row[7]),
                 crossing_type=None if row[8] is None else int(row[8]),
             ))
-    return [
-        ClipTrack(
-            vehicle_id=vehicle_id,
-            trip_id=f"{vehicle_id}:subtrack-{subtrack_index:04d}",
-            points=tuple(points),
-            subtrack_index=subtrack_index,
-        )
-        for subtrack_index, (vehicle_id, points) in sorted(grouped.items())
-    ]
+        if current_subtrack is not None:
+            if not current_vehicle:
+                raise ValueError(f"subtrack {current_subtrack} has no source vehicle")
+            yield ClipTrack(
+                vehicle_id=current_vehicle,
+                trip_id=f"{current_vehicle}:subtrack-{current_subtrack:04d}",
+                points=tuple(points), subtrack_index=current_subtrack,
+            )
 
 
 @observed_operation("读取 Refine 点序列")

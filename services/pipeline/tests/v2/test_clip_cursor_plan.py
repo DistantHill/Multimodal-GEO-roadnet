@@ -1,0 +1,69 @@
+"""Clip cursor planning is scoped; small metadata never joins the point stream."""
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from track.v2.db.queries import fetch_resolved_clip_tracks
+from track.v2.db.cursors import declare_full_scan_cursor
+from .test_clip_spool import Connection
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_declare_uses_full_consumption_and_restores_callers_fraction(failure):
+    conn = Connection([])
+
+    class DeclareCursor:
+        def execute(self, query, params):
+            assert conn.fraction == "1"
+            if failure:
+                raise ValueError("DECLARE failed")
+
+    if failure:
+        with pytest.raises(ValueError, match="DECLARE failed"):
+            declare_full_scan_cursor(conn, DeclareCursor(), "SELECT 1", ())
+    else:
+        declare_full_scan_cursor(conn, DeclareCursor(), "SELECT 1", ())
+    assert conn.fraction == "0.37"
+
+
+def test_intersection_lookup_preserves_missing_candidates_and_point_order():
+    rows = [(1, 1, 0, "v", 1., 2., None, None, None),
+            (2, 1, 1, None, 1., 2., 101, 10, 1),
+            (3, 1, 2, None, 1., 2., 102, 99, 0),
+            (4, 1, 3, "v", 1., 2., None, None, None)]
+    conn = Connection(rows)
+    with (
+        patch("track.v2.db.queries.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s")),
+        patch("track.v2.db.queries.validate_source_table", return_value=SimpleNamespace(quoted_table='"s"', key_sql_type="bigint")),
+    ):
+        tracks = list(fetch_resolved_clip_tracks(conn, "d"))
+    assert [point.resolved_point_id for point in tracks[0].points] == [1, 2, 3, 4]
+    assert [point.intersection_id for point in tracks[0].points] == [None, 10, None, None]
+    assert [point.crossing_id for point in tracks[0].points] == [None, 101, 102, None]
+    assert conn.fraction == "0.37"
+    assert conn.value.closed
+
+
+def test_postgres_declare_restores_settings_on_success_error_and_early_close():
+    import os
+    import uuid
+    import psycopg
+
+    dsn = os.getenv("ROADNET_TEST_DSN")
+    if not dsn:
+        pytest.skip("ROADNET_TEST_DSN is not set")
+    with psycopg.connect(dsn) as conn:
+        conn.execute("SET LOCAL cursor_tuple_fraction = 0.37")
+        with conn.cursor(name="clip_settings_" + uuid.uuid4().hex) as cur:
+            declare_full_scan_cursor(conn, cur, "SELECT generate_series(1, 10)", ())
+            assert conn.execute("SHOW cursor_tuple_fraction").fetchone()[0] == "0.37"
+            assert cur.fetchone() == (1,)
+        assert conn.execute("SHOW cursor_tuple_fraction").fetchone()[0] == "0.37"
+        with conn.cursor(name="clip_failure_" + uuid.uuid4().hex) as cur:
+            with pytest.raises(psycopg.errors.UndefinedTable):
+                declare_full_scan_cursor(conn, cur, "SELECT * FROM nonexistent_clip_table_" + uuid.uuid4().hex, ())
+        assert conn.execute("SHOW cursor_tuple_fraction").fetchone()[0] == "0.37"
+        # An error rolled back only the declaration savepoint, not the caller's transaction.
+        assert conn.execute("SELECT 123").fetchone() == (123,)
+        conn.rollback()
