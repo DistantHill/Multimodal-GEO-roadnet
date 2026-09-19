@@ -27,8 +27,8 @@
 | C01a | 引入依赖兼容范围与集中运行配置 | C00 | ≤700 | 已完成（`fca33cf`） |
 | C01b1 | 固定 Python 依赖解析版本 | C01a | ≤700 | 已完成（`12cdba3`） |
 | C01b2 | 准备离线 DuckDB PostgreSQL 扩展 | C01b1 | ≤700 | 已完成（`ecebe2a`） |
-| C02a | PostgreSQL Schema v5 制品登记 DDL 与迁移 | C01b2 | ≤700 | 已实施，待主对话验收 |
-| C02b | 制品描述校验与最小登记 API | C02a | ≤700 | 未开始 |
+| C02a | PostgreSQL Schema v5 制品登记 DDL 与迁移 | C01b2 | ≤700 | 已完成（`e05214d`） |
+| C02b | 制品描述校验与最小登记 API | C02a | ≤700 | 已实施，待主对话验收 |
 | C02c | 制品登记真实 PostgreSQL 集成验证 | C02b | ≤700 | 未开始 |
 | C03 | 不可变 Parquet staging/发布/校验基础模块 | C01b2–C02c | ≤700 | 未开始 |
 | C04 | artifact reconcile/gc dry-run/apply CLI | C03 | ≤700 | 未开始 |
@@ -101,7 +101,7 @@ Pipeline 全量测试 `1165 passed, 55 skipped`。
 
 验证：DDL 约束、追加生命周期、不可变保护、迁移选择、幂等及事务回滚单元测试。
 
-提交：本卡提交（待主对话验收）。
+提交：`e05214d`。
 
 ### C02b — 制品登记 API
 
@@ -109,7 +109,7 @@ Pipeline 全量测试 `1165 passed, 55 skipped`。
 
 验证：合法/非法清单、重复发布、跨 Run 隔离、未知 Schema 拒绝和事务边界测试。
 
-提交：待记录。
+提交：本卡提交（待主对话验收）。
 
 ### C02c — 真实 PostgreSQL 集成验证
 
