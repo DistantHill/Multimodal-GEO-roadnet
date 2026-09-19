@@ -1,10 +1,23 @@
 COMPOSE_DEV = docker compose --env-file .env -f infra/docker/compose.dev.yml
 COMPOSE_PROD = docker compose --env-file .env -f infra/docker/compose.prod.yml
+COMPOSE_SERVICES = docker compose --env-file /data/services/.env -f /data/services/compose.yml
 VISION_IMAGE = roadnet-vision-yolov8:8.3.0-cu117
 
-.PHONY: dev-up dev-down dev-logs dev-config build test frontend-test qgis-plugin-test pipeline-check pipeline-init-db pipeline-help vision-build vision-check vision-run prod-config
+.PHONY: services-up services-down services-logs services-config dev-up dev-down dev-logs dev-config build test frontend-test qgis-plugin-test pipeline-check pipeline-init-db pipeline-help vision-build vision-check vision-run prod-config
 
-dev-up:
+services-up:
+	$(COMPOSE_SERVICES) up -d --wait
+
+services-down:
+	$(COMPOSE_SERVICES) down
+
+services-logs:
+	$(COMPOSE_SERVICES) logs -f
+
+services-config:
+	$(COMPOSE_SERVICES) config
+
+dev-up: services-up
 	$(COMPOSE_DEV) up --build
 
 dev-down:
@@ -19,7 +32,7 @@ dev-config:
 build:
 	$(COMPOSE_DEV) build
 
-test: compose-test
+test: compose-test services-up
 	$(COMPOSE_DEV) run --rm backend pytest
 	$(COMPOSE_DEV) run --rm pipeline python -m pytest tests scripts/cv_human_check/tests
 

@@ -10,6 +10,7 @@
 - `image_compare.html`：交互页面模板，和脚本一起维护。
 - `export_intersections.py`：按 Detect 和经纬度范围导出全部交叉口的原始点裁剪，
   保存计数、三组灰度图、规则圆元数据和离线对比页。
+- `export_coco.py`：将已有裁剪导出为 CVAT Community 可导入的 COCO 检测预标注包。
 - `tests/`：归一化、报告、命令与输出路径的回归测试。
 
 这些工具供人工比较输入灰度图，不训练模型，也不自动选择最佳参数。
@@ -56,3 +57,23 @@ docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm --no-dep
 筛选范围只限制圆心，完整裁剪可以包含范围外的点。共享 P99.5 标尺从本批非零像素估计，
 重叠像素只计一次；log1p、asinh 均先取尺度 1，明确标为未调优的初始值。
 本批是待复核的训练正样本候选，尚未补充负样本或划分验证/测试区。
+
+## 标注工具与数据集格式
+
+人工标注采用 [CVAT Community](https://github.com/cvat-ai/cvat)（核心 MIT 许可），
+数据交换采用 [COCO](https://docs.cvat.ai/docs/dataset_management/formats/format-coco/)。
+本目录的 HTML 仅保留历史灰度预览用途，不扩展为自制标注工具。
+
+```sh
+docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm --no-deps pipeline \
+  python -m scripts.cv_human_check.export_coco \
+  --source /data/vision/datasets/detect-173ade7d-f03d-4c9d-8e46-906279085c9b-bbox-20260916 \
+  --output /data/vision/datasets/detect-173ade7d-f03d-4c9d-8e46-906279085c9b-bbox-20260916/coco-review \
+  --method sqrt
+```
+
+包内提供 `images.zip`、`annotations/instances_default.json`、完整 `coco.zip` 和导入说明。
+只标注一组灰度图片，其余两组按图片名复用标签，不扩增独立样本数量。
+检测标签包含可见相邻规则圆的外接框；尚未生成的掩膜以空 `segmentation` 表示。
+COCO 无原生圆字段，原始圆及地理变换保存在 `metadata/circles.json`；编辑矩形不会
+同步修改原始圆。当前包用于复核已有裁剪，区域窗口和背景样本仍待补充。

@@ -13,7 +13,7 @@
 - `services/pipeline`：Pipeline 独立运行单元，包含 Refine、Detect、Clip、Fitting、Network、持久化、回放和数据库初始化逻辑。Detect 的 DB 模式只构建一次 Refine 轨迹 workspace，并由转向/正交检测、跨车求交和拓扑验证共享；Backend request process 不执行这些耗时阶段。
 - `services/vision`：可选 YOLOv8 CUDA 11.7 离线推理/跟踪运行单元，通过 Compose `vision` profile 启用。
 - `db/postgres`、`db/qdrant`：数据库定义、初始化和迁移逻辑，不保存运行时数据。
-- `infra/docker`：开发和生产 Compose 文件。
+- `infra/docker`：开发和生产应用 Compose 文件；PostgreSQL 与 Qdrant 的独立 Compose 位于宿主机 `/data/services`。
 
 Detect 内部的视觉判别能力仍可作为 Pipeline 内部逻辑。独立 YOLOv8 GPU Runtime 已迁入 `services/vision`，但不强制改造成网络微服务，也不由 Backend request process 执行。没有稳定的跨服务共享语义时不创建 `libs/`。
 
@@ -21,8 +21,13 @@ Detect 内部的视觉判别能力仍可作为 Pipeline 内部逻辑。独立 YO
 
 ```sh
 cp .env.example .env
+make services-up
 docker compose --env-file .env -f infra/docker/compose.dev.yml up -d --build
 ```
+
+`make dev-up` 会先执行 `make services-up`。数据库栈可独立使用 `make services-up`、
+`make services-logs`、`make services-down` 管理；应用与数据库通过外部 Docker 网络
+`roadnet-services` 通信。
 
 服务入口：
 
@@ -62,13 +67,16 @@ QGIS 3.44 LTR 插件源码位于 `apps/qgis-plugin/roadnet_tools/`。开发机�
 
 真实 `.env` 不提交 Git。复制 `.env.example` 后按需修改；生产环境必须设置非示例的 `POSTGRES_PASSWORD` 和外部 `DATA_ROOT`。
 
-Raw trajectory、Parquet、中间文件、导出文件和模型权重属于 Runtime Data。开发/生产通过 `DATA_ROOT` 挂载到容器 `/data`，例如宿主机 `/data/road-network` 对应容器 `/data`；代码仓库不创建 `data/raw` 或 `data/parquet`。
+`DATA_ROOT` 保存可丢弃的 Pipeline 工作区、中间文件和运行产物；当前宿主机使用
+`/data/tmp/road-network`，并挂载到容器 `/data`。原始或公共数据集放在
+`/data/datasets`，最终交付物放在 `/data/export`，均不混入临时工作区。模型权重是
+独立持久资产，使用 `/data/service-data/vision/models`，不进入代码仓库。
 
 `.env` 的目录配置均为宿主机路径，容器内目录由 Compose 固定，通过绑定挂载（bind mount）连接，不使用跨容器软链接。
 
 | 宿主机目录配置 | 默认宿主机目录 | Pipeline 容器内目录 |
 | --- | --- | --- |
-| `DATA_ROOT` | 开发环境 `/data/road-network`；生产环境必填 | `/data` |
+| `DATA_ROOT` | 开发环境 `/data/tmp/road-network`；生产环境必填 | `/data` |
 | `PARQUET_ROOT` | `${DATA_ROOT}/parquet` | `/data/parquet` |
 | `PIPELINE_LOG_DIR` | `${DATA_ROOT}/logs` | `/data/logs` |
 
@@ -76,9 +84,15 @@ Pipeline 日志文件名为 `<timestamp>_pid-<pid>_log.txt`，每个进程使用
 
 每个 stage 都记录带关联 run ID 的 `[stage-start]` 和 `[stage-finish]`，结束记录中的 `elapsed_s` 是单调时钟测得的阶段耗时。Fitting 另记录 `phase=fit_compute` 与 `phase=fit_persist` 的 `[stage-phase]`；Detect 会记录全局空间索引的 membership、overflow 和候选数量，用于区分计算、持久化和资源回退耗时。
 
-YOLO 模型在容器内挂载到 `/models`，输入和输出分别使用 `/data/vision/input` 与 `/data/vision/output`。本地迁移权重位于被 Git 忽略的 `models/yolo/yolov8n.pt`；生产环境必须通过外部 `MODEL_ROOT` 挂载。
+YOLO 模型通过 `MODEL_ROOT` 挂载到容器 `/models`，当前宿主机目录为
+`/data/service-data/vision/models`。输入和运行输出分别使用 `/data/vision/input` 与
+`/data/vision/output`，因此属于 `DATA_ROOT` 下的临时运行数据。
 
-PostgreSQL 使用 `postgres_data:/var/lib/postgresql/data`，Qdrant 使用 `qdrant_data:/qdrant/storage`。这两个 named volume 不绑定到仓库目录。
+PostgreSQL 与 Qdrant 不再由项目 Compose 创建。独立编排文件为
+`/data/services/compose.yml`，运行数据通过绑定挂载分别保存到
+`/data/service-data/postgres` 和 `/data/service-data/qdrant`。数据库配置及本机凭据位于
+`/data/services`，其中 `.env` 必须保持为本机私有文件；项目 Compose 只通过外部网络
+`roadnet-services` 使用服务名 `postgres` 和 `qdrant` 访问数据库。
 
 Pipeline 的数据库配置优先读取进程中的来源兼容变量 `TRACK_PG_*`，其次读取标准 Compose 变量 `POSTGRES_HOST`、`POSTGRES_PORT`、`POSTGRES_DB`、`POSTGRES_USER`、`POSTGRES_PASSWORD`。这只是环境变量别名兼容，不代表旧执行架构仍受支持；代码不再提供默认数据库密码。
 

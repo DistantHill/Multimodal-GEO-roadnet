@@ -1,8 +1,8 @@
 # PostgreSQL / PostGIS
 
-这里只保存数据库定义、初始化和迁移逻辑。PostgreSQL runtime data 由 Compose 的 `postgres_data` named volume 管理，禁止在此目录或仓库内保存数据目录。
+这里只保存数据库定义、初始化和迁移逻辑。PostgreSQL 由 `/data/services/compose.yml` 独立编排，运行数据绑定挂载到 `/data/service-data/postgres`；禁止在此目录或仓库内保存数据目录。
 
-`init/001-enable-postgis.sql` 只在首次创建 named volume 时启用 PostGIS。业务
+`init/001-enable-postgis.sql` 只在空数据目录首次初始化时启用 PostGIS。业务
 Schema 的唯一权威入口是 `services/pipeline/src/track/v2/cli/init_db.py`。当前版本为
 schema v4：v3 使用 `init-db --migrate-refine` 保留数据升级，v1/v2 仍需另行处理
 或用 `init-db --reset` 全量重建。不要混跑依赖不同版本字段的服务。

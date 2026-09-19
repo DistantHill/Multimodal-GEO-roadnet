@@ -1,32 +1,6 @@
 name: roadnet-prod
 
 services:
-  postgres:
-    image: postgis/postgis:16-3.4
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-roadnet}
-      POSTGRES_USER: ${POSTGRES_USER:-roadnet}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ../../db/postgres/init:/docker-entrypoint-initdb.d:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-  qdrant:
-    image: qdrant/qdrant:v1.13.6
-    volumes:
-      - qdrant_data:/qdrant/storage
-    healthcheck:
-      # The minimal Qdrant image has no curl/wget; the Backend performs the HTTP check.
-      test: ["CMD-SHELL", "kill -0 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   backend:
     build:
       context: ../../apps/backend
@@ -44,11 +18,9 @@ services:
     command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
     expose:
       - "8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
+    networks:
+      - default
+      - roadnet_services
 
   pipeline:
     build:
@@ -70,11 +42,9 @@ services:
       - ${PARQUET_ROOT:-${DATA_ROOT}/parquet}:/data/parquet
       - ${PIPELINE_LOG_DIR:-${DATA_ROOT}/logs}:/data/logs
     command: ["python", "-m", "pipeline", "serve"]
-    depends_on:
-      postgres:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
+    networks:
+      - default
+      - roadnet_services
 
   vision:
     profiles: ["vision"]
@@ -112,6 +82,7 @@ services:
     depends_on:
       - backend
 
-volumes:
-  postgres_data:
-  qdrant_data:
+networks:
+  roadnet_services:
+    external: true
+    name: ${ROADNET_SERVICES_NETWORK:-roadnet-services}

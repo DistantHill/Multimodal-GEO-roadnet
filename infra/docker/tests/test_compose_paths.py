@@ -34,6 +34,21 @@ class ComposePathsTest(unittest.TestCase):
         )
         return json.loads(result.stdout)["services"]["pipeline"]
 
+    def resolve_config(self, mode):
+        environment = {
+            **os.environ,
+            "POSTGRES_PASSWORD": "compose-config-test-only",
+            "DATA_ROOT": "/host/runtime",
+            "MODEL_ROOT": "/host/models",
+        }
+        result = subprocess.run(
+            ["docker", "compose", "--env-file", os.devnull, "-f",
+             str(ROOT / "infra/docker" / f"compose.{mode}.yml"),
+             "config", "--format", "json"],
+            env=environment, capture_output=True, text=True, check=True,
+        )
+        return json.loads(result.stdout)
+
     def assert_paths(self, pipeline, data, parquet, logs):
         mounts = {entry["target"]: entry for entry in pipeline["volumes"]}
         for target, expected in (("/data", data), ("/data/parquet", parquet), ("/data/logs", logs)):
@@ -72,8 +87,21 @@ class ComposePathsTest(unittest.TestCase):
     def test_development_defaults_without_path_settings(self):
         self.assert_paths(
             self.resolve_pipeline("dev", {}),
-            "/data/road-network", "/data/road-network/parquet", "/data/road-network/logs",
+            "/data/tmp/road-network", "/data/tmp/road-network/parquet", "/data/tmp/road-network/logs",
         )
+
+    def test_databases_are_external_services(self):
+        for mode in ("dev", "prod"):
+            with self.subTest(mode=mode):
+                config = self.resolve_config(mode)
+                self.assertNotIn("postgres", config["services"])
+                self.assertNotIn("qdrant", config["services"])
+                self.assertTrue(config["networks"]["roadnet_services"]["external"])
+                self.assertEqual(config["networks"]["roadnet_services"]["name"], "roadnet-services")
+                for service in ("backend", "pipeline"):
+                    self.assertIn("default", config["services"][service]["networks"])
+                    self.assertIn("roadnet_services", config["services"][service]["networks"])
+                self.assertNotIn("roadnet_services", config["services"]["frontend"]["networks"])
 
 
 if __name__ == "__main__":
