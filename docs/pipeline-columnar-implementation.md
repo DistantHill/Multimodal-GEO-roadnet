@@ -28,8 +28,8 @@
 | C01b1 | 固定 Python 依赖解析版本 | C01a | ≤700 | 已完成（`12cdba3`） |
 | C01b2 | 准备离线 DuckDB PostgreSQL 扩展 | C01b1 | ≤700 | 已完成（`ecebe2a`） |
 | C02a | PostgreSQL Schema v5 制品登记 DDL 与迁移 | C01b2 | ≤700 | 已完成（`e05214d`） |
-| C02b | 制品描述校验与最小登记 API | C02a | ≤700 | 已实施，待主对话验收 |
-| C02c | 制品登记真实 PostgreSQL 集成验证 | C02b | ≤700 | 未开始 |
+| C02b | 制品描述校验与最小登记 API | C02a | ≤700 | 已完成（`04d62ce`） |
+| C02c | 制品登记真实 PostgreSQL 集成验证 | C02b | ≤700 | 已实施，待主对话验收 |
 | C03 | 不可变 Parquet staging/发布/校验基础模块 | C01b2–C02c | ≤700 | 未开始 |
 | C04 | artifact reconcile/gc dry-run/apply CLI | C03 | ≤700 | 未开始 |
 | C05 | Refine Parquet Schema 与发布路径 | C03 | 每提交 ≤700 | 未开始 |
@@ -109,13 +109,17 @@ Pipeline 全量测试 `1165 passed, 55 skipped`。
 
 验证：合法/非法清单、重复发布、跨 Run 隔离、未知 Schema 拒绝和事务边界测试。
 
-提交：本卡提交（待主对话验收）。
+提交：`04d62ce`。
 
 ### C02c — 真实 PostgreSQL 集成验证
 
 范围：在隔离 Schema 中验证 v4→v5、数据库约束、并发事件顺序和事务回滚。
 
 验证：真实 PostgreSQL 上迁移、约束、锁定、幂等和回滚均符合 C02a/C02b 语义。
+
+实现：新增 `ROADNET_TEST_DSN` 显式启用的真实 PostgreSQL 测试；普通用例在事务内创建
+唯一 Schema 并回滚，并发用例仅提交自身 UUID Schema，验证事件触发器以制品行锁串行化，
+最终显式清理该测试 Schema。
 
 提交：待记录。
 
