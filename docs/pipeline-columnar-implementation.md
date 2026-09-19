@@ -23,10 +23,11 @@
 
 | 卡片 | 目标 | 依赖 | 目标提交规模 | 状态 |
 | --- | --- | --- | ---: | --- |
-| C00 | 固化新 Spec、旧 Spec 跳转和本任务卡 | 无 | 文档 QA 例外 | 已完成 |
-| C01 | 引入 DuckDB/Polars 依赖与集中运行配置 | C00 | ≤700 | 未开始 |
-| C02 | PostgreSQL 制品登记与追加式事件 DDL/API | C01 | ≤700 | 未开始 |
-| C03 | 不可变 Parquet staging/发布/校验基础模块 | C01–C02 | ≤700 | 未开始 |
+| C00 | 固化新 Spec、旧 Spec 跳转和本任务卡 | 无 | 文档 QA 例外 | 已完成（`e31eae2`） |
+| C01a | 引入依赖兼容范围与集中运行配置 | C00 | ≤700 | 已完成 |
+| C01b | 固定解析版本与离线 DuckDB 扩展 | C01a | ≤700 | 未开始 |
+| C02 | PostgreSQL 制品登记与追加式事件 DDL/API | C01b | ≤700 | 未开始 |
+| C03 | 不可变 Parquet staging/发布/校验基础模块 | C01b–C02 | ≤700 | 未开始 |
 | C04 | artifact reconcile/gc dry-run/apply CLI | C03 | ≤700 | 未开始 |
 | C05 | Refine Parquet Schema 与发布路径 | C03 | 每提交 ≤700 | 未开始 |
 | C06 | DuckDB 读取 Refine Parquet 的 Detect 输入适配 | C05 | 每提交 ≤700 | 未开始 |
@@ -51,9 +52,9 @@
 
 验证：链接存在、Q19–Q63 连续、状态/实施授权一致、QA 附录位于文末。
 
-提交：已完成；提交哈希由主对话验收记录。
+提交：`e31eae2`。
 
-### C01 — 依赖、路径和引擎配置
+### C01a — 依赖兼容范围、路径和引擎配置
 
 范围：
 
@@ -61,10 +62,18 @@
 - 扩展 `RuntimeConfig`/`pipeline.toml`：DuckDB 1 GB、最多 4 线程、临时盘上限，
   Polars 线程、Parquet 文件/行组目标、GC 7 天；
 - 保持 `DATA_ROOT`/`PARQUET_ROOT` 环境挂载语义，新增派生的 duckdb/polars 路径检查；
-- 镜像构建期准备固定 DuckDB PostgreSQL 扩展，运行时禁止下载；
 - 只建立配置与启动检查，不迁移业务算法。
 
-验证：配置默认值、非法值、Compose 路径和离线扩展可用性测试。
+验证：配置默认值、非法值和运行时路径测试。
+
+提交：本卡提交。
+
+### C01b — 精确版本锁与离线扩展
+
+范围：锁定容器构建解析后的 DuckDB/Polars 精确版本；镜像构建期准备固定 DuckDB
+PostgreSQL 扩展，运行时禁止下载。依赖或扩展升级必须重跑语义差分与 26M 基准。
+
+验证：容器内精确版本、Compose 构建和离线扩展可用性测试。
 
 提交：待记录。
 

@@ -32,6 +32,16 @@ class DefaultPipelineConfigTest(unittest.TestCase):
         self.assertEqual(pc.network, NetworkConfig())
         self.assertEqual(pc.runtime, RuntimeConfig())
 
+    def test_columnar_runtime_defaults(self):
+        runtime = load_pipeline_config().runtime
+        self.assertEqual(runtime.duckdb_memory_limit, "1GB")
+        self.assertEqual(runtime.duckdb_threads, 4)
+        self.assertEqual(runtime.duckdb_max_temp_directory_size, "50GB")
+        self.assertEqual(runtime.polars_threads, 4)
+        self.assertEqual(runtime.parquet_target_file_size_bytes, 0)
+        self.assertEqual(runtime.parquet_row_group_size_rows, 0)
+        self.assertEqual(runtime.artifact_gc_grace_days, 7)
+
 
 class PipelineConfigOverrideTest(unittest.TestCase):
     def test_section_key_override_keeps_other_defaults(self):
@@ -120,6 +130,30 @@ class PipelineConfigErrorTest(unittest.TestCase):
         path = self._write("[runtime]\ndb_insert_batch = \"not-an-int\"\n")
         with self.assertRaises(ConfigError):
             load_pipeline_config(path)
+
+    def test_new_runtime_integer_limits_are_strict(self):
+        invalid_values = (
+            "duckdb_threads = true",
+            "duckdb_threads = 5",
+            "polars_threads = 0",
+            "parquet_target_file_size_bytes = -1",
+            "parquet_row_group_size_rows = -1",
+            "artifact_gc_grace_days = 0",
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                path = self._write(f"[runtime]\n{value}\n")
+                with self.assertRaises(ConfigError):
+                    load_pipeline_config(path)
+
+    def test_duckdb_capacity_limits_reject_invalid_values(self):
+        for value in ('"-1GB"', '"nanGB"', '"12 elephants"', '1'):
+            with self.subTest(value=value):
+                path = self._write(
+                    f"[runtime]\nduckdb_max_temp_directory_size = {value}\n"
+                )
+                with self.assertRaises(ConfigError):
+                    load_pipeline_config(path)
 
     def test_processing_srid_wrong_type_raises(self):
         path = self._write('[projection]\nprocessing_srid = "32650"\n')

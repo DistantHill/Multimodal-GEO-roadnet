@@ -76,3 +76,13 @@ excluded_flush_threshold = 2000
 refine_flush_point_threshold = 100000
 progress_interval = 500
 progress_time_threshold_s = 2.0
+duckdb_memory_limit = "1GB"
+duckdb_threads = 4
+# Initial operational default; calibrate against the 26M benchmark.
+duckdb_max_temp_directory_size = "50GB"
+# Apply POLARS_MAX_THREADS before the first Polars import in engine integration.
+polars_threads = 4
+# Zero delegates sizing to the engine until benchmark evidence is available.
+parquet_target_file_size_bytes = 0
+parquet_row_group_size_rows = 0
+artifact_gc_grace_days = 7

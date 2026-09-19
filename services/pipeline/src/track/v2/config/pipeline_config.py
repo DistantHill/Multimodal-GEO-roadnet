@@ -42,6 +42,13 @@ _REMOVED_DETECT_KEYS = {
     "dbscan_eps_m_ortho": None,
     "dbscan_min_samples_ortho": None,
 }
+_STRICT_RUNTIME_INTS = {
+    "duckdb_threads",
+    "polars_threads",
+    "parquet_target_file_size_bytes",
+    "parquet_row_group_size_rows",
+    "artifact_gc_grace_days",
+}
 
 
 @dataclass(frozen=True)
@@ -111,10 +118,22 @@ def _build_section(base: Any, section: Any) -> Any:
                     raise ConfigError(f"{cls}.processing_srid must be an integer")
                 overrides[field.name] = value
                 continue
+            if (
+                isinstance(base, RuntimeConfig)
+                and field.name in _STRICT_RUNTIME_INTS
+                and (
+                    isinstance(section[field.name], bool)
+                    or not isinstance(section[field.name], int)
+                )
+            ):
+                raise ConfigError(f"{cls}.{field.name} must be an integer")
             overrides[field.name] = _coerce(
                 section[field.name], getattr(base, field.name), f"{cls}.{field.name}"
             )
-    return dataclasses.replace(base, **overrides)
+    try:
+        return dataclasses.replace(base, **overrides)
+    except ValueError as exc:
+        raise ConfigError(f"invalid [{cls}] configuration: {exc}") from exc
 
 
 def load_pipeline_config(path: str | Path | None = None) -> PipelineConfig:

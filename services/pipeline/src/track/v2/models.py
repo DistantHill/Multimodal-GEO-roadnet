@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from enum import StrEnum
 import json
+import math
+import re
 import sys
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import date, datetime
@@ -375,6 +377,41 @@ class RuntimeConfig(TrackModel):
     refine_flush_point_threshold: int = 100_000
     progress_interval: int = 500
     progress_time_threshold_s: float = 2.0
+    duckdb_memory_limit: str = "1GB"
+    duckdb_threads: int = 4
+    duckdb_max_temp_directory_size: str = "50GB"
+    polars_threads: int = 4
+    parquet_target_file_size_bytes: int = 0
+    parquet_row_group_size_rows: int = 0
+    artifact_gc_grace_days: int = 7
+
+    def __post_init__(self) -> None:
+        for name, lower, upper in (
+            ("duckdb_threads", 1, 4),
+            ("polars_threads", 1, None),
+            ("parquet_target_file_size_bytes", 0, None),
+            ("parquet_row_group_size_rows", 0, None),
+            ("artifact_gc_grace_days", 1, None),
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+            if value < lower or (upper is not None and value > upper):
+                maximum = f" and <= {upper}" if upper is not None else ""
+                raise ValueError(f"{name} must be >= {lower}{maximum}")
+
+        for name in ("duckdb_memory_limit", "duckdb_max_temp_directory_size"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise ValueError(f"{name} must be a capacity string")
+            match = re.fullmatch(
+                r"\s*([+]?(?:\d+(?:\.\d*)?|\.\d+))\s*"
+                r"(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)\s*",
+                value,
+                flags=re.IGNORECASE,
+            )
+            if match is None or not math.isfinite(float(match.group(1))):
+                raise ValueError(f"{name} must be a non-negative finite capacity")
 
 
 class TrajectorySourceHandle(Protocol):

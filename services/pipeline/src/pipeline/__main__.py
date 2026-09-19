@@ -4,6 +4,7 @@ import argparse
 import os
 import signal
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,14 +14,24 @@ from pathlib import Path
 class PipelineConfig:
     data_root: Path
     parquet_root: Path
+    duckdb_root: Path
+    polars_root: Path
     postgres_host: str
     qdrant_host: str
 
     @classmethod
     def from_environment(cls) -> "PipelineConfig":
+        data_root = Path(os.getenv("DATA_ROOT", "/data"))
+        parquet_root = (
+            Path(os.environ["PARQUET_ROOT"])
+            if "PARQUET_ROOT" in os.environ
+            else data_root / "parquet"
+        )
         return cls(
-            data_root=Path(os.getenv("DATA_ROOT", "/data")),
-            parquet_root=Path(os.getenv("PARQUET_ROOT", "/data/parquet")),
+            data_root=data_root,
+            parquet_root=parquet_root,
+            duckdb_root=data_root / "duckdb",
+            polars_root=data_root / "polars",
             postgres_host=os.getenv("POSTGRES_HOST", "postgres"),
             qdrant_host=os.getenv("QDRANT_HOST", "qdrant"),
         )
@@ -29,10 +40,31 @@ class PipelineConfig:
 def check_config(config: PipelineConfig) -> int:
     print(f"DATA_ROOT={config.data_root}")
     print(f"PARQUET_ROOT={config.parquet_root}")
+    print(f"DUCKDB_ROOT={config.duckdb_root}")
+    print(f"POLARS_ROOT={config.polars_root}")
     print(f"POSTGRES_HOST={config.postgres_host}")
     print(f"QDRANT_HOST={config.qdrant_host}")
-    if not config.data_root.exists():
-        print(f"ERROR: DATA_ROOT does not exist: {config.data_root}")
+    roots = {
+        "DATA_ROOT": config.data_root,
+        "PARQUET_ROOT": config.parquet_root,
+        "DUCKDB_ROOT": config.duckdb_root,
+        "POLARS_ROOT": config.polars_root,
+    }
+    if any(not path.is_absolute() for path in roots.values()):
+        print("ERROR: runtime roots must be absolute paths")
+        return 1
+    try:
+        data_root = config.data_root.resolve(strict=False)
+        for name in ("DUCKDB_ROOT", "POLARS_ROOT"):
+            roots[name].resolve(strict=False).relative_to(data_root)
+        for name, path in roots.items():
+            path.mkdir(parents=True, exist_ok=True)
+            if not path.is_dir():
+                raise OSError(f"{name} is not a directory: {path}")
+            with tempfile.NamedTemporaryFile(dir=path):
+                pass
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: invalid runtime directory: {exc}")
         return 1
     return 0
 

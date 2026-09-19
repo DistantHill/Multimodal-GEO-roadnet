@@ -8,8 +8,10 @@ version = "0.1.0"
 description = "Independent freight trajectory road-network pipeline runtime"
 requires-python = ">=3.12"
 dependencies = [
+    "duckdb>=1.5.5,<1.6",
     "numpy>=2.0",
     "Pillow>=10.0",
+    "polars>=1.44.2,<1.45",
     "psycopg[binary]>=3.2",
     "pyproj>=3.7,<4",
     "rich>=13.0",
