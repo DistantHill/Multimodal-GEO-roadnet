@@ -1,6 +1,7 @@
-"""Create track.v2 schema v4 or migrate the v3 Refine naming in place.
+"""Create track.v2 schema v5 or migrate an existing v3/v4 schema in place.
 
-Schema v3 supports ``--migrate-refine``. An existing v1/v2
+Schema v3 supports ``--migrate-refine`` and v4 supports ``--migrate-artifacts``.
+An existing v1/v2
 database must be recreated with ``--reset`` so an old column can never retain
 an ambiguous meaning behind a new API.
 """
@@ -16,7 +17,7 @@ from ..logger import init_logger, shutdown_logger
 
 
 SCHEMA_COMPONENT = "track.v2"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 DDL_STATEMENTS: list[tuple[str, str]] = [
@@ -467,10 +468,74 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         )
         """,
     ),
+    (
+        "pipeline_artifacts",
+        """
+        CREATE TABLE IF NOT EXISTS pipeline_artifacts (
+            id                  UUID PRIMARY KEY,
+            stage               TEXT NOT NULL CHECK (stage IN ('refine', 'detect')),
+            refine_id            UUID REFERENCES refine_runs(id) ON DELETE RESTRICT,
+            detect_id           UUID REFERENCES detect_runs(id) ON DELETE RESTRICT,
+            relative_path       TEXT NOT NULL,
+            manifest_version    INTEGER NOT NULL CHECK (manifest_version = 1),
+            manifest            JSONB NOT NULL
+                                CHECK (jsonb_typeof(manifest) = 'object'),
+            manifest_sha256     TEXT NOT NULL
+                                CHECK (manifest_sha256 ~ '^[0-9a-f]{64}$'),
+            source_fingerprint  JSONB NOT NULL
+                                CHECK (jsonb_typeof(source_fingerprint) = 'object'),
+            row_count           BIGINT NOT NULL CHECK (row_count >= 0),
+            byte_count          BIGINT NOT NULL CHECK (byte_count >= 0),
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT pipeline_artifacts_owner_stage_check CHECK (
+                (stage = 'refine' AND refine_id IS NOT NULL AND detect_id IS NULL)
+                OR
+                (stage = 'detect' AND detect_id IS NOT NULL AND refine_id IS NULL)
+            ),
+            CONSTRAINT pipeline_artifacts_relative_path_check CHECK (
+                relative_path = BTRIM(relative_path)
+                AND relative_path <> ''
+                AND LEFT(relative_path, 1) <> '/'
+                AND RIGHT(relative_path, 1) <> '/'
+                AND relative_path !~ '(^|/)\\.\\.(/|$)'
+                AND relative_path !~ '//'
+            )
+        )
+        """,
+    ),
+    (
+        "pipeline_artifact_events",
+        """
+        CREATE TABLE IF NOT EXISTS pipeline_artifact_events (
+            id              BIGSERIAL PRIMARY KEY,
+            artifact_id     UUID NOT NULL
+                            REFERENCES pipeline_artifacts(id) ON DELETE RESTRICT,
+            state           TEXT NOT NULL CHECK (state IN ('present', 'deleted')),
+            event_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            reason          TEXT,
+            CONSTRAINT pipeline_artifact_events_reason_check CHECK (
+                (state = 'present' AND reason IS NULL)
+                OR
+                (state = 'deleted' AND reason = BTRIM(reason) AND reason <> '')
+            ),
+            CONSTRAINT pipeline_artifact_events_state_key UNIQUE (artifact_id, state)
+        )
+        """,
+    ),
 ]
 
 
 INDEX_STATEMENTS: list[tuple[str, str]] = [
+    (
+        "uq_pipeline_artifacts_refine_run",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_pipeline_artifacts_refine_run "
+        "ON pipeline_artifacts(refine_id) WHERE stage = 'refine'",
+    ),
+    (
+        "uq_pipeline_artifacts_detect_run",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_pipeline_artifacts_detect_run "
+        "ON pipeline_artifacts(detect_id) WHERE stage = 'detect'",
+    ),
     (
         "idx_refine_runs_source_table",
         "CREATE INDEX IF NOT EXISTS idx_refine_runs_source_table "
@@ -572,6 +637,72 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
 
 
 POST_DDL_STATEMENTS: list[tuple[str, str]] = [
+    (
+        "guard_pipeline_artifact_immutability_function",
+        """
+        CREATE OR REPLACE FUNCTION guard_pipeline_artifact_immutability()
+        RETURNS trigger LANGUAGE plpgsql AS $function$
+        BEGIN
+            RAISE EXCEPTION 'pipeline artifact registry is immutable and append-only';
+        END
+        $function$
+        """,
+    ),
+    (
+        "pipeline_artifact_immutability_triggers",
+        """
+        DROP TRIGGER IF EXISTS guard_pipeline_artifacts_mutation ON pipeline_artifacts;
+        CREATE TRIGGER guard_pipeline_artifacts_mutation
+        BEFORE UPDATE OR DELETE ON pipeline_artifacts
+        FOR EACH ROW EXECUTE FUNCTION guard_pipeline_artifact_immutability();
+        DROP TRIGGER IF EXISTS guard_pipeline_artifact_events_mutation
+            ON pipeline_artifact_events;
+        CREATE TRIGGER guard_pipeline_artifact_events_mutation
+        BEFORE UPDATE OR DELETE ON pipeline_artifact_events
+        FOR EACH ROW EXECUTE FUNCTION guard_pipeline_artifact_immutability()
+        """,
+    ),
+    (
+        "validate_pipeline_artifact_event_function",
+        """
+        CREATE OR REPLACE FUNCTION validate_pipeline_artifact_event()
+        RETURNS trigger LANGUAGE plpgsql AS $function$
+        DECLARE
+            prior_states TEXT[];
+        BEGIN
+            PERFORM 1 FROM pipeline_artifacts
+             WHERE id = NEW.artifact_id
+             FOR UPDATE;
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'artifact % does not exist', NEW.artifact_id;
+            END IF;
+
+            SELECT ARRAY_AGG(state ORDER BY id)
+              INTO prior_states
+              FROM pipeline_artifact_events
+             WHERE artifact_id = NEW.artifact_id;
+            IF prior_states IS NULL AND NEW.state <> 'present' THEN
+                RAISE EXCEPTION 'first artifact event must be present';
+            ELSIF prior_states = ARRAY['present']::TEXT[] AND NEW.state <> 'deleted' THEN
+                RAISE EXCEPTION 'present artifact can only transition to deleted';
+            ELSIF prior_states IS NOT NULL AND prior_states <> ARRAY['present']::TEXT[] THEN
+                RAISE EXCEPTION 'deleted artifact cannot receive more events';
+            END IF;
+            RETURN NEW;
+        END
+        $function$
+        """,
+    ),
+    (
+        "pipeline_artifact_event_insert_trigger",
+        """
+        DROP TRIGGER IF EXISTS validate_pipeline_artifact_event_insert
+            ON pipeline_artifact_events;
+        CREATE TRIGGER validate_pipeline_artifact_event_insert
+        BEFORE INSERT ON pipeline_artifact_events
+        FOR EACH ROW EXECUTE FUNCTION validate_pipeline_artifact_event()
+        """,
+    ),
     (
         "resolved_points_crossing_fkey",
         """
@@ -1794,14 +1925,15 @@ def _existing_pipeline_tables(cur: Any) -> list[str]:
     return [str(row[0]) for row in cur.fetchall()]
 
 
-def _require_empty_or_v4(cur: Any) -> None:
+def _require_empty_or_v5(cur: Any) -> None:
     version = _schema_version(cur)
     if version == SCHEMA_VERSION:
         return
     if version is not None:
         raise RuntimeError(
             f"database schema is v{version}; track.v2 requires v{SCHEMA_VERSION}. "
-            "For v3 use init-db --migrate-refine; older schemas require --reset."
+            "For v3 use init-db --migrate-refine; for v4 use "
+            "init-db --migrate-artifacts; older schemas require --reset."
         )
     existing = _existing_pipeline_tables(cur)
     if existing:
@@ -1809,7 +1941,7 @@ def _require_empty_or_v4(cur: Any) -> None:
         suffix = " ..." if len(existing) > 8 else ""
         raise RuntimeError(
             "unversioned/legacy pipeline tables exist "
-            f"({preview}{suffix}); schema v4 has no in-place migration. "
+            f"({preview}{suffix}); schema v5 has no legacy in-place migration. "
             "Run init_db --reset."
         )
 
@@ -1844,6 +1976,8 @@ def reset_tables(config: PostgresConfig) -> int:
                 "validate_fit_run_completion",
                 "guard_centerline_mutation",
                 "guard_centerline_source_clip_mutation",
+                "guard_pipeline_artifact_immutability",
+                "validate_pipeline_artifact_event",
             ):
                 cur.execute(f"DROP FUNCTION IF EXISTS {function_name}() CASCADE")
         conn.commit()
@@ -1851,15 +1985,27 @@ def reset_tables(config: PostgresConfig) -> int:
     return 0
 
 
-def create_tables(config: PostgresConfig, *, migrate: bool = False) -> int:
-    """Create schema v4 in one transaction, optionally migrating v3 first."""
+def create_tables(
+    config: PostgresConfig,
+    *,
+    migrate_refine_names: bool = False,
+    migrate_artifacts: bool = False,
+) -> int:
+    """Create schema v5, optionally migrating v3/v4 in one transaction."""
     with pg_connect(config) as conn:
         with conn.cursor() as cur:
-            if migrate:
+            if migrate_refine_names:
                 from ..db.refine_migration import migrate_refine
 
                 migrate_refine(cur)
-            _require_empty_or_v4(cur)
+                from ..db.artifact_migration import migrate_artifacts_v5
+
+                migrate_artifacts_v5(cur)
+            elif migrate_artifacts:
+                from ..db.artifact_migration import migrate_artifacts_v5
+
+                migrate_artifacts_v5(cur)
+            _require_empty_or_v5(cur)
 
             print("\n── 创建数据表 / Creating Tables ──")
             for name, ddl in DDL_STATEMENTS:
@@ -1907,7 +2053,7 @@ def create_tables(config: PostgresConfig, *, migrate: bool = False) -> int:
 def main() -> int:
     defaults = default_postgres_config()
     parser = argparse.ArgumentParser(
-        description="Initialize the destructive track.v2 PostgreSQL schema v4."
+        description="Initialize the destructive track.v2 PostgreSQL schema v5."
     )
     parser.add_argument("--host", default=defaults.host)
     parser.add_argument("--port", type=int, default=defaults.port)
@@ -1924,11 +2070,15 @@ def main() -> int:
     migration.add_argument(
         "--reset",
         action="store_true",
-        help="Destructively drop all known Pipeline tables before creating v4.",
+        help="Destructively drop all known Pipeline tables before creating v5.",
     )
     migration.add_argument(
         "--migrate-refine", action="store_true",
-        help="Preserve v3 data and rename Clean objects to Refine (schema v4).",
+        help="Preserve v3 data, rename Clean objects, then migrate through v5.",
+    )
+    migration.add_argument(
+        "--migrate-artifacts", action="store_true",
+        help="Preserve v4 data and add the immutable artifact registry (schema v5).",
     )
     args = parser.parse_args()
 
@@ -1952,7 +2102,11 @@ def main() -> int:
     try:
         if args.reset:
             reset_tables(config)
-        return create_tables(config, migrate=args.migrate_refine)
+        return create_tables(
+            config,
+            migrate_refine_names=args.migrate_refine,
+            migrate_artifacts=args.migrate_artifacts,
+        )
     except RuntimeError as exc:
         print(f"[FAIL] {exc}")
         return 2

@@ -4,10 +4,11 @@ import pytest
 
 from track.v2.cli.init_db import (
     DDL_STATEMENTS,
+    INDEX_STATEMENTS,
     POST_DDL_STATEMENTS,
     SCHEMA_COMPONENT,
     SCHEMA_VERSION,
-    _require_empty_or_v4,
+    _require_empty_or_v5,
 )
 
 
@@ -15,9 +16,9 @@ def _ddl(table: str) -> str:
     return dict(DDL_STATEMENTS)[table]
 
 
-def test_schema_v4_is_an_explicit_destructive_contract() -> None:
+def test_schema_v5_is_an_explicit_destructive_contract() -> None:
     assert SCHEMA_COMPONENT == "track.v2"
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
     assert "pipeline_schema_versions" in dict(DDL_STATEMENTS)
 
 
@@ -174,6 +175,36 @@ def test_artifact_immutability_guards_are_statement_level() -> None:
     ]
 
 
+def test_columnar_artifact_registry_is_immutable_and_run_scoped() -> None:
+    artifacts = _ddl("pipeline_artifacts")
+    events = _ddl("pipeline_artifact_events")
+    indexes = dict(INDEX_STATEMENTS)
+    post = dict(POST_DDL_STATEMENTS)
+
+    assert "pipeline_artifacts_owner_stage_check" in artifacts
+    assert "ON DELETE RESTRICT" in artifacts
+    assert "jsonb_typeof(manifest) = 'object'" in artifacts
+    assert "jsonb_typeof(source_fingerprint) = 'object'" in artifacts
+    assert "^[0-9a-f]{64}$" in artifacts
+    assert "row_count >= 0" in artifacts and "byte_count >= 0" in artifacts
+    assert "LEFT(relative_path, 1) <> '/'" in artifacts
+    assert "relative_path !~ '(^|/)\\.\\.(/|$)'" in artifacts
+    assert "UNIQUE (artifact_id, state)" in events
+    assert "state = 'present' AND reason IS NULL" in events
+    assert "WHERE stage = 'refine'" in indexes["uq_pipeline_artifacts_refine_run"]
+    assert "WHERE stage = 'detect'" in indexes["uq_pipeline_artifacts_detect_run"]
+    assert "BEFORE UPDATE OR DELETE ON pipeline_artifacts" in post[
+        "pipeline_artifact_immutability_triggers"
+    ]
+    assert "BEFORE UPDATE OR DELETE ON pipeline_artifact_events" in post[
+        "pipeline_artifact_immutability_triggers"
+    ]
+    lifecycle = post["validate_pipeline_artifact_event_function"]
+    assert "FOR UPDATE" in lifecycle
+    assert "first artifact event must be present" in lifecycle
+    assert "deleted artifact cannot receive more events" in lifecycle
+
+
 def test_all_run_deletes_require_the_confirmation_gated_service() -> None:
     post = dict(POST_DDL_STATEMENTS)
     function = post["run_delete_guard_function"]
@@ -235,9 +266,14 @@ class _VersionCursor:
 
 
 def test_unversioned_legacy_schema_is_refused_without_reset() -> None:
-    with pytest.raises(RuntimeError, match="no in-place migration"):
-        _require_empty_or_v4(_VersionCursor(None, ["refine_runs"]))
+    with pytest.raises(RuntimeError, match="no legacy in-place migration"):
+        _require_empty_or_v5(_VersionCursor(None, ["refine_runs"]))
 
 
-def test_existing_v3_schema_is_accepted() -> None:
-    _require_empty_or_v4(_VersionCursor(4, ["refine_runs"]))
+def test_existing_v5_schema_is_accepted() -> None:
+    _require_empty_or_v5(_VersionCursor(5, ["refine_runs"]))
+
+
+def test_existing_v4_schema_requires_artifact_migration() -> None:
+    with pytest.raises(RuntimeError, match="--migrate-artifacts"):
+        _require_empty_or_v5(_VersionCursor(4, ["refine_runs"]))

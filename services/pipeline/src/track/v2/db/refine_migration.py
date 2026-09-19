@@ -6,7 +6,18 @@ from typing import Any
 
 from psycopg import sql
 
-from .schema import SCHEMA_COMPONENT, SCHEMA_VERSION
+from .schema import SCHEMA_COMPONENT
+
+
+REFINE_SCHEMA_VERSION = 4
+_V5_ONLY_OBJECTS = {
+    "guard_pipeline_artifact_immutability_function",
+    "pipeline_artifact_immutability_triggers",
+    "validate_pipeline_artifact_event_function",
+    "pipeline_artifact_event_insert_trigger",
+    "uq_pipeline_artifacts_refine_run",
+    "uq_pipeline_artifacts_detect_run",
+}
 
 
 def _refine_name(name: str) -> str:
@@ -23,7 +34,7 @@ def migrate_refine(cur: Any) -> None:
         (SCHEMA_COMPONENT,),
     )
     row = cur.fetchone()
-    if row is not None and int(row[0]) == SCHEMA_VERSION:
+    if row is not None and int(row[0]) == REFINE_SCHEMA_VERSION:
         return
     if row is None or int(row[0]) != 3:
         raise RuntimeError("--migrate-refine requires an existing schema v3 database")
@@ -94,9 +105,10 @@ def migrate_refine(cur: Any) -> None:
         ))
     # PostgreSQL rewrites FK/constraint dependencies, but not PL/pgSQL source.
     # Reinstall all authoritative guards before publishing version 4.
-    for _name, ddl in (*POST_DDL_STATEMENTS, *INDEX_STATEMENTS):
-        cur.execute(ddl)
+    for name, ddl in (*POST_DDL_STATEMENTS, *INDEX_STATEMENTS):
+        if name not in _V5_ONLY_OBJECTS:
+            cur.execute(ddl)
     cur.execute(
         "UPDATE pipeline_schema_versions SET version = %s WHERE component = %s",
-        (SCHEMA_VERSION, SCHEMA_COMPONENT),
+        (REFINE_SCHEMA_VERSION, SCHEMA_COMPONENT),
     )
