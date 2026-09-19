@@ -25,8 +25,8 @@
 | --- | --- | --- | ---: | --- |
 | C00 | 固化新 Spec、旧 Spec 跳转和本任务卡 | 无 | 文档 QA 例外 | 已完成（`e31eae2`） |
 | C01a | 引入依赖兼容范围与集中运行配置 | C00 | ≤700 | 已完成（`fca33cf`） |
-| C01b1 | 固定 Python 依赖解析版本 | C01a | ≤700 | 已完成（本卡提交） |
-| C01b2 | 准备离线 DuckDB PostgreSQL 扩展 | C01b1 | ≤700 | 未开始 |
+| C01b1 | 固定 Python 依赖解析版本 | C01a | ≤700 | 已完成（`12cdba3`） |
+| C01b2 | 准备离线 DuckDB PostgreSQL 扩展 | C01b1 | ≤700 | 已实施，待主对话验收 |
 | C02 | PostgreSQL 制品登记与追加式事件 DDL/API | C01b2 | ≤700 | 未开始 |
 | C03 | 不可变 Parquet staging/发布/校验基础模块 | C01b2–C02 | ≤700 | 未开始 |
 | C04 | artifact reconcile/gc dry-run/apply CLI | C03 | ≤700 | 未开始 |
@@ -75,18 +75,22 @@
 安装依赖，再以禁用依赖解析和构建隔离的方式安装项目。本卡保持开发依赖在镜像中；
 生产与开发锁拆分留待后续处理。
 
-验证：锁文件重新生成无差异，DuckDB/Polars 精确版本，镜像构建及容器内版本。
+验证：锁文件重新生成无差异，DuckDB/Polars 精确版本，镜像构建及容器内版本；全量测试
+`1165 passed, 55 skipped`。
 
-提交：本卡提交。
+提交：`12cdba3`。
 
 ### C01b2 — 离线 DuckDB PostgreSQL 扩展
 
 范围：镜像构建期准备固定 DuckDB PostgreSQL 扩展，运行时禁止下载。依赖或扩展
 升级必须重跑语义差分与 26M 基准。
 
-验证：离线扩展可用性测试。
+验证：构建仅允许 `linux/amd64`，下载的 gzip 和解压扩展均校验 SHA-256；容器在
+`--network none` 下关闭 DuckDB 扩展自动安装和自动加载，从固定绝对路径显式 `LOAD`，
+并确认 `postgres_scan`、`postgres_attach` 可识别；`TARGETARCH=arm64` 构建按预期拒绝；
+Pipeline 全量测试 `1165 passed, 55 skipped`。
 
-提交：待记录。
+提交：本卡提交（待主对话验收）。
 
 ### C02 — 制品登记
 
