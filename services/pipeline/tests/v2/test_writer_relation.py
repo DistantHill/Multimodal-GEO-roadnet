@@ -36,6 +36,23 @@ def _crossing(ref):
               crossing_lon=113.0, crossing_lat=23.0)
 
 
+def _member(source, event_index, cross_index=None):
+    return NS(source=source, event_calculate_index=event_index,
+              cross_track_calculate_index=cross_index)
+
+
+def _resolve_for_annotations(relation, refs, turn_indices, cross_indices):
+    relation.collect_sources(
+        NS(turn_events=[_turn(index, refs[0]) for index in turn_indices],
+           cross_track_candidates=[_cross(index, refs[0], refs[1])
+                                   for index in cross_indices]),
+        [], [], {},
+    )
+    relation.add_mapping(refs[0], 100)
+    relation.add_mapping(refs[1], 101)
+    relation.resolve_sources()
+
+
 class ClosingIterable:
     def __init__(self, values, failure=None):
         self.values, self.failure, self.closed = values, failure, False
@@ -168,6 +185,97 @@ def test_empty_unresolved_and_closed_access(tmp_path):
         list(relation.iter_raw("turn"))
     with pytest.raises(RuntimeError, match="closed"):
         list(relation.iter_resolved_sources(0))
+
+
+def test_annotations_preserve_namespaces_duplicates_hotspots_and_order(tmp_path):
+    refs = [RefinedPointRef("kept", 1, 0, 0), RefinedPointRef("kept", 2, 0, 0)]
+    with _relation(tmp_path, batch_size=1) as relation:
+        _resolve_for_annotations(relation, refs, [7, 8, 9], [7, 10])
+        clusters = [
+            NS(cluster_calculate_index=1, events=[
+                _member("turn", 7), _member("turn", 7),
+                _member("other", 8), _member("orthogonal_cross_track", 10, None),
+            ]),
+            NS(cluster_calculate_index=2, events=[
+                _member("turn", 9), _member("orthogonal_cross_track", 999, 7),
+            ]),
+        ]
+        hotspots = [NS(event_calculate_index=7, g_star_z=1.5),
+                    NS(event_calculate_index=7, g_star_z=2.5),
+                    NS(event_calculate_index=99, g_star_z=9.0)]
+        relation.prepare_annotations(clusters, {1: 41, 2: 42}, hotspots)
+        assert list(relation.iter_annotations("turn")) == [
+            (0, 41, 2.5), (1, None, None), (2, 42, None)]
+        assert list(relation.iter_annotations("cross")) == [
+            (0, 42, None), (1, None, None)]
+        with pytest.raises(RuntimeError, match="already prepared"):
+            relation.prepare_annotations([], {}, [])
+
+
+def test_annotation_conflict_reports_earliest_encounter_not_smallest_key(tmp_path):
+    refs = [RefinedPointRef("kept", 1, 0, 0), RefinedPointRef("kept", 2, 0, 0)]
+    with _relation(tmp_path) as relation:
+        _resolve_for_annotations(relation, refs, [99, 1], [])
+        clusters = [
+            NS(cluster_calculate_index=1, events=[_member("turn", 99), _member("turn", 1)]),
+            NS(cluster_calculate_index=2, events=[_member("turn", 99), _member("turn", 1)]),
+        ]
+        with pytest.raises(ValueError, match=r"Detect entity 99 belongs"):
+            relation.prepare_annotations(clusters, {1: 10, 2: 20}, [])
+        assert relation._connection.execute("SELECT count(*) FROM members").fetchone() == (0,)
+        assert relation._connection.execute("SELECT count(*) FROM annotations").fetchone() == (0,)
+        relation.prepare_annotations(
+            [NS(cluster_calculate_index=1, events=[_member("turn", 99)])], {1: 10}, [])
+        assert list(relation.iter_annotations("turn")) == [
+            (0, 10, None), (1, None, None)]
+
+
+def test_annotation_state_is_fail_closed(tmp_path):
+    relation = _relation(tmp_path)
+    with pytest.raises(RuntimeError, match="not resolved"):
+        relation.prepare_annotations([], {}, [])
+    with pytest.raises(RuntimeError, match="not prepared"):
+        list(relation.iter_annotations("turn"))
+    relation.resolve_sources()
+    assert list(relation.iter_annotation_requests()) == []
+    relation.prepare_annotations([], {}, [])
+    assert list(relation.iter_annotations("turn")) == []
+    with pytest.raises(ValueError, match="unknown"):
+        list(relation.iter_annotations("crossing"))
+    relation.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        list(relation.iter_annotations("turn"))
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError("events"), KeyboardInterrupt()])
+def test_annotation_member_identity_iterator_always_closes(tmp_path, failure):
+    refs = [RefinedPointRef("kept", 1, 0, 0), RefinedPointRef("kept", 2, 0, 0)]
+    events = ClosingIterable([_member("turn", 1)], failure)
+    with _relation(tmp_path) as relation:
+        _resolve_for_annotations(relation, refs, [1], [])
+        clusters = [NS(cluster_calculate_index=1, events=events)]
+        if failure is None:
+            relation.prepare_annotations(clusters, {1: 10}, [])
+        else:
+            with pytest.raises(type(failure)):
+                relation.prepare_annotations(clusters, {1: 10}, [])
+            assert relation._connection.execute("SELECT count(*) FROM members").fetchone() == (0,)
+        assert events.closed
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError("hotspots"), KeyboardInterrupt()])
+def test_annotation_hotspot_iterator_always_closes(tmp_path, failure):
+    refs = [RefinedPointRef("kept", 1, 0, 0), RefinedPointRef("kept", 2, 0, 0)]
+    hotspots = ClosingIterable([NS(event_calculate_index=1, g_star_z=3.0)], failure)
+    with _relation(tmp_path) as relation:
+        _resolve_for_annotations(relation, refs, [1], [])
+        if failure is None:
+            relation.prepare_annotations([], {}, hotspots)
+        else:
+            with pytest.raises(type(failure)):
+                relation.prepare_annotations([], {}, hotspots)
+            assert relation._connection.execute("SELECT count(*) FROM hotspots").fetchone() == (0,)
+        assert hotspots.closed
 
 
 @pytest.mark.parametrize("batch_size", [True, 0])

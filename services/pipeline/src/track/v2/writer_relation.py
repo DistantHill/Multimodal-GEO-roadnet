@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import duckdb
 
+from .member_sequences import iter_member_identities
 from .models import RuntimeConfig
 
 
@@ -45,6 +46,7 @@ class WriterRelation:
         self._connection: duckdb.DuckDBPyConnection | None = None
         self._batch_size = batch_size
         self._resolved = False
+        self._annotations_prepared = False
         self._request_order = 0
         self._mapping_order = 0
         self.counts = [0, 0, 0]
@@ -99,6 +101,18 @@ class WriterRelation:
             CREATE TABLE resolved_sources (
                 consumer INTEGER NOT NULL, ordinal BIGINT NOT NULL,
                 endpoint INTEGER NOT NULL, resolved_id BIGINT NOT NULL
+            );
+            CREATE TABLE members (
+                kind VARCHAR NOT NULL, calculation_index BIGINT NOT NULL,
+                encounter BIGINT NOT NULL, candidate_id BIGINT NOT NULL
+            );
+            CREATE TABLE hotspots (
+                calculation_index BIGINT NOT NULL, input_ordinal BIGINT NOT NULL,
+                z DOUBLE
+            );
+            CREATE TABLE annotations (
+                request_order BIGINT PRIMARY KEY, kind VARCHAR NOT NULL,
+                ordinal BIGINT NOT NULL, candidate_id BIGINT, z DOUBLE
             )
         """)
 
@@ -219,6 +233,89 @@ class WriterRelation:
             SELECT kind,calculation_index,ordinal FROM annotation_requests
             ORDER BY request_order
         """, ())
+
+    def prepare_annotations(self, clusters, candidate_ids, hotspots) -> None:
+        """Associate annotation requests with the first candidate and last hotspot."""
+        connection = self._require_open()
+        if not self._resolved:
+            raise RuntimeError("writer relation is not resolved")
+        if self._annotations_prepared:
+            raise RuntimeError("writer annotations are already prepared")
+        connection.execute("BEGIN TRANSACTION")
+        try:
+            encounter = 0
+            with _closing_optional(iter(clusters)) as cluster_iterator:
+                for cluster in cluster_iterator:
+                    candidate_id = candidate_ids[cluster.cluster_calculate_index]
+                    identities = iter_member_identities(cluster.events)
+                    with _closing_optional(identities):
+                        for source, event_index, cross_index in identities:
+                            if source == "turn":
+                                kind, calculation_index = "turn", event_index
+                            elif source == "orthogonal_cross_track" and cross_index is not None:
+                                kind, calculation_index = "cross", cross_index
+                            else:
+                                continue
+                            connection.execute("INSERT INTO members VALUES (?,?,?,?)", (
+                                kind, calculation_index, encounter, candidate_id,
+                            ))
+                            encounter += 1
+            with _closing_optional(iter(hotspots)) as hotspot_iterator:
+                for ordinal, event in enumerate(hotspot_iterator):
+                    connection.execute("INSERT INTO hotspots VALUES (?,?,?)", (
+                        event.event_calculate_index, ordinal, event.g_star_z,
+                    ))
+            conflict = connection.execute("""
+                SELECT calculation_index FROM (
+                    SELECT calculation_index,encounter,candidate_id,
+                           first_value(candidate_id) OVER (
+                               PARTITION BY kind,calculation_index ORDER BY encounter
+                           ) AS first_candidate
+                    FROM members
+                ) WHERE candidate_id != first_candidate
+                ORDER BY encounter LIMIT 1
+            """).fetchone()
+            if conflict is not None:
+                raise ValueError(
+                    f"Detect entity {conflict[0]} belongs to multiple candidates"
+                )
+            connection.execute("""
+                INSERT INTO annotations
+                WITH unique_members AS (
+                    SELECT kind,calculation_index,candidate_id FROM members
+                    QUALIFY row_number() OVER (
+                        PARTITION BY kind,calculation_index ORDER BY encounter
+                    )=1
+                ), last_hotspots AS (
+                    SELECT calculation_index,z FROM hotspots
+                    QUALIFY row_number() OVER (
+                        PARTITION BY calculation_index ORDER BY input_ordinal DESC
+                    )=1
+                )
+                SELECT r.request_order,r.kind,r.ordinal,m.candidate_id,
+                       CASE WHEN r.kind='turn' THEN h.z ELSE NULL END
+                FROM annotation_requests r
+                LEFT JOIN unique_members m USING(kind,calculation_index)
+                LEFT JOIN last_hotspots h
+                  ON r.kind='turn' AND r.calculation_index=h.calculation_index
+                ORDER BY r.request_order
+            """)
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        self._annotations_prepared = True
+
+    def iter_annotations(self, kind: str) -> Iterator[tuple[int, int | None, float | None]]:
+        if kind not in self._CONSUMERS[:2]:
+            raise ValueError("unknown writer annotation kind")
+        connection = self._require_open()
+        if not self._annotations_prepared:
+            raise RuntimeError("writer annotations are not prepared")
+        yield from self._iterate(connection, """
+            SELECT ordinal,candidate_id,z FROM annotations
+            WHERE kind=? ORDER BY request_order
+        """, (kind,))
 
     def _iterate(self, connection, query: str, params: tuple) -> Iterator[tuple]:
         cursor = connection.cursor()
