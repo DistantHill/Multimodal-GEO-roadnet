@@ -13,6 +13,7 @@ from track.v2.cross_candidate_relation import (
     ClusterMemberSequence, CrossCandidateCoordinate, CrossCandidateRelation,
 )
 from track.v2.cross_member_store import CandidateStore
+from track.v2.member_sequences import SliceSequence
 from track.v2.models import CrossTrackCandidate, PointRef, RefinedPointRef, RuntimeConfig
 
 
@@ -61,6 +62,9 @@ def test_lossless_refs_index_slices_coordinates_and_batch_one(tmp_path):
         assert relation[-1] == candidates[1]
         assert relation[:] == candidates
         assert relation[::2] == candidates[::2]
+        assert isinstance(relation[::-1], SliceSequence)
+        assert relation[::-1] == candidates[::-1]
+        assert relation == list(candidates)
         assert candidates[0].as_dict() == relation[0].as_dict()
         assert list(relation.iter_coordinates()) == [
             CrossCandidateCoordinate(0, 1.0, 2.0),
@@ -209,6 +213,9 @@ def test_member_pass_matches_legacy_store_and_ignores_noise(tmp_path):
             assert isinstance(group, ClusterMemberSequence)
             assert tuple(group) == tuple(old_group)
             assert group[:] == tuple(old_group)
+            assert isinstance(group[::-1], SliceSequence)
+            assert group[::-1] == list(old_group)[::-1]
+            assert group == list(old_group)
             assert group[-1] == old_group[-1]
             assert list(group.iter_member_identities()) == list(old_group.iter_member_identities())
             assert list(group.iter_ordinals()) == list(old_group.iter_ordinals())

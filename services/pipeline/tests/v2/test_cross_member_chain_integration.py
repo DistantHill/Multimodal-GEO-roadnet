@@ -13,7 +13,8 @@ import pytest
 
 from track.v2 import detect
 from track.v2.candidate_extraction import extract_cross_track_candidates, extract_disk_cross_track_candidates
-from track.v2.cross_member_store import CandidateStore, ClusterMemberSequence, ConcatSequence
+from track.v2.cross_member_store import CandidateStore, ClusterMemberSequence
+from track.v2.member_sequences import ConcatSequence
 from track.v2.db_writer import _insert_tracks_cross, _refine_key
 from track.v2.writer_workspace import WriterWorkspace
 from track.v2.models import RefinedPointRef, RuntimeConfig

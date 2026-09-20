@@ -10,9 +10,8 @@ from unittest.mock import patch
 
 import pytest
 
-from track.v2.cross_member_store import (
-    CandidateStore, ClusterMemberSequence, ConcatSequence, PointRefSequence, SliceSequence,
-)
+from track.v2.cross_member_store import CandidateStore, ClusterMemberSequence
+from track.v2.member_sequences import ConcatSequence, PointRefSequence, SliceSequence
 from track.v2.models import CrossTrackCandidate, HotspotCluster, PointRef, RefinedPointRef
 
 
@@ -172,7 +171,7 @@ def test_coordinates_preserve_signed_zero_nonfinite_values_and_double_bits(tmp_p
 
 def test_member_creation_decodes_once_and_provenance_uses_only_small_summaries(tmp_path):
     import track.v2.cross_member_store as storage
-    from track.v2.cross_member_store import reference_source_ids, summarize_events
+    from track.v2.member_sequences import reference_source_ids, summarize_events
     with filled(tmp_path) as store:
         original=storage.pickle.loads
         with patch.object(storage.pickle,'loads',wraps=original) as loads:
@@ -195,7 +194,7 @@ def test_member_creation_decodes_once_and_provenance_uses_only_small_summaries(t
 
 
 def test_manual_events_fallback_summary_preserves_ref_source_order_and_missing_refs():
-    from track.v2.cross_member_store import reference_source_ids, summarize_events
+    from track.v2.member_sequences import reference_source_ids, summarize_events
     events=[ClusterMemberSequence._event(candidate(i),i) for i in range(4)]
     events=[replace(events[0],source='',source_ids=('manual-event',)),
             replace(events[1],source='turn'),
@@ -211,7 +210,7 @@ def test_manual_events_fallback_summary_preserves_ref_source_order_and_missing_r
 
 
 def test_narrow_membership_stream_avoids_payload_and_preserves_concat_duplicates(tmp_path):
-    from track.v2.cross_member_store import iter_member_identities
+    from track.v2.member_sequences import iter_member_identities
     with filled(tmp_path) as store:
         owner=store.create_members([1,-1,0,1,0,-1])
         groups=[view for _,view in owner.iter_groups()]
@@ -238,7 +237,7 @@ def test_narrow_membership_stream_avoids_payload_and_preserves_concat_duplicates
 
 
 def test_narrow_membership_iterator_closes_on_early_stop_and_empty_input(tmp_path):
-    from track.v2.cross_member_store import iter_member_identities
+    from track.v2.member_sequences import iter_member_identities
     assert list(iter_member_identities(()))==[]
     with filled(tmp_path) as store:
         owner=store.create_members([0]*6)

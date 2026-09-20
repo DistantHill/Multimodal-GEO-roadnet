@@ -58,9 +58,9 @@ from .candidate_extraction import (
 from .detect_workspace import DetectWorkspace
 from .dbscan_storage import ActiveGridLinks, index_typecode
 from .turn_event_relation import TurnCoordinate, TurnEventRelation
-from .cross_member_store import (
-    CandidateStore, ConcatSequence, MemberPass, PointRefSequence,
-    reference_source_ids, summarize_events,
+from .cross_member_store import CandidateStore, MemberPass
+from .member_sequences import (
+    ConcatSequence, PointRefSequence, reference_source_ids, summarize_events,
 )
 
 from .models import (

@@ -12,7 +12,7 @@ import pickle
 import tempfile
 from typing import Iterable, Iterator, Any
 
-from .cross_member_store import iter_member_identities
+from .member_sequences import iter_member_identities
 from .heartbeat import operation_heartbeat, heartbeat_progress
 
 

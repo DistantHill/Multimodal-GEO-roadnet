@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import duckdb
 
-from .cross_member_store import EventSummary
+from .member_sequences import EventSummary, ReadOnlySequence
 from .models import CrossTrackCandidate, PointRef, RefinedPointRef, RuntimeConfig, TurnEvent
 
 
@@ -19,7 +19,7 @@ class CrossCandidateCoordinate:
     y: float
 
 
-class CrossCandidateRelation(Sequence[CrossTrackCandidate]):
+class CrossCandidateRelation(ReadOnlySequence[CrossTrackCandidate]):
     """Append once, validate, then repeatedly stream cross-track candidates."""
 
     _POINT_COLUMNS = (
@@ -172,18 +172,10 @@ class CrossCandidateRelation(Sequence[CrossTrackCandidate]):
     def __iter__(self) -> Iterator[CrossTrackCandidate]:
         return self._iterate("", ())
 
-    def __getitem__(
-        self, index: int | slice,
-    ) -> CrossTrackCandidate | tuple[CrossTrackCandidate, ...]:
-        self._require_sealed()
-        if isinstance(index, slice):
-            return tuple(self[item] for item in range(*index.indices(len(self))))
+    def _get(self, index: int) -> CrossTrackCandidate:
         if not isinstance(index, int):
             raise TypeError("cross candidate index must be an integer or slice")
-        ordinal = index + len(self) if index < 0 else index
-        if ordinal < 0 or ordinal >= len(self):
-            raise IndexError(index)
-        iterator = self._iterate("WHERE ordinal=?", (ordinal,))
+        iterator = self._iterate("WHERE ordinal=?", (index,))
         try:
             return next(iterator)
         finally:
@@ -355,7 +347,7 @@ class MemberPass:
             pass
 
 
-class ClusterMemberSequence(Sequence[TurnEvent]):
+class ClusterMemberSequence(ReadOnlySequence[TurnEvent]):
     """Repeatable, bounded materialization of one label's member events."""
 
     _SOURCE = "orthogonal_cross_track"
@@ -366,16 +358,11 @@ class ClusterMemberSequence(Sequence[TurnEvent]):
     def __len__(self) -> int:
         return self._count
 
-    def __getitem__(self, index: int | slice) -> TurnEvent | tuple[TurnEvent, ...]:
-        self.pass_owner._check_open()
-        if isinstance(index, slice):
-            return tuple(self[item] for item in range(*index.indices(len(self))))
+    def _get(self, index: int) -> TurnEvent:
         if not isinstance(index, int):
             raise TypeError("member index must be an integer or slice")
-        position = index + len(self) if index < 0 else index
-        if position < 0 or position >= len(self):
-            raise IndexError(index)
-        rows = self._rows("m.member_order,c.*", "AND m.member_order=?", (position,))
+        self.pass_owner._check_open()
+        rows = self._rows("m.member_order,c.*", "AND m.member_order=?", (index,))
         try:
             row = next(rows)
             return self._event(self.pass_owner.relation._decode(row[1:]), row[0])
