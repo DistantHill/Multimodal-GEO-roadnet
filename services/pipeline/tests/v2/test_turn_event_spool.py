@@ -204,7 +204,7 @@ def test_hotspot_coordinate_and_output_iteration_close_on_error(tmp_path, phase,
 
 
 @pytest.mark.parametrize("failure", [None, RuntimeError("commit failed"), KeyboardInterrupt()])
-def test_turn_spool_stays_readable_until_commit_and_commit_failure_closes_it(tmp_path, failure):
+def test_turn_spool_closes_after_result_rows_commit_before_artifact_completion(tmp_path, failure):
     fixture = lifecycle.RunPipelineLifecycleTest()
     fixture.setUp()
     spool = DiskSequence(directory=tmp_path)
@@ -216,9 +216,9 @@ def test_turn_spool_stays_readable_until_commit_and_commit_failure_closes_it(tmp
 
     def commit():
         if fixture.events[-1] == "finish_detect:completed":
-            assert not spool._closed
-            assert list(spool) == [event]
-            assert list(spool) == [event]
+            # Detect Parquet reads committed PostgreSQL rows, so the transient
+            # calculation result must already be released before registration.
+            assert spool._closed
             completing.append(True)
             if failure is not None:
                 raise failure

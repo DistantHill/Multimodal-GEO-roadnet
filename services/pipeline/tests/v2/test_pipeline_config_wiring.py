@@ -103,6 +103,9 @@ class _ConfigRecordingStore:
     def finish_detect(self, detect_id: str, *, status: str) -> None:
         return None
 
+    def complete_detect_with_artifact(self, detect_id: str, descriptor: object) -> None:
+        return None
+
     def load_clip(self, detect_id: str, *, config: object) -> object:
         self.loaded_clip_config = config
         return self.clip_result
@@ -153,9 +156,17 @@ class PipelineConfigWiringTest(unittest.TestCase):
             patch("track.v2.pipeline.PostgresPipelineStore", return_value=store),
             patch("track.v2.pipeline.require_schema_v4"),
             patch("track.v2.pipeline.verify_refine_source_fingerprint"),
+            patch("track.v2.pipeline.validate_source_table", return_value=MagicMock()),
+            patch(
+                "track.v2.pipeline.calculate_source_fingerprint",
+                return_value={"version": 1, "row_count": 0, "sha256": "0"},
+            ),
             patch("track.v2.pipeline.find_refine_artifact", return_value=MagicMock()),
             patch("track.v2.pipeline.RefineDatasetReader", return_value=reader),
             patch("track.v2.pipeline.detect_intersections", return_value=intersections),
+            patch("track.v2.pipeline.create_staging", return_value=MagicMock(stage="detect")),
+            patch("track.v2.pipeline.export_detect_parquet", return_value=MagicMock()),
+            patch("track.v2.pipeline.publish"),
             patch("track.v2.pipeline.fit_centerline_variants", return_value=store.fit_bundle) as fit,
             patch("track.v2.pipeline.build_network", return_value=MagicMock()) as network,
             patch("track.v2.pipeline._add_clip_stats"),

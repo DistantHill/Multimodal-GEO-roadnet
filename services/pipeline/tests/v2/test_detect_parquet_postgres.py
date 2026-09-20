@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 from urllib.parse import unquote
 from uuid import uuid4
@@ -10,10 +11,13 @@ from uuid import uuid4
 import duckdb
 import pytest
 
-from track.v2.artifact_publication import create_staging
+from track.v2.artifact_parquet import build_descriptor, validate_published
+from track.v2.artifact_publication import create_staging, publish
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
 from track.v2.config import PostgresConfig
 from track.v2.db.queries import fetch_intersections, fetch_resolved_clip_tracks
+from track.v2.db.artifact_registry import find_detect_artifact
+from track.v2.db.pipeline_store import PostgresPipelineStore
 from track.v2.detect_parquet import export_detect_parquet
 from track.v2.models import RuntimeConfig
 
@@ -106,6 +110,13 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
         "VALUES (%s,%s,90,90,%s,%s)",
         (detect_id, intersection, crossings[0][0], crossings[1][0]))
     conn.commit()
+    conn.execute("ALTER TABLE refine_runs DISABLE TRIGGER USER")
+    conn.execute(
+        "UPDATE refine_runs SET status='completed', source_fingerprint=%s::jsonb WHERE id=%s",
+        (json.dumps({"version": 1, "row_count": 2, "sha256": "source"}), refine_id),
+    )
+    conn.execute("ALTER TABLE refine_runs ENABLE TRIGGER USER")
+    conn.commit()
 
     handle = create_staging(tmp_path.resolve(), "detect", detect_id, uuid4())
     descriptor = export_detect_parquet(
@@ -116,16 +127,23 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
     ).fetchone()[0] == "running"
     assert conn.info.transaction_status.name != "IDLE"
 
-    # The legacy Clip oracle accepts only completed Runs. Complete it after
-    # export solely to compare the already-written immutable staging files.
-    conn.execute("ALTER TABLE detect_runs DISABLE TRIGGER USER")
-    conn.execute("UPDATE detect_runs SET status='completed' WHERE id=%s", (detect_id,))
-    conn.execute("ALTER TABLE detect_runs ENABLE TRIGGER USER")
+    conn.rollback()  # Close the exporter snapshot before the final transaction.
+    publication = publish(handle)
+    PostgresPipelineStore(conn).complete_detect_with_artifact(str(detect_id), descriptor)
     conn.commit()
+    registered = find_detect_artifact(conn.cursor(), detect_id)
+    assert registered.state == "present"
+    assert registered.descriptor == descriptor
+    assert publication.final_path.stat().st_mode & 0o222 == 0
+    validate_published(tmp_path.resolve(), descriptor, "present", verify_sha256=True)
+    assert conn.execute(
+        "SELECT status FROM detect_runs WHERE id=%s", (detect_id,),
+    ).fetchone() == ("completed",)
+
     expected_intersections = fetch_intersections(conn, str(detect_id))
     expected_tracks = list(fetch_resolved_clip_tracks(conn, str(detect_id)))
     with duckdb.connect() as db:
-        root = handle.path
+        root = publication.final_path
         actual_intersections = db.execute(
             "SELECT intersection_id,lon,lat,radius_m FROM read_parquet(?) ORDER BY intersection_id",
             [str(root / "intersections/part-00000.parquet")],
@@ -144,3 +162,52 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
         for track in expected_tracks for point in track.points
     ]
     assert descriptor.detect_id == detect_id
+
+
+def test_detect_final_transaction_failure_leaves_reconcilable_orphan(database, tmp_path):
+    conn, _config_value, schema = database
+    refine_id, detect_id = uuid4(), uuid4()
+    conn.execute(
+        "INSERT INTO refine_runs"
+        "(id,source_table,processing_srid,projection_config,status) "
+        "VALUES (%s,%s,3857,'{\"coordinate_semantics_version\":2,"
+        "\"always_xy\":true,\"distance_semantics\":\"projected_euclidean_metre\","
+        "\"input_heading_semantics\":\"clockwise_degrees_from_true_north\","
+        "\"topology_bearing_semantics\":\"clockwise_degrees_from_processing_grid_north\","
+        "\"enforce_area_of_use\":false,\"max_scale_error\":0.05}','running')",
+        (refine_id, f"{schema}.source_points"),
+    )
+    conn.execute(
+        "INSERT INTO detect_runs(id,refine_id,status) VALUES (%s,%s,'running')",
+        (detect_id, refine_id),
+    )
+    conn.commit()
+    conn.execute("ALTER TABLE refine_runs DISABLE TRIGGER USER")
+    conn.execute(
+        "UPDATE refine_runs SET status='completed', source_fingerprint=%s::jsonb WHERE id=%s",
+        (json.dumps({"version": 1, "row_count": 0, "sha256": "0"}), refine_id),
+    )
+    conn.execute("ALTER TABLE refine_runs ENABLE TRIGGER USER")
+    conn.commit()
+    handle = create_staging(tmp_path.resolve(), "detect", detect_id, uuid4())
+    output = handle.path / "part-00000.parquet"
+    with duckdb.connect() as db:
+        db.execute("COPY (SELECT 1 AS value) TO ? (FORMAT PARQUET)", [str(output)])
+    descriptor = build_descriptor(
+        handle, {"probe": [output.name]}, {"version": 1, "row_count": 0, "sha256": "0"},
+    )
+    publication = publish(handle)
+    PostgresPipelineStore(conn).complete_detect_with_artifact(str(detect_id), descriptor)
+    conn.rollback()
+
+    assert publication.final_path.is_dir()
+    assert conn.execute(
+        "SELECT count(*) FROM pipeline_artifacts WHERE detect_id=%s", (detect_id,),
+    ).fetchone() == (0,)
+    store = PostgresPipelineStore(conn)
+    store.finish_detect(str(detect_id), status="failed")
+    store.commit()
+    assert conn.execute(
+        "SELECT status FROM detect_runs WHERE id=%s", (detect_id,),
+    ).fetchone() == ("failed",)
+    validate_published(tmp_path.resolve(), descriptor, "present", verify_sha256=True)

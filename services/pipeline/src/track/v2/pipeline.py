@@ -31,6 +31,7 @@ from .db.source_table import (
 )
 from .fitting import fit_centerline_variants
 from .detect import detect_intersections
+from .detect_parquet import export_detect_parquet
 from .logger import log_info
 from .heartbeat import operation_heartbeat
 from .models import (
@@ -365,6 +366,8 @@ def run_pipeline(
             live_status=live_intersect,
         )
         detect_completed = False
+        detect_staging = None
+        detect_published = False
         iresult = None
         try:
             detect_compute_started = time.perf_counter()
@@ -416,19 +419,50 @@ def run_pipeline(
                 )
             # Persistence is not complete until the run-level validator and
             # every deferred FK/constraint have passed at COMMIT.  Keep that
-            # work inside ``detect_persist_s``; measuring only the writer made
-            # large deferred-trigger regressions invisible in A65 reports.
+            # work inside ``detect_persist_s`` together with checkpoint export
+            # and publication; this metric covers the full durable Detect path.
             with operation_heartbeat(
-                "Detect：完整性校验与事务提交",
+                "Detect：结果行校验与事务提交",
                 emit=lambda message: live_intersect.update(
                     detail=message, elapsed=time.perf_counter() - intersect_started,
                 ),
             ):
-                store.finish_detect(detect_id, status="completed")
                 store.commit()
-            detect_completed = True
             iresult.close()
             iresult = None
+
+            # The authoritative Detect rows are committed while the Run stays
+            # running.  Export from that stable checkpoint, then independently
+            # re-read the canonical Refine/raw-source fingerprint before the
+            # irreversible atomic rename.
+            detect_source_contract = validate_source_table(conn, str(source_table))
+            source_fingerprint = calculate_source_fingerprint(
+                conn, str(refine_id), detect_source_contract,
+            )
+            detect_staging = create_staging(
+                _parquet_root(), "detect", detect_id, uuid4(),
+            )
+            detect_descriptor = export_detect_parquet(
+                conn, db_config, detect_staging, pc.runtime, source_fingerprint,
+            )
+            # Close the exporter's psycopg snapshot before checking a new view.
+            store.rollback()
+            confirmed_fingerprint = calculate_source_fingerprint(
+                conn, str(refine_id), detect_source_contract,
+            )
+            if confirmed_fingerprint != source_fingerprint:
+                raise RuntimeError("Detect source changed during Parquet export")
+            publish(detect_staging)
+            detect_published = True
+            with operation_heartbeat(
+                "Detect：制品登记、完整性校验与事务提交",
+                emit=lambda message: live_intersect.update(
+                    detail=message, elapsed=time.perf_counter() - intersect_started,
+                ),
+            ):
+                store.complete_detect_with_artifact(detect_id, detect_descriptor)
+                store.commit()
+            detect_completed = True
             detect_persist_elapsed = time.perf_counter() - detect_persist_started
             stats["detect_persist_s"] = round(detect_persist_elapsed, 6)
             stats["resolved_sequence_s"] = round(
@@ -468,6 +502,9 @@ def run_pipeline(
 
         except (Exception, KeyboardInterrupt):
             store.rollback()
+            if detect_staging is not None and not detect_published:
+                with suppress(Exception):
+                    abandon_staging(detect_staging)
             # Once the atomic Detect transaction has committed, later output
             # or progress-rendering failures must not rewrite an immutable
             # completed run as failed.

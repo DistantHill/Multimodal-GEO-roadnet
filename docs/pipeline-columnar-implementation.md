@@ -46,8 +46,8 @@
 | C07c1 | Detect 跨轨迹 DuckDB broad phase | C07b | 每提交 ≤700 | 已完成，`6551037`，待主对话确认 |
 | C07c2 | Detect 跨轨迹精确内核与正式入口接线 | C07c1 | 每提交 ≤700 | 已完成（`a30ace3`） |
 | C08a | Detect Parquet staging export 与 v1 Schema | C07c2 | 每提交 ≤700 | 已完成（`58013b9`；Q41 修复 `aece70c`） |
-| C08b1 | Detect 制品数据库约束与事务中立 API | C08a | 每提交 ≤700 | 已完成，待主对话确认 |
-| C08b2 | Detect Parquet 发布与失败生命周期接线 | C08b1 | 每提交 ≤700 | 未开始 |
+| C08b1 | Detect 制品数据库约束与事务中立 API | C08a | 每提交 ≤700 | 已完成（`2ee7f28`） |
+| C08b2 | Detect Parquet 发布与失败生命周期接线 | C08b1 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C08c | Clip 列式读取与正式入口接线 | C08b2 | 每提交 ≤700 | 未开始 |
 | C09 | Clip/Fitting 顺序计算与旧 spool 清除 | C08c | 每提交 ≤700 | 未开始 |
 | C10 | Detect/写入器旧磁盘工作区清除 | C07a–C09 | 每提交 ≤700 | 未开始 |
@@ -334,6 +334,10 @@ deleted 状态和失败回滚。
 
 范围：把 C08a staging exporter 接入 Detect 完成路径，落实原子发布、制品登记、来源
 指纹复核与失败/orphan 生命周期；不改变 Clip 消费入口。
+权威 Detect 结果行先提交以供 exporter 可见，Run 在来源指纹前后复核、原子发布
+和最终登记事务完成前保持 `running`。`detect_persist_s` 覆盖结果持久化、制品导出、
+发布与登记的完整持久路径。最终事务失败时保留未登记的只读 orphan，并将仍为
+`running` 的 Run 永久标记为 `failed`。
 
 验证：发布顺序、登记事务、失败注入、只读权限和对账可见性。
 
