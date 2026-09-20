@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -102,6 +102,30 @@ def test_disabled_turn_detection_still_consumes_workspace_without_running_kernel
         )
     assert events == []
     assert workspace == tracks
+
+
+def test_parquet_reader_uses_columnar_turns_and_still_populates_workspace():
+    tracks = _turn_tracks()
+    cfg = IntersectConfig(stream_batch_size=2, turn_window=1, min_leg_m=10)
+    expected = detect_turn_patch(tracks, cfg)
+    reader = Mock()
+    reader.iter_turn_candidates.return_value = iter(expected)
+    reader.iter_tracks.return_value = iter(tracks.values())
+    with patch(
+        "track.v2.candidate_extraction.detect_turn_patch",
+        side_effect=AssertionError("Python turn operator must not run"),
+    ):
+        actual, workspace = _load_tracks_and_turn_candidates(
+            object(), cfg, _CONTEXT, _TRANSFORMER, refine_reader=reader,
+        )
+    assert actual == expected
+    assert workspace == tracks
+    reader.iter_turn_candidates.assert_called_once_with(
+        cfg.db_table, cfg, batch_size=cfg.stream_batch_size,
+    )
+    reader.iter_tracks.assert_called_once_with(
+        cfg.db_table, batch_size=cfg.stream_batch_size,
+    )
 
 
 def test_db_reader_is_closed_if_detection_fails_before_next_patch():

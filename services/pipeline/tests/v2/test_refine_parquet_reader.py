@@ -12,7 +12,9 @@ import pytest
 from track.v2 import artifact_publication, refine_parquet
 from track.v2.artifact_parquet import build_descriptor
 from track.v2.db.artifact_registry import ArtifactDescriptor, canonical_json
+from track.v2.detect import IntersectConfig
 from track.v2.models import RuntimeConfig
+from track.v2.turn_events import detect_turn_patch
 
 
 def _published(tmp_path: Path):
@@ -51,6 +53,52 @@ def _published(tmp_path: Path):
     descriptor = build_descriptor(
         handle,
         {name: [f"{name}/part.parquet"] for name in refine_parquet.REFINE_PARQUET_V1},
+        {"version": 1},
+    )
+    artifact_publication.publish(handle)
+    return descriptor
+
+
+def _published_tracks(tmp_path: Path, tracks):
+    """Publish real Parquet rows used to differential-test the SQL operator."""
+    handle = artifact_publication.create_staging(
+        tmp_path.resolve(), "refine", uuid4(), uuid4(),
+    )
+    with duckdb.connect() as connection:
+        kept = handle.path / "kept_points"
+        kept.mkdir()
+        rows = []
+        point_id = 0
+        for vehicle_id, subtrack_index, points in tracks:
+            for sequence, (timestamp, x, y, heading) in enumerate(points):
+                point_id += 1
+                rows.append((handle.run_id, point_id, vehicle_id, subtrack_index,
+                             sequence, timestamp, 120 + x / 1e6, 30 + y / 1e6,
+                             x, y, heading, 4.0, f"source-{point_id}"))
+        connection.execute("""
+            CREATE TABLE input_points(
+              refine_id UUID, point_id BIGINT, vehicle_id VARCHAR,
+              subtrack_index INTEGER, refined_sequence_in_subtrack BIGINT,
+              timestamp DOUBLE, lon DOUBLE, lat DOUBLE, x DOUBLE, y DOUBLE,
+              heading DOUBLE, speed DOUBLE, source_row_key VARCHAR)
+        """)
+        connection.executemany(
+            "INSERT INTO input_points VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows,
+        )
+        connection.execute("COPY input_points TO ? (FORMAT PARQUET)",
+                           [str(kept / "part.parquet")])
+        injected = handle.path / "injected_points"
+        injected.mkdir()
+        connection.execute("""
+            COPY (SELECT refine_id, point_id, vehicle_id, subtrack_index,
+                         refined_sequence_in_subtrack, timestamp, lon, lat, x, y,
+                         heading, speed, 'unused'::VARCHAR generated_reason,
+                         0::INTEGER after_sequence_in_subtrack
+                  FROM input_points WHERE false)
+            TO ? (FORMAT PARQUET)
+        """, [str(injected / "part.parquet")])
+    descriptor = build_descriptor(
+        handle, {name: [f"{name}/part.parquet"] for name in refine_parquet.REFINE_PARQUET_V1},
         {"version": 1},
     )
     artifact_publication.publish(handle)
@@ -194,6 +242,63 @@ def test_batch_api_uses_bounded_fetchmany_not_fetchall() -> None:
     assert result.fetchmany.call_count == 3
     result.fetchmany.assert_called_with(17)
     assert not result.fetchall.called
+
+
+@pytest.mark.parametrize("window", [1, 2])
+def test_duckdb_turn_candidates_match_python_oracle_across_batches(tmp_path, window) -> None:
+    # DuckDB is selected because ordering, fixed windows and threshold filtering
+    # are columnar and spillable; this operator needs no Polars/Python fallback.
+    tracks = [
+        ("a", 1, [(0, -40, 0, 359), (10, -20, 0, 1), (20, 0, 0, 90),
+                   (30, 0, 20, 91), (40, 0, 40, 89)]),
+        ("b", 2, [(0, 0, 0, 1), (10, 20, 0, 359), (20, 40, 0, 270),
+                   (30, 40, -20, 269), (40, 40, -40, 271)]),
+        ("short", 3, [(0, 0, 0, 0), (1, 1, 0, 90)]),
+        ("elapsed", 4, [(0, 0, 0, 0), (0, 20, 0, 0), (0, 20, 20, 90)]),
+    ]
+    descriptor = _published_tracks(tmp_path, tracks)
+    cfg = IntersectConfig(turn_window=window, min_turn_deg=45, max_turn_deg=170,
+                          min_leg_m=19, min_movement_speed_mps=1)
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        expected = detect_turn_patch(
+            {f"{t[0]}\0{t[1]}": t for t in reader.iter_tracks("public.source", batch_size=2)},
+            cfg,
+        )
+        actual = list(reader.iter_turn_candidates("public.source", cfg, batch_size=1))
+    assert [(e.event_calculate_index, e.vehicle_id, e.point_ref, e.refined_point_ref)
+            for e in actual] == [
+        (e.event_calculate_index, e.vehicle_id, e.point_ref, e.refined_point_ref)
+        for e in expected
+    ]
+    for left, right in zip(actual, expected, strict=True):
+        assert left.source_ids == right.source_ids
+        assert left.x == pytest.approx(right.x, abs=1e-6)
+        assert left.y == pytest.approx(right.y, abs=1e-6)
+        assert left.lon == pytest.approx(right.lon, abs=1e-9)
+        assert left.lat == pytest.approx(right.lat, abs=1e-9)
+        for field in ("timestamp", "entry_bearing", "exit_bearing", "turn_deg", "score"):
+            assert getattr(left, field) == pytest.approx(getattr(right, field), abs=1e-12)
+
+
+def test_duckdb_turn_thresholds_are_inclusive_and_config_is_strict(tmp_path) -> None:
+    descriptor = _published_tracks(tmp_path, [
+        ("edge", 0, [(0, 0, 0, 0), (10, 0, 10, 90), (20, 10, 10, 90)]),
+    ])
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        cfg = IntersectConfig(turn_window=1, min_turn_deg=90, max_turn_deg=90,
+                              min_leg_m=10, min_movement_speed_mps=1)
+        assert len(list(reader.iter_turn_candidates("source", cfg))) == 1
+        for invalid in (
+            IntersectConfig(turn_window=0),
+            IntersectConfig(min_leg_m=float("nan")),
+            IntersectConfig(min_turn_deg=100, max_turn_deg=90),
+        ):
+            with pytest.raises(refine_parquet.RefineParquetError, match="turn"):
+                list(reader.iter_turn_candidates("source", invalid))
 
 
 def test_reader_closes_connection_when_view_creation_fails(tmp_path, monkeypatch) -> None:

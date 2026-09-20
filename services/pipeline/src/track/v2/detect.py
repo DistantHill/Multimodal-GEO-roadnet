@@ -873,13 +873,32 @@ def _load_tracks_and_turn_candidates(
 ) -> tuple[Sequence[TurnEvent], MutableMapping[str, list[TrajectoryPoint]]]:
     """Wire the DB reader, track scheduler and candidate collector together."""
     tracks: MutableMapping[str, list[TrajectoryPoint]] = workspace if workspace is not None else {}
-    with closing(_iter_prepared_db_tracks(
-        conn, cfg, spatial_context, transformer, tracks, refine_reader,
-    )) as source:
-        turn_events = extract_turn_candidates(
-            iter_track_patches(source, cfg.stream_batch_size),
-            cfg, live_status=live_status, perf=perf, event_store=event_store,
+    if refine_reader is not None:
+        events: list[TurnEvent] | DiskSequence[TurnEvent] = (
+            [] if event_store is None else event_store
         )
+        if cfg.use_turn_events:
+            for event in refine_reader.iter_turn_candidates(
+                cfg.source_table or cfg.db_table, cfg, batch_size=cfg.stream_batch_size,
+            ):
+                if event_store is None:
+                    events.append(event)
+                else:
+                    event_store.append(event, key=str(event.event_calculate_index))
+        with closing(_iter_prepared_db_tracks(
+            conn, cfg, spatial_context, transformer, tracks, refine_reader,
+        )) as source:
+            for _key, _track in source:
+                pass
+        turn_events = events
+    else:
+        with closing(_iter_prepared_db_tracks(
+            conn, cfg, spatial_context, transformer, tracks,
+        )) as source:
+            turn_events = extract_turn_candidates(
+                iter_track_patches(source, cfg.stream_batch_size),
+                cfg, live_status=live_status, perf=perf, event_store=event_store,
+            )
     return turn_events, tracks
 
 
