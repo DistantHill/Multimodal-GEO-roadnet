@@ -18,10 +18,6 @@ from track.v2.cross_track import _prepare_segments
 from track.v2.candidate_extraction import (
     extract_columnar_cross_track_candidates, extract_cross_track_candidates,
 )
-from track.v2.candidate_patches import (
-    CROSS_TRACK_OVERFLOW_PAIR_LIMIT, CrossTrackCapacityError,
-    build_cross_track_index, iter_cross_track_patches,
-)
 from track.v2.models import RuntimeConfig, SpatialContext
 from track.v2.projection import CoordinateTransformer
 from track.v2.turn_events import detect_turn_patch
@@ -525,16 +521,17 @@ def test_duckdb_cross_track_segments_match_q49_oracle(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("batch_size", [1, 3])
-def test_duckdb_cross_track_pairs_match_grid_and_overflow_oracle(tmp_path, batch_size) -> None:
-    # Q44: expansion, joins, dedupe, and overflow pairing are spillable relations;
-    # Python receives only bounded metadata batches for the later exact kernel.
-    # The old oracle pairs every overflow segment with every finite cross-vehicle
-    # segment, even for disjoint AABBs, so SQL deliberately retains that strict set.
+def test_duckdb_cross_track_pairs_match_aabb_oracle(tmp_path, batch_size) -> None:
+    # Q44: DuckDB owns the spillable closed-AABB range join and stable ordering;
+    # Python receives only bounded batches for the later exact NumPy kernel.
     tracks = [
         ("a", 10, [(0, -10, 0, 0), (1, 10, 0, 0)]),
         ("a", 2, [(2, -100, 30, 0), (3, 100, 30, 0)]),
         ("b", 20, [(4, 0, -10, 90), (5, 0, 10, 90)]),
         ("c", 30, [(6, 20, -100, 90), (7, 20, 100, 90)]),
+        ("d", 40, [(8, 10, 0, 90), (9, 10, 10, 90)]),  # endpoint boundary
+        ("e", 50, [(10, -100, -100, 45), (11, 100, 100, 45)]),  # long diagonal
+        ("f", 60, [(12, 1000, -100, 90), (13, 1000, 100, 90)]),  # disjoint long
     ]
     descriptor = _published_tracks(tmp_path, tracks)
     cfg = IntersectConfig(cross_track_grid_cell_m=10,
@@ -551,12 +548,23 @@ def test_duckdb_cross_track_pairs_match_grid_and_overflow_oracle(tmp_path, batch
             for track in reader.iter_tracks("public.source", batch_size=1)
         }
         segments, _ = _prepare_segments(oracle_tracks, transformer, cfg)
-        index = build_cross_track_index(segments, cell_m=10, max_cells=3)
-        expected = {(int(a), int(b))
-                    for ids_a, ids_b in iter_cross_track_patches(index, 1)
-                    for a, b in zip(ids_a, ids_b, strict=True)}
+        expected = {
+            (a, b) for a, left in enumerate(segments)
+            for b, right in enumerate(segments[a + 1:], a + 1)
+            if left.vehicle_rank != right.vehicle_rank
+            and min(left.x1, left.x2) <= max(right.x1, right.x2)
+            and min(right.x1, right.x2) <= max(left.x1, left.x2)
+            and min(left.y1, left.y2) <= max(right.y1, right.y2)
+            and min(right.y1, right.y2) <= max(left.y1, left.y2)
+        }
         batches = list(reader.iter_cross_track_pair_batches(
             "public.source", cfg, batch_size=batch_size,
+        ))
+        compatibility_batches = list(reader.iter_cross_track_pair_batches(
+            "public.source",
+            IntersectConfig(cross_track_grid_cell_m=1,
+                            cross_track_max_grid_cells_per_segment=1),
+            batch_size=batch_size,
         ))
     actual = [((a.track_rank, a.segment_index), (b.track_rank, b.segment_index))
               for batch in batches for a, b in batch]
@@ -565,6 +573,10 @@ def test_duckdb_cross_track_pairs_match_grid_and_overflow_oracle(tmp_path, batch
          (segments[b].track_rank, segments[b].segment_index)) for a, b in expected
     }
     assert set(actual) == expected_identity
+    assert actual == [
+        ((a.track_rank, a.segment_index), (b.track_rank, b.segment_index))
+        for batch in compatibility_batches for a, b in batch
+    ]
     assert len(actual) == len(set(actual))
     order = [
         (a.vehicle_rank, b.vehicle_rank, a.segment_index, b.segment_index,
@@ -573,6 +585,8 @@ def test_duckdb_cross_track_pairs_match_grid_and_overflow_oracle(tmp_path, batch
     ]
     assert order == sorted(order)
     assert all(0 < len(batch) <= batch_size for batch in batches)
+    assert not any(a.vehicle_id == "f" or b.vehicle_id == "f"
+                   for batch in batches for a, b in batch)
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -663,32 +677,22 @@ def test_duckdb_cross_track_pairs_empty_single_vehicle_and_strict_config(tmp_pat
 def test_cross_track_pair_api_never_fetches_all() -> None:
     reader = object.__new__(refine_parquet.RefineDatasetReader)
     reader._descriptor = Mock(refine_id=uuid4())
-    validation, estimate, result = Mock(), Mock(), Mock()
+    validation, result = Mock(), Mock()
     validation.fetchone.return_value = (0,)
-    estimate.fetchone.return_value = (0,)
     result.fetchmany.return_value = []
     connection = Mock()
-    connection.execute.side_effect = [validation, estimate, result]
+    connection.execute.side_effect = [validation, result]
     reader._connection = connection
     assert list(reader.iter_cross_track_pair_batches(
         "source", IntersectConfig(), batch_size=1,
     )) == []
     result.fetchmany.assert_called_once_with(1)
     assert not result.fetchall.called
-
-
-def test_cross_track_pair_api_fails_closed_before_overflow_join() -> None:
-    reader = object.__new__(refine_parquet.RefineDatasetReader)
-    reader._descriptor = Mock(refine_id=uuid4())
-    validation, estimate = Mock(), Mock()
-    validation.fetchone.return_value = (0,)
-    estimate.fetchone.return_value = (CROSS_TRACK_OVERFLOW_PAIR_LIMIT + 1,)
-    connection = Mock()
-    connection.execute.side_effect = [validation, estimate]
-    reader._connection = connection
-    with pytest.raises(CrossTrackCapacityError, match="20,000,001"):
-        list(reader.iter_cross_track_pair_batches("source", IntersectConfig()))
-    assert connection.execute.call_count == 2
+    sql, parameters = connection.execute.call_args_list[-1].args
+    assert "a.segment_id < b.segment_id" in sql
+    assert "a.min_x <= b.max_x AND b.min_x <= a.max_x" in sql
+    assert "a.min_y <= b.max_y AND b.min_y <= a.max_y" in sql
+    assert parameters == [IntersectConfig().cross_track_straightness_deg]
 
 
 def test_cross_track_segment_api_is_bounded_and_validates_config() -> None:

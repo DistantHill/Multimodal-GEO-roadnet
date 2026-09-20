@@ -16,9 +16,6 @@ import duckdb
 
 from track.v2.artifact_parquet import build_descriptor, validate_published
 from track.v2.artifact_publication import StagingDataset, _validate_handle
-from track.v2.candidate_patches import (
-    CROSS_TRACK_OVERFLOW_PAIR_LIMIT, CrossTrackCapacityError,
-)
 from track.v2.config import PostgresConfig
 from track.v2.db.artifact_registry import ArtifactDescriptor
 from track.v2.db.queries import SpatialWindow
@@ -404,7 +401,7 @@ class RefineDatasetReader:
     def iter_cross_track_pair_batches(
         self, source_table: str, cfg: Any, *, batch_size: int = 4096,
     ) -> Iterator[tuple[tuple[_CrossTrackSegment, _CrossTrackSegment], ...]]:
-        """Yield stable broad-phase pairs; DuckDB owns expansion and deduplication."""
+        """Yield stable AABB-overlap pairs through DuckDB's spillable range join."""
         connection, threshold = self._validate_cross_track_request(
             source_table, cfg, batch_size,
         )
@@ -417,49 +414,20 @@ class RefineDatasetReader:
                 or max_cells < 1):
             raise RefineParquetError("cross-track maximum grid cells is invalid")
         self._validate_source(connection)
-        relation = self._cross_track_pair_relation()
-        parameters = [threshold, float(cell_m), float(cell_m), float(cell_m),
-                      float(cell_m), max_cells]
-        estimate = connection.execute(
-            relation + " SELECT count(*) * (SELECT count(*) FROM spans) FROM spans WHERE overflow",
-            parameters,
-        ).fetchone()
-        if estimate is None or estimate[0] is None:
-            raise RefineParquetError("cross-track overflow estimate failed")
-        if int(estimate[0]) > CROSS_TRACK_OVERFLOW_PAIR_LIMIT:
-            raise CrossTrackCapacityError(
-                "global cross-track overflow fallback spans "
-                f"{int(estimate[0]):,} segment pairs; budget is "
-                f"{CROSS_TRACK_OVERFLOW_PAIR_LIMIT:,}"
-            )
-        query = relation + """
-          , memberships AS (
-            SELECT segment_id, vehicle_rank, min_cell_x, min_cell_y, cell_x, cell_y
-            FROM spans,
-              LATERAL range(min_cell_x, max_cell_x + 1) cells_x(cell_x),
-              LATERAL range(min_cell_y, max_cell_y + 1) cells_y(cell_y)
-            WHERE NOT overflow
-          ), grid_pairs AS (
-            SELECT a.segment_id AS a_id, b.segment_id AS b_id
-            FROM memberships a JOIN memberships b
-              ON a.cell_x = b.cell_x AND a.cell_y = b.cell_y
-             AND a.segment_id < b.segment_id AND a.vehicle_rank != b.vehicle_rank
-             AND greatest(a.min_cell_x, b.min_cell_x) = a.cell_x
-             AND greatest(a.min_cell_y, b.min_cell_y) = a.cell_y
-          ), overflow_pairs AS (
-            SELECT a.segment_id AS a_id, b.segment_id AS b_id
-            FROM spans a JOIN spans b ON a.segment_id < b.segment_id
-             AND a.vehicle_rank != b.vehicle_rank AND (a.overflow OR b.overflow)
-          ), pairs AS (
-            SELECT * FROM grid_pairs UNION ALL SELECT * FROM overflow_pairs
-          )
-          SELECT a.*, b.* FROM pairs
-          JOIN straight a ON a.segment_id = pairs.a_id
-          JOIN straight b ON b.segment_id = pairs.b_id
+        # These legacy knobs remain validated for configuration compatibility,
+        # but AABB overlap is independent of grid size and overflow thresholds.
+        query = self._cross_track_segment_relation("""
+          SELECT a.* EXCLUDE (min_x, max_x, min_y, max_y),
+                 b.* EXCLUDE (min_x, max_x, min_y, max_y)
+          FROM straight a JOIN straight b
+            ON a.segment_id < b.segment_id
+           AND a.vehicle_rank != b.vehicle_rank
+           AND a.min_x <= b.max_x AND b.min_x <= a.max_x
+           AND a.min_y <= b.max_y AND b.min_y <= a.max_y
           ORDER BY a.vehicle_rank, b.vehicle_rank,
                    a.segment_index, b.segment_index, a.track_rank, b.track_rank
-        """
-        result = connection.execute(query, parameters)
+        """)
+        result = connection.execute(query, [threshold])
         while rows := result.fetchmany(batch_size):
             yield tuple((self._decode_cross_track_segment(row[:23], source_table),
                          self._decode_cross_track_segment(row[23:], source_table))
@@ -540,23 +508,12 @@ class RefineDatasetReader:
                    refined_sequence_in_subtrack, timestamp, lon, lat, x, y,
                    heading, speed, point_kind, source_row_key, generated_reason,
                    after_sequence_in_subtrack, 1 AS vehicles,
-                   vehicle_rank, track_rank, segment_index, end_x, end_y
+                   vehicle_rank, track_rank, segment_index, end_x, end_y,
+                   least(x, end_x) AS min_x, greatest(x, end_x) AS max_x,
+                   least(y, end_y) AS min_y, greatest(y, end_y) AS max_y
             FROM deltas WHERE abs(heading_delta) <= ?
           )
         """ + select_sql
-
-    @classmethod
-    def _cross_track_pair_relation(cls) -> str:
-        return cls._cross_track_segment_relation("""
-          , spans AS (
-            SELECT *, floor(least(x, end_x) / ?)::BIGINT AS min_cell_x,
-                   floor(greatest(x, end_x) / ?)::BIGINT AS max_cell_x,
-                   floor(least(y, end_y) / ?)::BIGINT AS min_cell_y,
-                   floor(greatest(y, end_y) / ?)::BIGINT AS max_cell_y,
-                   ((max_cell_x-min_cell_x+1) * (max_cell_y-min_cell_y+1)) > ? AS overflow
-            FROM straight
-          )
-        """)
 
     def _decode_cross_track_segment(
         self, row: tuple[Any, ...], source_table: str,

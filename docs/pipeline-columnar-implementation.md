@@ -67,7 +67,7 @@
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
-| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12c2c；1M 阻塞） |
+| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12d1；待重跑 1M） |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
 ## 3. 任务卡
@@ -342,6 +342,33 @@ deleted 状态和失败回滚。
 
 迁移不为 v6 中已有的 completed Detect Run 回填或伪造制品；C08c 消费时对此类历史 Run
 按 fail closed 处理，需要按 Q45/Q54 以新 Run 重跑。
+
+提交：`29b3f04`。
+
+#### C12d1 — Cross-track AABB range join
+
+针对 C12c2c 的 1M overflow 阻塞，Refine Parquet reader 的 broad phase 改由 DuckDB
+执行闭区间 AABB overlap range join。规范谓词为不同车辆、`a.segment_id < b.segment_id`，
+且两个线段 bbox 在 x/y 两轴均闭区间重叠。任意真实线段相交必然满足 AABB overlap，
+因此不会漏掉进入现有 NumPy exact kernel 的真实候选；相较旧 grid memberships 与
+`overflow × all`，只删除 AABB 已分离、最终 exact kernel 必然拒绝的 false-positive broad
+pairs。稳定 `ORDER BY`、`fetchmany(batch_size)` 与后续 exact kernel 均保持不变。
+
+Q44 引擎边界是 DuckDB 负责 window、range join、排序及按运行时配置进行外存管理，Python
+只解码一个有界 batch 并交给既有向量化 NumPy 精确几何核；这里没有 Polars 更合适的连续
+几何算子，故不增加中间转换，也未引入自研 spill、线程、进程或 Dask。遗留
+`cross_track_grid_cell_m` 与 `cross_track_max_grid_cells_per_segment` 继续严格校验以兼容
+配置，但不再影响候选结果，后续卡再评估字段退役。
+
+固定 1M Refine Parquet 的只读 `EXPLAIN` 将该自连接规划为
+`PIECEWISE_MERGE_JOIN`（估算输出约 2,098,224 行），不是 `CROSS_PRODUCT`；小型固定数据
+也没有 cross product。单元回归以 brute-force 闭区间 AABB oracle 为准，覆盖长段但 bbox
+分离、端点边界、长对角、同车排除、canonical once、稳定跨 batch、`batch_size=1` 与禁止
+`fetchall`；最终 exact candidate 继续与 legacy 严格差分并保留 overflow 样例。
+验证结果：cross-track/reader 定向套件 `58 passed`，标准 Pipeline 全量
+`935 passed, 50 skipped`，`git diff --check` 通过。
+
+本卡不重跑 1M，C12 仍为进行中；C12c2c 保留的数据库、容器和运行目录均未改动。
 
 提交：待记录。
 
