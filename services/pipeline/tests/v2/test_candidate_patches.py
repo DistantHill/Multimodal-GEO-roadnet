@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -13,7 +13,7 @@ from track.v2.candidate_patches import (
     iter_track_patches,
 )
 from track.v2.cross_track import _prepare_segments, extract_cross_track_candidates_reference
-from track.v2.detect import IntersectConfig, _load_tracks_and_turn_candidates
+from track.v2.detect import IntersectConfig
 from track.v2.models import PointRef, RefinedPointRef, SpatialContext, TrajectoryPoint
 from track.v2.projection import CoordinateTransformer
 from track.v2.turn_events import detect_turn_patch
@@ -74,7 +74,7 @@ def test_track_patches_are_lazy_keep_tracks_intact_and_emit_tail():
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 5, 100])
-def test_turn_candidates_and_db_workspace_are_independent_of_patch_size(batch_size):
+def test_turn_candidates_are_independent_of_patch_size(batch_size):
     tracks = _turn_tracks()
     cfg = IntersectConfig(stream_batch_size=batch_size, turn_window=1, min_leg_m=10)
     expected = detect_turn_patch(tracks, cfg)
@@ -82,74 +82,6 @@ def test_turn_candidates_and_db_workspace_are_independent_of_patch_size(batch_si
     assert [e.event_calculate_index for e in expected] == list(range(len(tracks)))
     actual = extract_turn_candidates(iter_track_patches(tracks.items(), batch_size), cfg)
     assert actual == expected
-    with patch("track.v2.detect._stream_vehicle_tracks_from_db", return_value=iter(tracks.values())):
-        streamed, workspace = _load_tracks_and_turn_candidates(
-            object(), cfg, _CONTEXT, _TRANSFORMER,
-        )
-    assert streamed == expected
-    assert workspace == tracks
-
-
-def test_disabled_turn_detection_still_consumes_workspace_without_running_kernel():
-    tracks = _turn_tracks()
-    with (
-        patch("track.v2.detect._stream_vehicle_tracks_from_db", return_value=iter(tracks.values())),
-        patch("track.v2.candidate_extraction.detect_turn_patch", side_effect=AssertionError("disabled")),
-    ):
-        events, workspace = _load_tracks_and_turn_candidates(
-            object(), IntersectConfig(use_turn_events=False, stream_batch_size=2),
-            _CONTEXT, _TRANSFORMER,
-        )
-    assert events == []
-    assert workspace == tracks
-
-
-def test_parquet_reader_uses_columnar_turns_and_still_populates_workspace():
-    tracks = _turn_tracks()
-    cfg = IntersectConfig(stream_batch_size=2, turn_window=1, min_leg_m=10)
-    expected = detect_turn_patch(tracks, cfg)
-    reader = Mock()
-    reader.iter_turn_candidates.return_value = iter(expected)
-    reader.iter_tracks.return_value = iter(tracks.values())
-    with patch(
-        "track.v2.candidate_extraction.detect_turn_patch",
-        side_effect=AssertionError("Python turn operator must not run"),
-    ):
-        actual, workspace = _load_tracks_and_turn_candidates(
-            object(), cfg, _CONTEXT, _TRANSFORMER, refine_reader=reader,
-        )
-    assert actual == expected
-    assert workspace == tracks
-    reader.iter_turn_candidates.assert_called_once_with(
-        cfg.db_table, cfg, batch_size=cfg.stream_batch_size,
-    )
-    reader.iter_tracks.assert_called_once_with(
-        cfg.db_table, batch_size=cfg.stream_batch_size,
-    )
-
-
-def test_db_reader_is_closed_if_detection_fails_before_next_patch():
-    closed = []
-    consumed = []
-
-    def source():
-        try:
-            for key, track in _turn_tracks().items():
-                consumed.append(key)
-                yield track
-        finally:
-            closed.append(True)
-
-    with (
-        patch("track.v2.detect._stream_vehicle_tracks_from_db", return_value=source()),
-        patch("track.v2.candidate_extraction.detect_turn_patch", side_effect=RuntimeError("kernel failed")),
-        pytest.raises(RuntimeError, match="kernel failed"),
-    ):
-        _load_tracks_and_turn_candidates(
-            object(), IntersectConfig(stream_batch_size=2), _CONTEXT, _TRANSFORMER,
-        )
-    assert len(consumed) == 2
-    assert closed == [True]
 
 
 def _cross_tracks():

@@ -50,8 +50,8 @@ from track.v2.detect import (
     SpatialWindowIterator,
     _cluster_orthogonal_cross_track_candidates,
     _extract_cross_track_windows,
-    _query_spatial_extent,
 )
+from track.v2.db.queries import _query_spatial_extent
 from track.v2.db.source_table import validate_source_table
 from track.v2.manual_thin_benchmark._thin_bench_helpers import connect_test_db
 from track.v2.models import ProjectionConfig, SpatialContext

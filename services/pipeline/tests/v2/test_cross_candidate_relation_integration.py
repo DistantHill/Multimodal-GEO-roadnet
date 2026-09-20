@@ -5,23 +5,20 @@ from dataclasses import replace
 import gc
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import weakref
 
 import pytest
 
 from track.v2 import detect
-from track.v2.candidate_extraction import extract_cross_track_candidates, extract_disk_cross_track_candidates
 from track.v2.cross_candidate_relation import ClusterMemberSequence, CrossCandidateRelation
 from track.v2.member_sequences import ConcatSequence
 from track.v2.db_writer import _insert_tracks_cross, _refine_key
 from track.v2.writer_workspace import WriterWorkspace
 from track.v2.models import RefinedPointRef, RuntimeConfig
-from track.v2.detect_workspace import DetectWorkspace
 from track.v2.models import HotspotCluster, PointRef
 from .test_ablation_centroid_memory import _crossing, _event
-from .test_detect import _TEST_TRANSFORMER
-from .test_detect_disk_workspace import CONTEXT, TRANSFORMER, crossing_tracks
+from .test_detect import _TEST_SPATIAL_CONTEXT, _TEST_TRANSFORMER
 
 
 
@@ -227,37 +224,25 @@ def test_ablation_failure_closes_only_its_pass(tmp_path, failure):
         assert serialized(main) == before
 
 
-def test_sorted_extraction_to_result_survives_track_workspace_and_writes_same_rows(tmp_path):
-    # The geometry-only fixture reuses (kept, 10000, subtrack=1) across
-    # vehicles. Persistence needs globally distinct Refine source identities.
-    # Keep every coordinate, source PointRef and injected/kept kind unchanged.
-    tracks = {
-        f"{points[0].vehicle_id}\x00{track_index}": [
-            replace(point, refined_point_ref=replace(
-                point.refined_point_ref, point_id=track_index * 10000 + point_index,
-                subtrack_index=track_index,
-            ))
-            for point_index, point in enumerate(points)
-        ]
-        for track_index, points in enumerate(crossing_tracks().values(), 1)
-    }
-    source_keys = [_refine_key(point.refined_point_ref) for points in tracks.values() for point in points]
-    assert len(source_keys) == len(set(source_keys))
+def test_sorted_relation_to_result_writes_same_rows(tmp_path):
     cfg = detect.IntersectConfig(cross_track_pair_batch_size=3, use_turn_events=False,
-                                cross_track_dbscan_min_samples=1)
-    expected, _, _ = extract_cross_track_candidates(tracks, TRANSFORMER, cfg)
+                                 cross_track_dbscan_min_samples=1)
+    expected = [replace(
+        value,
+        from_segment_start=RefinedPointRef("kept", index * 2 + 1, index, 0),
+        to_segment_start=RefinedPointRef("kept", index * 2 + 2, index, 0),
+    ) for index, value in enumerate(candidates(8), 1)]
     spool = CrossCandidateRelation(RuntimeConfig(), tmp_path)
     try:
-        with DetectWorkspace(cfg, directory=tmp_path) as workspace:
-            for key in reversed(list(tracks)):
-                workspace[key] = tracks[key]
-            actual = extract_disk_cross_track_candidates(workspace, TRANSFORMER, cfg,
-                                                         candidate_store=spool)
+        for value in expected:
+            spool.append(value)
+        spool.seal()
+        actual = spool
         assert actual is spool
         assert actual == expected
-        _, eager_clusters = detect._cluster_pipeline([], expected, TRANSFORMER, cfg)
-        _, lazy_clusters = detect._cluster_pipeline([], spool, TRANSFORMER, cfg)
-        result = replace(detect._empty_intersect_result(CONTEXT), clusters=lazy_clusters,
+        _, eager_clusters = detect._cluster_pipeline([], expected, _TEST_TRANSFORMER, cfg)
+        _, lazy_clusters = detect._cluster_pipeline([], spool, _TEST_TRANSFORMER, cfg)
+        result = replace(detect._empty_intersect_result(_TEST_SPATIAL_CONTEXT), clusters=lazy_clusters,
                          cross_track_candidates=spool)
         eager = replace(result, clusters=eager_clusters, cross_track_candidates=expected)
         assert result.as_dict() == eager.as_dict()
@@ -313,46 +298,21 @@ def test_sorted_extraction_to_result_survives_track_workspace_and_writes_same_ro
 @pytest.mark.parametrize("failure", [RuntimeError("stage failed"), KeyboardInterrupt()])
 def test_db_owner_closes_all_spools_on_failure(tmp_path, monkeypatch, phase, failure):
     monkeypatch.setenv("DATA_ROOT", str(tmp_path))
-    tracks = crossing_tracks()
     cfg = detect.IntersectConfig(use_turn_events=False, cross_track_dbscan_min_samples=1)
+    reader = MagicMock()
+    reader.extent.return_value = (0., 0., 1., 1.)
+    reader.iter_cross_track_pair_batches.return_value = iter(())
+    reader.iter_topology_tracks.return_value = iter(())
+    reader.track_count.return_value = 0
     with ExitStack() as stack:
-        stack.enter_context(patch.object(detect, "_query_spatial_extent", return_value=(0., 0., 1., 1.)))
-        stack.enter_context(patch.object(detect, "_stream_vehicle_tracks_from_db", return_value=iter(tracks.values())))
-        target = {"reader": "_load_tracks_and_turn_candidates", "clustering": "_cluster_pipeline",
+        target = {"reader": "_extract_cross_track_db", "clustering": "_cluster_pipeline",
                   "topology": "_build_topologies_from_tracks"}[phase]
         stack.enter_context(patch.object(detect, target, side_effect=failure))
         with pytest.raises(type(failure)):
             detect._detect_intersections_db(
-                object(), cfg, CONTEXT, runtime=RuntimeConfig(), data_root=tmp_path,
+                object(), cfg, _TEST_SPATIAL_CONTEXT, runtime=RuntimeConfig(),
+                data_root=tmp_path, refine_reader=reader,
             )
-    assert not list(tmp_path.glob("duckdb/turn-event-relations/*"))
-    assert not list(tmp_path.glob("duckdb/cross-candidate-relations/*"))
-
-
-def test_db_owner_returns_live_candidate_store_and_complete_eager_result(tmp_path, monkeypatch):
-    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
-    tracks = crossing_tracks()
-    cfg = detect.IntersectConfig(use_turn_events=False, cross_track_dbscan_min_samples=1)
-    expected_candidates, _, _ = extract_cross_track_candidates(tracks, TRANSFORMER, cfg)
-    hotspots, clusters = detect._cluster_pipeline([], expected_candidates, TRANSFORMER, cfg)
-    topologies, clusters, observations = detect._build_topologies_from_tracks(clusters, tracks, cfg, TRANSFORMER)
-    eager = detect.IntersectResult(
-        turn_events=[], hotspot_events=hotspots, clusters=clusters, topologies=topologies,
-        observations=observations, cross_track_candidates=expected_candidates, spatial_context=CONTEXT,
-        report=detect._build_intersect_report(clusters, topologies, [], hotspots, expected_candidates, len(tracks)),
-    )
-    with patch.object(detect, "_query_spatial_extent", return_value=(0., 0., 1., 1.)), patch.object(
-        detect, "_stream_vehicle_tracks_from_db", return_value=iter(tracks.values()),
-    ):
-        actual = detect._detect_intersections_db(
-            object(), cfg, CONTEXT, runtime=RuntimeConfig(), data_root=tmp_path,
-        )
-    try:
-        assert isinstance(actual.cross_track_candidates, CrossCandidateRelation)
-        assert actual.as_dict() == eager.as_dict()
-        assert actual.as_dict() == eager.as_dict()
-    finally:
-        actual.close()
     assert not list(tmp_path.glob("duckdb/turn-event-relations/*"))
     assert not list(tmp_path.glob("duckdb/cross-candidate-relations/*"))
 

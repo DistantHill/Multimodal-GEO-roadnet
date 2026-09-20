@@ -4,7 +4,7 @@ import gc
 import math
 from pathlib import Path
 import weakref
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -93,7 +93,7 @@ def test_compact_gstar_matches_full_event_scores_and_hotspots(tmp_path, radius, 
             ]
 
 
-def test_db_result_survives_track_workspace_and_cross_holds_no_full_turns(tmp_path, monkeypatch):
+def test_db_result_survives_columnar_run_and_cross_holds_no_full_turns(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_ROOT", str(tmp_path))
     tracks = _turn_tracks()
     cfg = IntersectConfig(stream_batch_size=1000, turn_window=1, min_leg_m=10, g_star_min_z=-100.)
@@ -116,15 +116,22 @@ def test_db_result_survives_track_workspace_and_cross_holds_no_full_turns(tmp_pa
         assert all(reference() is None for reference in stored[0].written)
         return []
 
+    reader = type("Reader", (), {
+        "extent": lambda self: (0., 0., 1., 1.),
+        "iter_turn_candidates": lambda self, *_args, **_kwargs: (
+            replace(event) for event in expected_turns
+        ),
+        "track_count": lambda self: len(tracks),
+    })()
+
     with (
         patch("track.v2.detect.TurnEventRelation", OwnedSequence),
-        patch("track.v2.detect._query_spatial_extent", return_value=(0., 0., 1., 1.)),
-        patch("track.v2.detect._stream_vehicle_tracks_from_db", return_value=iter(tracks.values())),
-        patch("track.v2.detect._extract_cross_track_db_workspace", side_effect=cross),
+        patch("track.v2.detect._extract_cross_track_db", side_effect=cross),
         patch("track.v2.detect._build_topologies_from_tracks", side_effect=lambda clusters, *_a, **_kw: ([], clusters, [])),
     ):
         result = _detect_intersections_db(
             object(), cfg, _CONTEXT, runtime=RuntimeConfig(), data_root=tmp_path,
+            refine_reader=reader,
         )
     assert result.turn_events is stored[0]
     assert list(result.turn_events) == expected_turns
@@ -145,11 +152,11 @@ def test_detect_internal_failure_closes_output_relation(tmp_path, monkeypatch, f
         event_store.append(_event(0, 0., 0.))
         raise failure
 
-    with patch("track.v2.detect._detect_intersections_db_workspace", side_effect=fail):
+    with patch("track.v2.detect._run_columnar_db_detect", side_effect=fail):
         with pytest.raises(type(failure)):
             _detect_intersections_db(
                 object(), IntersectConfig(), _CONTEXT,
-                runtime=RuntimeConfig(), data_root=tmp_path,
+                runtime=RuntimeConfig(), data_root=tmp_path, refine_reader=MagicMock(),
             )
     _assert_no_turn_relations(tmp_path)
 

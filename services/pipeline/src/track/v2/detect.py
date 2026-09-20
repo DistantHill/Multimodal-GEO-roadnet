@@ -18,7 +18,7 @@ import time
 from array import array
 from bisect import bisect_right
 from collections import defaultdict
-from collections.abc import Iterator, MutableMapping, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import closing
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -48,14 +48,11 @@ from ._geometry import (
     _segment_circle_crossings_batch,
 )
 from .exceptions import V2Error
-from .candidate_patches import (
-    CROSS_TRACK_OVERFLOW_PAIR_LIMIT, CrossTrackCapacityError, iter_track_patches,
-)
+from .candidate_patches import iter_track_patches
 from .candidate_extraction import (
     extract_columnar_cross_track_candidates, extract_cross_track_candidates,
-    extract_turn_candidates, extract_disk_cross_track_candidates,
+    extract_turn_candidates,
 )
-from .detect_workspace import DetectWorkspace
 from .dbscan_storage import ActiveGridLinks, index_typecode
 from .turn_event_relation import TurnCoordinate, TurnEventRelation
 from .cross_candidate_relation import CrossCandidateRelation, MemberPass
@@ -84,18 +81,12 @@ from .db.queries import (
     SpatialWindow,
     SpatialWindowIterator,
     _query_active_points_in_window,
-    _query_spatial_extent,
-    _stream_vehicle_tracks_from_db,
     _tracks_from_points,
     fetch_refine_run_row,
 )
 from .db.source_table import verify_refine_source_fingerprint
 from .db.artifact_registry import canonical_json
 from .parser import BaseTrajectorySourceHandle as TrajectorySourceHandle
-
-
-_DB_GLOBAL_GRID_MEMBERSHIP_LIMIT = 8_000_000
-_DB_GLOBAL_OVERFLOW_PAIR_LIMIT = CROSS_TRACK_OVERFLOW_PAIR_LIMIT
 
 
 def _perf_iter(perf, iterable, *, name, total=None, track=True):
@@ -800,136 +791,6 @@ def _detect_intersections_handle(
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def _iter_prepared_db_tracks(
-    conn: Any,
-    cfg: IntersectConfig,
-    spatial_context: SpatialContext,
-    transformer: CoordinateTransformer,
-    workspace: MutableMapping[str, list[TrajectoryPoint]],
-    refine_reader: RefineDatasetReader | None = None,
-) -> Iterator[tuple[str, list[TrajectoryPoint]]]:
-    """Read/project tracks once and publish them to the caller-owned workspace."""
-    read_bounds: tuple[float, float, float, float] | None = None
-    source = (
-        refine_reader.iter_tracks(cfg.source_table or cfg.db_table, batch_size=cfg.stream_batch_size)
-        if refine_reader is not None
-        else _stream_vehicle_tracks_from_db(
-            conn, table=cfg.db_table, kept_table=cfg.kept_table,
-            source_table=cfg.source_table, refine_id=cfg.refine_id,
-            spatial_context=spatial_context,
-        )
-    )
-    try:
-        for track in source:
-            for point in track:
-                if not (math.isfinite(point.lon) and math.isfinite(point.lat)):
-                    raise V2Error("DB point has non-finite longitude/latitude")
-                if (point.x is None) != (point.y is None):
-                    raise V2Error("DB point has incomplete processing x/y")
-                if point.x is not None and not (
-                    math.isfinite(point.x) and math.isfinite(point.y)  # type: ignore[arg-type]
-                ):
-                    raise V2Error("DB point has non-finite processing x/y")
-                if not (-180.0 <= point.lon <= 180.0 and -90.0 <= point.lat <= 90.0):
-                    raise V2Error("DB point longitude/latitude is outside EPSG:4326")
-                point_bounds = (point.lon, point.lat, point.lon, point.lat)
-                read_bounds = (
-                    point_bounds
-                    if read_bounds is None
-                    else (
-                        min(read_bounds[0], point.lon),
-                        min(read_bounds[1], point.lat),
-                        max(read_bounds[2], point.lon),
-                        max(read_bounds[3], point.lat),
-                    )
-                )
-            subtrack_index = (
-                track[0].refined_point_ref.subtrack_index
-                if track[0].refined_point_ref is not None
-                else 1
-            )
-            track_key = f"{track[0].vehicle_id}\x00{subtrack_index}"
-            track = _project_tracks(
-                {track_key: track}, transformer, trust_existing=True
-            )[track_key]
-            if any(
-                point.x is None or point.y is None
-                or not math.isfinite(point.x) or not math.isfinite(point.y)
-                for point in track
-            ):
-                raise V2Error("DB point could not provide finite processing x/y")
-            workspace[track_key] = track
-            yield track_key, track
-        if read_bounds is not None:
-            transformer.validate_bounds(read_bounds)
-    finally:
-        close = getattr(source, "close", None)
-        if close is not None:
-            close()
-
-
-def _load_tracks_and_turn_candidates(
-    conn: Any,
-    cfg: IntersectConfig,
-    spatial_context: SpatialContext,
-    transformer: CoordinateTransformer,
-    *,
-    live_status: Any = None,
-    perf: PerfTracker | None = None,
-    workspace: MutableMapping[str, list[TrajectoryPoint]] | None = None,
-    event_store: TurnEventRelation | None = None,
-    refine_reader: RefineDatasetReader | None = None,
-    populate_workspace: bool = True,
-) -> tuple[Sequence[TurnEvent], MutableMapping[str, list[TrajectoryPoint]]]:
-    """Wire the DB reader, track scheduler and candidate collector together."""
-    tracks: MutableMapping[str, list[TrajectoryPoint]] = workspace if workspace is not None else {}
-    if refine_reader is not None:
-        events: list[TurnEvent] | TurnEventRelation = (
-            [] if event_store is None else event_store
-        )
-        if cfg.use_turn_events:
-            for event in refine_reader.iter_turn_candidates(
-                cfg.source_table or cfg.db_table, cfg, batch_size=cfg.stream_batch_size,
-            ):
-                if event_store is None:
-                    events.append(event)
-                else:
-                    event_store.append(event)
-        if event_store is not None:
-            event_store.seal()
-        if populate_workspace:
-            with closing(_iter_prepared_db_tracks(
-                conn, cfg, spatial_context, transformer, tracks, refine_reader,
-            )) as source:
-                for _key, _track in source:
-                    pass
-        turn_events = events
-    else:
-        with closing(_iter_prepared_db_tracks(
-            conn, cfg, spatial_context, transformer, tracks,
-        )) as source:
-            turn_events = extract_turn_candidates(
-                iter_track_patches(source, cfg.stream_batch_size),
-                cfg, live_status=live_status, perf=perf, event_store=event_store,
-            )
-    return turn_events, tracks
-
-
-def _db_global_grid_cell_cap(cfg: IntersectConfig) -> int:
-    """Choose a bounded cap that covers segments fitting the former DB window."""
-    if cfg.cross_track_grid_cell_m <= 0.0:
-        return cfg.cross_track_max_grid_cells_per_segment
-    padded_width = cfg.spatial_window_size[0] * (
-        1.0 + 2.0 * max(0.0, cfg.spatial_window_overlap)
-    )
-    padded_height = cfg.spatial_window_size[1] * (
-        1.0 + 2.0 * max(0.0, cfg.spatial_window_overlap)
-    )
-    cells_x = math.ceil(padded_width / cfg.cross_track_grid_cell_m) + 1
-    cells_y = math.ceil(padded_height / cfg.cross_track_grid_cell_m) + 1
-    return max(cfg.cross_track_max_grid_cells_per_segment, cells_x * cells_y)
-
-
 def _point_window_indexes(
     value: float,
     *,
@@ -1051,73 +912,22 @@ def _extract_cross_track_memory_windows(
     return candidates
 
 
-def _extract_cross_track_db_workspace(
-    tracks: dict[str, list[TrajectoryPoint]],
+def _extract_cross_track_db(
+    reader: RefineDatasetReader,
     cfg: IntersectConfig,
-    extent: tuple[float, float, float, float],
     transformer: CoordinateTransformer,
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
     candidate_store: CrossCandidateRelation | None = None,
-    refine_reader: RefineDatasetReader | None = None,
 ) -> Sequence[CrossTrackCandidate]:
-    """Use bounded disk broad phase for DB runs; retain handle benchmark seams."""
+    """Extract DB-mode candidates exclusively through the columnar reader."""
     if not cfg.use_cross_track_candidates:
         return []
-    if refine_reader is not None:
-        return extract_columnar_cross_track_candidates(
-            refine_reader, cfg.source_table or cfg.db_table, transformer, cfg,
-            live_status=live_status, candidate_store=candidate_store,
-        )
-    if isinstance(tracks, DetectWorkspace):
-        return extract_disk_cross_track_candidates(
-            tracks, transformer, cfg, live_status=live_status, perf=perf,
-            candidate_store=candidate_store,
-        )
-    global_cfg = replace(
-        cfg,
-        cross_track_max_grid_cells_per_segment=_db_global_grid_cell_cap(cfg),
+    return extract_columnar_cross_track_candidates(
+        reader, cfg.source_table or cfg.db_table, transformer, cfg,
+        live_status=live_status, candidate_store=candidate_store,
     )
-    telemetry: dict[str, int | float] = {}
-    fallback_reason: str | None = None
-    try:
-        candidates, _, _ = extract_cross_track_candidates(
-            tracks,
-            transformer,
-            global_cfg,
-            live_status=live_status,
-            perf=perf,
-            telemetry=telemetry,
-            max_grid_memberships=_DB_GLOBAL_GRID_MEMBERSHIP_LIMIT,
-            max_overflow_pair_space=_DB_GLOBAL_OVERFLOW_PAIR_LIMIT,
-        )
-    except CrossTrackCapacityError as exc:
-        fallback_reason = str(exc)
-
-    if fallback_reason is not None:
-        log_info(
-            "    全局空间索引超出预算，切换内存分窗 / "
-            "Global index over budget; using memory windows: "
-            f"{fallback_reason}"
-        )
-        return _extract_cross_track_memory_windows(
-            tracks,
-            cfg,
-            extent,
-            transformer,
-            live_status=live_status,
-            perf=perf,
-        )
-
-    log_info(
-        "    全局空间索引 / Global spatial index: "
-        f"cap={global_cfg.cross_track_max_grid_cells_per_segment:,}, "
-        f"memberships={int(telemetry.get('grid_memberships_estimate', 0)):,}, "
-        f"overflow={int(telemetry.get('overflow_segments', 0)):,}, "
-        f"{len(candidates):,} 候选/candidates"
-    )
-    return candidates
 
 
 def _extract_cross_track_windows(
@@ -1459,9 +1269,7 @@ def _build_topologies_from_tracks(
             clusters, windows, refine_reader, cfg, transformer,
             live_status=live_status, perf=perf, started_at=t0,
         )
-    if isinstance(tracks, DetectWorkspace):
-        point_index = None
-    elif perf is None:
+    if perf is None:
         point_index = _build_topology_point_index(tracks)
     else:
         with perf.stage("topology_index_points"):
@@ -1484,24 +1292,18 @@ def _build_topologies_from_tracks(
             cfg.min_intersection_radius_m,
             cluster.radius_m + cfg.topology_radius_padding_m,
         )
-        if isinstance(tracks, DetectWorkspace):
-            observations, crossing_points = _extract_disk_entry_exit_observations(
-                tracks, windows[cluster_index], cluster=cluster,
-                transformer=transformer, radius_m=radius, bearing_window=cfg.bearing_window,
-            )
+        if perf is None:
+            nearby_tracks = point_index.tracks_in(windows[cluster_index])
         else:
-            if perf is None:
+            with perf.stage("topology_route_window"):
                 nearby_tracks = point_index.tracks_in(windows[cluster_index])
-            else:
-                with perf.stage("topology_route_window"):
-                    nearby_tracks = point_index.tracks_in(windows[cluster_index])
-            observations, crossing_points = _extract_entry_exit_observations_batch(
-                nearby_tracks,
-                cluster=cluster,
-                transformer=transformer,
-                radius_m=radius,
-                bearing_window=cfg.bearing_window,
-            )
+        observations, crossing_points = _extract_entry_exit_observations_batch(
+            nearby_tracks,
+            cluster=cluster,
+            transformer=transformer,
+            radius_m=radius,
+            bearing_window=cfg.bearing_window,
+        )
         cluster = replace(cluster, crossing_points=tuple(crossing_points))
         topology, annotated, cluster_observations = _build_topology_for_cluster(
             cluster, observations, cfg,
@@ -1597,30 +1399,6 @@ def _build_topologies_from_reader(
 
 
 
-def _extract_disk_entry_exit_observations(
-    workspace: DetectWorkspace,
-    window: SpatialWindow,
-    **kwargs: Any,
-) -> tuple[list[EntryExitObservation], list[CrossingPoint]]:
-    observations: list[EntryExitObservation] = []
-    crossings: list[CrossingPoint] = []
-    for key, track in workspace.iter_nearby_tracks(window):
-        track_observations, track_crossings = _extract_entry_exit_observations_batch(
-            {key: track}, **kwargs,
-        )
-        offset = len(crossings)
-        crossings.extend(replace(point, crossing_calculate_index=offset + point.crossing_calculate_index)
-                         for point in track_crossings)
-        observations.extend(replace(
-            item,
-            entry_crossing_calculate_index=(None if item.entry_crossing_calculate_index is None
-                                            else offset + item.entry_crossing_calculate_index),
-            exit_crossing_calculate_index=(None if item.exit_crossing_calculate_index is None
-                                           else offset + item.exit_crossing_calculate_index),
-        ) for item in track_observations)
-    return observations, crossings
-
-
 def _detect_intersections_db(
     conn: Any,
     cfg: IntersectConfig,
@@ -1630,22 +1408,17 @@ def _detect_intersections_db(
     data_root: str | Path,
     refine_reader: RefineDatasetReader | None = None,
 ) -> IntersectResult:
-    """Close track storage after Detect; transfer event storage to its result."""
+    """Run columnar DB Detect and transfer relation ownership to its result."""
+    if refine_reader is None:
+        raise V2Error("formal DB Detect requires a RefineDatasetReader")
     event_store = TurnEventRelation(runtime, data_root)
     candidate_store = None
     try:
         candidate_store = CrossCandidateRelation(runtime, data_root)
-        if refine_reader is not None:
-            result = _detect_intersections_db_workspace(
-                conn, cfg, spatial_context, {}, event_store=event_store,
-                candidate_store=candidate_store, refine_reader=refine_reader,
-            )
-        else:
-            with DetectWorkspace(cfg) as workspace:
-                result = _detect_intersections_db_workspace(
-                    conn, cfg, spatial_context, workspace, event_store=event_store,
-                    candidate_store=candidate_store,
-                )
+        result = _run_columnar_db_detect(
+            cfg, spatial_context, refine_reader, event_store=event_store,
+            candidate_store=candidate_store,
+        )
         if result.turn_events is not event_store:
             # Empty input and test/reference seams can return in-memory output.
             event_store.close()
@@ -1661,23 +1434,17 @@ def _detect_intersections_db(
         raise
 
 
-def _detect_intersections_db_workspace(
-    conn: Any,
+def _run_columnar_db_detect(
     cfg: IntersectConfig,
     spatial_context: SpatialContext,
-    workspace: DetectWorkspace,
+    refine_reader: RefineDatasetReader,
     *,
     event_store: TurnEventRelation | None = None,
     candidate_store: CrossCandidateRelation | None = None,
-    refine_reader: RefineDatasetReader | None = None,
 ) -> IntersectResult:
-    """DB Detect stages share a disk workspace and unchanged global clustering."""
+    """Run DB Detect through Refine columnar readers and bounded relations."""
     # ── Spatial extent ──────────────────────────────────────────────
-    extent = refine_reader.extent() if refine_reader is not None else _query_spatial_extent(
-        conn, table=cfg.db_table, kept_table=cfg.kept_table,
-        source_table=cfg.source_table, refine_id=cfg.refine_id,
-        spatial_context=spatial_context,
-    )
+    extent = refine_reader.extent()
     if extent is None:
         return _empty_intersect_result(spatial_context)
 
@@ -1693,12 +1460,24 @@ def _detect_intersections_db_workspace(
                     detail="读取轨迹并提取转向候选...")
     t_stage = time.perf_counter()
     with tracker.stage("load_tracks_and_turn_candidates"):
-        turn_events, tracks = _load_tracks_and_turn_candidates(
-            conn, cfg, spatial_context, transformer,
-            live_status=live, perf=tracker, workspace=workspace, event_store=event_store,
-            refine_reader=refine_reader,
-            populate_workspace=refine_reader is None,
-        )
+        turn_events: Sequence[TurnEvent] = [] if event_store is None else event_store
+        if cfg.use_turn_events:
+            iterator = iter(refine_reader.iter_turn_candidates(
+                cfg.source_table or cfg.db_table, cfg, batch_size=cfg.stream_batch_size,
+            ))
+            try:
+                for event in iterator:
+                    if event_store is not None:
+                        event_store.append(event)
+                    else:
+                        turn_events.append(event)
+                event = None
+            finally:
+                close = getattr(iterator, "close", None)
+                if close is not None:
+                    close()
+        if event_store is not None:
+            event_store.seal()
     if live is not None:
         live.update(
             detail=f"Turn events: {len(turn_events):,}",
@@ -1708,15 +1487,13 @@ def _detect_intersections_db_workspace(
     # ── Stream globally indexed disk segment pairs ────────────────
     t_stage = time.perf_counter()
     with tracker.stage("cross_track_global"):
-        cross_candidates = _extract_cross_track_db_workspace(
-            tracks,
+        cross_candidates = _extract_cross_track_db(
+            refine_reader,
             cfg,
-            extent,
             transformer,
             live_status=live,
             perf=tracker,
             candidate_store=candidate_store,
-            refine_reader=refine_reader,
         )
 
     # ── Shared: cluster pipeline (G* + DBSCAN + merge + ablation) ───
@@ -1743,7 +1520,7 @@ def _detect_intersections_db_workspace(
     t_stage = time.perf_counter()
     with tracker.stage("topology_index"):
         topologies, annotated_clusters, observations = _build_topologies_from_tracks(
-            annotated_clusters, tracks, cfg, transformer,
+            annotated_clusters, {}, cfg, transformer,
             live_status=live, perf=tracker,
             refine_reader=refine_reader,
         )
@@ -1764,8 +1541,7 @@ def _detect_intersections_db_workspace(
         report=_build_intersect_report(
             annotated_clusters, topologies,
             turn_events, hotspot_events, cross_candidates,
-            track_count=(refine_reader.track_count()
-                         if refine_reader is not None else len(tracks)),
+            track_count=refine_reader.track_count(),
         ),
         spatial_context=spatial_context,
     )

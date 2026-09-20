@@ -14,7 +14,6 @@ from track.v2.db.queries import SpatialWindowIterator
 from track.v2.detect import (
     IntersectConfig,
     _cross_track_candidate_key,
-    _extract_cross_track_db_workspace,
     _extract_cross_track_memory_windows,
     _extract_cross_track_windows,
     _project_tracks,
@@ -114,74 +113,6 @@ def test_capacity_guard_runs_before_grid_allocation() -> None:
                 cfg,
                 max_overflow_pair_space=1,
             )
-
-
-def test_db_workspace_prefers_capacity_guarded_global_index() -> None:
-    cfg = IntersectConfig()
-    tracks = _crossing_tracks()
-    extent = _projected_bounds(115.99, 38.99, 116.01, 39.01)
-
-    with patch(
-        "track.v2.detect.extract_cross_track_candidates",
-        return_value=([], 1, 1),
-    ) as global_extract, patch(
-        "track.v2.detect._extract_cross_track_memory_windows",
-        side_effect=AssertionError("fallback must not run"),
-    ):
-        assert _extract_cross_track_db_workspace(
-            tracks, cfg, extent, _TRANSFORMER,
-        ) == []
-
-    call = global_extract.call_args
-    assert call.args[1] is _TRANSFORMER
-    global_cfg = call.args[2]
-    assert global_cfg.cross_track_max_grid_cells_per_segment > (
-        cfg.cross_track_max_grid_cells_per_segment
-    )
-    assert call.kwargs["max_grid_memberships"] > 0
-    assert call.kwargs["max_overflow_pair_space"] > 0
-
-
-def test_db_workspace_capacity_failure_uses_memory_not_sql() -> None:
-    cfg = IntersectConfig()
-    tracks = _crossing_tracks()
-    extent = _projected_bounds(115.99, 38.99, 116.01, 39.01)
-    sentinel = [object()]
-
-    with patch(
-        "track.v2.detect.extract_cross_track_candidates",
-        side_effect=CrossTrackCapacityError("too dense"),
-    ), patch(
-        "track.v2.detect._extract_cross_track_memory_windows",
-        return_value=sentinel,
-    ) as fallback:
-        assert _extract_cross_track_db_workspace(
-            tracks, cfg, extent, _TRANSFORMER,
-        ) is sentinel
-
-    fallback.assert_called_once_with(
-        tracks,
-        cfg,
-        extent,
-        _TRANSFORMER,
-        live_status=None,
-        perf=None,
-    )
-
-
-def test_db_workspace_respects_disabled_cross_track_method() -> None:
-    cfg = IntersectConfig(use_cross_track_candidates=False)
-
-    with patch(
-        "track.v2.detect.extract_cross_track_candidates",
-        side_effect=AssertionError("Method 3 must stay disabled"),
-    ):
-        assert _extract_cross_track_db_workspace(
-            _crossing_tracks(),
-            cfg,
-            _projected_bounds(115.99, 38.99, 116.01, 39.01),
-            _TRANSFORMER,
-        ) == []
 
 
 def test_memory_windows_match_legacy_window_queries() -> None:

@@ -60,7 +60,7 @@
 | C10a4 | Detect 正式接线并删除旧跨轨迹成员暂存 | C10a3 | 每提交 ≤700 | 已完成（`e753f71`） |
 | C10b1 | Topology 窗口 Refine reader | C10a4 | 每提交 ≤700 | 已完成 |
 | C10b2 | Topology 正式接线 | C10b1 | 每提交 ≤700 | 已完成，待主对话确认 |
-| C10b3 | DetectWorkspace 列式迁移及旧工作区删除 | C10b2 | 每提交 ≤700 | 未开始 |
+| C10b3 | Detect 列式迁移及旧工作区删除 | C10b2 | 每提交 ≤700 | 已完成（待主对话确认） |
 | C10c | WriterWorkspace 列式迁移及旧工作区删除 | C10b3 | 每提交 ≤700 | 未开始 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 未开始 |
 | C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 未开始 |
@@ -466,7 +466,7 @@ psycopg 事务兼容与输出字段不变。DuckDB 负责片段关系的重复�
 
 范围：为 Refine Parquet reader 增加基于真实相邻线段包围盒命中的完整子轨迹流式读取，
 并将其 DuckDB 临时目录约束到显式数据根目录下的独占叶目录。本卡不改 Detect 编排，
-不删除 `DetectWorkspace`。
+不删除当时仍由 Detect 使用的旧磁盘工作区。
 
 验证：闭区间边界、长穿窗、窗口与轨迹去重、完整顺序、损坏输入、有界读取及临时目录隔离。
 
@@ -481,9 +481,11 @@ psycopg 事务兼容与输出字段不变。DuckDB 负责片段关系的重复�
 
 提交：待记录。
 
-### C10b3 — DetectWorkspace 列式迁移及旧工作区删除
+### C10b3 — Detect 列式迁移及旧工作区删除
 
-范围：迁移剩余 Detect 工作区磁盘暂存并删除无调用者的旧工作区，保持阶段边界。
+范围：正式 DB Detect 已收敛到 `RefineDatasetReader`、`CrossCandidateRelation` 与
+Topology 窗口读取路径，并删除 SQLite 工作区、磁盘候选提取器及 PostgreSQL 直接读取
+回退路径；handle 与纯内存参考接口保持不变。已完成，待主对话确认。
 
 验证：Topology、Detect 持久化、Replay 与 Backend 字段回归。
 

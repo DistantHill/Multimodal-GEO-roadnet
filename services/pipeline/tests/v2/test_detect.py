@@ -48,6 +48,7 @@ from track.v2.detect import (
     _detect_turn_events,
     _detect_intersections_db,
     _extract_entry_exit_observations_batch,
+    _extract_cross_track_db,
     _extract_cross_track_windows,
     _getis_local_counts_grid,
     _getis_local_counts_scan,
@@ -60,10 +61,6 @@ from track.v2.detect import (
     _nearest_angle_id,
     _project_tracks,
     _run_dbscan,
-    _load_tracks_and_turn_candidates,
-    _extract_cross_track_db_workspace,
-    _iter_prepared_db_tracks,
-    _stream_vehicle_tracks_from_db,
     _topology_point_windows,
     _query_active_points_in_window,
     _select_hotspot_events,
@@ -84,6 +81,7 @@ from track.v2.models import (
     TurnEvent,
 )
 from track.v2.db.source_table import SourceTableContract
+from track.v2.db.queries import _stream_vehicle_tracks_from_db
 from track.v2.parser import CsvSource, get_database
 from track.v2.projection import (
     CoordinateTransformer,
@@ -1065,13 +1063,11 @@ class ProjectionContextContractTest(unittest.TestCase):
             self.assertAlmostEqual(actual[1], expected[1], places=7)
 
     def test_formal_db_detect_requires_refine_before_any_data_query(self):
-        with patch("track.v2.detect._query_spatial_extent") as extent:
-            with self.assertRaisesRegex(V2Error, "requires refine_id"):
-                detect_intersections(
-                    conn=object(),
-                    config=IntersectConfig(query_active_from_db=True),
-                )
-        extent.assert_not_called()
+        with self.assertRaisesRegex(V2Error, "requires refine_id"):
+            detect_intersections(
+                conn=object(),
+                config=IntersectConfig(query_active_from_db=True),
+            )
 
     def test_formal_db_detect_requires_runtime_and_data_root(self):
         refine = SimpleNamespace(
@@ -1088,7 +1084,7 @@ class ProjectionContextContractTest(unittest.TestCase):
                 config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
             )
 
-    def test_formal_db_detect_inherits_context_and_checks_empty_source(self):
+    def test_formal_db_detect_requires_columnar_reader(self):
         refine = SimpleNamespace(
             refine_id="refine-1", source_table="raw_points", status="completed",
             spatial_context=_TEST_SPATIAL_CONTEXT, source_fingerprint={"version": 1},
@@ -1096,17 +1092,15 @@ class ProjectionContextContractTest(unittest.TestCase):
         with (
             patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
             patch("track.v2.detect.verify_refine_source_fingerprint") as fingerprint,
-            patch("track.v2.detect._query_spatial_extent", return_value=None) as extent,
+            self.assertRaisesRegex(V2Error, "RefineDatasetReader"),
         ):
-            result = detect_intersections(
+            detect_intersections(
                 conn=object(),
                 config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
                 runtime=RuntimeConfig(), data_root=Path(tempfile.mkdtemp()),
             )
 
         fingerprint.assert_called_once_with(ANY, "refine-1")
-        self.assertEqual(extent.call_args.kwargs["table"], "raw_points")
-        self.assertEqual(result.spatial_context, _TEST_SPATIAL_CONTEXT)
 
     def test_formal_parquet_detect_rejects_fingerprint_mismatch_without_pg_scan(self):
         refine = SimpleNamespace(
@@ -1136,31 +1130,13 @@ class ProjectionContextContractTest(unittest.TestCase):
     def test_formal_parquet_empty_extent_avoids_pg_point_queries(self):
         reader = MagicMock()
         reader.extent.return_value = None
-        with (
-            patch("track.v2.detect._query_spatial_extent") as extent,
-            patch("track.v2.detect._stream_vehicle_tracks_from_db") as stream,
-        ):
-            result = _detect_intersections_db(
-                object(), IntersectConfig(), _TEST_SPATIAL_CONTEXT,
-                runtime=RuntimeConfig(), data_root=Path(tempfile.mkdtemp()),
-                refine_reader=reader,
-            )
-        extent.assert_not_called()
-        stream.assert_not_called()
+        result = _detect_intersections_db(
+            object(), IntersectConfig(), _TEST_SPATIAL_CONTEXT,
+            runtime=RuntimeConfig(), data_root=Path(tempfile.mkdtemp()),
+            refine_reader=reader,
+        )
         reader.iter_tracks.assert_not_called()
         self.assertEqual(result.report.track_count, 0)
-
-    def test_formal_parquet_tracks_do_not_use_pg_stream(self):
-        reader = MagicMock()
-        reader.iter_tracks.return_value = iter(())
-        cfg = IntersectConfig(source_table="raw_points", stream_batch_size=17)
-        with patch("track.v2.detect._stream_vehicle_tracks_from_db") as stream:
-            tracks = list(_iter_prepared_db_tracks(
-                object(), cfg, _TEST_SPATIAL_CONTEXT, _TEST_TRANSFORMER, {}, reader,
-            ))
-        self.assertEqual(tracks, [])
-        reader.iter_tracks.assert_called_once_with("raw_points", batch_size=17)
-        stream.assert_not_called()
 
     def test_formal_parquet_cross_track_uses_columnar_pairs_not_disk_index(self):
         reader = MagicMock()
@@ -1168,25 +1144,21 @@ class ProjectionContextContractTest(unittest.TestCase):
         with (
             patch("track.v2.detect.extract_columnar_cross_track_candidates",
                   return_value=expected) as columnar,
-            patch("track.v2.detect.extract_disk_cross_track_candidates") as disk,
             patch("track.v2.candidate_extraction._prepare_segments") as prepare,
             patch("track.v2.candidate_extraction.build_cross_track_index") as build_index,
         ):
-            actual = _extract_cross_track_db_workspace(
-                {}, IntersectConfig(source_table="source"), (0, 0, 1, 1),
-                _TEST_TRANSFORMER, refine_reader=reader,
+            actual = _extract_cross_track_db(
+                reader, IntersectConfig(source_table="source"), _TEST_TRANSFORMER,
             )
         self.assertIs(actual, expected)
         columnar.assert_called_once()
-        disk.assert_not_called()
         prepare.assert_not_called()
         build_index.assert_not_called()
 
     def test_disabled_formal_parquet_cross_track_does_not_read_pair_planner(self):
         reader = MagicMock()
-        actual = _extract_cross_track_db_workspace(
-            {}, IntersectConfig(use_cross_track_candidates=False), (0, 0, 1, 1),
-            _TEST_TRANSFORMER, refine_reader=reader,
+        actual = _extract_cross_track_db(
+            reader, IntersectConfig(use_cross_track_candidates=False), _TEST_TRANSFORMER,
         )
         self.assertEqual(actual, [])
         reader.iter_cross_track_pair_batches.assert_not_called()
@@ -1223,14 +1195,12 @@ class ProjectionContextContractTest(unittest.TestCase):
             with (
                 self.subTest(status=status, fingerprint=fingerprint),
                 patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
-                patch("track.v2.detect._query_spatial_extent") as extent,
             ):
                 with self.assertRaisesRegex(V2Error, "completed immutable-source"):
                     detect_intersections(
                         conn=object(),
                         config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
                     )
-                extent.assert_not_called()
 
         refine = SimpleNamespace(
             refine_id="refine-1", source_table="raw_points", status="completed",
@@ -1283,38 +1253,6 @@ class ProjectionContextContractTest(unittest.TestCase):
             (projected["v1"][0].x, projected["v1"][0].y),
             (12_345.25, -98_765.5),
         )
-
-    def test_db_stream_validates_existing_xy_and_accumulated_bounds(self):
-        valid_x, valid_y = _TEST_TRANSFORMER.forward(116.0, 39.0)
-        bad_xy = replace(
-            _make_point("v1", "bad", 1.0, 116.0, 39.0, 0.0, 8.0),
-            x=float("nan"), y=valid_y,
-        )
-        with patch(
-            "track.v2.detect._stream_vehicle_tracks_from_db",
-            return_value=iter([[bad_xy]]),
-        ):
-            with self.assertRaisesRegex(V2Error, "non-finite processing"):
-                _load_tracks_and_turn_candidates(
-                    object(), IntersectConfig(), _TEST_SPATIAL_CONTEXT, _TEST_TRANSFORMER,
-                )
-
-        outside = replace(
-            _make_point("v1", "outside", 1.0, 100.0, 39.0, 0.0, 8.0),
-            x=valid_x, y=valid_y,
-        )
-        with patch(
-            "track.v2.detect._stream_vehicle_tracks_from_db",
-            return_value=iter([[outside]]),
-        ):
-            strict_context = SpatialContext(
-                4326, 32650,
-                {"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": .01},
-            )
-            with self.assertRaisesRegex(ProjectionError, "area of use|scale distortion"):
-                _load_tracks_and_turn_candidates(
-                    object(), IntersectConfig(), strict_context, CoordinateTransformer(strict_context),
-                )
 
     def test_half_populated_projected_coordinate_is_rejected(self):
         point = replace(
@@ -1431,39 +1369,6 @@ class TurnDetectionTest(unittest.TestCase):
         self.assertEqual(events, [])
         self.assertEqual(hotspots, [])
         self.assertEqual(clusters, [])
-
-    def test_db_stream_and_in_memory_turn_detection_match(self):
-        origin_lon, origin_lat = 116.391, 39.907
-        track = _build_track_through_intersection(
-            "v1", origin_lon, origin_lat,
-            approach_bearing=0.0, exit_bearing=90.0,
-        )
-        track[4] = replace(
-            track[4],
-            point_ref=PointRef(
-                "public.injected_points", "282", stable=False,
-                from_ref="21022680", to_ref="21022681",
-                generated_reason=GeneratedReason.HEADING_ORTHOGONAL,
-            ),
-        )
-        cfg = IntersectConfig(
-            use_cross_track_candidates=False,
-            min_leg_m=20.0,
-            min_movement_speed_mps=1.0,
-        )
-        projected = _with_processing_xy({"v1": track})
-        expected = _detect_turn_events(projected, cfg)
-
-        with patch(
-            "track.v2.detect._stream_vehicle_tracks_from_db",
-            return_value=iter([track]),
-        ):
-            actual, workspace = _load_tracks_and_turn_candidates(
-                object(), cfg, _TEST_SPATIAL_CONTEXT, _TEST_TRANSFORMER,
-            )
-
-        self.assertEqual(actual, expected)
-        self.assertEqual(workspace["v1\x001"], projected["v1"])
 
     def test_straight_line_no_turns(self):
         """I2-05: A vehicle on a straight line generates 0 turn events."""
@@ -2385,12 +2290,7 @@ class TopologyExtractionTest(unittest.TestCase):
             source_table="source", use_turn_events=False,
             use_cross_track_candidates=False,
         )
-        with tempfile.TemporaryDirectory() as directory, patch(
-            "track.v2.detect.DetectWorkspace", side_effect=AssertionError("workspace"),
-        ), patch(
-            "track.v2.detect._stream_vehicle_tracks_from_db",
-            side_effect=AssertionError("PG active query"),
-        ):
+        with tempfile.TemporaryDirectory() as directory:
             result = _detect_intersections_db(
                 object(), cfg, _TEST_SPATIAL_CONTEXT,
                 runtime=RuntimeConfig(), data_root=directory, refine_reader=reader,
@@ -2596,12 +2496,10 @@ class TopologyExtractionTest(unittest.TestCase):
         self.assertEqual(_nearest_angle_id(179.0, centers), 2)  # nearest to 180°
         self.assertEqual(_nearest_angle_id(272.0, centers), 3)  # nearest to 270°
 
-    def test_db_mode_reuses_streamed_tracks_for_topology(self):
-        """DB Detect passes its one workspace to topology without N+1 queries."""
+    def test_db_mode_routes_topology_through_columnar_reader(self):
         point = _with_processing_xy({
             "v1": [_make_point("v1", "1", 1.0, 116.0, 39.0, 0.0, 5.0)]
         })["v1"][0]
-        tracks = {"v1": [point]}
         cluster = HotspotCluster(
             cluster_calculate_index=0,
             centroid_x=point.x,
@@ -2621,11 +2519,14 @@ class TopologyExtractionTest(unittest.TestCase):
             reason="test",
         )
 
+        reader = MagicMock()
+        reader.descriptor = SimpleNamespace(
+            refine_id="refine-1", source_fingerprint_json='{"version":1}',
+        )
+        reader.extent.return_value = (115.0, 38.0, 117.0, 40.0)
+        reader.iter_turn_candidates.return_value = iter(())
+        reader.track_count.return_value = 1
         with (
-            patch(
-                "track.v2.detect._query_spatial_extent",
-                return_value=(115.0, 38.0, 117.0, 40.0),
-            ),
             patch(
                 "track.v2.detect.fetch_refine_run_row",
                 return_value=SimpleNamespace(
@@ -2636,13 +2537,8 @@ class TopologyExtractionTest(unittest.TestCase):
                     source_fingerprint={"version": 1},
                 ),
             ),
-            patch("track.v2.detect.verify_refine_source_fingerprint"),
             patch(
-                "track.v2.detect._load_tracks_and_turn_candidates",
-                return_value=([], tracks),
-            ),
-            patch(
-                "track.v2.detect._extract_cross_track_db_workspace",
+                "track.v2.detect._extract_cross_track_db",
                 return_value=[],
             ),
             patch(
@@ -2658,9 +2554,11 @@ class TopologyExtractionTest(unittest.TestCase):
                 conn=object(),
                 config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
                 runtime=RuntimeConfig(), data_root=Path(tempfile.mkdtemp()),
+                refine_reader=reader,
             )
 
-        self.assertIs(build_topologies.call_args.args[1], tracks)
+        self.assertEqual(build_topologies.call_args.args[1], {})
+        self.assertIs(build_topologies.call_args.kwargs["refine_reader"], reader)
         self.assertEqual(result.topologies, [topology])
 
 
