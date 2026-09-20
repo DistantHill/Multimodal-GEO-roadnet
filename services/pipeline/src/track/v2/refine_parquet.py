@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 from collections.abc import Iterator
@@ -17,7 +18,7 @@ from track.v2.artifact_publication import StagingDataset, _validate_handle
 from track.v2.config import PostgresConfig
 from track.v2.db.artifact_registry import ArtifactDescriptor
 from track.v2.db.source_table import SourceTableContract, validate_source_table
-from track.v2.models import RuntimeConfig
+from track.v2.models import PointRef, RefinedPointRef, RuntimeConfig, TrajectoryPoint
 from track.v2.projection import spatial_context_from_values
 
 
@@ -110,6 +111,117 @@ class RefineDatasetReader:
         result = self._connection.execute(query, [vehicle_id, subtrack_index])
         while rows := result.fetchmany(batch_size):
             yield tuple(rows)
+
+    def extent(self) -> tuple[float, float, float, float] | None:
+        """Return processing-CRS bounds without materializing dataset rows."""
+        connection = self._require_open()
+        row = connection.execute("""
+          SELECT min(x), min(y), max(x), max(y) FROM (
+            SELECT x, y FROM kept_points UNION ALL
+            SELECT x, y FROM injected_points
+          ) points
+        """).fetchone()
+        if row is None or row[0] is None:
+            return None
+        extent = tuple(float(value) for value in row)
+        if not all(math.isfinite(value) for value in extent):
+            raise RefineParquetError("dataset extent contains non-finite coordinates")
+        return extent  # type: ignore[return-value]
+
+    def iter_tracks(
+        self, source_table: str, *, batch_size: int = 4096,
+    ) -> Iterator[list[TrajectoryPoint]]:
+        """Yield validated Detect input, retaining at most one track and one batch."""
+        connection = self._require_open()
+        if not isinstance(source_table, str) or not source_table.strip():
+            raise RefineParquetError("source_table is required")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise RefineParquetError("batch_size is invalid")
+        result = connection.execute("""
+          SELECT refine_id, point_id, vehicle_id, subtrack_index,
+                 refined_sequence_in_subtrack, timestamp, lon, lat, x, y,
+                 heading, speed, point_kind, source_row_key, generated_reason,
+                 after_sequence_in_subtrack,
+                 count(DISTINCT vehicle_id) OVER (PARTITION BY subtrack_index)
+          FROM (
+            SELECT *, 'kept'::VARCHAR AS point_kind,
+                   NULL::VARCHAR AS generated_reason,
+                   NULL::INTEGER AS after_sequence_in_subtrack
+            FROM kept_points
+            UNION ALL BY NAME
+            SELECT *, 'injected'::VARCHAR AS point_kind,
+                   NULL::VARCHAR AS source_row_key
+            FROM injected_points
+          ) points
+          ORDER BY vehicle_id, subtrack_index, refined_sequence_in_subtrack,
+                   point_kind, point_id
+        """)
+        current_key: tuple[str, int] | None = None
+        track: list[TrajectoryPoint] = []
+        while rows := result.fetchmany(batch_size):
+            for row in rows:
+                point, key = self._decode_row(row, source_table, len(track), current_key)
+                if current_key is not None and key != current_key:
+                    yield track
+                    track = []
+                    point, key = self._decode_row(row, source_table, 0, None)
+                current_key = key
+                track.append(point)
+        if track:
+            yield track
+
+    def _require_open(self) -> duckdb.DuckDBPyConnection:
+        if self._connection is None:
+            raise RefineParquetError("dataset reader is not open")
+        return self._connection
+
+    def _decode_row(
+        self, row: tuple[Any, ...], source_table: str, expected_sequence: int,
+        current_key: tuple[str, int] | None,
+    ) -> tuple[TrajectoryPoint, tuple[str, int]]:
+        if len(row) != 17 or row[0] != self._descriptor.refine_id:
+            raise RefineParquetError("row owner differs from descriptor owner")
+        kind, point_id, vehicle_id = row[12], row[1], row[2]
+        if kind not in ("kept", "injected") or not isinstance(vehicle_id, str) or not vehicle_id:
+            raise RefineParquetError("row identity is invalid")
+        if isinstance(point_id, bool) or not isinstance(point_id, int):
+            raise RefineParquetError("point identity is invalid")
+        subtrack_index, sequence = row[3], row[4]
+        if (isinstance(subtrack_index, bool) or not isinstance(subtrack_index, int)
+                or subtrack_index < 0 or isinstance(sequence, bool)
+                or not isinstance(sequence, int) or sequence < 0):
+            raise RefineParquetError("subtrack identity is invalid")
+        if row[16] != 1:
+            raise RefineParquetError("subtrack contains multiple vehicles")
+        key = (vehicle_id, subtrack_index)
+        if current_key == key and sequence != expected_sequence:
+            raise RefineParquetError("subtrack sequence is not contiguous from zero")
+        if current_key != key and sequence != 0:
+            raise RefineParquetError("subtrack sequence does not start at zero")
+        try:
+            values = tuple(float(row[index]) for index in range(5, 12))
+        except (TypeError, ValueError) as exc:
+            raise RefineParquetError("point numeric fields are invalid") from exc
+        timestamp, lon, lat, x, y, heading, speed = values
+        if not all(math.isfinite(value) for value in values):
+            raise RefineParquetError("point contains non-finite numeric fields")
+        if not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0):
+            raise RefineParquetError("point longitude/latitude is outside EPSG:4326")
+        source_row_key, reason, after_sequence = row[13], row[14], row[15]
+        if kind == "kept":
+            if not isinstance(source_row_key, str) or not source_row_key or reason is not None or after_sequence is not None:
+                raise RefineParquetError("kept point identity fields are invalid")
+            point_ref = PointRef(source_table, source_row_key, True)
+        else:
+            if source_row_key is not None or not isinstance(reason, str) or not reason or isinstance(after_sequence, bool) or not isinstance(after_sequence, int):
+                raise RefineParquetError("injected point identity fields are invalid")
+            point_ref = PointRef("public.injected_points", str(point_id), False,
+                                 generated_reason=reason)
+        return TrajectoryPoint(
+            point_ref=point_ref, vehicle_id=vehicle_id, timestamp=timestamp,
+            lon=lon, lat=lat, heading=heading, speed=speed, extra={}, x=x, y=y,
+            refined_point_ref=RefinedPointRef(kind, point_id, subtrack_index, sequence),
+        ), key
 
 
 @dataclass(frozen=True, slots=True)

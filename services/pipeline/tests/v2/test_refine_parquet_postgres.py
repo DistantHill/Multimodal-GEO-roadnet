@@ -19,9 +19,11 @@ from track.v2.artifact_publication import abandon_staging, create_staging, publi
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
 from track.v2.config import PostgresConfig
 from track.v2.db.pipeline_store import PostgresPipelineStore
+from track.v2.db.queries import _stream_vehicle_tracks_from_db
 from track.v2.db.source_table import calculate_source_fingerprint, validate_source_table
 from track.v2.models import RuntimeConfig
-from track.v2.refine_parquet import REFINE_PARQUET_V1, export_refine_parquet
+from track.v2.projection import spatial_context_from_values
+from track.v2.refine_parquet import REFINE_PARQUET_V1, RefineDatasetReader, export_refine_parquet
 
 
 pytestmark = pytest.mark.skipif(
@@ -227,6 +229,49 @@ def test_real_refine_export_publish_register_and_complete(refine_database, tmp_p
     ).fetchone() == (f"refine/{run_id}", "present")
     validate_published(tmp_path, descriptor, "present", verify_sha256=True)
     _make_writable(result.final_path)
+
+
+def test_real_reader_tracks_match_legacy_postgres_detect_input(refine_database, tmp_path) -> None:
+    conn, config, schema = refine_database
+    run_id, fingerprint = _seed(conn, schema)
+    conn.execute(
+        "UPDATE source_points SET geom=public.ST_SetSRID(public.ST_MakePoint(lon,lat),4326)"
+    )
+    conn.commit()
+    fingerprint = calculate_source_fingerprint(
+        conn, str(run_id), validate_source_table(conn, f"{schema}.source_points"),
+    )
+    handle, descriptor = _export(conn, config, tmp_path, run_id, fingerprint)
+    publish(handle)
+    source_table = f"{schema}.source_points"
+    spatial = spatial_context_from_values(4326, 32650, {
+        "coordinate_semantics_version": 2, "always_xy": True,
+        "distance_semantics": "projected_euclidean_metre",
+        "input_heading_semantics": "clockwise_degrees_from_true_north",
+        "topology_bearing_semantics": "clockwise_degrees_from_processing_grid_north",
+        "enforce_area_of_use": False, "max_scale_error": 0.05,
+    })
+    legacy = list(_stream_vehicle_tracks_from_db(
+        conn, table=source_table, kept_table=f"{schema}.kept_trajectory_points",
+        source_table=source_table, refine_id=str(run_id), spatial_context=spatial,
+    ))
+    with RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        columnar = list(reader.iter_tracks(source_table, batch_size=2))
+
+    def detect_fields(point):
+        return (
+            point.point_ref, point.vehicle_id, point.timestamp, point.lon, point.lat,
+            point.heading, point.speed, point.x, point.y, point.refined_point_ref,
+        )
+
+    assert [[detect_fields(point) for point in track] for track in columnar] == [
+        [detect_fields(point) for point in track] for track in legacy
+    ]
+    assert all(point.extra == {} for track in columnar for point in track)
+    assert any(point.extra for track in legacy for point in track if point.point_ref.stable)
+    _make_writable(handle.final_path)
 
 
 def test_exporter_independent_connection_cannot_see_uncommitted_rows(

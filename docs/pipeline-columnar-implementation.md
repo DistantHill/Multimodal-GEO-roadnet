@@ -227,12 +227,24 @@ kept/injected 合并顺序、车辆边界、稳定身份、只读校验和批次
 
 提交：本卡提交，待主对话记录哈希。
 
-### C06b — Detect 输入接线
+### C06b1 — Detect 输入适配与旧路径差分
 
-范围：让 Detect 通过 C06a reader 按车辆及子轨迹批次获取最小对象，保留现有算法语义；
-本卡不改变 Detect 算子。
+范围：在 C06a reader 上增加全数据集有界顺序读取及列式 extent 查询，逐子轨迹适配为
+现有 `TrajectoryPoint` 输入对象；保留稳定身份并严格拒绝损坏数据。本卡不切换正式
+Detect/Pipeline 入口，也不改变 Detect 算子。
 
-验证：与旧 PostgreSQL 读取路径逐轨差分，并验证批次内存边界。
+验证：跨读取批次、多个车辆及子轨迹、kept/injected 顺序、身份、extent 和损坏输入；
+真实 PostgreSQL 样本与旧读取路径逐轨差分。Parquet v1 不携带 `extra`，适配结果固定为
+空字典，差分明确排除此字段。
+
+提交：本卡提交，待主对话记录哈希。
+
+### C06b2 — Detect/Pipeline 正式接线
+
+范围：将正式 Detect/Pipeline 入口切换至 C06b1 只读接口，并保留迁移期 PostgreSQL
+回退路径；不改变 Detect 算法。
+
+验证：入口选择、生命周期与错误传播、extent 消费、端到端 Detect 回归及资源边界。
 
 提交：待记录。
 

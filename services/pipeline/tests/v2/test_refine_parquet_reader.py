@@ -21,7 +21,7 @@ def _published(tmp_path: Path):
     )
     common = (
         f"'{handle.run_id}'::UUID AS refine_id, {{point}}::BIGINT AS point_id, "
-        "'{vehicle}'::VARCHAR AS vehicle_id, 4::INTEGER AS subtrack_index, "
+        "'{vehicle}'::VARCHAR AS vehicle_id, {subtrack}::INTEGER AS subtrack_index, "
         "{sequence}::BIGINT AS refined_sequence_in_subtrack, "
         "1.0::DOUBLE AS \"timestamp\", 120.0::DOUBLE AS lon, 30.0::DOUBLE AS lat, "
         "10.0::DOUBLE AS x, 20.0::DOUBLE AS y, 90.0::DOUBLE AS heading, "
@@ -33,16 +33,17 @@ def _published(tmp_path: Path):
             directory.mkdir()
             output = directory / "part.parquet"
             if table == "kept_points":
-                rows = [common.format(point=1, vehicle="v1", sequence=0),
-                        common.format(point=3, vehicle="v1", sequence=2),
-                        common.format(point=8, vehicle="v2", sequence=0)]
+                rows = [common.format(point=1, vehicle="v1", subtrack=4, sequence=0),
+                        common.format(point=3, vehicle="v1", subtrack=4, sequence=2),
+                        common.format(point=7, vehicle="v1", subtrack=5, sequence=0),
+                        common.format(point=8, vehicle="v2", subtrack=6, sequence=0)]
                 sql = " UNION ALL ".join(
                     f"SELECT {row}, ('source-' || point_id)::VARCHAR source_row_key"
                     for row in rows
                 )
             else:
                 sql = (
-                    f"SELECT {common.format(point=2, vehicle='v1', sequence=1)}, "
+                    f"SELECT {common.format(point=2, vehicle='v1', subtrack=4, sequence=1)}, "
                     "'orthogonal'::VARCHAR generated_reason, "
                     "0::INTEGER after_sequence_in_subtrack"
                 )
@@ -76,6 +77,77 @@ def test_reader_uses_only_manifest_files_and_merges_one_vehicle_subtrack(tmp_pat
     extra.parent.chmod(0o555)
     with pytest.raises(Exception, match="manifest"):
         refine_parquet.RefineDatasetReader(tmp_path, descriptor, "present", RuntimeConfig())
+
+
+def test_reader_adapts_all_tracks_across_batches_and_queries_extent(tmp_path) -> None:
+    descriptor = _published(tmp_path)
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        tracks = list(reader.iter_tracks("public.source_points", batch_size=2))
+        assert [(track[0].vehicle_id, track[0].refined_point_ref.subtrack_index,
+                 [point.refined_point_ref.refined_sequence_in_subtrack for point in track])
+                for track in tracks] == [
+            ("v1", 4, [0, 1, 2]), ("v1", 5, [0]), ("v2", 6, [0]),
+        ]
+        first, injected, last = tracks[0]
+        assert first.point_ref == refine_parquet.PointRef(
+            "public.source_points", "source-1", True,
+        )
+        assert injected.point_ref == refine_parquet.PointRef(
+            "public.injected_points", "2", False, generated_reason="orthogonal",
+        )
+        assert injected.extra == {} and last.refined_point_ref.point_kind == "kept"
+        assert reader.extent() == (10.0, 20.0, 10.0, 20.0)
+
+
+def _adapter_reader(rows, owner):
+    reader = object.__new__(refine_parquet.RefineDatasetReader)
+    result = Mock()
+    result.fetchmany.side_effect = [rows, []]
+    connection = Mock()
+    connection.execute.return_value = result
+    reader._connection = connection
+    reader._descriptor = Mock(refine_id=owner)
+    return reader, result
+
+
+def _adapter_row(owner, *, vehicle="v1", sequence=0, kind="kept", source_key="source-1"):
+    return (owner, 1, vehicle, 4, sequence, 1.0, 120.0, 30.0, 10.0, 20.0,
+            90.0, 4.0, kind, source_key,
+            None if kind == "kept" else "orthogonal",
+            None if kind == "kept" else 0, 1)
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"owner": uuid4()}, "owner"),
+    ({"sequence": 1}, "start"),
+    ({"vehicle": ""}, "identity"),
+    ({"kind": "injected", "source_key": "illegal"}, "injected"),
+])
+def test_adapter_fails_closed_on_corrupt_identity(change, message) -> None:
+    owner = uuid4()
+    changes = dict(change)
+    row_owner = changes.pop("owner", owner)
+    reader, _ = _adapter_reader([_adapter_row(row_owner, **changes)], owner)
+    with pytest.raises(refine_parquet.RefineParquetError, match=message):
+        list(reader.iter_tracks("public.source"))
+
+
+def test_adapter_rejects_sequence_gap_and_non_finite_or_out_of_range_values() -> None:
+    owner = uuid4()
+    for rows, message in [
+        ([_adapter_row(owner), _adapter_row(owner, sequence=2)], "contiguous"),
+        ([tuple(list(_adapter_row(owner))[:6] + [float("nan")] +
+                list(_adapter_row(owner))[7:])], "non-finite"),
+        ([tuple(list(_adapter_row(owner))[:6] + [181.0] +
+                list(_adapter_row(owner))[7:])], "outside"),
+        ([tuple(list(_adapter_row(owner))[:-1] + [2])], "multiple vehicles"),
+    ]:
+        reader, result = _adapter_reader(rows, owner)
+        with pytest.raises(refine_parquet.RefineParquetError, match=message):
+            list(reader.iter_tracks("public.source", batch_size=1))
+        assert not result.fetchall.called
 
 
 def test_reader_rejects_non_present_unknown_tables_and_schema(tmp_path) -> None:
