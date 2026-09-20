@@ -44,9 +44,11 @@
 | C07a | Detect 转向候选列式迁移 | C06b | 每提交 ≤700 | 已完成（`cfecadd`） |
 | C07b | Detect 跨轨迹候选准备列式迁移 | C07a | 每提交 ≤700 | 已完成（`2fc3146`） |
 | C07c1 | Detect 跨轨迹 DuckDB broad phase | C07b | 每提交 ≤700 | 已完成，`6551037`，待主对话确认 |
-| C07c2 | Detect 跨轨迹精确内核与正式入口接线 | C07c1 | 每提交 ≤700 | 已完成，待主对话确认 |
-| C08 | Detect Parquet 发布与 Clip 列式读取 | C07c2 | 每提交 ≤700 | 未开始 |
-| C09 | Clip/Fitting 顺序计算与旧 spool 清除 | C08 | 每提交 ≤700 | 未开始 |
+| C07c2 | Detect 跨轨迹精确内核与正式入口接线 | C07c1 | 每提交 ≤700 | 已完成（`a30ace3`） |
+| C08a | Detect Parquet staging export 与 v1 Schema | C07c2 | 每提交 ≤700 | 已完成，待主对话确认 |
+| C08b | Detect Parquet 发布、登记与生命周期 | C08a | 每提交 ≤700 | 未开始 |
+| C08c | Clip 列式读取与正式入口接线 | C08b | 每提交 ≤700 | 未开始 |
+| C09 | Clip/Fitting 顺序计算与旧 spool 清除 | C08c | 每提交 ≤700 | 未开始 |
 | C10 | Detect/写入器旧磁盘工作区清除 | C07a–C09 | 每提交 ≤700 | 未开始 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 未开始 |
 | C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 未开始 |
@@ -295,17 +297,38 @@ batch=1、方向角圆周、包含阈值、单点轨迹和禁止跨子轨迹连�
 
 验证：Q49 crossing 配对与坐标容差、正式入口选择、错误传播及资源边界。
 
-提交：待记录。
+提交：`a30ace3`。
 
 后续 C07d 收敛 DBSCAN/聚类的最小 Python 回退，并明确候选存储移除边界；本卡保留
 `CandidateStore` 和拓扑所需 tracks 工作区，不扩大到聚类或拓扑迁移。
 
-### C08 — Detect Parquet 与 Clip
+### C08a — Detect Parquet staging export 与 v1 Schema
 
-范围：按 Spec 5.2 发布 resolved_points/intersections/entry_exit_points；Clip 只从已登记
-Detect Parquet 读取，保持 API 身份和顺序。
+范围：按 Spec 5.2 从已提交的 completed Detect PostgreSQL 权威结果，以只读 DuckDB
+扫描写出 resolved_points/intersections/entry_exit_points 三张显式 v1 逻辑表；只构建
+staging 与描述符，不发布、不登记、不控制事务。
 
-验证：三个逻辑表逐表差分、Clip 输出差分、未知版本/缺失文件、只读消费。
+验证：Schema、清单、空表、owner/status、数值/枚举/引用、连续顺序、未知版本，以及
+真实 PostgreSQL 与现有 Clip 查询的 intersection 和 resolved p/i/c 序列差分。Q44
+评审结论由测试固定：本卡仅需 DuckDB 关系投影和校验，不需要 Polars 或 Python 行对象。
+
+提交：待记录。
+
+### C08b — Detect Parquet 发布、登记与生命周期
+
+范围：把 C08a staging exporter 接入 Detect 完成路径，落实原子发布、制品登记、来源
+指纹复核与失败/orphan 生命周期；不改变 Clip 消费入口。
+
+验证：发布顺序、登记事务、失败注入、只读权限和对账可见性。
+
+提交：待记录。
+
+### C08c — Clip 列式读取与正式入口接线
+
+范围：实现已登记 Detect Parquet v1 读取器，并将正式 Clip 入口切换到列式检查点；保持
+现有 PostgreSQL 路径作为短期差分 oracle，不改变前后端字段。
+
+验证：三个逻辑表逐表差分、Clip 输出差分、未知版本/缺失文件和只读消费。
 
 提交：待记录。
 
