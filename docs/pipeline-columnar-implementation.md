@@ -31,9 +31,10 @@
 | C02b | 制品描述校验与最小登记 API | C02a | ≤700 | 已完成（`04d62ce`） |
 | C02c | 制品登记真实 PostgreSQL 集成验证 | C02b | ≤700 | 已完成（`b0db129`） |
 | C03a | 安全 staging 与同文件系统原子只读发布 | C01b2–C02c | ≤700 | 已完成（`bc7e77c`） |
-| C03b | Parquet 检查、快速消费校验与 orphan 识别 | C03a | ≤700 | 已实施，待主对话验收 |
-| C04 | artifact reconcile/gc dry-run/apply CLI | C03b | ≤700 | 未开始 |
-| C05 | Refine Parquet Schema 与发布路径 | C03b | 每提交 ≤700 | 未开始 |
+| C03b | Parquet 检查、快速消费校验与 orphan 识别 | C03a | ≤700 | 已完成（`af4d098`） |
+| C04a | artifact reconcile/gc 只读计划 | C03b | ≤700 | 已实施，待主对话验收 |
+| C04b | artifact reconcile/gc 显式 apply 与 CLI | C04a | ≤700 | 未开始 |
+| C05 | Refine Parquet Schema 与发布路径 | C04b | 每提交 ≤700 | 未开始 |
 | C06 | DuckDB 读取 Refine Parquet 的 Detect 输入适配 | C05 | 每提交 ≤700 | 未开始 |
 | C07 | Detect 算子列式迁移及 Python 回退收敛 | C06 | 每提交 ≤700 | 未开始 |
 | C08 | Detect Parquet 发布与 Clip 列式读取 | C07 | 每提交 ≤700 | 未开始 |
@@ -141,14 +142,24 @@ orphan 识别；不实现阶段业务 Schema。
 
 验证：篡改、缺失、未知 Schema、footer、清单与只读消费测试。
 
+提交：`af4d098`。
+
+### C04a — 对账与垃圾回收只读计划
+
+范围：以一次只读数据库查询和受控目录扫描生成确定排序的对账计划；区分登记状态、
+缺失、残留、orphan、staging 和异常项。已完成或运行中的 Run 均受保护；只有已失败且
+超过宽限期的制品，以及超过宽限期的未登记目录，才可进入后续 apply。
+
+验证：查询零写入、状态保护、7 天边界、orphan/staging、符号链接与异常状态测试。
+
 提交：待记录。
 
-### C04 — 对账与垃圾回收
+### C04b — 显式 apply 与 CLI
 
-范围：实现默认 dry-run、显式 apply 的 reconcile/gc CLI；当前成功血缘不可删除，
-未引用制品默认宽限 7 天，删除追加事件；不新增后台线程。
+范围：消费 C04a 计划，实现默认 dry-run、显式 apply 的 reconcile/gc CLI；删除受控文件
+后追加 `deleted` 事件，不新增后台线程。
 
-验证：dry-run 零写入、引用保护、宽限边界、orphan、幂等 apply 和失败恢复测试。
+验证：dry-run 零写入、幂等 apply、删除/事件顺序和失败恢复测试。
 
 提交：待记录。
 
