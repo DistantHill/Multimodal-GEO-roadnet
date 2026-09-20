@@ -39,8 +39,8 @@
 | C05b | Refine Parquet 发布、登记与 Run 完成事务 | C05a | ≤700 | 已完成（`8050876`） |
 | C05c1 | Refine 真实 PostgreSQL 差分与发布故障验证 | C05b | ≤700 | 已完成（`5a25516`） |
 | C05c2 | completed 制品约束迁移与 Refine 最终切换闸门 | C05c1 | ≤700 | 已完成（`b6a9e03`） |
-| C06a | Refine Parquet 只读消费边界 | C05c2 | ≤700 | 已完成（本卡提交，待主对话记录哈希） |
-| C06b | Detect 接入 Refine Parquet reader | C06a | ≤700 | 未开始 |
+| C06a | Refine Parquet 只读消费边界 | C05c2 | ≤700 | 已完成（`1fe007f`） |
+| C06b | Detect 接入 Refine Parquet reader | C06a | ≤700 | 已完成（C06b1 `aac372c`；C06b2 本卡提交，待主对话记录哈希） |
 | C07 | Detect 算子列式迁移及 Python 回退收敛 | C06b | 每提交 ≤700 | 未开始 |
 | C08 | Detect Parquet 发布与 Clip 列式读取 | C07 | 每提交 ≤700 | 未开始 |
 | C09 | Clip/Fitting 顺序计算与旧 spool 清除 | C08 | 每提交 ≤700 | 未开始 |
@@ -214,7 +214,7 @@ PostgreSQL 上完成迁移、并发和回滚验证；通过后才允许 C06 消�
 验证：既有数据迁移、completed/failed/running 状态约束、制品事件状态、并发提交和
 回滚。
 
-提交：本卡提交，待主对话记录哈希。
+提交：`b6a9e03`。
 
 ### C06a — Refine Parquet 只读消费边界
 
@@ -225,7 +225,7 @@ PostgreSQL 上完成迁移、并发和回滚验证；通过后才允许 C06 消�
 验证：登记重建、最新事件、未知或非 present 拒绝、声明文件、v1 表及 Schema、
 kept/injected 合并顺序、车辆边界、稳定身份、只读校验和批次接口。
 
-提交：本卡提交，待主对话记录哈希。
+提交：`1fe007f`。
 
 ### C06b1 — Detect 输入适配与旧路径差分
 
@@ -237,16 +237,16 @@ Detect/Pipeline 入口，也不改变 Detect 算子。
 真实 PostgreSQL 样本与旧读取路径逐轨差分。Parquet v1 不携带 `extra`，适配结果固定为
 空字典，差分明确排除此字段。
 
-提交：本卡提交，待主对话记录哈希。
+提交：`aac372c`。
 
 ### C06b2 — Detect/Pipeline 正式接线
 
-范围：将正式 Detect/Pipeline 入口切换至 C06b1 只读接口，并保留迁移期 PostgreSQL
-回退路径；不改变 Detect 算法。
+范围：将正式 Detect/Pipeline 入口切换至 C06b1 只读接口；PostgreSQL 路径仅作
+显式未传 reader 的兼容和测试入口，正式 Pipeline 不自动回退；不改变 Detect 算法。
 
 验证：入口选择、生命周期与错误传播、extent 消费、端到端 Detect 回归及资源边界。
 
-提交：待记录。
+提交：本卡提交，待主对话记录哈希。C06 总阶段已完成。
 
 ### C07 — Detect 列式迁移
 

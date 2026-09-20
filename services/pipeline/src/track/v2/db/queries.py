@@ -738,7 +738,7 @@ class _RefineRunRow:
     source_table: str
     status: str
     spatial_context: SpatialContext
-    has_source_fingerprint: bool
+    source_fingerprint: dict[str, object] | None
 
 
 def fetch_refine_run_row(conn: object, refine_id: str) -> _RefineRunRow:
@@ -746,19 +746,24 @@ def fetch_refine_run_row(conn: object, refine_id: str) -> _RefineRunRow:
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(
             "SELECT id, source_table, status, source_srid, processing_srid, "
-            "projection_config, source_fingerprint IS NOT NULL "
+            "projection_config, source_fingerprint "
             "FROM refine_runs WHERE id = %s",
             (refine_id,),
         )
         row = cur.fetchone()
     if row is None:
         raise ValueError(f"unknown Refine Run: {refine_id}")
+    fingerprint = row[6]
+    if isinstance(fingerprint, str):
+        fingerprint = json.loads(fingerprint)
+    if fingerprint is not None and not isinstance(fingerprint, dict):
+        raise ValueError("Refine Run source_fingerprint is malformed")
     return _RefineRunRow(
         refine_id=str(row[0]),
         source_table=str(row[1]),
         status=str(row[2]),
         spatial_context=spatial_context_from_values(row[3], row[4], row[5]),
-        has_source_fingerprint=bool(row[6]),
+        source_fingerprint=fingerprint,
     )
 
 

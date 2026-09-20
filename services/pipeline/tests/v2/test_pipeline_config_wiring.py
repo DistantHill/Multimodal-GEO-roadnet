@@ -58,7 +58,7 @@ class _Connection:
 
 class _ConfigRecordingStore:
     def __init__(self) -> None:
-        self.connection = object()
+        self.connection = MagicMock()
         self.refine_record = RefineRunRecord(
             id=REFINE_ID,
             source_table="raw_points",
@@ -144,6 +144,8 @@ class PipelineConfigWiringTest(unittest.TestCase):
         )
         store = _ConfigRecordingStore()
         intersections = _empty_intersect_result()
+        reader = MagicMock()
+        reader.__enter__.return_value = reader
 
         with (
             patch("track.v2.pipeline.load_pipeline_config", return_value=pipeline_config),
@@ -151,6 +153,8 @@ class PipelineConfigWiringTest(unittest.TestCase):
             patch("track.v2.pipeline.PostgresPipelineStore", return_value=store),
             patch("track.v2.pipeline.require_schema_v4"),
             patch("track.v2.pipeline.verify_refine_source_fingerprint"),
+            patch("track.v2.pipeline.find_refine_artifact", return_value=MagicMock()),
+            patch("track.v2.pipeline.RefineDatasetReader", return_value=reader),
             patch("track.v2.pipeline.detect_intersections", return_value=intersections),
             patch("track.v2.pipeline.fit_centerline_variants", return_value=store.fit_bundle) as fit,
             patch("track.v2.pipeline.build_network", return_value=MagicMock()) as network,

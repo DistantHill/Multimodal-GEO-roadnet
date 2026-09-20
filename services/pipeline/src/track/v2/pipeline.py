@@ -21,6 +21,7 @@ from .artifact_publication import abandon_staging, create_staging, publish
 from .config import PostgresConfig, connect as pg_connect
 from .config.pipeline_config import load_pipeline_config
 from .db.pipeline_store import PipelineStore, PostgresPipelineStore
+from .db.artifact_registry import find_refine_artifact
 from .db.schema import require_schema_v4
 from .db.source_table import (
     calculate_source_fingerprint,
@@ -47,7 +48,7 @@ from .parser import get_database
 from .pipeline_events import EventProgressAdapter, EventSink, PipelineEvent
 from .projection import CoordinateTransformer, create_spatial_context
 from .parser import StreamVehicleSource
-from .refine_parquet import export_refine_parquet
+from .refine_parquet import RefineDatasetReader, export_refine_parquet
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,10 +368,17 @@ def run_pipeline(
         iresult = None
         try:
             detect_compute_started = time.perf_counter()
-            iresult = detect_intersections(
-                conn=store.connection,
-                config=icfg,
+            with store.connection.cursor() as cur:
+                registered = find_refine_artifact(cur, refine_id)
+            reader = RefineDatasetReader(
+                _parquet_root(), registered.descriptor, registered.state, pc.runtime,
             )
+            with reader:
+                iresult = detect_intersections(
+                    conn=store.connection,
+                    config=icfg,
+                    refine_reader=reader,
+                )
             detect_compute_elapsed = time.perf_counter() - detect_compute_started
             # psycopg starts a transaction for the Detect SELECTs. The result
             # no longer depends on that DB cursor, so discard its snapshot before

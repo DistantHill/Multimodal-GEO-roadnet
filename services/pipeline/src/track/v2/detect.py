@@ -28,6 +28,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     from .logger import LiveStatus
+    from .refine_parquet import RefineDatasetReader
 
 from .logger import log_info
 from .heartbeat import heartbeat_progress, observed_operation, operation_heartbeat
@@ -85,6 +86,7 @@ from .db.queries import (
     fetch_refine_run_row,
 )
 from .db.source_table import verify_refine_source_fingerprint
+from .db.artifact_registry import canonical_json
 from .parser import BaseTrajectorySourceHandle as TrajectorySourceHandle
 
 
@@ -647,6 +649,7 @@ def detect_intersections(
     config: IntersectConfig | None = None,
     conn: Any = None,
     spatial_context: SpatialContext | None = None,
+    refine_reader: RefineDatasetReader | None = None,
 ) -> IntersectResult:
     """Run intersection detection and topology extraction.
 
@@ -665,7 +668,7 @@ def detect_intersections(
         if cfg.refine_id is None:
             raise V2Error("formal DB Detect requires refine_id")
         refine = fetch_refine_run_row(conn, cfg.refine_id)
-        if refine.status != "completed" or not refine.has_source_fingerprint:
+        if refine.status != "completed" or refine.source_fingerprint is None:
             raise V2Error(
                 f"Refine Run {cfg.refine_id} is not a completed immutable-source run"
             )
@@ -683,8 +686,17 @@ def detect_intersections(
             source_table=refine.source_table,
             kept_table="kept_trajectory_points",
         )
-        verify_refine_source_fingerprint(conn, refine.refine_id)
-        return _detect_intersections_db(conn, cfg, refine.spatial_context)
+        if refine_reader is None:
+            verify_refine_source_fingerprint(conn, refine.refine_id)
+        else:
+            descriptor = refine_reader.descriptor
+            if descriptor.refine_id is None or str(descriptor.refine_id) != refine.refine_id:
+                raise V2Error("Refine artifact does not belong to the parent Refine Run")
+            if descriptor.source_fingerprint_json != canonical_json(refine.source_fingerprint):
+                raise V2Error("Refine artifact source fingerprint does not match its Run")
+        return _detect_intersections_db(
+            conn, cfg, refine.spatial_context, refine_reader=refine_reader,
+        )
     elif source is not None:
         if spatial_context is None:
             raise V2Error(
@@ -785,16 +797,18 @@ def _iter_prepared_db_tracks(
     spatial_context: SpatialContext,
     transformer: CoordinateTransformer,
     workspace: MutableMapping[str, list[TrajectoryPoint]],
+    refine_reader: RefineDatasetReader | None = None,
 ) -> Iterator[tuple[str, list[TrajectoryPoint]]]:
     """Read/project tracks once and publish them to the caller-owned workspace."""
     read_bounds: tuple[float, float, float, float] | None = None
-    source = _stream_vehicle_tracks_from_db(
-        conn,
-        table=cfg.db_table,
-        kept_table=cfg.kept_table,
-        source_table=cfg.source_table,
-        refine_id=cfg.refine_id,
-        spatial_context=spatial_context,
+    source = (
+        refine_reader.iter_tracks(cfg.source_table or cfg.db_table, batch_size=cfg.stream_batch_size)
+        if refine_reader is not None
+        else _stream_vehicle_tracks_from_db(
+            conn, table=cfg.db_table, kept_table=cfg.kept_table,
+            source_table=cfg.source_table, refine_id=cfg.refine_id,
+            spatial_context=spatial_context,
+        )
     )
     try:
         for track in source:
@@ -855,10 +869,13 @@ def _load_tracks_and_turn_candidates(
     perf: PerfTracker | None = None,
     workspace: MutableMapping[str, list[TrajectoryPoint]] | None = None,
     event_store: DiskSequence[TurnEvent] | None = None,
+    refine_reader: RefineDatasetReader | None = None,
 ) -> tuple[Sequence[TurnEvent], MutableMapping[str, list[TrajectoryPoint]]]:
     """Wire the DB reader, track scheduler and candidate collector together."""
     tracks: MutableMapping[str, list[TrajectoryPoint]] = workspace if workspace is not None else {}
-    with closing(_iter_prepared_db_tracks(conn, cfg, spatial_context, transformer, tracks)) as source:
+    with closing(_iter_prepared_db_tracks(
+        conn, cfg, spatial_context, transformer, tracks, refine_reader,
+    )) as source:
         turn_events = extract_turn_candidates(
             iter_track_patches(source, cfg.stream_batch_size),
             cfg, live_status=live_status, perf=perf, event_store=event_store,
@@ -1486,6 +1503,8 @@ def _detect_intersections_db(
     conn: Any,
     cfg: IntersectConfig,
     spatial_context: SpatialContext,
+    *,
+    refine_reader: RefineDatasetReader | None = None,
 ) -> IntersectResult:
     """Close track storage after Detect; transfer event storage to its result."""
     event_store = DiskSequence[TurnEvent](directory=os.environ.get("DATA_ROOT") or None)
@@ -1495,7 +1514,7 @@ def _detect_intersections_db(
         with DetectWorkspace(cfg) as workspace:
             result = _detect_intersections_db_workspace(
                 conn, cfg, spatial_context, workspace, event_store=event_store,
-                candidate_store=candidate_store,
+                candidate_store=candidate_store, refine_reader=refine_reader,
             )
         if result.turn_events is not event_store:
             # Empty input and test/reference seams can return in-memory output.
@@ -1520,15 +1539,13 @@ def _detect_intersections_db_workspace(
     *,
     event_store: DiskSequence[TurnEvent] | None = None,
     candidate_store: CandidateStore | None = None,
+    refine_reader: RefineDatasetReader | None = None,
 ) -> IntersectResult:
     """DB Detect stages share a disk workspace and unchanged global clustering."""
     # ── Spatial extent ──────────────────────────────────────────────
-    extent = _query_spatial_extent(
-        conn,
-        table=cfg.db_table,
-        kept_table=cfg.kept_table,
-        source_table=cfg.source_table,
-        refine_id=cfg.refine_id,
+    extent = refine_reader.extent() if refine_reader is not None else _query_spatial_extent(
+        conn, table=cfg.db_table, kept_table=cfg.kept_table,
+        source_table=cfg.source_table, refine_id=cfg.refine_id,
         spatial_context=spatial_context,
     )
     if extent is None:
@@ -1549,6 +1566,7 @@ def _detect_intersections_db_workspace(
         turn_events, tracks = _load_tracks_and_turn_candidates(
             conn, cfg, spatial_context, transformer,
             live_status=live, perf=tracker, workspace=workspace, event_store=event_store,
+            refine_reader=refine_reader,
         )
     if live is not None:
         live.update(

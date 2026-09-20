@@ -73,6 +73,26 @@ class _Connection:
     def __exit__(self, exc_type, exc, traceback) -> None:
         return None
 
+    def cursor(self):
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        return cursor
+
+
+class _Reader:
+    instances: list["_Reader"] = []
+
+    def __init__(self, *args: object) -> None:
+        self.args = args
+        self.closed = False
+        self.__class__.instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.closed = True
+
 
 class _EmptyHandle:
     def __init__(self) -> None:
@@ -202,6 +222,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             host="localhost", port=5432, database="track", user="track", password="",
         )
         self.events: list[str] = []
+        _Reader.instances.clear()
         self.conn = _Connection(self.events)
         self.store = _RecordingStore(self.conn, self.events)
         self.stack = ExitStack()
@@ -235,6 +256,13 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.staging = SimpleNamespace(path="staging")
         self.descriptor = SimpleNamespace(id="artifact", relative_path=f"refine/{REFINE_ID}")
         self.stack.enter_context(patch(
+            "track.v2.pipeline.find_refine_artifact",
+            side_effect=lambda *_args: SimpleNamespace(
+                descriptor=self.descriptor, state="present",
+            ),
+        ))
+        self.stack.enter_context(patch("track.v2.pipeline.RefineDatasetReader", _Reader))
+        self.stack.enter_context(patch(
             "track.v2.pipeline.create_staging",
             side_effect=lambda *args: self.events.append("create_staging") or self.staging,
         ))
@@ -253,7 +281,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.stack.enter_context(patch(
             "track.v2.pipeline._parquet_root", return_value="/tmp/parquet",
         ))
-        self.stack.enter_context(
+        self.detect = self.stack.enter_context(
             patch("track.v2.pipeline.detect_intersections", return_value=_empty_intersect_result())
         )
         self.handle = _EmptyHandle()
@@ -281,6 +309,8 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertEqual(self.store.completed_artifact[0], REFINE_ID)
         self.assertIs(self.store.completed_artifact[1], self.descriptor)
         self.assertEqual(self.descriptor.relative_path, f"refine/{REFINE_ID}")
+        self.assertTrue(_Reader.instances[-1].closed)
+        self.assertIs(self.detect.call_args.kwargs["refine_reader"], _Reader.instances[-1])
         self.assertEqual(
             self.events,
             [
@@ -379,6 +409,39 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertIn("finish_detect:failed", self.events)
         self.assertFalse(any(event.kind == PipelineEventKind.STAGE_FINISH for event in emitted))
         self.assertFalse(any(event.progress == 1.0 for event in emitted))
+
+    def test_artifact_read_failure_closes_reader_and_marks_detect_failed(self) -> None:
+        class _FailingReader(_Reader):
+            def __enter__(self):
+                super().__enter__()
+                self.closed = True
+                raise RuntimeError("artifact deleted")
+
+        with (
+            patch("track.v2.pipeline.RefineDatasetReader", _FailingReader),
+            self.assertRaisesRegex(RuntimeError, "artifact deleted"),
+        ):
+            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
+
+        self.assertTrue(_FailingReader.instances[-1].closed)
+        self.assertIn("finish_detect:failed", self.events)
+        self.detect.assert_not_called()
+
+    def test_missing_artifact_marks_detect_failed(self) -> None:
+        with (
+            patch("track.v2.pipeline.find_refine_artifact", side_effect=RuntimeError("missing")),
+            self.assertRaisesRegex(RuntimeError, "missing"),
+        ):
+            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
+        self.assertIn("finish_detect:failed", self.events)
+        self.detect.assert_not_called()
+
+    def test_fingerprint_mismatch_closes_reader_and_marks_detect_failed(self) -> None:
+        self.detect.side_effect = RuntimeError("fingerprint mismatch")
+        with self.assertRaisesRegex(RuntimeError, "fingerprint mismatch"):
+            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
+        self.assertTrue(_Reader.instances[-1].closed)
+        self.assertIn("finish_detect:failed", self.events)
 
     def test_fit_output_failure_does_not_rewrite_committed_run(self) -> None:
         def emit(event):

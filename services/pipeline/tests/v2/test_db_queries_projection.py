@@ -236,14 +236,14 @@ class DetectRunSpatialContextQueryTest(unittest.TestCase):
     def test_refine_run_metadata_is_materialized_before_detect_reads(self) -> None:
         conn = _Connection((
             "refine-1", "raw_points", "completed", 4326, 32650,
-            _SPATIAL_CONTEXT.projection_config, True,
+            _SPATIAL_CONTEXT.projection_config, {"version": 1},
         ))
 
         row = fetch_refine_run_row(conn, "refine-1")
 
         self.assertEqual(row.source_table, "raw_points")
         self.assertEqual(row.spatial_context, _SPATIAL_CONTEXT)
-        self.assertTrue(row.has_source_fingerprint)
+        self.assertEqual(row.source_fingerprint, {"version": 1})
 
     def test_detect_run_inherits_validated_refine_run_context(self) -> None:
         conn = _Connection((

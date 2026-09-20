@@ -44,6 +44,11 @@ class RefineDatasetReader:
         self._root = Path(publication_root).resolve(strict=True)
         self._connection: duckdb.DuckDBPyConnection | None = None
 
+    @property
+    def descriptor(self) -> ArtifactDescriptor:
+        """Return the validated immutable descriptor for provenance checks."""
+        return self._descriptor
+
     def __enter__(self) -> RefineDatasetReader:
         if self._connection is not None:
             raise RefineParquetError("dataset reader is already open")

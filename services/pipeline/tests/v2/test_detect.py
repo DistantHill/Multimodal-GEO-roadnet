@@ -9,7 +9,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import numpy as np
 
@@ -46,6 +46,7 @@ from track.v2.detect import (
     _annotate_source_ablation,
     _compute_getis_ord_g_star,
     _detect_turn_events,
+    _detect_intersections_db,
     _extract_entry_exit_observations_batch,
     _extract_cross_track_windows,
     _getis_local_counts_grid,
@@ -60,6 +61,7 @@ from track.v2.detect import (
     _project_tracks,
     _run_dbscan,
     _load_tracks_and_turn_candidates,
+    _iter_prepared_db_tracks,
     _stream_vehicle_tracks_from_db,
     _topology_point_windows,
     _query_active_points_in_window,
@@ -1071,7 +1073,7 @@ class ProjectionContextContractTest(unittest.TestCase):
     def test_formal_db_detect_inherits_context_and_checks_empty_source(self):
         refine = SimpleNamespace(
             refine_id="refine-1", source_table="raw_points", status="completed",
-            spatial_context=_TEST_SPATIAL_CONTEXT, has_source_fingerprint=True,
+            spatial_context=_TEST_SPATIAL_CONTEXT, source_fingerprint={"version": 1},
         )
         with (
             patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
@@ -1087,10 +1089,63 @@ class ProjectionContextContractTest(unittest.TestCase):
         self.assertEqual(extent.call_args.kwargs["table"], "raw_points")
         self.assertEqual(result.spatial_context, _TEST_SPATIAL_CONTEXT)
 
+    def test_formal_parquet_detect_rejects_fingerprint_mismatch_without_pg_scan(self):
+        refine = SimpleNamespace(
+            refine_id="11111111-1111-1111-1111-111111111111",
+            source_table="raw_points", status="completed",
+            spatial_context=_TEST_SPATIAL_CONTEXT,
+            source_fingerprint={"version": 1},
+        )
+        reader = SimpleNamespace(descriptor=SimpleNamespace(
+            refine_id=refine.refine_id,
+            source_fingerprint_json='{"version":2}',
+        ))
+        with (
+            patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
+            patch("track.v2.detect.verify_refine_source_fingerprint") as fingerprint,
+            patch("track.v2.detect._detect_intersections_db") as compute,
+            self.assertRaisesRegex(V2Error, "fingerprint"),
+        ):
+            detect_intersections(
+                conn=object(),
+                config=IntersectConfig(query_active_from_db=True, refine_id=refine.refine_id),
+                refine_reader=reader,
+            )
+        fingerprint.assert_not_called()
+        compute.assert_not_called()
+
+    def test_formal_parquet_empty_extent_avoids_pg_point_queries(self):
+        reader = MagicMock()
+        reader.extent.return_value = None
+        with (
+            patch("track.v2.detect._query_spatial_extent") as extent,
+            patch("track.v2.detect._stream_vehicle_tracks_from_db") as stream,
+        ):
+            result = _detect_intersections_db(
+                object(), IntersectConfig(), _TEST_SPATIAL_CONTEXT,
+                refine_reader=reader,
+            )
+        extent.assert_not_called()
+        stream.assert_not_called()
+        reader.iter_tracks.assert_not_called()
+        self.assertEqual(result.report.track_count, 0)
+
+    def test_formal_parquet_tracks_do_not_use_pg_stream(self):
+        reader = MagicMock()
+        reader.iter_tracks.return_value = iter(())
+        cfg = IntersectConfig(source_table="raw_points", stream_batch_size=17)
+        with patch("track.v2.detect._stream_vehicle_tracks_from_db") as stream:
+            tracks = list(_iter_prepared_db_tracks(
+                object(), cfg, _TEST_SPATIAL_CONTEXT, _TEST_TRANSFORMER, {}, reader,
+            ))
+        self.assertEqual(tracks, [])
+        reader.iter_tracks.assert_called_once_with("raw_points", batch_size=17)
+        stream.assert_not_called()
+
     def test_formal_db_detect_rejects_assertion_and_source_mismatch(self):
         refine = SimpleNamespace(
             refine_id="refine-1", source_table="raw_points", status="completed",
-            spatial_context=_TEST_SPATIAL_CONTEXT, has_source_fingerprint=True,
+            spatial_context=_TEST_SPATIAL_CONTEXT, source_fingerprint={"version": 1},
         )
         different = SpatialContext(
             4326, 32649,
@@ -1111,10 +1166,10 @@ class ProjectionContextContractTest(unittest.TestCase):
                 )
 
     def test_formal_db_detect_rejects_unready_refine_and_table_overrides_before_reads(self):
-        for status, fingerprint in (("running", True), ("completed", False)):
+        for status, fingerprint in (("running", {"version": 1}), ("completed", None)):
             refine = SimpleNamespace(
                 refine_id="refine-1", source_table="raw_points", status=status,
-                spatial_context=_TEST_SPATIAL_CONTEXT, has_source_fingerprint=fingerprint,
+                spatial_context=_TEST_SPATIAL_CONTEXT, source_fingerprint=fingerprint,
             )
             with (
                 self.subTest(status=status, fingerprint=fingerprint),
@@ -1130,7 +1185,7 @@ class ProjectionContextContractTest(unittest.TestCase):
 
         refine = SimpleNamespace(
             refine_id="refine-1", source_table="raw_points", status="completed",
-            spatial_context=_TEST_SPATIAL_CONTEXT, has_source_fingerprint=True,
+            spatial_context=_TEST_SPATIAL_CONTEXT, source_fingerprint={"version": 1},
         )
         for override in (
             {"db_table": "other"},
@@ -2427,7 +2482,7 @@ class TopologyExtractionTest(unittest.TestCase):
                     source_table="trajectory_points",
                     status="completed",
                     spatial_context=_TEST_SPATIAL_CONTEXT,
-                    has_source_fingerprint=True,
+                    source_fingerprint={"version": 1},
                 ),
             ),
             patch("track.v2.detect.verify_refine_source_fingerprint"),
