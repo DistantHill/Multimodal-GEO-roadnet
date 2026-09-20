@@ -29,10 +29,11 @@
 | C01b2 | 准备离线 DuckDB PostgreSQL 扩展 | C01b1 | ≤700 | 已完成（`ecebe2a`） |
 | C02a | PostgreSQL Schema v5 制品登记 DDL 与迁移 | C01b2 | ≤700 | 已完成（`e05214d`） |
 | C02b | 制品描述校验与最小登记 API | C02a | ≤700 | 已完成（`04d62ce`） |
-| C02c | 制品登记真实 PostgreSQL 集成验证 | C02b | ≤700 | 已实施，待主对话验收 |
-| C03 | 不可变 Parquet staging/发布/校验基础模块 | C01b2–C02c | ≤700 | 未开始 |
-| C04 | artifact reconcile/gc dry-run/apply CLI | C03 | ≤700 | 未开始 |
-| C05 | Refine Parquet Schema 与发布路径 | C03 | 每提交 ≤700 | 未开始 |
+| C02c | 制品登记真实 PostgreSQL 集成验证 | C02b | ≤700 | 已完成（`b0db129`） |
+| C03a | 安全 staging 与同文件系统原子只读发布 | C01b2–C02c | ≤700 | 已实施，待主对话验收 |
+| C03b | Parquet 检查、快速消费校验与 orphan 识别 | C03a | ≤700 | 未开始 |
+| C04 | artifact reconcile/gc dry-run/apply CLI | C03b | ≤700 | 未开始 |
+| C05 | Refine Parquet Schema 与发布路径 | C03b | 每提交 ≤700 | 未开始 |
 | C06 | DuckDB 读取 Refine Parquet 的 Detect 输入适配 | C05 | 每提交 ≤700 | 未开始 |
 | C07 | Detect 算子列式迁移及 Python 回退收敛 | C06 | 每提交 ≤700 | 未开始 |
 | C08 | Detect Parquet 发布与 Clip 列式读取 | C07 | 每提交 ≤700 | 未开始 |
@@ -121,14 +122,24 @@ Pipeline 全量测试 `1165 passed, 55 skipped`。
 唯一 Schema 并回滚，并发用例仅提交自身 UUID Schema，验证事件触发器以制品行锁串行化，
 最终显式清理该测试 Schema。
 
+提交：`b0db129`。
+
+### C03a — 安全 staging 与原子只读发布
+
+范围：建立受控根路径内的 Run staging，以一次同文件系统目录改名完成不可覆盖的只读
+发布，并提供严格受限的 staging 放弃操作；不接生产者、数据库或业务清单。
+
+验证：成功发布、空或半写失败、目标不覆盖、路径逃逸、跨设备、改名后数据库失败仍
+保留 final，以及 staging 放弃边界测试。
+
 提交：待记录。
 
-### C03 — 不可变 Parquet 基础模块
+### C03b — Parquet 校验与 orphan 识别
 
-范围：Run staging、同文件系统原子改名、只读发布、文件清单/大小/footer/SHA-256、
-快速消费校验、orphan 识别；不实现阶段业务 Schema。
+范围：在 C03a 发布原语上增加文件清单、大小、Parquet footer、SHA-256、快速消费校验和
+orphan 识别；不实现阶段业务 Schema。
 
-验证：成功发布、半写失败、改名后 DB 失败、篡改/缺失、只读和路径逃逸测试。
+验证：篡改、缺失、未知 Schema、footer、清单与只读消费测试。
 
 提交：待记录。
 
