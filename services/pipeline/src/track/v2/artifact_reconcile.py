@@ -5,9 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
+import os
+import shutil
 import stat
 from typing import Any
 from uuid import UUID
+
+from track.v2.db.artifact_registry import append_deleted
 
 
 class ReconcileError(RuntimeError):
@@ -45,6 +49,21 @@ class ReconcilePlan:
     actions: tuple[ReconcileAction, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ApplyResult:
+    removed_final: tuple[str, ...]
+    removed_staging: tuple[str, ...]
+    removed_sidecars: tuple[str, ...]
+    appended_events: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRemoval:
+    action: ReconcileAction
+    path: Path
+    category: str
+
+
 _QUERY = """
 SELECT a.id, a.stage, COALESCE(a.refine_id, a.detect_id), a.relative_path,
        a.created_at, COALESCE(rr.status, dr.status),
@@ -57,6 +76,19 @@ LEFT JOIN LATERAL (
     WHERE artifact_id = a.id ORDER BY id DESC LIMIT 1
 ) AS event ON TRUE
 ORDER BY a.id
+"""
+
+_LOCK_ARTIFACT = """
+SELECT a.relative_path, COALESCE(rr.status, dr.status), event.state
+FROM pipeline_artifacts AS a
+LEFT JOIN refine_runs AS rr ON rr.id = a.refine_id
+LEFT JOIN detect_runs AS dr ON dr.id = a.detect_id
+LEFT JOIN LATERAL (
+    SELECT state FROM pipeline_artifact_events
+    WHERE artifact_id = a.id ORDER BY id DESC LIMIT 1
+) AS event ON TRUE
+WHERE a.id = %s
+FOR UPDATE OF a
 """
 
 
@@ -254,3 +286,145 @@ def build_reconcile_plan(
     actions.sort(key=lambda item: (item.relative_path, item.kind,
                                    "" if item.artifact_id is None else str(item.artifact_id)))
     return ReconcilePlan(now, grace_days, tuple(actions))
+
+
+def _canonical_uuid(text: str) -> bool:
+    try:
+        return str(UUID(text)) == text
+    except ValueError:
+        return False
+
+
+def _apply_path(root: Path, action: ReconcileAction) -> tuple[Path, str]:
+    parts = PurePosixPath(action.relative_path).parts
+    if action.kind in ("registered_present", "deleted_residue", "final_orphan"):
+        if len(parts) != 2 or parts[0] not in ("refine", "detect") or not _canonical_uuid(parts[1]):
+            raise ReconcileError("final action is outside the controlled leaf layout")
+        category = "final"
+    elif action.kind == "staging_leftover" and len(parts) == 4:
+        if (parts[0] != ".artifact-staging" or parts[1] not in ("refine", "detect") or
+                not _canonical_uuid(parts[2])):
+            raise ReconcileError("staging action is outside the controlled leaf layout")
+        marker = parts[3]
+        if _canonical_uuid(marker):
+            category = "staging"
+        elif (marker.startswith(".") and marker.endswith(".publication.json") and
+              _canonical_uuid(marker[1:-len(".publication.json")])):
+            category = "sidecar"
+        else:
+            raise ReconcileError("staging action is outside the controlled leaf layout")
+    else:
+        raise ReconcileError("eligible action kind is not removable")
+    path = root.joinpath(*parts)
+    current = root
+    for part in parts[:-1]:
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError as exc:
+            raise ReconcileError("planned removal path no longer exists") from exc
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise ReconcileError("planned removal has an unsafe parent")
+    return path, category
+
+
+def _validate_tree(path: Path, category: str) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError as exc:
+        raise ReconcileError("planned removal path no longer exists") from exc
+    if category == "sidecar":
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise ReconcileError("planned sidecar is not a regular file")
+        return
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise ReconcileError("planned dataset is not a real directory")
+    for current, names, files in os.walk(path, topdown=True, followlinks=False):
+        directory = Path(current)
+        if stat.S_ISLNK(directory.lstat().st_mode):
+            raise ReconcileError("planned dataset contains a symlink")
+        for name in names:
+            mode = (directory / name).lstat().st_mode
+            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                raise ReconcileError("planned dataset contains a non-directory entry")
+        for name in files:
+            mode = (directory / name).lstat().st_mode
+            if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+                raise ReconcileError("planned dataset contains a non-regular file")
+
+
+def _remove_leaf(item: _PreparedRemoval) -> None:
+    if item.category == "sidecar":
+        item.path.chmod(0o600)
+        item.path.unlink()
+        return
+    item.path.chmod(0o700)
+    for current, names, files in os.walk(item.path, topdown=True, followlinks=False):
+        directory = Path(current)
+        for name in names:
+            (directory / name).chmod(0o700)
+        for name in files:
+            (directory / name).chmod(0o600)
+    shutil.rmtree(item.path)
+
+
+def apply_reconcile_plan(
+    cur: Any, parquet_root: Path | str, plan: ReconcilePlan, *, reason: str,
+) -> ApplyResult:
+    """Apply eligible removals after a complete locked preflight.
+
+    The caller owns the transaction. Files are removed before lifecycle events are
+    appended; an event failure therefore intentionally leaves a registered-missing
+    condition for the next reconciliation pass.
+    """
+    if type(plan) is not ReconcilePlan:
+        raise ValueError("plan must be a ReconcilePlan")
+    if type(reason) is not str or not reason.strip() or reason != reason.strip():
+        raise ValueError("reason must be nonempty trimmed text")
+    root = _root(parquet_root)
+    selected = [item for item in plan.actions if item.eligible and not item.protected]
+    if not selected:
+        return ApplyResult((), (), (), 0)
+
+    if any(item.kind == "final_orphan" for item in selected):
+        cur.execute("LOCK TABLE pipeline_artifacts IN SHARE MODE", ())
+    prepared: list[_PreparedRemoval] = []
+    seen_paths: set[Path] = set()
+    for action in selected:
+        path, category = _apply_path(root, action)
+        if path in seen_paths:
+            raise ReconcileError("removal plan contains a duplicate leaf")
+        seen_paths.add(path)
+        _validate_tree(path, category)
+        if action.kind in ("registered_present", "deleted_residue"):
+            if action.artifact_id is None:
+                raise ReconcileError("registered removal has no artifact id")
+            cur.execute(_LOCK_ARTIFACT, (action.artifact_id,))
+            record = cur.fetchone()
+            expected_state = "present" if action.kind == "registered_present" else "deleted"
+            if (record is None or tuple(record) !=
+                    (action.relative_path, "failed", expected_state)):
+                raise ReconcileError("registered removal plan is stale")
+        elif action.kind == "final_orphan":
+            if action.artifact_id is not None:
+                raise ReconcileError("orphan removal unexpectedly has an artifact id")
+            cur.execute(
+                "SELECT 1 FROM pipeline_artifacts WHERE relative_path = %s LIMIT 1",
+                (action.relative_path,),
+            )
+            if cur.fetchone() is not None:
+                raise ReconcileError("orphan removal plan is stale")
+        prepared.append(_PreparedRemoval(action, path, category))
+
+    final: list[str] = []
+    staging: list[str] = []
+    sidecars: list[str] = []
+    events = 0
+    for item in prepared:
+        _remove_leaf(item)
+        target = {"final": final, "staging": staging, "sidecar": sidecars}[item.category]
+        target.append(item.action.relative_path)
+        if item.action.kind == "registered_present":
+            append_deleted(cur, item.action.artifact_id, reason)
+            events += 1
+    return ApplyResult(tuple(final), tuple(staging), tuple(sidecars), events)
