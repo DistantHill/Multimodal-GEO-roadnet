@@ -76,7 +76,9 @@ def test_postgres_query_is_run_scoped_safe_and_computes_interleaved_sequence():
 
     assert sql.count(f"'{run_id}'::uuid") == 2
     assert 'JOIN "odd"."schema" s' in sql
-    assert "ST_Transform(s.geom, 32650)" in sql
+    projected = "ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), 32650)"
+    assert sql.count(projected) == 2
+    assert "ST_Transform(s.geom" not in sql
     assert "PARTITION BY subtrack_index" in sql
     assert "ORDER BY anchor_sequence, point_kind, point_id" in sql
     assert "row_number()" in sql

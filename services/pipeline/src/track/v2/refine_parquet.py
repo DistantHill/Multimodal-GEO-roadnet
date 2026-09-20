@@ -83,8 +83,8 @@ WITH points AS (
  SELECT k.refine_id, k.id AS point_id, k.vehicle_id, k.subtrack_index,
         k.sequence_in_subtrack AS anchor_sequence, 0 AS point_kind,
         s.timestamp, s.lon, s.lat,
-        ST_X(ST_Transform(s.geom, {srid})) AS x,
-        ST_Y(ST_Transform(s.geom, {srid})) AS y,
+        ST_X(ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), {srid})) AS x,
+        ST_Y(ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), {srid})) AS y,
         s.heading, s.speed, k.source_row_key, NULL::text AS generated_reason,
         NULL::integer AS after_sequence_in_subtrack
  FROM kept_trajectory_points k JOIN {contract.quoted_table} s
