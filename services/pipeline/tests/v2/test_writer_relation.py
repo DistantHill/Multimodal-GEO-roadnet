@@ -1,0 +1,249 @@
+"""First-phase DuckDB writer relation behavior and lifecycle."""
+from __future__ import annotations
+
+import inspect
+from pathlib import Path
+from types import SimpleNamespace as NS
+
+import pytest
+
+from track.v2 import writer_relation
+from track.v2.models import RefinedPointRef, RuntimeConfig
+from track.v2.writer_relation import WriterRelation
+
+
+def _relation(tmp_path: Path, *, batch_size: int = 2) -> WriterRelation:
+    return WriterRelation(
+        RuntimeConfig(duckdb_memory_limit="128MB", duckdb_threads=1,
+                      duckdb_max_temp_directory_size="256MB"),
+        tmp_path, "detect", batch_size=batch_size, relation_id="relation",
+    )
+
+
+def _turn(index, ref):
+    return NS(event_calculate_index=index, refined_point_ref=ref,
+              entry_bearing=10.0 + index, exit_bearing=20.0,
+              turn_deg=-10.0, score=0.5)
+
+
+def _cross(index, first, second):
+    return NS(cross_track_calculate_index=index, from_segment_start=first,
+              to_segment_start=second, x=index + 0.1, y=2.0, lon=113.0, lat=23.0)
+
+
+def _crossing(ref):
+    return NS(segment_start=ref, is_entry=True, crossing_x=1.0, crossing_y=2.0,
+              crossing_lon=113.0, crossing_lat=23.0)
+
+
+class ClosingIterable:
+    def __init__(self, values, failure=None):
+        self.values, self.failure, self.closed = values, failure, False
+
+    def __iter__(self):
+        try:
+            yield from self.values
+            if self.failure is not None:
+                raise self.failure
+        finally:
+            self.closed = True
+
+
+def test_collect_resolve_exact_keys_last_wins_and_order_across_batches(tmp_path):
+    refs = [RefinedPointRef("kept", 7, 2, 0),
+            RefinedPointRef("injected", 7, 2, 1),
+            RefinedPointRef("kept", 7, 3, 0)]
+    turns = ClosingIterable([_turn(9, refs[2]), _turn(4, refs[0])])
+    crosses = ClosingIterable([_cross(8, refs[1], refs[0]),
+                               _cross(3, refs[2], refs[1])])
+    pending = ClosingIterable([(NS(cluster_calculate_index=5), _crossing(refs[0]))])
+    crossing_ids = ClosingIterable([900])
+    with _relation(tmp_path, batch_size=1) as relation:
+        relation.collect_sources(NS(turn_events=turns, cross_track_candidates=crosses),
+                                 pending, crossing_ids, {5: 50})
+        assert relation.counts == [2, 2, 1]
+        assert list(relation.iter_raw("turn")) == [
+            (0, 19.0, 20.0, -10.0, 0.5), (1, 14.0, 20.0, -10.0, 0.5)]
+        assert [row[0] for row in relation.iter_raw("cross")] == [0, 1]
+        assert list(relation.iter_raw("crossing")) == [
+            (0, 900, 50, 1, 1.0, 2.0, 113.0, 23.0)]
+        assert list(relation.iter_annotation_requests()) == [
+            ("turn", 9, 0), ("turn", 4, 1), ("cross", 8, 0), ("cross", 3, 1)]
+        for resolved_id, ref in enumerate(refs, 100):
+            relation.add_mapping(ref, resolved_id)
+        relation.add_mapping(refs[0], 999)
+        relation.resolve_sources()
+        assert list(relation.iter_resolved_sources(0)) == [(0, 0, 102), (1, 0, 999)]
+        assert list(relation.iter_resolved_sources(1)) == [
+            (0, 0, 101), (0, 1, 999), (1, 0, 102), (1, 1, 101)]
+        assert list(relation.iter_resolved_sources(2)) == [(0, 0, 999)]
+        relation.resolve_sources()
+        with pytest.raises(RuntimeError, match="resolved"):
+            relation.add_mapping(refs[0], 1)
+        with pytest.raises(RuntimeError, match="resolved"):
+            relation.add_request(0, 2, 0, refs[0])
+    assert turns.closed and crosses.closed and pending.closed and crossing_ids.closed
+
+
+def test_missing_key_reports_exact_three_field_identity(tmp_path):
+    ref = RefinedPointRef("kept", 100, 4, 9)
+    with _relation(tmp_path) as relation:
+        relation.add_request(0, 0, 0, ref)
+        relation.add_mapping(RefinedPointRef("kept", 100, 5, 9), 1)
+        relation.add_mapping(RefinedPointRef("injected", 100, 4, 9), 2)
+        with pytest.raises(KeyError) as error:
+            relation.resolve_sources()
+        assert error.value.args == (("kept", 100, 4),)
+
+
+@pytest.mark.parametrize("stage,failure", [
+    ("success", None), ("turn", RuntimeError("broken")),
+    ("cross", KeyboardInterrupt()), ("crossing", RuntimeError("broken")),
+    ("crossing_ids", KeyboardInterrupt()),
+])
+def test_input_iterators_close_on_success_and_base_exception(tmp_path, stage, failure):
+    ref = RefinedPointRef("kept", 1, 1, 0)
+    turns = ClosingIterable([_turn(0, ref)], failure if stage == "turn" else None)
+    crosses = ClosingIterable([_cross(0, ref, ref)] if stage == "cross" else [],
+                              failure if stage == "cross" else None)
+    crossing_rows = [(NS(cluster_calculate_index=1), _crossing(ref))]
+    if stage == "crossing_ids":
+        crossing_rows *= 2
+    pending = ClosingIterable(
+        crossing_rows if stage.startswith("crossing") else [],
+        failure if stage == "crossing" else None,
+    )
+    crossing_ids = ClosingIterable([4, 5] if stage.startswith("crossing") else [],
+                                   failure if stage == "crossing_ids" else None)
+    relation = _relation(tmp_path)
+    try:
+        if failure is None:
+            relation.collect_sources(NS(turn_events=turns, cross_track_candidates=crosses),
+                                     pending, crossing_ids, {1: 2})
+        else:
+            with pytest.raises(type(failure)):
+                relation.collect_sources(NS(turn_events=turns, cross_track_candidates=crosses),
+                                         pending, crossing_ids, {1: 2})
+        assert turns.closed
+        if stage != "turn":
+            assert crosses.closed
+        if stage.startswith("crossing"):
+            assert pending.closed and crossing_ids.closed
+    finally:
+        relation.close()
+
+
+@pytest.mark.parametrize("consumer", ["turn", "cross", "crossing"])
+def test_missing_stable_reference_closes_active_iterators(tmp_path, consumer):
+    ref = RefinedPointRef("kept", 1, 1, 0)
+    turns = ClosingIterable([_turn(0, None)] if consumer == "turn" else [])
+    crosses = ClosingIterable([_cross(0, ref, None)] if consumer == "cross" else [])
+    pending = ClosingIterable(
+        [(NS(cluster_calculate_index=1), _crossing(None))] if consumer == "crossing" else [])
+    with _relation(tmp_path) as relation:
+        with pytest.raises(ValueError, match="stable"):
+            relation.collect_sources(NS(turn_events=turns, cross_track_candidates=crosses),
+                                     pending, [4] if consumer == "crossing" else [], {1: 2})
+    assert turns.closed
+    if consumer != "turn":
+        assert crosses.closed
+    if consumer == "crossing":
+        assert pending.closed
+
+
+def test_empty_unresolved_and_closed_access(tmp_path):
+    relation = _relation(tmp_path)
+    with pytest.raises(RuntimeError, match="not resolved"):
+        list(relation.iter_resolved_sources(0))
+    relation.resolve_sources()
+    assert relation.counts == [0, 0, 0]
+    assert list(relation.iter_resolved_sources(0)) == []
+    assert list(relation.iter_raw("turn")) == []
+    assert list(relation.iter_annotation_requests()) == []
+    leaf = relation._temp_directory
+    relation.close()
+    relation.close()
+    assert not leaf.exists() and leaf.parent.is_dir()
+    with pytest.raises(RuntimeError, match="closed"):
+        list(relation.iter_raw("turn"))
+    with pytest.raises(RuntimeError, match="closed"):
+        list(relation.iter_resolved_sources(0))
+
+
+@pytest.mark.parametrize("batch_size", [True, 0])
+def test_invalid_batch_size(tmp_path, batch_size):
+    with pytest.raises(ValueError, match="batch_size"):
+        WriterRelation(RuntimeConfig(), tmp_path, "detect", batch_size=batch_size)
+
+
+@pytest.mark.parametrize("root", ["relative", "/"])
+def test_unsafe_data_root(root):
+    with pytest.raises(ValueError, match="absolute and non-root"):
+        WriterRelation(RuntimeConfig(), root, "detect")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("detect_id", "bad/name"), ("detect_id", ".."),
+    ("relation_id", "bad/name"), ("relation_id", "bad\x00name"),
+])
+def test_unsafe_identity(tmp_path, field, value):
+    kwargs = {field: value}
+    detect_id = kwargs.pop("detect_id", "detect")
+    with pytest.raises(ValueError, match=field):
+        WriterRelation(RuntimeConfig(), tmp_path, detect_id, **kwargs)
+
+
+def test_connection_and_schema_failures_clean_only_leaf(tmp_path, monkeypatch):
+    sibling = tmp_path / "duckdb" / "writer-relations" / "detect" / "keep"
+    sibling.mkdir(parents=True)
+    monkeypatch.setattr(writer_relation.duckdb, "connect",
+                        lambda **_kw: (_ for _ in ()).throw(RuntimeError("open failed")))
+    with pytest.raises(RuntimeError, match="open failed"):
+        WriterRelation(RuntimeConfig(), tmp_path, "detect", relation_id="failed")
+    assert sibling.is_dir() and not (sibling.parent / "failed").exists()
+
+
+def test_schema_failure_closes_connection_and_cleans_only_leaf(tmp_path, monkeypatch):
+    sibling = tmp_path / "duckdb" / "writer-relations" / "detect" / "keep"
+    sibling.mkdir(parents=True)
+    real_connect = writer_relation.duckdb.connect
+    connection = real_connect(":memory:")
+    monkeypatch.setattr(writer_relation.duckdb, "connect", lambda **_kw: connection)
+    monkeypatch.setattr(WriterRelation, "_create_schema",
+                        lambda _self: (_ for _ in ()).throw(RuntimeError("schema failed")))
+    with pytest.raises(RuntimeError, match="schema failed"):
+        WriterRelation(RuntimeConfig(), tmp_path, "detect", relation_id="failed")
+    with pytest.raises(Exception):
+        connection.execute("SELECT 1")
+    assert sibling.is_dir() and not (sibling.parent / "failed").exists()
+
+
+def test_identity_collision_preserves_foreign_leaf(tmp_path):
+    leaf = tmp_path / "duckdb" / "writer-relations" / "detect" / "occupied"
+    leaf.mkdir(parents=True)
+    marker = leaf / "owned"
+    marker.write_text("keep")
+    with pytest.raises(FileExistsError):
+        WriterRelation(RuntimeConfig(), tmp_path, "detect", relation_id="occupied")
+    assert marker.read_text() == "keep"
+
+
+def test_offline_limits_and_columnar_primitives(tmp_path):
+    with _relation(tmp_path) as relation:
+        names = ("threads", "memory_limit", "max_temp_directory_size", "temp_directory",
+                 "allow_unsigned_extensions",
+                 "autoload_known_extensions", "autoinstall_known_extensions")
+        settings = dict(relation._connection.execute(
+            "SELECT name,value FROM duckdb_settings() WHERE name IN (?,?,?,?,?,?,?)", names
+        ).fetchmany(20))
+        assert settings == {
+            "threads": "1", "memory_limit": "122.0 MiB",
+            "max_temp_directory_size": "244.1 MiB",
+            "temp_directory": str(relation._temp_directory),
+            "allow_unsigned_extensions": "false",
+            "autoload_known_extensions": "false", "autoinstall_known_extensions": "false",
+        }
+    source = inspect.getsource(writer_relation).lower()
+    assert 'database=":memory:"' in source and "fetchmany" in source and "order by" in source
+    for forbidden in ("fetchall", "pickle", "heapq", "tempfile"):
+        assert forbidden not in source
