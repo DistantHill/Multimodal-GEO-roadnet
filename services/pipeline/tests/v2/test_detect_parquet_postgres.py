@@ -19,6 +19,7 @@ from track.v2.db.queries import fetch_intersections, fetch_resolved_clip_tracks
 from track.v2.db.artifact_registry import find_detect_artifact
 from track.v2.db.pipeline_store import PostgresPipelineStore
 from track.v2.detect_parquet import export_detect_parquet
+from track.v2.detect_parquet_reader import DetectDatasetReader
 from track.v2.models import RuntimeConfig
 
 
@@ -142,6 +143,12 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
 
     expected_intersections = fetch_intersections(conn, str(detect_id))
     expected_tracks = list(fetch_resolved_clip_tracks(conn, str(detect_id)))
+    with DetectDatasetReader(
+        tmp_path, registered.descriptor, registered.state,
+        RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        assert list(reader.intersections()) == expected_intersections
+        assert list(reader.iter_tracks(batch_size=1)) == expected_tracks
     with duckdb.connect() as db:
         root = publication.final_path
         actual_intersections = db.execute(
