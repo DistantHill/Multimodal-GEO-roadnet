@@ -66,7 +66,7 @@
 | C10c3 | Writer 最终行组合与配对校验 | C10c2 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
-| C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已开始（C11a） |
+| C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已开始（C11a–C11b） |
 | C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 未开始 |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
@@ -516,14 +516,20 @@ C10c1–C10c5 已完成，待主对话确认；生产写入路径已接入
 `004_patch_ledger.sql` 和专用测试；提供手工 DROP 顺序；保留 heartbeat。
 
 C11a 已删除无生产调用者的 `patch_coordinator.py` 及仅覆盖该协调器的单元测试和
-PostgreSQL 集成测试。`patch_pool.py`、`patch_spool.py`、`patch_admission.py`、
-`db/patch_ledger.py`、`resource_budget.py` 及其专用测试暂时保留，后续任务卡继续清理；
-本步不改 heartbeat、列式引擎配置、业务持久化或前后端字段。
+PostgreSQL 集成测试。
+
+C11b 已删除随协调器孤立的 `patch_admission.py` 手写内存与外存溢写配额预留器及其专用
+测试。`patch_pool.py`、`patch_spool.py`、`db/patch_ledger.py`、`resource_budget.py` 及其
+专用测试暂时保留，后续任务卡继续清理。本步不改 heartbeat、DuckDB/Polars 引擎资源
+控制、PostgreSQL 业务持久化、API 或前端字段；C11 尚未完成。
 
 验证：全仓无生产引用、初始化器不引用旧结构、Pipeline 单进程路径完整。
 
 C11a 验证：Pipeline 与 scripts 全量测试 `1447 passed, 68 skipped`；生产代码和测试中的
 协调器模块及其公开符号引用清零。
+
+C11b 验证：Pipeline 与 scripts 全量测试 `1383 passed, 68 skipped`；生产代码和测试中的
+`patch_admission`、`ReservationBook`、`ReservationToken`、`ResourceUnavailable` 引用清零。
 
 提交：待记录。
 
