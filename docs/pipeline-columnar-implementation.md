@@ -67,7 +67,7 @@
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
-| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 已开始（C12a、C12b、C12c1） |
+| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 已开始（C12a–C12c2a） |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
 ## 3. 任务卡
@@ -642,7 +642,7 @@ schema v7。
 实现、历史文档和保留文件名中的 v4 阶段叙述不属于旧活跃 guard。C12b 不执行 1M 差分或
 资源剖析，因此不宣称 C12 或 C13 完成。
 
-提交：待记录。
+提交：`4190c50`。
 
 #### C12c1 — 真实 PostgreSQL/Parquet 与小样本逐表差分
 
@@ -672,6 +672,33 @@ schema v7。
 本卡禁止迁移的约束未运行；这两组不属于本卡的发布、读取或固定样本差分缺口。
 
 C12c1 不包含 1M 差分、资源剖析或 26M 最终验收，因此不宣称 C12 或 C13 完成。
+
+提交：`7979cde`。
+
+#### C12c2a — 有界只读语义差分工具
+
+范围：新增 `python -m pipeline semantic-diff`，接收同一数据库内 baseline/candidate 的
+Refine、Detect、Fit Run ID，先校验两条血缘均存在、关系一致且 completed，再以服务端
+命名游标逐行比较。数据库事务显式只读；工具不创建、修改或删除数据库对象，也不使用
+项目自研外存、线程池、进程池或 Dask。结果以 JSON 输出逐表行数、最大误差、不可比较
+字段及 pass/fail。
+
+业务身份规范化不比较 Run UUID、自增主键或时间戳：Refine 使用来源键或注入锚点；
+resolved point 使用子轨迹最终序号及来源身份；crossing 使用线段起点的子轨迹/最终序号和
+类型；intersection 使用完整 entry/exit 证据集合；centerline 与派生 Network 拓扑使用
+规范化 intersection 端点。缺少 intersection 证据或业务键不唯一时 fail closed，不以
+行数替代语义。成员、crossing 配对和拓扑严格比较；米制、经纬度和其他浮点分别使用
+`1e-6`、`1e-9`、`1e-12` 绝对误差，并拒绝非有限值。
+
+本卡只实现工具和小样本回归，不连接或创建数据库，不运行现有 1M 基线。当前纵切比较
+Refine kept/injected、Detect resolved/intersection/entry-exit、Fitting centerline 与从
+centerline 派生的 Network 节点连接拓扑；候选诊断表不是最终业务语义，本卡不比较。
+C12c2a 不代表 1M 差分、资源剖析、C12 或 C13 完成。
+
+验证：语义差分定向测试 `11 passed`，CLI/import/API 合并定向测试 `22 passed`，标准
+Pipeline 全量 `956 passed, 50 skipped`；CLI help 可用，8 条逐表查询均通过真实 PostgreSQL
+只读 `EXPLAIN` 解析。测试覆盖 ID 偏移规范化、同数量
+拓扑变化、三类容差边界、非有限值、缺失/重复业务身份，以及只读语句和命名游标。
 
 提交：待记录。
 
