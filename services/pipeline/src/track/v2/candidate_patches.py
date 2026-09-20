@@ -23,6 +23,9 @@ class CrossTrackCapacityError(RuntimeError):
     """The requested global broad-phase would exceed its memory/work budget."""
 
 
+CROSS_TRACK_OVERFLOW_PAIR_LIMIT = 20_000_000
+
+
 def iter_track_patches(
     tracks: Iterable[tuple[str, list[TrajectoryPoint]]],
     batch_size: int,

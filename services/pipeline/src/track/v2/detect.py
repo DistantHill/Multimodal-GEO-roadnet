@@ -48,7 +48,9 @@ from ._geometry import (
     _segment_circle_crossings_batch,
 )
 from .exceptions import V2Error
-from .candidate_patches import CrossTrackCapacityError, iter_track_patches
+from .candidate_patches import (
+    CROSS_TRACK_OVERFLOW_PAIR_LIMIT, CrossTrackCapacityError, iter_track_patches,
+)
 from .candidate_extraction import (
     extract_cross_track_candidates, extract_turn_candidates, extract_disk_cross_track_candidates,
 )
@@ -91,7 +93,7 @@ from .parser import BaseTrajectorySourceHandle as TrajectorySourceHandle
 
 
 _DB_GLOBAL_GRID_MEMBERSHIP_LIMIT = 8_000_000
-_DB_GLOBAL_OVERFLOW_PAIR_LIMIT = 20_000_000
+_DB_GLOBAL_OVERFLOW_PAIR_LIMIT = CROSS_TRACK_OVERFLOW_PAIR_LIMIT
 
 
 def _perf_iter(perf, iterable, *, name, total=None, track=True):

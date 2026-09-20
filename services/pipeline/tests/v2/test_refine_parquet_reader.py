@@ -14,6 +14,10 @@ from track.v2.artifact_parquet import build_descriptor
 from track.v2.db.artifact_registry import ArtifactDescriptor, canonical_json
 from track.v2.detect import IntersectConfig
 from track.v2.cross_track import _prepare_segments
+from track.v2.candidate_patches import (
+    CROSS_TRACK_OVERFLOW_PAIR_LIMIT, CrossTrackCapacityError,
+    build_cross_track_index, iter_cross_track_patches,
+)
 from track.v2.models import RuntimeConfig, SpatialContext
 from track.v2.projection import CoordinateTransformer
 from track.v2.turn_events import detect_turn_patch
@@ -344,6 +348,103 @@ def test_duckdb_cross_track_segments_match_q49_oracle(tmp_path) -> None:
             assert getattr(left, field) == pytest.approx(getattr(right, field), abs=1e-6)
     # The old oracle ranks the decimal track key lexically: a\0 10 precedes a\0 2.
     assert [(segment.track_rank, segment.segment_index) for segment in actual] == [(0, 0), (2, 0)]
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+def test_duckdb_cross_track_pairs_match_grid_and_overflow_oracle(tmp_path, batch_size) -> None:
+    # Q44: expansion, joins, dedupe, and overflow pairing are spillable relations;
+    # Python receives only bounded metadata batches for the later exact kernel.
+    # The old oracle pairs every overflow segment with every finite cross-vehicle
+    # segment, even for disjoint AABBs, so SQL deliberately retains that strict set.
+    tracks = [
+        ("a", 10, [(0, -10, 0, 0), (1, 10, 0, 0)]),
+        ("a", 2, [(2, -100, 30, 0), (3, 100, 30, 0)]),
+        ("b", 20, [(4, 0, -10, 90), (5, 0, 10, 90)]),
+        ("c", 30, [(6, 20, -100, 90), (7, 20, 100, 90)]),
+    ]
+    descriptor = _published_tracks(tmp_path, tracks)
+    cfg = IntersectConfig(cross_track_grid_cell_m=10,
+                          cross_track_max_grid_cells_per_segment=3)
+    transformer = CoordinateTransformer(SpatialContext(
+        4326, 32650, {"coordinate_semantics_version": 2,
+                      "enforce_area_of_use": True, "max_scale_error": .01},
+    ))
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        oracle_tracks = {
+            f"{track[0].vehicle_id}\0{track[0].refined_point_ref.subtrack_index}": track
+            for track in reader.iter_tracks("public.source", batch_size=1)
+        }
+        segments, _ = _prepare_segments(oracle_tracks, transformer, cfg)
+        index = build_cross_track_index(segments, cell_m=10, max_cells=3)
+        expected = {(int(a), int(b))
+                    for ids_a, ids_b in iter_cross_track_patches(index, 1)
+                    for a, b in zip(ids_a, ids_b, strict=True)}
+        batches = list(reader.iter_cross_track_pair_batches(
+            "public.source", cfg, batch_size=batch_size,
+        ))
+    actual = [((a.track_rank, a.segment_index), (b.track_rank, b.segment_index))
+              for batch in batches for a, b in batch]
+    expected_identity = {
+        ((segments[a].track_rank, segments[a].segment_index),
+         (segments[b].track_rank, segments[b].segment_index)) for a, b in expected
+    }
+    assert set(actual) == expected_identity
+    assert len(actual) == len(set(actual))
+    assert actual == sorted(actual)
+    assert all(0 < len(batch) <= batch_size for batch in batches)
+
+
+def test_duckdb_cross_track_pairs_empty_single_vehicle_and_strict_config(tmp_path) -> None:
+    descriptor = _published_tracks(tmp_path, [
+        ("a", 0, [(0, -1, 0, 0), (1, 1, 0, 0)]),
+        ("a", 1, [(2, 0, -1, 90), (3, 0, 1, 90)]),
+    ])
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        assert list(reader.iter_cross_track_pair_batches("source", IntersectConfig())) == []
+        for cfg, match in (
+            (IntersectConfig(cross_track_grid_cell_m=float("nan")), "cell size"),
+            (IntersectConfig(cross_track_grid_cell_m=0), "cell size"),
+            (IntersectConfig(cross_track_max_grid_cells_per_segment=0), "maximum grid"),
+        ):
+            with pytest.raises(refine_parquet.RefineParquetError, match=match):
+                list(reader.iter_cross_track_pair_batches("source", cfg))
+        with pytest.raises(refine_parquet.RefineParquetError, match="batch_size"):
+            list(reader.iter_cross_track_pair_batches("source", IntersectConfig(), batch_size=0))
+
+
+def test_cross_track_pair_api_never_fetches_all() -> None:
+    reader = object.__new__(refine_parquet.RefineDatasetReader)
+    reader._descriptor = Mock(refine_id=uuid4())
+    validation, estimate, result = Mock(), Mock(), Mock()
+    validation.fetchone.return_value = (0,)
+    estimate.fetchone.return_value = (0,)
+    result.fetchmany.return_value = []
+    connection = Mock()
+    connection.execute.side_effect = [validation, estimate, result]
+    reader._connection = connection
+    assert list(reader.iter_cross_track_pair_batches(
+        "source", IntersectConfig(), batch_size=1,
+    )) == []
+    result.fetchmany.assert_called_once_with(1)
+    assert not result.fetchall.called
+
+
+def test_cross_track_pair_api_fails_closed_before_overflow_join() -> None:
+    reader = object.__new__(refine_parquet.RefineDatasetReader)
+    reader._descriptor = Mock(refine_id=uuid4())
+    validation, estimate = Mock(), Mock()
+    validation.fetchone.return_value = (0,)
+    estimate.fetchone.return_value = (CROSS_TRACK_OVERFLOW_PAIR_LIMIT + 1,)
+    connection = Mock()
+    connection.execute.side_effect = [validation, estimate]
+    reader._connection = connection
+    with pytest.raises(CrossTrackCapacityError, match="20,000,001"):
+        list(reader.iter_cross_track_pair_batches("source", IntersectConfig()))
+    assert connection.execute.call_count == 2
 
 
 def test_cross_track_segment_api_is_bounded_and_validates_config() -> None:

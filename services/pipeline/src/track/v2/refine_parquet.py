@@ -15,6 +15,9 @@ import duckdb
 
 from track.v2.artifact_parquet import build_descriptor, validate_published
 from track.v2.artifact_publication import StagingDataset, _validate_handle
+from track.v2.candidate_patches import (
+    CROSS_TRACK_OVERFLOW_PAIR_LIMIT, CrossTrackCapacityError,
+)
 from track.v2.config import PostgresConfig
 from track.v2.db.artifact_registry import ArtifactDescriptor
 from track.v2.db.source_table import SourceTableContract, validate_source_table
@@ -247,6 +250,90 @@ class RefineDatasetReader:
         self, source_table: str, cfg: Any, *, batch_size: int = 4096,
     ) -> Iterator[_CrossTrackSegment]:
         """Yield straight adjacent segments prepared by spillable DuckDB SQL."""
+        connection, threshold = self._validate_cross_track_request(
+            source_table, cfg, batch_size,
+        )
+        self._validate_cross_track_source(connection)
+        query = self._cross_track_segment_relation("""
+          SELECT segment_id, refine_id, point_id, vehicle_id, subtrack_index,
+                 refined_sequence_in_subtrack, timestamp, lon, lat, x, y,
+                 heading, speed, point_kind, source_row_key, generated_reason,
+                 after_sequence_in_subtrack, 1 AS vehicles,
+                 vehicle_rank, track_rank, segment_index, end_x, end_y
+          FROM straight
+          ORDER BY track_rank, segment_index
+        """)
+        result = connection.execute(query, [threshold])
+        while rows := result.fetchmany(batch_size):
+            for row in rows:
+                yield self._decode_cross_track_segment(row, source_table)
+
+    def iter_cross_track_pair_batches(
+        self, source_table: str, cfg: Any, *, batch_size: int = 4096,
+    ) -> Iterator[tuple[tuple[_CrossTrackSegment, _CrossTrackSegment], ...]]:
+        """Yield stable broad-phase pairs; DuckDB owns expansion and deduplication."""
+        connection, threshold = self._validate_cross_track_request(
+            source_table, cfg, batch_size,
+        )
+        cell_m = cfg.cross_track_grid_cell_m
+        max_cells = cfg.cross_track_max_grid_cells_per_segment
+        if (isinstance(cell_m, bool) or not isinstance(cell_m, (int, float))
+                or not math.isfinite(cell_m) or cell_m <= 0):
+            raise RefineParquetError("cross-track grid cell size is invalid")
+        if (isinstance(max_cells, bool) or not isinstance(max_cells, int)
+                or max_cells < 1):
+            raise RefineParquetError("cross-track maximum grid cells is invalid")
+        self._validate_cross_track_source(connection)
+        relation = self._cross_track_pair_relation()
+        parameters = [threshold, float(cell_m), float(cell_m), float(cell_m),
+                      float(cell_m), max_cells]
+        estimate = connection.execute(
+            relation + " SELECT count(*) * (SELECT count(*) FROM spans) FROM spans WHERE overflow",
+            parameters,
+        ).fetchone()
+        if estimate is None or estimate[0] is None:
+            raise RefineParquetError("cross-track overflow estimate failed")
+        if int(estimate[0]) > CROSS_TRACK_OVERFLOW_PAIR_LIMIT:
+            raise CrossTrackCapacityError(
+                "global cross-track overflow fallback spans "
+                f"{int(estimate[0]):,} segment pairs; budget is "
+                f"{CROSS_TRACK_OVERFLOW_PAIR_LIMIT:,}"
+            )
+        query = relation + """
+          , memberships AS (
+            SELECT segment_id, vehicle_rank, min_cell_x, min_cell_y, cell_x, cell_y
+            FROM spans,
+              LATERAL range(min_cell_x, max_cell_x + 1) cells_x(cell_x),
+              LATERAL range(min_cell_y, max_cell_y + 1) cells_y(cell_y)
+            WHERE NOT overflow
+          ), grid_pairs AS (
+            SELECT a.segment_id AS a_id, b.segment_id AS b_id
+            FROM memberships a JOIN memberships b
+              ON a.cell_x = b.cell_x AND a.cell_y = b.cell_y
+             AND a.segment_id < b.segment_id AND a.vehicle_rank != b.vehicle_rank
+             AND greatest(a.min_cell_x, b.min_cell_x) = a.cell_x
+             AND greatest(a.min_cell_y, b.min_cell_y) = a.cell_y
+          ), overflow_pairs AS (
+            SELECT a.segment_id AS a_id, b.segment_id AS b_id
+            FROM spans a JOIN spans b ON a.segment_id < b.segment_id
+             AND a.vehicle_rank != b.vehicle_rank AND (a.overflow OR b.overflow)
+          ), pairs AS (
+            SELECT * FROM grid_pairs UNION ALL SELECT * FROM overflow_pairs
+          )
+          SELECT a.*, b.* FROM pairs
+          JOIN straight a ON a.segment_id = pairs.a_id
+          JOIN straight b ON b.segment_id = pairs.b_id
+          ORDER BY pairs.a_id, pairs.b_id
+        """
+        result = connection.execute(query, parameters)
+        while rows := result.fetchmany(batch_size):
+            yield tuple((self._decode_cross_track_segment(row[:23], source_table),
+                         self._decode_cross_track_segment(row[23:], source_table))
+                        for row in rows)
+
+    def _validate_cross_track_request(
+        self, source_table: str, cfg: Any, batch_size: int,
+    ) -> tuple[duckdb.DuckDBPyConnection, float]:
         connection = self._require_open()
         if not isinstance(source_table, str) or not source_table.strip():
             raise RefineParquetError("source_table is required")
@@ -256,6 +343,9 @@ class RefineDatasetReader:
             raise RefineParquetError("cross-track straightness threshold is invalid")
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise RefineParquetError("batch_size is invalid")
+        return connection, float(threshold)
+
+    def _validate_cross_track_source(self, connection: duckdb.DuckDBPyConnection) -> None:
         invalid = connection.execute("""
           WITH checked AS (
             SELECT *,
@@ -287,7 +377,10 @@ class RefineDatasetReader:
         """, [self._descriptor.refine_id]).fetchone()
         if invalid is None or invalid[0]:
             raise RefineParquetError("cross-track source contains corrupt identity or sequence data")
-        query = """
+
+    @staticmethod
+    def _cross_track_segment_relation(select_sql: str) -> str:
+        return """
           WITH adjacent AS (
             SELECT *,
               dense_rank() OVER (ORDER BY vehicle_id) - 1 AS vehicle_rank,
@@ -304,32 +397,49 @@ class RefineDatasetReader:
             SELECT *, (((end_heading-heading+180.0) % 360.0 + 360.0)
                        % 360.0)-180.0 AS heading_delta
             FROM adjacent WHERE end_x IS NOT NULL
+          ), straight AS (
+            SELECT row_number() OVER (ORDER BY track_rank, segment_index) - 1 AS segment_id,
+                   refine_id, point_id, vehicle_id, subtrack_index,
+                   refined_sequence_in_subtrack, timestamp, lon, lat, x, y,
+                   heading, speed, point_kind, source_row_key, generated_reason,
+                   after_sequence_in_subtrack, 1 AS vehicles,
+                   vehicle_rank, track_rank, segment_index, end_x, end_y
+            FROM deltas WHERE abs(heading_delta) <= ?
           )
-          SELECT refine_id, point_id, vehicle_id, subtrack_index,
-                 refined_sequence_in_subtrack, timestamp, lon, lat, x, y,
-                 heading, speed, point_kind, source_row_key, generated_reason,
-                 after_sequence_in_subtrack, 1 AS vehicles,
-                 vehicle_rank, track_rank, segment_index, end_x, end_y
-          FROM deltas WHERE abs(heading_delta) <= ?
-          ORDER BY track_rank, segment_index
-        """
-        result = connection.execute(query, [float(threshold)])
+        """ + select_sql
+
+    @classmethod
+    def _cross_track_pair_relation(cls) -> str:
+        return cls._cross_track_segment_relation("""
+          , spans AS (
+            SELECT *, floor(least(x, end_x) / ?)::BIGINT AS min_cell_x,
+                   floor(greatest(x, end_x) / ?)::BIGINT AS max_cell_x,
+                   floor(least(y, end_y) / ?)::BIGINT AS min_cell_y,
+                   floor(greatest(y, end_y) / ?)::BIGINT AS max_cell_y,
+                   ((max_cell_x-min_cell_x+1) * (max_cell_y-min_cell_y+1)) > ? AS overflow
+            FROM straight
+          )
+        """)
+
+    def _decode_cross_track_segment(
+        self, row: tuple[Any, ...], source_table: str,
+    ) -> _CrossTrackSegment:
         from .cross_track import _CrossTrackSegment
-        while rows := result.fetchmany(batch_size):
-            for row in rows:
-                point, _ = self._decode_row(
-                    row[:17], source_table, int(row[19]),
-                    (str(row[2]), int(row[3])),
-                )
-                coordinates = tuple(float(value) for value in (row[8], row[9], row[20], row[21]))
-                if not all(math.isfinite(value) for value in coordinates):
-                    raise RefineParquetError("cross-track segment contains non-finite coordinates")
-                yield _CrossTrackSegment(
-                    vehicle_id=point.vehicle_id, vehicle_rank=int(row[17]),
-                    track_rank=int(row[18]), segment_index=int(row[19]), start=point,
-                    x1=coordinates[0], y1=coordinates[1], x2=coordinates[2],
-                    y2=coordinates[3], heading=point.heading, timestamp=point.timestamp,
-                )
+        # segment_id prefixes the 22 columns used by C07b.
+        data = row[1:]
+        point, _ = self._decode_row(
+            data[:17], source_table, int(data[19]),
+            (str(data[2]), int(data[3])),
+        )
+        coordinates = tuple(float(value) for value in (data[8], data[9], data[20], data[21]))
+        if not all(math.isfinite(value) for value in coordinates):
+            raise RefineParquetError("cross-track segment contains non-finite coordinates")
+        return _CrossTrackSegment(
+            vehicle_id=point.vehicle_id, vehicle_rank=int(data[17]),
+            track_rank=int(data[18]), segment_index=int(data[19]), start=point,
+            x1=coordinates[0], y1=coordinates[1], x2=coordinates[2],
+            y2=coordinates[3], heading=point.heading, timestamp=point.timestamp,
+        )
 
     def _decode_turn_row(
         self, row: tuple[Any, ...], source_table: str, event_index: int,
