@@ -58,7 +58,7 @@ from .candidate_extraction import (
 from .detect_workspace import DetectWorkspace
 from .dbscan_storage import ActiveGridLinks, index_typecode
 from .turn_event_relation import TurnCoordinate, TurnEventRelation
-from .cross_member_store import CandidateStore, MemberPass
+from .cross_candidate_relation import CrossCandidateRelation, MemberPass
 from .member_sequences import (
     ConcatSequence, PointRefSequence, reference_source_ids, summarize_events,
 )
@@ -1057,7 +1057,7 @@ def _extract_cross_track_db_workspace(
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
-    candidate_store: CandidateStore | None = None,
+    candidate_store: CrossCandidateRelation | None = None,
     refine_reader: RefineDatasetReader | None = None,
 ) -> Sequence[CrossTrackCandidate]:
     """Use bounded disk broad phase for DB runs; retain handle benchmark seams."""
@@ -1548,7 +1548,7 @@ def _detect_intersections_db(
     event_store = TurnEventRelation(runtime, data_root)
     candidate_store = None
     try:
-        candidate_store = CandidateStore(directory=data_root)
+        candidate_store = CrossCandidateRelation(runtime, data_root)
         with DetectWorkspace(cfg) as workspace:
             result = _detect_intersections_db_workspace(
                 conn, cfg, spatial_context, workspace, event_store=event_store,
@@ -1576,7 +1576,7 @@ def _detect_intersections_db_workspace(
     workspace: DetectWorkspace,
     *,
     event_store: TurnEventRelation | None = None,
-    candidate_store: CandidateStore | None = None,
+    candidate_store: CrossCandidateRelation | None = None,
     refine_reader: RefineDatasetReader | None = None,
 ) -> IntersectResult:
     """DB Detect stages share a disk workspace and unchanged global clustering."""
@@ -2395,12 +2395,12 @@ def _cluster_orthogonal_cross_track_candidates(
     if n == 0:
         return []
 
-    if isinstance(candidates, CandidateStore):
+    if isinstance(candidates, CrossCandidateRelation):
         xs, ys = array("d"), array("d")
         with closing(candidates.iter_coordinates()) as coordinates:
-            for x, y in coordinates:
-                xs.append(x)
-                ys.append(y)
+            for coordinate in coordinates:
+                xs.append(coordinate.x)
+                ys.append(coordinate.y)
     else:
         xs = [c.x for c in candidates]
         ys = [c.y for c in candidates]
@@ -2408,7 +2408,7 @@ def _cluster_orthogonal_cross_track_candidates(
     labels = _run_dbscan(xs, ys, eps_m=eps_m, min_samples=min_samples,
                           live_status=live_status, stage="orthogonal_cross_track", perf=perf)
 
-    if isinstance(candidates, CandidateStore):
+    if isinstance(candidates, CrossCandidateRelation):
         member_pass = candidates.create_members(labels)
         if member_passes is not None:
             member_passes.append(member_pass)

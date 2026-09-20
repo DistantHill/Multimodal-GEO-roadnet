@@ -56,8 +56,8 @@
 | C09c2 | Detect TurnEvent 接线及旧 spool 删除 | C09c1 | 每提交 ≤700 | 已完成（`853da8c`） |
 | C10a1 | Detect CrossTrackCandidate 规范化列式关系 | C09c2 | 每提交 ≤700 | 已完成（`7b3e6c4`） |
 | C10a2 | Detect 跨轨迹候选多 pass 簇成员关系 | C10a1 | 每提交 ≤700 | 已完成（`aa60989`） |
-| C10a3 | Detect 通用成员序列 helper 剥离 | C10a2 | 每提交 ≤700 | 已完成，待主对话确认 |
-| C10a4 | Detect 正式接线并删除旧跨轨迹成员暂存 | C10a3 | 每提交 ≤700 | 未开始 |
+| C10a3 | Detect 通用成员序列 helper 剥离 | C10a2 | 每提交 ≤700 | 已完成（`a16bf52`） |
+| C10a4 | Detect 正式接线并删除旧跨轨迹成员暂存 | C10a3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10b | Topology 与 DetectWorkspace 列式迁移及旧工作区删除 | C10a4 | 每提交 ≤700 | 未开始 |
 | C10c | WriterWorkspace 列式迁移及旧工作区删除 | C10b | 每提交 ≤700 | 未开始 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 未开始 |
@@ -449,12 +449,12 @@ psycopg 事务兼容与输出字段不变。DuckDB 负责片段关系的重复�
 
 验证：普通与惰性序列、反向切片、重复项、来源回退、提前关闭，以及新旧成员视图等价。
 
-提交：待记录。
+提交：`a16bf52`。
 
 ### C10a4 — Detect 正式接线并删除旧跨轨迹成员暂存
 
 范围：将 Detect 跨轨迹候选及成员 pass 正式接入 `CrossCandidateRelation`，并删除
-`cross_member_store.py`。
+`cross_member_store.py`。已完成，待主对话确认。
 
 验证：Detect 聚类、消融、持久化、来源摘要及旧模块生产引用清零。
 

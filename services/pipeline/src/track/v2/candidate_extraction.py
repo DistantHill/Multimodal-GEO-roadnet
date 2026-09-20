@@ -20,7 +20,7 @@ from .models import CrossTrackCandidate, TrajectoryPoint, TurnEvent
 from .projection import CoordinateTransformer
 from .turn_events import detect_turn_patch
 from .turn_event_relation import TurnEventRelation
-from .cross_member_store import CandidateStore
+from .cross_candidate_relation import CrossCandidateRelation
 
 if TYPE_CHECKING:
     from .detect import IntersectConfig
@@ -176,10 +176,10 @@ def extract_columnar_cross_track_candidates(
     cfg: Any,
     *,
     live_status: Any = None,
-    candidate_store: CandidateStore | None = None,
+    candidate_store: CrossCandidateRelation | None = None,
 ) -> Sequence[CrossTrackCandidate]:
     """Run the existing exact NumPy kernel on bounded DuckDB pair batches."""
-    result: list[CrossTrackCandidate] | CandidateStore = (
+    result: list[CrossTrackCandidate] | CrossCandidateRelation = (
         [] if candidate_store is None else candidate_store
     )
     pair_count = 0
@@ -276,7 +276,7 @@ def extract_disk_cross_track_candidates(
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
-    candidate_store: CandidateStore | None = None,
+    candidate_store: CrossCandidateRelation | None = None,
 ) -> Sequence[CrossTrackCandidate]:
     """Run the same pair kernel on disk-indexed bbox patches, then sort globally.
 

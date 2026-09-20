@@ -12,7 +12,6 @@ from track.v2 import cross_candidate_relation
 from track.v2.cross_candidate_relation import (
     ClusterMemberSequence, CrossCandidateCoordinate, CrossCandidateRelation,
 )
-from track.v2.cross_member_store import CandidateStore
 from track.v2.member_sequences import SliceSequence
 from track.v2.models import CrossTrackCandidate, PointRef, RefinedPointRef, RuntimeConfig
 
@@ -196,32 +195,41 @@ def test_runtime_limits_bounded_fetch_and_columnar_implementation(tmp_path):
         assert forbidden not in source
 
 
-def test_member_pass_matches_legacy_store_and_ignores_noise(tmp_path):
+def test_member_pass_has_independent_expected_views_and_ignores_noise(tmp_path):
     candidates = tuple(_candidate(index, optional=index % 2 == 0) for index in range(5))
     labels = [4, -1, 2, 4, 2]
-    with _relation(tmp_path) as relation, CandidateStore(directory=str(tmp_path)) as legacy:
+    with _relation(tmp_path) as relation:
         for candidate in candidates:
             relation.append(candidate)
-            legacy.append(candidate)
         relation_pass = relation.create_members(labels)
-        legacy_pass = legacy.create_members(labels)
         actual = dict(relation_pass.iter_groups())
-        expected = dict(legacy_pass.iter_groups())
-        assert list(actual) == list(expected) == [2, 4]
-        for label in actual:
-            group, old_group = actual[label], expected[label]
+        expected_ordinals = {2: [2, 4], 4: [0, 3]}
+        assert list(actual) == list(expected_ordinals) == [2, 4]
+        for label, ordinals in expected_ordinals.items():
+            group = actual[label]
+            expected_candidates = [candidates[index] for index in ordinals]
             assert isinstance(group, ClusterMemberSequence)
-            assert tuple(group) == tuple(old_group)
-            assert group[:] == tuple(old_group)
+            assert [event.cross_track_calculate_index for event in group] == ordinals
+            assert group[:] == tuple(group)
             assert isinstance(group[::-1], SliceSequence)
-            assert group[::-1] == list(old_group)[::-1]
-            assert group == list(old_group)
-            assert group[-1] == old_group[-1]
-            assert list(group.iter_member_identities()) == list(old_group.iter_member_identities())
-            assert list(group.iter_ordinals()) == list(old_group.iter_ordinals())
-            assert list(group.iter_coordinates()) == list(old_group.iter_coordinates())
-            assert list(group.iter_candidates()) == list(old_group.iter_candidates())
-            assert group.provenance_summary("ignored") == old_group.provenance_summary("ignored")
+            assert group[::-1] == list(group)[::-1]
+            assert group == list(group)
+            assert group[-1].cross_track_calculate_index == ordinals[-1]
+            assert list(group.iter_member_identities()) == [
+                ("orthogonal_cross_track", order, ordinal)
+                for order, ordinal in enumerate(ordinals)
+            ]
+            assert list(group.iter_ordinals()) == ordinals
+            assert list(group.iter_coordinates()) == [
+                (candidate.x, candidate.y) for candidate in expected_candidates
+            ]
+            assert list(group.iter_candidates()) == expected_candidates
+            summary = group.provenance_summary("ignored")
+            assert summary.event_source_ids == frozenset({"source", "other"})
+            assert summary.ref_counts == {"orthogonal_cross_track": len(ordinals)}
+            assert summary.ref_source_ids == {
+                "orthogonal_cross_track": frozenset({"source"})
+            }
             assert tuple(group) == tuple(group)
 
 

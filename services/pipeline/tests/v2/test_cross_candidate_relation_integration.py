@@ -4,7 +4,6 @@ from contextlib import ExitStack
 from dataclasses import replace
 import gc
 import json
-import pickle
 from pathlib import Path
 from unittest.mock import patch
 import weakref
@@ -13,7 +12,7 @@ import pytest
 
 from track.v2 import detect
 from track.v2.candidate_extraction import extract_cross_track_candidates, extract_disk_cross_track_candidates
-from track.v2.cross_member_store import CandidateStore, ClusterMemberSequence
+from track.v2.cross_candidate_relation import ClusterMemberSequence, CrossCandidateRelation
 from track.v2.member_sequences import ConcatSequence
 from track.v2.db_writer import _insert_tracks_cross, _refine_key
 from track.v2.writer_workspace import WriterWorkspace
@@ -64,7 +63,7 @@ def candidates(count=17):
 
 
 def stored(tmp_path, values):
-    spool = CandidateStore(directory=tmp_path)
+    spool = CrossCandidateRelation(RuntimeConfig(), tmp_path)
     for candidate in values:
         spool.append(candidate)
     spool.seal()
@@ -77,7 +76,9 @@ def serialized(clusters):
 
 
 def cluster_pass_ids(spool):
-    return [row[0] for row in spool._db.execute("SELECT DISTINCT pass_id FROM members ORDER BY pass_id")]
+    return [row[0] for row in spool._connection.execute(
+        "SELECT DISTINCT pass_id FROM cross_candidate_members ORDER BY pass_id"
+    ).fetchall()]
 
 
 @pytest.mark.parametrize("merge_distance", [0., 30., 100.])
@@ -140,13 +141,13 @@ def test_lazy_members_merge_and_provenance_do_not_retain_decoded_payloads(tmp_pa
     cfg = detect.IntersectConfig(cross_track_dbscan_eps_m=2., cross_track_dbscan_min_samples=2,
                                 dbscan_eps_m_turn=2., dbscan_min_samples_turn=2,
                                 merge_centroid_distance_m=100.)
-    real_loads = pickle.loads
+    real_decode = CrossCandidateRelation._decode.__func__
     real_event = ClusterMemberSequence._event
     decoded = []
     wrapped = []
 
-    def observe_loads(payload, **kwargs):
-        candidate = real_loads(payload, **kwargs)
+    def observe_decode(cls, row):
+        candidate = real_decode(cls, row)
         decoded.extend((weakref.ref(candidate), weakref.ref(candidate.point_ref)))
         return candidate
 
@@ -157,12 +158,12 @@ def test_lazy_members_merge_and_provenance_do_not_retain_decoded_payloads(tmp_pa
 
     with stored(tmp_path, values) as spool:
         del values
-        with patch("track.v2.cross_member_store.pickle.loads", side_effect=observe_loads), patch.object(
+        with patch.object(CrossCandidateRelation, "_decode", new=classmethod(observe_decode)), patch.object(
             ClusterMemberSequence, "_event", new=staticmethod(observe_event),
         ):
             clusters = detect._build_candidate_clusters([], spool, cfg, _TEST_TRANSFORMER)
             gc.collect()
-            assert decoded
+            assert not decoded
             assert not wrapped  # summary construction never needs TurnEvent payloads
             assert all(reference() is None for reference in decoded + wrapped)
             assert all(isinstance(cluster.events, ConcatSequence) for cluster in clusters)
@@ -176,6 +177,7 @@ def test_lazy_members_merge_and_provenance_do_not_retain_decoded_payloads(tmp_pa
             gc.collect()
             assert all(reference() is None for reference in decoded + wrapped)
             assert serialized(annotated)
+            assert decoded
             assert wrapped  # explicit export is the point where events are decoded
             gc.collect()
             assert all(reference() is None for reference in decoded + wrapped)
@@ -244,7 +246,7 @@ def test_sorted_extraction_to_result_survives_track_workspace_and_writes_same_ro
     cfg = detect.IntersectConfig(cross_track_pair_batch_size=3, use_turn_events=False,
                                 cross_track_dbscan_min_samples=1)
     expected, _, _ = extract_cross_track_candidates(tracks, TRANSFORMER, cfg)
-    spool = CandidateStore(directory=tmp_path)
+    spool = CrossCandidateRelation(RuntimeConfig(), tmp_path)
     try:
         with DetectWorkspace(cfg, directory=tmp_path) as workspace:
             for key in reversed(list(tracks)):
@@ -300,7 +302,7 @@ def test_sorted_extraction_to_result_survives_track_workspace_and_writes_same_ro
         assert result.as_dict() == eager.as_dict()
         result.close()
         result.close()
-        assert not list(tmp_path.iterdir())
+        assert not list(tmp_path.glob("duckdb/cross-candidate-relations/*"))
         with pytest.raises(RuntimeError):
             list(lazy_clusters[0].events)
     finally:
@@ -324,6 +326,7 @@ def test_db_owner_closes_all_spools_on_failure(tmp_path, monkeypatch, phase, fai
                 object(), cfg, CONTEXT, runtime=RuntimeConfig(), data_root=tmp_path,
             )
     assert not list(tmp_path.glob("duckdb/turn-event-relations/*"))
+    assert not list(tmp_path.glob("duckdb/cross-candidate-relations/*"))
 
 
 def test_db_owner_returns_live_candidate_store_and_complete_eager_result(tmp_path, monkeypatch):
@@ -345,12 +348,13 @@ def test_db_owner_returns_live_candidate_store_and_complete_eager_result(tmp_pat
             object(), cfg, CONTEXT, runtime=RuntimeConfig(), data_root=tmp_path,
         )
     try:
-        assert isinstance(actual.cross_track_candidates, CandidateStore)
+        assert isinstance(actual.cross_track_candidates, CrossCandidateRelation)
         assert actual.as_dict() == eager.as_dict()
         assert actual.as_dict() == eager.as_dict()
     finally:
         actual.close()
     assert not list(tmp_path.glob("duckdb/turn-event-relations/*"))
+    assert not list(tmp_path.glob("duckdb/cross-candidate-relations/*"))
 
 
 def test_summary_merge_and_reference_lengths_do_not_decode_members_again(tmp_path):
@@ -361,33 +365,33 @@ def test_summary_merge_and_reference_lengths_do_not_decode_members_again(tmp_pat
         merge_centroid_distance_m=100.,
     )
     turns = [_event(i, values[i].x, values[i].y) for i in range(4)]
-    real_loads = pickle.loads
+    real_decode = CrossCandidateRelation._decode.__func__
     decoded = 0
 
-    def count_loads(payload, **kwargs):
+    def count_decode(cls, row):
         nonlocal decoded
         decoded += 1
-        return real_loads(payload, **kwargs)
+        return real_decode(cls, row)
 
     with stored(tmp_path, values) as spool:
-        with patch("track.v2.cross_member_store.pickle.loads", new=count_loads):
+        with patch.object(CrossCandidateRelation, "_decode", new=classmethod(count_decode)):
             crosses = detect._cluster_orthogonal_cross_track_candidates(
                 spool, _TEST_TRANSFORMER, eps_m=2., min_samples=2,
             )
         turn_clusters = detect._cluster_dbscan(
             turns, _TEST_TRANSFORMER, eps_m=2., min_samples=2, source="turn",
         )
-        # Each pass builds summaries during at most one full global-order scan.
-        assert 0 < decoded <= len(values)
+        # Narrow provenance summaries do not reconstruct candidate payloads.
+        assert decoded == 0
         assert len(crosses) > 1
-        with patch("track.v2.cross_member_store.pickle.loads", side_effect=AssertionError("decoded cached provenance")):
+        with patch.object(CrossCandidateRelation, "_decode", side_effect=AssertionError("decoded cached provenance")):
             initial = detect._merge_clusters([*turn_clusters, *crosses], 100., _TEST_TRANSFORMER)
             normalized = [detect._with_source_provenance(cluster) for cluster in initial]
             assert sum(len(refs) for cluster in normalized for refs in cluster.source_point_refs.values()) == 16
         before_ablation = decoded
-        with patch("track.v2.cross_member_store.pickle.loads", new=count_loads):
+        with patch.object(CrossCandidateRelation, "_decode", new=classmethod(count_decode)):
             annotated = detect._annotate_source_ablation(initial, turns, spool, cfg, _TEST_TRANSFORMER)
-        assert 0 < decoded - before_ablation <= len(values)
+        assert decoded == before_ablation
         assert serialized(annotated) == serialized(detect._annotate_source_ablation(
             detect._build_candidate_clusters(turns, values, cfg, _TEST_TRANSFORMER),
             turns, values, cfg, _TEST_TRANSFORMER,
