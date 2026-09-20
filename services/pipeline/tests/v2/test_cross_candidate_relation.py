@@ -1,0 +1,188 @@
+"""Normalized DuckDB cross-candidate relation behavior and guards."""
+from __future__ import annotations
+
+import inspect
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from track.v2 import cross_candidate_relation
+from track.v2.cross_candidate_relation import CrossCandidateCoordinate, CrossCandidateRelation
+from track.v2.models import CrossTrackCandidate, PointRef, RefinedPointRef, RuntimeConfig
+
+
+def _candidate(index: int, *, optional: bool = False) -> CrossTrackCandidate:
+    point = PointRef("source", f"row-{index}", True, "from", None, "", "hash")
+    other = PointRef("other", f"other-{index}", False, None, "to", "derived", "hash-2")
+    return CrossTrackCandidate(
+        point_ref=point, from_segment_start_point_ref=point,
+        to_segment_start_point_ref=other, vehicle_id="a|b", timestamp=10.5 + index,
+        lon=120.0, lat=30.0, x=1.0 + index, y=2.0 + index,
+        heading=359.5, speed=3.25,
+        from_segment_start=RefinedPointRef("kept", 4, 2, 8) if optional else None,
+        to_segment_start=RefinedPointRef("injected", 5, 3, 9) if optional else None,
+        cross_track_calculate_index=index,
+    )
+
+
+def _relation(tmp_path: Path, *, batch_size: int = 1) -> CrossCandidateRelation:
+    return CrossCandidateRelation(
+        RuntimeConfig(
+            duckdb_memory_limit="128MB", duckdb_threads=1,
+            duckdb_max_temp_directory_size="256MB",
+        ),
+        tmp_path, batch_size=batch_size, relation_id="test-relation",
+    )
+
+
+def test_empty_relation_seals_and_repeats(tmp_path):
+    with _relation(tmp_path) as relation:
+        relation.seal()
+        assert len(relation) == 0
+        assert list(relation) == list(relation) == []
+        assert list(relation.iter_coordinates()) == []
+
+
+def test_lossless_refs_index_slices_coordinates_and_batch_one(tmp_path):
+    candidates = (_candidate(0, optional=True), _candidate(1))
+    with _relation(tmp_path) as relation:
+        for candidate in candidates:
+            relation.append(candidate)
+        with pytest.raises(RuntimeError, match="not sealed"):
+            list(relation)
+        relation.seal()
+        assert tuple(relation) == tuple(relation) == candidates
+        assert relation[0] == relation[-2] == candidates[0]
+        assert relation[-1] == candidates[1]
+        assert relation[:] == candidates
+        assert relation[::2] == candidates[::2]
+        assert candidates[0].as_dict() == relation[0].as_dict()
+        assert list(relation.iter_coordinates()) == [
+            CrossCandidateCoordinate(0, 1.0, 2.0),
+            CrossCandidateCoordinate(1, 2.0, 3.0),
+        ]
+        with pytest.raises(IndexError):
+            _ = relation[2]
+        with pytest.raises(TypeError):
+            _ = relation[1.5]  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "UPDATE cross_candidates SET ordinal=2",
+        "UPDATE cross_candidates SET cross_track_calculate_index=2",
+        "UPDATE cross_candidates SET vehicle_id=NULL",
+        "UPDATE cross_candidates SET x='NaN'::DOUBLE",
+        "UPDATE cross_candidates SET lon=181",
+        "UPDATE cross_candidates SET point_source_id=''",
+        "UPDATE cross_candidates SET from_point_stable=NULL",
+        "UPDATE cross_candidates SET from_id=NULL",
+        "UPDATE cross_candidates SET to_id=-1,to_kind='kept',to_subtrack=0,to_sequence=0",
+    ],
+)
+def test_seal_rejects_corruption_and_closes(tmp_path, sql):
+    relation = _relation(tmp_path)
+    relation.append(_candidate(0, optional=True))
+    relation._connection.execute(sql)
+    with pytest.raises(ValueError, match="invalid CrossTrackCandidate relation"):
+        relation.seal()
+    with pytest.raises(RuntimeError, match="closed"):
+        len(relation)
+
+
+def test_sealed_and_closed_lifecycle(tmp_path):
+    relation = _relation(tmp_path)
+    relation.append(_candidate(0))
+    relation.seal()
+    relation.seal()
+    with pytest.raises(RuntimeError, match="sealed"):
+        relation.append(_candidate(1))
+    relation.close()
+    relation.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        list(relation)
+    with pytest.raises(RuntimeError, match="closed"):
+        list(relation.iter_coordinates())
+
+
+def test_seal_rejects_non_contiguous_appended_calculate_index(tmp_path):
+    relation = _relation(tmp_path)
+    relation.append(replace(_candidate(0), cross_track_calculate_index=4))
+    with pytest.raises(ValueError, match="invalid CrossTrackCandidate relation"):
+        relation.seal()
+    with pytest.raises(RuntimeError, match="closed"):
+        len(relation)
+
+
+@pytest.mark.parametrize("batch_size", [True, 0])
+def test_invalid_batch_size_is_rejected(tmp_path, batch_size):
+    with pytest.raises(ValueError, match="batch_size"):
+        CrossCandidateRelation(RuntimeConfig(), tmp_path, batch_size=batch_size)
+
+
+@pytest.mark.parametrize("root", ["relative", "/"])
+def test_unsafe_data_root_is_rejected(root):
+    with pytest.raises(ValueError, match="absolute and non-root"):
+        CrossCandidateRelation(RuntimeConfig(), root)
+
+
+@pytest.mark.parametrize("relation_id", [".", "..", "bad/name", "bad\x00name"])
+def test_unsafe_relation_identity_is_rejected(tmp_path, relation_id):
+    with pytest.raises(ValueError, match="relation_id"):
+        CrossCandidateRelation(RuntimeConfig(), tmp_path, relation_id=relation_id)
+
+
+def test_connection_failure_removes_only_its_empty_leaf(tmp_path, monkeypatch):
+    sibling = tmp_path / "duckdb" / "cross-candidate-relations" / "keep"
+    sibling.mkdir(parents=True)
+    monkeypatch.setattr(
+        cross_candidate_relation.duckdb, "connect",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("open failed")),
+    )
+    with pytest.raises(RuntimeError, match="open failed"):
+        CrossCandidateRelation(RuntimeConfig(), tmp_path, relation_id="failed")
+    assert sibling.is_dir() and not (sibling.parent / "failed").exists()
+
+
+def test_relation_identity_collision_fails_closed(tmp_path):
+    occupied = tmp_path / "duckdb" / "cross-candidate-relations" / "occupied"
+    occupied.mkdir(parents=True)
+    marker = occupied / "owned-by-other-run"
+    marker.write_text("keep")
+    with pytest.raises(FileExistsError):
+        CrossCandidateRelation(RuntimeConfig(), tmp_path, relation_id="occupied")
+    assert marker.read_text() == "keep"
+
+
+def test_constructor_failure_after_connect_closes_and_cleans(tmp_path, monkeypatch):
+    connection = cross_candidate_relation.duckdb.connect(":memory:")
+    monkeypatch.setattr(cross_candidate_relation.duckdb, "connect", lambda **_kwargs: connection)
+    monkeypatch.setattr(CrossCandidateRelation, "_create_schema", lambda _self: 1 / 0)
+    with pytest.raises(ZeroDivisionError):
+        CrossCandidateRelation(RuntimeConfig(), tmp_path, relation_id="failed")
+    with pytest.raises(Exception):
+        connection.execute("SELECT 1")
+    assert not (tmp_path / "duckdb" / "cross-candidate-relations" / "failed").exists()
+
+
+def test_runtime_limits_bounded_fetch_and_columnar_implementation(tmp_path):
+    with _relation(tmp_path) as relation:
+        settings = dict(relation._connection.execute(
+            "SELECT name,value FROM duckdb_settings() WHERE name IN "
+            "('threads','memory_limit','max_temp_directory_size','temp_directory',"
+            "'autoload_known_extensions','autoinstall_known_extensions')"
+        ).fetchall())
+        assert settings["threads"] == "1"
+        assert settings["memory_limit"] == "122.0 MiB"
+        assert settings["max_temp_directory_size"] == "244.1 MiB"
+        assert settings["autoload_known_extensions"] == "false"
+        assert settings["autoinstall_known_extensions"] == "false"
+        assert settings["temp_directory"] == str(relation._temp_directory)
+    source = inspect.getsource(cross_candidate_relation).lower()
+    assert "fetchmany" in inspect.getsource(CrossCandidateRelation._iterate).lower()
+    assert "fetchmany" in inspect.getsource(CrossCandidateRelation.iter_coordinates).lower()
+    assert "execute(" not in inspect.getsource(CrossCandidateRelation._decode).lower()
+    for forbidden in ("sqlite", "pickle", "struct", "temporarydirectory"):
+        assert forbidden not in source
