@@ -30,22 +30,35 @@ class _Cursor:
 
 
 class _Result:
+    def __init__(self, row: tuple) -> None:
+        self.row = row
+
     def fetchone(self):
-        return ("completed", "completed", "completed", True, True)
+        return self.row
+
+
+_METADATA = (
+    "completed", "completed", "completed", "public.source", {"sha256": "same"},
+    4326, 32650, {"coordinate_semantics_version": 2}, {"refine": 1}, {"detect": 1},
+    "clip", "1", "fit", "1", {"fitting": 1},
+)
 
 
 class _Connection:
-    def __init__(self) -> None:
+    def __init__(self, candidate_metadata: tuple = _METADATA) -> None:
         self.statements: list[str] = []
+        self.metadata = iter([_METADATA, candidate_metadata])
+        self.rows_opened = 0
 
     def execute(self, sql: str, _params: tuple = ()):
         self.statements.append(sql)
         assert sql.strip().upper().startswith(("SET TRANSACTION READ ONLY", "SELECT"))
-        return _Result()
+        return _Result(()) if sql.strip().upper().startswith("SET") else _Result(next(self.metadata))
 
     def cursor(self, name: str | None = None):
         if name is None:
             return _SchemaCursor()
+        self.rows_opened += 1
         spec = next(spec for spec in TABLES if spec.name.replace(".", "_") in name)
         row = ("stable-key", *(0.0 if kind != "exact" else "same" for _, kind in spec.columns))
         return _Cursor(name, [row])
@@ -84,6 +97,38 @@ def test_surrogate_id_offsets_are_absent_from_normalized_rows() -> None:
     result = compare_rows("detect.resolved_points", columns, baseline, candidate)
     assert result["passed"] is True
     assert result["not_comparable"] == ["surrogate primary keys", "run UUIDs", "timestamps"]
+
+
+def test_candidate_id_offsets_pass_but_diagnostic_member_change_fails() -> None:
+    columns = (("candidate", "exact"), ("x", "metre"))
+    normalized = [("[1, 2, 3, 4]", "turn:[1,2]", 10.0)]
+    assert compare_rows("detect.tracks_cross", columns, normalized, normalized)["passed"]
+    changed = [("[1, 2, 3, 4]", "turn:[1,3]", 10.0)]
+    assert not compare_rows("detect.tracks_cross", columns, normalized, changed)["passed"]
+
+
+def test_excluded_membership_change_fails() -> None:
+    baseline = [("source-1", "stationary")]
+    candidate = [("source-2", "stationary")]
+    assert not compare_rows(
+        "refine.excluded_points", (("reason", "exact"),), baseline, candidate,
+    )["passed"]
+
+
+@pytest.mark.parametrize(
+    "index,category",
+    [(3, "source_table"), (4, "source_fingerprint"), (7, "projection_config"),
+     (8, "refine_semantic_config"), (9, "detect_semantic_config"),
+     (14, "fit_semantic_config")],
+)
+def test_incompatible_lineage_fails_before_reading_tables(index: int, category: str) -> None:
+    changed = list(_METADATA)
+    changed[index] = {"different": True} if index != 3 else "other.source"
+    conn = _Connection(tuple(changed))
+    runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
+    result = compare_runs(conn, runs, runs)
+    assert result["error"] == f"preflight:{category}"
+    assert conn.rows_opened == 0
 
 
 def test_topology_change_fails_even_when_row_counts_match() -> None:

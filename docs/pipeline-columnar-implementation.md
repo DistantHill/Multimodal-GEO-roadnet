@@ -684,23 +684,33 @@ Refine、Detect、Fit Run ID，先校验两条血缘均存在、关系一致且 
 字段及 pass/fail。
 
 业务身份规范化不比较 Run UUID、自增主键或时间戳：Refine 使用来源键或注入锚点；
-resolved point 使用子轨迹最终序号及来源身份；crossing 使用线段起点的子轨迹/最终序号和
-类型；intersection 使用完整 entry/exit 证据集合；centerline 与派生 Network 拓扑使用
-规范化 intersection 端点。缺少 intersection 证据或业务键不唯一时 fail closed，不以
-行数替代语义。成员、crossing 配对和拓扑严格比较；米制、经纬度和其他浮点分别使用
+候选交叉口使用 turn resolved point 与 tracks_cross 两端 resolved point 的离散成员证据；
+candidate crossing 再绑定候选身份、线段起点与类型；最终 intersection、entry/exit、
+centerline、来源 clip 与派生 Network 拓扑均复用同一身份链。无候选成员、缺少引用证据或
+业务键不唯一时 fail closed，不以行数或近似坐标替代语义。成员、crossing 配对和拓扑
+严格比较；米制、经纬度和其他浮点分别使用
 `1e-6`、`1e-9`、`1e-12` 绝对误差，并拒绝非有限值。
 
-本卡只实现工具和小样本回归，不连接或创建数据库，不运行现有 1M 基线。当前纵切比较
-Refine kept/injected、Detect resolved/intersection/entry-exit、Fitting centerline 与从
-centerline 派生的 Network 节点连接拓扑；候选诊断表不是最终业务语义，本卡不比较。
+表读取前还严格比较两条血缘的源表、源指纹、投影配置，以及剔除顶层
+`execution_config` 后的 Refine/Detect/Fit 语义参数；不兼容时输出具体 preflight 类别并
+停止。当前覆盖 Refine kept/injected/excluded，Detect resolved、candidate intersection、
+tracks cross、turn event、candidate crossing、最终 intersection 与 entry/exit，Fitting
+centerline 与来源 clip，以及从 combined centerline 派生的 Network 拓扑。
+
+本卡只实现工具和小样本回归，不创建数据库，不运行现有 1M 基线。Network 没有独立
+持久化结果，issues/report 和 `include_isolated_nodes` 无法可靠比较并继续明确列为不可比较；
 C12c2a 不代表 1M 差分、资源剖析、C12 或 C13 完成。
 
 验证：语义差分定向测试 `11 passed`，CLI/import/API 合并定向测试 `22 passed`，标准
-Pipeline 全量 `956 passed, 50 skipped`；CLI help 可用，8 条逐表查询均通过真实 PostgreSQL
+Pipeline 全量 `956 passed, 50 skipped`；CLI help 可用；逐表查询通过真实 PostgreSQL
 只读 `EXPLAIN` 解析。测试覆盖 ID 偏移规范化、同数量
 拓扑变化、三类容差边界、非有限值、缺失/重复业务身份，以及只读语句和命名游标。
 
 提交：待记录。
+
+C12c2b 补全验证：诊断表与 preflight 定向测试 `19 passed`；13 条逐表查询均通过真实
+PostgreSQL 只读 `EXPLAIN` 解析；标准 Pipeline 全量 `964 passed, 50 skipped`。候选 ID
+偏移不影响规范身份；诊断成员、excluded 或语义配置/源指纹变化均在最终表比较前失败。
 
 ### C13 — 26M 最终验收
 

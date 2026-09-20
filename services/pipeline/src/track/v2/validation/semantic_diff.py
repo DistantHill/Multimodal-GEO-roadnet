@@ -19,22 +19,38 @@ class TableSpec:
     columns: tuple[tuple[str, str], ...]
 
 
-_INTERSECTION_KEYS = """
-WITH crossing_keys AS (
- SELECT c.id, c.detect_id,
-        jsonb_build_array(r.subtrack_index,r.sequence_in_subtrack,c.crossing_type)::text AS business_key
+_SEMANTIC_KEYS = """
+WITH member_evidence AS (
+ SELECT t.detect_id,t.candidate_intersection_id,
+        jsonb_build_array('turn',r.subtrack_index,r.sequence_in_subtrack)::text AS evidence
+ FROM turn_events t JOIN resolved_subtrack_points r
+   ON (r.id,r.detect_id)=(t.resolved_point_id,t.detect_id)
+ WHERE t.candidate_intersection_id IS NOT NULL
+ UNION ALL
+ SELECT x.detect_id,x.candidate_intersection_id,
+        jsonb_build_array('cross',a.subtrack_index,a.sequence_in_subtrack,
+                          b.subtrack_index,b.sequence_in_subtrack)::text
+ FROM tracks_cross x
+ JOIN resolved_subtrack_points a ON (a.id,a.detect_id)=(x.from_segment_start_point_id,x.detect_id)
+ JOIN resolved_subtrack_points b ON (b.id,b.detect_id)=(x.to_segment_start_point_id,x.detect_id)
+ WHERE x.candidate_intersection_id IS NOT NULL
+), candidate_keys AS (
+ SELECT c.id,c.detect_id,string_agg(m.evidence,',' ORDER BY m.evidence) AS business_key
+ FROM candidate_intersections c LEFT JOIN member_evidence m
+   ON (m.candidate_intersection_id,m.detect_id)=(c.id,c.detect_id)
+ GROUP BY c.id,c.detect_id
+), crossing_keys AS (
+ SELECT c.id,c.detect_id,
+        CASE WHEN k.business_key IS NULL THEN NULL ELSE
+          jsonb_build_array(k.business_key,r.subtrack_index,r.sequence_in_subtrack,c.crossing_type)::text
+        END AS business_key
  FROM candidate_entry_exit_points c
- JOIN resolved_subtrack_points r
-   ON (r.id, r.detect_id) = (c.segment_start_point_id, c.detect_id)
+ JOIN candidate_keys k ON (k.id,k.detect_id)=(c.candidate_intersection_id,c.detect_id)
+ JOIN resolved_subtrack_points r ON (r.id,r.detect_id)=(c.segment_start_point_id,c.detect_id)
 ), intersection_keys AS (
- SELECT i.id, i.detect_id,
-        string_agg(jsonb_build_array(e.business_key,x.business_key)::text, ','
-                   ORDER BY e.business_key, x.business_key) AS business_key
- FROM intersections i
- LEFT JOIN entry_exit_points p ON (p.intersection_id, p.detect_id)=(i.id, i.detect_id)
- LEFT JOIN crossing_keys e ON (e.id,e.detect_id)=(p.entry_crossing_id,p.detect_id)
- LEFT JOIN crossing_keys x ON (x.id,x.detect_id)=(p.exit_crossing_id,p.detect_id)
- GROUP BY i.id, i.detect_id
+ SELECT i.id,i.detect_id,k.business_key
+ FROM intersections i JOIN candidate_keys k
+   ON (k.id,k.detect_id)=(i.candidate_intersection_id,i.detect_id)
 ) """
 
 
@@ -50,22 +66,65 @@ TABLES = (
       ORDER BY vehicle_id,subtrack_index,after_sequence_in_subtrack,generated_reason
     """, (("timestamp", "float"), ("lon", "degree"), ("lat", "degree"),
            ("x", "metre"), ("y", "metre"), ("heading", "float"), ("speed", "float"))),
-    TableSpec("detect.resolved_points", "detect", """
+    TableSpec("refine.excluded_points", "refine", """
+      SELECT source_row_key,reason FROM excluded_points WHERE refine_id=%s ORDER BY source_row_key
+    """, (("reason", "exact"),)),
+    TableSpec("detect.resolved_points", "detect", _SEMANTIC_KEYS + """
       SELECT jsonb_build_array(r.subtrack_index,r.sequence_in_subtrack)::text,
              r.refined_sequence_in_subtrack,
              CASE WHEN k.id IS NOT NULL THEN jsonb_build_array('kept',k.source_row_key)::text
                   WHEN n.id IS NOT NULL THEN jsonb_build_array('injected',n.vehicle_id,n.subtrack_index,
                                                                n.after_sequence_in_subtrack,n.generated_reason)::text
-                  ELSE jsonb_build_array('crossing',s.subtrack_index,s.sequence_in_subtrack,c.crossing_type)::text
+                  ELSE jsonb_build_array('crossing',COALESCE(q.business_key,'__UNCOMPARABLE_CROSSING__'))::text
              END
       FROM resolved_subtrack_points r
       LEFT JOIN kept_trajectory_points k ON k.id=r.kept_point_id
       LEFT JOIN injected_points n ON n.id=r.injected_point_id
       LEFT JOIN candidate_entry_exit_points c ON c.id=r.crossing_point_id AND c.detect_id=r.detect_id
-      LEFT JOIN resolved_subtrack_points s ON s.id=c.segment_start_point_id AND s.detect_id=c.detect_id
+      LEFT JOIN crossing_keys q ON (q.id,q.detect_id)=(c.id,c.detect_id)
       WHERE r.detect_id=%s ORDER BY r.subtrack_index,r.sequence_in_subtrack
     """, (("refined_sequence", "exact"), ("source_identity", "exact"))),
-    TableSpec("detect.intersections", "detect", _INTERSECTION_KEYS + """
+    TableSpec("detect.candidate_intersections", "detect", _SEMANTIC_KEYS + """
+      SELECT COALESCE(k.business_key,'__UNCOMPARABLE_CANDIDATE__'),
+             c.centroid_x,c.centroid_y,c.centroid_lon,c.centroid_lat,c.radius_m,
+             ST_AsGeoJSON(c.geom),c.contributors::text,c.critical_contributors::text
+      FROM candidate_intersections c JOIN candidate_keys k ON (k.id,k.detect_id)=(c.id,c.detect_id)
+      WHERE c.detect_id=%s ORDER BY k.business_key NULLS FIRST
+    """, (("centroid_x", "metre"), ("centroid_y", "metre"),
+           ("centroid_lon", "degree"), ("centroid_lat", "degree"), ("radius_m", "metre"),
+           ("geometry", "geojson"), ("contributors", "json_float"), ("critical", "json"))),
+    TableSpec("detect.tracks_cross", "detect", _SEMANTIC_KEYS + """
+      SELECT jsonb_build_array(a.subtrack_index,a.sequence_in_subtrack,
+                               b.subtrack_index,b.sequence_in_subtrack)::text,
+             CASE WHEN x.candidate_intersection_id IS NULL THEN '__NO_CANDIDATE__'
+                  ELSE COALESCE(k.business_key,'__UNCOMPARABLE_CANDIDATE__') END,x.x,x.y,x.lon,x.lat
+      FROM tracks_cross x
+      JOIN resolved_subtrack_points a ON (a.id,a.detect_id)=(x.from_segment_start_point_id,x.detect_id)
+      JOIN resolved_subtrack_points b ON (b.id,b.detect_id)=(x.to_segment_start_point_id,x.detect_id)
+      LEFT JOIN candidate_keys k ON (k.id,k.detect_id)=(x.candidate_intersection_id,x.detect_id)
+      WHERE x.detect_id=%s ORDER BY 1
+    """, (("candidate", "exact"), ("x", "metre"), ("y", "metre"),
+           ("lon", "degree"), ("lat", "degree"))),
+    TableSpec("detect.turn_events", "detect", _SEMANTIC_KEYS + """
+      SELECT jsonb_build_array(r.subtrack_index,r.sequence_in_subtrack)::text,
+             CASE WHEN t.candidate_intersection_id IS NULL THEN '__NO_CANDIDATE__'
+                  ELSE COALESCE(k.business_key,'__UNCOMPARABLE_CANDIDATE__') END,
+             t.entry_bearing,t.exit_bearing,
+             t.turn_deg,t.score,t.g_star_z
+      FROM turn_events t JOIN resolved_subtrack_points r
+        ON (r.id,r.detect_id)=(t.resolved_point_id,t.detect_id)
+      LEFT JOIN candidate_keys k ON (k.id,k.detect_id)=(t.candidate_intersection_id,t.detect_id)
+      WHERE t.detect_id=%s ORDER BY 1
+    """, (("candidate", "exact"), ("entry_bearing", "float"), ("exit_bearing", "float"),
+           ("turn_deg", "float"), ("score", "float"), ("g_star_z", "nullable_float"))),
+    TableSpec("detect.candidate_entry_exit_points", "detect", _SEMANTIC_KEYS + """
+      SELECT COALESCE(k.business_key,'__UNCOMPARABLE_CROSSING__'),
+             c.crossing_x,c.crossing_y,c.crossing_lon,c.crossing_lat
+      FROM candidate_entry_exit_points c JOIN crossing_keys k ON (k.id,k.detect_id)=(c.id,c.detect_id)
+      WHERE c.detect_id=%s ORDER BY k.business_key NULLS FIRST
+    """, (("crossing_x", "metre"), ("crossing_y", "metre"),
+           ("crossing_lon", "degree"), ("crossing_lat", "degree"))),
+    TableSpec("detect.intersections", "detect", _SEMANTIC_KEYS + """
       SELECT COALESCE(k.business_key,'__UNCOMPARABLE_INTERSECTION__'),
              i.branch_centers_deg::text, i.transition_counts::text,
              i.observation_count,i.clip_radius_m,ST_AsGeoJSON(i.geom)
@@ -73,7 +132,7 @@ TABLES = (
       WHERE i.detect_id=%s ORDER BY k.business_key NULLS FIRST
     """, (("branches", "json_float"), ("transitions", "json"), ("observations", "exact"),
            ("clip_radius_m", "metre"), ("geometry", "geojson"))),
-    TableSpec("detect.entry_exit", "detect", _INTERSECTION_KEYS + """
+    TableSpec("detect.entry_exit", "detect", _SEMANTIC_KEYS + """
       , crossing_keys2 AS (SELECT * FROM crossing_keys)
       SELECT jsonb_build_array(COALESCE(k.business_key,'__UNCOMPARABLE_INTERSECTION__'),
                                e.business_key,x.business_key)::text,
@@ -84,7 +143,7 @@ TABLES = (
       JOIN crossing_keys2 x ON (x.id,x.detect_id)=(p.exit_crossing_id,p.detect_id)
       WHERE p.detect_id=%s ORDER BY 1
     """, (("entry_bearing", "float"), ("exit_bearing", "float"))),
-    TableSpec("fitting.centerlines", "fit", _INTERSECTION_KEYS + """
+    TableSpec("fitting.centerlines", "fit", _SEMANTIC_KEYS + """
       SELECT jsonb_build_array(c.variant,COALESCE(a.business_key,'__UNCOMPARABLE_INTERSECTION__'),
                                COALESCE(b.business_key,'__UNCOMPARABLE_INTERSECTION__'))::text,c.length_m,
              c.forward_clip_count,c.reverse_clip_count,ST_AsGeoJSON(c.geom)
@@ -94,7 +153,7 @@ TABLES = (
       WHERE c.fit_id=%s ORDER BY 1
     """, (("length_m", "metre"), ("forward_clips", "exact"), ("reverse_clips", "exact"),
            ("geometry", "geojson"))),
-    TableSpec("fitting.source_clips", "fit", _INTERSECTION_KEYS + """
+    TableSpec("fitting.source_clips", "fit", _SEMANTIC_KEYS + """
       , all_crossings AS (SELECT * FROM crossing_keys), line_keys AS (
         SELECT c.id,c.detect_id,
                jsonb_build_array(c.variant,COALESCE(a.business_key,'__UNCOMPARABLE_INTERSECTION__'),
@@ -111,7 +170,7 @@ TABLES = (
       JOIN all_crossings x ON (x.id,x.detect_id)=(s.end_crossing_id,s.detect_id)
       ORDER BY 1
     """, (("start_crossing", "exact"), ("end_crossing", "exact"), ("reverse", "exact"))),
-    TableSpec("network.topology", "fit", _INTERSECTION_KEYS + """
+    TableSpec("network.topology", "fit", _SEMANTIC_KEYS + """
       SELECT jsonb_build_array('edge',COALESCE(a.business_key,'__UNCOMPARABLE_INTERSECTION__'),
                                COALESCE(b.business_key,'__UNCOMPARABLE_INTERSECTION__'))::text,c.variant
       FROM centerlines c
@@ -142,6 +201,10 @@ def _json_floats(value: Any) -> Iterator[float]:
 
 
 def _compare_value(left: Any, right: Any, kind: str) -> tuple[bool, float]:
+    if kind == "nullable_float":
+        if left is None or right is None:
+            return left is None and right is None, 0.0 if left is right else math.inf
+        kind = "float"
     if kind in _TOLERANCE:
         values = (float(left), float(right))
         if not all(math.isfinite(value) for value in values):
@@ -226,19 +289,40 @@ def _rows(conn: Any, spec: TableSpec, run_id: UUID, side: str, batch_size: int) 
         yield from cursor
 
 
+def _lineage(conn: Any, runs: dict[str, UUID]) -> tuple[Any, ...] | None:
+    return conn.execute("""
+      SELECT r.status,d.status,f.status,r.source_table,r.source_fingerprint,
+             r.source_srid,r.processing_srid,r.projection_config,
+             r.parameters-'execution_config',d.parameters-'execution_config',
+             f.clip_algorithm,f.clip_version,f.fitting_algorithm,f.fitting_version,
+             f.parameters-'execution_config'
+      FROM refine_runs r
+      JOIN detect_runs d ON d.id=%s AND d.refine_id=r.id
+      JOIN fit_runs f ON f.id=%s AND f.detect_id=d.id
+      WHERE r.id=%s
+    """, (runs["detect"], runs["fit"], runs["refine"])).fetchone()
+
+
 def compare_runs(conn: Any, baseline: dict[str, UUID], candidate: dict[str, UUID], *, batch_size: int = 2000) -> dict[str, Any]:
     conn.execute("SET TRANSACTION READ ONLY")
     require_current_schema(conn)
-    for label, runs in (("baseline", baseline), ("candidate", candidate)):
-        row = conn.execute("""
-          SELECT r.status,d.status,f.status,d.refine_id=r.id,f.detect_id=d.id
-          FROM refine_runs r
-          JOIN detect_runs d ON d.id=%s AND d.refine_id=r.id
-          JOIN fit_runs f ON f.id=%s AND f.detect_id=d.id
-          WHERE r.id=%s
-        """, (runs["detect"], runs["fit"], runs["refine"])).fetchone()
-        if row != ("completed", "completed", "completed", True, True):
-            return {"version": 1, "passed": False, "error": f"{label} lineage is missing, mismatched, or incomplete", "tables": []}
+    metadata = {label: _lineage(conn, runs) for label, runs in
+                (("baseline", baseline), ("candidate", candidate))}
+    for label, row in metadata.items():
+        if row is None or row[:3] != ("completed", "completed", "completed"):
+            return {"version": 1, "passed": False,
+                    "error": f"preflight:lineage:{label}", "tables": []}
+    left, right = metadata["baseline"], metadata["candidate"]
+    assert left is not None and right is not None
+    checks = (
+        ("source_table", slice(3, 4)), ("source_fingerprint", slice(4, 5)),
+        ("projection_config", slice(5, 8)), ("refine_semantic_config", slice(8, 9)),
+        ("detect_semantic_config", slice(9, 10)), ("fit_semantic_config", slice(10, 15)),
+    )
+    for category, fields in checks:
+        if left[fields] != right[fields]:
+            return {"version": 1, "passed": False,
+                    "error": f"preflight:{category}", "tables": []}
     tables = [compare_rows(spec.name, spec.columns,
                            _rows(conn, spec, baseline[spec.run_kind], "baseline", batch_size),
                            _rows(conn, spec, candidate[spec.run_kind], "candidate", batch_size))
