@@ -67,7 +67,7 @@
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
-| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 已开始（C12a、C12b） |
+| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 已开始（C12a、C12b、C12c1） |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
 ## 3. 任务卡
@@ -641,6 +641,37 @@ schema v7。
 活跃生产与测试不存在旧 guard 或 schema v4 错误提示。历史迁移
 实现、历史文档和保留文件名中的 v4 阶段叙述不属于旧活跃 guard。C12b 不执行 1M 差分或
 资源剖析，因此不宣称 C12 或 C13 完成。
+
+提交：待记录。
+
+#### C12c1 — 真实 PostgreSQL/Parquet 与小样本逐表差分
+
+范围：在删除旧实现后执行分层验证闸门的第 2、3 层。真实 PostgreSQL 使用
+`postgresql://roadnet:***@127.0.0.1:15432/roadnet`，仅运行已审计为事务回滚或 UUID
+测试 Schema 隔离的用例；Parquet 仅写 pytest 临时目录。未执行数据库 reset、迁移或
+数据库级删除，也未读取或修改历史业务 Run。
+
+现有固定小样本已充分覆盖本卡，不新增重复测试：Refine 对 `kept_points`、
+`injected_points` 逐列比较 PostgreSQL 权威行，并把 Refine reader 与旧 PostgreSQL Detect
+输入逐点比较；Detect 对 `intersections`、`resolved_points`、`entry_exit_points` 导出、
+登记和读取进行检查，把 reader 与 PostgreSQL Clip reader 比较，并在包含/排除边界片段
+两种配置下比较完整 Clip 输出。Fitting 不直接读取阶段 Parquet；其 Clip 列式关系消费、
+中心线语义和 PostgreSQL 写入字段由独立定向测试覆盖。
+
+验证命令与结果：
+
+- 指定 `ROADNET_TEST_DSN`，运行 Refine/Detect Parquet、completion、source fingerprint、
+  artifact reconcile、游标、PostGIS 投影及 Detect/Turn writer 的安全真实 PostgreSQL
+  矩阵：`54 passed`；
+- Clip/Fitting 列式消费、拟合、持久化与数据库 writer 定向矩阵：`27 passed`；
+- 不设置 `ROADNET_TEST_DSN` 的标准 Pipeline 全量：`945 passed, 50 skipped`。
+
+真实 Parquet fixture 为每次测试创建随机 Schema，在 `finally` 中只清理该测试 Schema；
+其余真实 PostgreSQL 用例使用事务本地对象或随机 Schema，并在 fixture 末 rollback。
+`test_refine_migration_postgres.py` 和 `test_artifact_registry_postgres.py` 会主动执行迁移，按
+本卡禁止迁移的约束未运行；这两组不属于本卡的发布、读取或固定样本差分缺口。
+
+C12c1 不包含 1M 差分、资源剖析或 26M 最终验收，因此不宣称 C12 或 C13 完成。
 
 提交：待记录。
 
