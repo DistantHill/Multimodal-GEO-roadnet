@@ -19,7 +19,10 @@ from track.v2.detect import (
     _extract_disk_entry_exit_observations, _extract_entry_exit_observations_batch,
 )
 from track.v2.detect_workspace import DetectWorkspace
-from track.v2.models import HotspotCluster, PointRef, RefinedPointRef, SpatialContext, TrajectoryPoint
+from track.v2.models import (
+    HotspotCluster, PointRef, RefinedPointRef, RuntimeConfig, SpatialContext,
+    TrajectoryPoint,
+)
 from track.v2.projection import CoordinateTransformer
 
 
@@ -77,7 +80,7 @@ def test_cross_candidates_match_grid_with_long_boundary_and_cross_patch_segments
         assert workspace.max_pair_rows <= min(batch_size, 8192)
         assert workspace.max_loaded_segments <= 2 * min(batch_size, 8192)
         assert len({(c.from_segment_start_point_ref, c.to_segment_start_point_ref) for c in actual}) == len(actual)
-    assert not list(tmp_path.iterdir())
+    assert not list(tmp_path.glob("duckdb/turn-event-relations/*"))
 
 
 def test_random_cross_candidates_have_exact_global_order_and_numbering(tmp_path):
@@ -311,8 +314,11 @@ def test_db_orchestrator_cleans_disk_workspace_on_reader_failure(tmp_path, monke
     with patch("track.v2.detect._query_spatial_extent", return_value=(0, 0, 1, 1)), \
          patch("track.v2.detect._load_tracks_and_turn_candidates", side_effect=RuntimeError("reader failed")):
         with pytest.raises(RuntimeError, match="reader failed"):
-            _detect_intersections_db(object(), IntersectConfig(), CONTEXT)
-    assert not list(tmp_path.iterdir())
+            _detect_intersections_db(
+                object(), IntersectConfig(), CONTEXT,
+                runtime=RuntimeConfig(), data_root=tmp_path,
+            )
+    assert not list(tmp_path.glob("duckdb/turn-event-relations/*"))
 
 
 def test_nan_end_heading_keeps_historical_straight_segment_semantics(tmp_path):

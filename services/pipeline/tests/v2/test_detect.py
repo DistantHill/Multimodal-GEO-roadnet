@@ -78,6 +78,7 @@ from track.v2.models import (
     IntersectReport,
     IntersectionTopology,
     PointRef,
+    RuntimeConfig,
     SpatialContext,
     TrajectoryPoint,
     TurnEvent,
@@ -1071,6 +1072,21 @@ class ProjectionContextContractTest(unittest.TestCase):
                 )
         extent.assert_not_called()
 
+    def test_formal_db_detect_requires_runtime_and_data_root(self):
+        refine = SimpleNamespace(
+            refine_id="refine-1", source_table="raw_points", status="completed",
+            spatial_context=_TEST_SPATIAL_CONTEXT, source_fingerprint={"version": 1},
+        )
+        with (
+            patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
+            patch("track.v2.detect.verify_refine_source_fingerprint"),
+            self.assertRaisesRegex(V2Error, "runtime and data_root"),
+        ):
+            detect_intersections(
+                conn=object(),
+                config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
+            )
+
     def test_formal_db_detect_inherits_context_and_checks_empty_source(self):
         refine = SimpleNamespace(
             refine_id="refine-1", source_table="raw_points", status="completed",
@@ -1084,6 +1100,7 @@ class ProjectionContextContractTest(unittest.TestCase):
             result = detect_intersections(
                 conn=object(),
                 config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
+                runtime=RuntimeConfig(), data_root=Path(tempfile.mkdtemp()),
             )
 
         fingerprint.assert_called_once_with(ANY, "refine-1")
@@ -1124,6 +1141,7 @@ class ProjectionContextContractTest(unittest.TestCase):
         ):
             result = _detect_intersections_db(
                 object(), IntersectConfig(), _TEST_SPATIAL_CONTEXT,
+                runtime=RuntimeConfig(), data_root=Path(tempfile.mkdtemp()),
                 refine_reader=reader,
             )
         extent.assert_not_called()
@@ -2536,6 +2554,7 @@ class TopologyExtractionTest(unittest.TestCase):
             result = detect_intersections(
                 conn=object(),
                 config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
+                runtime=RuntimeConfig(), data_root=Path(tempfile.mkdtemp()),
             )
 
         self.assertIs(build_topologies.call_args.args[1], tracks)

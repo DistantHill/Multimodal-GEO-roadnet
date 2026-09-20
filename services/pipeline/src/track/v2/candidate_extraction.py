@@ -19,7 +19,7 @@ from .logger import log_info
 from .models import CrossTrackCandidate, TrajectoryPoint, TurnEvent
 from .projection import CoordinateTransformer
 from .turn_events import detect_turn_patch
-from .clip_spool import DiskSequence
+from .turn_event_relation import TurnEventRelation
 from .cross_member_store import CandidateStore
 
 if TYPE_CHECKING:
@@ -32,14 +32,14 @@ def extract_turn_candidates(
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
-    event_store: DiskSequence[TurnEvent] | None = None,
+    event_store: TurnEventRelation | None = None,
 ) -> Sequence[TurnEvent]:
     """Consume all patches, preserving event order and assigning global IDs.
 
     Patches are still consumed with turn detection disabled so the DB reader
     can populate the workspace used by cross-track detection and topology.
     """
-    events: list[TurnEvent] | DiskSequence[TurnEvent] = (
+    events: list[TurnEvent] | TurnEventRelation = (
         [] if event_store is None else event_store
     )
     track_count = 0
@@ -55,7 +55,7 @@ def extract_turn_candidates(
                     if event_store is None:
                         events.append(numbered)
                     else:
-                        event_store.append(numbered, key=str(numbered.event_calculate_index))
+                        event_store.append(numbered)
             track_count += len(patch)
             now = time.perf_counter()
             if live_status is not None and now - last_progress >= 3.0:
@@ -68,6 +68,8 @@ def extract_turn_candidates(
             # Do not retain the previous full patch while the producer builds
             # the next one. Events retain provenance, not trajectory objects.
             del patch
+    if event_store is not None:
+        event_store.seal()
     log_info(f"── 轨迹处理: {track_count:,} 轨迹/tracks → "
              f"{len(events):,} 转向事件/turn events "
              f"({time.perf_counter() - started:.1f}s)")

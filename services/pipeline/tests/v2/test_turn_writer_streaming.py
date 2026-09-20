@@ -8,7 +8,7 @@ import os
 import pytest
 
 from track.v2 import db_writer as writer
-from track.v2.models import RefinedPointRef
+from track.v2.models import RefinedPointRef, TurnEvent
 from track.v2.writer_workspace import WriterWorkspace
 from .writer_workspace_helpers import prepared_turn_workspace
 
@@ -185,8 +185,9 @@ def test_postgres_turn_batches_keep_id_order_and_rollback_prior_batches():
             conn.rollback()
 
 
-def test_disk_turn_sequence_survives_sparse_mapping_scan_and_batched_write(monkeypatch):
-    from track.v2.clip_spool import DiskSequence
+def test_turn_relation_survives_sparse_mapping_scan_and_batched_write(monkeypatch, tmp_path):
+    from track.v2.models import RuntimeConfig
+    from track.v2.turn_event_relation import TurnEventRelation
 
     next_id = [200]
     copied = []
@@ -208,9 +209,16 @@ def test_disk_turn_sequence_survives_sparse_mapping_scan_and_batched_write(monke
     monkeypatch.setattr(writer, '_reserve_ids', reserve)
     monkeypatch.setattr(writer, '_copy_insert', copy)
     conn = SimpleNamespace(cursor=lambda: nullcontext(None))
-    with DiskSequence() as turns:
+    with TurnEventRelation(RuntimeConfig(), tmp_path) as turns:
         for i in [1, 3]:
-            turns.append(event(i), key=str(i))
+            value = event(i)
+            turns.append(TurnEvent(
+                event_calculate_index=len(turns), vehicle_id="v", timestamp=float(i),
+                lon=120.0, lat=30.0, x=float(i), y=float(i), entry_bearing=value.entry_bearing,
+                exit_bearing=value.exit_bearing, turn_deg=value.turn_deg, score=value.turn_deg,
+                refined_point_ref=value.refined_point_ref,
+            ))
+        turns.seal()
         output = result(turns)
         output.cross_track_candidates = []
         with WriterWorkspace(batch_size=2) as ws:
@@ -222,4 +230,4 @@ def test_disk_turn_sequence_survives_sparse_mapping_scan_and_batched_write(monke
             assert writer._insert_turn_events(conn, 'd', ws, batch_size=1) == 2
             assert [row[2] for row in copied] == [201, 203]
         # The writer closes only its iterator; ownership stays with the result.
-        assert [value.event_calculate_index for value in turns] == [1, 3]
+        assert [value.event_calculate_index for value in turns] == [0, 1]

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import math
 import heapq
-import os
 import time
 from array import array
 from bisect import bisect_right
@@ -22,6 +21,7 @@ from collections import defaultdict
 from collections.abc import Iterator, MutableMapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
 import numpy as np
@@ -57,7 +57,7 @@ from .candidate_extraction import (
 )
 from .detect_workspace import DetectWorkspace
 from .dbscan_storage import ActiveGridLinks, index_typecode
-from .clip_spool import DiskSequence
+from .turn_event_relation import TurnCoordinate, TurnEventRelation
 from .cross_member_store import (
     CandidateStore, ConcatSequence, MemberPass, PointRefSequence,
     reference_source_ids, summarize_events,
@@ -72,6 +72,7 @@ from .models import (
     IntersectReport,
     IntersectionTopology,
     PointRef,
+    RuntimeConfig,
     SpatialContext,
     TrackModel,
     TrajectoryPoint,
@@ -653,6 +654,8 @@ def detect_intersections(
     conn: Any = None,
     spatial_context: SpatialContext | None = None,
     refine_reader: RefineDatasetReader | None = None,
+    runtime: RuntimeConfig | None = None,
+    data_root: str | Path | None = None,
 ) -> IntersectResult:
     """Run intersection detection and topology extraction.
 
@@ -697,8 +700,11 @@ def detect_intersections(
                 raise V2Error("Refine artifact does not belong to the parent Refine Run")
             if descriptor.source_fingerprint_json != canonical_json(refine.source_fingerprint):
                 raise V2Error("Refine artifact source fingerprint does not match its Run")
+        if runtime is None or data_root is None:
+            raise V2Error("formal DB Detect requires runtime and data_root")
         return _detect_intersections_db(
-            conn, cfg, refine.spatial_context, refine_reader=refine_reader,
+            conn, cfg, refine.spatial_context, runtime=runtime, data_root=data_root,
+            refine_reader=refine_reader,
         )
     elif source is not None:
         if spatial_context is None:
@@ -871,13 +877,13 @@ def _load_tracks_and_turn_candidates(
     live_status: Any = None,
     perf: PerfTracker | None = None,
     workspace: MutableMapping[str, list[TrajectoryPoint]] | None = None,
-    event_store: DiskSequence[TurnEvent] | None = None,
+    event_store: TurnEventRelation | None = None,
     refine_reader: RefineDatasetReader | None = None,
 ) -> tuple[Sequence[TurnEvent], MutableMapping[str, list[TrajectoryPoint]]]:
     """Wire the DB reader, track scheduler and candidate collector together."""
     tracks: MutableMapping[str, list[TrajectoryPoint]] = workspace if workspace is not None else {}
     if refine_reader is not None:
-        events: list[TurnEvent] | DiskSequence[TurnEvent] = (
+        events: list[TurnEvent] | TurnEventRelation = (
             [] if event_store is None else event_store
         )
         if cfg.use_turn_events:
@@ -887,7 +893,9 @@ def _load_tracks_and_turn_candidates(
                 if event_store is None:
                     events.append(event)
                 else:
-                    event_store.append(event, key=str(event.event_calculate_index))
+                    event_store.append(event)
+        if event_store is not None:
+            event_store.seal()
         with closing(_iter_prepared_db_tracks(
             conn, cfg, spatial_context, transformer, tracks, refine_reader,
         )) as source:
@@ -1532,13 +1540,15 @@ def _detect_intersections_db(
     cfg: IntersectConfig,
     spatial_context: SpatialContext,
     *,
+    runtime: RuntimeConfig,
+    data_root: str | Path,
     refine_reader: RefineDatasetReader | None = None,
 ) -> IntersectResult:
     """Close track storage after Detect; transfer event storage to its result."""
-    event_store = DiskSequence[TurnEvent](directory=os.environ.get("DATA_ROOT") or None)
+    event_store = TurnEventRelation(runtime, data_root)
     candidate_store = None
     try:
-        candidate_store = CandidateStore(directory=os.environ.get("DATA_ROOT") or None)
+        candidate_store = CandidateStore(directory=data_root)
         with DetectWorkspace(cfg) as workspace:
             result = _detect_intersections_db_workspace(
                 conn, cfg, spatial_context, workspace, event_store=event_store,
@@ -1565,7 +1575,7 @@ def _detect_intersections_db_workspace(
     spatial_context: SpatialContext,
     workspace: DetectWorkspace,
     *,
-    event_store: DiskSequence[TurnEvent] | None = None,
+    event_store: TurnEventRelation | None = None,
     candidate_store: CandidateStore | None = None,
     refine_reader: RefineDatasetReader | None = None,
 ) -> IntersectResult:
@@ -1886,11 +1896,7 @@ def _getis_local_counts_grid(
     return local_counts
 
 
-@dataclass(frozen=True, slots=True)
-class _GStarCoordinate:
-    event_calculate_index: int
-    x: float
-    y: float
+_GStarCoordinate = TurnCoordinate
 
 
 def _select_hotspot_events(
@@ -1905,14 +1911,13 @@ def _select_hotspot_events(
 
     log_info(f"── 热点筛选 / Hotspot selection ({len(events):,} 事件/events) ...")
     t0 = time.perf_counter()
-    if isinstance(events, DiskSequence):
+    if isinstance(events, TurnEventRelation):
         # Neighbour lookup must never deserialize full event payloads. Keep
         # only the fields G* reads, then release them before hotspot decoding.
-        with operation_heartbeat("G*：读取紧凑事件坐标"), closing(iter(events)) as event_iterator:
-            coordinates = [
-                _GStarCoordinate(event.event_calculate_index, event.x, event.y)
-                for event in event_iterator
-            ]
+        with operation_heartbeat("G*：读取紧凑事件坐标"), closing(
+            events.iter_coordinates()
+        ) as coordinate_iterator:
+            coordinates = list(coordinate_iterator)
         try:
             z_scores = _compute_getis_ord_g_star(
                 coordinates, cfg.g_star_radius_m, live_status=live_status, perf=perf,

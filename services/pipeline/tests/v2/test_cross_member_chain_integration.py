@@ -16,7 +16,7 @@ from track.v2.candidate_extraction import extract_cross_track_candidates, extrac
 from track.v2.cross_member_store import CandidateStore, ClusterMemberSequence, ConcatSequence
 from track.v2.db_writer import _insert_tracks_cross, _refine_key
 from track.v2.writer_workspace import WriterWorkspace
-from track.v2.models import RefinedPointRef
+from track.v2.models import RefinedPointRef, RuntimeConfig
 from track.v2.detect_workspace import DetectWorkspace
 from track.v2.models import HotspotCluster, PointRef
 from .test_ablation_centroid_memory import _crossing, _event
@@ -319,8 +319,10 @@ def test_db_owner_closes_all_spools_on_failure(tmp_path, monkeypatch, phase, fai
                   "topology": "_build_topologies_from_tracks"}[phase]
         stack.enter_context(patch.object(detect, target, side_effect=failure))
         with pytest.raises(type(failure)):
-            detect._detect_intersections_db(object(), cfg, CONTEXT)
-    assert not list(tmp_path.iterdir())
+            detect._detect_intersections_db(
+                object(), cfg, CONTEXT, runtime=RuntimeConfig(), data_root=tmp_path,
+            )
+    assert not list(tmp_path.glob("duckdb/turn-event-relations/*"))
 
 
 def test_db_owner_returns_live_candidate_store_and_complete_eager_result(tmp_path, monkeypatch):
@@ -338,14 +340,16 @@ def test_db_owner_returns_live_candidate_store_and_complete_eager_result(tmp_pat
     with patch.object(detect, "_query_spatial_extent", return_value=(0., 0., 1., 1.)), patch.object(
         detect, "_stream_vehicle_tracks_from_db", return_value=iter(tracks.values()),
     ):
-        actual = detect._detect_intersections_db(object(), cfg, CONTEXT)
+        actual = detect._detect_intersections_db(
+            object(), cfg, CONTEXT, runtime=RuntimeConfig(), data_root=tmp_path,
+        )
     try:
         assert isinstance(actual.cross_track_candidates, CandidateStore)
         assert actual.as_dict() == eager.as_dict()
         assert actual.as_dict() == eager.as_dict()
     finally:
         actual.close()
-    assert not list(tmp_path.iterdir())
+    assert not list(tmp_path.glob("duckdb/turn-event-relations/*"))
 
 
 def test_summary_merge_and_reference_lengths_do_not_decode_members_again(tmp_path):

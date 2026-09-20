@@ -389,6 +389,8 @@ def run_pipeline(
                     conn=store.connection,
                     config=icfg,
                     refine_reader=reader,
+                    runtime=pc.runtime,
+                    data_root=_data_root(),
                 )
             detect_compute_elapsed = time.perf_counter() - detect_compute_started
             # psycopg starts a transaction for the Detect SELECTs. The result

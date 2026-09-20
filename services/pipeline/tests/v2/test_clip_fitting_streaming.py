@@ -1,9 +1,8 @@
-"""Disk-backed Clip/Fitting preserves geometry, ordering and ownership."""
+"""Columnar Clip/Fitting streaming preserves geometry, ordering and ownership."""
 import math
 import inspect
 from dataclasses import replace
 from contextlib import contextmanager
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -11,7 +10,6 @@ import numpy as np
 import pytest
 
 from track.v2.clip import extract_clips, extract_clips_for_detect
-from track.v2.clip_spool import DiskSequence
 from track.v2.db.queries import fetch_resolved_clip_tracks
 from track.v2.fitting import (
     _OrientedClip, _fit_pair_stream, _orient_clip, _resample_at_progress,
@@ -23,20 +21,6 @@ from .test_clip import _CONTEXT, _point
 from .test_fitting_network import _clip, _clip_result, _TRANSFORMER
 
 _EPS = 1e-9
-
-
-def test_disk_sequence_repeatability_lookup_slice_and_cleanup():
-    with DiskSequence() as sequence:
-        directory = Path(sequence._directory.name)
-        for index in range(3):
-            sequence.append((index, [index + 1]), key=str(index))
-        assert list(sequence) == list(sequence)
-        assert sequence[-1] == (2, [3])
-        assert sequence[::-1] == ((2, [3]), (1, [2]), (0, [1]))
-        assert sequence.get_by_clip_id("1") == sequence[1]
-        with pytest.raises(IndexError):
-            sequence[3]
-    assert not directory.exists()
 
 
 def test_streamed_clip_result_matches_memory_and_serializes(tmp_path):

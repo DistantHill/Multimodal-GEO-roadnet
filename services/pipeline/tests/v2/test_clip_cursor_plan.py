@@ -6,7 +6,7 @@ import pytest
 
 from track.v2.db.queries import fetch_resolved_clip_tracks
 from track.v2.db.cursors import declare_full_scan_cursor
-from .test_clip_spool import Connection
+from .test_clip_fitting_streaming import Connection
 
 
 @pytest.mark.parametrize("failure", [False, True])
