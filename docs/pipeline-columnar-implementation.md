@@ -66,7 +66,7 @@
 | C10c3 | Writer 最终行组合与配对校验 | C10c2 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
-| C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已开始（C11a–C11b） |
+| C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已开始（C11a–C11c） |
 | C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 未开始 |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
@@ -523,6 +523,13 @@ C11b 已删除随协调器孤立的 `patch_admission.py` 手写内存与外存�
 专用测试暂时保留，后续任务卡继续清理。本步不改 heartbeat、DuckDB/Polars 引擎资源
 控制、PostgreSQL 业务持久化、API 或前端字段；C11 尚未完成。
 
+C11c 已从 `resource_budget.py` 删除只服务于手写多进程 patch 池的并行预算规划器，并将
+运行环境快照的执行参数白名单收敛为单进程列式执行仍使用的 `memory_limit_bytes`、
+`fetch_rows` 和 `insert_rows`。只读、无凭据的 CPU、内存、cgroup、磁盘与运行参数快照
+继续保留。`patch_pool.py`、`patch_spool.py`、`db/patch_ledger.py` 及其测试仍留待后续
+任务卡删除；本步不改 heartbeat、DuckDB/Polars 引擎资源控制、业务 PostgreSQL、API 或
+前端字段，C11 尚未完成。
+
 验证：全仓无生产引用、初始化器不引用旧结构、Pipeline 单进程路径完整。
 
 C11a 验证：Pipeline 与 scripts 全量测试 `1447 passed, 68 skipped`；生产代码和测试中的
@@ -530,6 +537,10 @@ C11a 验证：Pipeline 与 scripts 全量测试 `1447 passed, 68 skipped`；生�
 
 C11b 验证：Pipeline 与 scripts 全量测试 `1383 passed, 68 skipped`；生产代码和测试中的
 `patch_admission`、`ReservationBook`、`ReservationToken`、`ResourceUnavailable` 引用清零。
+
+C11c 验证：环境快照定向测试 `52 passed`；Pipeline 与 scripts 全量测试
+`1332 passed, 68 skipped`；四个并行预算规划器符号引用清零，旧池/外溢协调执行参数已从
+快照白名单删除。
 
 提交：待记录。
 

@@ -1,13 +1,11 @@
-"""Explainable memory estimates and read-only, credential-free run snapshots.
+"""Read-only, credential-free run environment snapshots.
 
-Planning is not enforcement: callers must measure stage-specific peaks, enforce
-the process-group limit, bound queues, and react to runtime memory pressure.
 This module does not configure cgroups or connect to a database.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
 import os
@@ -17,121 +15,9 @@ import re
 from typing import Callable, Mapping, Sequence
 
 
-class InsufficientMemoryError(ValueError):
-    """The estimates cannot fit even one row in one calculation process."""
-
-
 def _integer(name: str, value: int, *, minimum: int = 0) -> None:
     if type(value) is not int or value < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}")
-
-
-@dataclass(frozen=True)
-class MemoryEstimates:
-    """Caller-measured byte costs, including native allocations and page cache.
-
-    Per-row costs cover input, output, and peak temporary storage at the chosen
-    thread count. Per-thread costs are *additional* to the process baseline.
-    Buffered results must be bounded within buffer_bytes, not retained again
-    outside this accounting. No default claims about real process sizes exist.
-    """
-
-    coordinator_bytes: int
-    process_baseline_bytes: int
-    peak_bytes_per_row: int
-    writer_bytes: int
-    buffer_bytes: int
-    safety_margin_bytes: int
-    thread_extra_bytes: int = 0
-
-    def __post_init__(self) -> None:
-        for name, value in asdict(self).items():
-            _integer(name, value, minimum=1 if name == "peak_bytes_per_row" else 0)
-
-
-@dataclass(frozen=True)
-class BudgetPlan:
-    memory_limit_bytes: int
-    executor_processes: int
-    native_threads_per_process: int
-    patch_target_rows: int
-    available_cpu_count: int
-    coordinator_bytes: int
-    writer_bytes: int
-    buffer_bytes: int
-    safety_margin_bytes: int
-    all_process_baselines_bytes: int
-    all_thread_extras_bytes: int
-    all_patch_working_bytes: int
-    estimated_peak_bytes: int
-    unallocated_bytes: int
-
-    def to_dict(self) -> dict[str, int]:
-        return asdict(self)
-
-
-def plan_budget(
-    memory_limit_bytes: int,
-    estimates: MemoryEstimates,
-    *,
-    available_cpu_count: int,
-    native_thread_limit: int = 1,
-    preferred_patch_rows: int = 10_000,
-) -> BudgetPlan:
-    """Choose W/T/n with estimated total strictly below the supplied limit.
-
-    Prefer processes that can each fit preferred_patch_rows; if none fit, use
-    one process and shrink n. T is bounded by CPU availability and the caller's
-    supported native-thread limit, falling back to fewer threads if necessary.
-    The preference is scheduling policy, not a throughput-optimal calibration.
-    An oversized indivisible group still needs admission checking or external
-    storage: n is a target, never permission to exceed the memory limit.
-    """
-    for name, value in {
-        "memory_limit_bytes": memory_limit_bytes,
-        "available_cpu_count": available_cpu_count,
-        "native_thread_limit": native_thread_limit,
-        "preferred_patch_rows": preferred_patch_rows,
-    }.items():
-        _integer(name, value, minimum=1)
-    fixed = (
-        estimates.coordinator_bytes + estimates.writer_bytes
-        + estimates.buffer_bytes + estimates.safety_margin_bytes
-    )
-    remaining = memory_limit_bytes - 1 - fixed
-    threads = min(native_thread_limit, available_cpu_count)
-    if estimates.thread_extra_bytes:
-        affordable_threads = (
-            remaining - estimates.process_baseline_bytes - estimates.peak_bytes_per_row
-        ) // estimates.thread_extra_bytes
-        threads = max(1, min(threads, affordable_threads))
-    baseline = estimates.process_baseline_bytes + threads * estimates.thread_extra_bytes
-    if remaining < baseline + estimates.peak_bytes_per_row:
-        required = fixed + baseline + estimates.peak_bytes_per_row + 1
-        raise InsufficientMemoryError(
-            f"estimated minimum limit is {required} bytes; supplied {memory_limit_bytes}"
-        )
-    preferred_cost = baseline + preferred_patch_rows * estimates.peak_bytes_per_row
-    processes = max(1, min(available_cpu_count // threads, remaining // preferred_cost))
-    rows = (remaining - processes * baseline) // (processes * estimates.peak_bytes_per_row)
-    working = processes * rows * estimates.peak_bytes_per_row
-    peak = fixed + processes * baseline + working
-    return BudgetPlan(
-        memory_limit_bytes=memory_limit_bytes,
-        executor_processes=processes,
-        native_threads_per_process=threads,
-        patch_target_rows=rows,
-        available_cpu_count=available_cpu_count,
-        coordinator_bytes=estimates.coordinator_bytes,
-        writer_bytes=estimates.writer_bytes,
-        buffer_bytes=estimates.buffer_bytes,
-        safety_margin_bytes=estimates.safety_margin_bytes,
-        all_process_baselines_bytes=processes * estimates.process_baseline_bytes,
-        all_thread_extras_bytes=processes * threads * estimates.thread_extra_bytes,
-        all_patch_working_bytes=working,
-        estimated_peak_bytes=peak,
-        unallocated_bytes=memory_limit_bytes - peak,
-    )
 
 
 def _read_text(path: str) -> str:
@@ -388,9 +274,7 @@ def _disk(probe: SnapshotProbe, path: str, mounts: list[dict[str, str]]) -> dict
 
 
 _EXECUTION_PARAMETERS = frozenset({
-    "memory_limit_bytes", "executor_processes", "native_threads_per_process",
-    "patch_target_rows", "fetch_rows", "insert_rows", "max_inflight_tasks",
-    "result_buffer_bytes", "spool_limit_bytes", "disk_reserve_bytes",
+    "memory_limit_bytes", "fetch_rows", "insert_rows",
 })
 
 
