@@ -530,6 +530,11 @@ C11c 已从 `resource_budget.py` 删除只服务于手写多进程 patch 池的�
 任务卡删除；本步不改 heartbeat、DuckDB/Polars 引擎资源控制、业务 PostgreSQL、API 或
 前端字段，C11 尚未完成。
 
+C11d 以两笔提交删除自行编写的进程池：先退休专用池测试以及仅验证 pool、spool、ledger
+组合的 PostgreSQL 测试，再删除已无调用者的 `patch_pool.py`。`patch_spool.py`、
+`db/patch_ledger.py` 及其完整性和账本测试暂留后续任务卡；本步不改 heartbeat、
+DuckDB/Polars 引擎线程或外存设置、业务 PostgreSQL、API 或前端字段，C11 尚未完成。
+
 验证：全仓无生产引用、初始化器不引用旧结构、Pipeline 单进程路径完整。
 
 C11a 验证：Pipeline 与 scripts 全量测试 `1447 passed, 68 skipped`；生产代码和测试中的
@@ -542,7 +547,12 @@ C11c 验证：环境快照定向测试 `52 passed`；Pipeline 与 scripts 全量
 `1332 passed, 68 skipped`；四个并行预算规划器符号引用清零，旧池/外溢协调执行参数已从
 快照白名单删除。
 
-提交：待记录。
+C11d 验证：第一笔 ledger/spool 定向测试 `88 passed, 17 skipped`；第二笔 Pipeline 与
+scripts 全量测试 `1256 passed, 67 skipped`；生产代码和测试中的 `patch_pool`、
+`ProcessPoolExecutor`、`run_bounded_patches`、`PatchTask`、`DispatchPause`、
+`PatchExecutionError`、`PoolShutdownUnconfirmed`、`RemotePatchFailure` 引用清零。
+
+提交：C11d 测试退休 `1a4264a`；C11d 实现删除为本提交。
 
 ### C12 — 集成与文档
 
