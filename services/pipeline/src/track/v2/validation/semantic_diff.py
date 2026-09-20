@@ -28,8 +28,12 @@ WITH member_evidence AS (
  WHERE t.candidate_intersection_id IS NOT NULL
  UNION ALL
  SELECT x.detect_id,x.candidate_intersection_id,
-        jsonb_build_array('cross',a.subtrack_index,a.sequence_in_subtrack,
-                          b.subtrack_index,b.sequence_in_subtrack)::text
+        CASE WHEN (a.subtrack_index,a.sequence_in_subtrack)
+                       <= (b.subtrack_index,b.sequence_in_subtrack)
+             THEN jsonb_build_array('cross',a.subtrack_index,a.sequence_in_subtrack,
+                                    b.subtrack_index,b.sequence_in_subtrack)::text
+             ELSE jsonb_build_array('cross',b.subtrack_index,b.sequence_in_subtrack,
+                                    a.subtrack_index,a.sequence_in_subtrack)::text END
  FROM tracks_cross x
  JOIN resolved_subtrack_points a ON (a.id,a.detect_id)=(x.from_segment_start_point_id,x.detect_id)
  JOIN resolved_subtrack_points b ON (b.id,b.detect_id)=(x.to_segment_start_point_id,x.detect_id)
@@ -94,8 +98,12 @@ TABLES = (
            ("centroid_lon", "degree"), ("centroid_lat", "degree"), ("radius_m", "metre"),
            ("geometry", "geojson"), ("contributors", "json_float"), ("critical", "json"))),
     TableSpec("detect.tracks_cross", "detect", _SEMANTIC_KEYS + """
-      SELECT jsonb_build_array(a.subtrack_index,a.sequence_in_subtrack,
-                               b.subtrack_index,b.sequence_in_subtrack)::text,
+      SELECT CASE WHEN (a.subtrack_index,a.sequence_in_subtrack)
+                            <= (b.subtrack_index,b.sequence_in_subtrack)
+                  THEN jsonb_build_array(a.subtrack_index,a.sequence_in_subtrack,
+                                         b.subtrack_index,b.sequence_in_subtrack)::text
+                  ELSE jsonb_build_array(b.subtrack_index,b.sequence_in_subtrack,
+                                         a.subtrack_index,a.sequence_in_subtrack)::text END,
              CASE WHEN x.candidate_intersection_id IS NULL THEN '__NO_CANDIDATE__'
                   ELSE COALESCE(k.business_key,'__UNCOMPARABLE_CANDIDATE__') END,x.x,x.y,x.lon,x.lat
       FROM tracks_cross x
@@ -187,6 +195,13 @@ _EXCLUSIONS = {
         "Network issues/report and include_isolated_nodes (not persisted)",
     ],
 }
+
+
+def canonical_endpoint_pair(
+    left: tuple[int, int], right: tuple[int, int],
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return the stable identity of an undirected resolved-segment pair."""
+    return (left, right) if left <= right else (right, left)
 
 
 def _json_floats(value: Any) -> Iterator[float]:

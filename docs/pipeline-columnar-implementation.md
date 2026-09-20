@@ -67,7 +67,7 @@
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
-| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 已开始（C12a–C12c2a） |
+| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12c2c；1M 阻塞） |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
 ## 3. 任务卡
@@ -706,11 +706,72 @@ Pipeline 全量 `956 passed, 50 skipped`；CLI help 可用；逐表查询通过�
 只读 `EXPLAIN` 解析。测试覆盖 ID 偏移规范化、同数量
 拓扑变化、三类容差边界、非有限值、缺失/重复业务身份，以及只读语句和命名游标。
 
-提交：待记录。
+提交：`742f919`。
 
 C12c2b 补全验证：诊断表与 preflight 定向测试 `19 passed`；13 条逐表查询均通过真实
 PostgreSQL 只读 `EXPLAIN` 解析；标准 Pipeline 全量 `964 passed, 50 skipped`。候选 ID
 偏移不影响规范身份；诊断成员、excluded 或语义配置/源指纹变化均在最终表比较前失败。
+
+提交：`7942439`。
+
+#### C12c2c — 现有 1M 基线隔离实测
+
+2026-09-20 只读前置核对确认：`roadnet_test` 无其他连接，schema v4，
+`public.day01` 精确 `1,000,000` 行，历史 Refine/Detect/Fit Run 分别为
+`bcac9210-3dd4-497a-ac64-8b872deafa1c`、`deb731ae-86b9-450f-a109-38b69a9b811c`、
+`9338132b-0d96-4968-8f06-e8c680241709`，状态均为 completed。使用 PostgreSQL
+`CREATE DATABASE ... TEMPLATE roadnet_test` 创建全新隔离库
+`roadnet_columnar_c12_1m_20260920`，只对该副本执行 `init-db --migrate-artifacts` 至 v7；
+迁移后源行数和历史血缘不变。未修改、迁移、重置或删除 `roadnet_test`/`roadnet`，也未
+终止连接。
+
+当前源码以保留容器 `roadnet-c12c2c-1m-20260920` 运行完整命令：
+`python -m pipeline run --source-table public.day01 --processing-srid 32649`。宿主为
+AMD Ryzen 5 5600H（6 核/12 线程）、14,497,005,568 B 内存，Docker 29.1.3、cgroup v2，
+数据盘运行前可用 176,667,430,912 B。镜像
+`sha256:df66d661b6d1ab17819709e0536feb06cc4c6791b633dea91f9cfefca8104754`；
+Python 3.12.14、DuckDB 1.5.5、Polars 1.44.2、NumPy 2.5.3、psycopg 3.3.6、
+pyproj 3.8.0。容器 `memory.max=2,000,000,000 B`，Docker `memory-swap` 与内存限制相同，
+即无额外 swap；运行中采样为 225.9 MiB，容器退出前未读取到精确 `memory.peak` 与
+`memory.events`，因此不能将该采样冒充峰值。容器退出记录为 `OOMKilled=false`。
+
+Refine 成功：70.340 秒，读取 1,000,000 行，写入 614,879 kept、999 injected、
+385,121 excluded，新 Refine ID 为 `e835f775-c30f-4ba4-a64e-1f8ad898a97a`，源指纹与
+历史 baseline 相同。Detect ID `684842e0-f3b9-4d7a-8921-5eded0c2b7a6` 在 279.5 秒后
+失败：已计算 56,239 turn events，随后 overflow fallback 预估
+`6,495,190,184` 个跨轨迹线段对，超过 `20,000,000` 保护阈值。总墙钟 351.74 秒，
+退出码 2；Detect 状态为 failed、七张 Detect 结果表均为 0 行，未创建 Fit Run，成功后
+才写出的 `stats.json` 不存在。历史 baseline 的对应数量为 resolved 679,649、candidate
+intersection 393、tracks cross 58,660、turn event 56,178、candidate crossing 83,947、
+intersection 292、entry/exit 31,207、centerline 1,506。
+
+由于当前 Run 未形成 completed Detect/Fit lineage，未运行 `semantic-diff`，没有逐表
+pass 结果；首个阻塞差异是当前 Detect 候选生成触发跨轨迹 pair-space fail-closed，不能
+通过放宽 Q49 容差或用空表比较规避。运行目录
+`/data/tmp/road-network/c12c2c_1m_20260920`、隔离数据库和保留容器均未删除，供复核。
+PostgreSQL 位于独立共享容器，前后 `memory.peak` 均为 5,551,116,288 B；该值含其他数据库
+活动，只作单列环境证据，不计入 Pipeline 2 GB。C12 保持进行中，C13 未开始。
+
+只读根因核对进一步确认新旧 Refine kept/excluded 集合完全一致，injected 仅 5 行存在
+Q49 容差内的纳米级投影差。当前 Parquet 的 437,416 条 straight adjacent segments 中，
+14,849 条 bbox 网格成员数超过 25，因此保护估算恰为
+`14,849 * 437,416 = 6,495,190,184`；最长相邻直线约 9,966.406 m、覆盖 1,683 个 bbox
+cells。这些是真实长跳段触发历史 global fallback，而非输入成员变化或意外全表物化。
+历史 Detect 于 2026-09-14 22:10 UTC 启动，早于 2026-09-15 加入的 20M DB global
+overflow guard；要保持历史候选语义并有界处理该规模，需要后续另行设计等价的
+DuckDB/Polars broad phase，不能在本卡直接抬高保护阈值。
+
+turn event 也按稳定 `(subtrack_index, refined_sequence_in_subtrack)` 做了只读对齐：
+56,176 个公共事件的 bearing/turn 最大差为 `1.1369e-13`，另有 63 个新增、2 个缺失；
+这 65 个集合差全部处于闭区间 45°/170° 边界，是 DuckDB 与历史 Python 三角函数及求和
+舍入方向不同造成的边界翻转，并非 Refine 成员变化。该兼容修复不混入本卡。
+
+本卡同时修正 `tracks_cross` 无向身份：候选成员证据与行身份都按稳定
+`(subtrack_index, sequence_in_subtrack)` 端点排序，不再依赖 surrogate ID 的 from/to
+顺序；端点反转等价回归已覆盖。定向测试 `20 passed`，标准 Pipeline 全量
+`936 passed, 50 skipped`，13 条语义查询再次通过真实 PostgreSQL 只读 `EXPLAIN` 解析。
+
+提交：待记录。
 
 ### C13 — 26M 最终验收
 

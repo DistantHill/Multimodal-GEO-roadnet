@@ -6,7 +6,9 @@ import pytest
 
 from uuid import uuid4
 
-from track.v2.validation.semantic_diff import TABLES, compare_rows, compare_runs
+from track.v2.validation.semantic_diff import (
+    TABLES, canonical_endpoint_pair, compare_rows, compare_runs,
+)
 
 
 class _Cursor:
@@ -105,6 +107,14 @@ def test_candidate_id_offsets_pass_but_diagnostic_member_change_fails() -> None:
     assert compare_rows("detect.tracks_cross", columns, normalized, normalized)["passed"]
     changed = [("[1, 2, 3, 4]", "turn:[1,3]", 10.0)]
     assert not compare_rows("detect.tracks_cross", columns, normalized, changed)["passed"]
+
+
+def test_tracks_cross_endpoint_reversal_has_same_undirected_identity() -> None:
+    forward = canonical_endpoint_pair((3, 7), (1, 9))
+    reverse = canonical_endpoint_pair((1, 9), (3, 7))
+    assert forward == reverse == ((1, 9), (3, 7))
+    tracks_query = next(spec.query for spec in TABLES if spec.name == "detect.tracks_cross")
+    assert "CASE WHEN (a.subtrack_index,a.sequence_in_subtrack)" in tracks_query
 
 
 def test_excluded_membership_change_fails() -> None:
