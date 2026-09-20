@@ -89,3 +89,13 @@ def test_run_subcommand_forwards_help_to_original_cli(monkeypatch) -> None:
 
     delegated.assert_called_once_with()
     assert __import__("sys").argv == ["track.v2.cli.run", "--help"]
+
+
+def test_artifacts_subcommand_forwards_to_artifact_cli(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", ["pipeline", "artifacts", "reconcile"])
+
+    with patch("track.v2.cli.artifacts.main", return_value=0) as delegated:
+        assert main() == 0
+
+    delegated.assert_called_once_with()
+    assert __import__("sys").argv == ["track.v2.cli.artifacts", "reconcile"]

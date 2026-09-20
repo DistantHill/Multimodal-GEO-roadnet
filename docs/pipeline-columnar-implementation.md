@@ -33,8 +33,8 @@
 | C03a | 安全 staging 与同文件系统原子只读发布 | C01b2–C02c | ≤700 | 已完成（`bc7e77c`） |
 | C03b | Parquet 检查、快速消费校验与 orphan 识别 | C03a | ≤700 | 已完成（`af4d098`） |
 | C04a | artifact reconcile/gc 只读计划 | C03b | ≤700 | 已完成（`9bc7f6b`） |
-| C04b1 | artifact reconcile/gc 显式 apply 核心 | C04a | ≤700 | 已实施，待主对话验收 |
-| C04b2 | artifact reconcile/gc CLI 与真实 PostgreSQL 验证 | C04b1 | ≤700 | 未开始 |
+| C04b1 | artifact reconcile/gc 显式 apply 核心 | C04a | ≤700 | 已完成（`615f4ce`） |
+| C04b2 | artifact reconcile/gc CLI 与真实 PostgreSQL 验证 | C04b1 | ≤700 | 已实施，待主对话验收 |
 | C05 | Refine Parquet Schema 与发布路径 | C04b2 | 每提交 ≤700 | 未开始 |
 | C06 | DuckDB 读取 Refine Parquet 的 Detect 输入适配 | C05 | 每提交 ≤700 | 未开始 |
 | C07 | Detect 算子列式迁移及 Python 回退收敛 | C06 | 每提交 ≤700 | 未开始 |
@@ -163,7 +163,7 @@ orphan 识别；不实现阶段业务 Schema。
 验证：计划过期、路径异常和符号链接全批零修改；删除/事件顺序、残留、orphan、
 staging 和事件失败语义由伪游标与临时目录单元测试覆盖。
 
-提交：待记录。
+提交：`615f4ce`。
 
 ### C04b2 — CLI 与真实 PostgreSQL 验证
 
