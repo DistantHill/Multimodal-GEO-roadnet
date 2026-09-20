@@ -49,8 +49,10 @@
 | C08b1 | Detect 制品数据库约束与事务中立 API | C08a | 每提交 ≤700 | 已完成（`2ee7f28`） |
 | C08b2 | Detect Parquet 发布与失败生命周期接线 | C08b1 | 每提交 ≤700 | 已完成（`a541fe9`） |
 | C08c1 | Detect Parquet v1 只读消费边界 | C08b2 | 每提交 ≤700 | 已完成（`fa63a9e`） |
-| C08c2 | Clip 正式入口接线 | C08c1 | 每提交 ≤700 | 已完成，待主对话确认 |
-| C09 | Clip/Fitting 顺序计算与旧 spool 清除 | C08c | 每提交 ≤700 | 未开始 |
+| C08c2 | Clip 正式入口接线 | C08c1 | 每提交 ≤700 | 已完成（`319a110`） |
+| C09a | Clip 规范化列式临时关系 | C08c | 每提交 ≤700 | 已完成，待主对话确认 |
+| C09b | Clip/Fitting 接线与 memmap 移除 | C09a | 每提交 ≤700 | 未开始 |
+| C09c | Detect TurnEvent 接线及旧 spool 删除 | C09b | 每提交 ≤700 | 未开始 |
 | C10 | Detect/写入器旧磁盘工作区清除 | C07a–C09 | 每提交 ≤700 | 未开始 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 未开始 |
 | C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 未开始 |
@@ -367,14 +369,35 @@ PostgreSQL 事务边界仍由 runner 管理，加载器不隐式提交；读取�
 DuckDB 已完成列式读取、排序和关系校验，Polars 不会减少数据搬运；Python 仅逐条构造
 一个现有 ClipTrack 并执行现有状态机，不引入全量对象图。
 
+提交：`319a110`。
+
+### C09a — Clip 规范化列式临时关系
+
+范围：建立 DuckDB 管理的 Clip 临时列式关系，规范化保存片段标量、端点与片段内点，
+支持按原始顺序和交叉口对稳定重复读取。本卡不接正式 Clip/Fitting，也不删除旧暂存。
+采用 DuckDB 是为了避免 Python 全量对象和自写外溢；现有 SQL 已覆盖筛选、排序和关系
+校验，Polars 不会减少数据搬运，Python 仅逐片段重建现有模型。
+
+验证：空关系、无片段内点、批量大小为 1、重复迭代、精确读取、配对与方向筛选、
+完整性校验、关闭语义及 DuckDB 资源配置。
+
 提交：待记录，主对话验收后回填。
 
-### C09 — Clip/Fitting 清理
+### C09b — Clip/Fitting 接线与 memmap 移除
 
-范围：以列式输入和顺序计算替换 `DiskSequence`；删除 `clip_spool.py` 及专用测试，
-确保 Fitting 最终 psycopg 事务兼容。
+范围：将 Clip/Fitting 正式路径接入 C09a 关系，删除 Fitting 的自写内存映射外溢，保持
+psycopg 事务兼容与输出字段不变。
 
 验证：Clip/Fitting 行为、失败回滚、配对顺序和中心线/清单差分。
+
+提交：待记录。
+
+### C09c — Detect TurnEvent 接线及旧 spool 删除
+
+范围：以 DuckDB 列式关系承接 Detect 转向事件，移除最后的 `DiskSequence` 调用者并删除
+旧暂存模块及专用测试。
+
+验证：Detect 转向候选、持久化与完整 Pipeline 回归；生产源码不再引用旧暂存。
 
 提交：待记录。
 
