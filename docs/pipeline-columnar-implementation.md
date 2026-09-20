@@ -66,7 +66,7 @@
 | C10c3 | Writer 最终行组合与配对校验 | C10c2 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
-| C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已开始（C11a–C11f） |
+| C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
 | C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 未开始 |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
@@ -551,6 +551,12 @@ C11g 删除已无生产或测试调用者的 patch ledger Python 实现与可选
 `test_patches.py` 仍留待下一卡清理，因此 C11 尚未完成。本步不改 heartbeat、
 DuckDB/Polars、业务数据库结构初始化、API 或前端字段。
 
+C11h 删除已只服务旧 patch 池与账本、且已无生产调用者的 patch 规划与签名
+模型及其专用测试，并从惰性导入测试移除已删模块。候选 patch 算法、制品
+`canonical_json`、heartbeat 单后台线程、只读环境快照，以及 DuckDB/Polars 引擎管理的
+线程与临时目录均保留。至此手写 coordinator、admission、process pool、spool、ledger 与
+planner 均已删除，C11 完成。
+
 验证：全仓无生产引用、初始化器不引用旧结构、Pipeline 单进程路径完整。
 
 C11a 验证：Pipeline 与 scripts 全量测试 `1447 passed, 68 skipped`；生产代码和测试中的
@@ -579,13 +585,20 @@ C11f 验证：第一笔 Pipeline 与 scripts 全量测试 `1168 passed, 50 skipp
 C11g 验证：Pipeline 与 scripts 全量测试 `1043 passed, 50 skipped`；已删除模块无法导入，
 初始化器 DDL 不含四张账本表，生产与测试源码中已退役符号引用清零。
 
-提交：C11d 测试退休 `1a4264a`；C11d 实现删除为本提交。
+C11h 验证：lazy import 定向测试 `5 passed`；Pipeline 与 scripts 全量测试
+`945 passed, 50 skipped`；生产与测试
+源码中 patch 规划与签名模型引用清零，全域审计仅保留允许的 heartbeat 单后台线程和
+DuckDB/Polars 引擎管理的线程、临时目录与外存溢写配置。
 
-提交：C11e 为本提交。
+提交：C11d 测试退休 `1a4264a`；C11d 实现删除 `8b9354d`。
 
-提交：C11f PostgreSQL 测试退休 `de7cde3`；单元测试退休为本提交。
+提交：C11e `acef192`。
 
-提交：C11g 为本提交。
+提交：C11f PostgreSQL 测试退休 `de7cde3`；单元测试退休 `b0f5605`。
+
+提交：C11g `a63d17a`。
+
+提交：C11h 为本提交。
 
 ### C12 — 集成与文档
 

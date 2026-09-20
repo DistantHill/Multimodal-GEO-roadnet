@@ -9,7 +9,7 @@ import pytest
 
 
 @pytest.mark.parametrize("module", [
-    "track.v2", "track.v2.patches", "track.v2.resource_budget", "track.v2.db.source_table",
+    "track.v2", "track.v2.resource_budget", "track.v2.db.source_table",
 ])
 def test_lightweight_import_does_not_initialize_numerical_libraries(module):
     result = subprocess.run(
