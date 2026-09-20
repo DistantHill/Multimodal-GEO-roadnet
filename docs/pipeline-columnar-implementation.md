@@ -30,8 +30,8 @@
 | C02a | PostgreSQL Schema v5 制品登记 DDL 与迁移 | C01b2 | ≤700 | 已完成（`e05214d`） |
 | C02b | 制品描述校验与最小登记 API | C02a | ≤700 | 已完成（`04d62ce`） |
 | C02c | 制品登记真实 PostgreSQL 集成验证 | C02b | ≤700 | 已完成（`b0db129`） |
-| C03a | 安全 staging 与同文件系统原子只读发布 | C01b2–C02c | ≤700 | 已实施，待主对话验收 |
-| C03b | Parquet 检查、快速消费校验与 orphan 识别 | C03a | ≤700 | 未开始 |
+| C03a | 安全 staging 与同文件系统原子只读发布 | C01b2–C02c | ≤700 | 已完成（`bc7e77c`） |
+| C03b | Parquet 检查、快速消费校验与 orphan 识别 | C03a | ≤700 | 已实施，待主对话验收 |
 | C04 | artifact reconcile/gc dry-run/apply CLI | C03b | ≤700 | 未开始 |
 | C05 | Refine Parquet Schema 与发布路径 | C03b | 每提交 ≤700 | 未开始 |
 | C06 | DuckDB 读取 Refine Parquet 的 Detect 输入适配 | C05 | 每提交 ≤700 | 未开始 |
@@ -132,7 +132,7 @@ Pipeline 全量测试 `1165 passed, 55 skipped`。
 验证：成功发布、空或半写失败、目标不覆盖、路径逃逸、跨设备、改名后数据库失败仍
 保留 final，以及 staging 放弃边界测试。
 
-提交：待记录。
+提交：`bc7e77c`。
 
 ### C03b — Parquet 校验与 orphan 识别
 
