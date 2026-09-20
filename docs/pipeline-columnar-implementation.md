@@ -54,8 +54,11 @@
 | C09b | Clip/Fitting 接线与 memmap 移除 | C09a | 每提交 ≤700 | 已完成（`51a9c97`） |
 | C09c1 | Detect TurnEvent 规范化列式关系 | C09b | 每提交 ≤700 | 已完成（`1572764`） |
 | C09c2 | Detect TurnEvent 接线及旧 spool 删除 | C09c1 | 每提交 ≤700 | 已完成（`853da8c`） |
-| C10a1 | Detect CrossTrackCandidate 规范化列式关系 | C09c2 | 每提交 ≤700 | 已完成，待主对话确认 |
-| C10a2 | Detect/写入器旧磁盘工作区清除 | C10a1 | 每提交 ≤700 | 未开始 |
+| C10a1 | Detect CrossTrackCandidate 规范化列式关系 | C09c2 | 每提交 ≤700 | 已完成（`7b3e6c4`） |
+| C10a2 | Detect 跨轨迹候选多 pass 簇成员关系 | C10a1 | 每提交 ≤700 | 已完成，待主对话确认 |
+| C10a3 | Detect 正式接线并删除旧跨轨迹成员暂存 | C10a2 | 每提交 ≤700 | 未开始 |
+| C10b | Topology 与 DetectWorkspace 列式迁移及旧工作区删除 | C10a3 | 每提交 ≤700 | 未开始 |
+| C10c | WriterWorkspace 列式迁移及旧工作区删除 | C10b | 每提交 ≤700 | 未开始 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 未开始 |
 | C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 未开始 |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
@@ -426,14 +429,40 @@ psycopg 事务兼容与输出字段不变。DuckDB 负责片段关系的重复�
 验证：空关系、完整可空引用、批量大小为 1、重复迭代、索引、坐标流、损坏关闭、资源
 配置、临时目录碰撞与构造失败。
 
+提交：`7b3e6c4`。
+
+### C10a2 — Detect 跨轨迹候选多 pass 簇成员关系
+
+范围：在 `CrossCandidateRelation` 内以 DuckDB 管理可同时存活、独立关闭的多 pass 簇成员
+归属记录，并提供与旧 `CandidateStore` 成员视图等价的有界重复读取、完整事件重建与来源
+摘要。本卡不接 Detect 正式入口，不删除 `cross_member_store.py`。
+
+验证：与旧成员接口差分、批量大小为 1、多 pass、噪声、标签错误、关闭与异常回滚。
+
 提交：待记录。
 
-### C10a2 — Detect/写入器工作区清理
+### C10a3 — Detect 正式接线并删除旧跨轨迹成员暂存
 
-范围：移除 `cross_member_store.py`、`detect_workspace.py`、`writer_workspace.py` 及专用
-测试；按列式关系或有界 Python 内核保留业务语义。无调用者的辅助模块同时删除。
+范围：将 Detect 跨轨迹候选及成员 pass 正式接入 `CrossCandidateRelation`，迁移通用轻量
+辅助接口并删除 `cross_member_store.py`。
 
-验证：Detect 持久化、成员归属、来源摘要、Replay 与 Backend 字段回归。
+验证：Detect 聚类、消融、持久化、来源摘要及旧模块生产引用清零。
+
+提交：待记录。
+
+### C10b — Topology 与 DetectWorkspace 列式迁移及旧工作区删除
+
+范围：迁移拓扑和 Detect 工作区的磁盘暂存，保持既有阶段边界与读取语义。
+
+验证：Topology、Detect 持久化、Replay 与 Backend 字段回归。
+
+提交：待记录。
+
+### C10c — WriterWorkspace 列式迁移及旧工作区删除
+
+范围：迁移写入器工作区并删除无调用者的旧辅助模块。
+
+验证：写入、发布、失败回滚与完整 Pipeline 回归。
 
 提交：待记录。
 

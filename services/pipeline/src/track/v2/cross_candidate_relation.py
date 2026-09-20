@@ -8,7 +8,8 @@ from uuid import uuid4
 
 import duckdb
 
-from .models import CrossTrackCandidate, PointRef, RefinedPointRef, RuntimeConfig
+from .cross_member_store import EventSummary
+from .models import CrossTrackCandidate, PointRef, RefinedPointRef, RuntimeConfig, TurnEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +46,7 @@ class CrossCandidateRelation(Sequence[CrossTrackCandidate]):
         self._temp_directory.mkdir(exist_ok=False)
         self._connection: duckdb.DuckDBPyConnection | None = None
         self._batch_size, self._count, self._sealed = batch_size, 0, False
+        self._next_pass = 0
         try:
             self._connection = duckdb.connect(database=":memory:", config={
                 "allow_unsigned_extensions": "false",
@@ -74,6 +76,13 @@ class CrossCandidateRelation(Sequence[CrossTrackCandidate]):
                 from_kind VARCHAR,from_id BIGINT,from_subtrack BIGINT,from_sequence BIGINT,
                 to_kind VARCHAR,to_id BIGINT,to_subtrack BIGINT,to_sequence BIGINT,
                 cross_track_calculate_index BIGINT
+            )
+        """)
+        self._require_open().execute("""
+            CREATE TABLE cross_candidate_members (
+                pass_id BIGINT NOT NULL,label BIGINT NOT NULL,
+                member_order BIGINT NOT NULL,ordinal BIGINT NOT NULL,
+                PRIMARY KEY(pass_id,label,member_order)
             )
         """)
 
@@ -222,6 +231,57 @@ class CrossCandidateRelation(Sequence[CrossTrackCandidate]):
         finally:
             cursor.close()
 
+    def create_members(self, labels: Sequence[int]) -> MemberPass:
+        """Create one independently owned clustering pass; negative labels are noise."""
+        self.seal()
+        if len(labels) != len(self):
+            raise ValueError("one DBSCAN label is required per candidate")
+        connection = self._require_sealed()
+        pass_id = self._next_pass
+        self._next_pass += 1
+        positions: dict[int, int] = {}
+        batch: list[tuple[int, int, int, int]] = []
+        connection.execute("BEGIN TRANSACTION")
+        iterator = iter(labels)
+        try:
+            for ordinal in range(len(self)):
+                try:
+                    raw_label = next(iterator)
+                except StopIteration as exc:
+                    raise ValueError(
+                        "one DBSCAN label is required per candidate"
+                    ) from exc
+                label = int(raw_label)
+                if label < 0:
+                    continue
+                position = positions.get(label, 0)
+                positions[label] = position + 1
+                batch.append((pass_id, label, position, ordinal))
+                if len(batch) == self._batch_size:
+                    connection.executemany(
+                        "INSERT INTO cross_candidate_members VALUES (?,?,?,?)", batch
+                    )
+                    batch.clear()
+            if batch:
+                connection.executemany(
+                    "INSERT INTO cross_candidate_members VALUES (?,?,?,?)", batch
+                )
+            try:
+                next(iterator)
+            except StopIteration:
+                pass
+            else:
+                raise ValueError("one DBSCAN label is required per candidate")
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        finally:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+        return MemberPass(self, pass_id, positions)
+
     def _require_sealed(self) -> duckdb.DuckDBPyConnection:
         connection = self._require_open()
         if not self._sealed:
@@ -250,3 +310,165 @@ class CrossCandidateRelation(Sequence[CrossTrackCandidate]):
 
     def __exit__(self, *_args: object) -> None:
         self.close()
+
+
+class MemberPass:
+    """One disposable set of cluster memberships owned by a relation."""
+
+    def __init__(
+        self, relation: CrossCandidateRelation, pass_id: int, counts: dict[int, int],
+    ) -> None:
+        self.relation, self.pass_id, self.counts = relation, pass_id, counts
+        self._closed = False
+
+    def _check_open(self) -> None:
+        self.relation._require_open()
+        if self._closed:
+            raise RuntimeError("member pass is closed")
+
+    def iter_groups(self) -> Iterator[tuple[int, ClusterMemberSequence]]:
+        self._check_open()
+        for label in sorted(self.counts):
+            yield label, ClusterMemberSequence(self, label, self.counts[label])
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.relation._connection is not None:
+            self.relation._connection.execute(
+                "DELETE FROM cross_candidate_members WHERE pass_id=?", (self.pass_id,)
+            )
+        self.counts.clear()
+
+    def __enter__(self) -> MemberPass:
+        self._check_open()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class ClusterMemberSequence(Sequence[TurnEvent]):
+    """Repeatable, bounded materialization of one label's member events."""
+
+    _SOURCE = "orthogonal_cross_track"
+
+    def __init__(self, pass_owner: MemberPass, label: int, count: int) -> None:
+        self.pass_owner, self.label, self._count = pass_owner, label, count
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __getitem__(self, index: int | slice) -> TurnEvent | tuple[TurnEvent, ...]:
+        self.pass_owner._check_open()
+        if isinstance(index, slice):
+            return tuple(self[item] for item in range(*index.indices(len(self))))
+        if not isinstance(index, int):
+            raise TypeError("member index must be an integer or slice")
+        position = index + len(self) if index < 0 else index
+        if position < 0 or position >= len(self):
+            raise IndexError(index)
+        rows = self._rows("m.member_order,c.*", "AND m.member_order=?", (position,))
+        try:
+            row = next(rows)
+            return self._event(self.pass_owner.relation._decode(row[1:]), row[0])
+        finally:
+            rows.close()
+
+    def _rows(
+        self, columns: str, extra: str = "", params: tuple[object, ...] = (),
+    ) -> Iterator[tuple[object, ...]]:
+        self.pass_owner._check_open()
+        relation = self.pass_owner.relation
+        cursor = relation._require_sealed().cursor()
+        try:
+            cursor.execute(f"""
+                SELECT {columns} FROM cross_candidate_members m
+                JOIN cross_candidates c ON c.ordinal=m.ordinal
+                WHERE m.pass_id=? AND m.label=? {extra} ORDER BY m.member_order
+            """, (self.pass_owner.pass_id, self.label, *params))
+            while rows := cursor.fetchmany(relation._batch_size):
+                yield from rows
+        finally:
+            cursor.close()
+
+    @classmethod
+    def _event(cls, candidate: CrossTrackCandidate, index: int) -> TurnEvent:
+        return TurnEvent(
+            event_calculate_index=index, vehicle_id=candidate.vehicle_id,
+            timestamp=candidate.timestamp, lon=candidate.lon, lat=candidate.lat,
+            x=candidate.x, y=candidate.y, entry_bearing=0.0, exit_bearing=0.0,
+            turn_deg=0.0, score=0.0, source=cls._SOURCE,
+            point_ref=candidate.point_ref,
+            cross_track_calculate_index=candidate.cross_track_calculate_index,
+            source_ids=tuple(sorted({candidate.from_segment_start_point_ref.source_id,
+                                     candidate.to_segment_start_point_ref.source_id})),
+        )
+
+    def __iter__(self) -> Iterator[TurnEvent]:
+        rows = self._rows("m.member_order,c.*")
+        try:
+            for row in rows:
+                yield self._event(self.pass_owner.relation._decode(row[1:]), row[0])
+        finally:
+            rows.close()
+
+    def _narrow(self, columns: str) -> Iterator[tuple[object, ...]]:
+        rows = self._rows(columns)
+        try:
+            yield from rows
+        finally:
+            rows.close()
+
+    def iter_member_identities(self) -> Iterator[tuple[str, int, int | None]]:
+        for member_order, ordinal in self._narrow("m.member_order,m.ordinal"):
+            yield self._SOURCE, member_order, ordinal
+
+    def iter_ordinals(self) -> Iterator[int]:
+        for (ordinal,) in self._narrow("m.ordinal"):
+            yield ordinal
+
+    def iter_coordinates(self) -> Iterator[tuple[float, float]]:
+        for x, y in self._narrow("c.x,c.y"):
+            yield x, y
+
+    def iter_candidates(self) -> Iterator[CrossTrackCandidate]:
+        for row in self._narrow("c.*"):
+            yield self.pass_owner.relation._decode(row)
+
+    def provenance_summary(self, fallback_source: str = "") -> EventSummary:
+        del fallback_source
+        self.pass_owner._check_open()
+        event_ids: set[str] = set()
+        ref_ids: set[str] = set()
+        relation = self.pass_owner.relation
+        cursor = relation._require_sealed().cursor()
+        try:
+            cursor.execute("""
+                WITH owned AS (
+                    SELECT c.from_point_source_id,c.to_point_source_id,c.point_source_id
+                    FROM cross_candidate_members m JOIN cross_candidates c USING (ordinal)
+                    WHERE m.pass_id=? AND m.label=?
+                )
+                SELECT kind,source_id FROM (
+                    SELECT 'event' kind,from_point_source_id source_id FROM owned
+                    UNION SELECT 'event',to_point_source_id FROM owned
+                    UNION SELECT 'ref',point_source_id FROM owned
+                ) WHERE source_id IS NOT NULL AND source_id<>'' ORDER BY kind,source_id
+            """, (self.pass_owner.pass_id, self.label))
+            while rows := cursor.fetchmany(relation._batch_size):
+                for kind, source_id in rows:
+                    (event_ids if kind == "event" else ref_ids).add(source_id)
+        finally:
+            cursor.close()
+        return EventSummary(
+            frozenset(event_ids), {self._SOURCE: self._count} if self._count else {},
+            {self._SOURCE: frozenset(ref_ids)} if self._count else {},
+        )

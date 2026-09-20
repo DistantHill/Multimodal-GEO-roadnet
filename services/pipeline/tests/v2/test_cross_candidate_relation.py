@@ -1,6 +1,7 @@
 """Normalized DuckDB cross-candidate relation behavior and guards."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 import inspect
 from dataclasses import replace
 from pathlib import Path
@@ -8,7 +9,10 @@ from pathlib import Path
 import pytest
 
 from track.v2 import cross_candidate_relation
-from track.v2.cross_candidate_relation import CrossCandidateCoordinate, CrossCandidateRelation
+from track.v2.cross_candidate_relation import (
+    ClusterMemberSequence, CrossCandidateCoordinate, CrossCandidateRelation,
+)
+from track.v2.cross_member_store import CandidateStore
 from track.v2.models import CrossTrackCandidate, PointRef, RefinedPointRef, RuntimeConfig
 
 
@@ -186,3 +190,92 @@ def test_runtime_limits_bounded_fetch_and_columnar_implementation(tmp_path):
     assert "execute(" not in inspect.getsource(CrossCandidateRelation._decode).lower()
     for forbidden in ("sqlite", "pickle", "struct", "temporarydirectory"):
         assert forbidden not in source
+
+
+def test_member_pass_matches_legacy_store_and_ignores_noise(tmp_path):
+    candidates = tuple(_candidate(index, optional=index % 2 == 0) for index in range(5))
+    labels = [4, -1, 2, 4, 2]
+    with _relation(tmp_path) as relation, CandidateStore(directory=str(tmp_path)) as legacy:
+        for candidate in candidates:
+            relation.append(candidate)
+            legacy.append(candidate)
+        relation_pass = relation.create_members(labels)
+        legacy_pass = legacy.create_members(labels)
+        actual = dict(relation_pass.iter_groups())
+        expected = dict(legacy_pass.iter_groups())
+        assert list(actual) == list(expected) == [2, 4]
+        for label in actual:
+            group, old_group = actual[label], expected[label]
+            assert isinstance(group, ClusterMemberSequence)
+            assert tuple(group) == tuple(old_group)
+            assert group[:] == tuple(old_group)
+            assert group[-1] == old_group[-1]
+            assert list(group.iter_member_identities()) == list(old_group.iter_member_identities())
+            assert list(group.iter_ordinals()) == list(old_group.iter_ordinals())
+            assert list(group.iter_coordinates()) == list(old_group.iter_coordinates())
+            assert list(group.iter_candidates()) == list(old_group.iter_candidates())
+            assert group.provenance_summary("ignored") == old_group.provenance_summary("ignored")
+            assert tuple(group) == tuple(group)
+
+
+def test_multiple_member_passes_close_independently(tmp_path):
+    with _relation(tmp_path) as relation:
+        for index in range(3):
+            relation.append(_candidate(index))
+        first = relation.create_members([0, 0, -1])
+        second = relation.create_members([1, -1, 1])
+        first_group = dict(first.iter_groups())[0]
+        second_group = dict(second.iter_groups())[1]
+        iterator = iter(first_group)
+        assert next(iterator).cross_track_calculate_index == 0
+        iterator.close()
+        first.close()
+        with pytest.raises(RuntimeError, match="member pass is closed"):
+            list(first_group)
+        assert list(second_group.iter_ordinals()) == [0, 2]
+        second.close()
+
+
+def test_member_label_length_and_failed_conversion_roll_back(tmp_path):
+    with _relation(tmp_path) as relation:
+        for index in range(3):
+            relation.append(_candidate(index))
+        with pytest.raises(ValueError, match="one DBSCAN label"):
+            relation.create_members([0, 1])
+        with pytest.raises(ValueError):
+            relation.create_members([0, "bad", 1])  # type: ignore[list-item]
+        assert relation._connection.execute(
+            "SELECT count(*) FROM cross_candidate_members"
+        ).fetchone()[0] == 0
+        valid = relation.create_members([-1, 7, 7])
+        assert list(dict(valid.iter_groups())[7].iter_ordinals()) == [1, 2]
+
+
+@pytest.mark.parametrize("items", [[0, 1], [0, 1, 2, 3]])
+def test_member_iteration_length_mismatch_rolls_back(tmp_path, items):
+    class LyingLabels(Sequence):
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, index):
+            return items[index]
+
+    with _relation(tmp_path) as relation:
+        for index in range(3):
+            relation.append(_candidate(index))
+        with pytest.raises(ValueError, match="one DBSCAN label"):
+            relation.create_members(LyingLabels())
+        assert relation._connection.execute(
+            "SELECT count(*) FROM cross_candidate_members"
+        ).fetchone()[0] == 0
+
+
+def test_relation_close_invalidates_member_views(tmp_path):
+    relation = _relation(tmp_path)
+    relation.append(_candidate(0))
+    member_pass = relation.create_members([0])
+    group = dict(member_pass.iter_groups())[0]
+    relation.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        list(group)
+    member_pass.close()
