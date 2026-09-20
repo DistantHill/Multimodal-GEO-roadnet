@@ -1,6 +1,6 @@
-"""Create track.v2 schema v5 or migrate an existing v3/v4 schema in place.
+"""Create track.v2 schema v6 or migrate an existing v3/v4/v5 schema in place.
 
-Schema v3 supports ``--migrate-refine`` and v4 supports ``--migrate-artifacts``.
+Schema v3 supports ``--migrate-refine``; v4/v5 support ``--migrate-artifacts``.
 An existing v1/v2
 database must be recreated with ``--reset`` so an old column can never retain
 an ambiguous meaning behind a new API.
@@ -17,7 +17,7 @@ from ..logger import init_logger, shutdown_logger
 
 
 SCHEMA_COMPONENT = "track.v2"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 DDL_STATEMENTS: list[tuple[str, str]] = [
@@ -701,6 +701,49 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
         CREATE TRIGGER validate_pipeline_artifact_event_insert
         BEFORE INSERT ON pipeline_artifact_events
         FOR EACH ROW EXECUTE FUNCTION validate_pipeline_artifact_event()
+        """,
+    ),
+    (
+        "validate_refine_artifact_completion_function",
+        """
+        CREATE OR REPLACE FUNCTION validate_refine_artifact_completion()
+        RETURNS trigger LANGUAGE plpgsql AS $function$
+        DECLARE
+            artifact_count BIGINT;
+            present_count BIGINT;
+        BEGIN
+            IF OLD.status = 'running' AND NEW.status = 'completed' THEN
+                SELECT COUNT(*), COUNT(*) FILTER (WHERE latest.state = 'present')
+                  INTO artifact_count, present_count
+                  FROM pipeline_artifacts AS artifact
+                  LEFT JOIN LATERAL (
+                      SELECT event.state
+                        FROM pipeline_artifact_events AS event
+                       WHERE event.artifact_id = artifact.id
+                       ORDER BY event.id DESC
+                       LIMIT 1
+                  ) AS latest ON TRUE
+                 WHERE artifact.stage = 'refine'
+                   AND artifact.refine_id = NEW.id;
+                IF artifact_count <> 1 OR present_count <> 1 THEN
+                    RAISE EXCEPTION
+                        'completed Refine Run % requires exactly one present Refine artifact',
+                        NEW.id;
+                END IF;
+            END IF;
+            RETURN NEW;
+        END
+        $function$
+        """,
+    ),
+    (
+        "refine_artifact_completion_trigger",
+        """
+        DROP TRIGGER IF EXISTS refine_artifact_completion_check ON refine_runs;
+        CREATE CONSTRAINT TRIGGER refine_artifact_completion_check
+        AFTER UPDATE OF status ON refine_runs
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION validate_refine_artifact_completion()
         """,
     ),
     (
@@ -1925,14 +1968,14 @@ def _existing_pipeline_tables(cur: Any) -> list[str]:
     return [str(row[0]) for row in cur.fetchall()]
 
 
-def _require_empty_or_v5(cur: Any) -> None:
+def _require_empty_or_v6(cur: Any) -> None:
     version = _schema_version(cur)
     if version == SCHEMA_VERSION:
         return
     if version is not None:
         raise RuntimeError(
             f"database schema is v{version}; track.v2 requires v{SCHEMA_VERSION}. "
-            "For v3 use init-db --migrate-refine; for v4 use "
+            "For v3 use init-db --migrate-refine; for v4 or v5 use "
             "init-db --migrate-artifacts; older schemas require --reset."
         )
     existing = _existing_pipeline_tables(cur)
@@ -1941,7 +1984,7 @@ def _require_empty_or_v5(cur: Any) -> None:
         suffix = " ..." if len(existing) > 8 else ""
         raise RuntimeError(
             "unversioned/legacy pipeline tables exist "
-            f"({preview}{suffix}); schema v5 has no legacy in-place migration. "
+            f"({preview}{suffix}); schema v6 has no legacy in-place migration. "
             "Run init_db --reset."
         )
 
@@ -1978,6 +2021,7 @@ def reset_tables(config: PostgresConfig) -> int:
                 "guard_centerline_source_clip_mutation",
                 "guard_pipeline_artifact_immutability",
                 "validate_pipeline_artifact_event",
+                "validate_refine_artifact_completion",
             ):
                 cur.execute(f"DROP FUNCTION IF EXISTS {function_name}() CASCADE")
         conn.commit()
@@ -1991,21 +2035,28 @@ def create_tables(
     migrate_refine_names: bool = False,
     migrate_artifacts: bool = False,
 ) -> int:
-    """Create schema v5, optionally migrating v3/v4 in one transaction."""
+    """Create schema v6, optionally migrating v3/v4/v5 in one transaction."""
     with pg_connect(config) as conn:
         with conn.cursor() as cur:
-            if migrate_refine_names:
+            installed_before = _schema_version(cur)
+            if migrate_refine_names and installed_before != SCHEMA_VERSION:
                 from ..db.refine_migration import migrate_refine
 
                 migrate_refine(cur)
                 from ..db.artifact_migration import migrate_artifacts_v5
 
                 migrate_artifacts_v5(cur)
-            elif migrate_artifacts:
-                from ..db.artifact_migration import migrate_artifacts_v5
+                from ..db.completion_migration import migrate_completion_v6
 
-                migrate_artifacts_v5(cur)
-            _require_empty_or_v5(cur)
+                migrate_completion_v6(cur)
+            elif migrate_artifacts and installed_before != SCHEMA_VERSION:
+                from ..db.artifact_migration import migrate_artifacts_v5
+                from ..db.completion_migration import migrate_completion_v6
+
+                if _schema_version(cur) == 4:
+                    migrate_artifacts_v5(cur)
+                migrate_completion_v6(cur)
+            _require_empty_or_v6(cur)
 
             print("\n── 创建数据表 / Creating Tables ──")
             for name, ddl in DDL_STATEMENTS:
@@ -2053,7 +2104,7 @@ def create_tables(
 def main() -> int:
     defaults = default_postgres_config()
     parser = argparse.ArgumentParser(
-        description="Initialize the destructive track.v2 PostgreSQL schema v5."
+        description="Initialize the destructive track.v2 PostgreSQL schema v6."
     )
     parser.add_argument("--host", default=defaults.host)
     parser.add_argument("--port", type=int, default=defaults.port)
@@ -2070,15 +2121,15 @@ def main() -> int:
     migration.add_argument(
         "--reset",
         action="store_true",
-        help="Destructively drop all known Pipeline tables before creating v5.",
+        help="Destructively drop all known Pipeline tables before creating v6.",
     )
     migration.add_argument(
         "--migrate-refine", action="store_true",
-        help="Preserve v3 data, rename Clean objects, then migrate through v5.",
+        help="Preserve v3 data, rename Clean objects, then migrate through v6.",
     )
     migration.add_argument(
         "--migrate-artifacts", action="store_true",
-        help="Preserve v4 data and add the immutable artifact registry (schema v5).",
+        help="Preserve v4/v5 data and migrate through schema v6.",
     )
     args = parser.parse_args()
 

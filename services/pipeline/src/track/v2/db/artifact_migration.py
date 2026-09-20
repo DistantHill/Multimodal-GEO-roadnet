@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from .schema import SCHEMA_COMPONENT, SCHEMA_VERSION
+from .schema import SCHEMA_COMPONENT
+
+
+ARTIFACT_SCHEMA_VERSION = 5
 
 
 _ARTIFACT_TABLES = {"pipeline_artifacts", "pipeline_artifact_events"}
@@ -30,7 +33,7 @@ def migrate_artifacts_v5(cur: Any) -> None:
         (SCHEMA_COMPONENT,),
     )
     row = cur.fetchone()
-    if row is not None and int(row[0]) == SCHEMA_VERSION:
+    if row is not None and int(row[0]) == ARTIFACT_SCHEMA_VERSION:
         return
     if row is None or int(row[0]) != 4:
         raise RuntimeError("--migrate-artifacts requires an existing schema v4 database")
@@ -46,5 +49,5 @@ def migrate_artifacts_v5(cur: Any) -> None:
             cur.execute(ddl)
     cur.execute(
         "UPDATE pipeline_schema_versions SET version = %s WHERE component = %s",
-        (SCHEMA_VERSION, SCHEMA_COMPONENT),
+        (ARTIFACT_SCHEMA_VERSION, SCHEMA_COMPONENT),
     )

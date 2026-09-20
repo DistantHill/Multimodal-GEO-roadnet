@@ -8,7 +8,7 @@ from track.v2.cli.init_db import (
     POST_DDL_STATEMENTS,
     SCHEMA_COMPONENT,
     SCHEMA_VERSION,
-    _require_empty_or_v5,
+    _require_empty_or_v6,
 )
 
 
@@ -16,9 +16,9 @@ def _ddl(table: str) -> str:
     return dict(DDL_STATEMENTS)[table]
 
 
-def test_schema_v5_is_an_explicit_destructive_contract() -> None:
+def test_schema_v6_is_an_explicit_destructive_contract() -> None:
     assert SCHEMA_COMPONENT == "track.v2"
-    assert SCHEMA_VERSION == 5
+    assert SCHEMA_VERSION == 6
     assert "pipeline_schema_versions" in dict(DDL_STATEMENTS)
 
 
@@ -106,6 +106,14 @@ def test_centerline_manifest_is_a_thin_crossing_relationship() -> None:
 
 def test_post_ddl_validates_semantics_once_when_runs_complete() -> None:
     post = dict(POST_DDL_STATEMENTS)
+    refine = post["validate_refine_artifact_completion_function"]
+    assert "OLD.status = 'running' AND NEW.status = 'completed'" in refine
+    assert "ORDER BY event.id DESC" in refine
+    assert "artifact.stage = 'refine'" in refine
+    assert "detect_id" not in refine
+    assert "DEFERRABLE INITIALLY DEFERRED" in post[
+        "refine_artifact_completion_trigger"
+    ]
     assert "DEFERRABLE INITIALLY DEFERRED" in post["resolved_points_crossing_fkey"]
     detect = post["validate_detect_completion_function"]
     assert "completed Detect Run requires a completed parent Refine Run" in detect
@@ -267,13 +275,14 @@ class _VersionCursor:
 
 def test_unversioned_legacy_schema_is_refused_without_reset() -> None:
     with pytest.raises(RuntimeError, match="no legacy in-place migration"):
-        _require_empty_or_v5(_VersionCursor(None, ["refine_runs"]))
+        _require_empty_or_v6(_VersionCursor(None, ["refine_runs"]))
 
 
-def test_existing_v5_schema_is_accepted() -> None:
-    _require_empty_or_v5(_VersionCursor(5, ["refine_runs"]))
+def test_existing_v6_schema_is_accepted() -> None:
+    _require_empty_or_v6(_VersionCursor(6, ["refine_runs"]))
 
 
-def test_existing_v4_schema_requires_artifact_migration() -> None:
+@pytest.mark.parametrize("version", [4, 5])
+def test_existing_v4_or_v5_schema_requires_artifact_migration(version: int) -> None:
     with pytest.raises(RuntimeError, match="--migrate-artifacts"):
-        _require_empty_or_v5(_VersionCursor(4, ["refine_runs"]))
+        _require_empty_or_v6(_VersionCursor(version, ["refine_runs"]))

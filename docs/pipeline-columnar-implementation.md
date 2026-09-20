@@ -37,8 +37,8 @@
 | C04b2 | artifact reconcile/gc CLI 与真实 PostgreSQL 验证 | C04b1 | ≤700 | 已完成（`9d62a5a`） |
 | C05a | Refine Parquet Schema 与 staging 导出 | C04b2 | ≤700 | 已完成（`3e5f6a8`；语义修复 `cc7d25a`） |
 | C05b | Refine Parquet 发布、登记与 Run 完成事务 | C05a | ≤700 | 已完成（`8050876`） |
-| C05c1 | Refine 真实 PostgreSQL 差分与发布故障验证 | C05b | ≤700 | 实施中，待主对话验收 |
-| C05c2 | completed 制品约束迁移与 Refine 最终切换闸门 | C05c1 | ≤700 | 未开始 |
+| C05c1 | Refine 真实 PostgreSQL 差分与发布故障验证 | C05b | ≤700 | 已完成（`5a25516`） |
+| C05c2 | completed 制品约束迁移与 Refine 最终切换闸门 | C05c1 | ≤700 | 已实施，待主对话验收 |
 | C06 | DuckDB 读取 Refine Parquet 的 Detect 输入适配 | C05c2 | 每提交 ≤700 | 未开始 |
 | C07 | Detect 算子列式迁移及 Python 回退收敛 | C06 | 每提交 ≤700 | 未开始 |
 | C08 | Detect Parquet 发布与 Clip 列式读取 | C07 | 每提交 ≤700 | 未开始 |
@@ -203,7 +203,7 @@ staging 和事件失败语义由伪游标与临时目录单元测试覆盖。
 验证：小样本逐表差分、独立连接可见性、来源变化、发布后数据库事务回滚及 orphan
 保留语义。
 
-提交：待记录。
+提交：`5a25516`。
 
 ### C05c2 — Refine 最终切换闸门
 
@@ -213,7 +213,7 @@ PostgreSQL 上完成迁移、并发和回滚验证；通过后才允许 C06 消�
 验证：既有数据迁移、completed/failed/running 状态约束、制品事件状态、并发提交和
 回滚。
 
-提交：待记录。
+提交：本卡提交，待主对话记录哈希。
 
 ### C06 — Detect 输入
 

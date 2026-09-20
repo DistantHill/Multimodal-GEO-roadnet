@@ -4,8 +4,9 @@
 
 `init/001-enable-postgis.sql` 只在空数据目录首次初始化时启用 PostGIS。业务
 Schema 的唯一权威入口是 `services/pipeline/src/track/v2/cli/init_db.py`。当前版本为
-schema v4：v3 使用 `init-db --migrate-refine` 保留数据升级，v1/v2 仍需另行处理
-或用 `init-db --reset` 全量重建。不要混跑依赖不同版本字段的服务。
+schema v6：v3 使用 `init-db --migrate-refine` 串联升级，v4/v5 使用
+`init-db --migrate-artifacts` 升级；v1/v2 仍需另行处理或用 `init-db --reset`
+全量重建。不要混跑依赖不同版本字段的服务。
 
 `refine_runs` 唯一保存外部 `source_table`，kept/excluded 使用字符串化的
 `source_row_key`。仓内实体关系使用 `BIGINT` 主键。Detect 在最终事务中写入

@@ -1,11 +1,12 @@
-# Schema v4 Refine migration
+# Schema v6 migrations
 
 `track.v2` 数据库结构（schema）v4 将 Clean 统一改名为 Refine。v3 可执行
 `python -m pipeline init-db --database roadnet --migrate-refine`，在一个事务内
-保留数据、改名并重建关系保护函数。执行前停止相关读写服务，完成后一起部署
-v4 Pipeline、Backend 和客户端。具体步骤见[迁移说明](../../../docs/refine-migration-and-performance.md)。
+保留数据、改名并依次升级至 v6。v4/v5 使用 `--migrate-artifacts` 升至 v6。
+执行前停止相关读写服务，完成后一起部署 Pipeline、Backend 和客户端。具体步骤见
+[迁移说明](../../../docs/refine-migration-and-performance.md)。
 
-无迁移选项时初始化器只接受空库或已登记为 v4 的库。v1、v2 或未版本化
+无迁移选项时初始化器只接受空库或已登记为 v6 的库。v1、v2 或未版本化
 Pipeline 表仍需另行处理；`--reset` 会破坏性重建。v4 业务表的权威数据定义语言
 （data definition language，DDL）位于
 `services/pipeline/src/track/v2/cli/init_db.py`。

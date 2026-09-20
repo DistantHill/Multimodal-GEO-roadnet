@@ -10,13 +10,15 @@ from .schema import SCHEMA_COMPONENT
 
 
 REFINE_SCHEMA_VERSION = 4
-_V5_ONLY_OBJECTS = {
+_LATER_SCHEMA_OBJECTS = {
     "guard_pipeline_artifact_immutability_function",
     "pipeline_artifact_immutability_triggers",
     "validate_pipeline_artifact_event_function",
     "pipeline_artifact_event_insert_trigger",
     "uq_pipeline_artifacts_refine_run",
     "uq_pipeline_artifacts_detect_run",
+    "validate_refine_artifact_completion_function",
+    "refine_artifact_completion_trigger",
 }
 
 
@@ -106,7 +108,7 @@ def migrate_refine(cur: Any) -> None:
     # PostgreSQL rewrites FK/constraint dependencies, but not PL/pgSQL source.
     # Reinstall all authoritative guards before publishing version 4.
     for name, ddl in (*POST_DDL_STATEMENTS, *INDEX_STATEMENTS):
-        if name not in _V5_ONLY_OBJECTS:
+        if name not in _LATER_SCHEMA_OBJECTS:
             cur.execute(ddl)
     cur.execute(
         "UPDATE pipeline_schema_versions SET version = %s WHERE component = %s",

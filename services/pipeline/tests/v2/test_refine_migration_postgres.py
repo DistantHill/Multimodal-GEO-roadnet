@@ -27,6 +27,11 @@ def legacy_connection(request):
             # own objects. Only PostGIS types/functions are explicitly public.
             conn.execute(sql.SQL("SET LOCAL search_path TO {}, pg_catalog").format(sql.Identifier(schema)))
             for _name, ddl in (*DDL_STATEMENTS, *POST_DDL_STATEMENTS, *INDEX_STATEMENTS):
+                if _name in (
+                    "validate_refine_artifact_completion_function",
+                    "refine_artifact_completion_trigger",
+                ):
+                    continue
                 if not request.param and _name in (
                     "guard_refine_artifact_mutation_function",
                     "refine_artifact_mutation_triggers",

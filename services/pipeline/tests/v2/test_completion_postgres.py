@@ -42,6 +42,17 @@ def seed_detect(conn, *, tracks=1, offset=0, long_subtrack=False):
     if long_subtrack:
         conn.execute("""UPDATE kept_trajectory_points SET vehicle_id='one', subtrack_index=1,
             sequence_in_subtrack=id-%s-1 WHERE refine_id=%s""", (offset, refine))
+    artifact = uuid4()
+    conn.execute("""
+        INSERT INTO pipeline_artifacts(
+            id, stage, refine_id, relative_path, manifest_version, manifest,
+            manifest_sha256, source_fingerprint, row_count, byte_count)
+        VALUES (%s, 'refine', %s, %s, 1, '{}', %s, '{}', 0, 0)
+    """, (artifact, refine, f"refine/{refine}", "a" * 64))
+    conn.execute(
+        "INSERT INTO pipeline_artifact_events(artifact_id, state) VALUES (%s, 'present')",
+        (artifact,),
+    )
     conn.execute("UPDATE refine_runs SET status='completed', finished_at=now() WHERE id=%s", (refine,))
     conn.execute("INSERT INTO detect_runs(id, refine_id, status) VALUES (%s, %s, 'running')", (detect, refine))
     conn.execute("""

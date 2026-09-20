@@ -11,6 +11,7 @@ import pytest
 
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
 from track.v2.db.artifact_migration import migrate_artifacts_v5
+from track.v2.db.completion_migration import migrate_completion_v6
 from track.v2.db.artifact_registry import (
     ArtifactDescriptor,
     append_deleted,
@@ -32,6 +33,8 @@ _ARTIFACT_OBJECTS = {
     "pipeline_artifact_immutability_triggers",
     "validate_pipeline_artifact_event_function",
     "pipeline_artifact_event_insert_trigger",
+    "validate_refine_artifact_completion_function",
+    "refine_artifact_completion_trigger",
 }
 
 
@@ -389,5 +392,131 @@ def test_event_trigger_serializes_on_artifact_row_lock() -> None:
                 with contender.cursor() as cur:
                     append_deleted(cur, artifact.id, "after lock release")
                 contender.commit()
+        finally:
+            admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+def test_v6_refine_completion_requires_latest_present_artifact(
+    migrated_connection,
+) -> None:
+    import psycopg
+
+    conn = migrated_connection
+    legacy_id, _ = _add_runs(conn)
+    conn.execute(
+        "UPDATE refine_runs SET status='completed', finished_at=now() WHERE id=%s",
+        (legacy_id,),
+    )
+
+    with pytest.raises(RuntimeError, match="rollback probe"):
+        with conn.transaction():
+            with conn.cursor() as cur:
+                migrate_completion_v6(cur)
+            raise RuntimeError("rollback probe")
+    assert conn.execute("SELECT version FROM pipeline_schema_versions").fetchone() == (5,)
+    assert conn.execute(
+        "SELECT to_regprocedure('validate_refine_artifact_completion()')"
+    ).fetchone() == (None,)
+
+    with conn.cursor() as cur:
+        migrate_completion_v6(cur)
+        migrate_completion_v6(cur)
+    assert conn.execute("SELECT version FROM pipeline_schema_versions").fetchone() == (6,)
+    assert conn.execute(
+        "SELECT status FROM refine_runs WHERE id=%s", (legacy_id,),
+    ).fetchone() == ("completed",)
+
+    def finish(refine_id: UUID, status: str = "completed") -> None:
+        conn.execute(
+            "UPDATE refine_runs SET status=%s, finished_at=now() WHERE id=%s",
+            (status, refine_id),
+        )
+        conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
+
+    missing_id, _ = _add_runs(conn)
+    with pytest.raises(psycopg.Error, match="requires exactly one present"):
+        with conn.transaction():
+            finish(missing_id)
+
+    metadata_id, _ = _add_runs(conn)
+    metadata = _descriptor("refine", metadata_id)
+    conn.execute(
+        "INSERT INTO pipeline_artifacts "
+        "(id, stage, refine_id, relative_path, manifest_version, manifest, "
+        "manifest_sha256, source_fingerprint, row_count, byte_count) VALUES "
+        "(%s, 'refine', %s, %s, 1, %s::jsonb, %s, %s::jsonb, %s, %s)",
+        (metadata.id, metadata_id, metadata.relative_path, metadata.manifest_json,
+         metadata.manifest_sha256, metadata.source_fingerprint_json,
+         metadata.row_count, metadata.byte_count),
+    )
+    with pytest.raises(psycopg.Error, match="requires exactly one present"):
+        with conn.transaction():
+            finish(metadata_id)
+
+    present_id, _ = _add_runs(conn)
+    with conn.transaction():
+        with conn.cursor() as cur:
+            insert_present(cur, _descriptor("refine", present_id))
+        finish(present_id)
+    assert conn.execute(
+        "SELECT status FROM refine_runs WHERE id=%s", (present_id,),
+    ).fetchone() == ("completed",)
+
+    deleted_id, _ = _add_runs(conn)
+    deleted = _descriptor("refine", deleted_id)
+    with conn.cursor() as cur:
+        insert_present(cur, deleted)
+        append_deleted(cur, deleted.id, "fixture deletion")
+    with pytest.raises(psycopg.Error, match="requires exactly one present"):
+        with conn.transaction():
+            finish(deleted_id)
+
+    failed_id, _ = _add_runs(conn)
+    finish(failed_id, "failed")
+    assert conn.execute(
+        "SELECT status FROM refine_runs WHERE id=%s", (failed_id,),
+    ).fetchone() == ("failed",)
+
+
+def test_refine_completion_cannot_observe_uncommitted_artifact() -> None:
+    import psycopg
+    from psycopg import sql
+
+    schema = "completion_race_" + uuid4().hex
+    dsn = os.environ["ROADNET_TEST_DSN"]
+    with psycopg.connect(dsn, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+        try:
+            with admin.transaction():
+                admin.execute(sql.SQL("SET LOCAL search_path TO {}, pg_catalog").format(
+                    sql.Identifier(schema)
+                ))
+                for _name, ddl in (*DDL_STATEMENTS, *POST_DDL_STATEMENTS, *INDEX_STATEMENTS):
+                    admin.execute(_postgres_ddl(ddl))
+                admin.execute(
+                    "INSERT INTO pipeline_schema_versions(component, version) "
+                    "VALUES ('track.v2', 6)"
+                )
+                refine_id = uuid4()
+                admin.execute(
+                    "INSERT INTO refine_runs(id, source_table, status) "
+                    "VALUES (%s, 'source.points', 'running')", (refine_id,),
+                )
+
+            with psycopg.connect(dsn) as publisher, psycopg.connect(dsn) as completer:
+                for conn in (publisher, completer):
+                    conn.execute(sql.SQL("SET search_path TO {}, pg_catalog").format(
+                        sql.Identifier(schema)
+                    ))
+                with publisher.cursor() as cur:
+                    insert_present(cur, _descriptor("refine", refine_id))
+                with pytest.raises(psycopg.Error, match="requires exactly one present"):
+                    completer.execute(
+                        "UPDATE refine_runs SET status='completed', finished_at=now() "
+                        "WHERE id=%s", (refine_id,),
+                    )
+                    completer.execute("SET CONSTRAINTS ALL IMMEDIATE")
+                publisher.rollback()
+                completer.rollback()
         finally:
             admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
