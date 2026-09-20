@@ -208,6 +208,23 @@ def test_topology_track_rebuild_preserves_kept_injected_order(tmp_path) -> None:
             for point in selected[0].points] == [("kept", 0), ("injected", 1), ("kept", 2)]
 
 
+def test_topology_selection_order_matches_legacy_text_track_key(tmp_path) -> None:
+    tracks = [
+        ("aa", 3, [(0, -1, 0, 0), (1, 1, 0, 0)]),
+        ("a", 2, [(2, -1, 0, 0), (3, 1, 0, 0)]),
+        ("a", 10, [(4, -1, 0, 0), (5, 1, 0, 0)]),
+    ]
+    descriptor = _published_tracks(tmp_path, tracks)
+    expected = sorted(f"{vehicle}\0{subtrack}" for vehicle, subtrack, _ in tracks)
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        actual = [selection.track_key for selection in reader.iter_topology_tracks(
+            "source", [SpatialWindow(0, 0, 0, 0)], batch_size=1,
+        )]
+    assert actual == expected
+
+
 @pytest.mark.parametrize(("points", "matches"), [
     ([(-1, 0), (0, 0)], True), ([(1, 1), (2, 1)], True),
     ([(0.5, -1), (0.5, 0)], True), ([(0.5, 1), (0.5, 2)], True),

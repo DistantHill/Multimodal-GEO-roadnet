@@ -263,7 +263,8 @@ class RefineDatasetReader:
                      p.generated_reason, p.after_sequence_in_subtrack, 1 AS vehicles,
                      s.window_order
               FROM selected s JOIN refine_points p USING (vehicle_id, subtrack_index)
-              ORDER BY s.window_order, p.vehicle_id, p.subtrack_index,
+              ORDER BY s.window_order, p.vehicle_id,
+                       CAST(p.subtrack_index AS VARCHAR),
                        p.refined_sequence_in_subtrack, p.point_kind, p.point_id
             """)
             current: tuple[int, str, int] | None = None
