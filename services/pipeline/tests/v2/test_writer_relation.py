@@ -355,3 +355,140 @@ def test_offline_limits_and_columnar_primitives(tmp_path):
     assert 'database=":memory:"' in source and "fetchmany" in source and "order by" in source
     for forbidden in ("fetchall", "pickle", "heapq", "tempfile"):
         assert forbidden not in source
+
+
+def _prepared_final_relation(tmp_path, *, batch_size=1, cross_refs=None):
+    refs = [RefinedPointRef("kept", index, 0, 0) for index in range(1, 7)]
+    relation = _relation(tmp_path, batch_size=batch_size)
+    crosses = cross_refs or [(refs[1], refs[0]), (refs[2], refs[3]), (refs[5], refs[4])]
+    relation.collect_sources(
+        NS(turn_events=[_turn(8, refs[0]), _turn(9, refs[1]), _turn(10, refs[2])],
+           cross_track_candidates=[_cross(index + 20, *pair)
+                                   for index, pair in enumerate(crosses)]),
+        [(NS(cluster_calculate_index=7), _crossing(refs[3])),
+         (NS(cluster_calculate_index=8),
+          NS(segment_start=refs[4], is_entry=False, crossing_x=3.0,
+             crossing_y=4.0, crossing_lon=114.0, crossing_lat=24.0))],
+        [900, 901], {7: 70, 8: 80},
+    )
+    for index, ref in enumerate(refs, 101):
+        relation.add_mapping(ref, index)
+    relation.resolve_sources()
+    relation.prepare_annotations([
+        NS(cluster_calculate_index=7, events=[
+            _member("turn", 8), _member("orthogonal_cross_track", 0, 20),
+        ]),
+        NS(cluster_calculate_index=8, events=[
+            _member("turn", 10), _member("orthogonal_cross_track", 0, 22),
+        ]),
+    ], {7: 70, 8: 80}, [NS(event_calculate_index=8, g_star_z=4.5)])
+    return relation
+
+
+def test_final_rows_exact_copy_shape_and_original_order_across_batches(tmp_path):
+    with _prepared_final_relation(tmp_path) as relation:
+        assert list(relation.iter_rows(0, "detect")) == [
+            ("detect", 70, 101, 18.0, 20.0, -10.0, 0.5, 4.5),
+            ("detect", None, 102, 19.0, 20.0, -10.0, 0.5, None),
+            ("detect", 80, 103, 20.0, 20.0, -10.0, 0.5, None),
+        ]
+        expected_cross = [
+            ("detect", 70, 101, 102, 20.1, 2.0, 113.0, 23.0),
+            ("detect", None, 103, 104, 21.1, 2.0, 113.0, 23.0),
+            ("detect", 80, 105, 106, 22.1, 2.0, 113.0, 23.0),
+        ]
+        with pytest.raises(RuntimeError, match="not validated"):
+            next(relation.iter_rows(1, "detect"))
+        assert list(relation.iter_rows(2, "detect")) == [
+            (900, "detect", 70, 104, 1, 1.0, 2.0, 113.0, 23.0),
+            (901, "detect", 80, 105, 0, 3.0, 4.0, 114.0, 24.0),
+        ]
+        relation.validate_cross_pairs("detect")
+        assert list(relation.iter_validated_cross_rows()) == expected_cross
+        assert list(relation.iter_rows(1, "detect")) == expected_cross
+        relation.validate_cross_pairs("detect")
+
+
+@pytest.mark.parametrize("pairs", [
+    ((0, 1), (1, 0), (2, 3)),
+    ((0, 1), (0, 1), (2, 3)),
+    ((0, 0), (1, 2), (3, 4)),
+])
+def test_cross_pair_validation_is_atomic_for_duplicates_and_degenerate(tmp_path, pairs):
+    refs = [RefinedPointRef("kept", index, 0, 0) for index in range(1, 7)]
+    relation = _prepared_final_relation(
+        tmp_path, cross_refs=[(refs[first], refs[second]) for first, second in pairs],
+    )
+    try:
+        with pytest.raises(ValueError, match="duplicate/degenerate track cross segment pair"):
+            relation.validate_cross_pairs("detect")
+        assert relation._connection.execute(
+            "SELECT count(*) FROM validated_cross"
+        ).fetchone() == (0,)
+        with pytest.raises(RuntimeError, match="not validated"):
+            next(relation.iter_validated_cross_rows())
+        with pytest.raises(RuntimeError, match="not validated"):
+            next(relation.iter_rows(1, "detect"))
+    finally:
+        relation.close()
+
+
+@pytest.mark.parametrize("mutation,error", [
+    ("DELETE FROM resolved_sources WHERE consumer=0 AND ordinal=0", "source"),
+    ("INSERT INTO resolved_sources VALUES (0,99,0,1)", "source"),
+    ("INSERT INTO resolved_sources VALUES (0,0,0,1)", "source"),
+    ("DELETE FROM annotations WHERE kind='turn' AND ordinal=0", "annotation"),
+    ("INSERT INTO annotations VALUES (999,'turn',99,NULL,NULL)", "annotation"),
+    ("DELETE FROM turn_raw WHERE ordinal=0", "raw"),
+])
+def test_final_rows_fail_closed_for_tampered_relations(tmp_path, mutation, error):
+    with _prepared_final_relation(tmp_path) as relation:
+        relation._connection.execute(mutation)
+        rows = relation.iter_rows(0, "detect")
+        with pytest.raises(RuntimeError, match=error):
+            next(rows)
+
+
+def test_cross_validation_association_failure_never_exposes_prefix(tmp_path):
+    with _prepared_final_relation(tmp_path) as relation:
+        relation._connection.execute(
+            "DELETE FROM annotations WHERE kind='cross' AND ordinal=2"
+        )
+        with pytest.raises(RuntimeError, match="annotation"):
+            relation.validate_cross_pairs("detect")
+        assert relation._connection.execute(
+            "SELECT count(*) FROM validated_cross"
+        ).fetchone() == (0,)
+        with pytest.raises(RuntimeError, match="not validated"):
+            next(relation.iter_validated_cross_rows())
+
+
+def test_final_row_states_identity_empty_and_close(tmp_path):
+    relation = _relation(tmp_path)
+    with pytest.raises(RuntimeError, match="not resolved"):
+        next(relation.iter_rows(2, "detect"))
+    relation.resolve_sources()
+    assert list(relation.iter_rows(2, "detect")) == []
+    with pytest.raises(RuntimeError, match="not prepared"):
+        next(relation.iter_rows(0, "detect"))
+    relation.prepare_annotations([], {}, [])
+    for consumer in (0, 2):
+        assert list(relation.iter_rows(consumer, "detect")) == []
+    with pytest.raises(RuntimeError, match="not validated"):
+        next(relation.iter_rows(1, "detect"))
+    relation.validate_cross_pairs("detect")
+    assert list(relation.iter_validated_cross_rows()) == []
+    assert list(relation.iter_rows(1, "detect")) == []
+    with pytest.raises(ValueError, match="unknown"):
+        next(relation.iter_rows(3, "detect"))
+    with pytest.raises(ValueError, match="does not match"):
+        next(relation.iter_rows(0, "other"))
+    with pytest.raises(ValueError, match="does not match"):
+        relation.validate_cross_pairs("other")
+    relation.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        next(relation.iter_rows(0, "detect"))
+    with pytest.raises(RuntimeError, match="closed"):
+        relation.validate_cross_pairs("detect")
+    with pytest.raises(RuntimeError, match="closed"):
+        next(relation.iter_validated_cross_rows())

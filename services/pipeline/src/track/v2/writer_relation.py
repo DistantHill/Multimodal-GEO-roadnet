@@ -45,8 +45,10 @@ class WriterRelation:
         self._temp_directory.mkdir(exist_ok=False)
         self._connection: duckdb.DuckDBPyConnection | None = None
         self._batch_size = batch_size
+        self._detect_id = detect_id
         self._resolved = False
         self._annotations_prepared = False
+        self._cross_validated = False
         self._request_order = 0
         self._mapping_order = 0
         self.counts = [0, 0, 0]
@@ -113,6 +115,12 @@ class WriterRelation:
             CREATE TABLE annotations (
                 request_order BIGINT PRIMARY KEY, kind VARCHAR NOT NULL,
                 ordinal BIGINT NOT NULL, candidate_id BIGINT, z DOUBLE
+            );
+            CREATE TABLE validated_cross (
+                ordinal BIGINT PRIMARY KEY, detect_id VARCHAR NOT NULL,
+                candidate_id BIGINT, low_resolved_id BIGINT NOT NULL,
+                high_resolved_id BIGINT NOT NULL, x DOUBLE, y DOUBLE,
+                lon DOUBLE, lat DOUBLE
             )
         """)
 
@@ -316,6 +324,148 @@ class WriterRelation:
             SELECT ordinal,candidate_id,z FROM annotations
             WHERE kind=? ORDER BY request_order
         """, (kind,))
+
+    def iter_rows(self, consumer: int, detect_id: str) -> Iterator[tuple]:
+        """Yield final PostgreSQL COPY rows after checking every association."""
+        if consumer not in range(len(self._CONSUMERS)):
+            raise ValueError("unknown source consumer")
+        connection = self._require_open()
+        self._require_detect_id(detect_id)
+        if not self._resolved:
+            raise RuntimeError("writer relation is not resolved")
+        if consumer < 2 and not self._annotations_prepared:
+            raise RuntimeError("writer annotations are not prepared")
+        if consumer == 1 and not self._cross_validated:
+            raise RuntimeError("track cross pairs are not validated")
+        self._validate_final_inputs(connection, consumer)
+        if consumer == 0:
+            query = """
+                SELECT ?,a.candidate_id,s.resolved_id,r.entry_bearing,r.exit_bearing,
+                       r.turn_deg,r.score,a.z
+                FROM turn_raw r
+                JOIN resolved_sources s
+                  ON s.consumer=0 AND s.ordinal=r.ordinal AND s.endpoint=0
+                JOIN annotations a ON a.kind='turn' AND a.ordinal=r.ordinal
+                ORDER BY r.ordinal
+            """
+        elif consumer == 1:
+            query = """
+                SELECT detect_id,candidate_id,low_resolved_id,high_resolved_id,
+                       x,y,lon,lat FROM validated_cross ORDER BY ordinal
+            """
+        else:
+            query = """
+                SELECT r.crossing_id,?,r.candidate_id,s.resolved_id,r.is_entry,
+                       r.x,r.y,r.lon,r.lat
+                FROM crossing_raw r
+                JOIN resolved_sources s
+                  ON s.consumer=2 AND s.ordinal=r.ordinal AND s.endpoint=0
+                ORDER BY r.ordinal
+            """
+        yield from self._iterate(connection, query, () if consumer == 1 else (detect_id,))
+
+    def _validate_final_inputs(self, connection, consumer: int) -> None:
+        kind = self._CONSUMERS[consumer]
+        expected_endpoints = 2 if consumer == 1 else 1
+        raw_count = connection.execute(
+            f"SELECT count(*) FROM {kind}_raw"
+        ).fetchone()[0]
+        if raw_count != self.counts[consumer]:
+            raise RuntimeError("raw writer row count mismatch")
+        source_error = connection.execute(f"""
+            SELECT 1 FROM (
+                SELECT ordinal,endpoint FROM resolved_sources WHERE consumer=?
+                EXCEPT
+                SELECT r.ordinal,e.endpoint FROM {kind}_raw r
+                CROSS JOIN range(?) e(endpoint)
+            ) UNION ALL SELECT 1 FROM (
+                SELECT r.ordinal,e.endpoint FROM {kind}_raw r
+                CROSS JOIN range(?) e(endpoint)
+                EXCEPT
+                SELECT ordinal,endpoint FROM resolved_sources WHERE consumer=?
+            ) UNION ALL SELECT 1 FROM (
+                SELECT ordinal,endpoint FROM resolved_sources WHERE consumer=?
+                GROUP BY ordinal,endpoint HAVING count(*) != 1
+            ) LIMIT 1
+        """, (consumer, expected_endpoints, expected_endpoints, consumer, consumer)).fetchone()
+        if source_error is not None:
+            raise RuntimeError("source association mismatch")
+        if consumer < 2:
+            annotation_error = connection.execute(f"""
+                SELECT 1 FROM (
+                    SELECT ordinal FROM annotations WHERE kind=?
+                    EXCEPT SELECT ordinal FROM {kind}_raw
+                ) UNION ALL SELECT 1 FROM (
+                    SELECT ordinal FROM {kind}_raw
+                    EXCEPT SELECT ordinal FROM annotations WHERE kind=?
+                ) UNION ALL SELECT 1 FROM (
+                    SELECT ordinal FROM annotations WHERE kind=?
+                    GROUP BY ordinal HAVING count(*) != 1
+                ) LIMIT 1
+            """, (kind, kind, kind)).fetchone()
+            if annotation_error is not None:
+                raise RuntimeError("annotation association mismatch")
+
+    def validate_cross_pairs(self, detect_id: str) -> None:
+        connection = self._require_open()
+        self._require_detect_id(detect_id)
+        if self._cross_validated:
+            return
+        if not self._resolved:
+            raise RuntimeError("writer relation is not resolved")
+        if not self._annotations_prepared:
+            raise RuntimeError("writer annotations are not prepared")
+        connection.execute("DELETE FROM validated_cross")
+        self._validate_final_inputs(connection, 1)
+        invalid = connection.execute("""
+            WITH pairs AS (
+                SELECT least(s0.resolved_id,s1.resolved_id) low_id,
+                       greatest(s0.resolved_id,s1.resolved_id) high_id
+                FROM cross_raw r
+                JOIN resolved_sources s0
+                  ON s0.consumer=1 AND s0.ordinal=r.ordinal AND s0.endpoint=0
+                JOIN resolved_sources s1
+                  ON s1.consumer=1 AND s1.ordinal=r.ordinal AND s1.endpoint=1
+            )
+            SELECT 1 FROM pairs GROUP BY low_id,high_id
+            HAVING low_id=high_id OR count(*)>1 LIMIT 1
+        """).fetchone()
+        if invalid is not None:
+            raise ValueError("duplicate/degenerate track cross segment pair")
+        connection.execute("BEGIN TRANSACTION")
+        try:
+            connection.execute("""
+                INSERT INTO validated_cross
+                SELECT r.ordinal,?,a.candidate_id,
+                       least(s0.resolved_id,s1.resolved_id),
+                       greatest(s0.resolved_id,s1.resolved_id),r.x,r.y,r.lon,r.lat
+                FROM cross_raw r
+                JOIN resolved_sources s0
+                  ON s0.consumer=1 AND s0.ordinal=r.ordinal AND s0.endpoint=0
+                JOIN resolved_sources s1
+                  ON s1.consumer=1 AND s1.ordinal=r.ordinal AND s1.endpoint=1
+                JOIN annotations a ON a.kind='cross' AND a.ordinal=r.ordinal
+                ORDER BY r.ordinal
+            """, (detect_id,))
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            connection.execute("DELETE FROM validated_cross")
+            raise
+        self._cross_validated = True
+
+    def iter_validated_cross_rows(self) -> Iterator[tuple]:
+        connection = self._require_open()
+        if not self._cross_validated:
+            raise RuntimeError("track cross pairs are not validated")
+        yield from self._iterate(connection, """
+            SELECT detect_id,candidate_id,low_resolved_id,high_resolved_id,x,y,lon,lat
+            FROM validated_cross ORDER BY ordinal
+        """, ())
+
+    def _require_detect_id(self, detect_id: str) -> None:
+        if detect_id != self._detect_id:
+            raise ValueError("detect_id does not match writer relation")
 
     def _iterate(self, connection, query: str, params: tuple) -> Iterator[tuple]:
         cursor = connection.cursor()
