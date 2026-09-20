@@ -1,5 +1,10 @@
 # 流式并行分步实施任务卡
 
+> **历史实施记录：已被取代。** 本文保留旧流式并行方案的实施证据，不再作为当前
+> 架构或运维依据。当前设计见
+> [Pipeline 列式存储与计算架构 Spec](pipeline-columnar-architecture-spec.md)，实施状态见
+> [Pipeline 列式架构分阶段实施任务卡](pipeline-columnar-implementation.md)。
+
 依据：[已确认规格说明（specification，Spec）](pipeline-20m-memory-budget-spec.md)第 9 节。
 术语遵循[项目术语与写作规范](terminology.md)，本文件只记录执行，不另建同主题设计。
 

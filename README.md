@@ -4,13 +4,13 @@
 
 当前仓库采用单 Repository、多 Docker Service 的结构。轨迹重建 Pipeline 最初从宿主机源码仓库的 `codex/pipe-06a-integration@75fa562` 迁入 `services/pipeline/src/track/v2/`；初始迁入保留了包名、阶段顺序和 lineage 意图。当前实现已在此基线上重构 Detect、Clip、持久化和 Run 生命周期，不承诺与来源版本逐行输出、顺序或失败重放完全等价。
 
-源码 provenance 与初始迁入边界见 [`services/pipeline/SOURCE.md`](services/pipeline/SOURCE.md)，当前执行架构和取舍见 [`docs/performance-optimization-review.md`](docs/performance-optimization-review.md)，2026-09-01 的完整 100 万行基准、逐项优化收益和内存口径见 [`docs/pipeline-1m-performance-benchmark-spec.md`](docs/pipeline-1m-performance-benchmark-spec.md)。2,000 万行输入的规模推演、全量物化审计、3 GB 内存合同和外存化改造门槛见 [`docs/pipeline-20m-memory-budget-spec.md`](docs/pipeline-20m-memory-budget-spec.md)；当前实现尚未通过该合同。
+源码 provenance 与初始迁入边界见 [`services/pipeline/SOURCE.md`](services/pipeline/SOURCE.md)。当前执行依据是 [Pipeline 列式存储与计算架构 Spec](docs/pipeline-columnar-architecture-spec.md)，部署和故障处置见 [Pipeline 列式架构运维指南](docs/pipeline-columnar-operations.md)。2026-09-01 的完整 100 万行历史基准、逐项优化收益和内存口径见 [`docs/pipeline-1m-performance-benchmark-spec.md`](docs/pipeline-1m-performance-benchmark-spec.md)。精确 26M、默认 2 GB 和一小时目标尚未完成最终验收。
 
 ## 目录职责
 
 - `apps/frontend`：独立前端开发容器；仅负责 UI 和 Backend API 调用。
 - `apps/backend`：独立 FastAPI API 容器；提供健康检查，以及只读、限量的地图图层、Replay 和 Clip GeoJSON API。
-- `services/pipeline`：Pipeline 独立运行单元，包含 Refine、Detect、Clip、Fitting、Network、持久化、回放和数据库初始化逻辑。Detect 的 DB 模式只构建一次 Refine 轨迹 workspace，并由转向/正交检测、跨车求交和拓扑验证共享；Backend request process 不执行这些耗时阶段。
+- `services/pipeline`：Pipeline 独立运行单元，包含 Refine、Detect、Clip、Fitting、Network、列式制品、持久化、回放和数据库初始化逻辑。PostgreSQL 保存权威状态，Refine/Detect 发布不可变 Parquet，DuckDB 承担主要列式计算；Backend request process 不执行这些耗时阶段。
 - `services/vision`：可选 YOLOv8 CUDA 11.7 离线推理/跟踪运行单元，通过 Compose `vision` profile 启用。
 - `db/postgres`、`db/qdrant`：数据库定义、初始化和迁移逻辑，不保存运行时数据。
 - `infra/docker`：开发和生产应用 Compose 文件；PostgreSQL 与 Qdrant 的独立 Compose 位于宿主机 `/data/services`。
@@ -78,6 +78,8 @@ QGIS 3.44 LTR 插件源码位于 `apps/qgis-plugin/roadnet_tools/`。开发机�
 | --- | --- | --- |
 | `DATA_ROOT` | 开发环境 `/data/tmp/road-network`；生产环境必填 | `/data` |
 | `PARQUET_ROOT` | `${DATA_ROOT}/parquet` | `/data/parquet` |
+| DuckDB 临时目录（从 `DATA_ROOT` 派生） | `${DATA_ROOT}/duckdb` | `/data/duckdb` |
+| Polars 临时目录（从 `DATA_ROOT` 派生） | `${DATA_ROOT}/polars` | `/data/polars` |
 | `PIPELINE_LOG_DIR` | `${DATA_ROOT}/logs` | `/data/logs` |
 
 Pipeline 日志文件名为 `<timestamp>_pid-<pid>_log.txt`，每个进程使用独立文件；`PIPELINE_LOG_DIR` 可指向 `DATA_ROOT` 之外的宿主机目录。Compose 不再读取 `PIPELINE_LOG_PATH`。旧配置中若将 `PIPELINE_LOG_DIR` 写成容器路径 `/data/logs`，需删掉该项使用默认值，或改成所需宿主机目录。挂载变更对新建容器生效；常驻服务需重新创建容器，已有日志不会自动搬移。
@@ -98,7 +100,9 @@ Pipeline 的数据库配置优先读取进程中的来源兼容变量 `TRACK_PG_
 
 ## Pipeline 运行
 
-空库直接执行 `init-db`。已有 v3 数据库使用 `--migrate-refine` 保留数据升级。
+空库直接执行 `init-db`。已有 v3 数据库使用 `--migrate-refine` 保留数据并依次完成 Refine
+改名、制品登记与完成态约束升级；v4、v5 或 v6 使用 `--migrate-artifacts` 依次升级制品
+登记和 Refine/Detect completed Run 的制品约束。
 仅在明确需要丢弃旧业务结果时，停止 Pipeline 写入、核对连接目标后执行全量重建：
 
 ```sh
@@ -106,9 +110,8 @@ docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm pipeline
   python -m pipeline init-db --database roadnet --reset
 ```
 
-初始化器创建 `track.v2` schema version 4。无迁移选项时，它只接受空库或
-已经标记为 v4 的数据库；v3 使用 `init-db --migrate-refine` 保留数据升级，
-检测到未版本化表、v1 或 v2 会失败。Pipeline 与
+初始化器创建 `track.v2` schema version 7。无迁移选项时，它只接受空库或
+已经标记为 v7 的数据库；检测到未版本化表、v1 或 v2 会失败。Pipeline 与
 Backend 启动时同样校验版本。`--reset` 会删除全部 Pipeline 业务数据，因此每次
 执行前都要核对输出的 database、user 与 schema。
 
@@ -137,6 +140,19 @@ CSV 当作运行入口，需要时先用独立 importer 导入 PostgreSQL。`--r
 `resolved_subtrack_points` 序列与所有 Detect 子产物在一个最终事务中落盘；失败
 会回滚子表并单独标记 Run 为 `failed`。只有 completed Detect 可供 Clip/Replay
 消费。同一 Detect/Fit Run 不支持重复落库，重新计算应创建新 Run。
+
+不可变制品的对账默认仅生成 dry-run 计划。只有核对计划、数据库目标和
+`PARQUET_ROOT` 后才可使用 `--apply`；计划包含 critical 项时命令会拒绝执行删除：
+
+```sh
+python -m pipeline artifacts reconcile
+python -m pipeline artifacts reconcile --apply
+```
+
+完整的 7 天宽限期、失败 Run 整阶段重跑和处置规则见
+[Pipeline 列式架构运维指南](docs/pipeline-columnar-operations.md)。禁止手工修改已发布
+Parquet。曾手工安装旧 patch ledger 的环境仅参考
+[PostgreSQL 迁移说明](db/postgres/migrations/README.md)清理。
 
 `32650` 仅是北京所在 UTM 分区的命令示例，不是项目默认值。新 Refine Run 必须按完整数据范围明确选择米制投影；也可在自定义 `pipeline.toml` 的 `[projection]` 中配置。使用 `--refine-id UUID` 时会继承原 Run 的投影，不能覆盖。选择与迁移规则见 [Run 级投影上下文](docs/run-projection-context.md)。
 
