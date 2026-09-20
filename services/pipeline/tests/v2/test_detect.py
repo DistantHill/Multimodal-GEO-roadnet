@@ -91,6 +91,7 @@ from track.v2.projection import (
     QueryWindowRequest,
     build_query_window,
 )
+from track.v2.refine_parquet import TopologyTrackSelection
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -2328,6 +2329,108 @@ class TopologyExtractionTest(unittest.TestCase):
         self.assertEqual(len(topologies), 1)
         self.assertEqual(len(annotated), 1)
         self.assertEqual(observations, [])
+
+    def test_reader_topology_matches_index_for_duplicate_windows_and_track_order(self):
+        cfg = IntersectConfig(
+            source_table="source", min_intersection_radius_m=50.0,
+            topology_radius_padding_m=0.0, bearing_window=1,
+        )
+        cluster = HotspotCluster(
+            cluster_calculate_index=0, centroid_x=0.0, centroid_y=0.0,
+            centroid_lon=0.0, centroid_lat=0.0, radius_m=1.0,
+            events=(), source="turn",
+        )
+        clusters = [cluster, replace(cluster, cluster_calculate_index=1)]
+        tracks = {
+            key: [
+                _make_xy_refined_point(vehicle, point_id, float(point_id), x, 0.0,
+                                       subtrack_index=subtrack,
+                                       sequence_in_subtrack=sequence)
+                for sequence, (point_id, x) in enumerate(((base, -250.0), (base + 1, 250.0)))
+            ]
+            for key, vehicle, subtrack, base in (
+                ("v\x0010", "v", 10, 10), ("v\x002", "v", 2, 20),
+            )
+        }
+        expected = _build_topologies_from_tracks(
+            clusters, tracks, cfg, _TEST_TRANSFORMER,
+        )
+        reader = MagicMock()
+        reader.iter_topology_tracks.return_value = iter(
+            TopologyTrackSelection((0, 1), key, tracks[key]) for key in sorted(tracks)
+        )
+
+        actual = _build_topologies_from_tracks(
+            clusters, {}, cfg, _TEST_TRANSFORMER, refine_reader=reader,
+        )
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(
+            [[point.crossing_calculate_index for point in item.crossing_points]
+             for item in actual[1]],
+            [[0, 1, 2, 3], [0, 1, 2, 3]],
+        )
+        reader.iter_topology_tracks.assert_called_once_with(
+            "source", _topology_point_windows(clusters, cfg),
+            batch_size=cfg.stream_batch_size,
+        )
+
+    def test_formal_reader_owner_never_constructs_or_populates_workspace(self):
+        reader = MagicMock()
+        reader.extent.return_value = (0.0, 0.0, 1.0, 1.0)
+        reader.iter_turn_candidates.return_value = iter(())
+        reader.iter_topology_tracks.return_value = (_ for _ in ())
+        reader.track_count.return_value = 7
+        cfg = IntersectConfig(
+            source_table="source", use_turn_events=False,
+            use_cross_track_candidates=False,
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "track.v2.detect.DetectWorkspace", side_effect=AssertionError("workspace"),
+        ), patch(
+            "track.v2.detect._stream_vehicle_tracks_from_db",
+            side_effect=AssertionError("PG active query"),
+        ):
+            result = _detect_intersections_db(
+                object(), cfg, _TEST_SPATIAL_CONTEXT,
+                runtime=RuntimeConfig(), data_root=directory, refine_reader=reader,
+            )
+        try:
+            self.assertEqual(result.report.track_count, 7)
+            reader.iter_tracks.assert_not_called()
+        finally:
+            result.close()
+
+    def test_reader_topology_closes_selection_iterator_on_geometry_failure(self):
+        cfg = IntersectConfig(min_intersection_radius_m=50.0)
+        cluster = HotspotCluster(
+            cluster_calculate_index=0, centroid_x=0.0, centroid_y=0.0,
+            centroid_lon=0.0, centroid_lat=0.0, radius_m=1.0,
+            events=(), source="turn",
+        )
+        track = [_make_xy_refined_point(
+            "v", 1, 0.0, -1.0, 0.0, subtrack_index=1,
+            sequence_in_subtrack=0,
+        )]
+        closed = False
+
+        def selections():
+            nonlocal closed
+            try:
+                yield TopologyTrackSelection((0,), "v\x001", track)
+            finally:
+                closed = True
+
+        reader = MagicMock()
+        reader.iter_topology_tracks.return_value = selections()
+        with patch(
+            "track.v2.detect._extract_entry_exit_observations_batch",
+            side_effect=KeyboardInterrupt,
+        ), self.assertRaises(KeyboardInterrupt):
+            _build_topologies_from_tracks(
+                [cluster], {}, cfg, _TEST_TRANSFORMER, refine_reader=reader,
+            )
+        self.assertTrue(closed)
 
     def test_segments_with_outer_endpoints_still_produce_entry_and_exit(self):
         """Each boundary segment remains real when its outer point misses the window."""

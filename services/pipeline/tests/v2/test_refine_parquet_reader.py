@@ -139,6 +139,15 @@ def test_reader_uses_only_manifest_files_and_merges_one_vehicle_subtrack(tmp_pat
         refine_parquet.RefineDatasetReader(tmp_path, descriptor, "present", RuntimeConfig())
 
 
+def test_track_count_validates_source_and_counts_subtrack_identities(tmp_path) -> None:
+    descriptor = _published(tmp_path)
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        assert reader.track_count() == 3
+        assert reader.track_count() == 3
+
+
 def test_reader_adapts_all_tracks_across_batches_and_queries_extent(tmp_path) -> None:
     descriptor = _published(tmp_path)
     with refine_parquet.RefineDatasetReader(

@@ -879,6 +879,7 @@ def _load_tracks_and_turn_candidates(
     workspace: MutableMapping[str, list[TrajectoryPoint]] | None = None,
     event_store: TurnEventRelation | None = None,
     refine_reader: RefineDatasetReader | None = None,
+    populate_workspace: bool = True,
 ) -> tuple[Sequence[TurnEvent], MutableMapping[str, list[TrajectoryPoint]]]:
     """Wire the DB reader, track scheduler and candidate collector together."""
     tracks: MutableMapping[str, list[TrajectoryPoint]] = workspace if workspace is not None else {}
@@ -896,11 +897,12 @@ def _load_tracks_and_turn_candidates(
                     event_store.append(event)
         if event_store is not None:
             event_store.seal()
-        with closing(_iter_prepared_db_tracks(
-            conn, cfg, spatial_context, transformer, tracks, refine_reader,
-        )) as source:
-            for _key, _track in source:
-                pass
+        if populate_workspace:
+            with closing(_iter_prepared_db_tracks(
+                conn, cfg, spatial_context, transformer, tracks, refine_reader,
+            )) as source:
+                for _key, _track in source:
+                    pass
         turn_events = events
     else:
         with closing(_iter_prepared_db_tracks(
@@ -1440,6 +1442,7 @@ def _build_topologies_from_tracks(
     *,
     live_status: Any = None,
     perf: PerfTracker | None = None,
+    refine_reader: RefineDatasetReader | None = None,
 ) -> tuple[list[IntersectionTopology], list[HotspotCluster], list[EntryExitObservation]]:
     """Verify topologies from real adjacent segments and complete subtracks.
 
@@ -1451,6 +1454,11 @@ def _build_topologies_from_tracks(
     log_info(f"── 拓扑验证 / Topology verification ({total_clusters:,} 簇/clusters) ...")
     t0 = time.perf_counter()
     windows = _topology_point_windows(clusters, cfg)
+    if refine_reader is not None:
+        return _build_topologies_from_reader(
+            clusters, windows, refine_reader, cfg, transformer,
+            live_status=live_status, perf=perf, started_at=t0,
+        )
     if isinstance(tracks, DetectWorkspace):
         point_index = None
     elif perf is None:
@@ -1510,6 +1518,84 @@ def _build_topologies_from_tracks(
     return topologies, annotated_clusters, all_observations
 
 
+def _build_topologies_from_reader(
+    clusters: list[HotspotCluster],
+    windows: list[SpatialWindow],
+    reader: RefineDatasetReader,
+    cfg: IntersectConfig,
+    transformer: CoordinateTransformer,
+    *,
+    live_status: Any,
+    perf: PerfTracker | None,
+    started_at: float,
+) -> tuple[list[IntersectionTopology], list[HotspotCluster], list[EntryExitObservation]]:
+    """Route complete reader subtracks without constructing a global track map."""
+    observations_by_cluster: list[list[EntryExitObservation]] = [[] for _ in clusters]
+    crossings_by_cluster: list[list[CrossingPoint]] = [[] for _ in clusters]
+    with closing(reader.iter_topology_tracks(
+        cfg.source_table or cfg.db_table, windows, batch_size=cfg.stream_batch_size,
+    )) as selections:
+        for selection in selections:
+            for cluster_index in selection.window_indices:
+                cluster = clusters[cluster_index]
+                radius = max(
+                    cfg.min_intersection_radius_m,
+                    cluster.radius_m + cfg.topology_radius_padding_m,
+                )
+                observations, crossings = _extract_entry_exit_observations_batch(
+                    {selection.track_key: selection.points}, cluster=cluster,
+                    transformer=transformer, radius_m=radius,
+                    bearing_window=cfg.bearing_window,
+                )
+                target_crossings = crossings_by_cluster[cluster_index]
+                offset = len(target_crossings)
+                target_crossings.extend(
+                    replace(point, crossing_calculate_index=offset + point.crossing_calculate_index)
+                    for point in crossings
+                )
+                observations_by_cluster[cluster_index].extend(replace(
+                    item,
+                    entry_crossing_calculate_index=(
+                        None if item.entry_crossing_calculate_index is None
+                        else offset + item.entry_crossing_calculate_index
+                    ),
+                    exit_crossing_calculate_index=(
+                        None if item.exit_crossing_calculate_index is None
+                        else offset + item.exit_crossing_calculate_index
+                    ),
+                ) for item in observations)
+
+    topologies: list[IntersectionTopology] = []
+    annotated_clusters: list[HotspotCluster] = []
+    all_observations: list[EntryExitObservation] = []
+    total = len(clusters)
+    for cluster_index, original in enumerate(
+        _perf_iter(perf, clusters, name="topo_clusters", total=total)
+    ):
+        _route_progress(
+            live_status,
+            detail=f"簇/Cluster:\t{cluster_index + 1:,}/{total:,}",
+            progress=(cluster_index + 1) / total,
+            elapsed=time.perf_counter() - started_at,
+            stage="Detect: 拓扑验证 / Topology",
+        )
+        cluster = replace(
+            original, crossing_points=tuple(crossings_by_cluster[cluster_index]),
+        )
+        topology, annotated, cluster_observations = _build_topology_for_cluster(
+            cluster, observations_by_cluster[cluster_index], cfg,
+        )
+        topologies.append(topology)
+        annotated_clusters.append(annotated)
+        all_observations.extend(cluster_observations)
+        heartbeat_progress(cluster_index + 1, total=total, unit="候选交叉口")
+    log_info(
+        f"── 拓扑验证: {len(topologies):,} 拓扑/topologies "
+        f"({time.perf_counter() - started_at:.1f}s)"
+    )
+    return topologies, annotated_clusters, all_observations
+
+
 
 def _extract_disk_entry_exit_observations(
     workspace: DetectWorkspace,
@@ -1549,11 +1635,17 @@ def _detect_intersections_db(
     candidate_store = None
     try:
         candidate_store = CrossCandidateRelation(runtime, data_root)
-        with DetectWorkspace(cfg) as workspace:
+        if refine_reader is not None:
             result = _detect_intersections_db_workspace(
-                conn, cfg, spatial_context, workspace, event_store=event_store,
+                conn, cfg, spatial_context, {}, event_store=event_store,
                 candidate_store=candidate_store, refine_reader=refine_reader,
             )
+        else:
+            with DetectWorkspace(cfg) as workspace:
+                result = _detect_intersections_db_workspace(
+                    conn, cfg, spatial_context, workspace, event_store=event_store,
+                    candidate_store=candidate_store,
+                )
         if result.turn_events is not event_store:
             # Empty input and test/reference seams can return in-memory output.
             event_store.close()
@@ -1605,6 +1697,7 @@ def _detect_intersections_db_workspace(
             conn, cfg, spatial_context, transformer,
             live_status=live, perf=tracker, workspace=workspace, event_store=event_store,
             refine_reader=refine_reader,
+            populate_workspace=refine_reader is None,
         )
     if live is not None:
         live.update(
@@ -1652,6 +1745,7 @@ def _detect_intersections_db_workspace(
         topologies, annotated_clusters, observations = _build_topologies_from_tracks(
             annotated_clusters, tracks, cfg, transformer,
             live_status=live, perf=tracker,
+            refine_reader=refine_reader,
         )
     if live is not None:
         live.update(
@@ -1670,7 +1764,8 @@ def _detect_intersections_db_workspace(
         report=_build_intersect_report(
             annotated_clusters, topologies,
             turn_events, hotspot_events, cross_candidates,
-            track_count=len(tracks),
+            track_count=(refine_reader.track_count()
+                         if refine_reader is not None else len(tracks)),
         ),
         spatial_context=spatial_context,
     )

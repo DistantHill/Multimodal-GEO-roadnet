@@ -66,6 +66,7 @@ class RefineDatasetReader:
             raise RefineParquetError("data_root must not be a filesystem root")
         self._temp_directory: Path | None = None
         self._connection: duckdb.DuckDBPyConnection | None = None
+        self._source_validated = False
 
     @property
     def descriptor(self) -> ArtifactDescriptor:
@@ -162,6 +163,19 @@ class RefineDatasetReader:
         if not all(math.isfinite(value) for value in extent):
             raise RefineParquetError("dataset extent contains non-finite coordinates")
         return extent  # type: ignore[return-value]
+
+    def track_count(self) -> int:
+        """Return the exact number of validated vehicle/subtrack identities."""
+        connection = self._require_open()
+        self._validate_source(connection)
+        row = connection.execute("""
+          SELECT count(*) FROM (
+            SELECT DISTINCT vehicle_id, subtrack_index FROM refine_points
+          ) tracks
+        """).fetchone()
+        if row is None:
+            raise RefineParquetError("could not count source tracks")
+        return int(row[0])
 
     def iter_tracks(
         self, source_table: str, *, batch_size: int = 4096,
@@ -466,6 +480,8 @@ class RefineDatasetReader:
         return connection, float(threshold)
 
     def _validate_source(self, connection: duckdb.DuckDBPyConnection) -> None:
+        if getattr(self, "_source_validated", False):
+            return
         invalid = connection.execute("""
           WITH checked AS (
             SELECT *,
@@ -497,6 +513,7 @@ class RefineDatasetReader:
         """, [self._descriptor.refine_id]).fetchone()
         if invalid is None or invalid[0]:
             raise RefineParquetError("source contains corrupt identity or sequence data")
+        self._source_validated = True
 
     @staticmethod
     def _cross_track_segment_relation(select_sql: str) -> str:
