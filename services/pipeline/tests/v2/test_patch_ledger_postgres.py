@@ -370,34 +370,6 @@ def test_lost_commit_acknowledgement_is_resolved_by_durable_lookup(ledger_databa
     recovered.close()
 
 
-def test_corrupt_spool_does_not_commit_provisional_rows(ledger_database, tmp_path):
-    from track.v2.db.patch_ledger import PatchLedger
-    from track.v2.patch_spool import ArtifactIntegrityError, iter_artifact_chunks, write_patch_artifact
-
-    schema, connect = ledger_database
-    ledger = PatchLedger(connect(), schema=schema)
-    _start(ledger)
-    manifest = _manifest()
-    ledger.register(manifest)
-    attempt = ledger.claim(manifest.task_id)
-    artifact = write_patch_artifact(
-        tmp_path, run_id=manifest.run_id, task_id=manifest.task_id,
-        attempt_id=attempt.token, chunks=[b"1"], attempt_byte_limit=1,
-    )
-    bad_descriptor = replace(artifact, sha256="0" * 64)
-
-    def write(cur):
-        for chunk in iter_artifact_chunks(tmp_path, bad_descriptor, chunk_size=1):
-            _write_result(schema, manifest.task_id, int(chunk))(cur)
-        pytest.fail("corrupt descriptor must fail before commit")
-
-    with pytest.raises(ArtifactIntegrityError):
-        ledger.commit_result(attempt, write)
-    assert _results(connect(), schema) == []
-    assert ledger.lookup(manifest.task_id).status == "working"
-    ledger.close()
-
-
 def test_resume_discovers_fixed_pending_manifests_without_replanning(ledger_database):
     from track.v2.db.patch_ledger import PatchLedger
 

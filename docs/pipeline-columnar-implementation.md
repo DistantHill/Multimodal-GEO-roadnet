@@ -535,6 +535,11 @@ C11d 以两笔提交删除自行编写的进程池：先退休专用池测试以
 `db/patch_ledger.py` 及其完整性和账本测试暂留后续任务卡；本步不改 heartbeat、
 DuckDB/Polars 引擎线程或外存设置、业务 PostgreSQL、API 或前端字段，C11 尚未完成。
 
+C11e 删除已无生产调用者的自行编写 patch 磁盘暂存模块、专用测试，以及 ledger 测试中
+仅验证 spool 损坏回滚的组合用例。DuckDB/Polars 管理的临时目录与外存溢写、普通测试
+临时目录、`db/patch_ledger.py`、patches 模型及其余账本测试继续保留；本步不改 heartbeat、
+引擎资源配置、业务 PostgreSQL、API 或前端字段，C11 尚未完成。
+
 验证：全仓无生产引用、初始化器不引用旧结构、Pipeline 单进程路径完整。
 
 C11a 验证：Pipeline 与 scripts 全量测试 `1447 passed, 68 skipped`；生产代码和测试中的
@@ -552,7 +557,13 @@ scripts 全量测试 `1256 passed, 67 skipped`；生产代码和测试中的 `pa
 `ProcessPoolExecutor`、`run_bounded_patches`、`PatchTask`、`DispatchPause`、
 `PatchExecutionError`、`PoolShutdownUnconfirmed`、`RemotePatchFailure` 引用清零。
 
+C11e 验证：Pipeline 与 scripts 全量测试 `1168 passed, 66 skipped`；生产代码和测试中的 `patch_spool`、
+`SpoolArtifact`、`write_patch_artifact`、`iter_artifact_chunks`、`ArtifactIntegrityError`、
+`SpoolLimitError` 引用清零。
+
 提交：C11d 测试退休 `1a4264a`；C11d 实现删除为本提交。
+
+提交：C11e 为本提交。
 
 ### C12 — 集成与文档
 
