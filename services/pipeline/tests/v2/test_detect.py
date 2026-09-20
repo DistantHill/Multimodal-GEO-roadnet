@@ -9,7 +9,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -1074,14 +1074,17 @@ class ProjectionContextContractTest(unittest.TestCase):
             refine_id="refine-1", source_table="raw_points", status="completed",
             spatial_context=_TEST_SPATIAL_CONTEXT, source_fingerprint={"version": 1},
         )
+        reader = SimpleNamespace(descriptor=SimpleNamespace(
+            refine_id="refine-1", source_fingerprint_json='{"version":1}',
+        ))
         with (
             patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
-            patch("track.v2.detect.verify_refine_source_fingerprint"),
             self.assertRaisesRegex(V2Error, "runtime and data_root"),
         ):
             detect_intersections(
                 conn=object(),
                 config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
+                refine_reader=reader,
             )
 
     def test_formal_db_detect_requires_columnar_reader(self):
@@ -1091,7 +1094,7 @@ class ProjectionContextContractTest(unittest.TestCase):
         )
         with (
             patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
-            patch("track.v2.detect.verify_refine_source_fingerprint") as fingerprint,
+            patch("track.v2.db.source_table.verify_refine_source_fingerprint") as fingerprint,
             self.assertRaisesRegex(V2Error, "RefineDatasetReader"),
         ):
             detect_intersections(
@@ -1099,8 +1102,7 @@ class ProjectionContextContractTest(unittest.TestCase):
                 config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
                 runtime=RuntimeConfig(), data_root=Path(tempfile.mkdtemp()),
             )
-
-        fingerprint.assert_called_once_with(ANY, "refine-1")
+        fingerprint.assert_not_called()
 
     def test_formal_parquet_detect_rejects_fingerprint_mismatch_without_pg_scan(self):
         refine = SimpleNamespace(
@@ -1115,7 +1117,6 @@ class ProjectionContextContractTest(unittest.TestCase):
         ))
         with (
             patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
-            patch("track.v2.detect.verify_refine_source_fingerprint") as fingerprint,
             patch("track.v2.detect._detect_intersections_db") as compute,
             self.assertRaisesRegex(V2Error, "fingerprint"),
         ):
@@ -1124,7 +1125,6 @@ class ProjectionContextContractTest(unittest.TestCase):
                 config=IntersectConfig(query_active_from_db=True, refine_id=refine.refine_id),
                 refine_reader=reader,
             )
-        fingerprint.assert_not_called()
         compute.assert_not_called()
 
     def test_formal_parquet_empty_extent_avoids_pg_point_queries(self):

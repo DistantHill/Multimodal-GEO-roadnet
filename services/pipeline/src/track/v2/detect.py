@@ -84,7 +84,6 @@ from .db.queries import (
     _tracks_from_points,
     fetch_refine_run_row,
 )
-from .db.source_table import verify_refine_source_fingerprint
 from .db.artifact_registry import canonical_json
 from .parser import BaseTrajectorySourceHandle as TrajectorySourceHandle
 
@@ -656,9 +655,9 @@ def detect_intersections(
       - **Handle mode**: ``source`` is a ``TrajectorySourceHandle``.
         All points are read into memory and grouped by vehicle_id.
       - **DB mode**: ``conn`` is a psycopg connection and
-        ``config.query_active_from_db`` is True.  Tracks are loaded once and
-        shared by candidate extraction and topology verification; Method 3
-        uses a capacity-guarded global spatial index.
+        ``config.query_active_from_db`` is True.  A ``RefineDatasetReader``
+        supplies columnar turn candidates, cross-track segment pairs and
+        complete subtracks for Topology window verification.
     """
     cfg = config or IntersectConfig()
     if conn is not None and cfg.query_active_from_db:
@@ -684,13 +683,12 @@ def detect_intersections(
             kept_table="kept_trajectory_points",
         )
         if refine_reader is None:
-            verify_refine_source_fingerprint(conn, refine.refine_id)
-        else:
-            descriptor = refine_reader.descriptor
-            if descriptor.refine_id is None or str(descriptor.refine_id) != refine.refine_id:
-                raise V2Error("Refine artifact does not belong to the parent Refine Run")
-            if descriptor.source_fingerprint_json != canonical_json(refine.source_fingerprint):
-                raise V2Error("Refine artifact source fingerprint does not match its Run")
+            raise V2Error("formal DB Detect requires a RefineDatasetReader")
+        descriptor = refine_reader.descriptor
+        if descriptor.refine_id is None or str(descriptor.refine_id) != refine.refine_id:
+            raise V2Error("Refine artifact does not belong to the parent Refine Run")
+        if descriptor.source_fingerprint_json != canonical_json(refine.source_fingerprint):
+            raise V2Error("Refine artifact source fingerprint does not match its Run")
         if runtime is None or data_root is None:
             raise V2Error("formal DB Detect requires runtime and data_root")
         return _detect_intersections_db(
@@ -1454,7 +1452,7 @@ def _run_columnar_db_detect(
 
     tracker = PerfTracker("detect_db")
 
-    # ── Read tracks to disk and extract turn candidates ────────────
+    # ── Stream columnar turn candidates into the bounded relation ─
     if live is not None:
         live.update(stage="Detect: 轨迹读取与转向候选",
                     detail="读取轨迹并提取转向候选...")
@@ -1484,7 +1482,7 @@ def _run_columnar_db_detect(
             elapsed=time.perf_counter() - t_stage,
         )
 
-    # ── Stream globally indexed disk segment pairs ────────────────
+    # ── Stream columnar cross-track segment pairs ─────────────────
     t_stage = time.perf_counter()
     with tracker.stage("cross_track_global"):
         cross_candidates = _extract_cross_track_db(
@@ -1513,10 +1511,10 @@ def _run_columnar_db_detect(
             elapsed=time.perf_counter() - t_stage,
         )
 
-    # ── DB-mode topology: reuse the single-pass tracks workspace ────
+    # ── DB-mode topology: stream complete subtracks for each window ─
     if live is not None:
         live.update(stage="Detect: 拓扑验证 / Topology",
-                    detail="Topology verification (disk workspace)...")
+                    detail="Topology verification (columnar windows)...")
     t_stage = time.perf_counter()
     with tracker.stage("topology_index"):
         topologies, annotated_clusters, observations = _build_topologies_from_tracks(
