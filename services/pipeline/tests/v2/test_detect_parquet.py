@@ -116,15 +116,15 @@ def test_unknown_manifest_version_is_rejected():
         detect_parquet._validate_schema(descriptor)
 
 
-@pytest.mark.parametrize("status", ["running", "failed"])
-def test_metadata_requires_completed_without_transaction_control(status):
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_metadata_requires_running_without_transaction_control(status):
     cursor = Mock()
     cursor.__enter__ = Mock(return_value=cursor)
     cursor.__exit__ = Mock(return_value=None)
     cursor.fetchone.return_value = ("public.source", "public", status)
     conn = Mock()
     conn.cursor.return_value = cursor
-    with pytest.raises(detect_parquet.DetectParquetError, match="completed"):
+    with pytest.raises(detect_parquet.DetectParquetError, match="remain running"):
         detect_parquet._metadata(conn, uuid4())
     conn.commit.assert_not_called()
     conn.rollback.assert_not_called()
@@ -135,3 +135,6 @@ def test_q44_export_is_pure_duckdb_sql_without_python_rows():
     source = Path(detect_parquet.__file__).read_text(encoding="utf-8")
     assert "fetchall(" not in source
     assert "polars" not in source.lower()
+    assert ".commit(" not in source
+    assert ".rollback(" not in source
+    assert "publish(" not in source

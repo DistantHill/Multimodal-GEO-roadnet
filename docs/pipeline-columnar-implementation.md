@@ -304,9 +304,10 @@ batch=1、方向角圆周、包含阈值、单点轨迹和禁止跨子轨迹连�
 
 ### C08a — Detect Parquet staging export 与 v1 Schema
 
-范围：按 Spec 5.2 从已提交的 completed Detect PostgreSQL 权威结果，以只读 DuckDB
-扫描写出 resolved_points/intersections/entry_exit_points 三张显式 v1 逻辑表；只构建
-staging 与描述符，不发布、不登记、不控制事务。
+范围：按 Spec 5.2 从已提交的 Detect PostgreSQL 权威结果行，以只读 DuckDB 扫描写出
+resolved_points/intersections/entry_exit_points 三张显式 v1 逻辑表；Run 在导出、校验和
+后续发布期间仍为 running。本卡只构建 staging 与描述符，不发布、不登记、不完成 Run、
+不控制事务。
 
 验证：Schema、清单、空表、owner/status、数值/枚举/引用、连续顺序、未知版本，以及
 真实 PostgreSQL 与现有 Clip 查询的 intersection 和 resolved p/i/c 序列差分。Q44

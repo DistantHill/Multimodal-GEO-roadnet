@@ -105,21 +105,25 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
         "(detect_id,intersection_id,entry_bearing,exit_bearing,entry_crossing_id,exit_crossing_id) "
         "VALUES (%s,%s,90,90,%s,%s)",
         (detect_id, intersection, crossings[0][0], crossings[1][0]))
-    conn.execute("ALTER TABLE refine_runs DISABLE TRIGGER USER")
-    conn.execute("ALTER TABLE detect_runs DISABLE TRIGGER USER")
-    conn.execute("UPDATE refine_runs SET status='completed' WHERE id=%s", (refine_id,))
-    conn.execute("UPDATE detect_runs SET status='completed' WHERE id=%s", (detect_id,))
-    conn.execute("ALTER TABLE refine_runs ENABLE TRIGGER USER")
-    conn.execute("ALTER TABLE detect_runs ENABLE TRIGGER USER")
     conn.commit()
 
-    expected_intersections = fetch_intersections(conn, str(detect_id))
-    expected_tracks = list(fetch_resolved_clip_tracks(conn, str(detect_id)))
     handle = create_staging(tmp_path.resolve(), "detect", detect_id, uuid4())
     descriptor = export_detect_parquet(
         conn, config, handle, RuntimeConfig(duckdb_threads=1), {"version": 1},
     )
+    assert conn.execute(
+        "SELECT status FROM detect_runs WHERE id=%s", (detect_id,),
+    ).fetchone()[0] == "running"
     assert conn.info.transaction_status.name != "IDLE"
+
+    # The legacy Clip oracle accepts only completed Runs. Complete it after
+    # export solely to compare the already-written immutable staging files.
+    conn.execute("ALTER TABLE detect_runs DISABLE TRIGGER USER")
+    conn.execute("UPDATE detect_runs SET status='completed' WHERE id=%s", (detect_id,))
+    conn.execute("ALTER TABLE detect_runs ENABLE TRIGGER USER")
+    conn.commit()
+    expected_intersections = fetch_intersections(conn, str(detect_id))
+    expected_tracks = list(fetch_resolved_clip_tracks(conn, str(detect_id)))
     with duckdb.connect() as db:
         root = handle.path
         actual_intersections = db.execute(

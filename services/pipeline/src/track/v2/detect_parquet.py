@@ -1,4 +1,4 @@
-"""Export one completed Detect Run from PostgreSQL into staged Parquet v1."""
+"""Export committed results of one still-running Detect Run to staged Parquet v1."""
 
 from __future__ import annotations
 
@@ -74,8 +74,8 @@ def _metadata(conn: Any, detect_id: UUID) -> tuple[str, str]:
         row = cur.fetchone()
     if row is None:
         raise DetectParquetError(f"unknown Detect Run: {detect_id}")
-    if row[2] != "completed":
-        raise DetectParquetError("Detect Run must be completed before staging export")
+    if row[2] != "running":
+        raise DetectParquetError("Detect Run must remain running during staging export")
     if not isinstance(row[1], str):
         raise DetectParquetError("current PostgreSQL schema is unavailable")
     return str(row[0]), _quote(row[1])
@@ -242,7 +242,12 @@ def _validate_schema(descriptor: ArtifactDescriptor) -> None:
 def export_detect_parquet(conn: Any, postgres: PostgresConfig, handle: StagingDataset,
                           runtime: RuntimeConfig,
                           source_fingerprint: dict[str, object]) -> ArtifactDescriptor:
-    """Write and inspect staging only; never publish or control transactions."""
+    """Write and inspect staging only; never publish, finish, or control transactions.
+
+    Detect result rows must already be committed and visible to postgres_scanner,
+    while the Run remains ``running`` until C08b publishes and registers the
+    artifact and completes the Run in its final PostgreSQL transaction.
+    """
     _validate_handle(handle)
     if handle.stage != "detect":
         raise DetectParquetError("staging dataset must belong to the detect stage")
