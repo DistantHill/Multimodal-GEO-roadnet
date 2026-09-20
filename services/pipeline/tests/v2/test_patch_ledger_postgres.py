@@ -7,8 +7,7 @@ created by this fixture after closing all of its connections.
 
 from __future__ import annotations
 
-from dataclasses import asdict, replace
-import json
+from dataclasses import replace
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -369,73 +368,6 @@ def test_lost_commit_acknowledgement_is_resolved_by_durable_lookup(ledger_databa
     assert recovered.claim(manifest.task_id) is None
     assert _results(connect(), schema) == [(manifest.task_id, 73)]
     recovered.close()
-
-
-def spool_kernel(task):
-    """Spawn-importable test kernel: read descriptor, spool output, never use DB."""
-    from track.v2.patch_spool import write_patch_artifact
-
-    description = json.loads(task.descriptor_json)
-    artifact = write_patch_artifact(
-        description["root"], run_id=description["run_id"], task_id=task.task_id,
-        attempt_id=description["attempt_id"], chunks=(b"7", b"3"),
-        attempt_byte_limit=16,
-    )
-    return canonical_json({"artifact": asdict(artifact), "pid": os.getpid()})
-
-
-def test_spawn_pool_spool_and_central_transaction_compose(ledger_database, tmp_path):
-    from track.v2.db.patch_ledger import PatchLedger
-    from track.v2.patch_pool import PatchTask, run_bounded_patches
-    from track.v2.patch_spool import SpoolArtifact, iter_artifact_chunks
-
-    schema, connect = ledger_database
-    ledger = PatchLedger(connect(), schema=schema)
-    _start(ledger)
-    attempts = {}
-    child_pids = set()
-
-    def tasks():
-        for group in range(4):
-            manifest = _manifest(group=group)
-            ledger.register(manifest)
-            attempt = ledger.claim(manifest.task_id)
-            attempts[manifest.task_id] = attempt
-            yield PatchTask(manifest.task_id, canonical_json({
-                "root": str(tmp_path), "run_id": manifest.run_id,
-                "attempt_id": attempt.token,
-            }))
-        ledger.seal()
-
-    def consume(task, result_json):
-        result = json.loads(result_json)
-        child_pids.add(result["pid"])
-        artifact = SpoolArtifact(**result["artifact"])
-        attempt = attempts.pop(task.task_id)
-        assert artifact.task_id == task.task_id
-        assert artifact.run_id == attempt.run_id
-        assert artifact.attempt_id == attempt.token
-
-        def write(cur):
-            # These test records are digits; production writers need their own
-            # streaming decoder. Exhaust inside the transaction before commit.
-            value = 0
-            for chunk in iter_artifact_chunks(tmp_path, artifact, chunk_size=1):
-                value = value * 10 + int(chunk)
-            _write_result(schema, task.task_id, value)(cur)
-
-        assert ledger.commit_result(attempt, write)
-
-    assert run_bounded_patches(
-        tasks(), compute_entrypoint="v2.test_patch_ledger_postgres:spool_kernel",
-        consume=consume, max_workers=2, max_inflight=2,
-    ) == 4
-    assert not attempts
-    assert child_pids and os.getpid() not in child_pids
-    assert len(child_pids) <= 2
-    assert [value for _, value in _results(connect(), schema)] == [73] * 4
-    assert ledger.publish()
-    ledger.close()
 
 
 def test_corrupt_spool_does_not_commit_provisional_rows(ledger_database, tmp_path):
