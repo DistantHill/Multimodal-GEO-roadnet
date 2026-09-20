@@ -323,7 +323,8 @@ class RefineDatasetReader:
           SELECT a.*, b.* FROM pairs
           JOIN straight a ON a.segment_id = pairs.a_id
           JOIN straight b ON b.segment_id = pairs.b_id
-          ORDER BY pairs.a_id, pairs.b_id
+          ORDER BY a.vehicle_rank, b.vehicle_rank,
+                   a.segment_index, b.segment_index, a.track_rank, b.track_rank
         """
         result = connection.execute(query, parameters)
         while rows := result.fetchmany(batch_size):

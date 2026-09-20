@@ -14,6 +14,9 @@ from track.v2.artifact_parquet import build_descriptor
 from track.v2.db.artifact_registry import ArtifactDescriptor, canonical_json
 from track.v2.detect import IntersectConfig
 from track.v2.cross_track import _prepare_segments
+from track.v2.candidate_extraction import (
+    extract_columnar_cross_track_candidates, extract_cross_track_candidates,
+)
 from track.v2.candidate_patches import (
     CROSS_TRACK_OVERFLOW_PAIR_LIMIT, CrossTrackCapacityError,
     build_cross_track_index, iter_cross_track_patches,
@@ -392,8 +395,78 @@ def test_duckdb_cross_track_pairs_match_grid_and_overflow_oracle(tmp_path, batch
     }
     assert set(actual) == expected_identity
     assert len(actual) == len(set(actual))
-    assert actual == sorted(actual)
+    order = [
+        (a.vehicle_rank, b.vehicle_rank, a.segment_index, b.segment_index,
+         a.track_rank, b.track_rank)
+        for batch in batches for a, b in batch
+    ]
+    assert order == sorted(order)
     assert all(0 < len(batch) <= batch_size for batch in batches)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_columnar_cross_track_exact_kernel_matches_q49_oracle(tmp_path, batch_size) -> None:
+    # Q44 fallback record: exact segment intersection is the existing vectorized
+    # NumPy geometry kernel. DuckDB owns relational pairing; Polars adds no useful
+    # operator for this continuous kernel, so bounded minimal Python objects are
+    # the permitted fallback. No threads, processes, or Dask are involved.
+    descriptor = _published_tracks(tmp_path, [
+        ("a", 10, [(0, -10, 0, 0), (2, 10, 0, 0)]),
+        ("a", 11, [(3, -10, 3, 0), (4, 10, 3, 0)]),  # same vehicle excluded
+        ("b", 20, [(1, 0, -10, 90), (5, 0, 10, 90)]),
+        ("c", 30, [(6, -10, 5, 0), (7, 10, 5, 0)]),  # parallel
+        ("d", 40, [(8, -8, -8, 45), (9, 8, 8, 45)]),  # angle boundary
+        ("e", 50, [(10, -100, -4, 90), (11, -100, 4, 90)]),  # overflow pair
+    ])
+    cfg = IntersectConfig(
+        cross_track_pair_batch_size=batch_size,
+        cross_track_grid_cell_m=5,
+        cross_track_max_grid_cells_per_segment=2,
+        cross_track_min_angle_deg=45,
+        cross_track_max_angle_deg=90,
+    )
+    transformer = CoordinateTransformer(SpatialContext(
+        4326, 32650, {"coordinate_semantics_version": 2,
+                      "enforce_area_of_use": True, "max_scale_error": .01},
+    ))
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        tracks = {
+            f"{track[0].vehicle_id}\0{track[0].refined_point_ref.subtrack_index}": track
+            for track in reader.iter_tracks("source", batch_size=1)
+        }
+        expected, _, _ = extract_cross_track_candidates(tracks, transformer, cfg)
+        actual = extract_columnar_cross_track_candidates(
+            reader, "source", transformer, cfg,
+        )
+    assert len(actual) == len(expected)
+    for left, right in zip(actual, expected, strict=True):
+        assert left.cross_track_calculate_index == right.cross_track_calculate_index
+        assert left.point_ref == right.point_ref
+        assert left.from_segment_start_point_ref == right.from_segment_start_point_ref
+        assert left.to_segment_start_point_ref == right.to_segment_start_point_ref
+        assert left.from_segment_start == right.from_segment_start
+        assert left.to_segment_start == right.to_segment_start
+        assert left.vehicle_id == right.vehicle_id
+        for field, tolerance in (("x", 1e-6), ("y", 1e-6),
+                                 ("lon", 1e-9), ("lat", 1e-9),
+                                 ("timestamp", 1e-12), ("heading", 1e-12),
+                                 ("speed", 1e-12)):
+            assert getattr(left, field) == pytest.approx(getattr(right, field), abs=tolerance)
+    assert any(candidate.vehicle_id == "a|b" for candidate in actual)
+
+
+def test_columnar_cross_track_does_not_seal_caller_store_on_error() -> None:
+    reader = Mock()
+    reader.iter_cross_track_pair_batches.side_effect = RuntimeError("planner failed")
+    store = Mock()
+    with pytest.raises(RuntimeError, match="planner failed"):
+        extract_columnar_cross_track_candidates(
+            reader, "source", Mock(), IntersectConfig(), candidate_store=store,
+        )
+    store.seal.assert_not_called()
+    store.close.assert_not_called()
 
 
 def test_duckdb_cross_track_pairs_empty_single_vehicle_and_strict_config(tmp_path) -> None:

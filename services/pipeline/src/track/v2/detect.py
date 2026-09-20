@@ -52,7 +52,8 @@ from .candidate_patches import (
     CROSS_TRACK_OVERFLOW_PAIR_LIMIT, CrossTrackCapacityError, iter_track_patches,
 )
 from .candidate_extraction import (
-    extract_cross_track_candidates, extract_turn_candidates, extract_disk_cross_track_candidates,
+    extract_columnar_cross_track_candidates, extract_cross_track_candidates,
+    extract_turn_candidates, extract_disk_cross_track_candidates,
 )
 from .detect_workspace import DetectWorkspace
 from .dbscan_storage import ActiveGridLinks, index_typecode
@@ -1049,10 +1050,16 @@ def _extract_cross_track_db_workspace(
     live_status: Any = None,
     perf: PerfTracker | None = None,
     candidate_store: CandidateStore | None = None,
+    refine_reader: RefineDatasetReader | None = None,
 ) -> Sequence[CrossTrackCandidate]:
     """Use bounded disk broad phase for DB runs; retain handle benchmark seams."""
     if not cfg.use_cross_track_candidates:
         return []
+    if refine_reader is not None:
+        return extract_columnar_cross_track_candidates(
+            refine_reader, cfg.source_table or cfg.db_table, transformer, cfg,
+            live_status=live_status, candidate_store=candidate_store,
+        )
     if isinstance(tracks, DetectWorkspace):
         return extract_disk_cross_track_candidates(
             tracks, transformer, cfg, live_status=live_status, perf=perf,
@@ -1606,6 +1613,7 @@ def _detect_intersections_db_workspace(
             live_status=live,
             perf=tracker,
             candidate_store=candidate_store,
+            refine_reader=refine_reader,
         )
 
     # ── Shared: cluster pipeline (G* + DBSCAN + merge + ablation) ───

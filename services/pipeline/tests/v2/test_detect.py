@@ -61,6 +61,7 @@ from track.v2.detect import (
     _project_tracks,
     _run_dbscan,
     _load_tracks_and_turn_candidates,
+    _extract_cross_track_db_workspace,
     _iter_prepared_db_tracks,
     _stream_vehicle_tracks_from_db,
     _topology_point_windows,
@@ -1141,6 +1142,35 @@ class ProjectionContextContractTest(unittest.TestCase):
         self.assertEqual(tracks, [])
         reader.iter_tracks.assert_called_once_with("raw_points", batch_size=17)
         stream.assert_not_called()
+
+    def test_formal_parquet_cross_track_uses_columnar_pairs_not_disk_index(self):
+        reader = MagicMock()
+        expected = []
+        with (
+            patch("track.v2.detect.extract_columnar_cross_track_candidates",
+                  return_value=expected) as columnar,
+            patch("track.v2.detect.extract_disk_cross_track_candidates") as disk,
+            patch("track.v2.candidate_extraction._prepare_segments") as prepare,
+            patch("track.v2.candidate_extraction.build_cross_track_index") as build_index,
+        ):
+            actual = _extract_cross_track_db_workspace(
+                {}, IntersectConfig(source_table="source"), (0, 0, 1, 1),
+                _TEST_TRANSFORMER, refine_reader=reader,
+            )
+        self.assertIs(actual, expected)
+        columnar.assert_called_once()
+        disk.assert_not_called()
+        prepare.assert_not_called()
+        build_index.assert_not_called()
+
+    def test_disabled_formal_parquet_cross_track_does_not_read_pair_planner(self):
+        reader = MagicMock()
+        actual = _extract_cross_track_db_workspace(
+            {}, IntersectConfig(use_cross_track_candidates=False), (0, 0, 1, 1),
+            _TEST_TRANSFORMER, refine_reader=reader,
+        )
+        self.assertEqual(actual, [])
+        reader.iter_cross_track_pair_batches.assert_not_called()
 
     def test_formal_db_detect_rejects_assertion_and_source_mismatch(self):
         refine = SimpleNamespace(

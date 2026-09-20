@@ -166,6 +166,76 @@ def extract_cross_track_candidates(
     return candidates, total_pairs, total_pairs
 
 
+@observed_operation("列式跨轨迹候选提取")
+def extract_columnar_cross_track_candidates(
+    reader: Any,
+    source_table: str,
+    transformer: CoordinateTransformer,
+    cfg: Any,
+    *,
+    live_status: Any = None,
+    candidate_store: CandidateStore | None = None,
+) -> Sequence[CrossTrackCandidate]:
+    """Run the existing exact NumPy kernel on bounded DuckDB pair batches."""
+    result: list[CrossTrackCandidate] | CandidateStore = (
+        [] if candidate_store is None else candidate_store
+    )
+    pair_count = 0
+    started = last_progress = time.perf_counter()
+    batches = reader.iter_cross_track_pair_batches(
+        source_table, cfg, batch_size=cfg.cross_track_pair_batch_size,
+    )
+    iterator = iter(batches)
+    try:
+        for batch in iterator:
+            size = len(batch)
+            segments = {
+                index: segment
+                for pair_index, pair in enumerate(batch)
+                for index, segment in ((pair_index * 2, pair[0]),
+                                       (pair_index * 2 + 1, pair[1]))
+            }
+            starts = np.asarray(
+                [(segments[index].x1, segments[index].y1) for index in range(size * 2)],
+                dtype=float,
+            )
+            ends = np.asarray(
+                [(segments[index].x2, segments[index].y2) for index in range(size * 2)],
+                dtype=float,
+            )
+            headings = np.asarray(
+                [segments[index].heading for index in range(size * 2)], dtype=float,
+            )
+            pair_a = np.arange(0, size * 2, 2, dtype=np.int64)
+            pair_b = pair_a + 1
+            xs, ys, hit_indices = intersect_cross_track_patch(
+                starts, ends, headings, pair_a, pair_b, cfg,
+            )
+            for _key, candidate in build_cross_track_patch_candidates(
+                segments, pair_a, pair_b, xs, ys, hit_indices, transformer,
+            ):
+                numbered = replace(candidate, cross_track_calculate_index=len(result))
+                result.append(numbered)
+            pair_count += size
+            heartbeat_progress(pair_count, unit="线段对")
+            now = time.perf_counter()
+            if live_status is not None and now - last_progress >= 3.0:
+                live_status.update(
+                    detail=f"跨轨迹计算：{pair_count:,} 线段对，{len(result):,} 候选",
+                    elapsed=now - started,
+                )
+                last_progress = now
+    finally:
+        close = getattr(iterator, "close", None)
+        if close is not None:
+            close()
+    if candidate_store is not None:
+        candidate_store.seal()
+    log_info(f"── 列式跨轨迹: {pair_count:,} 线段对 → {len(result):,} 候选 "
+             f"({time.perf_counter() - started:.1f}s)")
+    return result
+
+
 def _emit_progress(
     live_status: Any,
     pair_count: int,

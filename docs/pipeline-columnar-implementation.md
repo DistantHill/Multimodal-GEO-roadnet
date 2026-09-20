@@ -43,8 +43,8 @@
 | C06b | Detect 接入 Refine Parquet reader | C06a | ≤700 | 已完成（C06b1 `aac372c`；C06b2 `832ff99`） |
 | C07a | Detect 转向候选列式迁移 | C06b | 每提交 ≤700 | 已完成（`cfecadd`） |
 | C07b | Detect 跨轨迹候选准备列式迁移 | C07a | 每提交 ≤700 | 已完成（`2fc3146`） |
-| C07c1 | Detect 跨轨迹 DuckDB broad phase | C07b | 每提交 ≤700 | 已完成，待主对话确认 |
-| C07c2 | Detect 跨轨迹精确内核与正式入口接线 | C07c1 | 每提交 ≤700 | 未开始 |
+| C07c1 | Detect 跨轨迹 DuckDB broad phase | C07b | 每提交 ≤700 | 已完成，`6551037`，待主对话确认 |
+| C07c2 | Detect 跨轨迹精确内核与正式入口接线 | C07c1 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C08 | Detect Parquet 发布与 Clip 列式读取 | C07c2 | 每提交 ≤700 | 未开始 |
 | C09 | Clip/Fitting 顺序计算与旧 spool 清除 | C08 | 每提交 ≤700 | 未开始 |
 | C10 | Detect/写入器旧磁盘工作区清除 | C07a–C09 | 每提交 ≤700 | 未开始 |
@@ -286,7 +286,7 @@ batch=1、方向角圆周、包含阈值、单点轨迹和禁止跨子轨迹连�
 边界/负坐标、多 cell 去重、同车排除、不同子轨迹、overflow、批量和空输入；断言不调用
 `fetchall()`。
 
-提交：本卡提交，待主对话记录哈希。
+提交：`6551037`。
 
 ### C07c2 — Detect 跨轨迹精确内核与正式入口接线
 
@@ -296,6 +296,9 @@ batch=1、方向角圆周、包含阈值、单点轨迹和禁止跨子轨迹连�
 验证：Q49 crossing 配对与坐标容差、正式入口选择、错误传播及资源边界。
 
 提交：待记录。
+
+后续 C07d 收敛 DBSCAN/聚类的最小 Python 回退，并明确候选存储移除边界；本卡保留
+`CandidateStore` 和拓扑所需 tracks 工作区，不扩大到聚类或拓扑迁移。
 
 ### C08 — Detect Parquet 与 Clip
 
