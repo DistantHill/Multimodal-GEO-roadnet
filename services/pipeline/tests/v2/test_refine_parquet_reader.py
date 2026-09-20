@@ -12,6 +12,7 @@ import pytest
 from track.v2 import artifact_publication, refine_parquet
 from track.v2.artifact_parquet import build_descriptor
 from track.v2.db.artifact_registry import ArtifactDescriptor, canonical_json
+from track.v2.db.queries import SpatialWindow
 from track.v2.detect import IntersectConfig
 from track.v2.cross_track import _prepare_segments
 from track.v2.candidate_extraction import (
@@ -158,6 +159,150 @@ def test_reader_adapts_all_tracks_across_batches_and_queries_extent(tmp_path) ->
         )
         assert injected.extra == {} and last.refined_point_ref.point_kind == "kept"
         assert reader.extent() == (10.0, 20.0, 10.0, 20.0)
+
+
+def test_topology_windows_select_complete_tracks_with_stable_deduplication(tmp_path) -> None:
+    # Window matching, deduplication and stable sorting belong to spillable
+    # DuckDB relations. Python rebuilds only one complete subtrack at a time;
+    # Polars adds no operator needed by this boundary.
+    descriptor = _published_tracks(tmp_path, [
+        ("a", 2, [(0, -10, 0, 0), (1, 10, 0, 0), (2, 20, 20, 45)]),
+        ("a", 3, [(3, 0, 0, 0)]),
+        ("b", 1, [(4, 1, -1, 90), (5, 1, 1, 90), (6, 1, 2, 90)]),
+        ("c", 4, [(7, 1.000001, -1, 90), (8, 1.000001, 1, 90)]),
+    ])
+    windows = [
+        SpatialWindow(0, 0, 1, 1),
+        SpatialWindow(0, 0, 1, 1),
+        SpatialWindow(-5, -0.5, 5, 0.5),
+    ]
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        data_root=tmp_path,
+    ) as reader:
+        selected = list(reader.iter_topology_tracks("source", windows, batch_size=1))
+
+    assert [(item.window_indices, item.track_key) for item in selected] == [
+        ((0, 1), "a\0" + "2"), ((0, 1), "b\0" + "1"),
+        ((2,), "a\0" + "2"), ((2,), "b\0" + "1"), ((2,), "c\0" + "4"),
+    ]
+    assert [[point.refined_point_ref.refined_sequence_in_subtrack
+             for point in item.points] for item in selected] == [
+        [0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1],
+    ]
+
+
+def test_topology_track_rebuild_preserves_kept_injected_order(tmp_path) -> None:
+    descriptor = _published(tmp_path)
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        selected = list(reader.iter_topology_tracks(
+            "public.source", [SpatialWindow(10, 20, 10, 20)], batch_size=1,
+        ))
+    assert [(item.track_key, item.window_indices) for item in selected] == [
+        ("v1\0" + "4", (0,)),
+    ]
+    assert [(point.refined_point_ref.point_kind,
+             point.refined_point_ref.refined_sequence_in_subtrack)
+            for point in selected[0].points] == [("kept", 0), ("injected", 1), ("kept", 2)]
+
+
+@pytest.mark.parametrize(("points", "matches"), [
+    ([(-1, 0), (0, 0)], True), ([(1, 1), (2, 1)], True),
+    ([(0.5, -1), (0.5, 0)], True), ([(0.5, 1), (0.5, 2)], True),
+    ([(-1, -1), (0, 0)], True), ([(-1, -1e-6), (2, -1e-6)], False),
+])
+def test_topology_segment_aabb_uses_closed_window_edges(tmp_path, points, matches) -> None:
+    track = [(index, x, y, 0) for index, (x, y) in enumerate(points)]
+    descriptor = _published_tracks(tmp_path, [("edge", 0, track)])
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        selected = list(reader.iter_topology_tracks(
+            "source", [SpatialWindow(0, 0, 1, 1)], batch_size=1,
+        ))
+    assert bool(selected) is matches
+
+
+def test_topology_windows_reject_invalid_inputs_and_require_open_reader(tmp_path) -> None:
+    descriptor = _published(tmp_path)
+    reader = refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(), data_root=tmp_path,
+    )
+    with pytest.raises(refine_parquet.RefineParquetError, match="not open"):
+        list(reader.iter_topology_tracks("source", []))
+    with reader:
+        assert list(reader.iter_topology_tracks("source", [])) == []
+        for window in (
+            SpatialWindow(2, 0, 1, 1), SpatialWindow(0, 0, float("nan"), 1),
+            SpatialWindow(False, 0, 1, 1),
+        ):
+            with pytest.raises(refine_parquet.RefineParquetError, match="window"):
+                list(reader.iter_topology_tracks("source", [window]))
+        for batch_size in (0, True):
+            with pytest.raises(refine_parquet.RefineParquetError, match="batch_size"):
+                list(reader.iter_topology_tracks("source", [], batch_size=batch_size))
+
+
+def test_topology_generator_close_drops_window_table_and_allows_reuse(tmp_path) -> None:
+    descriptor = _published_tracks(tmp_path, [
+        ("a", 0, [(0, -1, 0, 0), (1, 1, 0, 0)]),
+    ])
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        iterator = reader.iter_topology_tracks(
+            "source", [SpatialWindow(0, 0, 0, 0)], batch_size=1,
+        )
+        assert next(iterator).track_key == "a\0" + "0"
+        iterator.close()
+        count = reader._connection.execute("""
+          SELECT count(*) FROM duckdb_tables()
+          WHERE table_name LIKE 'topology_windows_%'
+        """).fetchone()
+        assert count == (0,)
+        assert len(list(reader.iter_topology_tracks(
+            "source", [SpatialWindow(0, 0, 0, 0)], batch_size=1,
+        ))) == 1
+
+
+def test_reader_temp_directory_is_explicit_isolated_and_cleaned(tmp_path) -> None:
+    publication = tmp_path / "publication"
+    publication.mkdir()
+    descriptor = _published(publication)
+    data_root = tmp_path / "data"
+    sibling = data_root / "duckdb" / "refine-readers" / "sibling"
+    sibling.mkdir(parents=True)
+    marker = sibling / "owned-elsewhere"
+    marker.write_text("keep")
+    runtime = RuntimeConfig(
+        duckdb_memory_limit="64MB", duckdb_threads=1,
+        duckdb_max_temp_directory_size="1GB",
+    )
+    reader = refine_parquet.RefineDatasetReader(
+        publication, descriptor, "present", runtime,
+        data_root=data_root.resolve(),
+    )
+    with reader:
+        leaf = reader._temp_directory
+        assert leaf is not None and leaf.parent == sibling.parent and leaf.is_dir()
+        settings = dict(reader._connection.execute("""
+          SELECT name, value FROM duckdb_settings()
+          WHERE name IN ('temp_directory', 'memory_limit', 'threads',
+                         'max_temp_directory_size')
+        """).fetchall())
+        assert settings["temp_directory"] == str(leaf)
+        assert settings["threads"] == "1"
+        assert settings["memory_limit"] == "61.0 MiB"
+        assert settings["max_temp_directory_size"] == "953.6 MiB"
+    assert leaf is not None and not leaf.exists()
+    assert marker.read_text() == "keep"
+    with pytest.raises(refine_parquet.RefineParquetError, match="absolute"):
+        refine_parquet.RefineDatasetReader(
+            publication, descriptor, "present", RuntimeConfig(),
+            data_root=Path("relative"),
+        )
 
 
 def _adapter_reader(rows, owner):
@@ -567,7 +712,7 @@ def test_cross_track_segments_reject_null_on_single_point_track(tmp_path) -> Non
 def test_reader_closes_connection_when_view_creation_fails(tmp_path, monkeypatch) -> None:
     descriptor = _published(tmp_path)
     reader = refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(),
+        tmp_path, descriptor, "present", RuntimeConfig(), data_root=tmp_path,
     )
     connection = Mock()
     connection.execute.side_effect = duckdb.IOException("view probe")
@@ -578,3 +723,5 @@ def test_reader_closes_connection_when_view_creation_fails(tmp_path, monkeypatch
 
     connection.close.assert_called_once_with()
     assert reader._connection is None
+    temp_root = tmp_path / "duckdb" / "refine-readers"
+    assert temp_root.is_dir() and list(temp_root.iterdir()) == []

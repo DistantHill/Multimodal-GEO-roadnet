@@ -82,8 +82,9 @@ class _Connection:
 class _Reader:
     instances: list["_Reader"] = []
 
-    def __init__(self, *args: object) -> None:
+    def __init__(self, *args: object, **kwargs: object) -> None:
         self.args = args
+        self.kwargs = kwargs
         self.closed = False
         self.__class__.instances.append(self)
 

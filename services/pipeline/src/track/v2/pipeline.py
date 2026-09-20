@@ -383,6 +383,7 @@ def run_pipeline(
                 registered = find_refine_artifact(cur, refine_id)
             reader = RefineDatasetReader(
                 _parquet_root(), registered.descriptor, registered.state, pc.runtime,
+                data_root=_data_root(),
             )
             with reader:
                 iresult = detect_intersections(

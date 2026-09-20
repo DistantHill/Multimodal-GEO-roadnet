@@ -7,9 +7,10 @@ import json
 import math
 import os
 from pathlib import Path
-from collections.abc import Iterator
+import shutil
+from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import duckdb
 
@@ -20,6 +21,7 @@ from track.v2.candidate_patches import (
 )
 from track.v2.config import PostgresConfig
 from track.v2.db.artifact_registry import ArtifactDescriptor
+from track.v2.db.queries import SpatialWindow
 from track.v2.db.source_table import SourceTableContract, validate_source_table
 from track.v2.models import PointRef, RefinedPointRef, RuntimeConfig, TrajectoryPoint, TurnEvent
 from track.v2.projection import spatial_context_from_values
@@ -32,12 +34,20 @@ class RefineParquetError(RuntimeError):
     """The authoritative Refine result cannot be exported safely."""
 
 
+@dataclass(frozen=True, slots=True)
+class TopologyTrackSelection:
+    window_indices: tuple[int, ...]
+    track_key: str
+    points: list[TrajectoryPoint]
+
+
 class RefineDatasetReader:
     """Own a validated, read-only DuckDB view of one Refine v1 dataset."""
 
     def __init__(
         self, publication_root: Path | str, descriptor: ArtifactDescriptor, state: str,
         runtime: RuntimeConfig, *, verify_sha256: bool = False,
+        data_root: Path | str | None = None,
     ) -> None:
         validate_published(
             publication_root, descriptor, state, verify_sha256=verify_sha256,
@@ -48,6 +58,13 @@ class RefineDatasetReader:
         self._descriptor = descriptor
         self._runtime = runtime
         self._root = Path(publication_root).resolve(strict=True)
+        configured_root = Path(data_root) if data_root is not None else self._root.parent
+        if not configured_root.is_absolute():
+            raise RefineParquetError("data_root must be absolute")
+        self._data_root = configured_root.resolve()
+        if self._data_root == Path(self._data_root.anchor):
+            raise RefineParquetError("data_root must not be a filesystem root")
+        self._temp_directory: Path | None = None
         self._connection: duckdb.DuckDBPyConnection | None = None
 
     @property
@@ -59,17 +76,19 @@ class RefineDatasetReader:
         if self._connection is not None:
             raise RefineParquetError("dataset reader is already open")
         run_id = self._descriptor.refine_id
-        temp = self._root.parent / "duckdb" / str(run_id)
-        temp.mkdir(parents=True, exist_ok=True)
-        self._connection = duckdb.connect(database=":memory:", config={
-            "autoinstall_known_extensions": "false",
-            "autoload_known_extensions": "false",
-            "memory_limit": self._runtime.duckdb_memory_limit,
-            "threads": str(self._runtime.duckdb_threads),
-            "temp_directory": str(temp),
-            "max_temp_directory_size": self._runtime.duckdb_max_temp_directory_size,
-        })
+        temp = (self._data_root / "duckdb" / "refine-readers" /
+                f"{run_id}-{uuid4().hex}")
+        self._temp_directory = temp
         try:
+            temp.mkdir(parents=True, exist_ok=False)
+            self._connection = duckdb.connect(database=":memory:", config={
+                "autoinstall_known_extensions": "false",
+                "autoload_known_extensions": "false",
+                "memory_limit": self._runtime.duckdb_memory_limit,
+                "threads": str(self._runtime.duckdb_threads),
+                "temp_directory": str(temp),
+                "max_temp_directory_size": self._runtime.duckdb_max_temp_directory_size,
+            })
             manifest = json.loads(self._descriptor.manifest_json)
             final = self._root / self._descriptor.relative_path
             for table in manifest["tables"]:
@@ -91,8 +110,11 @@ class RefineDatasetReader:
                 FROM injected_points
             """)
         except BaseException:
-            self._connection.close()
+            if self._connection is not None:
+                self._connection.close()
             self._connection = None
+            shutil.rmtree(temp, ignore_errors=True)
+            self._temp_directory = None
             raise
         return self
 
@@ -100,6 +122,9 @@ class RefineDatasetReader:
         if self._connection is not None:
             self._connection.close()
             self._connection = None
+        if self._temp_directory is not None:
+            shutil.rmtree(self._temp_directory, ignore_errors=True)
+            self._temp_directory = None
 
     def iter_subtrack_batches(
         self, vehicle_id: str, subtrack_index: int, *, batch_size: int = 4096,
@@ -170,6 +195,99 @@ class RefineDatasetReader:
                 track.append(point)
         if track:
             yield track
+
+    def iter_topology_tracks(
+        self, source_table: str, windows: Iterable[SpatialWindow], *,
+        batch_size: int = 4096,
+    ) -> Iterator[TopologyTrackSelection]:
+        """Yield complete subtracks whose adjacent segments intersect each bbox."""
+        connection = self._require_open()
+        if not isinstance(source_table, str) or not source_table.strip():
+            raise RefineParquetError("source_table is required")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise RefineParquetError("batch_size is invalid")
+        canonical: list[tuple[int, tuple[int, ...], float, float, float, float]] = []
+        positions: dict[tuple[float, float, float, float], int] = {}
+        for input_index, window in enumerate(windows):
+            try:
+                bounds = tuple(float(value) for value in
+                               (window.x_min, window.y_min, window.x_max, window.y_max))
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise RefineParquetError("topology window is invalid") from exc
+            if (not all(math.isfinite(value) for value in bounds)
+                    or any(isinstance(value, bool) for value in
+                           (window.x_min, window.y_min, window.x_max, window.y_max))
+                    or bounds[0] > bounds[2] or bounds[1] > bounds[3]):
+                raise RefineParquetError("topology window is invalid")
+            position = positions.get(bounds)
+            if position is None:
+                positions[bounds] = len(canonical)
+                canonical.append((len(canonical), (input_index,), *bounds))
+            else:
+                item = canonical[position]
+                canonical[position] = (item[0], item[1] + (input_index,), *item[2:])
+        if not canonical:
+            return
+        self._validate_source(connection)
+        table = f"topology_windows_{uuid4().hex}"
+        try:
+            connection.execute(f"""
+              CREATE TEMP TABLE {table}(
+                window_order INTEGER, x_min DOUBLE, y_min DOUBLE,
+                x_max DOUBLE, y_max DOUBLE
+              )
+            """)
+            connection.executemany(
+                f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?)",
+                [(item[0], *item[2:]) for item in canonical],
+            )
+            result = connection.execute(f"""
+              WITH adjacent AS (
+                SELECT vehicle_id, subtrack_index, x, y,
+                       lead(x) OVER track AS end_x, lead(y) OVER track AS end_y
+                FROM refine_points
+                WINDOW track AS (PARTITION BY vehicle_id, subtrack_index ORDER BY
+                  refined_sequence_in_subtrack, point_kind, point_id)
+              ), selected AS (
+                SELECT DISTINCT w.window_order, a.vehicle_id, a.subtrack_index
+                FROM {table} w JOIN adjacent a
+                  ON a.end_x IS NOT NULL
+                 AND least(a.x, a.end_x) <= w.x_max
+                 AND greatest(a.x, a.end_x) >= w.x_min
+                 AND least(a.y, a.end_y) <= w.y_max
+                 AND greatest(a.y, a.end_y) >= w.y_min
+              )
+              SELECT p.refine_id, p.point_id, p.vehicle_id, p.subtrack_index,
+                     p.refined_sequence_in_subtrack, p.timestamp, p.lon, p.lat,
+                     p.x, p.y, p.heading, p.speed, p.point_kind, p.source_row_key,
+                     p.generated_reason, p.after_sequence_in_subtrack, 1 AS vehicles,
+                     s.window_order
+              FROM selected s JOIN refine_points p USING (vehicle_id, subtrack_index)
+              ORDER BY s.window_order, p.vehicle_id, p.subtrack_index,
+                       p.refined_sequence_in_subtrack, p.point_kind, p.point_id
+            """)
+            current: tuple[int, str, int] | None = None
+            points: list[TrajectoryPoint] = []
+            for rows in iter(lambda: result.fetchmany(batch_size), []):
+                for row in rows:
+                    key = (int(row[17]), str(row[2]), int(row[3]))
+                    if current is not None and key != current:
+                        yield TopologyTrackSelection(
+                            canonical[current[0]][1], f"{current[1]}\0{current[2]}", points,
+                        )
+                        points = []
+                    point, _ = self._decode_row(
+                        row[:17], source_table, len(points),
+                        None if not points else (key[1], key[2]),
+                    )
+                    current = key
+                    points.append(point)
+            if current is not None:
+                yield TopologyTrackSelection(
+                    canonical[current[0]][1], f"{current[1]}\0{current[2]}", points,
+                )
+        finally:
+            connection.execute(f"DROP TABLE IF EXISTS {table}")
 
     def iter_turn_candidates(
         self, source_table: str, cfg: Any, *, batch_size: int = 4096,
@@ -253,7 +371,7 @@ class RefineDatasetReader:
         connection, threshold = self._validate_cross_track_request(
             source_table, cfg, batch_size,
         )
-        self._validate_cross_track_source(connection)
+        self._validate_source(connection)
         query = self._cross_track_segment_relation("""
           SELECT segment_id, refine_id, point_id, vehicle_id, subtrack_index,
                  refined_sequence_in_subtrack, timestamp, lon, lat, x, y,
@@ -283,7 +401,7 @@ class RefineDatasetReader:
         if (isinstance(max_cells, bool) or not isinstance(max_cells, int)
                 or max_cells < 1):
             raise RefineParquetError("cross-track maximum grid cells is invalid")
-        self._validate_cross_track_source(connection)
+        self._validate_source(connection)
         relation = self._cross_track_pair_relation()
         parameters = [threshold, float(cell_m), float(cell_m), float(cell_m),
                       float(cell_m), max_cells]
@@ -346,7 +464,7 @@ class RefineDatasetReader:
             raise RefineParquetError("batch_size is invalid")
         return connection, float(threshold)
 
-    def _validate_cross_track_source(self, connection: duckdb.DuckDBPyConnection) -> None:
+    def _validate_source(self, connection: duckdb.DuckDBPyConnection) -> None:
         invalid = connection.execute("""
           WITH checked AS (
             SELECT *,
@@ -377,7 +495,7 @@ class RefineDatasetReader:
                   OR generated_reason = '' OR after_sequence_in_subtrack IS NULL))
         """, [self._descriptor.refine_id]).fetchone()
         if invalid is None or invalid[0]:
-            raise RefineParquetError("cross-track source contains corrupt identity or sequence data")
+            raise RefineParquetError("source contains corrupt identity or sequence data")
 
     @staticmethod
     def _cross_track_segment_relation(select_sql: str) -> str:

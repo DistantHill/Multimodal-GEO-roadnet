@@ -57,9 +57,11 @@
 | C10a1 | Detect CrossTrackCandidate 规范化列式关系 | C09c2 | 每提交 ≤700 | 已完成（`7b3e6c4`） |
 | C10a2 | Detect 跨轨迹候选多 pass 簇成员关系 | C10a1 | 每提交 ≤700 | 已完成（`aa60989`） |
 | C10a3 | Detect 通用成员序列 helper 剥离 | C10a2 | 每提交 ≤700 | 已完成（`a16bf52`） |
-| C10a4 | Detect 正式接线并删除旧跨轨迹成员暂存 | C10a3 | 每提交 ≤700 | 已完成，待主对话确认 |
-| C10b | Topology 与 DetectWorkspace 列式迁移及旧工作区删除 | C10a4 | 每提交 ≤700 | 未开始 |
-| C10c | WriterWorkspace 列式迁移及旧工作区删除 | C10b | 每提交 ≤700 | 未开始 |
+| C10a4 | Detect 正式接线并删除旧跨轨迹成员暂存 | C10a3 | 每提交 ≤700 | 已完成（`e753f71`） |
+| C10b1 | Topology 窗口 Refine reader | C10a4 | 每提交 ≤700 | 已完成，待主对话确认 |
+| C10b2 | Topology 正式接线 | C10b1 | 每提交 ≤700 | 未开始 |
+| C10b3 | DetectWorkspace 列式迁移及旧工作区删除 | C10b2 | 每提交 ≤700 | 未开始 |
+| C10c | WriterWorkspace 列式迁移及旧工作区删除 | C10b3 | 每提交 ≤700 | 未开始 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 未开始 |
 | C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 未开始 |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
@@ -460,9 +462,27 @@ psycopg 事务兼容与输出字段不变。DuckDB 负责片段关系的重复�
 
 提交：待记录。
 
-### C10b — Topology 与 DetectWorkspace 列式迁移及旧工作区删除
+### C10b1 — Topology 窗口 Refine reader
 
-范围：迁移拓扑和 Detect 工作区的磁盘暂存，保持既有阶段边界与读取语义。
+范围：为 Refine Parquet reader 增加基于真实相邻线段包围盒命中的完整子轨迹流式读取，
+并将其 DuckDB 临时目录约束到显式数据根目录下的独占叶目录。本卡不改 Detect 编排，
+不删除 `DetectWorkspace`。
+
+验证：闭区间边界、长穿窗、窗口与轨迹去重、完整顺序、损坏输入、有界读取及临时目录隔离。
+
+提交：待记录。
+
+### C10b2 — Topology 正式接线
+
+范围：将 Topology 正式入口接入 Refine Parquet 窗口读取接口，保留既有持久化语义。
+
+验证：Topology 算法、持久化及完整 Pipeline 回归。
+
+提交：待记录。
+
+### C10b3 — DetectWorkspace 列式迁移及旧工作区删除
+
+范围：迁移剩余 Detect 工作区磁盘暂存并删除无调用者的旧工作区，保持阶段边界。
 
 验证：Topology、Detect 持久化、Replay 与 Backend 字段回归。
 
