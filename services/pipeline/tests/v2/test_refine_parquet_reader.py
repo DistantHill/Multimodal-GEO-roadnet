@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import duckdb
@@ -477,6 +478,84 @@ def test_duckdb_turn_thresholds_are_inclusive_and_config_is_strict(tmp_path) -> 
         ):
             with pytest.raises(refine_parquet.RefineParquetError, match="turn"):
                 list(reader.iter_turn_candidates("source", invalid))
+
+
+def test_duckdb_turn_boundary_fallback_matches_python_oracle(tmp_path) -> None:
+    below_min = math.nextafter(45.0, -math.inf)
+    above_min = math.nextafter(45.0, math.inf)
+    below_max = math.nextafter(170.0, -math.inf)
+    above_max = math.nextafter(170.0, math.inf)
+    descriptor = _published_tracks(tmp_path, [
+        ("positive-min", 0, [(0, 0, 0, 0), (10, 10, 0, 45), (20, 20, 0, 45)]),
+        ("negative-min", 1, [(0, 0, 10, 45), (10, 10, 10, 0), (20, 20, 10, 0)]),
+        ("positive-max", 2, [(0, 0, 20, 0), (10, 10, 20, 170), (20, 20, 20, 170)]),
+        ("negative-max", 3, [(0, 0, 30, 170), (10, 10, 30, 0), (20, 20, 30, 0)]),
+        ("below-min", 4, [(0, 0, 40, 0), (10, 10, 40, below_min), (20, 20, 40, 0)]),
+        ("above-min", 5, [(0, 0, 50, 0), (10, 10, 50, above_min), (20, 20, 50, 0)]),
+        ("below-max", 6, [(0, 0, 60, 0), (10, 10, 60, below_max), (20, 20, 60, 0)]),
+        ("above-max", 7, [(0, 0, 70, 0), (10, 10, 70, above_max), (20, 20, 70, 0)]),
+        ("wrap", 8, [(0, 0, 80, 359), (10, 10, 80, 44), (20, 20, 80, 44)]),
+        ("neg-below-min", 9, [(0, 0, 90, below_min), (10, 10, 90, 0),
+                               (20, 20, 90, 0)]),
+        ("neg-above-min", 10, [(0, 0, 100, above_min), (10, 10, 100, 0),
+                                (20, 20, 100, 0)]),
+        ("neg-below-max", 11, [(0, 0, 110, below_max), (10, 10, 110, 0),
+                                (20, 20, 110, 0)]),
+        ("neg-above-max", 12, [(0, 0, 120, above_max), (10, 10, 120, 0),
+                                (20, 20, 120, 0)]),
+    ])
+    cfg = IntersectConfig(turn_window=1, min_turn_deg=45, max_turn_deg=170,
+                          min_leg_m=1, min_movement_speed_mps=0)
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        tracks = {f"{t[0]}\0{t[1]}": t for t in reader.iter_tracks("source")}
+        expected = detect_turn_patch(tracks, cfg)
+        actual = list(reader.iter_turn_candidates("source", cfg, batch_size=1))
+    assert [event.vehicle_id for event in actual] == [event.vehicle_id for event in expected]
+    assert [event.event_calculate_index for event in actual] == list(range(len(actual)))
+    for left, right in zip(actual, expected, strict=True):
+        assert left.point_ref == right.point_ref
+        assert left.refined_point_ref == right.refined_point_ref
+        for field in ("entry_bearing", "exit_bearing", "turn_deg", "score"):
+            assert getattr(left, field) == getattr(right, field)
+
+
+def test_duckdb_turn_unstable_resultant_forces_python_oracle(tmp_path) -> None:
+    descriptor = _published_tracks(tmp_path, [
+        ("unstable", 0, [(0, 0, 0, 0), (10, 10, 0, 180), (20, 20, 0, 90),
+                          (30, 30, 0, 270), (40, 40, 0, 0)]),
+    ])
+    cfg = IntersectConfig(turn_window=2, min_turn_deg=0, max_turn_deg=180,
+                          min_leg_m=1, min_movement_speed_mps=0)
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        tracks = {"unstable": next(reader.iter_tracks("source"))}
+        expected = detect_turn_patch(tracks, cfg)
+        with patch.object(
+            refine_parquet, "_circular_mean_deg",
+            wraps=refine_parquet._circular_mean_deg,
+        ) as exact:
+            actual = list(reader.iter_turn_candidates("source", cfg, batch_size=1))
+    assert exact.call_count == 2
+    assert len(actual) == len(expected) == 1
+    for field in ("entry_bearing", "exit_bearing", "turn_deg", "score"):
+        assert getattr(actual[0], field) == getattr(expected[0], field)
+
+
+def test_duckdb_turn_internal_rows_do_not_call_python_exact_helper(tmp_path) -> None:
+    descriptor = _published_tracks(tmp_path, [
+        ("internal", 0, [(0, 0, 0, 0), (10, 10, 0, 90), (20, 20, 0, 90)]),
+    ])
+    cfg = IntersectConfig(turn_window=1, min_turn_deg=45, max_turn_deg=170,
+                          min_leg_m=1, min_movement_speed_mps=0)
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader, patch.object(refine_parquet, "_circular_mean_deg") as exact:
+        actual = list(reader.iter_turn_candidates("source", cfg, batch_size=1))
+    assert len(actual) == 1
+    exact.assert_not_called()
 
 
 def test_duckdb_cross_track_segments_match_q49_oracle(tmp_path) -> None:

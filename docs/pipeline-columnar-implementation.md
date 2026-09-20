@@ -67,7 +67,7 @@
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
-| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12d1；待重跑 1M） |
+| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12d2；待重跑 1M） |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
 ## 3. 任务卡
@@ -343,34 +343,7 @@ deleted 状态和失败回滚。
 迁移不为 v6 中已有的 completed Detect Run 回填或伪造制品；C08c 消费时对此类历史 Run
 按 fail closed 处理，需要按 Q45/Q54 以新 Run 重跑。
 
-提交：`29b3f04`。
-
-#### C12d1 — Cross-track AABB range join
-
-针对 C12c2c 的 1M overflow 阻塞，Refine Parquet reader 的 broad phase 改由 DuckDB
-执行闭区间 AABB overlap range join。规范谓词为不同车辆、`a.segment_id < b.segment_id`，
-且两个线段 bbox 在 x/y 两轴均闭区间重叠。任意真实线段相交必然满足 AABB overlap，
-因此不会漏掉进入现有 NumPy exact kernel 的真实候选；相较旧 grid memberships 与
-`overflow × all`，只删除 AABB 已分离、最终 exact kernel 必然拒绝的 false-positive broad
-pairs。稳定 `ORDER BY`、`fetchmany(batch_size)` 与后续 exact kernel 均保持不变。
-
-Q44 引擎边界是 DuckDB 负责 window、range join、排序及按运行时配置进行外存管理，Python
-只解码一个有界 batch 并交给既有向量化 NumPy 精确几何核；这里没有 Polars 更合适的连续
-几何算子，故不增加中间转换，也未引入自研 spill、线程、进程或 Dask。遗留
-`cross_track_grid_cell_m` 与 `cross_track_max_grid_cells_per_segment` 继续严格校验以兼容
-配置，但不再影响候选结果，后续卡再评估字段退役。
-
-固定 1M Refine Parquet 的只读 `EXPLAIN` 将该自连接规划为
-`PIECEWISE_MERGE_JOIN`（估算输出约 2,098,224 行），不是 `CROSS_PRODUCT`；小型固定数据
-也没有 cross product。单元回归以 brute-force 闭区间 AABB oracle 为准，覆盖长段但 bbox
-分离、端点边界、长对角、同车排除、canonical once、稳定跨 batch、`batch_size=1` 与禁止
-`fetchall`；最终 exact candidate 继续与 legacy 严格差分并保留 overflow 样例。
-验证结果：cross-track/reader 定向套件 `58 passed`，标准 Pipeline 全量
-`935 passed, 50 skipped`，`git diff --check` 通过。
-
-本卡不重跑 1M，C12 仍为进行中；C12c2c 保留的数据库、容器和运行目录均未改动。
-
-提交：待记录。
+提交：`2ee7f28`。
 
 ### C08b2 — Detect Parquet 发布与失败生命周期接线
 
@@ -797,6 +770,40 @@ turn event 也按稳定 `(subtrack_index, refined_sequence_in_subtrack)` 做了�
 `(subtrack_index, sequence_in_subtrack)` 端点排序，不再依赖 surrogate ID 的 from/to
 顺序；端点反转等价回归已覆盖。定向测试 `20 passed`，标准 Pipeline 全量
 `936 passed, 50 skipped`，13 条语义查询再次通过真实 PostgreSQL 只读 `EXPLAIN` 解析。
+
+提交：`29b3f04`。
+
+#### C12d1 — Cross-track AABB range join
+
+针对 C12c2c 的 1M overflow 阻塞，Refine Parquet reader 的 broad phase 改由 DuckDB
+执行闭区间 AABB overlap range join。不同车辆按 `a.segment_id < b.segment_id` 规范一次，
+且两个 bbox 在 x/y 两轴均闭区间重叠。任意真实线段相交必满足该条件，因此不会漏掉进入
+现有 NumPy exact kernel 的真实候选；只删除旧 `overflow × all` 中 AABB 已分离、最终必被
+拒绝的 false positive。DuckDB 继续负责 window、join、排序和外存，Python 只解码有界
+batch；遗留 grid 配置继续校验但不影响候选。固定 1M Parquet 的只读 `EXPLAIN` 为
+`PIECEWISE_MERGE_JOIN`、估算约 2,098,224 行，不是 `CROSS_PRODUCT`。
+
+验证：定向 `58 passed`，Pipeline 全量 `935 passed, 50 skipped`。
+提交：`0f88034`。
+
+#### C12d2 — Turn 闭区间边界兼容
+
+DuckDB 继续负责按子轨迹 partition/window、leg/elapsed/speed 条件、圆均值近似、稳定排序
+与单一有序结果流。SQL 的 turn 阈值改为 Q49 `1e-12°` 宽筛，绑定下限/上限分别用
+`math.nextafter` 向外扩张；远离阈值且数值稳定的行直接使用 SQL 值。位于 45°/170° 等
+阈值邻域的行仅携带有序 in/out heading 小窗口，由现有 Python
+`_circular_mean_deg`、`_angle_delta_deg` 按历史闭区间精算，未通过的行跳过且不占
+`event_calculate_index`，因此最终索引连续、无第二查询归并。
+
+病态圆向量也强制进入同一最小 fallback：SQL 携带 resultant magnitude 与 sin/cos
+绝对和，以 `gamma_n = n*u/(1-n*u)`、`u=2^-53` 判断累计舍入误差是否足以覆盖 resultant。
+该规则防止近零向量的 SQL 方位近似决定成员，但与历史 oracle 的最终一致仍以固定镜像和
+libm 为验证前提，不声称对任意 libm 提供数学同一性。Q44 上，DuckDB 保持列式、可外存的
+全量工作，Python 只处理阈值邻域或病态窗口，不引入全表 Python、自研 spill、并发池或
+Dask。本卡不重跑 1M，C12 仍为进行中。
+
+验证：turn 定向 `6 passed`；Pipeline 与 `scripts/cv_human_check/tests` 合并全量
+`967 passed, 50 skipped`，其中 scripts 单独 `29 passed`；`git diff --check` 通过。
 
 提交：待记录。
 

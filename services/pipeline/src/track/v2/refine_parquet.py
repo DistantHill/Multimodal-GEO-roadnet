@@ -20,6 +20,7 @@ from track.v2.config import PostgresConfig
 from track.v2.db.artifact_registry import ArtifactDescriptor
 from track.v2.db.queries import SpatialWindow
 from track.v2.db.source_table import SourceTableContract, validate_source_table
+from track.v2._geometry import _angle_delta_deg, _circular_mean_deg
 from track.v2.models import PointRef, RefinedPointRef, RuntimeConfig, TrajectoryPoint, TurnEvent
 from track.v2.projection import spatial_context_from_values
 
@@ -320,8 +321,13 @@ class RefineDatasetReader:
                 or cfg.min_turn_deg > cfg.max_turn_deg):
             raise RefineParquetError("turn thresholds are invalid")
         frame_after = w - 1
+        tolerance = 1e-12
+        lower = math.nextafter(cfg.min_turn_deg - tolerance, -math.inf)
+        upper = math.nextafter(cfg.max_turn_deg + tolerance, math.inf)
+        unit_roundoff = 2.0 ** -53
+        gamma = (w * unit_roundoff) / (1.0 - w * unit_roundoff)
         query = f"""
-          WITH windows AS (
+          WITH window_sums AS (
             SELECT *,
               row_number() OVER track AS position,
               count(*) OVER (PARTITION BY vehicle_id, subtrack_index) AS track_size,
@@ -331,21 +337,47 @@ class RefineDatasetReader:
               lead(x, {w}) OVER track AS after_x,
               lead(y, {w}) OVER track AS after_y,
               lead(timestamp, {w}) OVER track AS after_time,
-              atan2(sum(sin(radians(heading))) OVER
+              sum(sin(radians(heading))) OVER
                 (PARTITION BY vehicle_id, subtrack_index ORDER BY refined_sequence_in_subtrack
-                 ROWS BETWEEN {w} PRECEDING AND 1 PRECEDING),
-                    sum(cos(radians(heading))) OVER
+                 ROWS BETWEEN {w} PRECEDING AND 1 PRECEDING) AS in_sin,
+              sum(cos(radians(heading))) OVER
                 (PARTITION BY vehicle_id, subtrack_index ORDER BY refined_sequence_in_subtrack
-                 ROWS BETWEEN {w} PRECEDING AND 1 PRECEDING)) * 180.0 / pi() AS in_raw,
-              atan2(sum(sin(radians(heading))) OVER
+                 ROWS BETWEEN {w} PRECEDING AND 1 PRECEDING) AS in_cos,
+              sum(abs(sin(radians(heading)))) OVER
                 (PARTITION BY vehicle_id, subtrack_index ORDER BY refined_sequence_in_subtrack
-                 ROWS BETWEEN CURRENT ROW AND {frame_after} FOLLOWING),
-                    sum(cos(radians(heading))) OVER
+                 ROWS BETWEEN {w} PRECEDING AND 1 PRECEDING) AS in_sin_abs,
+              sum(abs(cos(radians(heading)))) OVER
                 (PARTITION BY vehicle_id, subtrack_index ORDER BY refined_sequence_in_subtrack
-                 ROWS BETWEEN CURRENT ROW AND {frame_after} FOLLOWING)) * 180.0 / pi() AS out_raw
+                 ROWS BETWEEN {w} PRECEDING AND 1 PRECEDING) AS in_cos_abs,
+              list(heading) OVER
+                (PARTITION BY vehicle_id, subtrack_index ORDER BY refined_sequence_in_subtrack
+                 ROWS BETWEEN {w} PRECEDING AND 1 PRECEDING) AS in_headings,
+              sum(sin(radians(heading))) OVER
+                (PARTITION BY vehicle_id, subtrack_index ORDER BY refined_sequence_in_subtrack
+                 ROWS BETWEEN CURRENT ROW AND {frame_after} FOLLOWING) AS out_sin,
+              sum(cos(radians(heading))) OVER
+                (PARTITION BY vehicle_id, subtrack_index ORDER BY refined_sequence_in_subtrack
+                 ROWS BETWEEN CURRENT ROW AND {frame_after} FOLLOWING) AS out_cos,
+              sum(abs(sin(radians(heading)))) OVER
+                (PARTITION BY vehicle_id, subtrack_index ORDER BY refined_sequence_in_subtrack
+                 ROWS BETWEEN CURRENT ROW AND {frame_after} FOLLOWING) AS out_sin_abs,
+              sum(abs(cos(radians(heading)))) OVER
+                (PARTITION BY vehicle_id, subtrack_index ORDER BY refined_sequence_in_subtrack
+                 ROWS BETWEEN CURRENT ROW AND {frame_after} FOLLOWING) AS out_cos_abs,
+              list(heading) OVER
+                (PARTITION BY vehicle_id, subtrack_index ORDER BY refined_sequence_in_subtrack
+                 ROWS BETWEEN CURRENT ROW AND {frame_after} FOLLOWING) AS out_headings
             FROM refine_points
             WINDOW track AS (PARTITION BY vehicle_id, subtrack_index
                              ORDER BY refined_sequence_in_subtrack)
+          ), windows AS (
+            SELECT *, atan2(in_sin, in_cos) * 180.0 / pi() AS in_raw,
+              atan2(out_sin, out_cos) * 180.0 / pi() AS out_raw,
+              sqrt(in_sin*in_sin + in_cos*in_cos) AS in_resultant,
+              in_sin_abs + in_cos_abs AS in_abs_sum,
+              sqrt(out_sin*out_sin + out_cos*out_cos) AS out_resultant,
+              out_sin_abs + out_cos_abs AS out_abs_sum
+            FROM window_sums
           ), measures AS (
             SELECT *, sqrt(pow(x-before_x, 2)+pow(y-before_y, 2)) AS in_leg,
               sqrt(pow(after_x-x, 2)+pow(after_y-y, 2)) AS out_leg,
@@ -362,18 +394,34 @@ class RefineDatasetReader:
           SELECT refine_id, point_id, vehicle_id, subtrack_index,
                  refined_sequence_in_subtrack, timestamp, lon, lat, x, y,
                  point_kind, source_row_key, generated_reason,
-                 after_sequence_in_subtrack, in_bearing, out_bearing, turn_deg
+                 after_sequence_in_subtrack, in_bearing, out_bearing, turn_deg,
+                 in_headings, out_headings, in_resultant, in_abs_sum,
+                 out_resultant, out_abs_sum
           FROM turns WHERE abs(turn_deg) BETWEEN ? AND ?
+             OR in_resultant <= ? * in_abs_sum
+             OR out_resultant <= ? * out_abs_sum
           ORDER BY vehicle_id, subtrack_index, refined_sequence_in_subtrack,
                    point_kind, point_id
         """
         result = connection.execute(query, [cfg.min_leg_m, cfg.min_leg_m,
                                             cfg.min_movement_speed_mps,
-                                            cfg.min_turn_deg, cfg.max_turn_deg])
+                                            lower, upper, gamma, gamma])
         event_index = 0
         while rows := result.fetchmany(batch_size):
             for row in rows:
-                yield self._decode_turn_row(row, source_table, event_index)
+                sql_turn = float(row[16])
+                unstable = (float(row[19]) <= gamma * float(row[20])
+                            or float(row[21]) <= gamma * float(row[22]))
+                boundary = (abs(abs(sql_turn) - cfg.min_turn_deg) <= tolerance
+                            or abs(abs(sql_turn) - cfg.max_turn_deg) <= tolerance)
+                if unstable or boundary:
+                    entry = _circular_mean_deg(row[17])
+                    exit_ = _circular_mean_deg(row[18])
+                    turn = _angle_delta_deg(entry, exit_)
+                    if not cfg.min_turn_deg <= abs(turn) <= cfg.max_turn_deg:
+                        continue
+                    row = row[:14] + (entry, exit_, turn) + row[17:]
+                yield self._decode_turn_row(row[:17], source_table, event_index)
                 event_index += 1
 
     def iter_cross_track_segments(
