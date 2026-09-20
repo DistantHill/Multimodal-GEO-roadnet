@@ -6,12 +6,13 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any
 from uuid import UUID
 
 import duckdb
 
-from track.v2.artifact_parquet import build_descriptor
+from track.v2.artifact_parquet import build_descriptor, validate_published
 from track.v2.artifact_publication import StagingDataset, _validate_handle
 from track.v2.config import PostgresConfig
 from track.v2.db.artifact_registry import ArtifactDescriptor
@@ -22,6 +23,93 @@ from track.v2.projection import spatial_context_from_values
 
 class RefineParquetError(RuntimeError):
     """The authoritative Refine result cannot be exported safely."""
+
+
+class RefineDatasetReader:
+    """Own a validated, read-only DuckDB view of one Refine v1 dataset."""
+
+    def __init__(
+        self, publication_root: Path | str, descriptor: ArtifactDescriptor, state: str,
+        runtime: RuntimeConfig, *, verify_sha256: bool = False,
+    ) -> None:
+        validate_published(
+            publication_root, descriptor, state, verify_sha256=verify_sha256,
+        )
+        if descriptor.stage != "refine" or descriptor.refine_id is None:
+            raise RefineParquetError("dataset must belong to the refine stage")
+        _validate_schema(descriptor)
+        self._descriptor = descriptor
+        self._runtime = runtime
+        self._root = Path(publication_root).resolve(strict=True)
+        self._connection: duckdb.DuckDBPyConnection | None = None
+
+    def __enter__(self) -> RefineDatasetReader:
+        if self._connection is not None:
+            raise RefineParquetError("dataset reader is already open")
+        run_id = self._descriptor.refine_id
+        temp = self._root.parent / "duckdb" / str(run_id)
+        temp.mkdir(parents=True, exist_ok=True)
+        self._connection = duckdb.connect(database=":memory:", config={
+            "autoinstall_known_extensions": "false",
+            "autoload_known_extensions": "false",
+            "memory_limit": self._runtime.duckdb_memory_limit,
+            "threads": str(self._runtime.duckdb_threads),
+            "temp_directory": str(temp),
+            "max_temp_directory_size": self._runtime.duckdb_max_temp_directory_size,
+        })
+        try:
+            manifest = json.loads(self._descriptor.manifest_json)
+            final = self._root / self._descriptor.relative_path
+            for table in manifest["tables"]:
+                paths = [str(final / item["relative_path"]) for item in table["files"]]
+                literals = ", ".join(_literal(path) for path in paths)
+                self._connection.execute(
+                    f"CREATE TEMP VIEW {table['name']} AS "
+                    f"SELECT * FROM read_parquet([{literals}])"
+                )
+        except BaseException:
+            self._connection.close()
+            self._connection = None
+            raise
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
+
+    def iter_subtrack_batches(
+        self, vehicle_id: str, subtrack_index: int, *, batch_size: int = 4096,
+    ) -> Iterator[tuple[tuple[Any, ...], ...]]:
+        """Yield bounded row batches ordered across kept and injected points."""
+        if self._connection is None:
+            raise RefineParquetError("dataset reader is not open")
+        if not isinstance(vehicle_id, str) or not vehicle_id or isinstance(subtrack_index, bool):
+            raise RefineParquetError("vehicle_id and subtrack_index are required")
+        if (not isinstance(subtrack_index, int) or isinstance(batch_size, bool)
+                or not isinstance(batch_size, int) or batch_size < 1):
+            raise RefineParquetError("subtrack_index and batch_size are invalid")
+        query = """
+          SELECT refine_id, point_id, vehicle_id, subtrack_index,
+                 refined_sequence_in_subtrack, timestamp, lon, lat, x, y,
+                 heading, speed, point_kind, source_row_key, generated_reason,
+                 after_sequence_in_subtrack
+          FROM (
+            SELECT *, 'kept'::VARCHAR AS point_kind,
+                   NULL::VARCHAR AS generated_reason,
+                   NULL::INTEGER AS after_sequence_in_subtrack
+            FROM kept_points
+            UNION ALL BY NAME
+            SELECT *, 'injected'::VARCHAR AS point_kind,
+                   NULL::VARCHAR AS source_row_key
+            FROM injected_points
+          ) points
+          WHERE vehicle_id = ? AND subtrack_index = ?
+          ORDER BY refined_sequence_in_subtrack, point_kind, point_id
+        """
+        result = self._connection.execute(query, [vehicle_id, subtrack_index])
+        while rows := result.fetchmany(batch_size):
+            yield tuple(rows)
 
 
 @dataclass(frozen=True, slots=True)

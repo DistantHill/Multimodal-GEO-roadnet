@@ -232,6 +232,67 @@ class ArtifactDescriptor:
         )
 
 
+class ArtifactRegistryReadError(RuntimeError):
+    """Registry rows cannot identify one trustworthy artifact snapshot."""
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredArtifact:
+    descriptor: ArtifactDescriptor
+    state: str
+
+
+def _json_object_text(value: Any, name: str) -> str:
+    if type(value) is str:
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ArtifactRegistryReadError(f"{name} is invalid JSON") from exc
+    try:
+        return canonical_json(_object(value, name))
+    except ValueError as exc:
+        raise ArtifactRegistryReadError(f"invalid {name}") from exc
+
+
+def find_refine_artifact(cur: Any, refine_id: UUID | str) -> RegisteredArtifact:
+    """Read one Refine artifact and latest lifecycle event without transaction control."""
+    owner = _uuid(refine_id, "refine_id")
+    cur.execute(
+        "SELECT a.id, a.stage, a.refine_id, a.detect_id, a.relative_path, "
+        "a.manifest_version, a.manifest, a.manifest_sha256, a.source_fingerprint, "
+        "a.row_count, a.byte_count, latest.state "
+        "FROM pipeline_artifacts a LEFT JOIN LATERAL ("
+        "SELECT e.state FROM pipeline_artifact_events e "
+        "WHERE e.artifact_id = a.id ORDER BY e.id DESC LIMIT 1"
+        ") latest ON true WHERE a.refine_id = %s LIMIT 2",
+        (owner,),
+    )
+    rows = cur.fetchmany(2)
+    if not rows:
+        raise ArtifactRegistryReadError(f"unknown Refine artifact: {owner}")
+    if len(rows) != 1:
+        raise ArtifactRegistryReadError(f"duplicate Refine artifacts: {owner}")
+    row = rows[0]
+    if len(row) != 12 or row[5] != 1 or row[11] not in ("present", "deleted"):
+        raise ArtifactRegistryReadError("artifact registry row is malformed")
+    try:
+        descriptor = ArtifactDescriptor(
+            id=_uuid(row[0], "artifact id"), stage=row[1],
+            refine_id=None if row[2] is None else _uuid(row[2], "refine_id"),
+            detect_id=None if row[3] is None else _uuid(row[3], "detect_id"),
+            relative_path=row[4],
+            manifest_json=_json_object_text(row[6], "manifest"),
+            manifest_sha256=row[7],
+            source_fingerprint_json=_json_object_text(row[8], "source_fingerprint"),
+            row_count=row[9], byte_count=row[10],
+        )
+    except (TypeError, ValueError) as exc:
+        raise ArtifactRegistryReadError("artifact descriptor is malformed") from exc
+    if descriptor.stage != "refine" or descriptor.refine_id != owner:
+        raise ArtifactRegistryReadError("artifact owner is malformed")
+    return RegisteredArtifact(descriptor, row[11])
+
+
 def insert_present(cur: Any, descriptor: ArtifactDescriptor) -> None:
     """Insert metadata then its present event; the caller owns the transaction."""
     if type(descriptor) is not ArtifactDescriptor:

@@ -38,9 +38,10 @@
 | C05a | Refine Parquet Schema 与 staging 导出 | C04b2 | ≤700 | 已完成（`3e5f6a8`；语义修复 `cc7d25a`） |
 | C05b | Refine Parquet 发布、登记与 Run 完成事务 | C05a | ≤700 | 已完成（`8050876`） |
 | C05c1 | Refine 真实 PostgreSQL 差分与发布故障验证 | C05b | ≤700 | 已完成（`5a25516`） |
-| C05c2 | completed 制品约束迁移与 Refine 最终切换闸门 | C05c1 | ≤700 | 已实施，待主对话验收 |
-| C06 | DuckDB 读取 Refine Parquet 的 Detect 输入适配 | C05c2 | 每提交 ≤700 | 未开始 |
-| C07 | Detect 算子列式迁移及 Python 回退收敛 | C06 | 每提交 ≤700 | 未开始 |
+| C05c2 | completed 制品约束迁移与 Refine 最终切换闸门 | C05c1 | ≤700 | 已完成（`b6a9e03`） |
+| C06a | Refine Parquet 只读消费边界 | C05c2 | ≤700 | 已完成（本卡提交，待主对话记录哈希） |
+| C06b | Detect 接入 Refine Parquet reader | C06a | ≤700 | 未开始 |
+| C07 | Detect 算子列式迁移及 Python 回退收敛 | C06b | 每提交 ≤700 | 未开始 |
 | C08 | Detect Parquet 发布与 Clip 列式读取 | C07 | 每提交 ≤700 | 未开始 |
 | C09 | Clip/Fitting 顺序计算与旧 spool 清除 | C08 | 每提交 ≤700 | 未开始 |
 | C10 | Detect/写入器旧磁盘工作区清除 | C07–C09 | 每提交 ≤700 | 未开始 |
@@ -215,12 +216,23 @@ PostgreSQL 上完成迁移、并发和回滚验证；通过后才允许 C06 消�
 
 提交：本卡提交，待主对话记录哈希。
 
-### C06 — Detect 输入
+### C06a — Refine Parquet 只读消费边界
 
-范围：镜像内固定 PostgreSQL 扩展；DuckDB 扫描 Refine Parquet，按子轨迹批次向现有
-不可列式内核提供最小对象；禁止整表 Python 物化。
+范围：按 `refine_id` 从登记表严格重建制品及最新生命周期状态；消费前校验发布结构、
+清单、大小、Schema 和 footer。DuckDB 仅扫描清单声明文件，并按车辆及子轨迹返回有界
+批次；禁止整表 Python 物化。
 
-验证：kept/injected 合并顺序、车辆边界、稳定身份、内存批次和旧读取路径差分。
+验证：登记重建、最新事件、未知或非 present 拒绝、声明文件、v1 表及 Schema、
+kept/injected 合并顺序、车辆边界、稳定身份、只读校验和批次接口。
+
+提交：本卡提交，待主对话记录哈希。
+
+### C06b — Detect 输入接线
+
+范围：让 Detect 通过 C06a reader 按车辆及子轨迹批次获取最小对象，保留现有算法语义；
+本卡不改变 Detect 算子。
+
+验证：与旧 PostgreSQL 读取路径逐轨差分，并验证批次内存边界。
 
 提交：待记录。
 

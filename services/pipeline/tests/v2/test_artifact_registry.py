@@ -9,8 +9,10 @@ import pytest
 
 from track.v2.db.artifact_registry import (
     ArtifactDescriptor,
+    ArtifactRegistryReadError,
     append_deleted,
     canonical_json,
+    find_refine_artifact,
     insert_present,
 )
 
@@ -53,10 +55,11 @@ def _descriptor(stage: str = "refine", **changes: object) -> ArtifactDescriptor:
 
 
 class _Cursor:
-    def __init__(self, fail_at: int | None = None) -> None:
+    def __init__(self, fail_at: int | None = None, rows=()) -> None:
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         self.fail_at = fail_at
         self.committed = False
+        self.rows = list(rows)
 
     def execute(self, statement: str, params: tuple[object, ...]) -> None:
         self.calls.append((" ".join(statement.split()), params))
@@ -65,6 +68,9 @@ class _Cursor:
 
     def commit(self) -> None:
         self.committed = True
+
+    def fetchmany(self, size: int):
+        return self.rows[:size]
 
 
 def test_descriptor_computes_canonical_manifest_hash_and_totals() -> None:
@@ -240,3 +246,49 @@ def test_frozen_descriptor_cannot_bypass_validation_by_direct_construction() -> 
             '{"z":1, "a":2}', valid.manifest_json, valid.manifest_sha256,
             valid.row_count, valid.byte_count,
         )
+
+
+def _registry_row(descriptor: ArtifactDescriptor, state: str = "present") -> tuple[object, ...]:
+    return (
+        descriptor.id, descriptor.stage, descriptor.refine_id, descriptor.detect_id,
+        descriptor.relative_path, 1, json.loads(descriptor.manifest_json),
+        descriptor.manifest_sha256, json.loads(descriptor.source_fingerprint_json),
+        descriptor.row_count, descriptor.byte_count, state,
+    )
+
+
+def test_find_refine_artifact_strictly_rebuilds_latest_snapshot_without_commit() -> None:
+    descriptor = _descriptor()
+    descriptor = ArtifactDescriptor.create(
+        id=descriptor.id, stage="refine", refine_id=descriptor.refine_id,
+        relative_path=f"refine/{descriptor.refine_id}",
+        source_fingerprint=json.loads(descriptor.source_fingerprint_json),
+        manifest=json.loads(descriptor.manifest_json),
+    )
+    cur = _Cursor(rows=[_registry_row(descriptor, "deleted")])
+
+    snapshot = find_refine_artifact(cur, descriptor.refine_id)
+
+    assert snapshot.descriptor == descriptor
+    assert snapshot.state == "deleted"
+    assert "ORDER BY e.id DESC LIMIT 1" in cur.calls[0][0]
+    assert cur.calls[0][1] == (descriptor.refine_id,)
+    assert not cur.committed
+
+
+@pytest.mark.parametrize("rows,message", [([], "unknown"), ([object(), object()], "duplicate")])
+def test_find_refine_artifact_rejects_unknown_and_duplicates(rows, message) -> None:
+    with pytest.raises(ArtifactRegistryReadError, match=message):
+        find_refine_artifact(_Cursor(rows=rows), uuid4())
+
+
+def test_find_refine_artifact_rejects_missing_event_and_corrupt_metadata() -> None:
+    descriptor = _descriptor()
+    missing_event = list(_registry_row(descriptor))
+    missing_event[-1] = None
+    with pytest.raises(ArtifactRegistryReadError, match="malformed"):
+        find_refine_artifact(_Cursor(rows=[tuple(missing_event)]), descriptor.refine_id)
+    corrupt = list(_registry_row(descriptor))
+    corrupt[9] += 1
+    with pytest.raises(ArtifactRegistryReadError, match="descriptor"):
+        find_refine_artifact(_Cursor(rows=[tuple(corrupt)]), descriptor.refine_id)

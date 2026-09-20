@@ -16,6 +16,7 @@ from track.v2.db.artifact_registry import (
     ArtifactDescriptor,
     append_deleted,
     canonical_json,
+    find_refine_artifact,
     insert_present,
 )
 
@@ -195,6 +196,11 @@ def test_registry_api_enforces_run_uniqueness_isolation_and_atomic_rollback(
     with conn.cursor() as cur:
         insert_present(cur, refine)
         insert_present(cur, detect)
+        assert find_refine_artifact(cur, refine_id).state == "present"
+        append_deleted(cur, refine.id, "reader latest-event probe")
+        latest = find_refine_artifact(cur, refine_id)
+        assert latest.descriptor == refine
+        assert latest.state == "deleted"
     assert conn.execute(
         "SELECT stage, refine_id, detect_id FROM pipeline_artifacts ORDER BY stage"
     ).fetchall() == [("detect", None, detect_id), ("refine", refine_id, None)]
