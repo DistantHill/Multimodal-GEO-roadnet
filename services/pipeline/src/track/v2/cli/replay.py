@@ -11,7 +11,7 @@ import getpass
 import uuid
 
 from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
-from ..db.schema import require_schema_v4
+from ..db.schema import require_current_schema
 from ..logger import init_logger, shutdown_logger
 from ..output import error_payload, print_json
 from ..replay import (
@@ -104,7 +104,7 @@ def main() -> int:
     try:
         try:
             with pg_connect(config) as conn:
-                require_schema_v4(conn)
+                require_current_schema(conn)
                 service = ReplayService(PostgresReplayStore(conn))
                 trace = service.replay(target)
         except (RuntimeError, ValueError) as exc:

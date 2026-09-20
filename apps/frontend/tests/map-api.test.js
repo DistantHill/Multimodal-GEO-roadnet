@@ -160,3 +160,40 @@ test('layer keeps nullable point properties and completion metadata unchanged', 
   assert.equal(result.metadata.bbox, null);
   assert.equal(result.metadata.crs, 'EPSG:4326');
 });
+
+test('layers preserve entry-exit and centerline feature collections unchanged', async () => {
+  const entryExit = {
+    type: 'Feature', id: 7, geometry: { type: 'Point', coordinates: [120.1, 30.2] },
+    properties: {
+      detect_id: 'detect-1', crossing_id: 7, intersection_id: 8,
+      resolved_point_id: 9, source_row_key: null, subtrack_index: 10,
+      crossing_type: 1, crossing_kind: 'entry',
+    },
+  };
+  const centerline = {
+    type: 'Feature', id: 81,
+    geometry: { type: 'LineString', coordinates: [[120.1, 30.2], [120.2, 30.3]] },
+    properties: {
+      detect_id: 'detect-1', variant: 'directed', from_intersection_id: 11,
+      to_intersection_id: 12, length_m: 123.5, forward_clip_count: 8,
+      reverse_clip_count: 3,
+    },
+  };
+  const payloads = [
+    { type: 'FeatureCollection', features: [entryExit], metadata: { detect_id: 'detect-1', count: 1 } },
+    { type: 'FeatureCollection', features: [centerline], metadata: { detect_id: 'detect-1', fit_id: 'fit-1', count: 1 } },
+  ];
+  globalThis.fetch = async () => jsonResponse(payloads.shift());
+
+  const entryResult = await loadMapLayer('entry_exit_points', { detectId: 'detect-1' });
+  const centerlineResult = await loadMapLayer('centerlines', { detectId: 'detect-1', fitId: 'fit-1' });
+
+  assert.deepEqual(entryResult, {
+    featureCollection: { type: 'FeatureCollection', features: [entryExit] },
+    metadata: { detect_id: 'detect-1', count: 1, context: {} },
+  });
+  assert.deepEqual(centerlineResult, {
+    featureCollection: { type: 'FeatureCollection', features: [centerline] },
+    metadata: { detect_id: 'detect-1', fit_id: 'fit-1', count: 1, context: {} },
+  });
+});

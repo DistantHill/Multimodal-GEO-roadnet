@@ -75,6 +75,34 @@ def test_resolved_point_identity_and_nullable_crossings(source_key: str | None) 
     }
 
 
+def test_intersection_feature_contract_is_exact() -> None:
+    polygon = {
+        "type": "Polygon",
+        "coordinates": [[[120.0, 30.0], [120.2, 30.0], [120.0, 30.0]]],
+    }
+    result = PostgresMapStore._intersection_feature(
+        (17, 120.1, 30.2, 35.5, "[10.0, 95.0]", '{"10->95": 4}', 6,
+         '{"vehicle-1": 3}', '["vehicle-1"]', polygon),
+        DETECT_ID,
+    )
+    assert result == {
+        "type": "Feature",
+        "id": 17,
+        "geometry": polygon,
+        "properties": {
+            "detect_id": DETECT_ID,
+            "intersection_id": 17,
+            "centroid": [120.1, 30.2],
+            "clip_radius_m": 35.5,
+            "branch_centers_deg": [10.0, 95.0],
+            "transition_counts": {"10->95": 4},
+            "observation_count": 6,
+            "contributors": {"vehicle-1": 3},
+            "critical_contributors": ["vehicle-1"],
+        },
+    }
+
+
 @pytest.mark.parametrize("kind, label", [(1, "entry"), (2, "exit")])
 def test_crossing_fields_keep_resolved_identity(kind: int, label: str) -> None:
     result = PostgresMapStore._entry_exit_feature((7, 8, 9, 10, kind, POINT), DETECT_ID)

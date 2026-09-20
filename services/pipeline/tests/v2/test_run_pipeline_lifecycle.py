@@ -246,7 +246,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.stack.enter_context(
             patch("track.v2.pipeline.PostgresPipelineStore", return_value=self.store)
         )
-        self.stack.enter_context(patch("track.v2.pipeline.require_schema_v4"))
+        self.stack.enter_context(patch("track.v2.pipeline.require_current_schema"))
         self.stack.enter_context(patch("track.v2.pipeline.verify_refine_source_fingerprint"))
         self.stack.enter_context(
             patch(

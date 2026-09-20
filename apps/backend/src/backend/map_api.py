@@ -1,4 +1,4 @@
-"""Read-only map, replay, and Clip projections for schema v4.
+"""Read-only map, replay, and Clip projections for the current schema.
 
 The Backend never reconstructs Detect geometry. In particular, Clip consumes
 the final ``resolved_subtrack_points`` order and its persisted crossing rows.
@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 import psycopg
 from pyproj import CRS, Proj, Transformer
 
-from .database import get_read_connection, open_read_connection, require_schema_v4
+from .database import get_read_connection, open_read_connection, require_current_schema
 from .map_schemas import BBox, ClipRequest, FeatureCollection, ReplayRequest, parse_bbox
 
 
@@ -291,7 +291,7 @@ _LAYER_DEFINITIONS = (
 
 
 class PostgresMapStore:
-    """Bounded, read-only projections over Pipeline schema v4."""
+    """Bounded, read-only projections over the current Pipeline schema."""
 
     def __init__(self, connection: Any) -> None:
         self.connection = connection
@@ -528,11 +528,11 @@ class PostgresMapStore:
         try:
             with open_read_connection(request.database_name) as connection:
                 try:
-                    require_schema_v4(connection)
+                    require_current_schema(connection)
                 except RuntimeError as exc:
                     raise HTTPException(status_code=409, detail={
                         "error": "database_schema_mismatch",
-                        "message": "所选数据库不是兼容的 schema v4，请确认 QGIS 图层的 database 是否对应。",
+                        "message": "所选数据库不是兼容的当前 schema v7，请确认 QGIS 图层的 database 是否对应。",
                     }) from exc
                 result = getattr(PostgresMapStore(connection), operation)(
                     request.model_copy(update={"database_name": None})
@@ -1040,9 +1040,9 @@ def get_map_store(
     try:
         with open_read_connection(database_name) as target:
             try:
-                require_schema_v4(target)
+                require_current_schema(target)
             except RuntimeError as exc:
-                raise HTTPException(409, detail="所选数据库不兼容 schema v4，请选择业务数据库。") from exc
+                raise HTTPException(409, detail="所选数据库不兼容当前 schema v7，请选择业务数据库。") from exc
             yield PostgresMapStore(target)
     except psycopg.Error as exc:
         raise database_query_error(exc) from exc

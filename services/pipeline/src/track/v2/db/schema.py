@@ -9,8 +9,8 @@ SCHEMA_COMPONENT = "track.v2"
 SCHEMA_VERSION = 7
 
 
-def require_schema_v4(conn: Any) -> None:
-    """Fail before work unless schema v7 is installed (legacy API name)."""
+def require_current_schema(conn: Any) -> None:
+    """Fail before work unless the current track.v2 schema is installed."""
     with conn.cursor() as cur:
         cur.execute("SELECT to_regclass('pipeline_schema_versions')")
         if cur.fetchone()[0] is None:

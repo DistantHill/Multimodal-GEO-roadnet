@@ -6,10 +6,7 @@ from collections.abc import Iterator
 from typing import Any
 
 import psycopg
-
-
-SCHEMA_COMPONENT = "track.v2"
-SCHEMA_VERSION = 4
+from track.v2.db.schema import SCHEMA_VERSION, require_current_schema
 
 
 def postgres_connection_settings() -> dict[str, Any]:
@@ -24,31 +21,10 @@ def postgres_connection_settings() -> dict[str, Any]:
     }
 
 
-def require_schema_v4(connection: Any) -> None:
-    """Fail closed when Backend is connected to anything except schema v4."""
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT to_regclass('pipeline_schema_versions')")
-        if cursor.fetchone()[0] is None:
-            raise RuntimeError(
-                "track.v2 schema metadata is missing; run init_db --reset"
-            )
-        cursor.execute(
-            "SELECT version FROM pipeline_schema_versions WHERE component = %s",
-            (SCHEMA_COMPONENT,),
-        )
-        row = cursor.fetchone()
-    if row is None or int(row[0]) != SCHEMA_VERSION:
-        actual = "missing" if row is None else f"v{int(row[0])}"
-        raise RuntimeError(
-            f"track.v2 schema mismatch: expected v{SCHEMA_VERSION}, got {actual}; "
-            "for v3 run init-db --migrate-refine; older schemas require --reset"
-        )
-
-
 def verify_runtime_schema() -> None:
     """Open one startup connection and enforce the Pipeline schema contract."""
     with psycopg.connect(**postgres_connection_settings()) as connection:
-        require_schema_v4(connection)
+        require_current_schema(connection)
 
 
 def get_read_connection() -> Iterator[Any]:

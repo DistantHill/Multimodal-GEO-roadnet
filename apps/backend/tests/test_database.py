@@ -92,15 +92,16 @@ def test_target_database_connection_does_not_mutate_default(monkeypatch):
     assert connection.closed and connection.rolled_back
 
 
-def test_schema_guard_accepts_only_track_v2_schema_v4() -> None:
-    current = ScriptedConnection([("pipeline_schema_versions",), (4,)])
-    database.require_schema_v4(current)
+def test_schema_guard_accepts_only_current_track_v2_schema() -> None:
+    assert database.SCHEMA_VERSION == 7
+    current = ScriptedConnection([("pipeline_schema_versions",), (7,)])
+    database.require_current_schema(current)
     assert current.cursor_instance.executions[1][1] == ("track.v2",)
 
     stale = ScriptedConnection([("pipeline_schema_versions",), (2,)])
-    with pytest.raises(RuntimeError, match="expected v4, got v2"):
-        database.require_schema_v4(stale)
+    with pytest.raises(RuntimeError, match="expected v7, got v2"):
+        database.require_current_schema(stale)
 
     missing = ScriptedConnection([(None,)])
     with pytest.raises(RuntimeError, match="schema metadata is missing"):
-        database.require_schema_v4(missing)
+        database.require_current_schema(missing)

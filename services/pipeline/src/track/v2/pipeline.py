@@ -22,7 +22,7 @@ from .config import PostgresConfig, connect as pg_connect
 from .config.pipeline_config import load_pipeline_config
 from .db.pipeline_store import PipelineStore, PostgresPipelineStore
 from .db.artifact_registry import find_refine_artifact
-from .db.schema import require_schema_v4
+from .db.schema import require_current_schema
 from .db.source_table import (
     calculate_source_fingerprint,
     source_order_query,
@@ -126,7 +126,7 @@ def run_pipeline(
     reuse_refine = refine_id is not None
 
     with ExitStack() as resources, pg_connect(db_config) as conn:
-        require_schema_v4(conn)
+        require_current_schema(conn)
         store: PipelineStore = PostgresPipelineStore(conn)
         if reuse_refine:
             refine_record = store.get_refine_run(str(refine_id))

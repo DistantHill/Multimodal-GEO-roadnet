@@ -32,7 +32,7 @@ from ..db.queries import (
     fetch_intersections,
     fetch_resolved_clip_tracks,
 )
-from ..db.schema import require_schema_v4
+from ..db.schema import require_current_schema
 from ..db.source_table import verify_refine_source_fingerprint
 from ..models import ClipInput
 
@@ -332,7 +332,7 @@ def main() -> int:
     }
     with connect(config) as conn:
         conn.execute("SET TRANSACTION READ ONLY")
-        require_schema_v4(conn)
+        require_current_schema(conn)
         report["tables"] = _table_metrics(conn)
         detect_id = args.detect_id or _latest_completed_detect(conn)
         report["detect_id"] = detect_id

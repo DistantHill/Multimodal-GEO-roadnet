@@ -167,7 +167,7 @@ class PipelineConfigWiringTest(unittest.TestCase):
             patch("track.v2.pipeline.load_pipeline_config", return_value=pipeline_config),
             patch("track.v2.pipeline.pg_connect", return_value=_Connection()),
             patch("track.v2.pipeline.PostgresPipelineStore", return_value=store),
-            patch("track.v2.pipeline.require_schema_v4"),
+            patch("track.v2.pipeline.require_current_schema"),
             patch("track.v2.pipeline.verify_refine_source_fingerprint"),
             patch("track.v2.pipeline.validate_source_table", return_value=MagicMock()),
             patch(

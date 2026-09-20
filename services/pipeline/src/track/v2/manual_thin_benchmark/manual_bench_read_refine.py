@@ -20,7 +20,7 @@ import time
 
 from track.v2 import get_database
 from track.v2.refine import refine_vehicle
-from track.v2.db.schema import require_schema_v4
+from track.v2.db.schema import require_current_schema
 from track.v2.db.source_table import source_order_query, validate_source_table
 from track.v2.manual_thin_benchmark._thin_bench_helpers import (
     TEST_DB_NAME,
@@ -70,7 +70,7 @@ def main() -> None:
     try:
         conn.execute("SET TRANSACTION READ ONLY")
         conn.execute("SET LOCAL statement_timeout TO '10min'")
-        require_schema_v4(conn)
+        require_current_schema(conn)
         contract = validate_source_table(conn, SOURCE_TABLE)
         source = PostgresSource(
             config=None,  # type: ignore[arg-type] -- factory owns connections

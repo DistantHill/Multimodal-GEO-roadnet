@@ -61,7 +61,7 @@ def test_existing_database_routes_request_without_changing_default(operation):
         )
     )
     with patch("backend.map_api.open_read_connection", connection), patch(
-        "backend.map_api.require_schema_v4"
+        "backend.map_api.require_current_schema"
     ) as schema, patch("backend.map_api.PostgresMapStore") as factory:
         getattr(factory.return_value, operation).return_value = {"features": []}
         result = store._query_database(operation, request)
@@ -78,7 +78,7 @@ def test_incompatible_target_schema_returns_structured_error():
     store = PostgresMapStore(Mock())
     store._fetchone = Mock(return_value=("roadnet", True))
     with patch("backend.map_api.open_read_connection"), patch(
-        "backend.map_api.require_schema_v4", side_effect=RuntimeError("bad schema")
+        "backend.map_api.require_current_schema", side_effect=RuntimeError("bad schema")
     ), pytest.raises(HTTPException) as error:
         store.replay(ReplayRequest(database_name="other", source_row_keys=["1"]))
     assert error.value.status_code == 409

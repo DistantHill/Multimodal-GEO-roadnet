@@ -67,7 +67,7 @@
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
-| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 已开始（C12a） |
+| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 已开始（C12a、C12b） |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
 ## 3. 任务卡
@@ -619,6 +619,28 @@ DuckDB/Polars 引擎管理的线程、临时目录与外存溢写配置。
 
 验证：Markdown 相对链接目标存在；CLI help 与 parser 一致；文档/配置定向测试；工作树
 只包含本卡文档及既有未跟踪用户文件。
+
+提交：`3bd828b`。
+
+#### C12b — Schema guard 与最终字段兼容闸门
+
+范围：修复 Pipeline 已使用 schema v7、Backend 却仍复制并硬编码 schema v4 guard 的
+真实集成故障。Pipeline、Backend、命令行接口、手工基准与测试统一使用
+`track.v2.db.schema.require_current_schema`；Backend 直接导入共享 `SCHEMA_VERSION` 和
+guard，不保留旧名称或第二套校验实现。地图接口的活跃说明与错误提示同步为当前
+schema v7。
+
+最终字段兼容采用唯一方案：不改业务表、Parquet Schema 或 API 字段，以 Backend 的
+精确 Feature 断言固定 intersection、resolved point、entry/exit 和 centerline 输出，
+并以 Frontend FeatureCollection 回归固定 entry/exit、centerline 的 properties 与 metadata
+透传。迁移说明同步当前 v7 以及 v3、v4/v5/v6 的既有迁移入口，保留 patch ledger 手工
+清理说明。
+
+验证：Backend 定向 `23 passed`、全量 `75 passed`；Pipeline schema 定向 `38 passed`、
+全量 `945 passed, 50 skipped`；Frontend 全量 `npm test` 为 `14 passed`；全仓检索确认
+活跃生产与测试不存在旧 guard 或 schema v4 错误提示。历史迁移
+实现、历史文档和保留文件名中的 v4 阶段叙述不属于旧活跃 guard。C12b 不执行 1M 差分或
+资源剖析，因此不宣称 C12 或 C13 完成。
 
 提交：待记录。
 
