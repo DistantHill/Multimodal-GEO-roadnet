@@ -531,7 +531,10 @@ def run_pipeline(
         sink(PipelineEvent.stage_start("Clip: 路段切分 / Track clipping"))
         clip_config = pc.clip
         clip_assembly_started = time.perf_counter()
-        clip_result = store.load_clip(detect_id, config=clip_config)
+        clip_result = store.load_clip(
+            detect_id, publication_root=_parquet_root(), runtime=pc.runtime,
+            config=clip_config,
+        )
         close_clips = getattr(clip_result.clips, "close", None)
         if close_clips is not None:
             resources.callback(close_clips)

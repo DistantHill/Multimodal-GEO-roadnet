@@ -10,17 +10,20 @@ from uuid import uuid4
 
 import duckdb
 import pytest
+from unittest.mock import patch
 
 from track.v2.artifact_parquet import build_descriptor, validate_published
 from track.v2.artifact_publication import create_staging, publish
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
 from track.v2.config import PostgresConfig
 from track.v2.db.queries import fetch_intersections, fetch_resolved_clip_tracks
+from track.v2.db.queries import fetch_detect_row
 from track.v2.db.artifact_registry import find_detect_artifact
 from track.v2.db.pipeline_store import PostgresPipelineStore
 from track.v2.detect_parquet import export_detect_parquet
 from track.v2.detect_parquet_reader import DetectDatasetReader
-from track.v2.models import RuntimeConfig
+from track.v2.clip import extract_clips, extract_clips_for_detect
+from track.v2.models import ClipConfig, ClipInput, RuntimeConfig
 
 
 pytestmark = pytest.mark.skipif(
@@ -149,6 +152,32 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
     ) as reader:
         assert list(reader.intersections()) == expected_intersections
         assert list(reader.iter_tracks(batch_size=1)) == expected_tracks
+    oracle_input = ClipInput(
+        tuple(expected_intersections), tuple(expected_tracks),
+        fetch_detect_row(conn, str(detect_id)).spatial_context, str(detect_id),
+    )
+    for include_boundaries in (True, False):
+        clip_config = ClipConfig(include_boundary_clips=include_boundaries)
+        expected_clip = extract_clips(oracle_input, config=clip_config)
+        with (
+            patch("track.v2.db.source_table.verify_refine_source_fingerprint",
+                  side_effect=AssertionError("legacy source fingerprint called")),
+            patch("track.v2.db.queries.fetch_intersections",
+                  side_effect=AssertionError("legacy intersection reader called")),
+            patch("track.v2.db.queries.fetch_resolved_clip_tracks",
+                  side_effect=AssertionError("legacy track reader called")),
+        ):
+            actual_clip = extract_clips_for_detect(
+                conn, str(detect_id), publication_root=tmp_path,
+                runtime=RuntimeConfig(duckdb_threads=1), config=clip_config,
+            )
+        try:
+            assert actual_clip.as_dict() == expected_clip.as_dict()
+            assert tuple(actual_clip.clips) == expected_clip.clips
+            assert actual_clip.report == expected_clip.report
+            assert actual_clip.intersections == expected_clip.intersections
+        finally:
+            actual_clip.clips.close()
     with duckdb.connect() as db:
         root = publication.final_path
         actual_intersections = db.execute(

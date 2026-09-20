@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import unittest
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from track.v2 import (
     ClipConfig,
@@ -14,7 +14,8 @@ from track.v2 import (
     extract_clips,
     extract_clips_for_detect,
 )
-from track.v2.models import ResolvedTrackPoint, SpatialContext
+from track.v2 import clip as clip_module
+from track.v2.models import ResolvedTrackPoint, RuntimeConfig, SpatialContext
 from track.v2.projection import CoordinateTransformer
 
 
@@ -234,6 +235,11 @@ class ResolvedSequenceClipTest(unittest.TestCase):
 
 
 class DetectClipLoadTest(unittest.TestCase):
+    def test_formal_loader_has_no_legacy_postgres_point_stream_seams(self) -> None:
+        self.assertFalse(hasattr(clip_module, "verify_refine_source_fingerprint"))
+        self.assertFalse(hasattr(clip_module, "fetch_intersections"))
+        self.assertFalse(hasattr(clip_module, "fetch_resolved_clip_tracks"))
+
     def test_completed_detect_loads_final_resolved_sequence(self) -> None:
         run = SimpleNamespace(
             status="completed",
@@ -241,26 +247,87 @@ class DetectClipLoadTest(unittest.TestCase):
             spatial_context=_CONTEXT,
         )
         tracks = (ClipTrack("v", "s", (_point(1, -10.0), _point(2, 10.0)), 1),)
+        reader = MagicMock()
+        reader.__enter__.return_value = reader
+        reader.intersections.return_value = ()
+        reader.iter_tracks.return_value = iter(tracks)
+        conn = MagicMock()
         with (
             patch("track.v2.clip.fetch_detect_row", return_value=run),
-            patch("track.v2.clip.verify_refine_source_fingerprint") as verify,
-            patch("track.v2.clip.fetch_intersections", return_value=[]),
-            patch("track.v2.clip.fetch_resolved_clip_tracks", return_value=list(tracks)),
+            patch("track.v2.clip.find_detect_artifact", return_value=SimpleNamespace(
+                descriptor="descriptor", state="present",
+            )),
+            patch("track.v2.clip.DetectDatasetReader", return_value=reader) as factory,
         ):
-            result = extract_clips_for_detect(object(), "detect-1")
+            result = extract_clips_for_detect(
+                conn, "detect-1", publication_root="/parquet", runtime=RuntimeConfig(),
+            )
 
-        verify.assert_called_once_with(ANY, "refine-1")
+        factory.assert_called_once_with("/parquet", "descriptor", "present", ANY)
+        reader.__exit__.assert_called_once()
+        conn.commit.assert_not_called()
         self.assertEqual(result.detect_id, "detect-1")
         self.assertEqual(result.report.full_track_clips, 1)
+
+    def test_artifact_failure_closes_spool_without_postgres_fallback(self) -> None:
+        run = SimpleNamespace(status="completed", spatial_context=_CONTEXT)
+        conn = MagicMock()
+        spool = MagicMock()
+        with (
+            patch("track.v2.clip.fetch_detect_row", return_value=run),
+            patch("track.v2.clip.find_detect_artifact", return_value=SimpleNamespace(
+                descriptor="descriptor", state="deleted",
+            )),
+            patch("track.v2.clip.DetectDatasetReader", side_effect=ValueError("deleted")),
+            patch.object(
+                clip_module.DiskSequence, "__class_getitem__",
+                return_value=lambda: spool,
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "deleted"):
+                extract_clips_for_detect(
+                    conn, "detect-1", publication_root="/parquet",
+                    runtime=RuntimeConfig(),
+                )
+        spool.close.assert_called_once_with()
+
+    def test_track_iteration_failure_closes_reader_and_spool(self) -> None:
+        run = SimpleNamespace(status="completed", spatial_context=_CONTEXT)
+        reader = MagicMock()
+        reader.__enter__.return_value = reader
+        reader.intersections.return_value = ()
+        reader.iter_tracks.side_effect = ValueError("broken relation")
+        spool = MagicMock()
+        with (
+            patch("track.v2.clip.fetch_detect_row", return_value=run),
+            patch("track.v2.clip.find_detect_artifact", return_value=SimpleNamespace(
+                descriptor="descriptor", state="present",
+            )),
+            patch("track.v2.clip.DetectDatasetReader", return_value=reader),
+            patch.object(
+                clip_module.DiskSequence, "__class_getitem__",
+                return_value=lambda: spool,
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "broken relation"):
+                extract_clips_for_detect(
+                    MagicMock(), "detect-1", publication_root="/parquet",
+                    runtime=RuntimeConfig(),
+                )
+        reader.__exit__.assert_called_once()
+        spool.close.assert_called_once_with()
 
     def test_incomplete_detect_is_rejected_before_child_queries(self) -> None:
         run = SimpleNamespace(status="running", refine_id="refine-1")
         with (
             patch("track.v2.clip.fetch_detect_row", return_value=run),
-            patch("track.v2.clip.fetch_intersections") as fetch,
+            patch("track.v2.clip.find_detect_artifact") as fetch,
         ):
             with self.assertRaisesRegex(ValueError, "is not completed"):
-                extract_clips_for_detect(object(), "detect-1")
+                extract_clips_for_detect(
+                    object(), "detect-1", publication_root="/parquet",
+                    runtime=RuntimeConfig(),
+                )
         fetch.assert_not_called()
 
 

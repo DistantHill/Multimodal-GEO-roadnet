@@ -4,7 +4,7 @@ from dataclasses import replace
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -16,7 +16,7 @@ from track.v2.fitting import (
     _OrientedClip, _fit_pair_stream, _orient_clip, _resample_at_progress,
     _resample_at_spacing, _xy_polyline_length, fit_centerline_variants,
 )
-from track.v2.models import Centerline, ClipInput, ClipTrack, FittingConfig
+from track.v2.models import Centerline, ClipInput, ClipTrack, FittingConfig, RuntimeConfig
 from track.v2.projection import CoordinateTransformer
 from .test_clip import _CONTEXT, _point
 from .test_fitting_network import _clip, _clip_result, _TRANSFORMER
@@ -43,13 +43,21 @@ def test_streamed_clip_result_matches_memory_and_serializes():
                    for i in range(1, 4))
     run = SimpleNamespace(status="completed", refine_id="r", spatial_context=_CONTEXT)
     expected = extract_clips(ClipInput((), tracks, _CONTEXT, "detect"))
+    reader = MagicMock()
+    reader.__enter__.return_value = reader
+    reader.intersections.return_value = ()
+    reader.iter_tracks.return_value = iter(tracks)
+    conn = MagicMock()
     with (
         patch("track.v2.clip.fetch_detect_row", return_value=run),
-        patch("track.v2.clip.verify_refine_source_fingerprint"),
-        patch("track.v2.clip.fetch_intersections", return_value=[]),
-        patch("track.v2.clip.fetch_resolved_clip_tracks", return_value=iter(tracks)),
+        patch("track.v2.clip.find_detect_artifact", return_value=SimpleNamespace(
+            descriptor="descriptor", state="present",
+        )),
+        patch("track.v2.clip.DetectDatasetReader", return_value=reader),
     ):
-        actual = extract_clips_for_detect(object(), "detect")
+        actual = extract_clips_for_detect(
+            conn, "detect", publication_root="/parquet", runtime=RuntimeConfig(),
+        )
     try:
         assert actual.as_dict() == expected.as_dict()
         assert tuple(actual.clips) == expected.clips

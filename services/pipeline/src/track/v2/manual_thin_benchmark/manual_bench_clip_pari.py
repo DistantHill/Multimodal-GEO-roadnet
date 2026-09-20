@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -7,14 +8,21 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from track.v2.clip import extract_clips_for_detect
 from track.v2.config import connect, default_postgres_config
+from track.v2.config.pipeline_config import load_pipeline_config
 
 DETECT_ID = "a06566cc-c860-4efd-9ae2-c536a7d1477b"
 PAIRS = {(55,79), (79,55)}
 
 
 def main() -> None:
+    runtime = load_pipeline_config().runtime
+    publication_root = Path(os.environ.get(
+        "PARQUET_ROOT", str(Path(os.environ.get("DATA_ROOT", "/data")) / "parquet"),
+    ))
     with connect(default_postgres_config()) as conn:
-        result = extract_clips_for_detect(conn, DETECT_ID)
+        result = extract_clips_for_detect(
+            conn, DETECT_ID, publication_root=publication_root, runtime=runtime,
+        )
 
     clips = [
         clip

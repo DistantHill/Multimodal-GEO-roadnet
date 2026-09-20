@@ -10,6 +10,7 @@ EN: Provide a stage-level wrapper around the existing PostgreSQL writers and
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Protocol
 
 from ..heartbeat import validation_notices
@@ -40,6 +41,7 @@ from ..models import (
     ExcludedPoint,
     FittingConfig,
     RefinementSubtrack,
+    RuntimeConfig,
     SpatialContext,
 )
 
@@ -141,6 +143,8 @@ class PipelineStore(Protocol):
         self,
         detect_id: str,
         *,
+        publication_root: Path | str,
+        runtime: RuntimeConfig,
         config: ClipConfig | None = None,
     ) -> ClipResult: ...
 
@@ -348,9 +352,14 @@ class PostgresPipelineStore:
         self,
         detect_id: str,
         *,
+        publication_root: Path | str,
+        runtime: RuntimeConfig,
         config: ClipConfig | None = None,
     ) -> ClipResult:
-        return extract_clips_for_detect(self._conn, detect_id, config=config)
+        return extract_clips_for_detect(
+            self._conn, detect_id, publication_root=publication_root,
+            runtime=runtime, config=config,
+        )
 
     def start_fit_run(
         self,

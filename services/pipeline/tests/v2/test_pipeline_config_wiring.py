@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from track.v2.config import PostgresConfig
@@ -74,6 +75,8 @@ class _ConfigRecordingStore:
             getattr(self.fit_bundle, variant).report.as_dict.return_value = {}
             getattr(self.fit_bundle, variant).issues = ()
         self.loaded_clip_config: object | None = None
+        self.loaded_clip_publication_root: object | None = None
+        self.loaded_clip_runtime: object | None = None
         self.fit_clip_config: object | None = None
         self.fit_fitting_config: object | None = None
 
@@ -106,7 +109,12 @@ class _ConfigRecordingStore:
     def complete_detect_with_artifact(self, detect_id: str, descriptor: object) -> None:
         return None
 
-    def load_clip(self, detect_id: str, *, config: object) -> object:
+    def load_clip(
+        self, detect_id: str, *, publication_root: object,
+        runtime: object, config: object,
+    ) -> object:
+        self.loaded_clip_publication_root = publication_root
+        self.loaded_clip_runtime = runtime
         self.loaded_clip_config = config
         return self.clip_result
 
@@ -172,10 +180,13 @@ class PipelineConfigWiringTest(unittest.TestCase):
             patch("track.v2.pipeline._add_clip_stats"),
             patch("track.v2.pipeline._add_fit_stats"),
             patch("track.v2.pipeline._add_network_stats"),
+            patch("track.v2.pipeline._parquet_root", return_value=Path("/tmp/parquet")),
         ):
             run_pipeline(PipelineInput(db_config, refine_id=REFINE_ID))
 
         self.assertIs(store.loaded_clip_config, clip_config)
+        self.assertEqual(store.loaded_clip_publication_root, Path("/tmp/parquet"))
+        self.assertIs(store.loaded_clip_runtime, pipeline_config.runtime)
         self.assertIs(store.fit_clip_config, clip_config)
         self.assertIs(store.fit_fitting_config, fitting_config)
         fit.assert_called_once_with(store.clip_result, config=fitting_config)
