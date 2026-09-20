@@ -10,12 +10,12 @@ import pytest
 
 from track.v2 import db_writer as writer
 from track.v2.models import RefinedPointRef, HotspotCluster
-from .writer_workspace_helpers import run_resolved_sequence
+from .writer_relation_helpers import run_resolved_sequence
 from v2.test_db_writer import _build_resolved_rows, _crossing
 
 
 @pytest.mark.parametrize('batch_size', [1, 2, 3, 100])
-def test_streamed_rows_match_materialized_sequence_and_sparse_mapping(monkeypatch, batch_size):
+def test_streamed_rows_match_materialized_sequence_and_sparse_mapping(monkeypatch, tmp_path, batch_size):
     refs = [RefinedPointRef('kept', 100 + i, 1 if i < 3 else 2, i if i < 3 else i - 3)
             for i in range(5)]
     refs[1] = replace(refs[1], point_kind='injected')
@@ -58,7 +58,7 @@ def test_streamed_rows_match_materialized_sequence_and_sparse_mapping(monkeypatc
     result = SimpleNamespace(turn_events=[], cross_track_candidates=[])
     count, mapping = run_resolved_sequence(
         SimpleNamespace(cursor=lambda: nullcontext(None)), 'detect', 'refine',
-        result, crossings, crossings, crossing_ids, batch_size=batch_size,
+        result, crossings, crossings, crossing_ids, batch_size=batch_size, data_root=tmp_path,
     )
     assert sorted(copied, key=lambda row: (row[2], row[4])) == expected
     assert count == len(expected)
@@ -66,7 +66,7 @@ def test_streamed_rows_match_materialized_sequence_and_sparse_mapping(monkeypatc
     assert state['closed']
 
 
-def test_streaming_closes_reader_after_copy_failure(monkeypatch):
+def test_streaming_closes_reader_after_copy_failure(monkeypatch, tmp_path):
     closed = []
 
     def batches(*args):
@@ -85,12 +85,13 @@ def test_streaming_closes_reader_after_copy_failure(monkeypatch):
     with pytest.raises(RuntimeError, match='copy failed'):
         run_resolved_sequence(
             SimpleNamespace(cursor=lambda: nullcontext(None)), 'detect', 'refine',
-            SimpleNamespace(turn_events=[], cross_track_candidates=[]), [], [], {}, batch_size=1,
+            SimpleNamespace(turn_events=[], cross_track_candidates=[]), [], [], {},
+            batch_size=1, data_root=tmp_path,
         )
     assert closed == [True]
 
 
-def test_sparse_mapping_retains_unclustered_events_and_cross_segments(monkeypatch):
+def test_sparse_mapping_retains_unclustered_events_and_cross_segments(monkeypatch, tmp_path):
     refs = [RefinedPointRef('kept', i, 1, i) for i in range(5)]
     monkeypatch.setattr(writer, '_iter_refine_member_batches',
                         lambda *args: (batch for batch in [[writer._RefineMember(r, 'v') for r in refs]]))
@@ -102,14 +103,14 @@ def test_sparse_mapping_retains_unclustered_events_and_cross_segments(monkeypatc
     )
     count, mapping = run_resolved_sequence(
         SimpleNamespace(cursor=lambda: nullcontext(None)), 'd', 'r', result,
-        [], [], {}, batch_size=5,
+        [], [], {}, batch_size=5, data_root=tmp_path,
     )
     assert count == 5
     assert mapping == {writer._refine_key(refs[i]): i + 10 for i in (0, 2, 3)}
 
 
 @pytest.mark.skipif(not os.getenv('ROADNET_TEST_DSN'), reason='ROADNET_TEST_DSN is not set')
-def test_named_cursor_and_batched_copy_share_atomic_transaction():
+def test_named_cursor_and_batched_copy_share_atomic_transaction(tmp_path):
     import psycopg
     with psycopg.connect(os.environ['ROADNET_TEST_DSN']) as conn:
         try:
@@ -128,7 +129,7 @@ def test_named_cursor_and_batched_copy_share_atomic_transaction():
             conn.execute("INSERT INTO injected_points VALUES (1,'r','v',1,0)")
             result = SimpleNamespace(turn_events=[], cross_track_candidates=[])
             count, mapping = run_resolved_sequence(
-                conn, 'd', 'r', result, [], [], {}, batch_size=1,
+                conn, 'd', 'r', result, [], [], {}, batch_size=1, data_root=tmp_path,
             )
             assert count == 4 and mapping == {}
             assert conn.execute('''SELECT id,subtrack_index,refined_sequence_in_subtrack,
@@ -146,16 +147,16 @@ def test_named_cursor_and_batched_copy_share_atomic_transaction():
 
 
 @pytest.mark.parametrize('missing_ref', [False, True])
-def test_empty_refine_and_missing_required_source(monkeypatch, missing_ref):
+def test_empty_refine_and_missing_required_source(monkeypatch, tmp_path, missing_ref):
     monkeypatch.setattr(writer, '_iter_refine_member_batches', lambda *args: (x for x in []))
     events = [SimpleNamespace(refined_point_ref=RefinedPointRef('kept', 1, 1, 0))] if missing_ref else []
     result = SimpleNamespace(turn_events=events, cross_track_candidates=[])
     args = (SimpleNamespace(cursor=lambda: nullcontext(None)), 'd', 'r', result, [], [], {})
     if missing_ref:
         with pytest.raises(KeyError):
-            run_resolved_sequence(*args, batch_size=1)
+            run_resolved_sequence(*args, batch_size=1, data_root=tmp_path)
     else:
-        assert run_resolved_sequence(*args, batch_size=1) == (0, {})
+        assert run_resolved_sequence(*args, batch_size=1, data_root=tmp_path) == (0, {})
 
 
 def test_refine_vehicle_check_crosses_fetch_batch_boundary():
@@ -187,7 +188,7 @@ def test_refine_vehicle_check_crosses_fetch_batch_boundary():
     assert cursor.closed
 
 
-def test_short_copy_batches_keep_cumulative_heartbeat(monkeypatch):
+def test_short_copy_batches_keep_cumulative_heartbeat(monkeypatch, tmp_path):
     from threading import Event
     from track.v2.heartbeat import operation_heartbeat
 
@@ -226,7 +227,8 @@ def test_short_copy_batches_keep_cumulative_heartbeat(monkeypatch):
     with operation_heartbeat('外层写入', emit=emit, interval=.01):
         count, _ = run_resolved_sequence(
             SimpleNamespace(cursor=lambda: nullcontext(Cursor())), 'd', 'r',
-            SimpleNamespace(turn_events=[], cross_track_candidates=[]), [], [], {}, batch_size=1,
+            SimpleNamespace(turn_events=[], cross_track_candidates=[]), [], [], {},
+            batch_size=1, data_root=tmp_path,
         )
     assert count == 3
     assert ticks[1].is_set() and ticks[2].is_set()

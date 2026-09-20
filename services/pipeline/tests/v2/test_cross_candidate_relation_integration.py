@@ -14,7 +14,7 @@ from track.v2 import detect
 from track.v2.cross_candidate_relation import ClusterMemberSequence, CrossCandidateRelation
 from track.v2.member_sequences import ConcatSequence
 from track.v2.db_writer import _insert_tracks_cross, _refine_key
-from track.v2.writer_workspace import WriterWorkspace
+from track.v2.writer_relation import WriterRelation
 from track.v2.models import RefinedPointRef, RuntimeConfig
 from track.v2.models import HotspotCluster, PointRef
 from .test_ablation_centroid_memory import _crossing, _event
@@ -22,10 +22,16 @@ from .test_detect import _TEST_SPATIAL_CONTEXT, _TEST_TRANSFORMER
 
 
 
-def membership_rows(clusters, ids):
-    with WriterWorkspace(batch_size=3, merge_fan_in=2) as ws:
-        ws.prepare_annotations(clusters, ids, [])
-        return list(ws.records("unique_members"))
+def membership_rows(tmp_path, clusters, ids):
+    with WriterRelation(RuntimeConfig(), tmp_path, "membership", batch_size=3) as relation:
+        relation.resolve_sources()
+        relation.prepare_annotations(clusters, ids, [])
+        return relation._connection.execute("""
+            SELECT kind,calculation_index,candidate_id FROM members
+            QUALIFY row_number() OVER (
+                PARTITION BY kind,calculation_index ORDER BY encounter
+            )=1 ORDER BY kind,calculation_index
+        """).fetchall()
 
 
 def eager_membership_rows(clusters, ids):
@@ -99,7 +105,9 @@ def test_complete_pipeline_matches_eager_order_refs_ablation_and_writer_membersh
         assert len(cluster_pass_ids(spool)) == 1  # ablation passes were removed
         assert spool[-1] == values[-1]  # noise retained independently of members
         ids = {cluster.cluster_calculate_index: 100 + i for i, cluster in enumerate(actual)}
-        assert membership_rows(actual, ids) == membership_rows(expected, ids) == eager_membership_rows(expected, ids)
+        assert (membership_rows(tmp_path, actual, ids)
+                == membership_rows(tmp_path, expected, ids)
+                == eager_membership_rows(expected, ids))
         for cluster, original in zip(actual, expected):
             assert cluster.events == original.events
             assert cluster.events[::-1] == original.events[::-1]
@@ -247,7 +255,7 @@ def test_sorted_relation_to_result_writes_same_rows(tmp_path):
         eager = replace(result, clusters=eager_clusters, cross_track_candidates=expected)
         assert result.as_dict() == eager.as_dict()
         ids = {cluster.cluster_calculate_index: 100 + i for i, cluster in enumerate(lazy_clusters)}
-        assert membership_rows(lazy_clusters, ids) == eager_membership_rows(eager_clusters, ids)
+        assert membership_rows(tmp_path, lazy_clusters, ids) == eager_membership_rows(eager_clusters, ids)
         refined = {_refine_key(ref) for candidate in expected
                    for ref in (candidate.from_segment_start, candidate.to_segment_start)}
         resolved = {ref: i + 1 for i, ref in enumerate(sorted(refined))}
@@ -267,14 +275,14 @@ def test_sorted_relation_to_result_writes_same_rows(tmp_path):
             def capture(_cursor, _table, _columns, values, **kwargs):
                 assert len(values) <= 3
                 copied.extend(values)
-            with WriterWorkspace(directory=tmp_path, batch_size=3) as writer_workspace:
-                writer_workspace.collect_sources(output, [], (), ids)
+            with WriterRelation(RuntimeConfig(), tmp_path, "run", batch_size=3) as relation:
+                relation.collect_sources(output, [], (), ids)
                 for (kind, point_id, subtrack), rid in resolved.items():
-                    writer_workspace.add_mapping(RefinedPointRef(kind, point_id, subtrack, 0), rid)
-                writer_workspace.resolve_sources()
-                writer_workspace.prepare_annotations(output.clusters, ids, output.hotspot_events)
+                    relation.add_mapping(RefinedPointRef(kind, point_id, subtrack, 0), rid)
+                relation.resolve_sources()
+                relation.prepare_annotations(output.clusters, ids, output.hotspot_events)
                 with patch("track.v2.db_writer._copy_insert", side_effect=capture):
-                    _insert_tracks_cross(Connection(), "run", writer_workspace, batch_size=3)
+                    _insert_tracks_cross(Connection(), "run", relation, batch_size=3)
             rows.append(copied)
         membership = {index: value for kind, index, value in eager_membership_rows(eager_clusters, ids) if kind == "cross"}
         expected_rows = []
@@ -368,7 +376,7 @@ def test_eager_and_lazy_membership_conflicts_still_raise(tmp_path):
             duplicate = replace(first, cluster_calculate_index=999)
             ids = {first.cluster_calculate_index: 10, 999: 20}
             with pytest.raises(ValueError, match="belongs to multiple candidates"):
-                membership_rows([first, duplicate], ids)
+                membership_rows(tmp_path, [first, duplicate], ids)
         with pytest.raises(ValueError, match="belongs to multiple candidates"):
             eager_membership_rows([eager[0], replace(eager[0], cluster_calculate_index=999)],
                                   {eager[0].cluster_calculate_index: 10, 999: 20})
