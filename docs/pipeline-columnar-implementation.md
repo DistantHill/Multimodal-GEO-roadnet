@@ -36,9 +36,10 @@
 | C04b1 | artifact reconcile/gc 显式 apply 核心 | C04a | ≤700 | 已完成（`615f4ce`） |
 | C04b2 | artifact reconcile/gc CLI 与真实 PostgreSQL 验证 | C04b1 | ≤700 | 已完成（`9d62a5a`） |
 | C05a | Refine Parquet Schema 与 staging 导出 | C04b2 | ≤700 | 已完成（`3e5f6a8`；语义修复 `cc7d25a`） |
-| C05b | Refine Parquet 发布、登记与 Run 完成事务 | C05a | ≤700 | 已实施，待主对话验收 |
-| C05c | 真实 PostgreSQL 差分、故障验证与切换闸门 | C05b | ≤700 | 未开始 |
-| C06 | DuckDB 读取 Refine Parquet 的 Detect 输入适配 | C05c | 每提交 ≤700 | 未开始 |
+| C05b | Refine Parquet 发布、登记与 Run 完成事务 | C05a | ≤700 | 已完成（`8050876`） |
+| C05c1 | Refine 真实 PostgreSQL 差分与发布故障验证 | C05b | ≤700 | 实施中，待主对话验收 |
+| C05c2 | completed 制品约束迁移与 Refine 最终切换闸门 | C05c1 | ≤700 | 未开始 |
+| C06 | DuckDB 读取 Refine Parquet 的 Detect 输入适配 | C05c2 | 每提交 ≤700 | 未开始 |
 | C07 | Detect 算子列式迁移及 Python 回退收敛 | C06 | 每提交 ≤700 | 未开始 |
 | C08 | Detect Parquet 发布与 Clip 列式读取 | C07 | 每提交 ≤700 | 未开始 |
 | C09 | Clip/Fitting 顺序计算与旧 spool 清除 | C08 | 每提交 ≤700 | 未开始 |
@@ -192,13 +193,25 @@ staging 和事件失败语义由伪游标与临时目录单元测试覆盖。
 
 验证：来源变化、发布/登记/完成顺序、各故障点恢复和 orphan 行为。
 
+提交：`8050876`。
+
+### C05c1 — Refine 真实集成与故障验证
+
+范围：以真实 PostgreSQL/PostGIS 和镜像内 DuckDB `postgres_scanner` 执行逐表差分与
+发布故障验证；不在本卡增加 completed Run 的数据库约束。
+
+验证：小样本逐表差分、独立连接可见性、来源变化、发布后数据库事务回滚及 orphan
+保留语义。
+
 提交：待记录。
 
-### C05c — Refine Parquet 切换闸门
+### C05c2 — Refine 最终切换闸门
 
-范围：以真实 PostgreSQL/PostGIS 执行逐表差分与故障注入，满足切换闸门后停用旧读取路径。
+范围：增加 completed Refine Run 必须关联 present 制品的数据库级强制约束，并在真实
+PostgreSQL 上完成迁移、并发和回滚验证；通过后才允许 C06 消费 Refine Parquet。
 
-验证：小样本逐表差分、特殊连接参数、源变化及发布失败。
+验证：既有数据迁移、completed/failed/running 状态约束、制品事件状态、并发提交和
+回滚。
 
 提交：待记录。
 

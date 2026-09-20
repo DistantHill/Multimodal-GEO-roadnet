@@ -72,10 +72,12 @@ def test_postgres_query_is_run_scoped_safe_and_computes_interleaved_sequence():
         source_table="odd.schema", quoted_table='"odd"."schema"',
         key_sql_type="bigint", has_extra=True,
     )
-    sql = refine_parquet._postgres_query(run_id, contract, 32650)
+    sql = refine_parquet._postgres_query(run_id, contract, 32650, '"run""schema"')
 
     assert sql.count(f"'{run_id}'::uuid") == 2
     assert 'JOIN "odd"."schema" s' in sql
+    assert 'FROM "run""schema".kept_trajectory_points k' in sql
+    assert 'FROM "run""schema".injected_points i' in sql
     projected = "ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), 32650)"
     assert sql.count(projected) == 2
     assert "ST_Transform(s.geom" not in sql
@@ -97,16 +99,12 @@ def test_postgres_query_is_run_scoped_safe_and_computes_interleaved_sequence():
     assert rows == [(20, 0), (10, 1), (99, 2), (30, 3)]
 
 
-def test_relation_escapes_credentials_and_contains_no_install():
-    postgres = PostgresConfig(
-        host="db host", database="road/net", user="o'reilly", password="p'a ss",
-    )
-    relation = refine_parquet._relation(postgres.dsn(), "SELECT 'quoted'", "kept_points")
+def test_relation_uses_attached_postgres_without_install():
+    relation = refine_parquet._relation("SELECT 'quoted'", "kept_points")
 
     assert "postgres_query(" in relation
     assert "INSTALL" not in relation.upper()
-    assert "o%27reilly" in relation
-    assert "p%27a+ss" in relation
+    assert "authoritative_pg" in relation
     assert "SELECT ''quoted''" in relation
     assert relation.endswith(
         "ORDER BY subtrack_index, refined_sequence_in_subtrack, point_id"
@@ -155,10 +153,12 @@ def test_copy_writes_real_typed_files_including_empty_injected(tmp_path):
 @pytest.mark.parametrize(
     "row, message",
     [(None, "unknown"),
-     (("public.source", 4326, 32650, {"coordinate_semantics_version": 2}, "completed"),
+     (("public.source", 4326, 32650, {"coordinate_semantics_version": 2}, "completed", "public"),
       "running"),
-     (("public.source", 4326, None, {"coordinate_semantics_version": 2}, "running"),
-      "processing_srid")],
+     (("public.source", 4326, None, {"coordinate_semantics_version": 2}, "running", "public"),
+      "processing_srid"),
+     (("public.source", 4326, 32650, {"coordinate_semantics_version": 2}, "running", None),
+      "schema")],
 )
 def test_export_rejects_invalid_run_before_opening_duckdb(tmp_path, row, message, monkeypatch):
     monkeypatch.setattr(refine_parquet, "validate_source_table", Mock())

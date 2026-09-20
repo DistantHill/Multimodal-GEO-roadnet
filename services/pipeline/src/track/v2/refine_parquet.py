@@ -55,10 +55,17 @@ def _literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _run_metadata(conn: Any, refine_id: UUID) -> tuple[str, int]:
+def _quote_identifier(value: str) -> str:
+    if not value or "\x00" in value:
+        raise RefineParquetError("current PostgreSQL schema is unavailable")
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _run_metadata(conn: Any, refine_id: UUID) -> tuple[str, int, str]:
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT source_table, source_srid, processing_srid, projection_config, status "
+            "SELECT source_table, source_srid, processing_srid, projection_config, status, "
+            "current_schema() "
             "FROM refine_runs WHERE id = %s",
             (refine_id,),
         )
@@ -69,14 +76,19 @@ def _run_metadata(conn: Any, refine_id: UUID) -> tuple[str, int]:
         raise RefineParquetError("Refine Run must be running during staging export")
     if not str(row[0]).strip():
         raise RefineParquetError("Refine Run source metadata is required")
+    if not isinstance(row[5], str):
+        raise RefineParquetError("current PostgreSQL schema is unavailable")
+    result_schema = _quote_identifier(row[5])
     try:
         spatial_context = spatial_context_from_values(row[1], row[2], row[3])
     except (TypeError, ValueError) as exc:
         raise RefineParquetError("Refine Run processing_srid metadata is invalid") from exc
-    return str(row[0]), spatial_context.processing_srid
+    return str(row[0]), spatial_context.processing_srid, result_schema
 
 
-def _postgres_query(refine_id: UUID, contract: SourceTableContract, srid: int) -> str:
+def _postgres_query(
+    refine_id: UUID, contract: SourceTableContract, srid: int, result_schema: str,
+) -> str:
     run = _literal(str(refine_id))
     return f"""
 WITH points AS (
@@ -87,7 +99,7 @@ WITH points AS (
         ST_Y(ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), {srid})) AS y,
         s.heading, s.speed, k.source_row_key, NULL::text AS generated_reason,
         NULL::integer AS after_sequence_in_subtrack
- FROM kept_trajectory_points k JOIN {contract.quoted_table} s
+ FROM {result_schema}.kept_trajectory_points k JOIN {contract.quoted_table} s
    ON s.id = k.source_row_key::{contract.key_sql_type}
  WHERE k.refine_id = {run}::uuid
  UNION ALL
@@ -95,7 +107,7 @@ WITH points AS (
         i.after_sequence_in_subtrack, 1, i.timestamp, i.lon, i.lat, i.x, i.y,
         i.heading, i.speed, NULL::text, i.generated_reason,
         i.after_sequence_in_subtrack
- FROM injected_points i WHERE i.refine_id = {run}::uuid
+ FROM {result_schema}.injected_points i WHERE i.refine_id = {run}::uuid
 ), sequenced AS (
  SELECT *, row_number() OVER (
    PARTITION BY subtrack_index
@@ -106,12 +118,12 @@ WITH points AS (
 SELECT * FROM sequenced""".strip()
 
 
-def _relation(dsn: str, postgres_sql: str, table: str) -> str:
+def _relation(postgres_sql: str, table: str) -> str:
     columns = REFINE_PARQUET_V1[table]
     projection = ", ".join(f"{column.name}::{column.duckdb_type} AS {column.name}" for column in columns)
     point_kind = 0 if table == "kept_points" else 1
     return (
-        f"SELECT {projection} FROM postgres_query({_literal(dsn)}, {_literal(postgres_sql)}) "
+        f"SELECT {projection} FROM postgres_query('authoritative_pg', {_literal(postgres_sql)}) "
         f"WHERE point_kind = {point_kind} "
         "ORDER BY subtrack_index, refined_sequence_in_subtrack, point_id"
     )
@@ -174,9 +186,9 @@ def export_refine_parquet(
     _validate_handle(handle)
     if handle.stage != "refine":
         raise RefineParquetError("staging dataset must belong to the refine stage")
-    source_table, srid = _run_metadata(conn, handle.run_id)
+    source_table, srid, result_schema = _run_metadata(conn, handle.run_id)
     contract = validate_source_table(conn, source_table)
-    postgres_sql = _postgres_query(handle.run_id, contract, srid)
+    postgres_sql = _postgres_query(handle.run_id, contract, srid, result_schema)
     data_root = Path(os.environ.get("DATA_ROOT", "/data"))
     outputs = {
         name: f"{name}/part-00000.parquet" for name in REFINE_PARQUET_V1
@@ -184,9 +196,13 @@ def export_refine_parquet(
     # C05a deliberately writes one file per logical table. Target file sizing
     # remains zero/engine-default until the benchmark introduces partitioning.
     with _open_duckdb(runtime, data_root / "duckdb" / str(handle.run_id)) as connection:
+        connection.execute(
+            f"ATTACH {_literal(postgres.dsn())} AS authoritative_pg "
+            "(TYPE postgres, READ_ONLY)"
+        )
         for name, relative in outputs.items():
             _copy_table(
-                connection, _relation(postgres.dsn(), postgres_sql, name),
+                connection, _relation(postgres_sql, name),
                 handle.path / relative, name, runtime,
             )
     descriptor = build_descriptor(
