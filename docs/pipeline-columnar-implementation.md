@@ -41,9 +41,10 @@
 | C05c2 | completed 制品约束迁移与 Refine 最终切换闸门 | C05c1 | ≤700 | 已完成（`b6a9e03`） |
 | C06a | Refine Parquet 只读消费边界 | C05c2 | ≤700 | 已完成（`1fe007f`） |
 | C06b | Detect 接入 Refine Parquet reader | C06a | ≤700 | 已完成（C06b1 `aac372c`；C06b2 `832ff99`） |
-| C07a | Detect 转向候选列式迁移 | C06b | 每提交 ≤700 | 进行中 |
-| C07b | Detect 跨轨迹候选准备列式迁移 | C07a | 每提交 ≤700 | 未开始 |
-| C08 | Detect Parquet 发布与 Clip 列式读取 | C07b | 每提交 ≤700 | 未开始 |
+| C07a | Detect 转向候选列式迁移 | C06b | 每提交 ≤700 | 已完成（`cfecadd`） |
+| C07b | Detect 跨轨迹候选准备列式迁移 | C07a | 每提交 ≤700 | 已完成，待主对话确认 |
+| C07c | Detect 跨轨迹 broad phase 与精确内核接线 | C07b | 每提交 ≤700 | 未开始 |
+| C08 | Detect Parquet 发布与 Clip 列式读取 | C07c | 每提交 ≤700 | 未开始 |
 | C09 | Clip/Fitting 顺序计算与旧 spool 清除 | C08 | 每提交 ≤700 | 未开始 |
 | C10 | Detect/写入器旧磁盘工作区清除 | C07a–C09 | 每提交 ≤700 | 未开始 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 未开始 |
@@ -258,14 +259,28 @@ PostgreSQL 路径保留为差分参考实现。
 验证：真实 Parquet 与 `detect_turn_patch` 按 Q49 差分，覆盖窗口、圆周、阈值、异常
 时间、短轨、多车辆/子轨迹和读取批次边界；断言正式路径未调用 Python 转向算子。
 
-提交：本卡提交，待主对话记录哈希。
+提交：`cfecadd`。
 
 ### C07b — Detect 跨轨迹候选准备列式迁移
 
-范围：迁移跨轨迹的排序、过滤和候选准备；保留 DBSCAN、精确求交与拓扑 Python
-内核，不在本卡删除 Detect 工作区。
+范围：以 DuckDB `lead` 窗口迁移真实相邻线段构造、稳定排序、车辆/轨迹 rank 和直行
+过滤；Python 仅构造精确内核所需的最小线段对象。旧实现按
+`vehicle_id || chr(0) || CAST(subtrack_index AS VARCHAR)` 排序轨迹，因此本卡明确保留其
+十进制字符串字典序，而不是子轨迹数值序。本卡不构造线段对、不切换正式跨轨迹入口，
+也不删除 Detect 工作区。
 
-验证：成员、crossing 配对和拓扑严格一致，覆盖边界网格和超大语义单元保护。
+验证：真实 Parquet 与旧 `_prepare_segments` 按 Q49 严格差分，覆盖多车辆/子轨迹、
+batch=1、方向角圆周、包含阈值、单点轨迹和禁止跨子轨迹连接；拒绝损坏身份、非有限值、
+非相邻序列及全局 `subtrack_index` 车辆混合，并断言不调用 `fetchall()`。
+
+提交：本卡提交，待主对话记录哈希。
+
+### C07c — Detect 跨轨迹 broad phase 与精确内核接线
+
+范围：用 DuckDB 准备 broad-phase 线段对并接线现有精确 NumPy 求交内核；本卡不迁移
+DBSCAN 或拓扑，不扩大 C07b 的线段准备职责。
+
+验证：成员与 crossing 配对严格一致、边界网格、超大语义单元保护及正式入口切换。
 
 提交：待记录。
 

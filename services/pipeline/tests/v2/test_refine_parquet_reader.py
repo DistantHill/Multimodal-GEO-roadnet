@@ -13,7 +13,9 @@ from track.v2 import artifact_publication, refine_parquet
 from track.v2.artifact_parquet import build_descriptor
 from track.v2.db.artifact_registry import ArtifactDescriptor, canonical_json
 from track.v2.detect import IntersectConfig
-from track.v2.models import RuntimeConfig
+from track.v2.cross_track import _prepare_segments
+from track.v2.models import RuntimeConfig, SpatialContext
+from track.v2.projection import CoordinateTransformer
 from track.v2.turn_events import detect_turn_patch
 
 
@@ -73,7 +75,9 @@ def _published_tracks(tmp_path: Path, tracks):
             for sequence, (timestamp, x, y, heading) in enumerate(points):
                 point_id += 1
                 rows.append((handle.run_id, point_id, vehicle_id, subtrack_index,
-                             sequence, timestamp, 120 + x / 1e6, 30 + y / 1e6,
+                             sequence, timestamp,
+                             120 + x / 1e6 if x is not None else 120,
+                             30 + y / 1e6 if y is not None else 30,
                              x, y, heading, 4.0, f"source-{point_id}"))
         connection.execute("""
             CREATE TABLE input_points(
@@ -299,6 +303,91 @@ def test_duckdb_turn_thresholds_are_inclusive_and_config_is_strict(tmp_path) -> 
         ):
             with pytest.raises(refine_parquet.RefineParquetError, match="turn"):
                 list(reader.iter_turn_candidates("source", invalid))
+
+
+def test_duckdb_cross_track_segments_match_q49_oracle(tmp_path) -> None:
+    # DuckDB fits partition/window/sort/filter and can spill externally; segment
+    # preparation needs neither Polars nor a Python fallback. Python constructs
+    # only the minimal objects required by the later exact geometry kernel.
+    tracks = [
+        ("a", 10, [(0, 0, 0, 359), (1, 1, 0, 1), (2, 2, 0, 4)]),
+        ("a", 2, [(3, 8, 8, 90)]),
+        ("b", 3, [(4, 0, 1, 180), (5, -1, 1, 178), (6, -2, 1, 174)]),
+    ]
+    descriptor = _published_tracks(tmp_path, tracks)
+    cfg = IntersectConfig(cross_track_straightness_deg=2)
+    transformer = CoordinateTransformer(SpatialContext(
+        4326, 32650,
+        {"coordinate_semantics_version": 2, "enforce_area_of_use": True,
+         "max_scale_error": .01},
+    ))
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        oracle_tracks = {
+            f"{track[0].vehicle_id}\0{track[0].refined_point_ref.subtrack_index}": track
+            for track in reader.iter_tracks("public.source", batch_size=2)
+        }
+        expected, vehicle_count = _prepare_segments(oracle_tracks, transformer, cfg)
+        actual = list(reader.iter_cross_track_segments("public.source", cfg, batch_size=1))
+    assert vehicle_count == 2
+    assert len(actual) == len(expected) == 2
+    for left, right in zip(actual, expected, strict=True):
+        assert (left.vehicle_id, left.vehicle_rank, left.track_rank, left.segment_index,
+                left.start.point_ref, left.start.refined_point_ref) == (
+            right.vehicle_id, right.vehicle_rank, right.track_rank, right.segment_index,
+            right.start.point_ref, right.start.refined_point_ref,
+        )
+        for field in ("heading", "timestamp"):
+            assert getattr(left, field) == pytest.approx(getattr(right, field), abs=1e-12)
+        for field in ("x1", "y1", "x2", "y2"):
+            assert getattr(left, field) == pytest.approx(getattr(right, field), abs=1e-6)
+    # The old oracle ranks the decimal track key lexically: a\0 10 precedes a\0 2.
+    assert [(segment.track_rank, segment.segment_index) for segment in actual] == [(0, 0), (2, 0)]
+
+
+def test_cross_track_segment_api_is_bounded_and_validates_config() -> None:
+    owner = uuid4()
+    reader = object.__new__(refine_parquet.RefineDatasetReader)
+    validation = Mock()
+    validation.fetchone.return_value = (0,)
+    result = Mock()
+    result.fetchmany.side_effect = [[], []]
+    connection = Mock()
+    connection.execute.side_effect = [validation, result]
+    reader._connection = connection
+    reader._descriptor = Mock(refine_id=owner)
+
+    assert list(reader.iter_cross_track_segments(
+        "source", IntersectConfig(), batch_size=1,
+    )) == []
+    result.fetchmany.assert_called_with(1)
+    assert not result.fetchall.called
+    for threshold in (float("nan"), -1, 181, True):
+        with pytest.raises(refine_parquet.RefineParquetError, match="straightness"):
+            list(reader.iter_cross_track_segments(
+                "source", IntersectConfig(cross_track_straightness_deg=threshold),
+            ))
+
+
+def test_cross_track_segments_reject_global_subtrack_vehicle_mixing(tmp_path) -> None:
+    descriptor = _published_tracks(tmp_path, [
+        ("a", 7, [(0, 0, 0, 0)]), ("b", 7, [(1, 1, 0, 0)]),
+    ])
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        with pytest.raises(refine_parquet.RefineParquetError, match="corrupt"):
+            list(reader.iter_cross_track_segments("source", IntersectConfig()))
+
+
+def test_cross_track_segments_reject_null_on_single_point_track(tmp_path) -> None:
+    descriptor = _published_tracks(tmp_path, [("a", 0, [(0, None, 0, 0)])])
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        with pytest.raises(refine_parquet.RefineParquetError, match="corrupt"):
+            list(reader.iter_cross_track_segments("source", IntersectConfig()))
 
 
 def test_reader_closes_connection_when_view_creation_fails(tmp_path, monkeypatch) -> None:

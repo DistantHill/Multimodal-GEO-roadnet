@@ -8,7 +8,7 @@ import math
 import os
 from pathlib import Path
 from collections.abc import Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import duckdb
@@ -20,6 +20,9 @@ from track.v2.db.artifact_registry import ArtifactDescriptor
 from track.v2.db.source_table import SourceTableContract, validate_source_table
 from track.v2.models import PointRef, RefinedPointRef, RuntimeConfig, TrajectoryPoint, TurnEvent
 from track.v2.projection import spatial_context_from_values
+
+if TYPE_CHECKING:
+    from .cross_track import _CrossTrackSegment
 
 
 class RefineParquetError(RuntimeError):
@@ -239,6 +242,94 @@ class RefineDatasetReader:
             for row in rows:
                 yield self._decode_turn_row(row, source_table, event_index)
                 event_index += 1
+
+    def iter_cross_track_segments(
+        self, source_table: str, cfg: Any, *, batch_size: int = 4096,
+    ) -> Iterator[_CrossTrackSegment]:
+        """Yield straight adjacent segments prepared by spillable DuckDB SQL."""
+        connection = self._require_open()
+        if not isinstance(source_table, str) or not source_table.strip():
+            raise RefineParquetError("source_table is required")
+        threshold = cfg.cross_track_straightness_deg
+        if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+                or not math.isfinite(threshold) or not 0 <= threshold <= 180):
+            raise RefineParquetError("cross-track straightness threshold is invalid")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise RefineParquetError("batch_size is invalid")
+        invalid = connection.execute("""
+          WITH checked AS (
+            SELECT *,
+              row_number() OVER track - 1 AS expected_sequence,
+              count(DISTINCT vehicle_id) OVER (PARTITION BY subtrack_index) AS vehicles
+            FROM refine_points
+            WINDOW track AS (PARTITION BY vehicle_id, subtrack_index
+                             ORDER BY refined_sequence_in_subtrack, point_kind, point_id)
+          )
+          SELECT count(*) FROM checked
+          WHERE refine_id IS DISTINCT FROM ? OR point_id IS NULL
+             OR vehicle_id IS NULL OR vehicle_id = ''
+             OR subtrack_index IS NULL OR subtrack_index < 0
+             OR refined_sequence_in_subtrack IS NULL
+             OR refined_sequence_in_subtrack != expected_sequence OR vehicles != 1
+             OR NOT coalesce(isfinite(timestamp), false)
+             OR NOT coalesce(isfinite(lon), false) OR NOT coalesce(isfinite(lat), false)
+             OR NOT coalesce(isfinite(x), false) OR NOT coalesce(isfinite(y), false)
+             OR NOT coalesce(isfinite(heading), false)
+             OR NOT coalesce(isfinite(speed), false) OR lon NOT BETWEEN -180 AND 180
+             OR lat NOT BETWEEN -90 AND 90 OR point_kind IS NULL
+             OR point_kind NOT IN ('kept', 'injected')
+             OR (point_kind = 'kept' AND
+                 (source_row_key IS NULL OR source_row_key = '' OR generated_reason IS NOT NULL
+                  OR after_sequence_in_subtrack IS NOT NULL))
+             OR (point_kind = 'injected' AND
+                 (source_row_key IS NOT NULL OR generated_reason IS NULL
+                  OR generated_reason = '' OR after_sequence_in_subtrack IS NULL))
+        """, [self._descriptor.refine_id]).fetchone()
+        if invalid is None or invalid[0]:
+            raise RefineParquetError("cross-track source contains corrupt identity or sequence data")
+        query = """
+          WITH adjacent AS (
+            SELECT *,
+              dense_rank() OVER (ORDER BY vehicle_id) - 1 AS vehicle_rank,
+              dense_rank() OVER
+                (ORDER BY vehicle_id || chr(0) || CAST(subtrack_index AS VARCHAR)) - 1
+                AS track_rank,
+              row_number() OVER track - 1 AS segment_index,
+              lead(x) OVER track AS end_x, lead(y) OVER track AS end_y,
+              lead(heading) OVER track AS end_heading
+            FROM refine_points
+            WINDOW track AS (PARTITION BY vehicle_id, subtrack_index
+                             ORDER BY refined_sequence_in_subtrack, point_kind, point_id)
+          ), deltas AS (
+            SELECT *, (((end_heading-heading+180.0) % 360.0 + 360.0)
+                       % 360.0)-180.0 AS heading_delta
+            FROM adjacent WHERE end_x IS NOT NULL
+          )
+          SELECT refine_id, point_id, vehicle_id, subtrack_index,
+                 refined_sequence_in_subtrack, timestamp, lon, lat, x, y,
+                 heading, speed, point_kind, source_row_key, generated_reason,
+                 after_sequence_in_subtrack, 1 AS vehicles,
+                 vehicle_rank, track_rank, segment_index, end_x, end_y
+          FROM deltas WHERE abs(heading_delta) <= ?
+          ORDER BY track_rank, segment_index
+        """
+        result = connection.execute(query, [float(threshold)])
+        from .cross_track import _CrossTrackSegment
+        while rows := result.fetchmany(batch_size):
+            for row in rows:
+                point, _ = self._decode_row(
+                    row[:17], source_table, int(row[19]),
+                    (str(row[2]), int(row[3])),
+                )
+                coordinates = tuple(float(value) for value in (row[8], row[9], row[20], row[21]))
+                if not all(math.isfinite(value) for value in coordinates):
+                    raise RefineParquetError("cross-track segment contains non-finite coordinates")
+                yield _CrossTrackSegment(
+                    vehicle_id=point.vehicle_id, vehicle_rank=int(row[17]),
+                    track_rank=int(row[18]), segment_index=int(row[19]), start=point,
+                    x1=coordinates[0], y1=coordinates[1], x2=coordinates[2],
+                    y2=coordinates[3], heading=point.heading, timestamp=point.timestamp,
+                )
 
     def _decode_turn_row(
         self, row: tuple[Any, ...], source_table: str, event_index: int,
