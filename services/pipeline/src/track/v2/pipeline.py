@@ -8,13 +8,16 @@ this module and remains responsible only for command-line concerns.
 from __future__ import annotations
 
 import time
-from contextlib import ExitStack
+import os
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
+from uuid import uuid4
 
 import psycopg
 
 from .refine import refine_vehicle
+from .artifact_publication import abandon_staging, create_staging, publish
 from .config import PostgresConfig, connect as pg_connect
 from .config.pipeline_config import load_pipeline_config
 from .db.pipeline_store import PipelineStore, PostgresPipelineStore
@@ -44,6 +47,7 @@ from .parser import get_database
 from .pipeline_events import EventProgressAdapter, EventSink, PipelineEvent
 from .projection import CoordinateTransformer, create_spatial_context
 from .parser import StreamVehicleSource
+from .refine_parquet import export_refine_parquet
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +70,26 @@ class PipelineResult:
 
 def _noop_event_sink(_event: PipelineEvent) -> None:
     """Default sink for non-CLI callers."""
+
+
+def _parquet_root() -> Path:
+    root = Path(os.environ.get("PARQUET_ROOT", "")) if "PARQUET_ROOT" in os.environ else (
+        Path(os.environ.get("DATA_ROOT", "/data")) / "parquet"
+    )
+    if not root.is_absolute():
+        raise ValueError("PARQUET_ROOT must be absolute")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _fail_running_refine(store: PipelineStore, refine_id: str) -> None:
+    """Best-effort failure convergence that never masks the original error."""
+    with suppress(Exception):
+        store.rollback()
+    with suppress(Exception):
+        if store.get_refine_run(refine_id).status == "running":
+            store.finish_refine(refine_id, status="failed")
+            store.commit()
 
 
 def run_pipeline(
@@ -135,6 +159,8 @@ def run_pipeline(
             assert refine_id is not None
             handle = None
             stream = None
+            staging = None
+            refine_published = False
             try:
                 refine_started = _log_stage_start("refine", refine_id=refine_id)
                 refine_stage = "Parser + Refine: 流式读取&精炼 / Streaming read & refine"
@@ -269,16 +295,34 @@ def run_pipeline(
                     refine_id,
                     source_contract,
                 )
-                store.finish_refine(
-                    refine_id,
-                    status="completed",
-                    source_fingerprint=source_fingerprint,
+                # Make authoritative rows visible to postgres_scanner while the
+                # Run deliberately remains running.
+                store.commit()
+                staging = create_staging(
+                    _parquet_root(), "refine", refine_id, uuid4(),
+                )
+                descriptor = export_refine_parquet(
+                    conn, db_config, staging, pc.runtime, source_fingerprint,
+                )
+                # Close the exporter's transaction before taking an independent
+                # post-export source view.
+                store.rollback()
+                confirmed_fingerprint = calculate_source_fingerprint(
+                    conn, refine_id, source_contract,
+                )
+                if confirmed_fingerprint != source_fingerprint:
+                    raise RuntimeError("Refine source changed during Parquet export")
+                publish(staging)
+                refine_published = True
+                store.complete_refine_with_artifact(
+                    refine_id, descriptor, confirmed_fingerprint,
                 )
                 store.commit()
             except Exception:
-                store.rollback()
-                store.finish_refine(refine_id, status="failed")
-                store.commit()
+                if staging is not None and not refine_published:
+                    with suppress(Exception):
+                        abandon_staging(staging)
+                _fail_running_refine(store, refine_id)
                 raise
 
             refine_elapsed = _log_stage_finish(

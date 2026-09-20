@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -97,6 +97,28 @@ def test_refine_lifecycle_uses_source_table_and_fingerprint() -> None:
         status="completed",
         source_fingerprint=fingerprint,
     )
+
+
+def test_refine_artifact_is_registered_before_run_completion_without_commit() -> None:
+    connection = MagicMock()
+    descriptor = SimpleNamespace(stage="refine", refine_id="refine")
+    fingerprint = {"version": 1, "row_count": 2, "sha256": "a" * 64}
+    calls: list[str] = []
+    store = PostgresPipelineStore(connection)
+    with (
+        patch(
+            "track.v2.db.pipeline_store.insert_present",
+            side_effect=lambda *args: calls.append("metadata+present"),
+        ),
+        patch(
+            "track.v2.db.pipeline_store.finish_refine_run",
+            side_effect=lambda *args, **kwargs: calls.append("completed"),
+        ),
+    ):
+        store.complete_refine_with_artifact("refine", descriptor, fingerprint)
+
+    assert calls == ["metadata+present", "completed"]
+    connection.commit.assert_not_called()
 
 
 def test_refine_batch_assigns_globally_increasing_subtrack_ids() -> None:

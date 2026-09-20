@@ -35,8 +35,8 @@
 | C04a | artifact reconcile/gc 只读计划 | C03b | ≤700 | 已完成（`9bc7f6b`） |
 | C04b1 | artifact reconcile/gc 显式 apply 核心 | C04a | ≤700 | 已完成（`615f4ce`） |
 | C04b2 | artifact reconcile/gc CLI 与真实 PostgreSQL 验证 | C04b1 | ≤700 | 已完成（`9d62a5a`） |
-| C05a | Refine Parquet Schema 与 staging 导出 | C04b2 | ≤700 | 已实施，待主对话验收 |
-| C05b | Refine Parquet 发布、登记与 Run 完成事务 | C05a | ≤700 | 未开始 |
+| C05a | Refine Parquet Schema 与 staging 导出 | C04b2 | ≤700 | 已完成（`3e5f6a8`；语义修复 `cc7d25a`） |
+| C05b | Refine Parquet 发布、登记与 Run 完成事务 | C05a | ≤700 | 已实施，待主对话验收 |
 | C05c | 真实 PostgreSQL 差分、故障验证与切换闸门 | C05b | ≤700 | 未开始 |
 | C06 | DuckDB 读取 Refine Parquet 的 Detect 输入适配 | C05c | 每提交 ≤700 | 未开始 |
 | C07 | Detect 算子列式迁移及 Python 回退收敛 | C06 | 每提交 ≤700 | 未开始 |
@@ -183,7 +183,7 @@ staging 和事件失败语义由伪游标与临时目录单元测试覆盖。
 
 验证：Schema、行数/身份/交错顺序、SQL 隔离、DuckDB 离线配置和空表文件。
 
-提交：本卡提交。
+提交：`3e5f6a8`；语义修复 `cc7d25a`。
 
 ### C05b — Refine Parquet 发布与登记
 

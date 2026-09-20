@@ -14,6 +14,7 @@ from typing import Any, Protocol
 
 from ..heartbeat import validation_notices
 from ..clip import extract_clips_for_detect
+from .artifact_registry import ArtifactDescriptor, insert_present
 from .queries import fetch_detect_row
 from ..db_writer import (
     RefineRunRecord,
@@ -95,6 +96,13 @@ class PipelineStore(Protocol):
         *,
         status: str,
         source_fingerprint: dict[str, object] | None = None,
+    ) -> None: ...
+
+    def complete_refine_with_artifact(
+        self,
+        refine_id: str,
+        descriptor: ArtifactDescriptor,
+        source_fingerprint: dict[str, object],
     ) -> None: ...
 
     def persist_refine_batch(
@@ -202,6 +210,24 @@ class PostgresPipelineStore:
             self._conn,
             refine_id,
             status=status,
+            source_fingerprint=source_fingerprint,
+        )
+
+    def complete_refine_with_artifact(
+        self,
+        refine_id: str,
+        descriptor: ArtifactDescriptor,
+        source_fingerprint: dict[str, object],
+    ) -> None:
+        """Register a present artifact and complete its Run without committing."""
+        if descriptor.stage != "refine" or str(descriptor.refine_id) != str(refine_id):
+            raise ValueError("artifact does not belong to the Refine Run")
+        with self._conn.cursor() as cur:
+            insert_present(cur, descriptor)
+        finish_refine_run(
+            self._conn,
+            refine_id,
+            status="completed",
             source_fingerprint=source_fingerprint,
         )
 

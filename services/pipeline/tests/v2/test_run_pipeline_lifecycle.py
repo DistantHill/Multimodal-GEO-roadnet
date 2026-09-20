@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from contextlib import ExitStack
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -117,6 +118,8 @@ class _RecordingStore:
         self.fit_bundle_error: RuntimeError | None = None
         self.clip_error: RuntimeError | None = None
         self.persist_detect_error: RuntimeError | None = None
+        self.refine_status = "completed"
+        self.completed_artifact: tuple[object, ...] | None = None
 
     def commit(self) -> None:
         self.events.append("commit")
@@ -126,10 +129,11 @@ class _RecordingStore:
 
     def get_refine_run(self, refine_id: str) -> RefineRunRecord:
         self.events.append("get_refine")
-        return self.refine_record
+        return replace(self.refine_record, status=self.refine_status)
 
     def start_refine_run(self, **kwargs: object) -> str:
         self.events.append("start_refine")
+        self.refine_status = "running"
         return REFINE_ID
 
     def finish_refine(
@@ -140,6 +144,12 @@ class _RecordingStore:
         source_fingerprint: dict[str, object] | None = None,
     ) -> None:
         self.events.append(f"finish_refine:{status}")
+        self.refine_status = status
+
+    def complete_refine_with_artifact(self, *args: object) -> None:
+        self.events.extend(["artifact:metadata", "artifact:present", "finish_refine:completed"])
+        self.completed_artifact = args
+        self.refine_status = "completed"
 
     def persist_refine_batch(self, *args: object, **kwargs: object) -> RefineBatchResult:
         self.events.append("persist_refine_batch")
@@ -222,6 +232,27 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 return_value={"version": 1, "row_count": 0, "sha256": "0"},
             )
         )
+        self.staging = SimpleNamespace(path="staging")
+        self.descriptor = SimpleNamespace(id="artifact", relative_path=f"refine/{REFINE_ID}")
+        self.stack.enter_context(patch(
+            "track.v2.pipeline.create_staging",
+            side_effect=lambda *args: self.events.append("create_staging") or self.staging,
+        ))
+        self.stack.enter_context(patch(
+            "track.v2.pipeline.export_refine_parquet",
+            side_effect=lambda *args: self.events.append("export") or self.descriptor,
+        ))
+        self.stack.enter_context(patch(
+            "track.v2.pipeline.publish",
+            side_effect=lambda *args: self.events.append("publish"),
+        ))
+        self.abandon = self.stack.enter_context(patch(
+            "track.v2.pipeline.abandon_staging",
+            side_effect=lambda *args: self.events.append("abandon"),
+        ))
+        self.stack.enter_context(patch(
+            "track.v2.pipeline._parquet_root", return_value="/tmp/parquet",
+        ))
         self.stack.enter_context(
             patch("track.v2.pipeline.detect_intersections", return_value=_empty_intersect_result())
         )
@@ -247,10 +278,15 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         ).stats
 
         self.assertEqual((result["refine_id"], result["detect_id"]), (REFINE_ID, DETECT_ID))
+        self.assertEqual(self.store.completed_artifact[0], REFINE_ID)
+        self.assertIs(self.store.completed_artifact[1], self.descriptor)
+        self.assertEqual(self.descriptor.relative_path, f"refine/{REFINE_ID}")
         self.assertEqual(
             self.events,
             [
-                "start_refine", "commit", "persist_refine_batch", "finish_refine:completed", "commit",
+                "start_refine", "commit", "persist_refine_batch", "commit",
+                "create_staging", "export", "rollback", "publish",
+                "artifact:metadata", "artifact:present", "finish_refine:completed", "commit",
                 "start_detect", "commit", "rollback",
                 "persist_detect", "finish_detect:completed", "commit",
                 "load_clip", "start_fit", "commit", "persist_fit", "finish_fit:completed", "commit",
@@ -364,6 +400,8 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         )
         self.assertEqual(self.events.count("start_refine"), 0)
         self.assertEqual(self.events.count("get_refine"), 2)
+        self.assertNotIn("create_staging", self.events)
+        self.assertNotIn("publish", self.events)
 
     def test_refine_stream_failure_closes_source_and_marks_run_failed(self) -> None:
         class _FailingStream(_EmptyStream):
@@ -382,11 +420,53 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             )
 
         self.assertEqual(
-            self.events[-3:],
-            ["rollback", "finish_refine:failed", "commit"],
+            self.events[-4:],
+            ["rollback", "get_refine", "finish_refine:failed", "commit"],
         )
         self.assertEqual(self.handle.close_calls, 1)
         self.assertNotIn("start_detect", self.events)
+
+    def test_refine_source_change_abandons_staging_without_publish(self) -> None:
+        fingerprints = iter((
+            {"version": 1, "row_count": 0, "sha256": "0"},
+            {"version": 1, "row_count": 1, "sha256": "1"},
+        ))
+        with (
+            patch("track.v2.pipeline.calculate_source_fingerprint", side_effect=fingerprints),
+            self.assertRaisesRegex(RuntimeError, "source changed"),
+        ):
+            run_pipeline(PipelineInput(self.config, source_table="raw_points"))
+
+        self.assertIn("abandon", self.events)
+        self.assertNotIn("publish", self.events)
+        self.assertEqual(self.events[-3:], ["get_refine", "finish_refine:failed", "commit"])
+
+    def test_refine_export_failure_abandons_staging_and_preserves_error(self) -> None:
+        with (
+            patch(
+                "track.v2.pipeline.export_refine_parquet",
+                side_effect=RuntimeError("export failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "export failed"),
+        ):
+            run_pipeline(PipelineInput(self.config, source_table="raw_points"))
+
+        self.assertIn("abandon", self.events)
+        self.assertNotIn("publish", self.events)
+        self.assertIn("finish_refine:failed", self.events)
+
+    def test_refine_registration_failure_keeps_published_orphan(self) -> None:
+        def fail_completion(*args: object) -> None:
+            self.events.append("artifact:metadata")
+            raise RuntimeError("registry failed")
+
+        self.store.complete_refine_with_artifact = fail_completion
+        with self.assertRaisesRegex(RuntimeError, "registry failed"):
+            run_pipeline(PipelineInput(self.config, source_table="raw_points"))
+
+        self.assertIn("publish", self.events)
+        self.assertNotIn("abandon", self.events)
+        self.assertEqual(self.events[-3:], ["get_refine", "finish_refine:failed", "commit"])
 
     def test_projection_bounds_failure_closes_source_and_marks_run_failed(self) -> None:
         point = SimpleNamespace(lon=116.0, lat=39.0)
@@ -417,8 +497,8 @@ class RunPipelineLifecycleTest(unittest.TestCase):
 
         transformer.validate_bounds.assert_called_once_with((116.0, 39.0, 116.0, 39.0))
         self.assertEqual(
-            self.events[-3:],
-            ["rollback", "finish_refine:failed", "commit"],
+            self.events[-4:],
+            ["rollback", "get_refine", "finish_refine:failed", "commit"],
         )
         self.assertEqual(self.handle.close_calls, 1)
         self.assertNotIn("persist_refine_batch", self.events)
