@@ -545,6 +545,12 @@ C11f 以两笔提交退休已无生产调用者的 patch ledger 专用测试：�
 `db/patch_ledger.py`、`004_patch_ledger.sql` 和 `patches.py` 仍须删除，不改 heartbeat、
 DuckDB/Polars、业务 PostgreSQL、API 或前端字段，C11 尚未完成。
 
+C11g 删除已无生产或测试调用者的 patch ledger Python 实现与可选 DDL 模板。
+该可选结构从未由初始化器自动安装；迁移说明仅为曾手工安装的环境提供不含
+`CASCADE` 的显式卸载顺序，本卡不执行任何数据库删除。`patches.py` 及
+`test_patches.py` 仍留待下一卡清理，因此 C11 尚未完成。本步不改 heartbeat、
+DuckDB/Polars、业务数据库结构初始化、API 或前端字段。
+
 验证：全仓无生产引用、初始化器不引用旧结构、Pipeline 单进程路径完整。
 
 C11a 验证：Pipeline 与 scripts 全量测试 `1447 passed, 68 skipped`；生产代码和测试中的
@@ -570,11 +576,16 @@ C11f 验证：第一笔 Pipeline 与 scripts 全量测试 `1168 passed, 50 skipp
 `1043 passed, 50 skipped`。除待删除实现、DDL、迁移说明及仍独立测试的 patches 模型外，
 生产代码和测试中不再存在 patch ledger 调用者。
 
+C11g 验证：Pipeline 与 scripts 全量测试 `1043 passed, 50 skipped`；已删除模块无法导入，
+初始化器 DDL 不含四张账本表，生产与测试源码中已退役符号引用清零。
+
 提交：C11d 测试退休 `1a4264a`；C11d 实现删除为本提交。
 
 提交：C11e 为本提交。
 
 提交：C11f PostgreSQL 测试退休 `de7cde3`；单元测试退休为本提交。
+
+提交：C11g 为本提交。
 
 ### C12 — 集成与文档
 

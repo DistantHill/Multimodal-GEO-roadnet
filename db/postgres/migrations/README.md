@@ -11,14 +11,20 @@ Pipeline 表仍需另行处理；`--reset` 会破坏性重建。v4 业务表的�
 （data definition language，DDL）位于
 `services/pipeline/src/track/v2/cli/init_db.py`。
 
-## 流式任务账本扩展
+## 已撤回的 patch ledger 扩展
 
-`004_patch_ledger.sql` 是独立任务账本的显式安装定义，不是历史业务数据迁移，
-不改变 v3 业务表，也不由现有初始化入口自动执行。文件序号不表示已升级至 schema v4。
-由 `track.v2.db.patch_ledger.install_ledger` 将定义安装到调用方指定、已存在的数据库结构；
-不得直接把模板内容作为普通 SQL 文件运行。该接口需要独占、空闲且开启自动提交的连接，
-安装操作自身在一个事务内执行；应先在隔离测试结构验证，再于业务接入时显式部署。
+该可选账本从未由数据库初始化器自动安装，相关 Python 实现与 DDL 模板已撤回。
+新环境不需要执行任何账本安装或卸载操作。
 
-任务状态与业务运行状态是两个边界：任务全部完成不能绕过清单封闭与阶段发布检查，
-当前扩展不会自动更新 `refine_runs`、`detect_runs` 或前后端字段。
-实现进度、限制与验证证据见[实施任务卡](../../../docs/pipeline-streaming-implementation.md)。
+若某环境曾手工安装该扩展，必须先停止所有相关调用并确认无账本作业运行，
+再将下列 `target_schema` 替换为经核对的目标数据库结构名称，以显式限定名称严格按顺序手工执行：
+
+```sql
+DROP TABLE IF EXISTS target_schema.pipeline_patch_attempts;
+DROP TABLE IF EXISTS target_schema.pipeline_patch_tasks;
+DROP TABLE IF EXISTS target_schema.pipeline_patch_executions;
+DROP TABLE IF EXISTS target_schema.pipeline_patch_runs;
+```
+
+不得使用 `CASCADE`，不得删除 `refine_runs`、`detect_runs` 或其他业务表。本仓库仅提供上述
+手工操作说明，初始化、迁移和测试入口均不执行这些 `DROP TABLE` 语句。
