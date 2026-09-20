@@ -12,13 +12,16 @@ import pytest
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
 from track.v2.db.artifact_migration import migrate_artifacts_v5
 from track.v2.db.completion_migration import migrate_completion_v6
+from track.v2.db.detect_completion_migration import migrate_completion_v7
 from track.v2.db.artifact_registry import (
     ArtifactDescriptor,
     append_deleted,
     canonical_json,
+    find_detect_artifact,
     find_refine_artifact,
     insert_present,
 )
+from track.v2.db.pipeline_store import PostgresPipelineStore
 
 
 pytestmark = pytest.mark.skipif(
@@ -36,6 +39,8 @@ _ARTIFACT_OBJECTS = {
     "pipeline_artifact_event_insert_trigger",
     "validate_refine_artifact_completion_function",
     "refine_artifact_completion_trigger",
+    "validate_detect_artifact_completion_function",
+    "detect_artifact_completion_trigger",
 }
 
 
@@ -526,3 +531,89 @@ def test_refine_completion_cannot_observe_uncommitted_artifact() -> None:
                 completer.rollback()
         finally:
             admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+def test_v7_detect_completion_requires_same_transaction_present_artifact(
+    migrated_connection,
+) -> None:
+    import psycopg
+
+    conn = migrated_connection
+    with conn.cursor() as cur:
+        migrate_completion_v6(cur)
+        migrate_completion_v7(cur)
+    assert conn.execute("SELECT version FROM pipeline_schema_versions").fetchone() == (7,)
+
+    refine_id, missing_id = _add_runs(conn)
+    with conn.cursor() as cur:
+        insert_present(cur, _descriptor("refine", refine_id))
+    conn.execute(
+        "UPDATE refine_runs SET status='completed', finished_at=now() WHERE id=%s",
+        (refine_id,),
+    )
+    conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
+
+    with pytest.raises(psycopg.Error, match="requires exactly one present Detect artifact"):
+        with conn.transaction():
+            conn.execute(
+                "UPDATE detect_runs SET status='completed', finished_at=now() WHERE id=%s",
+                (missing_id,),
+            )
+    assert conn.execute(
+        "SELECT status FROM detect_runs WHERE id=%s", (missing_id,),
+    ).fetchone() == ("running",)
+
+    _refine, success_id = _add_runs(conn)
+    conn.execute(
+        "UPDATE detect_runs SET refine_id=%s WHERE id=%s", (refine_id, success_id),
+    )
+    descriptor = _descriptor("detect", success_id)
+    with conn.transaction():
+        PostgresPipelineStore(conn).complete_detect_with_artifact(
+            str(success_id), descriptor,
+        )
+    assert find_detect_artifact(conn.cursor(), success_id).state == "present"
+    assert conn.execute(
+        "SELECT status FROM detect_runs WHERE id=%s", (success_id,),
+    ).fetchone() == ("completed",)
+    with pytest.raises(ValueError, match="does not belong"):
+        PostgresPipelineStore(conn).complete_detect_with_artifact(
+            str(missing_id), _descriptor("detect", success_id),
+        )
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        with conn.transaction():
+            with conn.cursor() as cur:
+                insert_present(cur, _descriptor("detect", success_id))
+
+    _refine, deleted_id = _add_runs(conn)
+    conn.execute(
+        "UPDATE detect_runs SET refine_id=%s WHERE id=%s", (refine_id, deleted_id),
+    )
+    deleted = _descriptor("detect", deleted_id)
+    with conn.cursor() as cur:
+        insert_present(cur, deleted)
+        append_deleted(cur, deleted.id, "non-present probe")
+    with pytest.raises(psycopg.Error, match="requires exactly one present Detect artifact"):
+        with conn.transaction():
+            conn.execute(
+                "UPDATE detect_runs SET status='completed', finished_at=now() WHERE id=%s",
+                (deleted_id,),
+            )
+
+    _refine, rollback_id = _add_runs(conn)
+    conn.execute(
+        "UPDATE detect_runs SET refine_id=%s WHERE id=%s", (refine_id, rollback_id),
+    )
+    rolled_back = _descriptor("detect", rollback_id)
+    with pytest.raises(RuntimeError, match="rollback probe"):
+        with conn.transaction():
+            PostgresPipelineStore(conn).complete_detect_with_artifact(
+                str(rollback_id), rolled_back,
+            )
+            raise RuntimeError("rollback probe")
+    assert conn.execute(
+        "SELECT status FROM detect_runs WHERE id=%s", (rollback_id,),
+    ).fetchone() == ("running",)
+    assert conn.execute(
+        "SELECT count(*) FROM pipeline_artifacts WHERE detect_id=%s", (rollback_id,),
+    ).fetchone() == (0,)

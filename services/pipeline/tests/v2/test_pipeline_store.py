@@ -121,6 +121,33 @@ def test_refine_artifact_is_registered_before_run_completion_without_commit() ->
     connection.commit.assert_not_called()
 
 
+def test_detect_artifact_is_registered_before_run_completion_without_commit() -> None:
+    connection = MagicMock()
+    descriptor = SimpleNamespace(stage="detect", detect_id="detect")
+    calls: list[str] = []
+    store = PostgresPipelineStore(connection)
+    with (
+        patch("track.v2.db.pipeline_store.insert_present",
+              side_effect=lambda *args: calls.append("metadata+present")),
+        patch("track.v2.db.pipeline_store.finish_detect_run",
+              side_effect=lambda *args, **kwargs: calls.append("completed")),
+    ):
+        store.complete_detect_with_artifact("detect", descriptor)
+
+    assert calls == ["metadata+present", "completed"]
+    connection.commit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "descriptor",
+    [SimpleNamespace(stage="refine", detect_id="detect"),
+     SimpleNamespace(stage="detect", detect_id="other")],
+)
+def test_detect_artifact_completion_rejects_wrong_stage_or_owner(descriptor) -> None:
+    with pytest.raises(ValueError, match="does not belong"):
+        PostgresPipelineStore(MagicMock()).complete_detect_with_artifact("detect", descriptor)
+
+
 def test_refine_batch_assigns_globally_increasing_subtrack_ids() -> None:
     store = PostgresPipelineStore(object())
     excluded = [ExcludedPoint(PointRef("source", "9", True), "stationary", 116, 39)]

@@ -45,9 +45,10 @@
 | C07b | Detect 跨轨迹候选准备列式迁移 | C07a | 每提交 ≤700 | 已完成（`2fc3146`） |
 | C07c1 | Detect 跨轨迹 DuckDB broad phase | C07b | 每提交 ≤700 | 已完成，`6551037`，待主对话确认 |
 | C07c2 | Detect 跨轨迹精确内核与正式入口接线 | C07c1 | 每提交 ≤700 | 已完成（`a30ace3`） |
-| C08a | Detect Parquet staging export 与 v1 Schema | C07c2 | 每提交 ≤700 | 已完成，待主对话确认 |
-| C08b | Detect Parquet 发布、登记与生命周期 | C08a | 每提交 ≤700 | 未开始 |
-| C08c | Clip 列式读取与正式入口接线 | C08b | 每提交 ≤700 | 未开始 |
+| C08a | Detect Parquet staging export 与 v1 Schema | C07c2 | 每提交 ≤700 | 已完成（`58013b9`；Q41 修复 `aece70c`） |
+| C08b1 | Detect 制品数据库约束与事务中立 API | C08a | 每提交 ≤700 | 已完成，待主对话确认 |
+| C08b2 | Detect Parquet 发布与失败生命周期接线 | C08b1 | 每提交 ≤700 | 未开始 |
+| C08c | Clip 列式读取与正式入口接线 | C08b2 | 每提交 ≤700 | 未开始 |
 | C09 | Clip/Fitting 顺序计算与旧 spool 清除 | C08c | 每提交 ≤700 | 未开始 |
 | C10 | Detect/写入器旧磁盘工作区清除 | C07a–C09 | 每提交 ≤700 | 未开始 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 未开始 |
@@ -313,9 +314,23 @@ resolved_points/intersections/entry_exit_points 三张显式 v1 逻辑表；Run 
 真实 PostgreSQL 与现有 Clip 查询的 intersection 和 resolved p/i/c 序列差分。Q44
 评审结论由测试固定：本卡仅需 DuckDB 关系投影和校验，不需要 Polars 或 Python 行对象。
 
+提交：`58013b9`；Q41 修复 `aece70c`。
+
+### C08b1 — Detect 制品数据库约束与事务中立 API
+
+范围：提供严格 Detect 制品查询、同事务登记并完成 Run 的存储 API，以及 v6→v7
+加法迁移；fresh 初始化和 v3/v4/v5 迁移链最终统一到 v7。只建立数据库约束，不接
+发布生命周期。
+
+验证：事务中立 API、迁移版本顺序，以及真实 PostgreSQL 上缺失、错误归属、重复、
+deleted 状态和失败回滚。
+
+迁移不为 v6 中已有的 completed Detect Run 回填或伪造制品；C08c 消费时对此类历史 Run
+按 fail closed 处理，需要按 Q45/Q54 以新 Run 重跑。
+
 提交：待记录。
 
-### C08b — Detect Parquet 发布、登记与生命周期
+### C08b2 — Detect Parquet 发布与失败生命周期接线
 
 范围：把 C08a staging exporter 接入 Detect 完成路径，落实原子发布、制品登记、来源
 指纹复核与失败/orphan 生命周期；不改变 Clip 消费入口。

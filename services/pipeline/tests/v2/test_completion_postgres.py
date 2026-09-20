@@ -87,6 +87,17 @@ def seed_detect(conn, *, tracks=1, offset=0, long_subtrack=False):
 
 
 def complete(conn, detect):
+    artifact = uuid4()
+    conn.execute("""
+        INSERT INTO pipeline_artifacts(
+            id, stage, detect_id, relative_path, manifest_version, manifest,
+            manifest_sha256, source_fingerprint, row_count, byte_count)
+        VALUES (%s, 'detect', %s, %s, 1, '{}', %s, '{}', 0, 0)
+    """, (artifact, detect, f"detect/{detect}", "a" * 64))
+    conn.execute(
+        "INSERT INTO pipeline_artifact_events(artifact_id, state) VALUES (%s, 'present')",
+        (artifact,),
+    )
     conn.execute("UPDATE detect_runs SET status='completed', finished_at=now() WHERE id=%s", (detect,))
     conn.execute('SET CONSTRAINTS ALL IMMEDIATE')
 

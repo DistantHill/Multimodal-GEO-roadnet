@@ -133,6 +133,10 @@ class PipelineStore(Protocol):
 
     def finish_detect(self, detect_id: str, *, status: str) -> None: ...
 
+    def complete_detect_with_artifact(
+        self, detect_id: str, descriptor: ArtifactDescriptor,
+    ) -> None: ...
+
     def load_clip(
         self,
         detect_id: str,
@@ -329,6 +333,16 @@ class PostgresPipelineStore:
 
     def finish_detect(self, detect_id: str, *, status: str) -> None:
         finish_detect_run(self._conn, detect_id, status=status)
+
+    def complete_detect_with_artifact(
+        self, detect_id: str, descriptor: ArtifactDescriptor,
+    ) -> None:
+        """Register a present artifact and complete its Run without committing."""
+        if descriptor.stage != "detect" or str(descriptor.detect_id) != str(detect_id):
+            raise ValueError("artifact does not belong to the Detect Run")
+        with self._conn.cursor() as cur:
+            insert_present(cur, descriptor)
+        finish_detect_run(self._conn, detect_id, status="completed")
 
     def load_clip(
         self,

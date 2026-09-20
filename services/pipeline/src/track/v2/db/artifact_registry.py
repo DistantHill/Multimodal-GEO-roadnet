@@ -254,9 +254,9 @@ def _json_object_text(value: Any, name: str) -> str:
         raise ArtifactRegistryReadError(f"invalid {name}") from exc
 
 
-def find_refine_artifact(cur: Any, refine_id: UUID | str) -> RegisteredArtifact:
-    """Read one Refine artifact and latest lifecycle event without transaction control."""
-    owner = _uuid(refine_id, "refine_id")
+def _find_artifact(cur: Any, owner_id: UUID | str, stage: str) -> RegisteredArtifact:
+    owner_field = f"{stage}_id"
+    owner = _uuid(owner_id, owner_field)
     cur.execute(
         "SELECT a.id, a.stage, a.refine_id, a.detect_id, a.relative_path, "
         "a.manifest_version, a.manifest, a.manifest_sha256, a.source_fingerprint, "
@@ -264,14 +264,14 @@ def find_refine_artifact(cur: Any, refine_id: UUID | str) -> RegisteredArtifact:
         "FROM pipeline_artifacts a LEFT JOIN LATERAL ("
         "SELECT e.state FROM pipeline_artifact_events e "
         "WHERE e.artifact_id = a.id ORDER BY e.id DESC LIMIT 1"
-        ") latest ON true WHERE a.refine_id = %s LIMIT 2",
+        f") latest ON true WHERE a.{owner_field} = %s LIMIT 2",
         (owner,),
     )
     rows = cur.fetchmany(2)
     if not rows:
-        raise ArtifactRegistryReadError(f"unknown Refine artifact: {owner}")
+        raise ArtifactRegistryReadError(f"unknown {stage.title()} artifact: {owner}")
     if len(rows) != 1:
-        raise ArtifactRegistryReadError(f"duplicate Refine artifacts: {owner}")
+        raise ArtifactRegistryReadError(f"duplicate {stage.title()} artifacts: {owner}")
     row = rows[0]
     if len(row) != 12 or row[5] != 1 or row[11] not in ("present", "deleted"):
         raise ArtifactRegistryReadError("artifact registry row is malformed")
@@ -288,9 +288,20 @@ def find_refine_artifact(cur: Any, refine_id: UUID | str) -> RegisteredArtifact:
         )
     except (TypeError, ValueError) as exc:
         raise ArtifactRegistryReadError("artifact descriptor is malformed") from exc
-    if descriptor.stage != "refine" or descriptor.refine_id != owner:
+    descriptor_owner = descriptor.refine_id if stage == "refine" else descriptor.detect_id
+    if descriptor.stage != stage or descriptor_owner != owner:
         raise ArtifactRegistryReadError("artifact owner is malformed")
     return RegisteredArtifact(descriptor, row[11])
+
+
+def find_refine_artifact(cur: Any, refine_id: UUID | str) -> RegisteredArtifact:
+    """Read one Refine artifact and latest lifecycle event without transaction control."""
+    return _find_artifact(cur, refine_id, "refine")
+
+
+def find_detect_artifact(cur: Any, detect_id: UUID | str) -> RegisteredArtifact:
+    """Read one Detect artifact and latest lifecycle event without transaction control."""
+    return _find_artifact(cur, detect_id, "detect")
 
 
 def insert_present(cur: Any, descriptor: ArtifactDescriptor) -> None:

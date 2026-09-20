@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from .schema import SCHEMA_COMPONENT, SCHEMA_VERSION
+from .schema import SCHEMA_COMPONENT
+
+
+_TARGET_VERSION = 6
 
 
 _COMPLETION_GUARDS = {
@@ -23,7 +26,7 @@ def migrate_completion_v6(cur: Any) -> None:
         (SCHEMA_COMPONENT,),
     )
     row = cur.fetchone()
-    if row is not None and int(row[0]) == SCHEMA_VERSION:
+    if row is not None and int(row[0]) == _TARGET_VERSION:
         return
     if row is None or int(row[0]) != 5:
         raise RuntimeError("Refine completion migration requires an existing schema v5 database")
@@ -33,5 +36,5 @@ def migrate_completion_v6(cur: Any) -> None:
             cur.execute(ddl)
     cur.execute(
         "UPDATE pipeline_schema_versions SET version = %s WHERE component = %s",
-        (SCHEMA_VERSION, SCHEMA_COMPONENT),
+        (_TARGET_VERSION, SCHEMA_COMPONENT),
     )

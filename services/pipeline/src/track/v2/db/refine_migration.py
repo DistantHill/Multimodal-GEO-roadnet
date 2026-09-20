@@ -19,6 +19,8 @@ _LATER_SCHEMA_OBJECTS = {
     "uq_pipeline_artifacts_detect_run",
     "validate_refine_artifact_completion_function",
     "refine_artifact_completion_trigger",
+    "validate_detect_artifact_completion_function",
+    "detect_artifact_completion_trigger",
 }
 
 

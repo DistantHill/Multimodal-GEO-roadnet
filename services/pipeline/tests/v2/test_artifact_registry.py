@@ -10,8 +10,10 @@ import pytest
 from track.v2.db.artifact_registry import (
     ArtifactDescriptor,
     ArtifactRegistryReadError,
+    RegisteredArtifact,
     append_deleted,
     canonical_json,
+    find_detect_artifact,
     find_refine_artifact,
     insert_present,
 )
@@ -292,3 +294,32 @@ def test_find_refine_artifact_rejects_missing_event_and_corrupt_metadata() -> No
     corrupt[9] += 1
     with pytest.raises(ArtifactRegistryReadError, match="descriptor"):
         find_refine_artifact(_Cursor(rows=[tuple(corrupt)]), descriptor.refine_id)
+
+
+def test_find_detect_artifact_is_strict_and_transaction_neutral() -> None:
+    descriptor = _descriptor(
+        "detect", relative_path="detect/run-1",
+    )
+    cur = _Cursor(rows=[_registry_row(descriptor)])
+    snapshot = find_detect_artifact(cur, descriptor.detect_id)
+    assert snapshot == RegisteredArtifact(descriptor, "present")
+    assert "a.detect_id = %s" in cur.calls[0][0]
+    assert not cur.committed
+
+
+def test_find_detect_artifact_rejects_wrong_owner_and_state() -> None:
+    descriptor = _descriptor("detect", relative_path="detect/run-1")
+    wrong = list(_registry_row(descriptor))
+    wrong[2], wrong[3] = wrong[3], None
+    with pytest.raises(ArtifactRegistryReadError, match="descriptor|owner"):
+        find_detect_artifact(_Cursor(rows=[tuple(wrong)]), descriptor.detect_id)
+    missing_event = list(_registry_row(descriptor))
+    missing_event[-1] = None
+    with pytest.raises(ArtifactRegistryReadError, match="malformed"):
+        find_detect_artifact(_Cursor(rows=[tuple(missing_event)]), descriptor.detect_id)
+
+
+@pytest.mark.parametrize("rows,message", [([], "unknown"), ([object(), object()], "duplicate")])
+def test_find_detect_artifact_rejects_unknown_and_duplicates(rows, message) -> None:
+    with pytest.raises(ArtifactRegistryReadError, match=message):
+        find_detect_artifact(_Cursor(rows=rows), uuid4())
