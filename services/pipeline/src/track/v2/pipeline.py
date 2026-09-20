@@ -378,12 +378,13 @@ def run_pipeline(
         detect_published = False
         iresult = None
         try:
+            detect_data_root = _data_root()
             detect_compute_started = time.perf_counter()
             with store.connection.cursor() as cur:
                 registered = find_refine_artifact(cur, refine_id)
             reader = RefineDatasetReader(
                 _parquet_root(), registered.descriptor, registered.state, pc.runtime,
-                data_root=_data_root(),
+                data_root=detect_data_root,
             )
             with reader:
                 iresult = detect_intersections(
@@ -391,7 +392,7 @@ def run_pipeline(
                     config=icfg,
                     refine_reader=reader,
                     runtime=pc.runtime,
-                    data_root=_data_root(),
+                    data_root=detect_data_root,
                 )
             detect_compute_elapsed = time.perf_counter() - detect_compute_started
             # psycopg starts a transaction for the Detect SELECTs. The result
@@ -426,6 +427,8 @@ def run_pipeline(
                 persisted_detect = store.persist_detect(
                     detect_id,
                     iresult,
+                    runtime=pc.runtime,
+                    data_root=detect_data_root,
                     batch_size=pc.runtime.db_insert_batch,
                 )
             # Persistence is not complete until the run-level validator and

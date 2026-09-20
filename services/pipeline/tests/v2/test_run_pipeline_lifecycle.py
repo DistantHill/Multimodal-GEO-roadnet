@@ -142,6 +142,7 @@ class _RecordingStore:
         self.refine_status = "completed"
         self.completed_artifact: tuple[object, ...] | None = None
         self.completed_detect_artifact: tuple[object, ...] | None = None
+        self.persist_detect_args: tuple[object, object] | None = None
 
     def commit(self) -> None:
         self.events.append("commit")
@@ -183,6 +184,7 @@ class _RecordingStore:
 
     def persist_detect(self, *args: object, **kwargs: object) -> DetectPersistenceResult:
         self.events.append("persist_detect")
+        self.persist_detect_args = (kwargs["runtime"], kwargs["data_root"])
         if self.persist_detect_error is not None:
             raise self.persist_detect_error
         return DetectPersistenceResult(
@@ -335,6 +337,9 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertEqual(
             self.store.loaded_clip_args,
             ("/tmp/parquet", "/tmp/data", _PIPELINE_CONFIG.runtime, _PIPELINE_CONFIG.clip),
+        )
+        self.assertEqual(
+            self.store.persist_detect_args, (_PIPELINE_CONFIG.runtime, "/tmp/data"),
         )
         self.assertEqual(self.descriptor.relative_path, f"refine/{REFINE_ID}")
         self.assertTrue(_Reader.instances[-1].closed)

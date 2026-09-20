@@ -9,7 +9,7 @@ import pytest
 
 from track.v2 import db_writer as writer
 from track.v2.writer_workspace import WriterWorkspace
-from track.v2.models import RefinedPointRef, HotspotCluster
+from track.v2.models import RefinedPointRef, HotspotCluster, RuntimeConfig
 from v2.test_db_writer import _build_resolved_rows, _crossing
 
 
@@ -197,7 +197,6 @@ def test_p_i_c_sequences_and_id_allocation_match_materialized_oracle(tmp_path, m
 
 @pytest.mark.parametrize('failure', [RuntimeError('late copy'), KeyboardInterrupt()])
 def test_public_writer_failure_closes_workspace_and_never_commits(tmp_path, monkeypatch, failure):
-    monkeypatch.setenv('DATA_ROOT', str(tmp_path))
     refs = [RefinedPointRef('kept', i, 1, i) for i in range(6)]
     result = NS(turn_events=OnePass([turn(i, ref) for i, ref in enumerate(refs)]),
                 cross_track_candidates=OnePass([]), hotspot_events=[], clusters=[], topologies=[], spatial_context=None)
@@ -224,10 +223,12 @@ def test_public_writer_failure_closes_workspace_and_never_commits(tmp_path, monk
                 raise failure
     monkeypatch.setattr(writer, '_copy_insert', copy)
     with pytest.raises(type(failure)):
-        writer.persist_detect_result(conn, 'd', result, batch_size=2)
+        writer.persist_detect_result(
+            conn, 'd', result, runtime=RuntimeConfig(), data_root=tmp_path, batch_size=2,
+        )
     assert len(turn_batches) == 2
     assert len(turn_batches[0]) == 2
-    assert list(tmp_path.iterdir()) == []
+    assert list((tmp_path / 'duckdb' / 'writer-relations' / 'd').iterdir()) == []
     assert result.turn_events.closed and result.cross_track_candidates.closed
 
 

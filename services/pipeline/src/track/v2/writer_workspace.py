@@ -282,6 +282,9 @@ class WriterWorkspace:
                         raise ValueError('duplicate/degenerate track cross segment pair')
                     previous = pair
 
+    def iter_validated_cross_rows(self):
+        return self.records('validated_cross')
+
     def close(self):
         if not self._closed:
             self._closed = True

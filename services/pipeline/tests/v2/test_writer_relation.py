@@ -10,6 +10,7 @@ import pytest
 from track.v2 import writer_relation
 from track.v2.models import RefinedPointRef, RuntimeConfig
 from track.v2.writer_relation import WriterRelation
+from track.v2 import db_writer
 
 
 def _relation(tmp_path: Path, *, batch_size: int = 2) -> WriterRelation:
@@ -18,6 +19,42 @@ def _relation(tmp_path: Path, *, batch_size: int = 2) -> WriterRelation:
                       duckdb_max_temp_directory_size="256MB"),
         tmp_path, "detect", batch_size=batch_size, relation_id="relation",
     )
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError("failed"), KeyboardInterrupt()])
+def test_persist_detect_result_owns_relation_lifecycle(tmp_path, monkeypatch, failure):
+    runtime = RuntimeConfig()
+    events = []
+
+    class Relation:
+        def __init__(self, actual_runtime, data_root, detect_id, *, batch_size):
+            events.append((actual_runtime, data_root, detect_id, batch_size))
+
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("close")
+
+    def persist(*_args, **_kwargs):
+        if failure is not None:
+            raise failure
+        return "written"
+
+    monkeypatch.setattr(db_writer, "WriterRelation", Relation)
+    monkeypatch.setattr(db_writer, "_persist_detect_result", persist)
+    if failure is None:
+        assert db_writer.persist_detect_result(
+            object(), "detect", object(), runtime=runtime, data_root=tmp_path, batch_size=7,
+        ) == "written"
+    else:
+        with pytest.raises(type(failure)):
+            db_writer.persist_detect_result(
+                object(), "detect", object(), runtime=runtime,
+                data_root=tmp_path, batch_size=7,
+            )
+    assert events == [(runtime, tmp_path, "detect", 7), "enter", "close"]
 
 
 def _turn(index, ref):

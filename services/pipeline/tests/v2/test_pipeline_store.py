@@ -16,6 +16,7 @@ from track.v2.models import (
     GeneratedReason,
     PointRef,
     RefinementSubtrack,
+    RuntimeConfig,
     SpatialContext,
     TrajectoryPoint,
 )
@@ -236,7 +237,13 @@ def test_detect_persistence_delegates_to_one_atomic_writer() -> None:
             return_value=counts,
         ) as persist,
     ):
-        actual = store.persist_detect("detect", result, batch_size=23)
+        runtime = RuntimeConfig()
+        actual = store.persist_detect(
+            "detect", result, runtime=runtime, data_root="/data/runtime", batch_size=23,
+        )
 
     assert actual == DetectPersistenceResult(10, 2, 3, 4, 5, 2, 6, 0.125)
-    persist.assert_called_once_with(connection, "detect", result, batch_size=23)
+    persist.assert_called_once_with(
+        connection, "detect", result,
+        runtime=runtime, data_root="/data/runtime", batch_size=23,
+    )

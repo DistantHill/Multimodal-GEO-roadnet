@@ -9,14 +9,14 @@ the Detect Run completed or roll everything back.
 from __future__ import annotations
 
 import json
-import os
 import time
 import uuid
 from contextlib import nullcontext, closing
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterator
 
-from .writer_workspace import WriterWorkspace
+from .writer_relation import WriterRelation
 from .heartbeat import observed_operation, heartbeat_progress, operation_heartbeat
 from .db.source_table import quote_table_name
 from .detect import IntersectResult
@@ -30,6 +30,7 @@ from .models import (
     GeneratedReason,
     HotspotCluster,
     RefinementSubtrack,
+    RuntimeConfig,
     SpatialContext,
     TrajectoryPoint,
 )
@@ -392,10 +393,14 @@ def persist_detect_result(
     detect_id: str,
     result: IntersectResult,
     *,
+    runtime: RuntimeConfig,
+    data_root: str | Path,
     batch_size: int = _BATCH,
 ) -> DetectWriteCounts:
     """Persist atomically; own narrow local relations until writer completion."""
-    with WriterWorkspace(directory=os.environ.get("DATA_ROOT") or None, batch_size=batch_size) as workspace:
+    with WriterRelation(
+        runtime, data_root, detect_id, batch_size=batch_size,
+    ) as workspace:
         return _persist_detect_result(conn, detect_id, result, batch_size=batch_size, workspace=workspace)
 
 
@@ -684,7 +689,7 @@ def _persist_resolved_sequence(
     crossing_id_by_calculation: dict[tuple[int, int], int],
     *,
     batch_size: int,
-    workspace: WriterWorkspace,
+    workspace: WriterRelation,
 ) -> int:
     """Keep historical p/i/c ordering, streaming exact source keys to disk."""
     if batch_size < 1:
@@ -875,7 +880,8 @@ def _insert_tracks_cross(conn, detect_id, workspace, *, batch_size):
         conn, "tracks_cross",
         ["detect_id", "candidate_intersection_id", "from_segment_start_point_id",
          "to_segment_start_point_id", "x", "y", "lon", "lat"],
-        workspace.records("validated_cross"), total=workspace.counts[1], batch_size=batch_size,
+        workspace.iter_validated_cross_rows(),
+        total=workspace.counts[1], batch_size=batch_size,
     )
 
 

@@ -130,6 +130,8 @@ class PipelineStore(Protocol):
         detect_id: str,
         result: IntersectResult,
         *,
+        runtime: RuntimeConfig,
+        data_root: Path | str,
         batch_size: int = _DEFAULT_BATCH_SIZE,
     ) -> DetectPersistenceResult: ...
 
@@ -309,6 +311,8 @@ class PostgresPipelineStore:
         detect_id: str,
         result: IntersectResult,
         *,
+        runtime: RuntimeConfig,
+        data_root: Path | str,
         batch_size: int = _DEFAULT_BATCH_SIZE,
     ) -> DetectPersistenceResult:
         spatial_context = result.spatial_context
@@ -323,6 +327,8 @@ class PostgresPipelineStore:
             self._conn,
             detect_id,
             result,
+            runtime=runtime,
+            data_root=data_root,
             batch_size=batch_size,
         )
         return DetectPersistenceResult(

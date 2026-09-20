@@ -79,6 +79,8 @@ class _ConfigRecordingStore:
         self.loaded_clip_runtime: object | None = None
         self.fit_clip_config: object | None = None
         self.fit_fitting_config: object | None = None
+        self.persist_detect_runtime: object | None = None
+        self.persist_detect_data_root: object | None = None
 
     def commit(self) -> None:
         return None
@@ -93,6 +95,8 @@ class _ConfigRecordingStore:
         return "detect-1"
 
     def persist_detect(self, *args: object, **kwargs: object) -> DetectPersistenceResult:
+        self.persist_detect_runtime = kwargs["runtime"]
+        self.persist_detect_data_root = kwargs["data_root"]
         return DetectPersistenceResult(
             resolved_point_count=0,
             tracks_cross_count=0,
@@ -190,6 +194,8 @@ class PipelineConfigWiringTest(unittest.TestCase):
         self.assertEqual(store.loaded_clip_publication_root, Path("/tmp/parquet"))
         self.assertEqual(store.loaded_clip_data_root, Path("/tmp/data"))
         self.assertIs(store.loaded_clip_runtime, pipeline_config.runtime)
+        self.assertIs(store.persist_detect_runtime, pipeline_config.runtime)
+        self.assertEqual(store.persist_detect_data_root, Path("/tmp/data"))
         self.assertIs(store.fit_clip_config, clip_config)
         self.assertIs(store.fit_fitting_config, fitting_config)
         fit.assert_called_once_with(store.clip_result, config=fitting_config)
