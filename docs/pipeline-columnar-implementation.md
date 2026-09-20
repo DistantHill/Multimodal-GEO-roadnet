@@ -34,9 +34,11 @@
 | C03b | Parquet 检查、快速消费校验与 orphan 识别 | C03a | ≤700 | 已完成（`af4d098`） |
 | C04a | artifact reconcile/gc 只读计划 | C03b | ≤700 | 已完成（`9bc7f6b`） |
 | C04b1 | artifact reconcile/gc 显式 apply 核心 | C04a | ≤700 | 已完成（`615f4ce`） |
-| C04b2 | artifact reconcile/gc CLI 与真实 PostgreSQL 验证 | C04b1 | ≤700 | 已实施，待主对话验收 |
-| C05 | Refine Parquet Schema 与发布路径 | C04b2 | 每提交 ≤700 | 未开始 |
-| C06 | DuckDB 读取 Refine Parquet 的 Detect 输入适配 | C05 | 每提交 ≤700 | 未开始 |
+| C04b2 | artifact reconcile/gc CLI 与真实 PostgreSQL 验证 | C04b1 | ≤700 | 已完成（`9d62a5a`） |
+| C05a | Refine Parquet Schema 与 staging 导出 | C04b2 | ≤700 | 已实施，待主对话验收 |
+| C05b | Refine Parquet 发布、登记与 Run 完成事务 | C05a | ≤700 | 未开始 |
+| C05c | 真实 PostgreSQL 差分、故障验证与切换闸门 | C05b | ≤700 | 未开始 |
+| C06 | DuckDB 读取 Refine Parquet 的 Detect 输入适配 | C05c | 每提交 ≤700 | 未开始 |
 | C07 | Detect 算子列式迁移及 Python 回退收敛 | C06 | 每提交 ≤700 | 未开始 |
 | C08 | Detect Parquet 发布与 Clip 列式读取 | C07 | 每提交 ≤700 | 未开始 |
 | C09 | Clip/Fitting 顺序计算与旧 spool 清除 | C08 | 每提交 ≤700 | 未开始 |
@@ -172,14 +174,31 @@ staging 和事件失败语义由伪游标与临时目录单元测试覆盖。
 
 验证：dry-run 零写入、幂等 apply、删除/事件顺序和失败恢复测试。
 
-提交：待记录。
+提交：`9d62a5a`。
 
-### C05 — Refine Parquet
+### C05a — Refine Parquet Schema 与 staging 导出
 
 范围：按 Spec 5.1 定义 kept_points/injected_points Schema；以 `refine_id` 隔离，
-来源指纹前后校验；完成 PostgreSQL 结果与 Parquet 的发布顺序。
+从 PostgreSQL 权威结果导出并校验 staging，不发布或登记，也不完成 Run。
 
-验证：Schema 指纹、行数/身份/顺序、来源变化、发布失败、小样本逐表差分。
+验证：Schema、行数/身份/交错顺序、SQL 隔离、DuckDB 离线配置和空表文件。
+
+提交：本卡提交。
+
+### C05b — Refine Parquet 发布与登记
+
+范围：核对来源指纹，原子发布文件，并在一个 PostgreSQL 事务中登记制品、追加
+`present` 事件及完成 Refine Run；失败时不暴露不完整数据集。
+
+验证：来源变化、发布/登记/完成顺序、各故障点恢复和 orphan 行为。
+
+提交：待记录。
+
+### C05c — Refine Parquet 切换闸门
+
+范围：以真实 PostgreSQL/PostGIS 执行逐表差分与故障注入，满足切换闸门后停用旧读取路径。
+
+验证：小样本逐表差分、特殊连接参数、源变化及发布失败。
 
 提交：待记录。
 
