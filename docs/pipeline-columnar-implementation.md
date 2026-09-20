@@ -66,7 +66,7 @@
 | C10c3 | Writer 最终行组合与配对校验 | C10c2 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
-| C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已开始（C11a–C11c） |
+| C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已开始（C11a–C11f） |
 | C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 未开始 |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
@@ -540,6 +540,11 @@ C11e 删除已无生产调用者的自行编写 patch 磁盘暂存模块、专�
 临时目录、`db/patch_ledger.py`、patches 模型及其余账本测试继续保留；本步不改 heartbeat、
 引擎资源配置、业务 PostgreSQL、API 或前端字段，C11 尚未完成。
 
+C11f 以两笔提交退休已无生产调用者的 patch ledger 专用测试：先删除真实 PostgreSQL
+覆盖，再删除伪连接单元覆盖并记录验证结果。本步仅为下一卡删除孤立实现解除测试约束；
+`db/patch_ledger.py`、`004_patch_ledger.sql` 和 `patches.py` 仍须删除，不改 heartbeat、
+DuckDB/Polars、业务 PostgreSQL、API 或前端字段，C11 尚未完成。
+
 验证：全仓无生产引用、初始化器不引用旧结构、Pipeline 单进程路径完整。
 
 C11a 验证：Pipeline 与 scripts 全量测试 `1447 passed, 68 skipped`；生产代码和测试中的
@@ -561,9 +566,15 @@ C11e 验证：Pipeline 与 scripts 全量测试 `1168 passed, 66 skipped`；生�
 `SpoolArtifact`、`write_patch_artifact`、`iter_artifact_chunks`、`ArtifactIntegrityError`、
 `SpoolLimitError` 引用清零。
 
+C11f 验证：第一笔 Pipeline 与 scripts 全量测试 `1168 passed, 50 skipped`；第二笔为
+`1043 passed, 50 skipped`。除待删除实现、DDL、迁移说明及仍独立测试的 patches 模型外，
+生产代码和测试中不再存在 patch ledger 调用者。
+
 提交：C11d 测试退休 `1a4264a`；C11d 实现删除为本提交。
 
 提交：C11e 为本提交。
+
+提交：C11f PostgreSQL 测试退休 `de7cde3`；单元测试退休为本提交。
 
 ### C12 — 集成与文档
 
