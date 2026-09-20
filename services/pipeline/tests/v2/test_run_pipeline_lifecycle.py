@@ -203,10 +203,10 @@ class _RecordingStore:
 
     def load_clip(
         self, detect_id: str, *, publication_root: object,
-        runtime: object, config: object,
+        data_root: object, runtime: object, config: object,
     ) -> object:
         self.events.append("load_clip")
-        self.loaded_clip_args = (publication_root, runtime, config)
+        self.loaded_clip_args = (publication_root, data_root, runtime, config)
         if self.clip_error is not None:
             raise self.clip_error
         return self.clip_result
@@ -299,6 +299,9 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.stack.enter_context(patch(
             "track.v2.pipeline._parquet_root", return_value="/tmp/parquet",
         ))
+        self.stack.enter_context(patch(
+            "track.v2.pipeline._data_root", return_value="/tmp/data",
+        ))
         self.detect = self.stack.enter_context(
             patch("track.v2.pipeline.detect_intersections", return_value=_empty_intersect_result())
         )
@@ -330,7 +333,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertIs(self.store.completed_detect_artifact[1], self.detect_descriptor)
         self.assertEqual(
             self.store.loaded_clip_args,
-            ("/tmp/parquet", _PIPELINE_CONFIG.runtime, _PIPELINE_CONFIG.clip),
+            ("/tmp/parquet", "/tmp/data", _PIPELINE_CONFIG.runtime, _PIPELINE_CONFIG.clip),
         )
         self.assertEqual(self.descriptor.relative_path, f"refine/{REFINE_ID}")
         self.assertTrue(_Reader.instances[-1].closed)

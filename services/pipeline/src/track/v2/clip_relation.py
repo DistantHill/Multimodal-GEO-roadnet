@@ -1,7 +1,7 @@
 """DuckDB-managed temporary columnar relation for Clip/Fitting handoff."""
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from itertools import islice
 from pathlib import Path
 from uuid import uuid4
@@ -11,7 +11,7 @@ import duckdb
 from .models import ClipEndpoint, ClipPoint, RuntimeConfig, TrackClip
 
 
-class ClipRelation:
+class ClipRelation(Sequence[TrackClip]):
     """Build once, validate, then repeatedly read ``TrackClip`` rows."""
 
     def __init__(
@@ -186,6 +186,21 @@ class ClipRelation:
 
     def __iter__(self) -> Iterator[TrackClip]:
         return self._iterate("", (), "c.ordinal")
+
+    def __getitem__(self, index: int | slice) -> TrackClip | tuple[TrackClip, ...]:
+        self._require_sealed()
+        if isinstance(index, slice):
+            return tuple(self[item] for item in range(*index.indices(len(self))))
+        if not isinstance(index, int):
+            raise TypeError("clip index must be an integer or slice")
+        ordinal = index + len(self) if index < 0 else index
+        if ordinal < 0 or ordinal >= len(self):
+            raise IndexError(index)
+        iterator = self._iterate("WHERE c.ordinal=?", (ordinal,), "c.ordinal")
+        try:
+            return next(iterator)
+        finally:
+            iterator.close()
 
     def get_by_clip_id(self, clip_id: str) -> TrackClip:
         self._require_sealed()

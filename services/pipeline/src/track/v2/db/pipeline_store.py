@@ -144,6 +144,7 @@ class PipelineStore(Protocol):
         detect_id: str,
         *,
         publication_root: Path | str,
+        data_root: Path | str,
         runtime: RuntimeConfig,
         config: ClipConfig | None = None,
     ) -> ClipResult: ...
@@ -353,11 +354,12 @@ class PostgresPipelineStore:
         detect_id: str,
         *,
         publication_root: Path | str,
+        data_root: Path | str,
         runtime: RuntimeConfig,
         config: ClipConfig | None = None,
     ) -> ClipResult:
         return extract_clips_for_detect(
-            self._conn, detect_id, publication_root=publication_root,
+            self._conn, detect_id, publication_root=publication_root, data_root=data_root,
             runtime=runtime, config=config,
         )
 

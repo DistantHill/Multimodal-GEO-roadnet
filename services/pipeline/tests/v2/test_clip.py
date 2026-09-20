@@ -260,7 +260,8 @@ class DetectClipLoadTest(unittest.TestCase):
             patch("track.v2.clip.DetectDatasetReader", return_value=reader) as factory,
         ):
             result = extract_clips_for_detect(
-                conn, "detect-1", publication_root="/parquet", runtime=RuntimeConfig(),
+                conn, "detect-1", publication_root="/parquet", data_root="/tmp",
+                runtime=RuntimeConfig(),
             )
 
         factory.assert_called_once_with("/parquet", "descriptor", "present", ANY)
@@ -268,6 +269,7 @@ class DetectClipLoadTest(unittest.TestCase):
         conn.commit.assert_not_called()
         self.assertEqual(result.detect_id, "detect-1")
         self.assertEqual(result.report.full_track_clips, 1)
+        result.clips.close()
 
     def test_artifact_failure_closes_spool_without_postgres_fallback(self) -> None:
         run = SimpleNamespace(status="completed", spatial_context=_CONTEXT)
@@ -279,15 +281,12 @@ class DetectClipLoadTest(unittest.TestCase):
                 descriptor="descriptor", state="deleted",
             )),
             patch("track.v2.clip.DetectDatasetReader", side_effect=ValueError("deleted")),
-            patch.object(
-                clip_module.DiskSequence, "__class_getitem__",
-                return_value=lambda: spool,
-            ),
+            patch("track.v2.clip.ClipRelation", return_value=spool),
         ):
             with self.assertRaisesRegex(ValueError, "deleted"):
                 extract_clips_for_detect(
                     conn, "detect-1", publication_root="/parquet",
-                    runtime=RuntimeConfig(),
+                    data_root="/tmp", runtime=RuntimeConfig(),
                 )
         spool.close.assert_called_once_with()
 
@@ -304,15 +303,12 @@ class DetectClipLoadTest(unittest.TestCase):
                 descriptor="descriptor", state="present",
             )),
             patch("track.v2.clip.DetectDatasetReader", return_value=reader),
-            patch.object(
-                clip_module.DiskSequence, "__class_getitem__",
-                return_value=lambda: spool,
-            ),
+            patch("track.v2.clip.ClipRelation", return_value=spool),
         ):
             with self.assertRaisesRegex(ValueError, "broken relation"):
                 extract_clips_for_detect(
                     MagicMock(), "detect-1", publication_root="/parquet",
-                    runtime=RuntimeConfig(),
+                    data_root="/tmp", runtime=RuntimeConfig(),
                 )
         reader.__exit__.assert_called_once()
         spool.close.assert_called_once_with()
@@ -326,7 +322,7 @@ class DetectClipLoadTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "is not completed"):
                 extract_clips_for_detect(
                     object(), "detect-1", publication_root="/parquet",
-                    runtime=RuntimeConfig(),
+                    data_root="/tmp", runtime=RuntimeConfig(),
                 )
         fetch.assert_not_called()
 

@@ -10,7 +10,7 @@ import math
 from collections import Counter
 from pathlib import Path
 
-from .clip_spool import DiskSequence
+from .clip_relation import ClipRelation
 from .heartbeat import observed_operation, heartbeat_progress
 
 from .db.artifact_registry import find_detect_artifact
@@ -93,6 +93,7 @@ def extract_clips_for_detect(
     detect_id: str,
     *,
     publication_root: Path | str,
+    data_root: Path | str,
     runtime: RuntimeConfig,
     config: ClipConfig | None = None,
 ) -> ClipResult:
@@ -104,7 +105,7 @@ def extract_clips_for_detect(
         registered = find_detect_artifact(cur, detect_id)
     cfg = config or ClipConfig()
     transformer = CoordinateTransformer(run.spatial_context)
-    spool = DiskSequence[TrackClip]()
+    relation = ClipRelation(runtime, data_root)
     vehicles: set[str] = set()
     seen_subtracks: set[int] = set()
     counts: Counter[str] = Counter()
@@ -133,7 +134,7 @@ def extract_clips_for_detect(
                     )
                     skipped += track_skipped
                     for clip in track_clips:
-                        spool.append(clip, key=clip.clip_id)
+                        relation.append(clip)
                         counts[clip.clip_type] += 1
                         point_count += clip.point_count
                     heartbeat_progress(len(seen_subtracks))
@@ -141,11 +142,12 @@ def extract_clips_for_detect(
                 close = getattr(tracks, "close", None)
                 if close is not None:
                     close()
+        relation.seal()
         return ClipResult(
-            clips=spool,
+            clips=relation,
             report=ClipReport(
                 total_vehicles=len(vehicles), total_subtracks=len(seen_subtracks),
-                total_clips=len(spool),
+                total_clips=len(relation),
                 between_intersection_clips=counts["between_intersection"],
                 boundary_start_clips=counts["boundary_start"],
                 boundary_end_clips=counts["boundary_end"],
@@ -156,7 +158,7 @@ def extract_clips_for_detect(
             intersections=intersections,
         )
     except BaseException:
-        spool.close()
+        relation.close()
         raise
 
 

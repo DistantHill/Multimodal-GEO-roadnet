@@ -61,6 +61,11 @@ def test_lossless_lookup_repeat_and_batch_one(tmp_path):
             list(relation)
         relation.seal()
         assert tuple(relation) == tuple(relation) == clips
+        assert relation[0] == relation[-3] == clips[0]
+        assert relation[-1] == clips[-1]
+        assert relation[1:] == clips[1:]
+        with pytest.raises(IndexError):
+            _ = relation[3]
         assert relation.get_by_clip_id("b") == clips[0]
         with pytest.raises(KeyError):
             relation.get_by_clip_id("missing")

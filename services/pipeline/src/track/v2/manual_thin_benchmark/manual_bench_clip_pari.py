@@ -16,12 +16,12 @@ PAIRS = {(55,79), (79,55)}
 
 def main() -> None:
     runtime = load_pipeline_config().runtime
-    publication_root = Path(os.environ.get(
-        "PARQUET_ROOT", str(Path(os.environ.get("DATA_ROOT", "/data")) / "parquet"),
-    ))
+    data_root = Path(os.environ.get("DATA_ROOT", "/data"))
+    publication_root = Path(os.environ.get("PARQUET_ROOT", str(data_root / "parquet")))
     with connect(default_postgres_config()) as conn:
         result = extract_clips_for_detect(
-            conn, DETECT_ID, publication_root=publication_root, runtime=runtime,
+            conn, DETECT_ID, publication_root=publication_root,
+            data_root=data_root, runtime=runtime,
         )
 
     clips = [

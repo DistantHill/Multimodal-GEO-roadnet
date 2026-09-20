@@ -84,6 +84,14 @@ def _parquet_root() -> Path:
     return root
 
 
+def _data_root() -> Path:
+    root = Path(os.environ.get("DATA_ROOT", "/data"))
+    if not root.is_absolute() or root == Path(root.anchor):
+        raise ValueError("DATA_ROOT must be an absolute non-root path")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def _fail_running_refine(store: PipelineStore, refine_id: str) -> None:
     """Best-effort failure convergence that never masks the original error."""
     with suppress(Exception):
@@ -532,7 +540,7 @@ def run_pipeline(
         clip_config = pc.clip
         clip_assembly_started = time.perf_counter()
         clip_result = store.load_clip(
-            detect_id, publication_root=_parquet_root(), runtime=pc.runtime,
+            detect_id, publication_root=_parquet_root(), data_root=_data_root(), runtime=pc.runtime,
             config=clip_config,
         )
         close_clips = getattr(clip_result.clips, "close", None)

@@ -1,5 +1,6 @@
 """Disk-backed Clip/Fitting preserves geometry, ordering and ownership."""
 import math
+import inspect
 from dataclasses import replace
 from contextlib import contextmanager
 from pathlib import Path
@@ -38,7 +39,7 @@ def test_disk_sequence_repeatability_lookup_slice_and_cleanup():
     assert not directory.exists()
 
 
-def test_streamed_clip_result_matches_memory_and_serializes():
+def test_streamed_clip_result_matches_memory_and_serializes(tmp_path):
     tracks = tuple(ClipTrack("v", f"s{i}", (_point(i * 2, -10), _point(i * 2 + 1, 10)), i)
                    for i in range(1, 4))
     run = SimpleNamespace(status="completed", refine_id="r", spatial_context=_CONTEXT)
@@ -56,7 +57,8 @@ def test_streamed_clip_result_matches_memory_and_serializes():
         patch("track.v2.clip.DetectDatasetReader", return_value=reader),
     ):
         actual = extract_clips_for_detect(
-            conn, "detect", publication_root="/parquet", runtime=RuntimeConfig(),
+            conn, "detect", publication_root="/parquet", data_root=tmp_path,
+            runtime=RuntimeConfig(),
         )
     try:
         assert actual.as_dict() == expected.as_dict()
@@ -67,7 +69,7 @@ def test_streamed_clip_result_matches_memory_and_serializes():
 
 
 @pytest.mark.parametrize("count", [2, 3, 9])
-def test_streamed_pair_is_exact_reference_median(count):
+def test_streamed_pair_is_exact_reference_median(count, tmp_path):
     clips = [_clip(str(i), 1 if i % 2 == 0 else 2, 2 if i % 2 == 0 else 1,
                    [(0, i), (40, i * i), (200, -i)][::1 if i % 2 == 0 else -1])
              for i in range(count)]
@@ -77,10 +79,41 @@ def test_streamed_pair_is_exact_reference_median(count):
     actual = _fit_pair_stream((1, 2), lambda: iter(oriented), count, cfg, _TRANSFORMER)
     assert actual == expected
     result = _clip_result(*clips)
-    with DiskSequence() as sequence:
+    from track.v2.clip_relation import ClipRelation
+    with ClipRelation(RuntimeConfig(), tmp_path) as sequence:
         for clip in clips:
-            sequence.append(clip, key=clip.clip_id)
+            sequence.append(clip)
+        sequence.seal()
         assert fit_centerline_variants(replace(result, clips=sequence)) == fit_centerline_variants(result)
+
+
+def test_pair_sampling_rejects_changed_count_and_uses_multiple_blocks(monkeypatch):
+    import track.v2.fitting as fitting
+    clips = [_clip(str(i), 1, 2, [(0, i), (40, i + 1), (200, i)]) for i in range(3)]
+    oriented = [_orient_clip(clip, _TRANSFORMER)[0] for clip in clips]
+    calls = 0
+
+    def read_clips():
+        nonlocal calls
+        calls += 1
+        return iter(oriented)
+
+    monkeypatch.setattr(fitting, "_FIT_BLOCK_BYTES", 48)
+    assert _fit_pair_stream(
+        (1, 2), read_clips, 3, FittingConfig(fit_sample_spacing_m=5), _TRANSFORMER,
+    )
+    assert calls > 2
+    with pytest.raises(ValueError, match="count changed"):
+        _fit_pair_stream((1, 2), lambda: iter(oriented[:2]), 3, FittingConfig(), _TRANSFORMER)
+
+
+def test_clip_and_fitting_do_not_use_legacy_spill_implementations():
+    import track.v2.clip as clip_module
+    import track.v2.fitting as fitting_module
+    assert "DiskSequence" not in inspect.getsource(clip_module)
+    fitting_source = inspect.getsource(fitting_module)
+    for forbidden in ("DiskSequence", "TemporaryDirectory", "np.memmap", "import mmap"):
+        assert forbidden not in fitting_source
 
 
 class Cursor:

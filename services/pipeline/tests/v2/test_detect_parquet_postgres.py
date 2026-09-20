@@ -168,7 +168,7 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
                   side_effect=AssertionError("legacy track reader called")),
         ):
             actual_clip = extract_clips_for_detect(
-                conn, str(detect_id), publication_root=tmp_path,
+                conn, str(detect_id), publication_root=tmp_path, data_root=tmp_path,
                 runtime=RuntimeConfig(duckdb_threads=1), config=clip_config,
             )
         try:

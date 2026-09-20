@@ -111,9 +111,10 @@ class _ConfigRecordingStore:
 
     def load_clip(
         self, detect_id: str, *, publication_root: object,
-        runtime: object, config: object,
+        data_root: object, runtime: object, config: object,
     ) -> object:
         self.loaded_clip_publication_root = publication_root
+        self.loaded_clip_data_root = data_root
         self.loaded_clip_runtime = runtime
         self.loaded_clip_config = config
         return self.clip_result
@@ -181,11 +182,13 @@ class PipelineConfigWiringTest(unittest.TestCase):
             patch("track.v2.pipeline._add_fit_stats"),
             patch("track.v2.pipeline._add_network_stats"),
             patch("track.v2.pipeline._parquet_root", return_value=Path("/tmp/parquet")),
+            patch("track.v2.pipeline._data_root", return_value=Path("/tmp/data")),
         ):
             run_pipeline(PipelineInput(db_config, refine_id=REFINE_ID))
 
         self.assertIs(store.loaded_clip_config, clip_config)
         self.assertEqual(store.loaded_clip_publication_root, Path("/tmp/parquet"))
+        self.assertEqual(store.loaded_clip_data_root, Path("/tmp/data"))
         self.assertIs(store.loaded_clip_runtime, pipeline_config.runtime)
         self.assertIs(store.fit_clip_config, clip_config)
         self.assertIs(store.fit_fitting_config, fitting_config)
