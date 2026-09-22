@@ -96,6 +96,45 @@ def test_extend_is_lossless_bounded_and_preserves_nullable_bigints(tmp_path, bat
         assert tuple(relation) == events
 
 
+def test_extend_typed_masks_preserve_false_empty_and_null_fields(tmp_path):
+    event = replace(
+        _event(0),
+        point_ref=PointRef("source", "row", False, None, "", "", ""),
+        refined_point_ref=None,
+        cross_track_calculate_index=None,
+        g_star_z=None,
+        source_ids=("", False, "source"),
+    )
+    with _relation(tmp_path, batch_size=2) as relation:
+        relation.extend((event,))
+        row = relation._connection.execute(
+            "SELECT point_stable,point_from_ref,point_to_ref,point_generated_reason,"
+            "point_source_row_hash,refined_point_id,cross_track_calculate_index,g_star_z "
+            "FROM turn_events"
+        ).fetchone()
+        assert row == (False, None, "", "", "", None, None, None)
+        sources = relation._connection.execute(
+            "SELECT source_id FROM source_ids ORDER BY source_ordinal"
+        ).fetchall()
+        assert sources == [("",), ("false",), ("source",)]
+        with pytest.raises(ValueError, match="invalid TurnEvent relation"):
+            relation.seal()
+
+
+@pytest.mark.parametrize("event", [
+    replace(_event(0), cross_track_calculate_index=1.5),
+    replace(_event(0), point_ref=PointRef("source", "row", "false")),
+])
+def test_extend_rejects_lossy_nullable_typed_values(tmp_path, event):
+    with _relation(tmp_path) as relation:
+        with pytest.raises(TypeError):
+            relation.extend((event,))
+        assert len(relation) == 0
+        assert relation._connection.execute(
+            "SELECT count(*) FROM turn_events"
+        ).fetchone() == (0,)
+
+
 def test_extend_rolls_back_failed_batch_but_keeps_prior_commit(tmp_path):
     with _relation(tmp_path, batch_size=1) as relation:
         with pytest.raises((TypeError, ValueError, OverflowError)):
@@ -296,5 +335,6 @@ def test_runtime_limits_and_columnar_implementation(tmp_path):
     assert "execute(" not in inspect.getsource(TurnEventRelation._decode).lower()
     assert "executemany" in inspect.getsource(TurnEventRelation.append).lower()
     assert "register" in inspect.getsource(TurnEventRelation._append_batch).lower()
+    assert "dtype=object" not in inspect.getsource(TurnEventRelation._append_batch).lower()
     for forbidden in ("sqlite", "pickle", "temporarydirectory", "disksequence"):
         assert forbidden not in source

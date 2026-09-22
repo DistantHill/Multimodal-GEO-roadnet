@@ -67,7 +67,7 @@
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
-| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12g3；待重跑 1M） |
+| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12g4；待重跑 1M） |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
 ## 3. 任务卡
@@ -1098,6 +1098,29 @@ cluster、member identity 与 hotspot iterator 在正常及 `BaseException` 路�
 回归覆盖跨 batch 的同 candidate 重复成员、跨 candidate 冲突全回滚、last-hotspot 为 NULL
 或 NaN、第二批 SQL 故障回滚前批、注册清理与删除故障注入后重试。C12g3 不修改
 TurnEventRelation、collect_sources、最终 COPY 或 Network。
+
+C12g3 主对话独立真实 PostgreSQL 定向验收为 `90 passed`，并确认单事务、顺序、NaN 与
+注册清理语义。该结果是 Writer 定向证据，不替代完整 Pipeline 或 1M 验收。
+
+#### C12g4 — TurnEventRelation typed 批次列
+
+TurnEventRelation 的 `extend` 不再先构造整行列表、再以 `zip` 转置成 object ndarray；它从
+当前有界 event batch 直接构造各列。ordinal 使用 int64；nullable BIGINT、BOOLEAN、DOUBLE
+与 VARCHAR 分别使用固定 dtype 值列和显式 null mask；DOUBLE 另有 NaN mask，避免 DuckDB
+NumPy scanner 把 NaN 静默变成 SQL NULL。source ID 仍按既有 batch size 有界流出，也改用
+Unicode 值列和 null mask。
+
+完整 event batch 与其全部 source IDs 仍在同一事务，任一 source chunk 失败会回滚 event
+主表；`_count` 只在 commit 后推进。单条 `append`、Detect 算法、公开 API 和顺序均不变。
+required DOUBLE 的非有限值仍由既有 `seal` 拒绝；optional `g_star_z` 仍在注册前要求 finite
+或 None。合法 False、空字符串、None、大于 `2^53` 的整数、source ID 顺序和重复值均保持；
+为防止 NumPy 静默失真，批 API 明确拒绝 nullable BIGINT 的 bool/非整数/越界值，以及
+`point_stable` 的非布尔值。历史 VARCHAR 的 bool 输入仍按既有 DuckDB 字符串形式规范为
+小写 `true` / `false`。
+
+Turn relation、接线与 streaming writer 定向为 `71 passed, 1 skipped`。冻结当前代码的 2k
+局部 microbenchmark 中，单条 append 为 `7.8477` 秒，typed extend 为 `0.05001` 秒，主表
+2,000 行和 source ID 4,000 行一致；约 `156.9x` 只描述该局部摄取，不代表 Detect 端到端。
 
 ### C13 — 26M 最终验收
 

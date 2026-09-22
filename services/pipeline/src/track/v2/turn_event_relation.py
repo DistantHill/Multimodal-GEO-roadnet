@@ -5,6 +5,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from itertools import islice
 import math
+from numbers import Integral
 from pathlib import Path
 from uuid import uuid4
 
@@ -19,6 +20,40 @@ class TurnCoordinate:
     event_calculate_index: int
     x: float
     y: float
+
+
+def _nullable_integer(values):
+    values = list(values)
+    if any(value is not None and (
+        isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral)
+        or not -(2**63) <= int(value) < 2**63
+    ) for value in values):
+        raise TypeError("nullable integer must fit signed int64")
+    return (
+        np.asarray([0 if value is None else value for value in values], dtype=np.int64),
+        np.asarray([value is None for value in values], dtype=np.bool_),
+    )
+
+
+def _nullable_float(values):
+    values = list(values)
+    nulls = np.asarray([value is None for value in values], dtype=np.bool_)
+    nans = np.asarray([
+        value is not None and math.isnan(float(value)) for value in values
+    ], dtype=np.bool_)
+    data = np.asarray([
+        0.0 if value is None or math.isnan(float(value)) else value for value in values
+    ], dtype=np.float64)
+    return data, nulls, nans
+
+
+def _nullable_string(values):
+    values = list(values)
+    data = np.asarray([
+        "" if value is None else str(value).lower() if isinstance(value, bool) else str(value)
+        for value in values
+    ], dtype=np.str_)
+    return data, np.asarray([value is None for value in values], dtype=np.bool_)
 
 
 class TurnEventRelation(Sequence[TurnEvent]):
@@ -118,9 +153,72 @@ class TurnEventRelation(Sequence[TurnEvent]):
 
     def _append_batch(self, events: tuple[TurnEvent, ...]) -> None:
         connection, first_ordinal = self._require_open(), self._count
-        rows = [self._event_values(first_ordinal + offset, event)
-                for offset, event in enumerate(events)]
-        columns = tuple(zip(*rows, strict=True))
+        for event in events:
+            if event.g_star_z is not None and not math.isfinite(event.g_star_z):
+                raise ValueError("g_star_z must be finite or None")
+        points = [event.point_ref for event in events]
+        refined = [event.refined_point_ref for event in events]
+        columnar = {
+            "ordinal": np.arange(first_ordinal, first_ordinal + len(events), dtype=np.int64),
+        }
+        nullable: list[str] = []
+        float_names = (
+            "timestamp", "lon", "lat", "x", "y", "entry_bearing", "exit_bearing",
+            "turn_deg", "score", "g_star_z",
+        )
+        for name in float_names:
+            data, nulls, nans = _nullable_float(getattr(event, name) for event in events)
+            columnar[name], columnar[f"{name}__null"], columnar[f"{name}__nan"] = (
+                data, nulls, nans,
+            )
+            nullable.append(name)
+        integer_values = {
+            "event_calculate_index": [event.event_calculate_index for event in events],
+            "refined_point_id": [None if item is None else item.point_id for item in refined],
+            "refined_subtrack_index": [
+                None if item is None else item.subtrack_index for item in refined
+            ],
+            "refined_sequence": [
+                None if item is None else item.refined_sequence_in_subtrack for item in refined
+            ],
+            "cross_track_calculate_index": [
+                event.cross_track_calculate_index for event in events
+            ],
+        }
+        for name, values in integer_values.items():
+            columnar[name], columnar[f"{name}__null"] = _nullable_integer(values)
+            nullable.append(name)
+        string_values = {
+            "vehicle_id": [event.vehicle_id for event in events],
+            "source": [event.source for event in events],
+            "point_source_id": [None if item is None else item.source_id for item in points],
+            "point_source_row_key": [
+                None if item is None else item.source_row_key for item in points
+            ],
+            "point_from_ref": [None if item is None else item.from_ref for item in points],
+            "point_to_ref": [None if item is None else item.to_ref for item in points],
+            "point_generated_reason": [
+                None if item is None else item.generated_reason for item in points
+            ],
+            "point_source_row_hash": [
+                None if item is None else item.source_row_hash for item in points
+            ],
+            "refined_point_kind": [None if item is None else item.point_kind for item in refined],
+        }
+        for name, values in string_values.items():
+            columnar[name], columnar[f"{name}__null"] = _nullable_string(values)
+            nullable.append(name)
+        stable_values = [None if item is None else item.stable for item in points]
+        if any(value is not None and not isinstance(value, (bool, np.bool_))
+               for value in stable_values):
+            raise TypeError("point_stable must be bool or None")
+        columnar["point_stable"] = np.asarray(
+            [False if value is None else bool(value) for value in stable_values], dtype=np.bool_,
+        )
+        columnar["point_stable__null"] = np.asarray(
+            [value is None for value in stable_values], dtype=np.bool_,
+        )
+        nullable.append("point_stable")
         names = (
             "ordinal", "event_calculate_index", "vehicle_id", "timestamp", "lon", "lat",
             "x", "y", "entry_bearing", "exit_bearing", "turn_deg", "score", "source",
@@ -129,25 +227,24 @@ class TurnEventRelation(Sequence[TurnEvent]):
             "refined_point_kind", "refined_point_id", "refined_subtrack_index",
             "refined_sequence", "cross_track_calculate_index", "g_star_z",
         )
-        integer = {0, 1}
-        nullable_integer = {21, 22, 23, 24}
-        floating = {3, 4, 5, 6, 7, 8, 9, 10, 11}
-        columnar = {
-            name: np.asarray(values, dtype=(
-                np.int64 if index in integer else np.float64 if index in floating else object
-            ))
-            for index, (name, values) in enumerate(zip(names, columns, strict=True))
-        }
-        # Object arrays keep nullable BIGINT values as Python int/None; converting
-        # through float would silently lose identities above 2**53.
-        assert all(columnar[names[index]].dtype == object for index in nullable_integer)
+        selects = []
+        for name in names:
+            if name in float_names:
+                selects.append(
+                    f"CASE WHEN {name}__null THEN NULL WHEN {name}__nan "
+                    f"THEN 'NaN'::DOUBLE ELSE {name} END AS {name}"
+                )
+            elif name in nullable:
+                selects.append(f"CASE WHEN {name}__null THEN NULL ELSE {name} END AS {name}")
+            else:
+                selects.append(name)
         registered = False
         connection.execute("BEGIN")
         try:
             connection.register("turn_event_batch", columnar)
             registered = True
             connection.execute(
-                "INSERT INTO turn_events SELECT " + ",".join(names)
+                "INSERT INTO turn_events SELECT " + ",".join(selects)
                 + " FROM turn_event_batch ORDER BY ordinal"
             )
             source_rows = (
@@ -156,15 +253,17 @@ class TurnEventRelation(Sequence[TurnEvent]):
                 for source_ordinal, source_id in enumerate(event.source_ids)
             )
             while chunk := tuple(islice(source_rows, self._batch_size)):
-                source_columns = tuple(zip(*chunk, strict=True))
+                source_ids = [item[2] for item in chunk]
+                source_values, source_nulls = _nullable_string(source_ids)
                 connection.register("turn_source_batch", {
-                    "event_ordinal": np.asarray(source_columns[0], dtype=np.int64),
-                    "source_ordinal": np.asarray(source_columns[1], dtype=np.int64),
-                    "source_id": np.asarray(source_columns[2], dtype=object),
+                    "event_ordinal": np.asarray([item[0] for item in chunk], dtype=np.int64),
+                    "source_ordinal": np.asarray([item[1] for item in chunk], dtype=np.int64),
+                    "source_id": source_values, "source_id__null": source_nulls,
                 })
                 try:
                     connection.execute(
-                        "INSERT INTO source_ids SELECT event_ordinal,source_ordinal,source_id "
+                        "INSERT INTO source_ids SELECT event_ordinal,source_ordinal,"
+                        "CASE WHEN source_id__null THEN NULL ELSE source_id END "
                         "FROM turn_source_batch ORDER BY event_ordinal,source_ordinal"
                     )
                 finally:
@@ -177,20 +276,6 @@ class TurnEventRelation(Sequence[TurnEvent]):
             if registered:
                 connection.unregister("turn_event_batch")
         self._count += len(events)
-
-    def _event_values(self, ordinal: int, event: TurnEvent) -> tuple[object, ...]:
-        if event.g_star_z is not None and not math.isfinite(event.g_star_z):
-            # DuckDB's NumPy scanner can map object-array NaN to NULL. NULL is
-            # valid for this optional field, so reject non-finite values before
-            # registration instead of letting an invalid value disappear.
-            raise ValueError("g_star_z must be finite or None")
-        return (
-            ordinal, event.event_calculate_index, event.vehicle_id, event.timestamp,
-            event.lon, event.lat, event.x, event.y, event.entry_bearing,
-            event.exit_bearing, event.turn_deg, event.score, event.source,
-            *self._point_values(event.point_ref), *self._refined_values(event.refined_point_ref),
-            event.cross_track_calculate_index, event.g_star_z,
-        )
 
     @staticmethod
     def _point_values(point: PointRef | None) -> tuple[object, ...]:
