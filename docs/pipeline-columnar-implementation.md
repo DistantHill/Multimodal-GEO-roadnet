@@ -6,7 +6,7 @@
 
 状态：实施中
 创建日期：2026-09-19
-更新日期：2026-09-20
+更新日期：2026-09-22
 
 ## 1. 执行规则
 
@@ -67,7 +67,7 @@
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
-| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12h1；待重跑 1M） |
+| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12h1；1M 全链路完成，正式差分执行中） |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
 ## 3. 任务卡
@@ -1142,6 +1142,58 @@ SQL 在 `1.0` 下改用 hash + sort，估算成本约为原计划三分之一，
 隔离 PostgreSQL 轻量回归覆盖成功与声明失败后的设置恢复、两个 full-scan 命名游标同时存活
 并交错读取且结果不变，以及 semantic/network 随机 Schema 小 fixture；不运行大型 1M
 查询或 `EXPLAIN ANALYZE`，避免干扰并行的冻结快照全流程运行。
+
+C12h1 主对话在隔离真实 PostgreSQL 上独立复测 `49 passed`（0.95 秒），代码审查通过。
+本卡提交为 `e2130d7`。此前各 Writer 批写卡的主对话真实 PostgreSQL 定向验收依次为
+C12g1 `84 passed`、C12g2 `88 passed`、C12g3 `90 passed`；C12g4 冻结快照的 Pipeline
+全量为 `1,032 passed, 53 skipped`。同一阶段还通过 Backend `75 passed`、Compose 配置
+`5 passed` 及 Refine/Detect 真实 PostgreSQL + Parquet `7 passed`。这些结果是分层回归
+证据，不替代 1M 正式语义差分或 C13。
+
+#### C12 2026-09-22 冻结快照 1M 全链路运行
+
+业务运行固定在 `7e170a5`，后续验证器固定在 `e2130d7`。容器为
+`roadnet-c12g-full-1m-20260922-145233`，运行根目录为
+`/data/tmp/road-network/c12g_full_1m_20260922-145233_yPGnIn` 。新建 Run 为 Refine
+`f083aa39-ec01-4308-8032-db15a4ec95fd`、Detect
+`9244a6bf-4c9a-4faf-bf43-31c593279e6c` 和 Fit
+`5a14fa07-df0d-49e4-8cc2-24abf3e0057d`；三者及 Network 均 completed。
+
+全链路墙钟为 `1,135.014419538` 秒。控制组 `memory.peak=1,999,998,976 B`，几乎触及
+十进制 `2,000,000,000 B` 上限，不能描述为余量充足；swap 为 0，`memory.events.max=715`，
+OOM 与 OOM kill 均为 0。阶段记录为 Refine `71.433` 秒，Detect compute
+`243.671071` 秒、persist `153.643566` 秒，其中 resolved sequence `24.222366` 秒；Clip
+`534.691` 秒；Fitting `130.473` 秒，其中 compute `38.275` 秒；Network `0.018` 秒。
+
+完成运行的 `stats.json` 报告以下业务计数：源点 `1,000,000`，kept `614,879`，injected
+`999`，resolved `679,649`，turn event `56,178`，tracks cross `58,660`，candidate
+intersection `393`，candidate entry/exit `83,947`，intersection `292`，entry/exit
+`31,207`；Clip 共 `35,005` 个、含点 `549,771`，其中 between-intersection `23,797`、
+boundary-start `3,585`、boundary-end `3,589`、full-track `4,034`；Fitting 输出
+`1,506` 条三个变体的 centerline；Network 为 `292` 个节点、`556` 条边和 `12` 个孤立节点。
+正式 semantic diff 已完成的 Refine 三表分别为 kept `614,879`、injected `999`、excluded
+`385,121`，均 pass；原始 1M 口径是 kept + excluded，injected 另计。
+
+PostgreSQL 单列前后统计包含隔离环境中的小 fixture 测试污染，不能把全部变化归因于本次
+1M Run。正式十四张持久化表加八张 Network controlled replay 的差分仍在执行，因此此处
+只能证明冻结快照在限制内完成全链路，不能把 C12 标为完成，也不能把当前计数视为最终
+验收确认。
+
+本轮只读热点审计形成两个待实施小卡，不在本次文档卡实现：
+
+- Clip 当前逐片段执行独立事务，并以 Python tuple `executemany` 写片段内点。后续应保留
+  单条 `append` 兼容语义，新增跨片段、跨点的 typed 有界批写；失败批整体回滚、此前批
+  保留，单个超长片段也不得全量展开。该静态发现不证明 `534.691` 秒全部来自写入。
+- Fitting 持久化对每个 centerline source membership 调用一次 `get_by_clip_id`，每次均
+  `LEFT JOIN clip_points` 并重建完整 `TrackClip`，但实际只需要片段类型与端点身份。后续
+  应一次窄读 Clip metadata，并以原顺序流式 COPY manifest，避免 M 次完整片段重建和
+  M 行清单列表；PostgreSQL centerline 已是批量 INSERT，manifest 已是单个 COPY，不能把
+  `130.473` 秒全部归因于逐行 PostgreSQL 往返。
+
+C13 仍没有可确认的旧 26M 完整 baseline，原数据库 v4 只能在用户确认方案后使用隔离
+clone，不能自动放宽验收标准或修改原库。Python trajectory point 对象替换为 Subtrack
+列数组、Segment 按 `isequence` 引用重建的工作，继续排在整个列式任务验收完成之后；当前
+不删除 Python 类型或 PostgreSQL 表。
 
 ### C13 — 26M 最终验收
 

@@ -57,3 +57,16 @@ python -m pipeline artifacts reconcile --apply
 列式架构已经接入，不等于最终容量与性能目标通过。精确 26M 输入、默认 2 GB 硬上限、
 无 swap 和 Refine 至 Network 小于一小时的 C13 验收尚未执行；运维记录不得把单元测试、
 小样本或提高内存上限的运行写成该验收已通过。
+
+2026-09-22 的冻结业务快照 `7e170a5` 已在 1M 输入上完成 Refine 至 Network，墙钟
+`1,135.014419538` 秒，`memory.peak=1,999,998,976 B`，swap/OOM/OOM kill 均为 0。
+该峰值几乎触及 `2,000,000,000 B` 内存上限，不代表容量余量充足。运行容器为
+`roadnet-c12g-full-1m-20260922-145233`，保留根目录为
+`/data/tmp/road-network/c12g_full_1m_20260922-145233_yPGnIn` ；不得将该目录当作可覆盖的
+日常输出路径，也不得在验收完成前清理其日志、统计和已发布制品。
+
+验证器 `e2130d7` 的十四张持久化表与八张 Network controlled replay 正式差分仍在执行。
+当前 Refine kept、injected、excluded 三表已分别比较 `614,879`、`999`、`385,121` 行且
+通过，但不能据此宣布完整 C12 验收成功。PostgreSQL 单列前后统计还包含小 fixture 测试
+污染，不得将全部数据库变化归因于该 1M Run。完整证据与阶段耗时见实施任务卡的
+“C12 2026-09-22 冻结快照 1M 全链路运行”章节。
