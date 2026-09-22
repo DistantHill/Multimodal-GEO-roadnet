@@ -187,6 +187,18 @@ def test_geojson_queries_request_fifteen_decimal_digits() -> None:
                                     for query in geometry_queries)
 
 
+def test_combined_line_queries_normalize_direction_but_directed_does_not() -> None:
+    centerline = next(spec for spec in TABLES if spec.name == "fitting.centerlines").query
+    source_clips = next(spec for spec in TABLES if spec.name == "fitting.source_clips").query
+    topology = next(spec for spec in TABLES if spec.name == "network.topology").query
+    assert "c.variant='combined' AND a.business_key>b.business_key" in centerline
+    assert "ST_Reverse(c.geom)" in centerline
+    assert "THEN c.reverse_clip_count ELSE c.forward_clip_count" in centerline
+    assert "c.variant='combined' AND a.business_key>b.business_key AS reversed" in source_clips
+    assert "WHEN l.reversed THEN NOT s.reverse_to_centerline_direction" in source_clips
+    assert "CASE WHEN a.business_key>b.business_key" in topology
+
+
 def test_surrogate_id_offsets_are_absent_from_normalized_rows() -> None:
     columns = (("source_identity", "exact"), ("lon", "degree"))
     baseline = [("track:1:0", "kept:source-7", 120.0)]
@@ -304,6 +316,115 @@ def semantic_database():
     finally:
         with psycopg.connect(dsn, autocommit=True) as admin:
             admin.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
+
+
+def test_real_postgres_combined_centerline_direction_normalization(semantic_database) -> None:
+    conn = semantic_database
+    left_detect, right_detect, left_fit, right_fit = (uuid4() for _ in range(4))
+    conn.execute("""
+      CREATE TEMP TABLE resolved_subtrack_points(
+        id bigint,detect_id uuid,subtrack_index bigint,sequence_in_subtrack bigint);
+      CREATE TEMP TABLE turn_events(
+        detect_id uuid,resolved_point_id bigint,candidate_intersection_id bigint);
+      CREATE TEMP TABLE tracks_cross(
+        detect_id uuid,candidate_intersection_id bigint,
+        from_segment_start_point_id bigint,to_segment_start_point_id bigint);
+      CREATE TEMP TABLE candidate_intersections(id bigint,detect_id uuid);
+      CREATE TEMP TABLE candidate_entry_exit_points(
+        id bigint,detect_id uuid,candidate_intersection_id bigint,
+        segment_start_point_id bigint,crossing_type integer);
+      CREATE TEMP TABLE intersections(id bigint,detect_id uuid,candidate_intersection_id bigint);
+      CREATE TEMP TABLE centerlines(
+        id bigint,detect_id uuid,fit_id uuid,variant text,
+        from_intersection_id bigint,to_intersection_id bigint,length_m double precision,
+        forward_clip_count integer,reverse_clip_count integer,geom public.geometry);
+      CREATE TEMP TABLE centerline_source_clips(
+        centerline_id bigint,detect_id uuid,input_ordinal integer,
+        start_crossing_id bigint,end_crossing_id bigint,
+        reverse_to_centerline_direction boolean)
+    """)
+
+    def add_lineage(detect_id, fit_id, base, reversed_combined):
+        conn.execute(
+            "INSERT INTO resolved_subtrack_points VALUES "
+            "(%s,%s,1,1),(%s,%s,2,1)",
+            (base + 1, detect_id, base + 2, detect_id),
+        )
+        conn.execute("INSERT INTO candidate_intersections VALUES (%s,%s),(%s,%s)",
+                     (base + 10, detect_id, base + 20, detect_id))
+        conn.execute("INSERT INTO turn_events VALUES (%s,%s,%s),(%s,%s,%s)",
+                     (detect_id, base + 1, base + 10,
+                      detect_id, base + 2, base + 20))
+        conn.execute("INSERT INTO intersections VALUES (%s,%s,%s),(%s,%s,%s)",
+                     (base + 30, detect_id, base + 10,
+                      base + 40, detect_id, base + 20))
+        conn.execute("INSERT INTO candidate_entry_exit_points VALUES "
+                     "(%s,%s,%s,%s,0),(%s,%s,%s,%s,1)",
+                     (base + 50, detect_id, base + 10, base + 1,
+                      base + 60, detect_id, base + 20, base + 2))
+        endpoints = ((base + 40, base + 30) if reversed_combined
+                     else (base + 30, base + 40))
+        geometry = "LINESTRING(1 0,0 0)" if reversed_combined else "LINESTRING(0 0,1 0)"
+        counts = (5, 3) if reversed_combined else (3, 5)
+        conn.execute(
+            "INSERT INTO centerlines VALUES "
+            "(%s,%s,%s,'combined',%s,%s,1,%s,%s,public.ST_GeomFromText(%s,4326))",
+            (base + 70, detect_id, fit_id, *endpoints, *counts, geometry),
+        )
+        conn.execute("INSERT INTO centerline_source_clips VALUES (%s,%s,0,%s,%s,%s)",
+                     (base + 70, detect_id, base + 50, base + 60, reversed_combined))
+
+    add_lineage(left_detect, left_fit, 0, False)
+    add_lineage(right_detect, right_fit, 100, True)
+    specs = {spec.name: spec for spec in TABLES if spec.name in {
+        "fitting.centerlines", "fitting.source_clips", "network.topology",
+    }}
+
+    def rows(name, detect_id, fit_id):
+        spec = specs[name]
+        return conn.execute(spec.query, (detect_id, fit_id)).fetchall()
+
+    for name, spec in specs.items():
+        assert compare_rows(spec.name, spec.columns,
+                            rows(name, left_detect, left_fit),
+                            rows(name, right_detect, right_fit))["passed"]
+
+    conn.execute("UPDATE centerlines SET geom=public.ST_GeomFromText('LINESTRING(0 0,1 0)',4326) "
+                 "WHERE detect_id=%s", (right_detect,))
+    assert not compare_rows(specs["fitting.centerlines"].name,
+                            specs["fitting.centerlines"].columns,
+                            rows("fitting.centerlines", left_detect, left_fit),
+                            rows("fitting.centerlines", right_detect, right_fit))["passed"]
+    conn.execute("UPDATE centerlines SET geom=public.ST_GeomFromText('LINESTRING(1 0,0 0)',4326),"
+                 "forward_clip_count=3,reverse_clip_count=5 WHERE detect_id=%s", (right_detect,))
+    assert not compare_rows(specs["fitting.centerlines"].name,
+                            specs["fitting.centerlines"].columns,
+                            rows("fitting.centerlines", left_detect, left_fit),
+                            rows("fitting.centerlines", right_detect, right_fit))["passed"]
+    conn.execute("UPDATE centerlines SET forward_clip_count=5,reverse_clip_count=3 "
+                 "WHERE detect_id=%s", (right_detect,))
+    conn.execute("UPDATE centerline_source_clips "
+                 "SET reverse_to_centerline_direction=false WHERE detect_id=%s",
+                 (right_detect,))
+    assert not compare_rows(specs["fitting.source_clips"].name,
+                            specs["fitting.source_clips"].columns,
+                            rows("fitting.source_clips", left_detect, left_fit),
+                            rows("fitting.source_clips", right_detect, right_fit))["passed"]
+
+    conn.execute("INSERT INTO centerlines VALUES "
+                 "(999,%s,%s,'directed',30,40,1,1,0,public.ST_GeomFromText('LINESTRING(0 0,1 0)',4326)),"
+                 "(998,%s,%s,'directed',40,30,1,1,0,public.ST_GeomFromText('LINESTRING(1 0,0 0)',4326)),"
+                 "(1099,%s,%s,'directed',130,140,1,1,0,public.ST_GeomFromText('LINESTRING(1 0,0 0)',4326)),"
+                 "(1098,%s,%s,'directed',140,130,1,1,0,public.ST_GeomFromText('LINESTRING(0 0,1 0)',4326))",
+                 (left_detect, left_fit, left_detect, left_fit,
+                  right_detect, right_fit, right_detect, right_fit))
+    left_lines = rows("fitting.centerlines", left_detect, left_fit)
+    right_lines = rows("fitting.centerlines", right_detect, right_fit)
+    assert sum('"directed"' in row[0] for row in left_lines) == 2
+    assert sum('"directed"' in row[0] for row in right_lines) == 2
+    assert not compare_rows(specs["fitting.centerlines"].name,
+                            specs["fitting.centerlines"].columns,
+                            left_lines, right_lines)["passed"]
 
 
 def test_real_postgres_scopes_members_and_preserves_geometry_precision(semantic_database) -> None:

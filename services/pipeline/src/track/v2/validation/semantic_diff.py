@@ -166,9 +166,19 @@ TABLES = (
       WHERE p.detect_id=%s ORDER BY 1
     """, (("entry_bearing", "float"), ("exit_bearing", "float"))),
     TableSpec("fitting.centerlines", ("detect", "fit"), _SEMANTIC_KEYS + """
-      SELECT jsonb_build_array(c.variant,COALESCE(a.business_key,'__UNCOMPARABLE_INTERSECTION__'),
-                               COALESCE(b.business_key,'__UNCOMPARABLE_INTERSECTION__'))::text,c.length_m,
-             c.forward_clip_count,c.reverse_clip_count,ST_AsGeoJSON(c.geom,15)
+      SELECT jsonb_build_array(c.variant,
+               COALESCE(CASE WHEN c.variant='combined' AND a.business_key>b.business_key
+                             THEN b.business_key ELSE a.business_key END,
+                        '__UNCOMPARABLE_INTERSECTION__'),
+               COALESCE(CASE WHEN c.variant='combined' AND a.business_key>b.business_key
+                             THEN a.business_key ELSE b.business_key END,
+                        '__UNCOMPARABLE_INTERSECTION__'))::text,c.length_m,
+             CASE WHEN c.variant='combined' AND a.business_key>b.business_key
+                  THEN c.reverse_clip_count ELSE c.forward_clip_count END,
+             CASE WHEN c.variant='combined' AND a.business_key>b.business_key
+                  THEN c.forward_clip_count ELSE c.reverse_clip_count END,
+             ST_AsGeoJSON(CASE WHEN c.variant='combined' AND a.business_key>b.business_key
+                               THEN ST_Reverse(c.geom) ELSE c.geom END,15)
       FROM centerlines c
       JOIN intersection_keys a ON (a.id,a.detect_id)=(c.from_intersection_id,c.detect_id)
       JOIN intersection_keys b ON (b.id,b.detect_id)=(c.to_intersection_id,c.detect_id)
@@ -178,14 +188,22 @@ TABLES = (
     TableSpec("fitting.source_clips", ("detect", "fit"), _SEMANTIC_KEYS + """
       , all_crossings AS (SELECT * FROM crossing_keys), line_keys AS (
         SELECT c.id,c.detect_id,
-               jsonb_build_array(c.variant,COALESCE(a.business_key,'__UNCOMPARABLE_INTERSECTION__'),
-                                 COALESCE(b.business_key,'__UNCOMPARABLE_INTERSECTION__'))::text AS business_key
+               jsonb_build_array(c.variant,
+                 COALESCE(CASE WHEN c.variant='combined' AND a.business_key>b.business_key
+                               THEN b.business_key ELSE a.business_key END,
+                          '__UNCOMPARABLE_INTERSECTION__'),
+                 COALESCE(CASE WHEN c.variant='combined' AND a.business_key>b.business_key
+                               THEN a.business_key ELSE b.business_key END,
+                          '__UNCOMPARABLE_INTERSECTION__'))::text AS business_key,
+               c.variant='combined' AND a.business_key>b.business_key AS reversed
         FROM centerlines c
         JOIN intersection_keys a ON (a.id,a.detect_id)=(c.from_intersection_id,c.detect_id)
         JOIN intersection_keys b ON (b.id,b.detect_id)=(c.to_intersection_id,c.detect_id)
         WHERE c.fit_id=%s)
       SELECT jsonb_build_array(l.business_key,s.input_ordinal)::text,
-             e.business_key,x.business_key,s.reverse_to_centerline_direction
+             e.business_key,x.business_key,
+             CASE WHEN l.reversed THEN NOT s.reverse_to_centerline_direction
+                  ELSE s.reverse_to_centerline_direction END
       FROM centerline_source_clips s
       JOIN line_keys l ON (l.id,l.detect_id)=(s.centerline_id,s.detect_id)
       JOIN crossing_keys e ON (e.id,e.detect_id)=(s.start_crossing_id,s.detect_id)
@@ -193,8 +211,13 @@ TABLES = (
       ORDER BY 1
     """, (("start_crossing", "exact"), ("end_crossing", "exact"), ("reverse", "exact"))),
     TableSpec("network.topology", ("detect", "fit"), _SEMANTIC_KEYS + """
-      SELECT jsonb_build_array('edge',COALESCE(a.business_key,'__UNCOMPARABLE_INTERSECTION__'),
-                               COALESCE(b.business_key,'__UNCOMPARABLE_INTERSECTION__'))::text,c.variant
+      SELECT jsonb_build_array('edge',
+               COALESCE(CASE WHEN a.business_key>b.business_key
+                             THEN b.business_key ELSE a.business_key END,
+                        '__UNCOMPARABLE_INTERSECTION__'),
+               COALESCE(CASE WHEN a.business_key>b.business_key
+                             THEN a.business_key ELSE b.business_key END,
+                        '__UNCOMPARABLE_INTERSECTION__'))::text,c.variant
       FROM centerlines c
       JOIN intersection_keys a ON (a.id,a.detect_id)=(c.from_intersection_id,c.detect_id)
       JOIN intersection_keys b ON (b.id,b.detect_id)=(c.to_intersection_id,c.detect_id)

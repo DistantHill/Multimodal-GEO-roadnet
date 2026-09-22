@@ -946,6 +946,21 @@ Network 非持久化产物的可复核覆盖；本卡不重建 Network，也不�
 Subtrack 列数组，并让 Segment 按 `isequence` 引用重建；当前阶段不删除这些 Python 类型，
 也不删除或改变 PostgreSQL 表。
 
+#### C12e5a — Semantic diff combined 端点方向规范化
+
+Semantic diff 仅对业务语义为无向的 `combined` centerline 按候选 intersection 稳定业务键
+规范端点方向。端点反序时同时交换业务键、`forward_clip_count` / `reverse_clip_count`，并以
+`ST_Reverse` 反转几何；source clip 的 line key 采用相同规范化，并切换
+`reverse_to_centerline_direction`，但 start/end crossing 仍保持原 clip 行进方向，不交换。
+Network topology 只读取 `combined`，因此同样规范无向端点 pair。空值或不可比较业务键仍
+输出既有 sentinel 并 fail closed。
+
+`directed` centerline 不执行无向规范化，正反两条线仍是不同业务行，方向或几何互换不会被
+视为等价。这是消除 shifted surrogate ID 导致的稳定端点反序假阴性，不是放宽差分容差，
+也不改变生产 Fitting 或 Network。隔离 PostgreSQL 随机 Schema 实际执行覆盖 combined 反向
+端点的等价，以及几何未反转、方向计数未交换、source clip 标志未切换的失败；同时验证
+directed 正反两行均保留且交换方向不等价。Semantic diff 定向真实 PG `29 passed`。
+
 #### C12f1 — Cross-track 一次物化与统计驱动空间连接
 
 `iter_cross_track_pair_batches` 在同一 DuckDB 连接内把完整 straight payload（含 AABB）
