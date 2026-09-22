@@ -4,13 +4,13 @@ import unittest
 from dataclasses import FrozenInstanceError
 
 from track.v2.cli.pipeline_reporter import PipelineReporter
-from track.v2.pipeline import _emit_report
 from track.v2.pipeline_events import (
     EventProgressAdapter,
     EventSink,
     PipelineEvent,
     PipelineEventKind,
 )
+from track.v2.stage_support import emit_report
 
 
 class FakeLiveStatus:
@@ -82,7 +82,7 @@ class PipelineEventTest(unittest.TestCase):
 
     def test_report_messages_preserve_integer_formatting(self) -> None:
         events: list[PipelineEvent] = []
-        _emit_report(
+        emit_report(
             events.append,
             "Report",
             {"count": 1234, "enabled": True, "label": "ok"},

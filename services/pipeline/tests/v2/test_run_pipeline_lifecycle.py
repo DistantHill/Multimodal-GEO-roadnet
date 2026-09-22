@@ -125,11 +125,31 @@ class _RecordingStore:
             source_fingerprint={"version": 1, "row_count": 0, "sha256": "0"},
         )
         self.clip_result = MagicMock()
-        self.clip_result.report.as_dict.return_value = {}
+        self.clip_report = {
+            "total_vehicles": 1,
+            "total_subtracks": 2,
+            "total_clips": 3,
+            "between_intersection_clips": 4,
+            "boundary_start_clips": 5,
+            "boundary_end_clips": 6,
+            "full_track_clips": 7,
+            "total_points_in_clips": 8,
+            "skipped_degenerate_count": 9,
+        }
+        self.clip_result.report.as_dict.return_value = self.clip_report
         self.fit_bundle = MagicMock()
         for variant in ("combined", "a_to_b", "b_to_a"):
             getattr(self.fit_bundle, variant).report.as_dict.return_value = {}
             getattr(self.fit_bundle, variant).issues = ()
+        self.fit_report = {
+            "input_clip_count": 10,
+            "eligible_clip_count": 11,
+            "connected_pair_count": 12,
+            "fitted_centerline_count": 13,
+            "skipped_clip_count": 14,
+            "skipped_pair_count": 15,
+        }
+        self.fit_bundle.combined.report.as_dict.return_value = self.fit_report
         self.fit_bundle_error: RuntimeError | None = None
         self.clip_error: RuntimeError | None = None
         self.persist_detect_error: RuntimeError | None = None
@@ -238,23 +258,26 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             patch("track.v2.pipeline.PostgresPipelineStore", return_value=self.store)
         )
         self.stack.enter_context(patch("track.v2.pipeline.require_current_schema"))
-        self.stack.enter_context(patch("track.v2.pipeline.verify_refine_source_fingerprint"))
-        self.stack.enter_context(
-            patch(
-                "track.v2.pipeline.validate_source_table",
-                return_value=SourceTableContract(
-                    source_table="raw_points",
-                    quoted_table='"raw_points"',
-                    key_sql_type="bigint",
-                    has_extra=True,
-                ),
-            )
+        source_contract = SourceTableContract(
+            source_table="raw_points",
+            quoted_table='"raw_points"',
+            key_sql_type="bigint",
+            has_extra=True,
         )
-        self.fingerprint = {"version": 1, "row_count": 0, "sha256": "0"}
         self.stack.enter_context(patch(
-            "track.v2.pipeline.calculate_source_fingerprint",
-            side_effect=lambda *_args: self.events.append("fingerprint") or self.fingerprint,
+            "track.v2.refine_stage.validate_source_table",
+            return_value=source_contract,
         ))
+        self.stack.enter_context(patch(
+            "track.v2.detect_stage.validate_source_table",
+            return_value=source_contract,
+        ))
+        self.fingerprint = {"version": 1, "row_count": 0, "sha256": "0"}
+        for module in ("refine_stage", "detect_stage"):
+            self.stack.enter_context(patch(
+                f"track.v2.{module}.calculate_source_fingerprint",
+                side_effect=lambda *_args: self.events.append("fingerprint") or self.fingerprint,
+            ))
         self.refine_staging = SimpleNamespace(path="refine-staging", stage="refine")
         self.detect_staging = SimpleNamespace(path="detect-staging", stage="detect")
         self.descriptor = SimpleNamespace(id="artifact", relative_path=f"refine/{REFINE_ID}")
@@ -262,50 +285,67 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             id="detect-artifact", relative_path=f"detect/{DETECT_ID}",
         )
         self.stack.enter_context(patch(
-            "track.v2.pipeline.find_refine_artifact",
+            "track.v2.detect_stage.find_refine_artifact",
             side_effect=lambda *_args: SimpleNamespace(
                 descriptor=self.descriptor, state="present",
             ),
         ))
-        self.stack.enter_context(patch("track.v2.pipeline.RefineDatasetReader", _Reader))
+        self.stack.enter_context(patch("track.v2.detect_stage.RefineDatasetReader", _Reader))
+        for module in ("refine_stage", "detect_stage"):
+            self.stack.enter_context(patch(
+                f"track.v2.{module}.create_staging",
+                side_effect=lambda _root, stage, *_args: self.events.append(
+                    f"create_staging:{stage}"
+                ) or (self.refine_staging if stage == "refine" else self.detect_staging),
+            ))
         self.stack.enter_context(patch(
-            "track.v2.pipeline.create_staging",
-            side_effect=lambda _root, stage, *_args: self.events.append(
-                f"create_staging:{stage}"
-            ) or (self.refine_staging if stage == "refine" else self.detect_staging),
-        ))
-        self.stack.enter_context(patch(
-            "track.v2.pipeline.export_refine_parquet",
+            "track.v2.refine_stage.export_refine_parquet",
             side_effect=lambda *args, **kwargs: self.events.append("export_refine") or self.descriptor,
         ))
         self.export_detect = self.stack.enter_context(patch(
-            "track.v2.pipeline.export_detect_parquet",
+            "track.v2.detect_stage.export_detect_parquet",
             side_effect=lambda *args, **kwargs: self.events.append("export_detect") or self.detect_descriptor,
         ))
-        self.stack.enter_context(patch(
-            "track.v2.pipeline.publish",
-            side_effect=lambda handle: self.events.append(f"publish:{handle.stage}"),
-        ))
-        self.abandon = self.stack.enter_context(patch(
-            "track.v2.pipeline.abandon_staging",
+        for module in ("refine_stage", "detect_stage"):
+            self.stack.enter_context(patch(
+                f"track.v2.{module}.publish",
+                side_effect=lambda handle: self.events.append(f"publish:{handle.stage}"),
+            ))
+        self.abandon = MagicMock(
             side_effect=lambda handle: self.events.append(f"abandon:{handle.stage}"),
-        ))
+        )
+        for module in ("refine_stage", "detect_stage"):
+            self.stack.enter_context(patch(
+                f"track.v2.{module}.abandon_staging", new=self.abandon,
+            ))
         self.detect = self.stack.enter_context(
-            patch("track.v2.pipeline.detect_intersections", return_value=_empty_intersect_result())
+            patch("track.v2.detect_stage.detect_intersections", return_value=_empty_intersect_result())
         )
         self.handle = _EmptyHandle()
         self.stack.enter_context(
-            patch("track.v2.pipeline.get_database", return_value=self.handle)
+            patch("track.v2.refine_stage.get_database", return_value=self.handle)
         )
-        self.stack.enter_context(patch("track.v2.pipeline.StreamVehicleSource", _EmptyStream))
+        self.stack.enter_context(patch("track.v2.refine_stage.StreamVehicleSource", _EmptyStream))
         self.stack.enter_context(
-            patch("track.v2.pipeline.fit_centerline_variants", return_value=self.store.fit_bundle)
+            patch("track.v2.fitting_stage.fit_centerline_variants", return_value=self.store.fit_bundle)
         )
-        self.stack.enter_context(patch("track.v2.pipeline.build_network", return_value=MagicMock()))
-        self.log_info = self.stack.enter_context(patch("track.v2.pipeline.log_info"))
-        self.stack.enter_context(patch("track.v2.pipeline._add_clip_stats"))
-        self.stack.enter_context(patch("track.v2.pipeline._add_fit_stats"))
-        self.stack.enter_context(patch("track.v2.pipeline._add_network_stats"))
+        network_result = MagicMock()
+        self.network_report = {
+            "input_centerline_count": 16,
+            "node_count": 17,
+            "edge_count": 18,
+            "isolated_node_count": 19,
+            "skipped_centerline_count": 20,
+        }
+        network_result.report.as_dict.return_value = self.network_report
+        self.stack.enter_context(patch(
+            "track.v2.network_stage.build_network", return_value=network_result,
+        ))
+        self.log_info = MagicMock()
+        for module in ("stage_support", "detect_stage", "fitting_stage"):
+            self.stack.enter_context(patch(
+                f"track.v2.{module}.log_info", new=self.log_info,
+            ))
 
     def test_full_run_uses_stage_store_and_preserves_commit_order(self) -> None:
         emitted: list[PipelineEvent] = []
@@ -315,6 +355,31 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         ).stats
 
         self.assertEqual((result["refine_id"], result["detect_id"]), (REFINE_ID, DETECT_ID))
+        expected_keys = {
+            "refine_id", "detect_id", "fit_id", "source_srid", "processing_srid",
+            "source_points", "kept_trajectory_points", "injected_points",
+            "detect_compute_s", "detect_persist_s", "resolved_sequence_s",
+            "tracks_cross", "resolved_subtrack_points", "turn_events",
+            "candidate_intersections", "candidate_entry_exit_points",
+            "intersections", "entry_exit_points", "clip_assembly_s", "centerlines",
+            "centerline_ids", "_elapsed_s",
+            *(f"clip_{name}" for name in self.store.clip_report),
+            *(f"fitting_{name}" for name in self.store.fit_report),
+            *(f"network_{name}" for name in self.network_report),
+        }
+        self.assertEqual(set(result), expected_keys)
+        for prefix, report in (
+            ("clip", self.store.clip_report),
+            ("fitting", self.store.fit_report),
+            ("network", self.network_report),
+        ):
+            self.assertEqual(
+                {f"{prefix}_{name}": value for name, value in report.items()},
+                {
+                    f"{prefix}_{name}": result[f"{prefix}_{name}"]
+                    for name in report
+                },
+            )
         self.assertEqual(self.store.completed_artifact[0], REFINE_ID)
         self.assertIs(self.store.completed_artifact[1], self.descriptor)
         self.assertEqual(self.store.completed_detect_artifact[0], DETECT_ID)
@@ -448,7 +513,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         changed = {"version": 1, "row_count": 1, "sha256": "changed"}
         with (
             patch(
-                "track.v2.pipeline.calculate_source_fingerprint",
+                "track.v2.detect_stage.calculate_source_fingerprint",
                 side_effect=(self.fingerprint, changed),
             ),
             self.assertRaisesRegex(RuntimeError, "Detect source changed"),
@@ -481,7 +546,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 raise RuntimeError("detect publish failed")
 
         with (
-            patch("track.v2.pipeline.publish", side_effect=fail_detect_publish),
+            patch("track.v2.detect_stage.publish", side_effect=fail_detect_publish),
             self.assertRaisesRegex(RuntimeError, "detect publish failed"),
         ):
             run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
@@ -501,7 +566,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 raise RuntimeError("artifact deleted")
 
         with (
-            patch("track.v2.pipeline.RefineDatasetReader", _FailingReader),
+            patch("track.v2.detect_stage.RefineDatasetReader", _FailingReader),
             self.assertRaisesRegex(RuntimeError, "artifact deleted"),
         ):
             run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
@@ -512,7 +577,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
 
     def test_missing_artifact_marks_detect_failed(self) -> None:
         with (
-            patch("track.v2.pipeline.find_refine_artifact", side_effect=RuntimeError("missing")),
+            patch("track.v2.detect_stage.find_refine_artifact", side_effect=RuntimeError("missing")),
             self.assertRaisesRegex(RuntimeError, "missing"),
         ):
             run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
@@ -558,6 +623,10 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertEqual(self.events.count("get_refine"), 2)
         self.assertNotIn("create_staging:refine", self.events)
         self.assertNotIn("publish:refine", self.events)
+        for result in (first, second):
+            self.assertTrue(
+                {"source_points", "kept_trajectory_points", "injected_points"}.isdisjoint(result)
+            )
 
     def test_refine_stream_failure_closes_source_and_marks_run_failed(self) -> None:
         class _FailingStream(_EmptyStream):
@@ -565,7 +634,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 raise RuntimeError("stream failed")
 
         with (
-            patch("track.v2.pipeline.StreamVehicleSource", _FailingStream),
+            patch("track.v2.refine_stage.StreamVehicleSource", _FailingStream),
             self.assertRaisesRegex(RuntimeError, "stream failed"),
         ):
             run_pipeline(
@@ -585,7 +654,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             {"version": 1, "row_count": 1, "sha256": "1"},
         ))
         with (
-            patch("track.v2.pipeline.calculate_source_fingerprint", side_effect=fingerprints),
+            patch("track.v2.refine_stage.calculate_source_fingerprint", side_effect=fingerprints),
             self.assertRaisesRegex(RuntimeError, "source changed"),
         ):
             run_pipeline(PipelineInput(source_table="raw_points"), self.config)
@@ -597,7 +666,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
     def test_refine_export_failure_abandons_staging_and_preserves_error(self) -> None:
         with (
             patch(
-                "track.v2.pipeline.export_refine_parquet",
+                "track.v2.refine_stage.export_refine_parquet",
                 side_effect=RuntimeError("export failed"),
             ),
             self.assertRaisesRegex(RuntimeError, "export failed"),
@@ -636,9 +705,9 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             subtracks=[],
         )
         with (
-            patch("track.v2.pipeline.StreamVehicleSource", _OneTrackStream),
-            patch("track.v2.pipeline.CoordinateTransformer", return_value=transformer),
-            patch("track.v2.pipeline.refine_vehicle", return_value=refine_result),
+            patch("track.v2.refine_stage.StreamVehicleSource", _OneTrackStream),
+            patch("track.v2.refine_stage.CoordinateTransformer", return_value=transformer),
+            patch("track.v2.refine_stage.refine_vehicle", return_value=refine_result),
             self.assertRaisesRegex(ValueError, "outside projection bounds"),
         ):
             run_pipeline(
@@ -666,6 +735,16 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         ])
         self.assertEqual(self.events.count("rollback"), 2)
 
+    def test_clip_report_cancellation_closes_loaded_resource_once(self) -> None:
+        def emit(event: PipelineEvent) -> None:
+            if event.message == "  Clip 报告 / Clip report":
+                raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config, emit=emit)
+
+        self.store.clip_result.clips.close.assert_called_once_with()
+
     def test_detect_persistence_failure_rolls_back_and_marks_detect_failed(self) -> None:
         self.store.persist_detect_error = RuntimeError("detect write failed")
 
@@ -680,7 +759,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
     def test_detect_compute_failure_closes_snapshot_and_marks_detect_failed(self) -> None:
         with (
             patch(
-                "track.v2.pipeline.detect_intersections",
+                "track.v2.detect_stage.detect_intersections",
                 side_effect=RuntimeError("detect compute failed"),
             ),
             self.assertRaisesRegex(RuntimeError, "detect compute failed"),
@@ -702,6 +781,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertEqual(self.events[-5:], [
             "commit", "persist_fit", "rollback", "finish_fit:failed", "commit",
         ])
+        self.store.clip_result.clips.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

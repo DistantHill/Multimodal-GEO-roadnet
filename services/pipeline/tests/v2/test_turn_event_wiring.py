@@ -218,7 +218,7 @@ def test_pipeline_closes_turn_storage_after_commit_or_failure(tmp_path, failure)
 
     try:
         with (
-            patch("track.v2.pipeline.detect_intersections", return_value=result),
+            patch("track.v2.detect_stage.detect_intersections", return_value=result),
             patch.object(fixture.store, "load_clip", side_effect=check_clip),
         ):
             if failure is None:
@@ -309,7 +309,7 @@ def test_turn_relation_closes_after_result_rows_commit_before_artifact_completio
 
     try:
         with (
-            patch("track.v2.pipeline.detect_intersections", return_value=result),
+            patch("track.v2.detect_stage.detect_intersections", return_value=result),
             patch.object(fixture.store, "commit", side_effect=commit),
         ):
             if failure is None:
@@ -344,7 +344,7 @@ def test_keyboard_interrupt_after_detect_commit_keeps_completed_status(tmp_path)
             raise KeyboardInterrupt()
 
     try:
-        with patch("track.v2.pipeline.detect_intersections", return_value=result):
+        with patch("track.v2.detect_stage.detect_intersections", return_value=result):
             with pytest.raises(KeyboardInterrupt):
                 run_pipeline(PipelineInput(refine_id=REFINE_ID), fixture.config, emit=emit)
         assert "finish_detect:completed" in fixture.events
@@ -360,7 +360,7 @@ def test_keyboard_interrupt_during_detect_compute_marks_header_failed():
     fixture = lifecycle.RunPipelineLifecycleTest()
     fixture.setUp()
     try:
-        with patch("track.v2.pipeline.detect_intersections", side_effect=KeyboardInterrupt()):
+        with patch("track.v2.detect_stage.detect_intersections", side_effect=KeyboardInterrupt()):
             with pytest.raises(KeyboardInterrupt):
                 run_pipeline(PipelineInput(refine_id=REFINE_ID), fixture.config)
         assert "finish_detect:completed" not in fixture.events
