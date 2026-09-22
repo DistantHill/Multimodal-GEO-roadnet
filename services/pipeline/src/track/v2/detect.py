@@ -1464,12 +1464,11 @@ def _run_columnar_db_detect(
                 cfg.source_table or cfg.db_table, cfg, batch_size=cfg.stream_batch_size,
             ))
             try:
-                for event in iterator:
-                    if event_store is not None:
-                        event_store.append(event)
-                    else:
+                if event_store is not None:
+                    event_store.extend(iterator, batch_size=cfg.stream_batch_size)
+                else:
+                    for event in iterator:
                         turn_events.append(event)
-                event = None
             finally:
                 close = getattr(iterator, "close", None)
                 if close is not None:

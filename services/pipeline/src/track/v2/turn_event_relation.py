@@ -1,13 +1,15 @@
 """DuckDB-managed normalized relation for transient Detect turn events."""
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from itertools import islice
+import math
 from pathlib import Path
 from uuid import uuid4
 
 import duckdb
+import numpy as np
 
 from .models import PointRef, RefinedPointRef, RuntimeConfig, TurnEvent
 
@@ -100,6 +102,95 @@ class TurnEventRelation(Sequence[TurnEvent]):
             connection.execute("ROLLBACK")
             raise
         self._count += 1
+
+    def extend(self, events: Iterable[TurnEvent], *, batch_size: int | None = None) -> None:
+        """Commit bounded event batches; a failed batch leaves earlier batches readable."""
+        if self._sealed:
+            raise RuntimeError("turn event relation is sealed")
+        size = self._batch_size if batch_size is None else batch_size
+        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+            raise ValueError("batch_size must be positive")
+        iterator = iter(events)
+        while batch := tuple(islice(iterator, size)):
+            self._append_batch(batch)
+
+    append_many = extend
+
+    def _append_batch(self, events: tuple[TurnEvent, ...]) -> None:
+        connection, first_ordinal = self._require_open(), self._count
+        rows = [self._event_values(first_ordinal + offset, event)
+                for offset, event in enumerate(events)]
+        columns = tuple(zip(*rows, strict=True))
+        names = (
+            "ordinal", "event_calculate_index", "vehicle_id", "timestamp", "lon", "lat",
+            "x", "y", "entry_bearing", "exit_bearing", "turn_deg", "score", "source",
+            "point_source_id", "point_source_row_key", "point_stable", "point_from_ref",
+            "point_to_ref", "point_generated_reason", "point_source_row_hash",
+            "refined_point_kind", "refined_point_id", "refined_subtrack_index",
+            "refined_sequence", "cross_track_calculate_index", "g_star_z",
+        )
+        integer = {0, 1}
+        nullable_integer = {21, 22, 23, 24}
+        floating = {3, 4, 5, 6, 7, 8, 9, 10, 11}
+        columnar = {
+            name: np.asarray(values, dtype=(
+                np.int64 if index in integer else np.float64 if index in floating else object
+            ))
+            for index, (name, values) in enumerate(zip(names, columns, strict=True))
+        }
+        # Object arrays keep nullable BIGINT values as Python int/None; converting
+        # through float would silently lose identities above 2**53.
+        assert all(columnar[names[index]].dtype == object for index in nullable_integer)
+        registered = False
+        connection.execute("BEGIN")
+        try:
+            connection.register("turn_event_batch", columnar)
+            registered = True
+            connection.execute(
+                "INSERT INTO turn_events SELECT " + ",".join(names)
+                + " FROM turn_event_batch ORDER BY ordinal"
+            )
+            source_rows = (
+                (first_ordinal + offset, source_ordinal, source_id)
+                for offset, event in enumerate(events)
+                for source_ordinal, source_id in enumerate(event.source_ids)
+            )
+            while chunk := tuple(islice(source_rows, self._batch_size)):
+                source_columns = tuple(zip(*chunk, strict=True))
+                connection.register("turn_source_batch", {
+                    "event_ordinal": np.asarray(source_columns[0], dtype=np.int64),
+                    "source_ordinal": np.asarray(source_columns[1], dtype=np.int64),
+                    "source_id": np.asarray(source_columns[2], dtype=object),
+                })
+                try:
+                    connection.execute(
+                        "INSERT INTO source_ids SELECT event_ordinal,source_ordinal,source_id "
+                        "FROM turn_source_batch ORDER BY event_ordinal,source_ordinal"
+                    )
+                finally:
+                    connection.unregister("turn_source_batch")
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        finally:
+            if registered:
+                connection.unregister("turn_event_batch")
+        self._count += len(events)
+
+    def _event_values(self, ordinal: int, event: TurnEvent) -> tuple[object, ...]:
+        if event.g_star_z is not None and not math.isfinite(event.g_star_z):
+            # DuckDB's NumPy scanner can map object-array NaN to NULL. NULL is
+            # valid for this optional field, so reject non-finite values before
+            # registration instead of letting an invalid value disappear.
+            raise ValueError("g_star_z must be finite or None")
+        return (
+            ordinal, event.event_calculate_index, event.vehicle_id, event.timestamp,
+            event.lon, event.lat, event.x, event.y, event.entry_bearing,
+            event.exit_bearing, event.turn_deg, event.score, event.source,
+            *self._point_values(event.point_ref), *self._refined_values(event.refined_point_ref),
+            event.cross_track_calculate_index, event.g_star_z,
+        )
 
     @staticmethod
     def _point_values(point: PointRef | None) -> tuple[object, ...]:

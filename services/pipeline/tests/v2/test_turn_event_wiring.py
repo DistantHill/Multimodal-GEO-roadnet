@@ -143,6 +143,32 @@ def test_db_result_survives_columnar_run_and_cross_holds_no_full_turns(tmp_path,
     _assert_no_turn_relations(tmp_path)
 
 
+def test_columnar_detect_feeds_turn_relation_through_bounded_extend(tmp_path):
+    calls = []
+
+    class ObservedRelation(TurnEventRelation):
+        def extend(self, events, *, batch_size=None):
+            calls.append(batch_size)
+            return super().extend(events, batch_size=batch_size)
+
+    reader = type("Reader", (), {
+        "extent": lambda self: (0., 0., 1., 1.),
+        "iter_turn_candidates": lambda self, *_args, **_kwargs: iter(()),
+        "track_count": lambda self: 0,
+    })()
+    cfg = IntersectConfig(stream_batch_size=7, use_cross_track_candidates=False)
+    with (
+        patch("track.v2.detect.TurnEventRelation", ObservedRelation),
+        patch("track.v2.detect._build_topologies_from_tracks", return_value=([], [], [])),
+    ):
+        result = _detect_intersections_db(
+            object(), cfg, _CONTEXT, runtime=RuntimeConfig(), data_root=tmp_path,
+            refine_reader=reader,
+        )
+    assert calls == [7]
+    result.close()
+
+
 
 @pytest.mark.parametrize("failure", [RuntimeError("failed"), KeyboardInterrupt()])
 def test_detect_internal_failure_closes_output_relation(tmp_path, monkeypatch, failure):

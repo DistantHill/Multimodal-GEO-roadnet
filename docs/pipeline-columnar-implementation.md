@@ -834,6 +834,35 @@ Polars 对该逐 pair 标量筛选不会减少搬运，Python 仅解码宽筛保
 验证：cross-track 定向 `11 passed`；Pipeline 与 `scripts/cv_human_check/tests` 合并全量
 `967 passed, 50 skipped`。本卡不重跑 1M，C12 仍为进行中。
 
+提交：`75087f0`。
+
+#### C12e2 — TurnEventRelation 有界列式批写
+
+正式 Detect 的 turn reader 原先逐事件调用 `append`，每条事件单独执行事务、标量
+`INSERT` 和 `source_ids` `executemany`。本卡保留 `append` 的单条立即可读和原子语义，新增
+显式 `extend` / `append_many` API：输入 iterator 按调用方批量上限切分，每批在一个事务中
+用 NumPy 列字典注册 DuckDB 临时关系，再以 `INSERT SELECT` 写入事件和来源 ID。成功提交
+后才推进 relation 计数；失败批整体回滚，先前已提交批保持可读，不存在隐藏延迟缓冲区。
+
+正式 `detect.py` 直接把 `iter_turn_candidates` 的 iterator 以 `stream_batch_size` 喂给批写
+API，避免为写入重新构建全量事件列表。nullable BIGINT 使用 Python `int`/`None` 的 object
+数组，避免经过浮点数丢失大于 `2^53` 的身份；浮点列显式使用 `float64`，NaN 即使被注册
+层表示为空值也会被既有 `seal` 校验拒绝。可空的 `g_star_z` 是例外：scanner 若把 NaN
+映射为合法 NULL 会绕过 `seal`，因此批次注册前显式拒绝非有限的非 None 值；失败批不进入
+事务，先前批仍保留。`source_ids` 跨事件形成有界行流；单个事件即使
+包含大量来源 ID，也只按 relation batch size 注册和写入，不会整体展开。每次注册均在
+`finally` 中注销，不增加 pyarrow 依赖，也不改 CrossCandidateRelation 或 WriterRelation。
+
+固定 2,000 事件、每事件一个 source ID、单进程、DuckDB 单线程、batch 256 的镜像微基准：
+旧 `append` 循环 6.876317 秒，新批写 3.116454 秒，墙钟加速 2.21 倍；事务由 2,000 降至
+8，事件与来源 INSERT 调用合计由 4,000 降至 16（若计 BEGIN/COMMIT，SQL 调用由 8,000
+降至 32）。两条路径均 `seal`，新路径精确回读 2,000 条且末条语义相同。该微基准只用于
+摄取开销对比，不替代 1M 或 C13 验收。
+
+验证：关系、正式接线和严格 `rel=0` Q49 reader 定向 `98 passed`；Pipeline 与
+`scripts/cv_human_check/tests` 合并全量 `977 passed, 50 skipped`。本卡不重跑 1M，
+C12 仍为进行中。
+
 ### C13 — 26M 最终验收
 
 范围：精确 26M，默认 2 GB、无 swap、Refine 至 Network 小于一小时；PostgreSQL

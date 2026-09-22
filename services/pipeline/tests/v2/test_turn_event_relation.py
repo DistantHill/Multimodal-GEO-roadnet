@@ -79,6 +79,75 @@ def test_lossless_optional_source_order_index_and_batch_one(tmp_path):
         assert json.loads(json.dumps(output)) == output
 
 
+@pytest.mark.parametrize("batch_size", [1, 2, 5])
+def test_extend_is_lossless_bounded_and_preserves_nullable_bigints(tmp_path, batch_size):
+    huge = 2**60 + 7
+    events = (
+        _event(0),
+        replace(_full_event(1), refined_point_ref=RefinedPointRef(
+            "kept", huge, huge + 1, huge + 2,
+        ), cross_track_calculate_index=huge + 3),
+        _event(2, source_ids=("string",)),
+    )
+    with _relation(tmp_path, batch_size=2) as relation:
+        relation.extend(iter(events), batch_size=batch_size)
+        assert len(relation) == 3
+        relation.seal()
+        assert tuple(relation) == events
+
+
+def test_extend_rolls_back_failed_batch_but_keeps_prior_commit(tmp_path):
+    with _relation(tmp_path, batch_size=1) as relation:
+        with pytest.raises((TypeError, ValueError, OverflowError)):
+            relation.extend((_event(0), replace(_event(1), event_calculate_index="bad")))
+        assert len(relation) == 1
+        assert relation._connection.execute("SELECT count(*) FROM turn_events").fetchone() == (1,)
+        relation.extend((_event(1),))
+        relation.seal()
+        assert tuple(relation) == (_event(0), _event(1))
+
+
+def test_extend_null_source_id_follows_seal_rejection(tmp_path):
+    with _relation(tmp_path, batch_size=1) as relation:
+        relation.extend((_event(0, source_ids=(None,)),))
+        with pytest.raises(ValueError, match="invalid TurnEvent relation"):
+            relation.seal()
+
+
+def test_extend_matches_append_bool_to_varchar_coercion(tmp_path):
+    with _relation(tmp_path / "append") as appended, _relation(tmp_path / "extend") as extended:
+        appended.append(_event(0, source_ids=(True, "string")))
+        extended.extend((_event(0, source_ids=(True, "string")),))
+        appended.seal()
+        extended.seal()
+        assert tuple(extended) == tuple(appended)
+
+
+def test_extend_streams_one_events_source_ids_in_bounded_chunks(tmp_path):
+    source_ids = (f"source-{index}" for index in range(7))
+    event = replace(_event(0), source_ids=source_ids)
+    with _relation(tmp_path, batch_size=2) as relation:
+        relation.append_many(iter((event,)), batch_size=1)
+        relation.seal()
+        assert relation[0].source_ids == tuple(f"source-{index}" for index in range(7))
+
+
+def test_extend_nan_cannot_bypass_relation_validation(tmp_path):
+    relation = _relation(tmp_path)
+    relation.extend((replace(_event(0), x=float("nan")),))
+    with pytest.raises(ValueError, match="invalid TurnEvent relation"):
+        relation.seal()
+
+
+def test_extend_rejects_nullable_nan_before_scanner_can_map_it_to_null(tmp_path):
+    with _relation(tmp_path, batch_size=1) as relation:
+        with pytest.raises(ValueError, match="g_star_z must be finite"):
+            relation.extend((_event(0), replace(_event(1), g_star_z=float("nan"))))
+        assert len(relation) == 1
+        relation.seal()
+        assert tuple(relation) == (_event(0),)
+
+
 @pytest.mark.parametrize(
     "setup",
     [
@@ -200,5 +269,6 @@ def test_runtime_limits_and_columnar_implementation(tmp_path):
     assert "fetchmany" in inspect.getsource(TurnEventRelation.iter_coordinates).lower()
     assert "execute(" not in inspect.getsource(TurnEventRelation._decode).lower()
     assert "executemany" in inspect.getsource(TurnEventRelation.append).lower()
+    assert "register" in inspect.getsource(TurnEventRelation._append_batch).lower()
     for forbidden in ("sqlite", "pickle", "temporarydirectory", "disksequence"):
         assert forbidden not in source

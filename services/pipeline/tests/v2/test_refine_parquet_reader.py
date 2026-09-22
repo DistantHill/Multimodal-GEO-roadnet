@@ -453,12 +453,14 @@ def test_duckdb_turn_candidates_match_python_oracle_across_batches(tmp_path, win
     ]
     for left, right in zip(actual, expected, strict=True):
         assert left.source_ids == right.source_ids
-        assert left.x == pytest.approx(right.x, abs=1e-6)
-        assert left.y == pytest.approx(right.y, abs=1e-6)
-        assert left.lon == pytest.approx(right.lon, abs=1e-9)
-        assert left.lat == pytest.approx(right.lat, abs=1e-9)
+        assert left.x == pytest.approx(right.x, abs=1e-6, rel=0)
+        assert left.y == pytest.approx(right.y, abs=1e-6, rel=0)
+        assert left.lon == pytest.approx(right.lon, abs=1e-9, rel=0)
+        assert left.lat == pytest.approx(right.lat, abs=1e-9, rel=0)
         for field in ("timestamp", "entry_bearing", "exit_bearing", "turn_deg", "score"):
-            assert getattr(left, field) == pytest.approx(getattr(right, field), abs=1e-12)
+            assert getattr(left, field) == pytest.approx(
+                getattr(right, field), abs=1e-12, rel=0,
+            )
 
 
 def test_duckdb_turn_thresholds_are_inclusive_and_config_is_strict(tmp_path) -> None:
@@ -592,9 +594,13 @@ def test_duckdb_cross_track_segments_match_q49_oracle(tmp_path) -> None:
             right.start.point_ref, right.start.refined_point_ref,
         )
         for field in ("heading", "timestamp"):
-            assert getattr(left, field) == pytest.approx(getattr(right, field), abs=1e-12)
+            assert getattr(left, field) == pytest.approx(
+                getattr(right, field), abs=1e-12, rel=0,
+            )
         for field in ("x1", "y1", "x2", "y2"):
-            assert getattr(left, field) == pytest.approx(getattr(right, field), abs=1e-6)
+            assert getattr(left, field) == pytest.approx(
+                getattr(right, field), abs=1e-6, rel=0,
+            )
     # The old oracle ranks the decimal track key lexically: a\0 10 precedes a\0 2.
     assert [(segment.track_rank, segment.segment_index) for segment in actual] == [(0, 0), (2, 0)]
 
@@ -729,7 +735,9 @@ def test_columnar_cross_track_exact_kernel_matches_q49_oracle(tmp_path, batch_si
                                  ("lon", 1e-9), ("lat", 1e-9),
                                  ("timestamp", 1e-12), ("heading", 1e-12),
                                  ("speed", 1e-12)):
-            assert getattr(left, field) == pytest.approx(getattr(right, field), abs=tolerance)
+            assert getattr(left, field) == pytest.approx(
+                getattr(right, field), abs=tolerance, rel=0,
+            )
     assert any(candidate.vehicle_id == "a|b" for candidate in actual)
 
 
