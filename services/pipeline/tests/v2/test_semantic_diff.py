@@ -4,6 +4,7 @@ import math
 import os
 import re
 import sys
+from contextlib import nullcontext
 from unittest.mock import MagicMock
 
 import pytest
@@ -93,10 +94,13 @@ class _Connection:
         row = ("stable-key", *(0.0 if kind != "exact" else "same" for _, kind in spec.columns))
         return _Cursor(name, [row])
 
+    def transaction(self):
+        return nullcontext()
+
 
 class _SchemaCursor:
     def __init__(self) -> None:
-        self.responses = iter([("pipeline_schema_versions",), (7,)])
+        self.response = None
 
     def __enter__(self):
         return self
@@ -105,10 +109,20 @@ class _SchemaCursor:
         return None
 
     def execute(self, sql: str, _params: tuple = ()) -> None:
-        assert sql.lstrip().upper().startswith("SELECT")
+        assert sql.lstrip().upper().startswith(("SELECT", "SET LOCAL"))
+        if "to_regclass" in sql:
+            self.response = ("pipeline_schema_versions",)
+        elif "pipeline_schema_versions" in sql:
+            self.response = (7,)
+        elif "current_setting" in sql:
+            self.response = ("0.1",)
+        elif "set_config" in sql:
+            self.response = ("0.1",)
+        else:
+            self.response = ()
 
     def fetchone(self):
-        return next(self.responses)
+        return self.response
 
 
 def test_compare_runs_is_read_only_and_uses_named_bounded_cursors() -> None:

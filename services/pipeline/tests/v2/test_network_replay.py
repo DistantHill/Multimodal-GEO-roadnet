@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import nullcontext
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -44,6 +45,23 @@ class _Cursor:
         return result
 
 
+class _SettingsCursor:
+    def __init__(self):
+        self.row = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def execute(self, query, _params=()):
+        self.row = ("0.1",) if "current_setting" in query else ("0.1",)
+
+    def fetchone(self):
+        return self.row
+
+
 class _Connection:
     def __init__(self):
         self.status = ("completed", "completed")
@@ -63,8 +81,10 @@ class _Connection:
         return _Result(self.status)
 
     def cursor(self, name=None):
-        assert name is not None
-        return _Cursor(self, name)
+        return _SettingsCursor() if name is None else _Cursor(self, name)
+
+    def transaction(self):
+        return nullcontext()
 
 
 def _replay(connection=None, identities=None):

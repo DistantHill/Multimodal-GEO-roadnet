@@ -9,6 +9,7 @@ from typing import Any, Iterable, Iterator
 from uuid import UUID
 
 from ..db.schema import require_current_schema
+from ..db.cursors import declare_full_scan_cursor
 from ..db.source_table import verify_refine_source_fingerprint
 from .network_replay import ReplayResult, replay_network
 
@@ -363,7 +364,9 @@ def _rows(
 ) -> Iterator[tuple[Any, ...]]:
     with conn.cursor(name=f"semantic_diff_{side}_{spec.name.replace('.', '_')}") as cursor:
         cursor.itersize = batch_size
-        cursor.execute(spec.query, tuple(runs[kind] for kind in spec.run_kinds))
+        declare_full_scan_cursor(
+            conn, cursor, spec.query, tuple(runs[kind] for kind in spec.run_kinds),
+        )
         yield from cursor
 
 
@@ -373,7 +376,9 @@ def _network_identity_rows(
     rows: list[tuple[Any, ...]] = []
     with conn.cursor(name=f"semantic_diff_{side}_network_identities") as cursor:
         cursor.itersize = batch_size
-        cursor.execute(_NETWORK_IDENTITY_QUERY, (detect_id, detect_id))
+        declare_full_scan_cursor(
+            conn, cursor, _NETWORK_IDENTITY_QUERY, (detect_id, detect_id),
+        )
         while batch := cursor.fetchmany(batch_size):
             rows.extend(batch)
     return rows

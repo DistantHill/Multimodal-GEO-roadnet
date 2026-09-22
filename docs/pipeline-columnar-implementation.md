@@ -67,7 +67,7 @@
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
-| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12g4；待重跑 1M） |
+| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12h1；待重跑 1M） |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
 ## 3. 任务卡
@@ -1121,6 +1121,27 @@ required DOUBLE 的非有限值仍由既有 `seal` 拒绝；optional `g_star_z` 
 Turn relation、接线与 streaming writer 定向为 `71 passed, 1 skipped`。冻结当前代码的 2k
 局部 microbenchmark 中，单条 append 为 `7.8477` 秒，typed extend 为 `0.05001` 秒，主表
 2,000 行和 source ID 4,000 行一致；约 `156.9x` 只描述该局部摄取，不代表 Detect 端到端。
+
+C12g4 主对话全量验收为 `1,032 passed, 53 skipped`，代码审查无阻断。2k 对比中的收益是
+typed extend 相对单条 scalar append 的局部差异；旧 extend 在 C12g4 前已经是批量接口，因此
+该比值不能单独归因于本卡的 dtype 替换，也不能外推为端到端收益。
+
+#### C12h1 — Semantic full-scan cursor 规划
+
+Semantic diff 的十四张逐表读取、Network stable identity 窄读和 controlled replay 的
+intersection/centerline 小表读取，统一复用既有 `declare_full_scan_cursor`。该 helper 只在
+DECLARE 规划期间以 `SET LOCAL cursor_tuple_fraction=1.0` 告知 PostgreSQL 游标会被完整消费，
+随后恢复调用方原设置；FETCH 仍使用已规划 portal，原事务、命名游标有界读取和只读语义不变。
+本卡不修改十四张 SQL、Q49 scope、数值容差、缓存、临时表或任何 Pipeline 生产算法。
+
+真实基线 self-probe 中，来源指纹与三次 Refine pass 共 `13.883` 秒；随后 resolved semantic
+查询在默认 `cursor_tuple_fraction=0.1` 下选择 nested loop，超过 300 秒后人工停止。该证据
+是读取规划热点，不是语义失败；全 scope 的最终差分仍待完成。只读 EXPLAIN 证据显示同一
+SQL 在 `1.0` 下改用 hash + sort，估算成本约为原计划三分之一，但不能替代实际全量差分。
+
+隔离 PostgreSQL 轻量回归覆盖成功与声明失败后的设置恢复、两个 full-scan 命名游标同时存活
+并交错读取且结果不变，以及 semantic/network 随机 Schema 小 fixture；不运行大型 1M
+查询或 `EXPLAIN ANALYZE`，避免干扰并行的冻结快照全流程运行。
 
 ### C13 — 26M 最终验收
 

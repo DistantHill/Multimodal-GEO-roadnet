@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 from ..models import Centerline, ClipIntersection, NetworkConfig
 from ..network import build_network
+from ..db.cursors import declare_full_scan_cursor
 
 
 EXPECTED_NETWORK_SHA256 = "1ffc98060cfce360c05aeca0ab73ec39a545cb420df003c50d977f58138bcbd0"
@@ -55,7 +56,7 @@ def _read_named(
     rows: list[tuple[Any, ...]] = []
     with conn.cursor(name=f"network_replay_{name}_{uuid4().hex}") as cursor:
         cursor.itersize = batch_size
-        cursor.execute(query, params)
+        declare_full_scan_cursor(conn, cursor, query, params)
         while batch := cursor.fetchmany(batch_size):
             rows.extend(batch)
     return rows
