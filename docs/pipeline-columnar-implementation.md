@@ -890,6 +890,44 @@ DuckDB 临时关系，以一个 `INSERT SELECT` 和一个显式事务提交；�
 定向 `40 passed`；Pipeline 与 `scripts/cv_human_check/tests` 合并全量
 `987 passed, 50 skipped`。本卡不重跑 1M，C12 仍为进行中。
 
+主对话验收复测：CrossCandidateRelation、TurnEventRelation 与 Refine reader 定向
+`116 passed`（6.17 秒）；Compose 配置单元测试 `5 passed`；Backend 在同时挂载当前
+Pipeline 源码后 `75 passed`。只挂载 Backend 的旧镜像会因其内置旧 Pipeline Schema
+缺少 `require_current_schema` 而在收集期失败，部署前需重建 Backend 镜像。
+
+提交：`81ed237`。
+
+#### C12e4a — Semantic diff 目标 Run 限定与候选成员流
+
+语义差分的公共 CTE 由入口绑定目标 `detect_id`，member evidence、candidate、crossing 与
+intersection 均只读取该 Run；Fitting 与 Network 查询显式同时接收其 lineage detect ID
+和 fit ID，不再为一个 fit 扫描全库 Detect 成员。候选业务键由全成员 `string_agg` 改为
+固定大小的最小 evidence 代表；新增独立 `detect.candidate_membership` 有序流，以 evidence
+为唯一行键并输出代表值，严格比较完整成员关系。非最小成员变化、无成员、重复 evidence，
+以及同一 evidence 分属不同代表均 fail closed；不能只比较最小成员。几何输出统一使用
+`ST_AsGeoJSON(geom,15)`，避免默认最多九位小数在 `1e-9°` 边界掩盖差异。
+
+真实 PostgreSQL 验证在隔离数据库的随机 Schema 中安装生产 DDL，对全部 semantic query
+执行带真实参数数量的 `EXPLAIN`，包括 fit 查询的 lineage detect ID；随后用事务内临时表
+实际执行 shifted surrogate ID、非最小成员变化、无关 Run 排除、无成员、重复 evidence、
+跨代表重复 evidence，以及 GeoJSON 九位比较通过而十五位比较失败的 `1.4e-9°` 边界。
+测试结束回滚并删除随机 Schema，不修改既有 Run 或业务表。真实 PG 定向 `24 passed`；
+Pipeline 与 `scripts/cv_human_check/tests` 合并全量 `990 passed, 51 skipped`。
+
+性能优化按实际读取/传输行字节数、SQL 调用次数和 Python 物化行/对象数评估，不把采用
+DuckDB 或 Polars 本身视为加速；来源前后指纹和兼容约束保持不变。
+
+另行只读性能试验未形成生产改动：固定 1M 上，v2 原 JOIN 的 COUNT 180 秒未返回，源校验
+0.414 秒、峰值 `479,576,064 B`；v3 仅把四个 AABB 条件前置，COUNT 同样 180 秒未返回，
+源校验 0.377 秒、峰值 `487,759,872 B`。两次 swap/OOM 均为 0，均人工超时停止并返回
+137；实际 count 未知，约 2,098,224 的估算不能视为实值。因此条件重排不合入本卡，也不
+重跑完整 1M。审计容器日志保留，旧数据与 PostgreSQL 均无写入。C12 仍为进行中。
+
+后续仍须实现 semantic diff 鲜活来源指纹的单次复核（共源两侧不能重复扫描），并拆分
+`persisted_equivalent` 与 `complete_scope`；Network 未持久化的 nodes、issues、report 和
+配置覆盖尚未纳入。当前逐表差分通过不能视为完整语义验收。性能工作应研究更有效的空间
+连接，而不是重复已超时的 COUNT；之后仍需完成 1M 全量差分和 26M 最终验收。
+
 ### C13 — 26M 最终验收
 
 范围：精确 26M，默认 2 GB、无 swap、Refine 至 Network 小于一小时；PostgreSQL
