@@ -446,6 +446,9 @@ def test_real_postgres_combined_centerline_direction_normalization(semantic_data
         id bigint,detect_id uuid,candidate_intersection_id bigint,
         segment_start_point_id bigint,crossing_type integer);
       CREATE TEMP TABLE intersections(id bigint,detect_id uuid,candidate_intersection_id bigint);
+      CREATE TEMP TABLE entry_exit_points(
+        detect_id uuid,intersection_id bigint,entry_crossing_id bigint,
+        exit_crossing_id bigint,entry_bearing double precision,exit_bearing double precision);
       CREATE TEMP TABLE centerlines(
         id bigint,detect_id uuid,fit_id uuid,variant text,
         from_intersection_id bigint,to_intersection_id bigint,length_m double precision,
@@ -474,6 +477,8 @@ def test_real_postgres_combined_centerline_direction_normalization(semantic_data
                      "(%s,%s,%s,%s,0),(%s,%s,%s,%s,1)",
                      (base + 50, detect_id, base + 10, base + 1,
                       base + 60, detect_id, base + 20, base + 2))
+        conn.execute("INSERT INTO entry_exit_points VALUES (%s,%s,%s,%s,12.5,87.5)",
+                     (detect_id, base + 30, base + 60, base + 50))
         endpoints = ((base + 40, base + 30) if reversed_combined
                      else (base + 30, base + 40))
         geometry = "LINESTRING(1 0,0 0)" if reversed_combined else "LINESTRING(0 0,1 0)"
@@ -489,17 +494,36 @@ def test_real_postgres_combined_centerline_direction_normalization(semantic_data
     add_lineage(left_detect, left_fit, 0, False)
     add_lineage(right_detect, right_fit, 100, True)
     specs = {spec.name: spec for spec in TABLES if spec.name in {
-        "fitting.centerlines", "fitting.source_clips", "network.topology",
+        "detect.entry_exit", "fitting.centerlines", "fitting.source_clips", "network.topology",
     }}
 
     def rows(name, detect_id, fit_id):
         spec = specs[name]
-        return conn.execute(spec.query, (detect_id, fit_id)).fetchall()
+        run_ids = {"detect": detect_id, "fit": fit_id}
+        return conn.execute(
+            spec.query, tuple(run_ids[kind] for kind in spec.run_kinds),
+        ).fetchall()
 
     for name, spec in specs.items():
         assert compare_rows(spec.name, spec.columns,
                             rows(name, left_detect, left_fit),
                             rows(name, right_detect, right_fit))["passed"]
+
+    for name in ("detect.entry_exit", "fitting.source_clips"):
+        spec = specs[name]
+        params = tuple(
+            {"detect": left_detect, "fit": left_fit}[kind] for kind in spec.run_kinds
+        )
+        original = spec.query.replace(
+            "crossing_keys AS NOT MATERIALIZED (", "crossing_keys AS (", 1,
+        )
+        assert conn.execute(original, params).fetchall() == conn.execute(
+            spec.query, params,
+        ).fetchall()
+        plan = "\n".join(row[0] for row in conn.execute(
+            "EXPLAIN " + spec.query, params,
+        ).fetchall()).lower()
+        assert "cte scan on crossing_keys" not in plan
 
     conn.execute("UPDATE centerlines SET geom=public.ST_GeomFromText('LINESTRING(0 0,1 0)',4326) "
                  "WHERE detect_id=%s", (right_detect,))

@@ -52,7 +52,7 @@ WITH target_detect AS (SELECT %s::uuid AS detect_id), member_evidence AS (
  LEFT JOIN member_evidence m
    ON (m.candidate_intersection_id,m.detect_id)=(c.id,c.detect_id)
  GROUP BY c.id,c.detect_id
-), crossing_keys AS (
+), crossing_keys AS NOT MATERIALIZED (
  SELECT c.id,c.detect_id,
         CASE WHEN k.business_key IS NULL THEN NULL ELSE
           jsonb_build_array(k.business_key,r.subtrack_index,r.sequence_in_subtrack,c.crossing_type)::text

@@ -1195,6 +1195,21 @@ clone，不能自动放宽验收标准或修改原库。Python trajectory point 
 列数组、Segment 按 `isequence` 引用重建的工作，继续排在整个列式任务验收完成之后；当前
 不删除 Python 类型或 PostgreSQL 表。
 
+#### C12h2 — Semantic crossing key 内联规划
+
+正式 semantic diff 在隔离 clone 对 candidate 新结果的九张相关表显式执行 `ANALYZE` 后，
+`detect.resolved_points` 以 `679,649` 行在 `9.137` 秒完成并 pass；其后累计十张表 pass。
+`detect.entry_exit` 在 60 秒内未完成而被有界停止。该结果是查询规划阻塞，不是语义不等价；
+完整十四张持久化表与八张 Network controlled replay 仍须在本修复后重新完成。
+
+同形 `EXPLAIN` 显示公共 `crossing_keys` 被两个查询各引用两次时，PostgreSQL 默认物化该
+CTE；candidate 新表虽有 `83,947` 行，统计估算仅为 `455` 行，物化结果的引用又只估算为
+两行，导致重复无索引 CTE scan。仅将 `crossing_keys` 标记为 `NOT MATERIALIZED`，让
+`detect.entry_exit` 与 `fitting.source_clips` 可以回到现有基表主键访问路径；共享的
+`candidate_keys`、所有业务键、输出列、排序、Q49 容差和 14+8 比较范围均不改变，也不在
+会话级禁用 nested loop。`fitting.source_clips` 的既有计划成本未见改善，因此本卡不预先
+宣称性能收益，须以修复后的两张目标表和完整正式差分实测为准。
+
 ### C13 — 26M 最终验收
 
 范围：精确 26M，默认 2 GB、无 swap、Refine 至 Network 小于一小时；PostgreSQL
