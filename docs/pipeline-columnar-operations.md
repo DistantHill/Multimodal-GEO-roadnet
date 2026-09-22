@@ -65,8 +65,16 @@ python -m pipeline artifacts reconcile --apply
 `/data/tmp/road-network/c12g_full_1m_20260922-145233_yPGnIn` ；不得将该目录当作可覆盖的
 日常输出路径，也不得在验收完成前清理其日志、统计和已发布制品。
 
-验证器 `e2130d7` 的十四张持久化表与八张 Network controlled replay 正式差分仍在执行。
-当前 Refine kept、injected、excluded 三表已分别比较 `614,879`、`999`、`385,121` 行且
-通过，但不能据此宣布完整 C12 验收成功。PostgreSQL 单列前后统计还包含小 fixture 测试
-污染，不得将全部数据库变化归因于该 1M Run。完整证据与阶段耗时见实施任务卡的
-“C12 2026-09-22 冻结快照 1M 全链路运行”章节。
+验证器从 `e2130d7` 演进到 crossing key 内联规划 `78dbd2a`；正式差分已有十张持久化表
+通过，但 `detect.entry_exit` 在原计划下超时。局部关闭 nested loop 的只读诊断在
+`8.499` 秒内确认第 `1,009` 个业务键存在 `exit_bearing` 差异
+`8.161123332683928e-09`，所以该历史 baseline 与新 Run 的严格差分未通过。C12h3 只在
+`detect.entry_exit` 的 DECLARE 规划期间应用并恢复该提示，让验证器能及时报告真实差异；
+它不放宽数值容差，也不代表十四张持久化表和八张 Network controlled replay 已完成。
+
+反例来自单个正交注入点的最低位坐标差异。当前镜像回放支持依赖环境差异这一候选解释，
+但历史 baseline 没有保存最初射线交点 XY、精确镜像或依赖版本，不能把候选解释记录成
+已证明根因。不得修改旧 Run、舍入结果或自动替换 baseline；如需建立可比较的新 baseline，
+应先取得用户确认，再在固定环境中使用旧源码生成新的隔离 Run。PostgreSQL 单列前后统计
+还包含小 fixture 测试污染，不得将全部数据库变化归因于该 1M Run。完整证据与阶段耗时见
+实施任务卡的“C12 2026-09-22 冻结快照 1M 全链路运行”章节。

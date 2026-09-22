@@ -1,4 +1,5 @@
 """Clip cursor planning is scoped; small metadata never joins the point stream."""
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -7,6 +8,79 @@ import pytest
 from track.v2.db.queries import fetch_resolved_clip_tracks
 from track.v2.db.cursors import declare_full_scan_cursor
 from .test_clip_fitting_streaming import Connection
+
+
+def test_default_full_scan_does_not_touch_nested_loop_setting():
+    statements = []
+
+    class Settings:
+        def execute(self, query, params=()):
+            statements.append((query, params))
+
+        def fetchone(self):
+            return ("0.37",)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    class Conn:
+        def cursor(self):
+            return Settings()
+
+        def transaction(self):
+            return nullcontext()
+
+    class Declared:
+        def execute(self, query, params):
+            statements.append((query, params))
+
+    declare_full_scan_cursor(Conn(), Declared(), "SELECT 1", ())
+    assert all("enable_nestloop" not in query for query, _params in statements)
+
+
+def test_discouraged_nested_loop_is_scoped_to_declare():
+    state = {"fraction": "0.37", "nested_loop": "on"}
+
+    class Settings:
+        row = None
+
+        def execute(self, query, params=()):
+            if "current_setting('cursor_tuple_fraction')" in query:
+                self.row = (state["fraction"], state["nested_loop"])
+            elif query.startswith("SET LOCAL cursor_tuple_fraction"):
+                state["fraction"] = "1"
+            elif query.startswith("SET LOCAL enable_nestloop"):
+                state["nested_loop"] = "off"
+            elif "set_config('enable_nestloop'" in query:
+                state["fraction"], state["nested_loop"] = params
+
+        def fetchone(self):
+            return self.row
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    class Conn:
+        def cursor(self):
+            return Settings()
+
+        def transaction(self):
+            return nullcontext()
+
+    class Declared:
+        def execute(self, _query, _params):
+            assert state == {"fraction": "1", "nested_loop": "off"}
+
+    declare_full_scan_cursor(
+        Conn(), Declared(), "SELECT 1", (), discourage_nested_loop=True,
+    )
+    assert state == {"fraction": "0.37", "nested_loop": "on"}
 
 
 @pytest.mark.parametrize("failure", [False, True])

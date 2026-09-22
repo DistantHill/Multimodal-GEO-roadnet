@@ -366,6 +366,7 @@ def _rows(
         cursor.itersize = batch_size
         declare_full_scan_cursor(
             conn, cursor, spec.query, tuple(runs[kind] for kind in spec.run_kinds),
+            discourage_nested_loop=spec.name == "detect.entry_exit",
         )
         yield from cursor
 

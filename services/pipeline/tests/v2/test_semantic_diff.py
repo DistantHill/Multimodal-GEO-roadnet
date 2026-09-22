@@ -115,9 +115,9 @@ class _SchemaCursor:
         elif "pipeline_schema_versions" in sql:
             self.response = (7,)
         elif "current_setting" in sql:
-            self.response = ("0.1",)
+            self.response = (("0.1", "on") if "enable_nestloop" in sql else ("0.1",))
         elif "set_config" in sql:
-            self.response = ("0.1",)
+            self.response = (("0.1", "on") if "enable_nestloop" in sql else ("0.1",))
         else:
             self.response = ()
 
@@ -137,6 +137,23 @@ def test_compare_runs_is_read_only_and_uses_named_bounded_cursors() -> None:
     assert result["scope"]["exclusions"] == []
     assert conn.statements[0] == "SET TRANSACTION READ ONLY"
     assert len(result["tables"]) == len(TABLES)
+
+
+def test_only_entry_exit_discourages_nested_loop(monkeypatch) -> None:
+    calls = []
+
+    def declare(_conn, _cursor, query, params, **kwargs):
+        calls.append((query, params, kwargs))
+
+    monkeypatch.setattr(semantic_diff, "declare_full_scan_cursor", declare)
+    conn = _Connection()
+    runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
+    entry_exit = next(spec for spec in TABLES if spec.name == "detect.entry_exit")
+    source_clips = next(spec for spec in TABLES if spec.name == "fitting.source_clips")
+    list(semantic_diff._rows(conn, entry_exit, runs, "baseline", 17))
+    list(semantic_diff._rows(conn, source_clips, runs, "baseline", 17))
+    assert calls[0][2] == {"discourage_nested_loop": True}
+    assert calls[1][2] == {"discourage_nested_loop": False}
 
 
 @pytest.mark.parametrize("batch_size", [0, -1, True, 1.5])
