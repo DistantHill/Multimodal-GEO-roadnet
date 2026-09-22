@@ -67,7 +67,7 @@
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
-| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12d2；待重跑 1M） |
+| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12f1；待重跑 1M） |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
 ## 3. 任务卡
@@ -945,6 +945,26 @@ Network 非持久化产物的可复核覆盖；本卡不重建 Network，也不�
 26M 最终验收。只有整个列式任务验收完成后，才另行安排 Python trajectory point 对象改为
 Subtrack 列数组，并让 Segment 按 `isequence` 引用重建；当前阶段不删除这些 Python 类型，
 也不删除或改变 PostgreSQL 表。
+
+#### C12f1 — Cross-track 一次物化与统计驱动空间连接
+
+`iter_cross_track_pair_batches` 在同一 DuckDB 连接内把完整 straight payload（含 AABB）
+一次性物化为引擎管理的临时表并执行 `ANALYZE`。这是一项 DuckDB 算子中间关系，不是自研
+spool、外存协议或 Python 缓存。后续 self-join 仍只投影原有 ID、坐标、heading 与 AABB
+窄列，保守角度/相交表达式、浮点边界和稳定排序均不改变；命中 ID 最后回连同一临时表获取
+payload，因此不再重读 Parquet、重跑窗口或为未命中 pair 构建 Python 点对象。零长段没有
+新增过滤，既有 grid 配置兼容校验、memory limit、temp directory 和精确 NumPy 核保持不变。
+
+临时表使用每次迭代唯一名称，并在正常完成、异常和 generator 提前关闭时由 `finally` 删除；
+reader 已先关闭时连接自身已经释放临时关系，不再用已关闭连接执行 DROP。回归覆盖来源关系
+仅物化一次、pair SQL 不重读 `refine_points`、提前关闭、解码失败、reader 先关闭和同一
+reader 重复调用，Refine reader 定向 `42 passed`。
+
+真实 1M 只读探针在 2 GB、swap 0 配置下以完整 payload 物化全部 `437,416` 段，其中保留
+`56,066` 个零长段；物化 `0.590` 秒、`ANALYZE` `0.055` 秒。实际 `EXPLAIN` 的 AABB 与
+完整保守数值查询均选择 `IE_JOIN`，两侧扫描由 projection pushdown 限定到窄列。此前同一
+物化方案的保守 COUNT 实计为 `59,018` pair、耗时 `16.675633` 秒；该数字不是最终 exact
+候选数，该时间也只覆盖 COUNT，不代表完整 cross-track 或全链路耗时。本卡不运行完整 1M。
 
 ### C13 — 26M 最终验收
 

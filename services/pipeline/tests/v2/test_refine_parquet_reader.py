@@ -785,27 +785,84 @@ def test_duckdb_cross_track_pairs_empty_single_vehicle_and_strict_config(tmp_pat
 def test_cross_track_pair_api_never_fetches_all() -> None:
     reader = object.__new__(refine_parquet.RefineDatasetReader)
     reader._descriptor = Mock(refine_id=uuid4())
-    validation, result = Mock(), Mock()
+    validation, materialized, analyzed, result, dropped = (Mock() for _ in range(5))
     validation.fetchone.return_value = (0,)
     result.fetchmany.return_value = []
     connection = Mock()
-    connection.execute.side_effect = [validation, result]
+    connection.execute.side_effect = [validation, materialized, analyzed, result, dropped]
     reader._connection = connection
     assert list(reader.iter_cross_track_pair_batches(
         "source", IntersectConfig(), batch_size=1,
     )) == []
     result.fetchmany.assert_called_once_with(1)
     assert not result.fetchall.called
-    sql, parameters = connection.execute.call_args_list[-1].args
+    create_sql, create_parameters = connection.execute.call_args_list[1].args
+    assert create_sql.startswith("CREATE TEMP TABLE cross_track_straight_")
+    assert create_sql.count("FROM refine_points") == 1
+    assert "end_x <> x" not in create_sql
+    default = IntersectConfig()
+    assert create_parameters == [default.cross_track_straightness_deg]
+    assert connection.execute.call_args_list[2].args[0].startswith("ANALYZE cross_track_straight_")
+    sql, parameters = connection.execute.call_args_list[3].args
+    assert "FROM refine_points" not in sql
     assert "a.segment_id < b.segment_id" in sql
     assert "a.min_x <= b.max_x AND b.min_x <= a.max_x" in sql
     assert "a.min_y <= b.max_y AND b.min_y <= a.max_y" in sql
-    default = IntersectConfig()
-    assert parameters == [default.cross_track_straightness_deg,
-                          default.cross_track_min_angle_deg,
+    assert parameters == [default.cross_track_min_angle_deg,
                           default.cross_track_max_angle_deg]
     assert "arithmetic_error" in sql
     assert "ta_num BETWEEN" in sql
+    assert connection.execute.call_args_list[4].args[0].startswith(
+        "DROP TABLE IF EXISTS cross_track_straight_"
+    )
+
+
+def test_cross_track_pair_temp_table_cleanup_and_reader_reuse(tmp_path) -> None:
+    descriptor = _published_tracks(tmp_path, [
+        ("a", 0, [(0, -1, 0, 0), (1, 1, 0, 0)]),
+        ("b", 1, [(2, 0, -1, 90), (3, 0, 1, 90)]),
+    ])
+    cfg = IntersectConfig()
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        count_sql = """
+          SELECT count(*) FROM duckdb_tables()
+          WHERE table_name LIKE 'cross_track_straight_%'
+        """
+        iterator = reader.iter_cross_track_pair_batches("source", cfg, batch_size=1)
+        assert len(next(iterator)) == 1
+        assert reader._connection.execute(count_sql).fetchone() == (1,)
+        iterator.close()
+        assert reader._connection.execute(count_sql).fetchone() == (0,)
+
+        first = list(reader.iter_cross_track_pair_batches("source", cfg, batch_size=1))
+        second = list(reader.iter_cross_track_pair_batches("source", cfg, batch_size=1))
+        assert first == second
+        assert reader._connection.execute(count_sql).fetchone() == (0,)
+
+        with patch.object(
+            reader, "_decode_cross_track_segment", side_effect=RuntimeError("decode failed"),
+        ):
+            with pytest.raises(RuntimeError, match="decode failed"):
+                list(reader.iter_cross_track_pair_batches("source", cfg, batch_size=1))
+        assert reader._connection.execute(count_sql).fetchone() == (0,)
+
+
+def test_cross_track_pair_generator_close_after_reader_close_is_safe(tmp_path) -> None:
+    descriptor = _published_tracks(tmp_path, [
+        ("a", 0, [(0, -1, 0, 0), (1, 1, 0, 0)]),
+        ("b", 1, [(2, 0, -1, 90), (3, 0, 1, 90)]),
+    ])
+    reader = refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    )
+    with reader:
+        iterator = reader.iter_cross_track_pair_batches(
+            "source", IntersectConfig(), batch_size=1,
+        )
+        assert len(next(iterator)) == 1
+    iterator.close()
 
 
 def test_cross_track_segment_api_is_bounded_and_validates_config() -> None:

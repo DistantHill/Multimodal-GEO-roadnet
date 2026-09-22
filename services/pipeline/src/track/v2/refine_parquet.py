@@ -469,8 +469,12 @@ class RefineDatasetReader:
         if (not math.isfinite(min_angle) or not math.isfinite(max_angle)
                 or not 0 <= min_angle <= max_angle <= 180):
             raise RefineParquetError("cross-track angle range is invalid")
-        query = self._cross_track_segment_relation("""
-        , paired AS (
+        table = f"cross_track_straight_{uuid4().hex}"
+        materialize = self._cross_track_segment_relation("""
+          SELECT * FROM straight
+        """)
+        query = f"""
+        WITH paired AS (
           SELECT a.segment_id AS a_id, b.segment_id AS b_id,
                  a.heading AS a_heading, b.heading AS b_heading,
                  a.end_x-a.x AS adx, a.end_y-a.y AS ady,
@@ -480,7 +484,7 @@ class RefineDatasetReader:
                       % 360.0)-180.0) AS angle,
                  1.4210854715202004e-14
                    * greatest(1.0, abs(a.heading)+abs(b.heading)+540.0) AS angle_error
-          FROM straight a JOIN straight b
+          FROM {table} a JOIN {table} b
             ON a.segment_id < b.segment_id
            AND a.vehicle_rank != b.vehicle_rank
            AND a.min_x <= b.max_x AND b.min_x <= a.max_x
@@ -509,16 +513,22 @@ class RefineDatasetReader:
           SELECT a.* EXCLUDE (min_x, max_x, min_y, max_y),
                  b.* EXCLUDE (min_x, max_x, min_y, max_y)
           FROM conservative_pairs p
-          JOIN straight a ON a.segment_id=p.a_id
-          JOIN straight b ON b.segment_id=p.b_id
+          JOIN {table} a ON a.segment_id=p.a_id
+          JOIN {table} b ON b.segment_id=p.b_id
           ORDER BY a.vehicle_rank, b.vehicle_rank,
                    a.segment_index, b.segment_index, a.track_rank, b.track_rank
-        """)
-        result = connection.execute(query, [threshold, min_angle, max_angle])
-        while rows := result.fetchmany(batch_size):
-            yield tuple((self._decode_cross_track_segment(row[:23], source_table),
-                         self._decode_cross_track_segment(row[23:], source_table))
-                        for row in rows)
+        """
+        try:
+            connection.execute(f"CREATE TEMP TABLE {table} AS {materialize}", [threshold])
+            connection.execute(f"ANALYZE {table}")
+            result = connection.execute(query, [min_angle, max_angle])
+            while rows := result.fetchmany(batch_size):
+                yield tuple((self._decode_cross_track_segment(row[:23], source_table),
+                             self._decode_cross_track_segment(row[23:], source_table))
+                            for row in rows)
+        finally:
+            if self._connection is connection:
+                connection.execute(f"DROP TABLE IF EXISTS {table}")
 
     def _validate_cross_track_request(
         self, source_table: str, cfg: Any, batch_size: int,
