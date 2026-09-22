@@ -923,10 +923,28 @@ DuckDB 或 Polars 本身视为加速；来源前后指纹和兼容约束保持�
 137；实际 count 未知，约 2,098,224 的估算不能视为实值。因此条件重排不合入本卡，也不
 重跑完整 1M。审计容器日志保留，旧数据与 PostgreSQL 均无写入。C12 仍为进行中。
 
-后续仍须实现 semantic diff 鲜活来源指纹的单次复核（共源两侧不能重复扫描），并拆分
-`persisted_equivalent` 与 `complete_scope`；Network 未持久化的 nodes、issues、report 和
-配置覆盖尚未纳入。当前逐表差分通过不能视为完整语义验收。性能工作应研究更有效的空间
-连接，而不是重复已超时的 COUNT；之后仍需完成 1M 全量差分和 26M 最终验收。
+#### C12e4b — Semantic diff 鲜活来源与完整范围门禁
+
+语义差分先比较两侧 lineage 保存的 `source_table` 与 `source_fingerprint`；两者一致后，
+仅以共同来源的 baseline Refine Run 执行一次既有 `verify_refine_source_fingerprint`，不为
+两侧重复扫描来源。该校验沿用既有指纹契约和命名只读游标的有界读取；来源漂移或校验异常
+会在打开逐表差分游标前结构化 fail closed，不新增散列体系。
+
+结果拆分为 `persisted_equivalent`、`complete_scope` 和 `acceptance_passed`。当前 Network 的
+nodes、issues、report 与 config 尚未持久化，均作为带 `blocks_complete_scope=true` 的结构化
+排除项；因此即使现有持久化逐表差分完全等价，`complete_scope`、`acceptance_passed` 以及
+兼容字段 `passed` 仍为 false，CLI 返回非零，不能误报完整验收成功。后续卡仍须补齐这些
+Network 非持久化产物的可复核覆盖；本卡不重建 Network，也不改变数据 Schema。
+
+定向回归覆盖共同来源仅校验一次、来源漂移结构化失败且不打开逐表游标、来源契约不一致时
+提前失败，以及 CLI 对“仅持久化表等价”返回非零。C12e4a 主验收同时确认 Pipeline 与
+`scripts/cv_human_check/tests` 合并全量 `990 passed, 51 skipped`；本卡当前树合并全量为
+`993 passed, 51 skipped`。
+
+性能工作应研究更有效的空间连接，而不是重复已超时的 COUNT；之后仍需完成 1M 全量差分和
+26M 最终验收。只有整个列式任务验收完成后，才另行安排 Python trajectory point 对象改为
+Subtrack 列数组，并让 Segment 按 `isequence` 引用重建；当前阶段不删除这些 Python 类型，
+也不删除或改变 PostgreSQL 表。
 
 ### C13 — 26M 最终验收
 

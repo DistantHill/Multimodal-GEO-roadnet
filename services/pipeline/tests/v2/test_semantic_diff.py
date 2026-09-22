@@ -3,12 +3,16 @@ from __future__ import annotations
 import math
 import os
 import re
+import sys
+from unittest.mock import MagicMock
 
 import pytest
 
 from uuid import uuid4
 
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
+from track.v2.validation import semantic_diff
+from track.v2.cli import semantic_diff as semantic_diff_cli
 from track.v2.validation.semantic_diff import (
     TABLES, canonical_endpoint_pair, compare_rows, compare_runs,
 )
@@ -47,6 +51,11 @@ _METADATA = (
     4326, 32650, {"coordinate_semantics_version": 2}, {"refine": 1}, {"detect": 1},
     "clip", "1", "fit", "1", {"fitting": 1},
 )
+
+
+@pytest.fixture(autouse=True)
+def _stable_live_source(monkeypatch):
+    monkeypatch.setattr(semantic_diff, "verify_refine_source_fingerprint", lambda *_args: None)
 
 
 class _Connection:
@@ -90,9 +99,57 @@ def test_compare_runs_is_read_only_and_uses_named_bounded_cursors() -> None:
     conn = _Connection()
     runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
     result = compare_runs(conn, runs, runs, batch_size=17)
-    assert result["passed"] is True
+    assert result["persisted_equivalent"] is True
+    assert result["complete_scope"] is result["acceptance_passed"] is result["passed"] is False
+    assert all(item["blocks_complete_scope"] for item in result["scope"]["exclusions"])
     assert conn.statements[0] == "SET TRANSACTION READ ONLY"
     assert len(result["tables"]) == len(TABLES)
+
+
+def test_shared_live_source_is_verified_once_before_table_reads(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        semantic_diff, "verify_refine_source_fingerprint",
+        lambda _conn, refine_id: calls.append(refine_id),
+    )
+    conn = _Connection()
+    runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
+    result = compare_runs(conn, runs, runs)
+    assert calls == [str(runs["refine"])]
+    assert result["persisted_equivalent"] is True
+
+
+def test_live_source_failure_is_structured_and_opens_no_table_cursor(monkeypatch) -> None:
+    def fail(*_args):
+        raise ValueError("source drift")
+
+    monkeypatch.setattr(semantic_diff, "verify_refine_source_fingerprint", fail)
+    conn = _Connection()
+    runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
+    result = compare_runs(conn, runs, runs)
+    assert result["error"] == "preflight:live_source_fingerprint:ValueError"
+    assert result["persisted_equivalent"] is result["acceptance_passed"] is False
+    assert conn.rows_opened == 0
+
+
+def test_cli_never_reports_full_acceptance_for_persisted_only(monkeypatch, capsys) -> None:
+    runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
+    result = {
+        "version": 2, "passed": False, "persisted_equivalent": True,
+        "complete_scope": False, "acceptance_passed": False, "error": None,
+        "scope": {"exclusions": []}, "tables": [],
+    }
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    monkeypatch.setattr(semantic_diff_cli.psycopg, "connect", lambda _dsn: connection)
+    monkeypatch.setattr(semantic_diff_cli, "compare_runs", lambda *_args, **_kwargs: result)
+    monkeypatch.setattr(sys, "argv", [
+        "semantic-diff", "--dsn", "postgresql://unused",
+        *[item for side in ("baseline", "candidate") for kind in ("refine", "detect", "fit")
+          for item in (f"--{side}-{kind}-id", str(runs[kind]))],
+    ])
+    assert semantic_diff_cli.main() == 1
+    assert '"persisted_equivalent": true' in capsys.readouterr().out
 
 
 def test_semantic_queries_are_detect_scoped_and_fit_uses_detect_lineage() -> None:
@@ -169,13 +226,21 @@ def test_excluded_membership_change_fails() -> None:
      (8, "refine_semantic_config"), (9, "detect_semantic_config"),
      (14, "fit_semantic_config")],
 )
-def test_incompatible_lineage_fails_before_reading_tables(index: int, category: str) -> None:
+def test_incompatible_lineage_fails_before_source_or_table_reads(
+    index: int, category: str, monkeypatch,
+) -> None:
+    source_checks = []
+    monkeypatch.setattr(
+        semantic_diff, "verify_refine_source_fingerprint",
+        lambda *_args: source_checks.append(True),
+    )
     changed = list(_METADATA)
     changed[index] = {"different": True} if index != 3 else "other.source"
     conn = _Connection(tuple(changed))
     runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
     result = compare_runs(conn, runs, runs)
     assert result["error"] == f"preflight:{category}"
+    assert source_checks == []
     assert conn.rows_opened == 0
 
 

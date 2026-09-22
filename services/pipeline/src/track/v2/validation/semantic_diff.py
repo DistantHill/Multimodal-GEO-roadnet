@@ -9,6 +9,7 @@ from typing import Any, Iterable, Iterator
 from uuid import UUID
 
 from ..db.schema import require_current_schema
+from ..db.source_table import verify_refine_source_fingerprint
 
 
 @dataclass(frozen=True)
@@ -208,6 +209,12 @@ _EXCLUSIONS = {
         "Network issues/report and include_isolated_nodes (not persisted)",
     ],
 }
+_SCOPE_EXCLUSIONS = (
+    {"name": "network.nodes", "reason": "not persisted", "blocks_complete_scope": True},
+    {"name": "network.issues", "reason": "not persisted", "blocks_complete_scope": True},
+    {"name": "network.report", "reason": "not persisted", "blocks_complete_scope": True},
+    {"name": "network.config", "reason": "not persisted", "blocks_complete_scope": True},
+)
 
 
 def canonical_endpoint_pair(
@@ -333,6 +340,24 @@ def _lineage(conn: Any, runs: dict[str, UUID]) -> tuple[Any, ...] | None:
     """, (runs["detect"], runs["fit"], runs["refine"])).fetchone()
 
 
+def _result(
+    *, tables: list[dict[str, Any]], persisted_equivalent: bool,
+    error: str | None = None,
+) -> dict[str, Any]:
+    complete_scope = not any(item["blocks_complete_scope"] for item in _SCOPE_EXCLUSIONS)
+    acceptance_passed = persisted_equivalent and complete_scope and error is None
+    return {
+        "version": 2,
+        "passed": acceptance_passed,
+        "persisted_equivalent": persisted_equivalent,
+        "complete_scope": complete_scope,
+        "acceptance_passed": acceptance_passed,
+        "error": error,
+        "scope": {"exclusions": list(_SCOPE_EXCLUSIONS)},
+        "tables": tables,
+    }
+
+
 def compare_runs(conn: Any, baseline: dict[str, UUID], candidate: dict[str, UUID], *, batch_size: int = 2000) -> dict[str, Any]:
     conn.execute("SET TRANSACTION READ ONLY")
     require_current_schema(conn)
@@ -340,8 +365,8 @@ def compare_runs(conn: Any, baseline: dict[str, UUID], candidate: dict[str, UUID
                 (("baseline", baseline), ("candidate", candidate))}
     for label, row in metadata.items():
         if row is None or row[:3] != ("completed", "completed", "completed"):
-            return {"version": 1, "passed": False,
-                    "error": f"preflight:lineage:{label}", "tables": []}
+            return _result(tables=[], persisted_equivalent=False,
+                           error=f"preflight:lineage:{label}")
     left, right = metadata["baseline"], metadata["candidate"]
     assert left is not None and right is not None
     checks = (
@@ -351,10 +376,22 @@ def compare_runs(conn: Any, baseline: dict[str, UUID], candidate: dict[str, UUID
     )
     for category, fields in checks:
         if left[fields] != right[fields]:
-            return {"version": 1, "passed": False,
-                    "error": f"preflight:{category}", "tables": []}
+            return _result(tables=[], persisted_equivalent=False,
+                           error=f"preflight:{category}")
+    try:
+        # The saved source table and fingerprint are already equal on both
+        # lineages, so one bounded verification of the shared source suffices.
+        verify_refine_source_fingerprint(conn, str(baseline["refine"]))
+    except Exception as exc:
+        return _result(
+            tables=[], persisted_equivalent=False,
+            error=f"preflight:live_source_fingerprint:{type(exc).__name__}",
+        )
     tables = [compare_rows(spec.name, spec.columns,
                            _rows(conn, spec, baseline, "baseline", batch_size),
                            _rows(conn, spec, candidate, "candidate", batch_size))
               for spec in TABLES]
-    return {"version": 1, "passed": all(table["passed"] for table in tables), "tables": tables}
+    return _result(
+        tables=tables,
+        persisted_equivalent=all(table["passed"] for table in tables),
+    )

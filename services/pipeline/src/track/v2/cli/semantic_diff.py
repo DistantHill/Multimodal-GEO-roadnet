@@ -40,6 +40,15 @@ def main() -> int:
         with psycopg.connect(args.dsn) as conn:
             result = compare_runs(conn, baseline, candidate, batch_size=args.batch_size)
     except Exception as exc:
-        result = {"version": 1, "passed": False, "error": type(exc).__name__, "tables": []}
+        result = {
+            "version": 2, "passed": False, "persisted_equivalent": False,
+            "complete_scope": False, "acceptance_passed": False,
+            "error": type(exc).__name__,
+            "scope": {"exclusions": [{
+                "name": "comparison", "reason": "comparison failed",
+                "blocks_complete_scope": True,
+            }]},
+            "tables": [],
+        }
     print(json.dumps(result, allow_nan=False, ensure_ascii=False, sort_keys=True))
-    return 0 if result["passed"] else 1
+    return 0 if result["acceptance_passed"] else 1
