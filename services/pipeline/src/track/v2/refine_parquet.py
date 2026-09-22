@@ -485,10 +485,10 @@ class RefineDatasetReader:
                  1.4210854715202004e-14
                    * greatest(1.0, abs(a.heading)+abs(b.heading)+540.0) AS angle_error
           FROM {table} a JOIN {table} b
-            ON a.segment_id < b.segment_id
-           AND a.vehicle_rank != b.vehicle_rank
-           AND a.min_x <= b.max_x AND b.min_x <= a.max_x
+            ON a.min_x <= b.max_x AND b.min_x <= a.max_x
            AND a.min_y <= b.max_y AND b.min_y <= a.max_y
+           AND a.segment_id < b.segment_id
+           AND a.vehicle_rank != b.vehicle_rank
         ), numeric_pairs AS (
           SELECT *,
                  adx*(-bdy)-(-bdx)*ady AS det,

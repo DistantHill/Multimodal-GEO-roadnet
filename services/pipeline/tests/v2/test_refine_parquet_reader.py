@@ -849,6 +849,50 @@ def test_cross_track_pair_temp_table_cleanup_and_reader_reuse(tmp_path) -> None:
         assert reader._connection.execute(count_sql).fetchone() == (0,)
 
 
+def test_cross_track_production_payload_plan_leads_with_aabb_range(tmp_path) -> None:
+    descriptor = _published_tracks(tmp_path, [
+        (f"v{index}", index, [(0, -10, index / 100, 0), (1, 10, index / 100, 0)])
+        for index in range(1100)
+    ])
+
+    class ExplainProxy:
+        def __init__(self, connection):
+            self.connection = connection
+            self.query = None
+            self.plan = None
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def execute(self, query, params=None):
+            if "conservative_pairs AS" in query and "SELECT a.* EXCLUDE" in query:
+                self.query = query
+                values = [] if params is None else params
+                self.plan = self.connection.execute("EXPLAIN " + query, values).fetchone()[1]
+            return (self.connection.execute(query) if params is None
+                    else self.connection.execute(query, params))
+
+    with refine_parquet.RefineDatasetReader(
+        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+    ) as reader:
+        proxy = ExplainProxy(reader._connection)
+        reader._connection = proxy
+        assert list(reader.iter_cross_track_pair_batches(
+            "source", IntersectConfig(), batch_size=7,
+        )) == []
+        assert proxy.query is not None and proxy.plan is not None
+        assert "SELECT a.* EXCLUDE" in proxy.query
+        assert "ORDER BY a.vehicle_rank, b.vehicle_rank" in proxy.query
+        join_sql = proxy.query[proxy.query.index("FROM cross_track_straight_"):
+                               proxy.query.index("), numeric_pairs AS")]
+        assert join_sql.index("a.min_x <= b.max_x") < join_sql.index("a.segment_id < b.segment_id")
+        join_plan = proxy.plan[proxy.plan.index("IE_JOIN"):]
+        first_aabb = min(join_plan.index(name) for name in ("min_x", "max_x", "min_y", "max_y"))
+        segment_id = join_plan.find("segment_id")
+        assert segment_id < 0 or first_aabb < segment_id
+        reader._connection = proxy.connection
+
+
 def test_cross_track_pair_generator_close_after_reader_close_is_safe(tmp_path) -> None:
     descriptor = _published_tracks(tmp_path, [
         ("a", 0, [(0, -1, 0, 0), (1, 1, 0, 0)]),
