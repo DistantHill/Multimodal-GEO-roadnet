@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from itertools import islice
+import math
 from numbers import Integral
 from pathlib import Path
 from uuid import uuid4
@@ -23,6 +24,52 @@ def _closing_optional(iterator):
         close = getattr(iterator, "close", None)
         if callable(close):
             close()
+
+
+def _integer_array(values, *, nullable: bool = False):
+    data, nulls = [], []
+    for value in values:
+        is_null = value is None
+        if is_null and nullable:
+            data.append(0)
+        elif (isinstance(value, bool) or not isinstance(value, Integral)
+              or not -(2**63) <= int(value) < 2**63):
+            raise TypeError("writer integer field has an invalid type or range")
+        else:
+            data.append(int(value))
+        nulls.append(is_null)
+    return np.asarray(data, dtype=np.int64), np.asarray(nulls, dtype=np.bool_)
+
+
+def _float_arrays(values):
+    data, nulls, nans = [], [], []
+    for value in values:
+        is_null = value is None
+        number = 0.0 if is_null else float(value)
+        data.append(0.0 if math.isnan(number) else number)
+        nulls.append(is_null)
+        nans.append(not is_null and math.isnan(number))
+    return (np.asarray(data, dtype=np.float64), np.asarray(nulls, dtype=np.bool_),
+            np.asarray(nans, dtype=np.bool_))
+
+
+def _string_array(values):
+    values = list(values)
+    if any(not isinstance(value, str) for value in values):
+        raise TypeError("writer string field has an invalid type")
+    return np.asarray(values, dtype=np.str_)
+
+
+def _next_validated_batch(iterator, size: int, validate):
+    batch = []
+    for _ in range(size):
+        try:
+            item = next(iterator)
+        except StopIteration:
+            break
+        validate(item)
+        batch.append(item)
+    return batch
 
 
 class WriterRelation:
@@ -142,53 +189,188 @@ class WriterRelation:
         )
         self._request_order += 1
 
+    def _register_batch(self, columns: dict[str, np.ndarray]) -> str:
+        relation = f"writer_batch_{uuid4().hex}"
+        self._require_appendable().register(relation, columns)
+        return relation
+
+    @staticmethod
+    def _float_batch(rows, names: tuple[str, ...]) -> dict[str, np.ndarray]:
+        result = {}
+        for name in names:
+            values, nulls, nans = _float_arrays([getattr(row, name) for row in rows])
+            result[name], result[f"{name}_null"], result[f"{name}_nan"] = (
+                values, nulls, nans,
+            )
+        return result
+
+    @staticmethod
+    def _float_select(names: tuple[str, ...]) -> str:
+        return ",".join(
+            f"CASE WHEN {name}_null THEN NULL WHEN {name}_nan "
+            f"THEN 'NaN'::DOUBLE ELSE {name} END"
+            for name in names
+        )
+
+    def _insert_batch(self, relations, statements: tuple[str, ...]) -> None:
+        connection = self._require_appendable()
+        names = (relations,) if isinstance(relations, str) else relations
+        try:
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                parameters = {f"relation{index}": name for index, name in enumerate(names)}
+                parameters["relation"] = names[0]
+                for statement in statements:
+                    connection.execute(statement.format(**parameters))
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        finally:
+            for name in names:
+                connection.unregister(name)
+
     def collect_sources(self, result, pending, crossing_ids, candidate_ids) -> None:
         connection = self._require_appendable()
         annotation_order = connection.execute(
             "SELECT count(*) FROM annotation_requests"
         ).fetchone()[0]
         with _closing_optional(iter(result.turn_events)) as turns:
-            for ordinal, event in enumerate(turns, self.counts[0]):
+            def validate_turn(event):
                 if event.refined_point_ref is None:
                     raise ValueError("a persisted turn event requires a stable resolved point")
-                self.add_request(0, ordinal, 0, event.refined_point_ref)
-                connection.execute("INSERT INTO turn_raw VALUES (?,?,?,?,?)", (
-                    ordinal, event.entry_bearing, event.exit_bearing, event.turn_deg, event.score,
+            while batch := _next_validated_batch(turns, self._batch_size, validate_turn):
+                start = self.counts[0]
+                ordinals = np.arange(start, start + len(batch), dtype=np.int64)
+                refs = [event.refined_point_ref for event in batch]
+                relation = self._register_batch({
+                    "request_order": np.arange(
+                        self._request_order, self._request_order + len(batch), dtype=np.int64,
+                    ),
+                    "point_kind": _string_array(ref.point_kind for ref in refs),
+                    "point_id": _integer_array([ref.point_id for ref in refs])[0],
+                    "subtrack_index": _integer_array([ref.subtrack_index for ref in refs])[0],
+                    "ordinal": ordinals,
+                    "annotation_order": np.arange(
+                        annotation_order, annotation_order + len(batch), dtype=np.int64,
+                    ),
+                    "calculation_index": _integer_array(
+                        [event.event_calculate_index for event in batch]
+                    )[0],
+                    **self._float_batch(batch, (
+                        "entry_bearing", "exit_bearing", "turn_deg", "score",
+                    )),
+                })
+                self._insert_batch(relation, (
+                    "INSERT INTO source_requests SELECT request_order,point_kind,point_id,"
+                    "subtrack_index,0,ordinal,0 FROM {relation} ORDER BY request_order",
+                    "INSERT INTO turn_raw SELECT ordinal," + self._float_select((
+                        "entry_bearing", "exit_bearing", "turn_deg", "score",
+                    )) + " FROM {relation} ORDER BY ordinal",
+                    "INSERT INTO annotation_requests SELECT annotation_order,'turn',"
+                    "calculation_index,ordinal FROM {relation} ORDER BY annotation_order",
                 ))
-                connection.execute("INSERT INTO annotation_requests VALUES (?,?,?,?)", (
-                    annotation_order, "turn", event.event_calculate_index, ordinal,
-                ))
-                annotation_order += 1
-                self.counts[0] += 1
+                self._request_order += len(batch)
+                annotation_order += len(batch)
+                self.counts[0] += len(batch)
         with _closing_optional(iter(result.cross_track_candidates)) as crosses:
-            for ordinal, candidate in enumerate(crosses, self.counts[1]):
-                for endpoint, ref in enumerate((candidate.from_segment_start,
-                                                candidate.to_segment_start)):
-                    if ref is None:
-                        raise ValueError("a persisted track cross requires stable segment starts")
-                    self.add_request(1, ordinal, endpoint, ref)
-                connection.execute("INSERT INTO cross_raw VALUES (?,?,?,?,?)", (
-                    ordinal, candidate.x, candidate.y, candidate.lon, candidate.lat,
+            def validate_cross(candidate):
+                if (candidate.from_segment_start is None
+                        or candidate.to_segment_start is None):
+                    raise ValueError("a persisted track cross requires stable segment starts")
+            while batch := _next_validated_batch(crosses, self._batch_size, validate_cross):
+                start = self.counts[1]
+                ordinals = np.arange(start, start + len(batch), dtype=np.int64)
+                raw_columns = {
+                    "ordinal": ordinals,
+                    "annotation_order": np.arange(
+                        annotation_order, annotation_order + len(batch), dtype=np.int64,
+                    ),
+                    "calculation_index": _integer_array(
+                        [candidate.cross_track_calculate_index for candidate in batch]
+                    )[0],
+                    **self._float_batch(batch, ("x", "y", "lon", "lat")),
+                }
+                refs = [
+                    (ref, ordinal, endpoint)
+                    for candidate, ordinal in zip(batch, ordinals, strict=True)
+                    for endpoint, ref in enumerate((candidate.from_segment_start,
+                                                    candidate.to_segment_start))
+                ]
+                source_columns = {
+                    "request_order": np.arange(
+                        self._request_order, self._request_order + len(refs), dtype=np.int64,
+                    ),
+                    "point_kind": _string_array(item[0].point_kind for item in refs),
+                    "point_id": _integer_array([item[0].point_id for item in refs])[0],
+                    "subtrack_index": _integer_array([item[0].subtrack_index for item in refs])[0],
+                    "ordinal": np.asarray([item[1] for item in refs], dtype=np.int64),
+                    "endpoint": np.asarray([item[2] for item in refs], dtype=np.int32),
+                }
+                raw_relation = self._register_batch(raw_columns)
+                try:
+                    source_relation = self._register_batch(source_columns)
+                except BaseException:
+                    connection.unregister(raw_relation)
+                    raise
+                self._insert_batch((raw_relation, source_relation), (
+                    "INSERT INTO source_requests SELECT request_order,point_kind,point_id,"
+                    "subtrack_index,1,ordinal,endpoint FROM {relation1} ORDER BY request_order",
+                    "INSERT INTO cross_raw SELECT ordinal," + self._float_select(
+                        ("x", "y", "lon", "lat"),
+                    ) + " FROM {relation0} ORDER BY ordinal",
+                    "INSERT INTO annotation_requests SELECT annotation_order,'cross',"
+                    "calculation_index,ordinal FROM {relation0} ORDER BY annotation_order",
                 ))
-                connection.execute("INSERT INTO annotation_requests VALUES (?,?,?,?)", (
-                    annotation_order, "cross", candidate.cross_track_calculate_index, ordinal,
-                ))
-                annotation_order += 1
-                self.counts[1] += 1
+                self._request_order += len(refs)
+                annotation_order += len(batch)
+                self.counts[1] += len(batch)
         with _closing_optional(iter(pending)) as pending_iterator, \
              _closing_optional(iter(crossing_ids)) as id_iterator:
-            for ordinal, ((cluster, crossing), crossing_id) in enumerate(
-                zip(pending_iterator, id_iterator, strict=True), self.counts[2]
-            ):
-                if crossing.segment_start is None:
+            paired = zip(pending_iterator, id_iterator, strict=True)
+            def validate_crossing(item):
+                if item[0][1].segment_start is None:
                     raise ValueError("a persisted crossing requires a stable segment start")
-                self.add_request(2, ordinal, 0, crossing.segment_start)
-                connection.execute("INSERT INTO crossing_raw VALUES (?,?,?,?,?,?,?,?)", (
-                    ordinal, crossing_id, candidate_ids[cluster.cluster_calculate_index],
-                    int(crossing.is_entry), crossing.crossing_x, crossing.crossing_y,
-                    crossing.crossing_lon, crossing.crossing_lat,
+            while batch := _next_validated_batch(paired, self._batch_size, validate_crossing):
+                start = self.counts[2]
+                ordinals = np.arange(start, start + len(batch), dtype=np.int64)
+                refs = [item[0][1].segment_start for item in batch]
+                crossing_values, crossing_nulls = _integer_array(
+                    [item[1] for item in batch], nullable=True,
+                )
+                candidate_values, candidate_nulls = _integer_array([
+                    candidate_ids[item[0][0].cluster_calculate_index] for item in batch
+                ], nullable=True)
+                relation = self._register_batch({
+                    "request_order": np.arange(
+                        self._request_order, self._request_order + len(batch), dtype=np.int64,
+                    ),
+                    "point_kind": _string_array(ref.point_kind for ref in refs),
+                    "point_id": _integer_array([ref.point_id for ref in refs])[0],
+                    "subtrack_index": _integer_array([ref.subtrack_index for ref in refs])[0],
+                    "ordinal": ordinals,
+                    "crossing_id": crossing_values, "crossing_id_null": crossing_nulls,
+                    "candidate_id": candidate_values, "candidate_id_null": candidate_nulls,
+                    "is_entry": np.asarray(
+                        [int(item[0][1].is_entry) for item in batch], dtype=np.int32,
+                    ),
+                    **self._float_batch(
+                        [item[0][1] for item in batch],
+                        ("crossing_x", "crossing_y", "crossing_lon", "crossing_lat"),
+                    ),
+                })
+                self._insert_batch(relation, (
+                    "INSERT INTO source_requests SELECT request_order,point_kind,point_id,"
+                    "subtrack_index,2,ordinal,0 FROM {relation} ORDER BY request_order",
+                    "INSERT INTO crossing_raw SELECT ordinal,"
+                    "CASE WHEN crossing_id_null THEN NULL ELSE crossing_id END,"
+                    "CASE WHEN candidate_id_null THEN NULL ELSE candidate_id END,is_entry,"
+                    + self._float_select((
+                        "crossing_x", "crossing_y", "crossing_lon", "crossing_lat",
+                    )) + " FROM {relation} ORDER BY ordinal",
                 ))
-                self.counts[2] += 1
+                self._request_order += len(batch)
+                self.counts[2] += len(batch)
 
     def add_mapping(self, ref: object, resolved_id: int) -> None:
         self._require_appendable().execute(

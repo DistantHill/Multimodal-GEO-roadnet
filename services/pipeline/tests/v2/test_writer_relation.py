@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -252,6 +253,94 @@ def test_input_iterators_close_on_success_and_base_exception(tmp_path, stage, fa
             assert pending.closed and crossing_ids.closed
     finally:
         relation.close()
+
+
+def test_collect_sources_preserves_nullable_nan_and_infinite_raw_values(tmp_path):
+    ref = RefinedPointRef("kept", 2**53 + 1, 2**53 + 2, 0)
+    turn = NS(event_calculate_index=2**53 + 3, refined_point_ref=ref,
+              entry_bearing=None, exit_bearing=float("nan"),
+              turn_deg=float("inf"), score=float("-inf"))
+    crossing = NS(segment_start=ref, is_entry=False, crossing_x=None,
+                  crossing_y=float("nan"), crossing_lon=float("inf"),
+                  crossing_lat=float("-inf"))
+    with _relation(tmp_path, batch_size=2) as relation:
+        relation.collect_sources(
+            NS(turn_events=[turn], cross_track_candidates=[]),
+            [(NS(cluster_calculate_index=9), crossing)], [None], {9: None},
+        )
+        turn_row = list(relation.iter_raw("turn"))[0]
+        assert turn_row[1] is None and math.isnan(turn_row[2])
+        assert turn_row[3:] == (float("inf"), float("-inf"),)
+        crossing_row = list(relation.iter_raw("crossing"))[0]
+        assert crossing_row[:4] == (0, None, None, 0)
+        assert crossing_row[4] is None and math.isnan(crossing_row[5])
+        assert crossing_row[6:] == (float("inf"), float("-inf"),)
+        requests = relation._connection.execute("""
+          SELECT point_id,subtrack_index FROM source_requests ORDER BY request_order
+        """).fetchall()
+        assert requests == [(2**53 + 1, 2**53 + 2)] * 2
+
+
+def test_collect_sources_failed_batch_is_atomic_and_retryable(tmp_path):
+    ref = RefinedPointRef("kept", 1, 1, 0)
+    turns = ClosingIterable([_turn(index, ref) for index in range(3)])
+    with _relation(tmp_path, batch_size=2) as relation:
+        relation._connection.execute("INSERT INTO turn_raw VALUES (2,0,0,0,0)")
+        with pytest.raises(Exception, match="duplicate key|constraint"):
+            relation.collect_sources(
+                NS(turn_events=turns, cross_track_candidates=[]), [], [], {},
+            )
+        assert turns.closed
+        assert relation.counts == [2, 0, 0]
+        assert relation._request_order == 2
+        assert relation._connection.execute(
+            "SELECT count(*) FROM source_requests"
+        ).fetchone() == (2,)
+        assert relation._connection.execute(
+            "SELECT count(*) FROM annotation_requests"
+        ).fetchone() == (2,)
+        assert relation._connection.execute("""
+          SELECT count(*) FROM duckdb_views() WHERE view_name LIKE 'writer_batch_%'
+        """).fetchone() == (0,)
+        relation._connection.execute("DELETE FROM turn_raw WHERE ordinal=2")
+        relation.collect_sources(
+            NS(turn_events=[_turn(2, ref)], cross_track_candidates=[]), [], [], {},
+        )
+        assert relation.counts == [3, 0, 0]
+        assert [row[0] for row in relation.iter_raw("turn")] == [0, 1, 2]
+
+
+def test_collect_sources_third_insert_failure_rolls_back_whole_batch(tmp_path):
+    ref = RefinedPointRef("kept", 1, 1, 0)
+    with _relation(tmp_path) as relation:
+        relation._connection.execute(
+            "INSERT INTO annotation_requests VALUES (1,'existing',0,0)"
+        )
+        with pytest.raises(Exception, match="duplicate key|constraint"):
+            relation.collect_sources(
+                NS(turn_events=[_turn(0, ref)], cross_track_candidates=[]), [], [], {},
+            )
+        assert relation.counts == [0, 0, 0] and relation._request_order == 0
+        assert relation._connection.execute(
+            "SELECT count(*) FROM source_requests"
+        ).fetchone() == (0,)
+        assert relation._connection.execute(
+            "SELECT count(*) FROM turn_raw"
+        ).fetchone() == (0,)
+
+
+def test_pending_strict_length_mismatch_closes_both_iterators(tmp_path):
+    ref = RefinedPointRef("kept", 1, 1, 0)
+    pending = ClosingIterable([(NS(cluster_calculate_index=1), _crossing(ref))])
+    crossing_ids = ClosingIterable([])
+    with _relation(tmp_path) as relation:
+        with pytest.raises(ValueError, match="shorter"):
+            relation.collect_sources(
+                NS(turn_events=[], cross_track_candidates=[]),
+                pending, crossing_ids, {1: 2},
+            )
+        assert relation.counts == [0, 0, 0] and relation._request_order == 0
+    assert pending.closed and crossing_ids.closed
 
 
 @pytest.mark.parametrize("consumer", ["turn", "cross", "crossing"])

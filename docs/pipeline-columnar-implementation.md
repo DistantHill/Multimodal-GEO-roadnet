@@ -67,7 +67,7 @@
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
-| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12g1；待重跑 1M） |
+| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12g2；待重跑 1M） |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
 ## 3. 任务卡
@@ -1048,6 +1048,36 @@ bool、非整数和超出有符号 int64 的值，避免 NumPy 静默截断或�
 均关闭。回归覆盖空、1、N、N+1、大整数、重复 mapping 最后胜出、SQL 批失败回滚、注册资源
 清理与先前批保留。该改动针对静态审计发现的约 `615,878` 次单行 DuckDB mapping 调用；
 不扩展到 collect_sources、annotations 或 Turn 摄取。
+
+C12g1 主对话独立验收的 Writer、db_writer 与 Turn/Detect streaming 真实 PostgreSQL 回归为
+`84 passed`。冻结 `5cd0ce2` 的 10k 局部 microbenchmark 中，单条 mapping 为 `10.7396` 秒、
+10k 次 execute，批写为 `0.04321` 秒、6 次 execute；五列、大于 `2^53` 的整数、Unicode 与
+重复 identity 最后胜出逐项相同。该 `248.5x` 只描述 source mapping 局部摄取，不代表 Detect
+端到端加速。
+
+#### C12g2 — Writer collect_sources typed 实体批
+
+`collect_sources` 按 turn、cross、pending 的原业务顺序分别有界读取，每批最多
+`WriterRelation.batch_size` 个实体，不把整个输入流转为列表。turn 批在同一 DuckDB 事务写
+source request、turn raw 与 annotation request；cross 批在同一事务写两个端点 request、
+cross raw 与 annotation；pending 批在同一事务写 source request 与 crossing raw。任一表
+失败则整批回滚；commit 后才推进 `_request_order`、annotation order 与对应 `counts`，此前
+已提交批保持可用且失败批可重试。
+
+整数列使用严格有符号 int64，字符串使用 NumPy Unicode；nullable crossing/candidate ID 使用
+值列与 null mask 后由 SQL `CASE` 恢复。nullable 浮点同时使用 value、null mask 与 NaN mask，
+显式区分 SQL NULL 和 NaN；±inf 保持原值，不新增有限性拒绝。cross 在注册任何批关系前验证
+两个端点引用；pending 继续在双方 iterator 的关闭上下文内使用 `zip(..., strict=True)`。
+正常、输入异常、SQL 异常和 `KeyboardInterrupt` 均关闭活动 iterator 并注销临时关系。
+
+回归覆盖 batch size 1/2/大值及连续 collect 的原顺序、两个 cross 端点缺失、pending/ID
+长度不等、nullable ID、NULL/NaN/±inf、大于 `2^53` 的 ID、第二/第三张表故障的整批回滚、
+先前批保留、retry 无主键冲突，以及注册与 iterator 生命周期。C12g2 不修改
+`prepare_annotations`、TurnEventRelation 或最终 PostgreSQL COPY。
+
+C13 尚无可确认的旧 26M 完整基线；现有原数据库 v4 不能被当作已证明的历史完整 baseline。
+未来只能在隔离 clone 上按用户确认的基线方案执行，不修改旧数据。当前已向用户询问该方案，
+在获得确认前只继续 C12，不宣称 C13 已具备差分基线或完成验收。
 
 ### C13 — 26M 最终验收
 
