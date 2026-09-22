@@ -600,9 +600,13 @@ def test_duckdb_cross_track_segments_match_q49_oracle(tmp_path) -> None:
 
 
 @pytest.mark.parametrize("batch_size", [1, 3])
-def test_duckdb_cross_track_pairs_match_aabb_oracle(tmp_path, batch_size) -> None:
-    # Q44: DuckDB owns the spillable closed-AABB range join and stable ordering;
-    # Python receives only bounded batches for the later exact NumPy kernel.
+def test_duckdb_cross_track_pairs_conservatively_reduce_aabb_oracle(
+    tmp_path, batch_size,
+) -> None:
+    # Q44: DuckDB owns the spillable AABB join plus conservative numeric broad
+    # phase. Python receives bounded uncertain/hit pairs for the exact NumPy
+    # kernel because SQL and NumPy floating-point expressions are not assumed
+    # identical.
     tracks = [
         ("a", 10, [(0, -10, 0, 0), (1, 10, 0, 0)]),
         ("a", 2, [(2, -100, 30, 0), (3, 100, 30, 0)]),
@@ -611,6 +615,7 @@ def test_duckdb_cross_track_pairs_match_aabb_oracle(tmp_path, batch_size) -> Non
         ("d", 40, [(8, 10, 0, 90), (9, 10, 10, 90)]),  # endpoint boundary
         ("e", 50, [(10, -100, -100, 45), (11, 100, 100, 45)]),  # long diagonal
         ("f", 60, [(12, 1000, -100, 90), (13, 1000, 100, 90)]),  # disjoint long
+        ("g", 70, [(14, 5, -1e-13, 90), (15, 5, 1e-13, 90)]),  # near-degenerate
     ]
     descriptor = _published_tracks(tmp_path, tracks)
     cfg = IntersectConfig(cross_track_grid_cell_m=10,
@@ -651,7 +656,13 @@ def test_duckdb_cross_track_pairs_match_aabb_oracle(tmp_path, batch_size) -> Non
         ((segments[a].track_rank, segments[a].segment_index),
          (segments[b].track_rank, segments[b].segment_index)) for a, b in expected
     }
-    assert set(actual) == expected_identity
+    assert len(expected_identity) == 10
+    assert len(actual) == 4
+    assert set(actual) < expected_identity
+    assert ((0, 0), (2, 0)) in actual  # interior crossing
+    assert ((0, 0), (4, 0)) in actual  # endpoint crossing
+    assert ((0, 0), (7, 0)) in actual  # uncertain determinant retained
+    assert not any(5 in (left[0], right[0]) for left, right in actual)  # angle reject
     assert actual == [
         ((a.track_rank, a.segment_index), (b.track_rank, b.segment_index))
         for batch in compatibility_batches for a, b in batch
@@ -681,6 +692,7 @@ def test_columnar_cross_track_exact_kernel_matches_q49_oracle(tmp_path, batch_si
         ("c", 30, [(6, -10, 5, 0), (7, 10, 5, 0)]),  # parallel
         ("d", 40, [(8, -8, -8, 45), (9, 8, 8, 45)]),  # angle boundary
         ("e", 50, [(10, -100, -4, 90), (11, -100, 4, 90)]),  # overflow pair
+        ("f", 60, [(12, 5, -1e-13, 90), (13, 5, 1e-13, 90)]),  # near-degenerate
     ])
     cfg = IntersectConfig(
         cross_track_pair_batch_size=batch_size,
@@ -771,7 +783,12 @@ def test_cross_track_pair_api_never_fetches_all() -> None:
     assert "a.segment_id < b.segment_id" in sql
     assert "a.min_x <= b.max_x AND b.min_x <= a.max_x" in sql
     assert "a.min_y <= b.max_y AND b.min_y <= a.max_y" in sql
-    assert parameters == [IntersectConfig().cross_track_straightness_deg]
+    default = IntersectConfig()
+    assert parameters == [default.cross_track_straightness_deg,
+                          default.cross_track_min_angle_deg,
+                          default.cross_track_max_angle_deg]
+    assert "arithmetic_error" in sql
+    assert "ta_num BETWEEN" in sql
 
 
 def test_cross_track_segment_api_is_bounded_and_validates_config() -> None:

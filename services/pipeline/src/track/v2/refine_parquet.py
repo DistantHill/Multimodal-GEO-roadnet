@@ -449,7 +449,7 @@ class RefineDatasetReader:
     def iter_cross_track_pair_batches(
         self, source_table: str, cfg: Any, *, batch_size: int = 4096,
     ) -> Iterator[tuple[tuple[_CrossTrackSegment, _CrossTrackSegment], ...]]:
-        """Yield stable AABB-overlap pairs through DuckDB's spillable range join."""
+        """Yield stable conservative intersection pairs for the exact NumPy kernel."""
         connection, threshold = self._validate_cross_track_request(
             source_table, cfg, batch_size,
         )
@@ -464,18 +464,57 @@ class RefineDatasetReader:
         self._validate_source(connection)
         # These legacy knobs remain validated for configuration compatibility,
         # but AABB overlap is independent of grid size and overflow thresholds.
+        min_angle = float(cfg.cross_track_min_angle_deg)
+        max_angle = float(cfg.cross_track_max_angle_deg)
+        if (not math.isfinite(min_angle) or not math.isfinite(max_angle)
+                or not 0 <= min_angle <= max_angle <= 180):
+            raise RefineParquetError("cross-track angle range is invalid")
         query = self._cross_track_segment_relation("""
-          SELECT a.* EXCLUDE (min_x, max_x, min_y, max_y),
-                 b.* EXCLUDE (min_x, max_x, min_y, max_y)
+        , paired AS (
+          SELECT a.segment_id AS a_id, b.segment_id AS b_id,
+                 a.heading AS a_heading, b.heading AS b_heading,
+                 a.end_x-a.x AS adx, a.end_y-a.y AS ady,
+                 b.end_x-b.x AS bdx, b.end_y-b.y AS bdy,
+                 b.x-a.x AS rx, b.y-a.y AS ry,
+                 abs((((b.heading-a.heading+180.0) % 360.0 + 360.0)
+                      % 360.0)-180.0) AS angle,
+                 1.4210854715202004e-14
+                   * greatest(1.0, abs(a.heading)+abs(b.heading)+540.0) AS angle_error
           FROM straight a JOIN straight b
             ON a.segment_id < b.segment_id
            AND a.vehicle_rank != b.vehicle_rank
            AND a.min_x <= b.max_x AND b.min_x <= a.max_x
            AND a.min_y <= b.max_y AND b.min_y <= a.max_y
+        ), numeric_pairs AS (
+          SELECT *,
+                 adx*(-bdy)-(-bdx)*ady AS det,
+                 rx*(-bdy)-(-bdx)*ry AS ta_num,
+                 adx*ry-rx*ady AS tb_num,
+                 1.4210854715202004e-14 * greatest(
+                   1.0, abs(adx*bdy)+abs(bdx*ady),
+                   abs(rx*bdy)+abs(bdx*ry),
+                   abs(adx*ry)+abs(rx*ady)
+                 ) AS arithmetic_error
+          FROM paired
+          WHERE abs(a_heading) > 1000000.0 OR abs(b_heading) > 1000000.0
+             OR angle BETWEEN ?-angle_error AND ?+angle_error
+        ), conservative_pairs AS (
+          SELECT * FROM numeric_pairs
+          WHERE NOT isfinite(det) OR NOT isfinite(ta_num) OR NOT isfinite(tb_num)
+             OR (ta_num BETWEEN least(0.0, det)-arithmetic_error
+                                AND greatest(0.0, det)+arithmetic_error
+                 AND tb_num BETWEEN least(0.0, det)-arithmetic_error
+                                AND greatest(0.0, det)+arithmetic_error)
+        )
+          SELECT a.* EXCLUDE (min_x, max_x, min_y, max_y),
+                 b.* EXCLUDE (min_x, max_x, min_y, max_y)
+          FROM conservative_pairs p
+          JOIN straight a ON a.segment_id=p.a_id
+          JOIN straight b ON b.segment_id=p.b_id
           ORDER BY a.vehicle_rank, b.vehicle_rank,
                    a.segment_index, b.segment_index, a.track_rank, b.track_rank
         """)
-        result = connection.execute(query, [threshold])
+        result = connection.execute(query, [threshold, min_angle, max_angle])
         while rows := result.fetchmany(batch_size):
             yield tuple((self._decode_cross_track_segment(row[:23], source_table),
                          self._decode_cross_track_segment(row[23:], source_table))

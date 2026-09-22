@@ -807,6 +807,33 @@ Dask。本卡不重跑 1M，C12 仍为进行中。
 
 提交：待记录。
 
+#### C12e1 — Cross-track 保守数值宽筛
+
+C12d1 的 AABB range join 只排除包围盒分离的线段对。固定 1M 现场运行实际在 cross 阶段
+处理了 `12,845,056` 个 pair，并在 `2,557.8 s` 时仍处于该阶段；暂停容器从
+08:05:24 到 08:53:56 共运行 48 分 32 秒，`OOMKilled=false`，退出码 137 来自人工停止。
+因此 C12d1 文中约 210 万行的 `EXPLAIN` 估算不能视作实际 pair 数或性能实测。
+
+本卡在 AABB join 内增加 DuckDB 数值宽筛：先按角度范围排除稳定的无效 pair，再用与
+现有 NumPy 核同形的 determinant、`ta_num`、`tb_num` 判断线段参数是否可能落在闭区间。
+每个比较按操作数尺度向外扩张 `64 * 2^-52`；超大 heading、非有限 SQL 中间结果、端点
+边界与近退化不确定行全部保留并交给原 `_paired_segment_intersections` 确认。SQL 不产生
+最终交点，Python 原核仍决定命中和坐标，因而不以 SQL 与 NumPy 浮点表达式完全相同为
+前提，也不改变 Q49 的成员、配对和拓扑要求。DuckDB 继续承担可外存 join、宽筛与排序；
+Polars 对该逐 pair 标量筛选不会减少搬运，Python 仅解码宽筛保留的有界批次，不引入
+自研 spill、线程、进程或 Dask。
+
+按用户指导，pair 应尽早在 DuckDB 内过滤，以减少数据库 I/O 和 Python 对象构建；巨大
+中间关系不应携带宽行元数据参与排序。本实现的 AABB 与数值关系只携带两端 segment ID、
+坐标和 heading，宽筛保留后才按 ID 回连来源元数据并执行稳定排序。读取仍为单条 SQL、
+单次顺序 `fetchmany()`，没有第二次扫描结果、逐行 `INSERT` 或 Python 侧归并。小样本回归
+固定报告 AABB pair 数和宽筛后解码 pair 数，以验证对象构建确有减少而非仅移动计算位置。
+当前长线段、角度边界、端点和近退化组合样本由 10 个 AABB pair 缩减为 4 个解码 pair，
+其中近退化不确定 pair 被保守保留；最终候选仍与 legacy Q49 oracle 一致。
+
+验证：cross-track 定向 `11 passed`；Pipeline 与 `scripts/cv_human_check/tests` 合并全量
+`967 passed, 50 skipped`。本卡不重跑 1M，C12 仍为进行中。
+
 ### C13 — 26M 最终验收
 
 范围：精确 26M，默认 2 GB、无 swap、Refine 至 Network 小于一小时；PostgreSQL
