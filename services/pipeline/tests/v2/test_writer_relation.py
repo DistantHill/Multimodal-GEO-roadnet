@@ -139,6 +139,73 @@ def test_collect_resolve_exact_keys_last_wins_and_order_across_batches(tmp_path)
     assert turns.closed and crosses.closed and pending.closed and crossing_ids.closed
 
 
+@pytest.mark.parametrize("count", [0, 1, 2, 3])
+def test_add_mappings_bounded_typed_order_and_large_ints(tmp_path, count):
+    refs = [
+        RefinedPointRef("kept", 2**53 + index, 10 + index, 0)
+        for index in range(count)
+    ]
+    with _relation(tmp_path, batch_size=2) as relation:
+        relation.add_mappings((ref, 2**53 + 100 + index)
+                              for index, ref in enumerate(refs))
+        rows = relation._connection.execute("""
+          SELECT mapping_order,point_kind,point_id,subtrack_index,resolved_id
+          FROM source_mappings ORDER BY mapping_order
+        """).fetchall()
+        assert rows == [
+            (index, "kept", ref.point_id, ref.subtrack_index, 2**53 + 100 + index)
+            for index, ref in enumerate(refs)
+        ]
+
+
+def test_add_mappings_preserves_last_mapping_wins(tmp_path):
+    ref = RefinedPointRef("kept", 7, 2, 0)
+    with _relation(tmp_path, batch_size=2) as relation:
+        relation.add_request(0, 0, 0, ref)
+        relation.add_mappings([(ref, 100), (ref, 999)])
+        relation.resolve_sources()
+        assert list(relation.iter_resolved_sources(0)) == [(0, 0, 999)]
+
+
+def test_add_mappings_sql_failure_rolls_back_batch_and_unregisters(tmp_path):
+    refs = [RefinedPointRef("kept", index, 1, index) for index in range(3)]
+    mappings = ClosingIterable([(ref, 100 + index) for index, ref in enumerate(refs)])
+    with _relation(tmp_path, batch_size=2) as relation:
+        relation._connection.execute(
+            "INSERT INTO source_mappings VALUES (2,'kept',999,9,999)"
+        )
+        with pytest.raises(Exception, match="duplicate key|constraint"):
+            relation.add_mappings(mappings)
+        assert relation._mapping_order == 2
+        assert relation._connection.execute("""
+          SELECT mapping_order,point_id,resolved_id FROM source_mappings
+          ORDER BY mapping_order
+        """).fetchall() == [(0, 0, 100), (1, 1, 101), (2, 999, 999)]
+        assert relation._connection.execute("""
+          SELECT count(*) FROM duckdb_views()
+          WHERE view_name LIKE 'source_mapping_batch_%'
+        """).fetchone() == (0,)
+    assert mappings.closed
+
+
+@pytest.mark.parametrize("field,value", [
+    ("point_id", 1.5), ("subtrack_index", True), ("resolved_id", "7"),
+    ("point_id", 2**63),
+])
+def test_add_mappings_rejects_lossy_typed_values(tmp_path, field, value):
+    values = {"point_id": 1, "subtrack_index": 2, "resolved_id": 3}
+    values[field] = value
+    ref = NS(point_kind="kept", point_id=values["point_id"],
+             subtrack_index=values["subtrack_index"])
+    with _relation(tmp_path) as relation:
+        with pytest.raises(TypeError, match="invalid types"):
+            relation.add_mappings([(ref, values["resolved_id"])])
+        assert relation._mapping_order == 0
+        assert relation._connection.execute(
+            "SELECT count(*) FROM source_mappings"
+        ).fetchone() == (0,)
+
+
 def test_missing_key_reports_exact_three_field_identity(tmp_path):
     ref = RefinedPointRef("kept", 100, 4, 9)
     with _relation(tmp_path) as relation:

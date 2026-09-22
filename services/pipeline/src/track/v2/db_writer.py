@@ -757,7 +757,6 @@ def _persist_resolved_sequence(
                         crossing_sequences[current_events[event_index][1]] = sequence
                         event_index += 1
                         sequence += 1
-                    workspace.add_mapping(identity, resolved_id)
                     rows.append((
                         resolved_id, detect_id, identity.subtrack_index,
                         identity.refined_sequence_in_subtrack, sequence,
@@ -766,6 +765,10 @@ def _persist_resolved_sequence(
                         None,
                     ))
                     sequence += 1
+                workspace.add_mappings(
+                    (member.identity, resolved_id)
+                    for member, resolved_id in zip(members, ids, strict=True)
+                )
                 _copy_insert(cur, "resolved_subtrack_points", columns, rows, observe=False)
                 count += len(rows)
                 heartbeat_progress(count)

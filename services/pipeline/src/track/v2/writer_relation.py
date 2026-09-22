@@ -1,12 +1,15 @@
 """DuckDB relations for the first, source-association phase of Detect writing."""
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from itertools import islice
+from numbers import Integral
 from pathlib import Path
 from uuid import uuid4
 
 import duckdb
+import numpy as np
 
 from .member_sequences import iter_member_identities
 from .models import RuntimeConfig
@@ -194,6 +197,48 @@ class WriterRelation:
              resolved_id),
         )
         self._mapping_order += 1
+
+    def add_mappings(self, mappings: Iterable[tuple[object, int]]) -> None:
+        """Insert source mappings in bounded committed batches."""
+        connection = self._require_appendable()
+        with _closing_optional(iter(mappings)) as iterator:
+            while batch := list(islice(iterator, self._batch_size)):
+                for ref, resolved_id in batch:
+                    values = (ref.point_id, ref.subtrack_index, resolved_id)
+                    if (not isinstance(ref.point_kind, str)
+                            or any(isinstance(value, bool) or not isinstance(value, Integral)
+                                   or not -(2**63) <= int(value) < 2**63
+                                   for value in values)):
+                        raise TypeError("source mapping fields have invalid types")
+                start = self._mapping_order
+                relation = f"source_mapping_batch_{uuid4().hex}"
+                columns = {
+                    "mapping_order": np.arange(start, start + len(batch), dtype=np.int64),
+                    "point_kind": np.asarray(
+                        [item[0].point_kind for item in batch], dtype=np.str_,
+                    ),
+                    "point_id": np.asarray([item[0].point_id for item in batch], dtype=np.int64),
+                    "subtrack_index": np.asarray(
+                        [item[0].subtrack_index for item in batch], dtype=np.int64,
+                    ),
+                    "resolved_id": np.asarray([item[1] for item in batch], dtype=np.int64),
+                }
+                connection.register(relation, columns)
+                try:
+                    connection.execute("BEGIN TRANSACTION")
+                    try:
+                        connection.execute(f"""
+                          INSERT INTO source_mappings
+                          SELECT mapping_order,point_kind,point_id,subtrack_index,resolved_id
+                          FROM {relation} ORDER BY mapping_order
+                        """)
+                        connection.execute("COMMIT")
+                    except BaseException:
+                        connection.execute("ROLLBACK")
+                        raise
+                finally:
+                    connection.unregister(relation)
+                self._mapping_order += len(batch)
 
     def resolve_sources(self) -> None:
         connection = self._require_open()

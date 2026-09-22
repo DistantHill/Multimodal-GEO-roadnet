@@ -67,7 +67,7 @@
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
-| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12f3；待重跑 1M） |
+| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12g1；待重跑 1M） |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
 ## 3. 任务卡
@@ -1023,6 +1023,31 @@ NumPy 核和全部 `437,416` 段均不改变，也不增加零长过滤或 `MATE
 payload 回连与 ORDER BY。测试对同一 SQL 执行 `EXPLAIN`，验证选择 `IE_JOIN` 且首个主要
 range 是 AABB 列而不是 segment ID，不以另写 COUNT 查询替代。Q49、端点、近退化、批次和
 临时表生命周期继续由完整 Refine reader 定向覆盖。
+
+C12f1 旧生产形状的完整运行在 cross 阶段 405 秒仍无首批，峰值 `1,179,484,160 B`，人工
+停止返回 137，OOM 为 0。C12f3 相同 SQL 内容的受控探针使用 2 GiB 容器限制（不是十进制
+2 GB 门禁），完整经过 Reader payload、ORDER BY、decode、原 exact kernel 与 typed candidate
+store：`59,018` 个 conservative pair 产出 `58,660` 个候选，共 `21.5003` 秒，峰值
+`1,083,285,504 B`，swap/OOM 均为 0。探针发生在提交前的相同工作树内容上，且 SQL 文本
+包含每次运行不同的临时表 UUID；因此不把该次 raw SQL hash 描述为可跨运行复现的文件锚点。
+正式门禁仍须由固定提交快照在小于 `2,000,000,000 B` 限制下完成。
+
+#### C12g1 — Writer source mapping typed 有界批写
+
+WriterRelation 新增显式 `add_mappings`：按 relation batch size 有界消费 iterator，以
+`int64` 保存 mapping order、point ID、subtrack index 和 resolved ID，以 NumPy Unicode
+保存必填 point kind，通过临时注册关系执行一次 `INSERT ... SELECT ... ORDER BY
+mapping_order`。每批独立事务，commit 后才推进 `_mapping_order`；失败批回滚并注销关系，
+此前已提交批保留。单条 `add_mapping` 继续保留立即可读的兼容语义，重复 exact mapping 仍由
+最高 mapping order 胜出。
+
+`_persist_resolved_sequence` 复用已有 members 与预留 IDs 的批，直接以 generator 交给
+`add_mappings`；PostgreSQL COPY、ID 分配、p/i/c 顺序、接口与结果不变。批量 API 明确拒绝
+bool、非整数和超出有符号 int64 的值，避免 NumPy 静默截断或转换；合法大于 `2^53` 的整数
+保持精确，字符串不经 object ndarray 慢路径。输入 iterator 在成功、转换异常和 SQL 异常时
+均关闭。回归覆盖空、1、N、N+1、大整数、重复 mapping 最后胜出、SQL 批失败回滚、注册资源
+清理与先前批保留。该改动针对静态审计发现的约 `615,878` 次单行 DuckDB mapping 调用；
+不扩展到 collect_sources、annotations 或 Turn 摄取。
 
 ### C13 — 26M 最终验收
 
