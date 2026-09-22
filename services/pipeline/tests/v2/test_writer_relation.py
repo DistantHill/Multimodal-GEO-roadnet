@@ -405,6 +405,49 @@ def test_annotations_preserve_namespaces_duplicates_hotspots_and_order(tmp_path)
             relation.prepare_annotations([], {}, [])
 
 
+def test_annotation_last_hotspot_preserves_null_and_nan(tmp_path):
+    refs = [RefinedPointRef("kept", 1, 0, 0), RefinedPointRef("kept", 2, 0, 0)]
+    with _relation(tmp_path, batch_size=2) as relation:
+        _resolve_for_annotations(relation, refs, [7, 8], [])
+        relation.prepare_annotations([], {}, [
+            NS(event_calculate_index=7, g_star_z=1.0),
+            NS(event_calculate_index=8, g_star_z=2.0),
+            NS(event_calculate_index=7, g_star_z=None),
+            NS(event_calculate_index=8, g_star_z=float("nan")),
+        ])
+        rows = list(relation.iter_annotations("turn"))
+        assert rows[0] == (0, None, None)
+        assert rows[1][:2] == (1, None) and math.isnan(rows[1][2])
+
+
+def test_annotation_second_batch_sql_failure_rolls_back_all_and_retries(tmp_path):
+    refs = [RefinedPointRef("kept", 1, 0, 0), RefinedPointRef("kept", 2, 0, 0)]
+    clusters = [NS(cluster_calculate_index=1, events=[
+        _member("turn", 1), _member("turn", 2), _member("turn", 3),
+    ])]
+    with _relation(tmp_path, batch_size=2) as relation:
+        _resolve_for_annotations(relation, refs, [1, 2, 3], [])
+        relation._connection.execute(
+            "CREATE UNIQUE INDEX members_encounter_unique ON members(encounter)"
+        )
+        relation._connection.execute("INSERT INTO members VALUES ('turn',999,2,999)")
+        with pytest.raises(Exception, match="duplicate key|constraint"):
+            relation.prepare_annotations(clusters, {1: 10}, [])
+        assert relation._connection.execute(
+            "SELECT kind,calculation_index,encounter,candidate_id FROM members"
+        ).fetchall() == [("turn", 999, 2, 999)]
+        assert relation._connection.execute("SELECT count(*) FROM hotspots").fetchone() == (0,)
+        assert relation._connection.execute("SELECT count(*) FROM annotations").fetchone() == (0,)
+        assert relation._connection.execute("""
+          SELECT count(*) FROM duckdb_views() WHERE view_name LIKE 'writer_batch_%'
+        """).fetchone() == (0,)
+        relation._connection.execute("DELETE FROM members")
+        relation.prepare_annotations(clusters, {1: 10}, [])
+        assert list(relation.iter_annotations("turn")) == [
+            (0, 10, None), (1, 10, None), (2, 10, None),
+        ]
+
+
 def test_annotation_conflict_reports_earliest_encounter_not_smallest_key(tmp_path):
     refs = [RefinedPointRef("kept", 1, 0, 0), RefinedPointRef("kept", 2, 0, 0)]
     with _relation(tmp_path) as relation:

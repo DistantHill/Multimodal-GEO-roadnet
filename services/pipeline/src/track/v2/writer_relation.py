@@ -191,7 +191,7 @@ class WriterRelation:
 
     def _register_batch(self, columns: dict[str, np.ndarray]) -> str:
         relation = f"writer_batch_{uuid4().hex}"
-        self._require_appendable().register(relation, columns)
+        self._require_open().register(relation, columns)
         return relation
 
     @staticmethod
@@ -229,6 +229,14 @@ class WriterRelation:
         finally:
             for name in names:
                 connection.unregister(name)
+
+    def _insert_registered(self, columns: dict[str, np.ndarray], statement: str) -> None:
+        connection = self._require_open()
+        relation = self._register_batch(columns)
+        try:
+            connection.execute(statement.format(relation=relation))
+        finally:
+            connection.unregister(relation)
 
     def collect_sources(self, result, pending, crossing_ids, candidate_ids) -> None:
         connection = self._require_appendable()
@@ -479,6 +487,25 @@ class WriterRelation:
         connection.execute("BEGIN TRANSACTION")
         try:
             encounter = 0
+            member_batch = []
+
+            def flush_members() -> None:
+                if not member_batch:
+                    return
+                self._insert_registered({
+                    "kind": _string_array(item[0] for item in member_batch),
+                    "calculation_index": _integer_array(
+                        [item[1] for item in member_batch]
+                    )[0],
+                    "encounter": _integer_array([item[2] for item in member_batch])[0],
+                    "candidate_id": _integer_array([item[3] for item in member_batch])[0],
+                }, """
+                  INSERT INTO members
+                  SELECT kind,calculation_index,encounter,candidate_id
+                  FROM {relation} ORDER BY encounter
+                """)
+                member_batch.clear()
+
             with _closing_optional(iter(clusters)) as cluster_iterator:
                 for cluster in cluster_iterator:
                     candidate_id = candidate_ids[cluster.cluster_calculate_index]
@@ -491,15 +518,40 @@ class WriterRelation:
                                 kind, calculation_index = "cross", cross_index
                             else:
                                 continue
-                            connection.execute("INSERT INTO members VALUES (?,?,?,?)", (
+                            member_batch.append((
                                 kind, calculation_index, encounter, candidate_id,
                             ))
                             encounter += 1
+                            if len(member_batch) == self._batch_size:
+                                flush_members()
+            flush_members()
+            hotspot_batch = []
+
+            def flush_hotspots() -> None:
+                if not hotspot_batch:
+                    return
+                values, nulls, nans = _float_arrays(item[2] for item in hotspot_batch)
+                self._insert_registered({
+                    "calculation_index": _integer_array(
+                        [item[0] for item in hotspot_batch]
+                    )[0],
+                    "input_ordinal": _integer_array([item[1] for item in hotspot_batch])[0],
+                    "z": values, "z_null": nulls, "z_nan": nans,
+                }, """
+                  INSERT INTO hotspots
+                  SELECT calculation_index,input_ordinal,
+                         CASE WHEN z_null THEN NULL WHEN z_nan
+                              THEN 'NaN'::DOUBLE ELSE z END
+                  FROM {relation} ORDER BY input_ordinal
+                """)
+                hotspot_batch.clear()
+
             with _closing_optional(iter(hotspots)) as hotspot_iterator:
                 for ordinal, event in enumerate(hotspot_iterator):
-                    connection.execute("INSERT INTO hotspots VALUES (?,?,?)", (
-                        event.event_calculate_index, ordinal, event.g_star_z,
-                    ))
+                    hotspot_batch.append((event.event_calculate_index, ordinal, event.g_star_z))
+                    if len(hotspot_batch) == self._batch_size:
+                        flush_hotspots()
+            flush_hotspots()
             conflict = connection.execute("""
                 SELECT calculation_index FROM (
                     SELECT calculation_index,encounter,candidate_id,

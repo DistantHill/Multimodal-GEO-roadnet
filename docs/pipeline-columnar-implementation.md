@@ -67,7 +67,7 @@
 | C10c4 | Writer 正式接线 | C10c3 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C10c5 | Writer 旧工作区删除 | C10c4 | 每提交 ≤700 | 已完成，待主对话确认 |
 | C11 | 进程池、协调器、资源预留、任务账本清除 | C02c–C10 | 每提交 ≤700 | 已完成（C11a–C11h） |
-| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12g2；待重跑 1M） |
+| C12 | 文档取代标记、全套回归和 1M 差分 | C11 | 每提交 ≤700 | 进行中（C12a–C12g3；待重跑 1M） |
 | C13 | 26M、默认 2 GB、全链路一小时最终验收 | C12 | 不适用 | 未开始 |
 
 ## 3. 任务卡
@@ -1078,6 +1078,26 @@ cross raw 与 annotation；pending 批在同一事务写 source request 与 cros
 C13 尚无可确认的旧 26M 完整基线；现有原数据库 v4 不能被当作已证明的历史完整 baseline。
 未来只能在隔离 clone 上按用户确认的基线方案执行，不修改旧数据。当前已向用户询问该方案，
 在获得确认前只继续 C12，不宣称 C13 已具备差分基线或完成验收。
+
+C12g2 主对话独立真实 PostgreSQL 定向验收为 `88 passed`（2.96 秒），并复核业务顺序、
+NULL/NaN 区分与注册关系清理。该验收不扩展 C12g2 的范围，也不代表完整 1M 或 C13 通过。
+
+#### C12g3 — Writer annotation typed 有界批写
+
+`prepare_annotations` 将 members 与 hotspots 的逐行 DuckDB execute 改为 typed 有界批次。
+members 的 kind 使用 NumPy Unicode，calculation index、encounter 与 candidate ID 使用严格
+int64；hotspot 的 z 使用 value、null mask 与 NaN mask，显式保持 SQL NULL、NaN 和 ±inf。
+每个批次的 `INSERT ... SELECT` 都显式按 encounter 或 input ordinal 排序，保持 first
+membership 冲突判定、同 candidate 重复成员、last-hotspot 和 annotation request 顺序不变。
+
+本卡刻意保留整个 `prepare_annotations` 原有的单一 `BEGIN` / `COMMIT`，不复用 C12g2 的
+逐批事务 helper。任意后批转换、SQL 或 iterator 错误会回滚本次方法已写入的全部 members、
+hotspots 与 annotations；成功后才设置 prepared 状态。每次注册关系均在 `finally` 注销，
+cluster、member identity 与 hotspot iterator 在正常及 `BaseException` 路径都关闭。
+
+回归覆盖跨 batch 的同 candidate 重复成员、跨 candidate 冲突全回滚、last-hotspot 为 NULL
+或 NaN、第二批 SQL 故障回滚前批、注册清理与删除故障注入后重试。C12g3 不修改
+TurnEventRelation、collect_sources、最终 COPY 或 Network。
 
 ### C13 — 26M 最终验收
 
