@@ -863,6 +863,33 @@ API，避免为写入重新构建全量事件列表。nullable BIGINT 使用 Pyt
 `scripts/cv_human_check/tests` 合并全量 `977 passed, 50 skipped`。本卡不重跑 1M，
 C12 仍为进行中。
 
+提交：`878b30c`。
+
+#### C12e3 — CrossCandidateRelation 有界列式批写
+
+CrossCandidateRelation 新增与单条 `append` 明确分离的 `extend` / `append_many` API。
+iterator 按调用方上限形成有界批次，每批将 39 个业务字段构造成 NumPy 列字典并注册为
+DuckDB 临时关系，以一个 `INSERT SELECT` 和一个显式事务提交；成功提交后才推进 `_count`，
+失败批回滚而此前批保留，注册关系始终在 `finally` 注销。nullable BIGINT 使用 `int64`
+数据列与独立空值掩码，避免浮点转换损失大于 `2^53` 的身份；可空字符串和布尔值同样以
+掩码重建 NULL。强制浮点 NaN 即使被 scanner 映射为 NULL，也由既有 `seal` 校验拒绝。
+
+列式 cross-track 提取不再逐命中 `result.append`。原精确核的命中顺序直接进入候选生成器，
+以每批开始时的 relation 长度和局部 `enumerate` 连续编号，再交给 `extend`；因此批尚未提交
+时不会重复使用 `len(result)`，也不额外构造 numbered candidate 列表。无 store 的内存路径
+仍以同一生成器扩展 list，顺序和业务语义不变。本卡未改 Turn、Writer 或聚类成员写入。
+
+固定 2,000 候选、单进程、DuckDB 单线程、单个 2,000 行有界批次的镜像微基准：旧
+`append` 循环 9.278646 秒，新批写 0.030783 秒，墙钟加速 301.42 倍；autocommit/显式事务
+由 2,000 降至 1，候选 INSERT 由 2,000 降至 1，若计 BEGIN/COMMIT 则 SQL 调用由 2,000
+降至 3。两条路径均通过 `seal`，新路径精确回读 2,000 条且末条语义相同。该隔离结果不
+替代 1M 或 C13 验收。
+
+事务故障回归在 Cross 主表 INSERT 和 Turn `source_ids` INSERT 内分别注入唯一约束失败，
+验证失败批主表/来源表零残留、此前批保留、`_count` 不前移且注册关系已注销。Cross relation
+定向 `40 passed`；Pipeline 与 `scripts/cv_human_check/tests` 合并全量
+`987 passed, 50 skipped`。本卡不重跑 1M，C12 仍为进行中。
+
 ### C13 — 26M 最终验收
 
 范围：精确 26M，默认 2 GB、无 swap、Refine 至 Network 小于一小时；PostgreSQL

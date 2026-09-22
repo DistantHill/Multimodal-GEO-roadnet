@@ -75,6 +75,69 @@ def test_lossless_refs_index_slices_coordinates_and_batch_one(tmp_path):
             _ = relation[1.5]  # type: ignore[index]
 
 
+@pytest.mark.parametrize("batch_size", [1, 2, 5])
+def test_extend_is_lossless_and_preserves_nullable_bigints(tmp_path, batch_size):
+    huge = 2**60 + 9
+    candidates = (
+        _candidate(0),
+        replace(
+            _candidate(1, optional=True),
+            from_segment_start=RefinedPointRef("kept", huge, huge + 1, huge + 2),
+            to_segment_start=RefinedPointRef("injected", huge + 3, huge + 4, huge + 5),
+        ),
+        _candidate(2),
+    )
+    with _relation(tmp_path, batch_size=2) as relation:
+        relation.extend(iter(candidates), batch_size=batch_size)
+        relation.seal()
+        assert tuple(relation) == candidates
+
+
+def test_extend_insert_failure_rolls_back_batch_and_unregisters(tmp_path):
+    first = replace(_candidate(0), vehicle_id="first")
+    with _relation(tmp_path, batch_size=2) as relation:
+        relation.extend((first,), batch_size=1)
+        relation._connection.execute(
+            "CREATE UNIQUE INDEX cross_vehicle_unique ON cross_candidates(vehicle_id)"
+        )
+        with pytest.raises(Exception, match="unique|duplicate|constraint"):
+            relation.extend((replace(_candidate(1), vehicle_id="duplicate"),
+                             replace(_candidate(2), vehicle_id="duplicate")))
+        assert len(relation) == 1
+        assert relation._connection.execute(
+            "SELECT count(*) FROM cross_candidates"
+        ).fetchone() == (1,)
+        assert relation._connection.execute(
+            "SELECT count(*) FROM duckdb_views() WHERE view_name='cross_candidate_batch'"
+        ).fetchone() == (0,)
+        second = replace(_candidate(1), vehicle_id="second")
+        relation.extend((second,))
+        relation.seal()
+        assert tuple(relation) == (first, second)
+
+
+def test_extend_nan_cannot_bypass_relation_validation(tmp_path):
+    relation = _relation(tmp_path)
+    relation.extend((replace(_candidate(0), x=float("nan")),))
+    with pytest.raises(ValueError, match="invalid CrossTrackCandidate relation"):
+        relation.seal()
+
+
+@pytest.mark.parametrize("field", ["source_id", "source_row_key",
+                                    "generated_reason", "source_row_hash"])
+def test_extend_and_append_reject_the_same_null_point_strings(tmp_path, field):
+    invalid_point = replace(_candidate(0).point_ref, **{field: None})
+    invalid = replace(
+        _candidate(0), point_ref=invalid_point,
+        from_segment_start_point_ref=invalid_point,
+    )
+    for method in ("append", "extend"):
+        relation = _relation(tmp_path / method)
+        getattr(relation, method)((invalid,) if method == "extend" else invalid)
+        with pytest.raises(ValueError, match="invalid CrossTrackCandidate relation"):
+            relation.seal()
+
+
 @pytest.mark.parametrize(
     "sql",
     [
@@ -191,6 +254,7 @@ def test_runtime_limits_bounded_fetch_and_columnar_implementation(tmp_path):
     assert "fetchmany" in inspect.getsource(CrossCandidateRelation._iterate).lower()
     assert "fetchmany" in inspect.getsource(CrossCandidateRelation.iter_coordinates).lower()
     assert "execute(" not in inspect.getsource(CrossCandidateRelation._decode).lower()
+    assert "register" in inspect.getsource(CrossCandidateRelation._append_batch).lower()
     for forbidden in ("sqlite", "pickle", "struct", "temporarydirectory"):
         assert forbidden not in source
 

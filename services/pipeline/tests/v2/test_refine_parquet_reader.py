@@ -16,6 +16,7 @@ from track.v2.db.artifact_registry import ArtifactDescriptor, canonical_json
 from track.v2.db.queries import SpatialWindow
 from track.v2.detect import IntersectConfig
 from track.v2.cross_track import _prepare_segments
+from track.v2.cross_candidate_relation import CrossCandidateRelation
 from track.v2.candidate_extraction import (
     extract_columnar_cross_track_candidates, extract_cross_track_candidates,
 )
@@ -722,6 +723,14 @@ def test_columnar_cross_track_exact_kernel_matches_q49_oracle(tmp_path, batch_si
         actual = extract_columnar_cross_track_candidates(
             reader, "source", transformer, cfg,
         )
+        with CrossCandidateRelation(
+            RuntimeConfig(duckdb_threads=1), tmp_path,
+        ) as candidate_store:
+            stored = extract_columnar_cross_track_candidates(
+                reader, "source", transformer, cfg, candidate_store=candidate_store,
+            )
+            assert stored is candidate_store
+            assert list(stored) == actual
     assert len(actual) == len(expected)
     for left, right in zip(actual, expected, strict=True):
         assert left.cross_track_calculate_index == right.cross_track_calculate_index

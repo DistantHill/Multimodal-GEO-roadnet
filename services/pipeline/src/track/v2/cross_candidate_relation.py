@@ -1,12 +1,14 @@
 """DuckDB-managed normalized relation for transient cross-track candidates."""
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from uuid import uuid4
 
 import duckdb
+import numpy as np
 
 from .member_sequences import EventSummary, ReadOnlySequence
 from .models import CrossTrackCandidate, PointRef, RefinedPointRef, RuntimeConfig, TurnEvent
@@ -105,6 +107,100 @@ class CrossCandidateRelation(ReadOnlySequence[CrossTrackCandidate]):
             values,
         )
         self._count += 1
+
+    def extend(
+        self, candidates: Iterable[CrossTrackCandidate], *, batch_size: int | None = None,
+    ) -> None:
+        """Commit bounded batches; a failed batch leaves earlier commits readable."""
+        if self._sealed:
+            raise RuntimeError("cross candidate relation is sealed")
+        size = self._batch_size if batch_size is None else batch_size
+        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+            raise ValueError("batch_size must be positive")
+        iterator = iter(candidates)
+        while batch := tuple(islice(iterator, size)):
+            self._append_batch(batch)
+
+    append_many = extend
+
+    def _append_batch(self, candidates: tuple[CrossTrackCandidate, ...]) -> None:
+        connection, first_ordinal = self._require_open(), self._count
+        rows = [self._candidate_values(first_ordinal + offset, candidate)
+                for offset, candidate in enumerate(candidates)]
+        columns = tuple(zip(*rows, strict=True))
+        point_names = tuple(
+            f"{prefix}_{name}" for prefix in ("point", "from_point", "to_point")
+            for name in self._POINT_COLUMNS
+        )
+        names = (
+            "ordinal", *point_names, "vehicle_id", "timestamp", "lon", "lat", "x", "y",
+            "heading", "speed", "from_kind", "from_id", "from_subtrack", "from_sequence",
+            "to_kind", "to_id", "to_subtrack", "to_sequence",
+            "cross_track_calculate_index",
+        )
+        integer = {0, 38}
+        floating = set(range(23, 30))
+        boolean = {3, 10, 17}
+        nullable_integer = {31, 32, 33, 35, 36, 37}
+        nullable_string = (
+            set(range(len(names))) - integer - floating - boolean - nullable_integer
+        )
+        nullable = boolean | nullable_integer | nullable_string
+
+        def array(index: int, values: tuple[object, ...]) -> np.ndarray:
+            if index in integer:
+                return np.asarray(values, dtype=np.int64)
+            if index in floating:
+                return np.asarray(values, dtype=np.float64)
+            if index in boolean or index in nullable_integer:
+                dtype = np.bool_ if index in boolean else np.int64
+                return np.asarray([0 if value is None else value for value in values], dtype=dtype)
+            return np.asarray(["" if value is None else value for value in values], dtype=str)
+
+        columnar = {
+            name: array(index, values)
+            for index, (name, values) in enumerate(zip(names, columns, strict=True))
+        }
+        for index in nullable:
+            columnar[f"{names[index]}__null"] = np.asarray(
+                [value is None for value in columns[index]], dtype=np.bool_,
+            )
+        selects = [
+            (f"CASE WHEN {name}__null THEN NULL ELSE {name} END AS {name}"
+             if index in nullable else name)
+            for index, name in enumerate(names)
+        ]
+        registered = False
+        connection.execute("BEGIN")
+        try:
+            connection.register("cross_candidate_batch", columnar)
+            registered = True
+            connection.execute(
+                "INSERT INTO cross_candidates SELECT " + ",".join(selects)
+                + " FROM cross_candidate_batch ORDER BY ordinal"
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        finally:
+            if registered:
+                connection.unregister("cross_candidate_batch")
+        self._count += len(candidates)
+
+    def _candidate_values(
+        self, ordinal: int, candidate: CrossTrackCandidate,
+    ) -> tuple[object, ...]:
+        return (
+            ordinal, *self._point_values(candidate.point_ref),
+            *self._point_values(candidate.from_segment_start_point_ref),
+            *self._point_values(candidate.to_segment_start_point_ref),
+            candidate.vehicle_id, candidate.timestamp, candidate.lon, candidate.lat,
+            candidate.x, candidate.y, candidate.heading, candidate.speed,
+            *self._refined_values(candidate.from_segment_start),
+            *self._refined_values(candidate.to_segment_start),
+            candidate.cross_track_calculate_index,
+        )
 
     @staticmethod
     def _point_values(point: PointRef) -> tuple[object, ...]:

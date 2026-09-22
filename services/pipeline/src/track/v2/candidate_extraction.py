@@ -12,7 +12,7 @@ from ._perf import PerfTracker
 from .candidate_patches import TrackPatch, build_cross_track_index, iter_cross_track_patches
 from .cross_track import (
     _prepare_segments, detect_cross_track_patch, intersect_cross_track_patch,
-    build_cross_track_patch_candidates,
+    iter_cross_track_patch_candidates,
 )
 from .heartbeat import heartbeat_progress, observed_operation, operation_heartbeat
 from .logger import log_info
@@ -213,11 +213,21 @@ def extract_columnar_cross_track_candidates(
             xs, ys, hit_indices = intersect_cross_track_patch(
                 starts, ends, headings, pair_a, pair_b, cfg,
             )
-            for _key, candidate in build_cross_track_patch_candidates(
-                segments, pair_a, pair_b, xs, ys, hit_indices, transformer,
-            ):
-                numbered = replace(candidate, cross_track_calculate_index=len(result))
-                result.append(numbered)
+            first_index = len(result)
+            numbered = (
+                replace(candidate, cross_track_calculate_index=first_index + offset)
+                for offset, (_key, candidate) in enumerate(
+                    iter_cross_track_patch_candidates(
+                        segments, pair_a, pair_b, xs, ys, hit_indices, transformer,
+                    )
+                )
+            )
+            if candidate_store is None:
+                result.extend(numbered)
+            else:
+                candidate_store.extend(
+                    numbered, batch_size=cfg.cross_track_pair_batch_size,
+                )
             pair_count += size
             heartbeat_progress(pair_count, unit="线段对")
             now = time.perf_counter()

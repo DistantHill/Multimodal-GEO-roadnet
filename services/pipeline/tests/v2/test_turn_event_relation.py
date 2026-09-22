@@ -148,6 +148,32 @@ def test_extend_rejects_nullable_nan_before_scanner_can_map_it_to_null(tmp_path)
         assert tuple(relation) == (_event(0),)
 
 
+def test_extend_source_insert_failure_rolls_back_event_and_unregisters(tmp_path):
+    first = _event(0, source_ids=("first",))
+    with _relation(tmp_path, batch_size=4) as relation:
+        relation.extend((first,), batch_size=1)
+        relation._connection.execute(
+            "CREATE UNIQUE INDEX turn_source_unique ON source_ids(source_id)"
+        )
+        with pytest.raises(Exception, match="unique|duplicate|constraint"):
+            relation.extend((_event(1, source_ids=("duplicate", "duplicate")),))
+        assert len(relation) == 1
+        assert relation._connection.execute(
+            "SELECT count(*) FROM turn_events"
+        ).fetchone() == (1,)
+        assert relation._connection.execute(
+            "SELECT count(*) FROM source_ids"
+        ).fetchone() == (1,)
+        assert relation._connection.execute(
+            "SELECT count(*) FROM duckdb_views() "
+            "WHERE view_name IN ('turn_event_batch','turn_source_batch')"
+        ).fetchone() == (0,)
+        second = _event(1, source_ids=("second",))
+        relation.extend((second,))
+        relation.seal()
+        assert tuple(relation) == (first, second)
+
+
 @pytest.mark.parametrize(
     "setup",
     [

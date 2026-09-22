@@ -5,7 +5,7 @@ module. The historical implementations remain available as benchmark oracles.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -126,9 +126,9 @@ def detect_cross_track_patch(
     xs, ys, hit_indices = intersect_cross_track_patch(
         starts, ends, headings, segment_ids_a, segment_ids_b, cfg,
     )
-    return build_cross_track_patch_candidates(
+    return list(iter_cross_track_patch_candidates(
         segments, segment_ids_a, segment_ids_b, xs, ys, hit_indices, transformer,
-    )
+    ))
 
 
 def intersect_cross_track_patch(
@@ -162,11 +162,25 @@ def build_cross_track_patch_candidates(
     transformer: CoordinateTransformer,
 ) -> list[tuple[tuple[int, ...], CrossTrackCandidate]]:
     """Build candidate provenance only for exact hits; this performs no I/O."""
-    ordered_candidates: list[tuple[tuple[int, ...], CrossTrackCandidate]] = []
+    return list(iter_cross_track_patch_candidates(
+        segments, segment_ids_a, segment_ids_b, xs, ys, hit_indices, transformer,
+    ))
+
+
+def iter_cross_track_patch_candidates(
+    segments: Sequence[_CrossTrackSegment] | Mapping[int, _CrossTrackSegment],
+    segment_ids_a: np.ndarray,
+    segment_ids_b: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    hit_indices: np.ndarray,
+    transformer: CoordinateTransformer,
+) -> Iterator[tuple[tuple[int, ...], CrossTrackCandidate]]:
+    """Yield candidate provenance in exact-kernel hit order without another list."""
     for x, y, hit_index in zip(xs, ys, hit_indices):
         segment_a = segments[int(segment_ids_a[hit_index])]
         segment_b = segments[int(segment_ids_b[hit_index])]
-        ordered_candidates.append((
+        yield (
             (
                 segment_a.vehicle_rank,
                 segment_b.vehicle_rank,
@@ -182,8 +196,7 @@ def build_cross_track_patch_candidates(
                 float(y),
                 transformer,
             ),
-        ))
-    return ordered_candidates
+        )
 
 
 def _candidate_from_segments(
