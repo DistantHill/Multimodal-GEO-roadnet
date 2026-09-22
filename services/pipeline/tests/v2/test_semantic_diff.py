@@ -13,6 +13,7 @@ from uuid import uuid4
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
 from track.v2.validation import semantic_diff
 from track.v2.cli import semantic_diff as semantic_diff_cli
+from track.v2.validation.network_replay import ReplayResult
 from track.v2.validation.semantic_diff import (
     TABLES, canonical_endpoint_pair, compare_rows, compare_runs,
 )
@@ -37,6 +38,10 @@ class _Cursor:
     def __iter__(self):
         return iter(self.rows)
 
+    def fetchmany(self, _size):
+        rows, self.rows = self.rows, []
+        return rows
+
 
 class _Result:
     def __init__(self, row: tuple) -> None:
@@ -56,6 +61,15 @@ _METADATA = (
 @pytest.fixture(autouse=True)
 def _stable_live_source(monkeypatch):
     monkeypatch.setattr(semantic_diff, "verify_refine_source_fingerprint", lambda *_args: None)
+    tables = {
+        f"network.replay.{mode}.{kind}": []
+        for mode in ("false", "true")
+        for kind in ("nodes", "edges", "issues", "report")
+    }
+    monkeypatch.setattr(
+        semantic_diff, "replay_network",
+        lambda *_args, **_kwargs: ReplayResult(tables, {"kind": "controlled_replay"}),
+    )
 
 
 class _Connection:
@@ -73,6 +87,8 @@ class _Connection:
         if name is None:
             return _SchemaCursor()
         self.rows_opened += 1
+        if "network_identities" in name:
+            return _Cursor(name, [])
         spec = next(spec for spec in TABLES if spec.name.replace(".", "_") in name)
         row = ("stable-key", *(0.0 if kind != "exact" else "same" for _, kind in spec.columns))
         return _Cursor(name, [row])
@@ -100,10 +116,22 @@ def test_compare_runs_is_read_only_and_uses_named_bounded_cursors() -> None:
     runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
     result = compare_runs(conn, runs, runs, batch_size=17)
     assert result["persisted_equivalent"] is True
-    assert result["complete_scope"] is result["acceptance_passed"] is result["passed"] is False
-    assert all(item["blocks_complete_scope"] for item in result["scope"]["exclusions"])
+    assert result["complete_scope"] is result["acceptance_passed"] is result["passed"] is True
+    assert result["network_parameterized_equivalent"] == {
+        "false": True, "true": True, "passed": True,
+    }
+    assert result["scope"]["exclusions"] == []
     assert conn.statements[0] == "SET TRANSACTION READ ONLY"
     assert len(result["tables"]) == len(TABLES)
+
+
+@pytest.mark.parametrize("batch_size", [0, -1, True, 1.5])
+def test_compare_runs_rejects_invalid_batch_before_database_reads(batch_size) -> None:
+    conn = _Connection()
+    runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
+    result = compare_runs(conn, runs, runs, batch_size=batch_size)
+    assert result["error"] == "preflight:batch_size"
+    assert conn.statements == []
 
 
 def test_shared_live_source_is_verified_once_before_table_reads(monkeypatch) -> None:
@@ -130,6 +158,76 @@ def test_live_source_failure_is_structured_and_opens_no_table_cursor(monkeypatch
     assert result["error"] == "preflight:live_source_fingerprint:ValueError"
     assert result["persisted_equivalent"] is result["acceptance_passed"] is False
     assert conn.rows_opened == 0
+
+
+def test_network_mismatch_is_separate_from_persisted_equivalence(monkeypatch) -> None:
+    empty = {
+        f"network.replay.{mode}.{kind}": []
+        for mode in ("false", "true") for kind in ("nodes", "edges", "issues", "report")
+    }
+    changed = {**empty, "network.replay.true.nodes": [("node", 120.0, 30.0, 1.0, 0)]}
+    replays = iter((ReplayResult(empty, {"side": "baseline"}),
+                    ReplayResult(changed, {"side": "candidate"})))
+    monkeypatch.setattr(semantic_diff, "replay_network", lambda *_args, **_kwargs: next(replays))
+    runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
+    result = compare_runs(_Connection(), runs, runs)
+    assert result["persisted_equivalent"] is True
+    assert result["complete_scope"] is True
+    assert result["network_parameterized_equivalent"] == {
+        "false": True, "true": False, "passed": False,
+    }
+    assert result["acceptance_passed"] is result["passed"] is False
+
+
+def test_network_replay_error_preserves_persisted_result(monkeypatch) -> None:
+    monkeypatch.setattr(
+        semantic_diff, "replay_network",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("invalid replay")),
+    )
+    runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
+    result = compare_runs(_Connection(), runs, runs)
+    assert result["persisted_equivalent"] is True
+    assert result["complete_scope"] is result["acceptance_passed"] is False
+    assert result["error"] == "network_replay:RuntimeError"
+
+
+def test_network_comparison_detects_pairing_tolerance_counts_issues_and_report() -> None:
+    base = {
+        f"network.replay.{mode}.nodes": [("a", 120.0, 30.0, 1.0, 1)]
+        for mode in ("false", "true")
+    }
+    for mode in ("false", "true"):
+        base[f"network.replay.{mode}.edges"] = [
+            ('["edge","a","b"]', '{"type":"LineString","coordinates":[[0,0],[1,1]]}',
+             2.0, 4, 3, 1),
+        ]
+        base[f"network.replay.{mode}.issues"] = []
+        base[f"network.replay.{mode}.report"] = [("report", 1, 1, 1, 0, 0)]
+
+    def compared(change):
+        candidate = {name: list(rows) for name, rows in base.items()}
+        change(candidate)
+        return semantic_diff._compare_network_replays(
+            ReplayResult(base, {}), ReplayResult(candidate, {}),
+        )[1]["passed"]
+
+    assert compared(lambda rows: rows["network.replay.true.nodes"].__setitem__(
+        0, ("a", 120.0 + 0.9e-9, 30.0, 1.0, 1),
+    ))
+    changes = [
+        lambda rows: rows["network.replay.true.nodes"].__setitem__(
+            0, ("a", 120.0 + 1.1e-9, 30.0, 1.0, 1)),
+        lambda rows: rows["network.replay.true.edges"].__setitem__(
+            0, ('["edge","a","c"]', base["network.replay.true.edges"][0][1],
+                2.0, 4, 3, 1)),
+        lambda rows: rows["network.replay.true.edges"].__setitem__(
+            0, (*base["network.replay.true.edges"][0][:-3], 5, 4, 1)),
+        lambda rows: rows["network.replay.true.issues"].append(
+            ('["issue","a","b","invalid_centerline_geometry"]',)),
+        lambda rows: rows["network.replay.true.report"].__setitem__(
+            0, ("report", 1, 1, 0, 0, 1)),
+    ]
+    assert all(not compared(change) for change in changes)
 
 
 def test_cli_never_reports_full_acceptance_for_persisted_only(monkeypatch, capsys) -> None:

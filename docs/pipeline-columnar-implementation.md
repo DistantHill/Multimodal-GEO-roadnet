@@ -961,6 +961,34 @@ Network topology 只读取 `combined`，因此同样规范无向端点 pair。�
 端点的等价，以及几何未反转、方向计数未交换、source clip 标志未切换的失败；同时验证
 directed 正反两行均保留且交换方向不等价。Semantic diff 定向真实 PG `29 passed`。
 
+#### C12e5b — Network 受控参数化重放
+
+新增独立 Network replay 验收模块，以当前 `network.py` 文件字节的固定 SHA-256 锚定受控
+算法版本；运行时哈希不符即 fail closed。`NetworkConfig` 必须仍且仅含
+`include_isolated_nodes: bool=True`，并穷举 false/true 两种配置；新增配置字段或类型、默认值
+变化不会被静默遗漏。该证据的 kind 为 `controlled_replay`，明确标记
+`historical_output_reconstructed=false`：它证明同一未变 Network 算法对两侧持久化输入的
+参数化等价，不冒充历史瞬时输出快照。
+
+每侧先校验 completed Fit→Detect lineage，通过命名游标各读取一次 intersection 小表和
+combined centerline 小表，再由两种配置复用；稳定 intersection identity 由目标 detect 的
+既有 semantic key CTE 单独窄读一次。该路径不读取 trajectory points、clip manifests，也不
+构造全量点对象。最小 Fit adapter 只提供生产 `build_network` 实际消费的 centerlines 与
+detect ID，不伪造 FitReport；生产 Network 算法文件保持不变。
+
+规范结果按两种配置分别生成 nodes、edges、issues、report 共八张表。节点以稳定
+intersection identity 为键；无向边按稳定端点 pair 排序，反向时同步反转 points 并交换
+forward/reverse count；issues 使用稳定 pair 与 reason；report 的五个整数严格比较。证据同时
+记录两侧 detect/fit ID、算法 expected/actual hash、穷举配置及三类读取行数。缺失或重复稳定
+identity、非有限值、错误 lineage、算法锚点或配置契约变化均 fail closed。
+
+顶层结果保留 `persisted_equivalent`，新增分别报告 false/true 的
+`network_parameterized_equivalent`。只有十四张持久化表与两种 Network replay 都等价且完整
+覆盖成立，`complete_scope`、`acceptance_passed` 和兼容字段 `passed` 才为 true；Network
+失败不会抹去已经得到的持久化表结论。隔离 PostgreSQL 随机 Schema 实际运行小表 SQL 与
+两种配置，定向覆盖孤立点、稳定端点反序、同步几何/计数、同边数不同配对、坐标容差边界、
+issues/report/count 变化和各类契约失败。
+
 #### C12f1 — Cross-track 一次物化与统计驱动空间连接
 
 `iter_cross_track_pair_batches` 在同一 DuckDB 连接内把完整 straight payload（含 AABB）

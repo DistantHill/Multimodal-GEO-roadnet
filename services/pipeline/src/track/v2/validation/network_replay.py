@@ -214,6 +214,8 @@ def replay_network(
         "configs": [{"include_isolated_nodes": False}, {"include_isolated_nodes": True}],
         "source_hash_expected": EXPECTED_NETWORK_SHA256,
         "source_hash_actual": actual_hash,
+        "detect_id": str(detect_id),
+        "fit_id": str(fit_id),
         "intersection_rows_read": len(intersection_rows),
         "centerline_rows_read": len(centerline_rows),
         "identity_rows_read": len(identity_rows),

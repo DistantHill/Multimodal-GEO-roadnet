@@ -10,6 +10,7 @@ from uuid import UUID
 
 from ..db.schema import require_current_schema
 from ..db.source_table import verify_refine_source_fingerprint
+from .network_replay import ReplayResult, replay_network
 
 
 @dataclass(frozen=True)
@@ -239,6 +240,23 @@ _SCOPE_EXCLUSIONS = (
     {"name": "network.config", "reason": "not persisted", "blocks_complete_scope": True},
 )
 
+_NETWORK_IDENTITY_QUERY = _SEMANTIC_KEYS + """
+  SELECT i.id,i.business_key
+  FROM intersection_keys i WHERE i.detect_id=%s ORDER BY i.id
+"""
+
+_NETWORK_COLUMNS = {
+    "nodes": (("lon", "degree"), ("lat", "degree"), ("radius_m", "metre"),
+              ("degree", "exact")),
+    "edges": (("geometry", "geojson"), ("length_m", "metre"),
+              ("source_clips", "exact"), ("forward_clips", "exact"),
+              ("reverse_clips", "exact")),
+    "issues": (),
+    "report": (("input_centerlines", "exact"), ("nodes", "exact"),
+               ("edges", "exact"), ("isolated_nodes", "exact"),
+               ("skipped_centerlines", "exact")),
+}
+
 
 def canonical_endpoint_pair(
     left: tuple[int, int], right: tuple[int, int],
@@ -349,6 +367,36 @@ def _rows(
         yield from cursor
 
 
+def _network_identity_rows(
+    conn: Any, detect_id: UUID, side: str, batch_size: int,
+) -> list[tuple[Any, ...]]:
+    rows: list[tuple[Any, ...]] = []
+    with conn.cursor(name=f"semantic_diff_{side}_network_identities") as cursor:
+        cursor.itersize = batch_size
+        cursor.execute(_NETWORK_IDENTITY_QUERY, (detect_id, detect_id))
+        while batch := cursor.fetchmany(batch_size):
+            rows.extend(batch)
+    return rows
+
+
+def _compare_network_replays(
+    baseline: ReplayResult, candidate: ReplayResult,
+) -> tuple[list[dict[str, Any]], dict[str, bool]]:
+    tables = []
+    modes: dict[str, bool] = {}
+    for mode in ("false", "true"):
+        mode_tables = []
+        for kind, columns in _NETWORK_COLUMNS.items():
+            name = f"network.replay.{mode}.{kind}"
+            comparison = compare_rows(
+                name, columns, baseline.tables[name], candidate.tables[name],
+            )
+            tables.append(comparison)
+            mode_tables.append(comparison)
+        modes[mode] = all(table["passed"] for table in mode_tables)
+    return tables, {**modes, "passed": all(modes.values())}
+
+
 def _lineage(conn: Any, runs: dict[str, UUID]) -> tuple[Any, ...] | None:
     return conn.execute("""
       SELECT r.status,d.status,f.status,r.source_table,r.source_fingerprint,
@@ -365,10 +413,21 @@ def _lineage(conn: Any, runs: dict[str, UUID]) -> tuple[Any, ...] | None:
 
 def _result(
     *, tables: list[dict[str, Any]], persisted_equivalent: bool,
-    error: str | None = None,
+    error: str | None = None, network_tables: list[dict[str, Any]] | None = None,
+    network_parameterized_equivalent: dict[str, bool] | None = None,
+    network_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    complete_scope = not any(item["blocks_complete_scope"] for item in _SCOPE_EXCLUSIONS)
-    acceptance_passed = persisted_equivalent and complete_scope and error is None
+    network_complete = (network_tables is not None
+                        and network_parameterized_equivalent is not None
+                        and network_evidence is not None)
+    exclusions = [] if network_complete else list(_SCOPE_EXCLUSIONS)
+    complete_scope = network_complete and error is None
+    network_equivalent = bool(
+        network_parameterized_equivalent
+        and network_parameterized_equivalent.get("passed")
+    )
+    acceptance_passed = (persisted_equivalent and network_equivalent
+                         and complete_scope and error is None)
     return {
         "version": 2,
         "passed": acceptance_passed,
@@ -376,12 +435,17 @@ def _result(
         "complete_scope": complete_scope,
         "acceptance_passed": acceptance_passed,
         "error": error,
-        "scope": {"exclusions": list(_SCOPE_EXCLUSIONS)},
+        "network_parameterized_equivalent": network_parameterized_equivalent,
+        "network_evidence": network_evidence,
+        "network_tables": network_tables or [],
+        "scope": {"exclusions": exclusions},
         "tables": tables,
     }
 
 
 def compare_runs(conn: Any, baseline: dict[str, UUID], candidate: dict[str, UUID], *, batch_size: int = 2000) -> dict[str, Any]:
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        return _result(tables=[], persisted_equivalent=False, error="preflight:batch_size")
     conn.execute("SET TRANSACTION READ ONLY")
     require_current_schema(conn)
     metadata = {label: _lineage(conn, runs) for label, runs in
@@ -414,7 +478,27 @@ def compare_runs(conn: Any, baseline: dict[str, UUID], candidate: dict[str, UUID
                            _rows(conn, spec, baseline, "baseline", batch_size),
                            _rows(conn, spec, candidate, "candidate", batch_size))
               for spec in TABLES]
+    persisted_equivalent = all(table["passed"] for table in tables)
+    try:
+        replays = {
+            label: replay_network(
+                conn, runs["detect"], runs["fit"],
+                _network_identity_rows(conn, runs["detect"], label, batch_size),
+                batch_size=batch_size,
+            )
+            for label, runs in (("baseline", baseline), ("candidate", candidate))
+        }
+        network_tables, network_equivalent = _compare_network_replays(
+            replays["baseline"], replays["candidate"],
+        )
+    except Exception as exc:
+        return _result(
+            tables=tables, persisted_equivalent=persisted_equivalent,
+            error=f"network_replay:{type(exc).__name__}",
+        )
     return _result(
-        tables=tables,
-        persisted_equivalent=all(table["passed"] for table in tables),
+        tables=tables, persisted_equivalent=persisted_equivalent,
+        network_tables=network_tables,
+        network_parameterized_equivalent=network_equivalent,
+        network_evidence={label: replay.evidence for label, replay in replays.items()},
     )

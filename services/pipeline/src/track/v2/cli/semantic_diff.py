@@ -43,6 +43,8 @@ def main() -> int:
         result = {
             "version": 2, "passed": False, "persisted_equivalent": False,
             "complete_scope": False, "acceptance_passed": False,
+            "network_parameterized_equivalent": None,
+            "network_evidence": None, "network_tables": [],
             "error": type(exc).__name__,
             "scope": {"exclusions": [{
                 "name": "comparison", "reason": "comparison failed",

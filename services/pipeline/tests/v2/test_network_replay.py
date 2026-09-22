@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -135,3 +136,58 @@ def test_new_network_config_field_fails_before_database_reads() -> None:
         with pytest.raises(NetworkReplayError, match="domain changed"):
             _replay(conn)
     assert conn.queries == []
+
+
+def test_real_postgres_replay_reads_only_persisted_small_inputs() -> None:
+    if not os.environ.get("ROADNET_TEST_DSN"):
+        pytest.skip("ROADNET_TEST_DSN is not set")
+    import psycopg
+    from psycopg import sql
+
+    dsn = os.environ["ROADNET_TEST_DSN"]
+    schema = "network_replay_" + uuid4().hex
+    detect_id, fit_id = uuid4(), uuid4()
+    with psycopg.connect(dsn, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    scoped = psycopg.conninfo.make_conninfo(dsn, options=f"-csearch_path={schema},public")
+    try:
+        with psycopg.connect(scoped) as conn:
+            conn.execute("""
+              CREATE TABLE detect_runs(id uuid PRIMARY KEY,status text);
+              CREATE TABLE fit_runs(id uuid PRIMARY KEY,detect_id uuid,status text);
+              CREATE TABLE candidate_intersections(
+                id bigint,detect_id uuid,centroid_lon double precision,centroid_lat double precision);
+              CREATE TABLE intersections(
+                id bigint,detect_id uuid,candidate_intersection_id bigint,clip_radius_m double precision);
+              CREATE TABLE centerlines(
+                fit_id uuid,detect_id uuid,variant text,from_intersection_id bigint,
+                to_intersection_id bigint,geom public.geometry(LineString,4326),
+                length_m double precision,forward_clip_count integer,reverse_clip_count integer)
+            """)
+            conn.execute("INSERT INTO detect_runs VALUES (%s,'completed')", (detect_id,))
+            conn.execute("INSERT INTO fit_runs VALUES (%s,%s,'completed')",
+                         (fit_id, detect_id))
+            conn.execute("INSERT INTO candidate_intersections VALUES "
+                         "(10,%s,120,30),(20,%s,120.001,30.001),(30,%s,121,31)",
+                         (detect_id, detect_id, detect_id))
+            conn.execute("INSERT INTO intersections VALUES "
+                         "(1,%s,10,10),(2,%s,20,11),(3,%s,30,12)",
+                         (detect_id, detect_id, detect_id))
+            conn.execute("INSERT INTO centerlines VALUES "
+                         "(%s,%s,'combined',1,2,"
+                         "public.ST_GeomFromText('LINESTRING(120 30,120.001 30.001)',4326),"
+                         "20,3,5)", (fit_id, detect_id))
+            result = replay_network(
+                conn, detect_id, fit_id, [(1, "z"), (2, "a"), (3, "isolated")],
+                batch_size=1,
+            )
+            assert len(result.tables["network.replay.false.nodes"]) == 2
+            assert len(result.tables["network.replay.true.nodes"]) == 3
+            assert result.evidence["detect_id"] == str(detect_id)
+            assert result.evidence["fit_id"] == str(fit_id)
+            conn.rollback()
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as admin:
+            admin.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                sql.Identifier(schema)
+            ))
