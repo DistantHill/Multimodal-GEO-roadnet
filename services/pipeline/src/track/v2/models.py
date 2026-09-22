@@ -191,12 +191,12 @@ class FieldSpec(TrackModel):
     """
 
     canonical: str
-    aliases: tuple[str, ...] = ()
-    required: bool = True
-    type: str = "float"
-    unit_scale: float = 1.0
-    default: Any = None
-    extra: bool = False
+    aliases: tuple[str, ...]
+    required: bool
+    type: str
+    unit_scale: float
+    default: Any
+    extra: bool
 
 
 @dataclass(frozen=True)
@@ -222,9 +222,9 @@ class FieldConfig(TrackModel):
     """Parser field specs plus data-quality thresholds."""
 
     specs: list[FieldSpec]
-    sample_errors_max: int = 50
-    max_consecutive_errors: int = 50
-    max_error_ratio: float = 1.0
+    sample_errors_max: int
+    max_consecutive_errors: int
+    max_error_ratio: float
 
 
 @dataclass(frozen=True)
@@ -323,13 +323,13 @@ class ExcludedIndex(TrackModel):
 class RefineConfig(TrackModel):
     """Refine configuration."""
 
-    max_extension_m: float = 80.0
-    min_heading_delta_deg: float = 80.0
-    max_heading_delta_deg: float = 100.0
-    max_gap_s: float = 120.0
-    min_speed_mps: float = 0.3
-    max_stationary_duration_s: float = 300.0
-    excluded_sample_max: int = 50
+    max_extension_m: float
+    min_heading_delta_deg: float
+    max_heading_delta_deg: float
+    max_gap_s: float
+    min_speed_mps: float
+    max_stationary_duration_s: float
+    excluded_sample_max: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,10 +340,10 @@ class ProjectionConfig(TrackModel):
     property of the data region, not a safe repository-wide constant.
     """
 
-    source_srid: int = 4326
-    processing_srid: int | None = None
-    enforce_area_of_use: bool = True
-    max_scale_error: float = 0.01
+    source_srid: int
+    processing_srid: int
+    enforce_area_of_use: bool
+    max_scale_error: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,25 +365,29 @@ class RuntimeConfig(TrackModel):
         progress throttling). Owned by the pipeline TOML, not any one stage.
     """
 
-    db_insert_batch: int = 5000
-    import_batch_size: int = 10_000
-    csv_max_field_size: int = 10 * 1024 * 1024
-    encoding_sample_size: int = 64 * 1024
-    encoding_confidence: float = 0.5
-    default_text_encoding: str = "utf-8-sig"
-    fallback_encodings: tuple[str, ...] = ("gb18030", "gbk", "cp936", "big5")
-    mark_flush_every_n: int = 2000
-    excluded_flush_threshold: int = 2000
-    refine_flush_point_threshold: int = 100_000
-    progress_interval: int = 500
-    progress_time_threshold_s: float = 2.0
-    duckdb_memory_limit: str = "1GB"
-    duckdb_threads: int = 4
-    duckdb_max_temp_directory_size: str = "50GB"
-    polars_threads: int = 4
-    parquet_target_file_size_bytes: int = 0
-    parquet_row_group_size_rows: int = 0
-    artifact_gc_grace_days: int = 7
+    db_insert_batch: int
+    db_stream_batch_size: int
+    relation_batch_size: int
+    parquet_read_batch_size: int
+    validation_batch_size: int
+    import_batch_size: int
+    csv_max_field_size: int
+    encoding_sample_size: int
+    encoding_confidence: float
+    default_text_encoding: str
+    fallback_encodings: tuple[str, ...]
+    mark_flush_every_n: int
+    excluded_flush_threshold: int
+    refine_flush_point_threshold: int
+    progress_interval: int
+    progress_time_threshold_s: float
+    duckdb_memory_limit: str
+    duckdb_threads: int
+    duckdb_max_temp_directory_size: str
+    polars_threads: int
+    parquet_target_file_size_bytes: int
+    parquet_row_group_size_rows: int
+    artifact_gc_grace_days: int
 
     def __post_init__(self) -> None:
         for name, lower, upper in (
@@ -772,7 +776,7 @@ class ClipResult(TrackModel):
 
 @dataclass(frozen=True, slots=True)
 class ClipConfig(TrackModel):
-    include_boundary_clips: bool = True
+    include_boundary_clips: bool
 
 
 # ── Fitting output models ───────────────────────────────────────────
@@ -782,9 +786,9 @@ class ClipConfig(TrackModel):
 class FittingConfig(TrackModel):
     """Configuration for fitting one centerline per connected pair."""
 
-    point_spacing_m: float = 50.0
-    fit_sample_spacing_m: float = 10.0
-    min_clips_per_pair: int = 1
+    point_spacing_m: float
+    fit_sample_spacing_m: float
+    min_clips_per_pair: int
 
 
 CenterlineVariant = Literal["combined", "directed"]
@@ -851,7 +855,7 @@ class CenterlineFitBundle(TrackModel):
 
 @dataclass(frozen=True, slots=True)
 class NetworkConfig(TrackModel):
-    include_isolated_nodes: bool = True
+    include_isolated_nodes: bool
 
 
 @dataclass(frozen=True, slots=True)

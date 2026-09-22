@@ -1,6 +1,8 @@
 """First-phase DuckDB writer relation behavior and lifecycle."""
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import inspect
 import math
 from pathlib import Path
@@ -16,7 +18,7 @@ from track.v2 import db_writer
 
 def _relation(tmp_path: Path, *, batch_size: int = 2) -> WriterRelation:
     return WriterRelation(
-        RuntimeConfig(duckdb_memory_limit="128MB", duckdb_threads=1,
+        runtime_config(duckdb_memory_limit="128MB", duckdb_threads=1,
                       duckdb_max_temp_directory_size="256MB"),
         tmp_path, "detect", batch_size=batch_size, relation_id="relation",
     )
@@ -24,7 +26,7 @@ def _relation(tmp_path: Path, *, batch_size: int = 2) -> WriterRelation:
 
 @pytest.mark.parametrize("failure", [None, RuntimeError("failed"), KeyboardInterrupt()])
 def test_persist_detect_result_owns_relation_lifecycle(tmp_path, monkeypatch, failure):
-    runtime = RuntimeConfig()
+    runtime = runtime_config()
     events = []
 
     class Relation:
@@ -517,13 +519,13 @@ def test_annotation_hotspot_iterator_always_closes(tmp_path, failure):
 @pytest.mark.parametrize("batch_size", [True, 0])
 def test_invalid_batch_size(tmp_path, batch_size):
     with pytest.raises(ValueError, match="batch_size"):
-        WriterRelation(RuntimeConfig(), tmp_path, "detect", batch_size=batch_size)
+        WriterRelation(runtime_config(), tmp_path, "detect", batch_size=batch_size)
 
 
 @pytest.mark.parametrize("root", ["relative", "/"])
 def test_unsafe_data_root(root):
     with pytest.raises(ValueError, match="absolute and non-root"):
-        WriterRelation(RuntimeConfig(), root, "detect")
+        WriterRelation(runtime_config(), root, "detect")
 
 
 @pytest.mark.parametrize("field,value", [
@@ -534,7 +536,7 @@ def test_unsafe_identity(tmp_path, field, value):
     kwargs = {field: value}
     detect_id = kwargs.pop("detect_id", "detect")
     with pytest.raises(ValueError, match=field):
-        WriterRelation(RuntimeConfig(), tmp_path, detect_id, **kwargs)
+        WriterRelation(runtime_config(), tmp_path, detect_id, **kwargs)
 
 
 def test_connection_and_schema_failures_clean_only_leaf(tmp_path, monkeypatch):
@@ -543,7 +545,7 @@ def test_connection_and_schema_failures_clean_only_leaf(tmp_path, monkeypatch):
     monkeypatch.setattr(writer_relation.duckdb, "connect",
                         lambda **_kw: (_ for _ in ()).throw(RuntimeError("open failed")))
     with pytest.raises(RuntimeError, match="open failed"):
-        WriterRelation(RuntimeConfig(), tmp_path, "detect", relation_id="failed")
+        WriterRelation(runtime_config(), tmp_path, "detect", relation_id="failed")
     assert sibling.is_dir() and not (sibling.parent / "failed").exists()
 
 
@@ -556,7 +558,7 @@ def test_schema_failure_closes_connection_and_cleans_only_leaf(tmp_path, monkeyp
     monkeypatch.setattr(WriterRelation, "_create_schema",
                         lambda _self: (_ for _ in ()).throw(RuntimeError("schema failed")))
     with pytest.raises(RuntimeError, match="schema failed"):
-        WriterRelation(RuntimeConfig(), tmp_path, "detect", relation_id="failed")
+        WriterRelation(runtime_config(), tmp_path, "detect", relation_id="failed")
     with pytest.raises(Exception):
         connection.execute("SELECT 1")
     assert sibling.is_dir() and not (sibling.parent / "failed").exists()
@@ -568,7 +570,7 @@ def test_identity_collision_preserves_foreign_leaf(tmp_path):
     marker = leaf / "owned"
     marker.write_text("keep")
     with pytest.raises(FileExistsError):
-        WriterRelation(RuntimeConfig(), tmp_path, "detect", relation_id="occupied")
+        WriterRelation(runtime_config(), tmp_path, "detect", relation_id="occupied")
     assert marker.read_text() == "keep"
 
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -150,10 +149,16 @@ def _relation(query: str, table: str) -> str:
     )
 
 
-def _open(runtime: RuntimeConfig, temp: Path) -> duckdb.DuckDBPyConnection:
-    extension = Path(os.environ.get("DUCKDB_POSTGRES_EXTENSION_PATH", ""))
+def _open(
+    runtime: RuntimeConfig,
+    temp: Path,
+    postgres_extension_path: Path,
+) -> duckdb.DuckDBPyConnection:
+    extension = postgres_extension_path
     if not extension.is_absolute() or not extension.is_file():
-        raise DetectParquetError("DUCKDB_POSTGRES_EXTENSION_PATH must name a bundled absolute file")
+        raise DetectParquetError(
+            "paths.duckdb_postgres_extension_path must name a bundled absolute file"
+        )
     temp.mkdir(parents=True, exist_ok=True)
     connection = duckdb.connect(database=":memory:", config={
         "autoinstall_known_extensions": "false", "autoload_known_extensions": "false",
@@ -241,7 +246,8 @@ def _validate_schema(descriptor: ArtifactDescriptor) -> None:
 
 def export_detect_parquet(conn: Any, postgres: PostgresConfig, handle: StagingDataset,
                           runtime: RuntimeConfig,
-                          source_fingerprint: dict[str, object]) -> ArtifactDescriptor:
+                          source_fingerprint: dict[str, object], *, data_root: Path,
+                          postgres_extension_path: Path) -> ArtifactDescriptor:
     """Write and inspect staging only; never publish, finish, or control transactions.
 
     Detect result rows must already be committed and visible to postgres_scanner,
@@ -255,8 +261,11 @@ def export_detect_parquet(conn: Any, postgres: PostgresConfig, handle: StagingDa
     contract = validate_source_table(conn, source_table)
     queries = _queries(handle.run_id, schema, contract.quoted_table, contract.key_sql_type)
     outputs = {name: handle.path / name / "part-00000.parquet" for name in DETECT_PARQUET_V1}
-    data_root = Path(os.environ.get("DATA_ROOT", "/data"))
-    with _open(runtime, data_root / "duckdb" / str(handle.run_id)) as connection:
+    with _open(
+        runtime,
+        data_root / "duckdb" / str(handle.run_id),
+        postgres_extension_path,
+    ) as connection:
         connection.execute(
             f"ATTACH {_literal(postgres.dsn())} AS authoritative_pg (TYPE postgres, READ_ONLY)"
         )

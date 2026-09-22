@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, pipeline_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import unittest
 from contextlib import ExitStack
 from dataclasses import replace
@@ -28,17 +30,9 @@ from track.v2.projection import create_spatial_context
 
 REFINE_ID = "11111111-1111-1111-1111-111111111111"
 DETECT_ID = "22222222-2222-2222-2222-222222222222"
-_PROJECTION_CONFIG = ProjectionConfig(processing_srid=3857)
+_PROJECTION_CONFIG = projection_config(processing_srid=3857)
 _SPATIAL_CONTEXT = create_spatial_context(_PROJECTION_CONFIG)
-_PIPELINE_CONFIG = PipelineConfig(
-    projection=_PROJECTION_CONFIG,
-    refine=RefineConfig(),
-    detect=IntersectConfig(),
-    clip=ClipConfig(),
-    fitting=FittingConfig(),
-    network=NetworkConfig(),
-    runtime=RuntimeConfig(),
-)
+_PIPELINE_CONFIG = replace(pipeline_config(), projection=_PROJECTION_CONFIG)
 
 
 def _empty_intersect_result() -> IntersectResult:
@@ -206,10 +200,12 @@ class _RecordingStore:
 
     def load_clip(
         self, detect_id: str, *, publication_root: object,
-        data_root: object, runtime: object, config: object,
+        data_root: object, runtime: object, config: object, verify_sha256: bool,
     ) -> object:
         self.events.append("load_clip")
-        self.loaded_clip_args = (publication_root, data_root, runtime, config)
+        self.loaded_clip_args = (
+            publication_root, data_root, runtime, config, verify_sha256,
+        )
         if self.clip_error is not None:
             raise self.clip_error
         return self.clip_result
@@ -230,9 +226,7 @@ class _RecordingStore:
 
 class RunPipelineLifecycleTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.config = PostgresConfig(
-            host="localhost", port=5432, database="track", user="track", password="",
-        )
+        self.config = _PIPELINE_CONFIG
         self.events: list[str] = []
         _Reader.instances.clear()
         self.conn = _Connection(self.events)
@@ -240,9 +234,6 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch("track.v2.pipeline.pg_connect", return_value=self.conn))
-        self.stack.enter_context(
-            patch("track.v2.pipeline.load_pipeline_config", return_value=_PIPELINE_CONFIG)
-        )
         self.stack.enter_context(
             patch("track.v2.pipeline.PostgresPipelineStore", return_value=self.store)
         )
@@ -285,11 +276,11 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         ))
         self.stack.enter_context(patch(
             "track.v2.pipeline.export_refine_parquet",
-            side_effect=lambda *args: self.events.append("export_refine") or self.descriptor,
+            side_effect=lambda *args, **kwargs: self.events.append("export_refine") or self.descriptor,
         ))
         self.export_detect = self.stack.enter_context(patch(
             "track.v2.pipeline.export_detect_parquet",
-            side_effect=lambda *args: self.events.append("export_detect") or self.detect_descriptor,
+            side_effect=lambda *args, **kwargs: self.events.append("export_detect") or self.detect_descriptor,
         ))
         self.stack.enter_context(patch(
             "track.v2.pipeline.publish",
@@ -298,12 +289,6 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.abandon = self.stack.enter_context(patch(
             "track.v2.pipeline.abandon_staging",
             side_effect=lambda handle: self.events.append(f"abandon:{handle.stage}"),
-        ))
-        self.stack.enter_context(patch(
-            "track.v2.pipeline._parquet_root", return_value="/tmp/parquet",
-        ))
-        self.stack.enter_context(patch(
-            "track.v2.pipeline._data_root", return_value="/tmp/data",
         ))
         self.detect = self.stack.enter_context(
             patch("track.v2.pipeline.detect_intersections", return_value=_empty_intersect_result())
@@ -325,7 +310,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
     def test_full_run_uses_stage_store_and_preserves_commit_order(self) -> None:
         emitted: list[PipelineEvent] = []
         result = run_pipeline(
-            PipelineInput(self.config, source_table="raw_points"),
+            PipelineInput(source_table="raw_points"), self.config,
             emit=emitted.append,
         ).stats
 
@@ -336,10 +321,16 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertIs(self.store.completed_detect_artifact[1], self.detect_descriptor)
         self.assertEqual(
             self.store.loaded_clip_args,
-            ("/tmp/parquet", "/tmp/data", _PIPELINE_CONFIG.runtime, _PIPELINE_CONFIG.clip),
+            (
+                _PIPELINE_CONFIG.paths.parquet_directory,
+                _PIPELINE_CONFIG.paths.data_root,
+                _PIPELINE_CONFIG.runtime,
+                _PIPELINE_CONFIG.clip, _PIPELINE_CONFIG.resources.verify_artifact_sha256,
+            ),
         )
         self.assertEqual(
-            self.store.persist_detect_args, (_PIPELINE_CONFIG.runtime, "/tmp/data"),
+            self.store.persist_detect_args,
+            (_PIPELINE_CONFIG.runtime, _PIPELINE_CONFIG.paths.data_root),
         )
         self.assertEqual(self.descriptor.relative_path, f"refine/{REFINE_ID}")
         self.assertTrue(_Reader.instances[-1].closed)
@@ -446,7 +437,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
 
         self.store.commit = commit
         with self.assertRaisesRegex(RuntimeError, "validation failed"):
-            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID), emit=emitted.append)
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config, emit=emitted.append)
         self.assertIn("finish_detect:failed", self.events)
         self.assertIn("publish:detect", self.events)
         self.assertNotIn("abandon:detect", self.events)
@@ -462,7 +453,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             ),
             self.assertRaisesRegex(RuntimeError, "Detect source changed"),
         ):
-            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
 
         self.assertIn("abandon:detect", self.events)
         self.assertNotIn("publish:detect", self.events)
@@ -474,7 +465,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
     def test_detect_export_failure_abandons_staging_and_marks_failed(self) -> None:
         self.export_detect.side_effect = RuntimeError("detect export failed")
         with self.assertRaisesRegex(RuntimeError, "detect export failed"):
-            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
 
         self.assertIn("abandon:detect", self.events)
         self.assertNotIn("publish:detect", self.events)
@@ -493,7 +484,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             patch("track.v2.pipeline.publish", side_effect=fail_detect_publish),
             self.assertRaisesRegex(RuntimeError, "detect publish failed"),
         ):
-            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
 
         self.assertIn("abandon:detect", self.events)
         self.assertNotIn("artifact:metadata", self.events)
@@ -513,7 +504,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             patch("track.v2.pipeline.RefineDatasetReader", _FailingReader),
             self.assertRaisesRegex(RuntimeError, "artifact deleted"),
         ):
-            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
 
         self.assertTrue(_FailingReader.instances[-1].closed)
         self.assertIn("finish_detect:failed", self.events)
@@ -524,14 +515,14 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             patch("track.v2.pipeline.find_refine_artifact", side_effect=RuntimeError("missing")),
             self.assertRaisesRegex(RuntimeError, "missing"),
         ):
-            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
         self.assertIn("finish_detect:failed", self.events)
         self.detect.assert_not_called()
 
     def test_fingerprint_mismatch_closes_reader_and_marks_detect_failed(self) -> None:
         self.detect.side_effect = RuntimeError("fingerprint mismatch")
         with self.assertRaisesRegex(RuntimeError, "fingerprint mismatch"):
-            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
         self.assertTrue(_Reader.instances[-1].closed)
         self.assertIn("finish_detect:failed", self.events)
 
@@ -541,7 +532,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 raise RuntimeError("output failed")
 
         with self.assertRaisesRegex(RuntimeError, "output failed"):
-            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID), emit=emit)
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config, emit=emit)
         self.assertIn("finish_fit:completed", self.events)
         self.assertNotIn("finish_fit:failed", self.events)
 
@@ -551,13 +542,13 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 raise RuntimeError("detect output failed")
 
         with self.assertRaisesRegex(RuntimeError, "detect output failed"):
-            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID), emit=emit)
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config, emit=emit)
         self.assertIn("finish_detect:completed", self.events)
         self.assertNotIn("finish_detect:failed", self.events)
 
     def test_completed_refine_reuses_store_record_without_refine_stage(self) -> None:
-        first = run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID)).stats
-        second = run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID)).stats
+        first = run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config).stats
+        second = run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config).stats
 
         self.assertEqual(
             (first["detect_id"], second["detect_id"]),
@@ -578,10 +569,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "stream failed"),
         ):
             run_pipeline(
-                PipelineInput(
-                    self.config,
-                    source_table="raw_points",
-                )
+                PipelineInput(source_table="raw_points"), self.config
             )
 
         self.assertEqual(
@@ -600,7 +588,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             patch("track.v2.pipeline.calculate_source_fingerprint", side_effect=fingerprints),
             self.assertRaisesRegex(RuntimeError, "source changed"),
         ):
-            run_pipeline(PipelineInput(self.config, source_table="raw_points"))
+            run_pipeline(PipelineInput(source_table="raw_points"), self.config)
 
         self.assertIn("abandon:refine", self.events)
         self.assertNotIn("publish:refine", self.events)
@@ -614,7 +602,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             ),
             self.assertRaisesRegex(RuntimeError, "export failed"),
         ):
-            run_pipeline(PipelineInput(self.config, source_table="raw_points"))
+            run_pipeline(PipelineInput(source_table="raw_points"), self.config)
 
         self.assertIn("abandon:refine", self.events)
         self.assertNotIn("publish:refine", self.events)
@@ -627,7 +615,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
 
         self.store.complete_refine_with_artifact = fail_completion
         with self.assertRaisesRegex(RuntimeError, "registry failed"):
-            run_pipeline(PipelineInput(self.config, source_table="raw_points"))
+            run_pipeline(PipelineInput(source_table="raw_points"), self.config)
 
         self.assertIn("publish:refine", self.events)
         self.assertNotIn("abandon:refine", self.events)
@@ -654,10 +642,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "outside projection bounds"),
         ):
             run_pipeline(
-                PipelineInput(
-                    self.config,
-                    source_table="raw_points",
-                )
+                PipelineInput(source_table="raw_points"), self.config
             )
 
         transformer.validate_bounds.assert_called_once_with((116.0, 39.0, 116.0, 39.0))
@@ -673,7 +658,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.store.clip_error = RuntimeError("clip failed")
 
         with self.assertRaisesRegex(RuntimeError, "clip failed"):
-            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
 
         self.assertEqual(self.events[-6:], [
             "publish:detect", "artifact:metadata", "artifact:present",
@@ -685,7 +670,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.store.persist_detect_error = RuntimeError("detect write failed")
 
         with self.assertRaisesRegex(RuntimeError, "detect write failed"):
-            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
 
         self.assertEqual(self.events[-5:], [
             "rollback", "persist_detect", "rollback", "finish_detect:failed", "commit",
@@ -700,7 +685,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             ),
             self.assertRaisesRegex(RuntimeError, "detect compute failed"),
         ):
-            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
 
         self.assertEqual(
             self.events[-4:],
@@ -712,7 +697,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.store.fit_bundle_error = RuntimeError("write failed")
 
         with self.assertRaisesRegex(RuntimeError, "write failed"):
-            run_pipeline(PipelineInput(self.config, refine_id=REFINE_ID))
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
 
         self.assertEqual(self.events[-5:], [
             "commit", "persist_fit", "rollback", "finish_fit:failed", "commit",

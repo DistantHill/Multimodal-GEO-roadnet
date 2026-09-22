@@ -1,172 +1,320 @@
-"""Centralized pipeline configuration loader.
-
-ZH: 从 ``config/pipeline.toml`` 加载 v2 运行时所有可调参数，映射到各阶段的
-    frozen dataclass。TOML 中缺失的键回退到 dataclass 默认值，未知键报错，
-    与 :mod:`track.v2.field_config` 的加载风格一致。
-
-EN: Load every tunable v2 runtime parameter from ``config/pipeline.toml`` and
-    map it onto the per-stage frozen dataclasses. Missing keys fall back to the
-    dataclass defaults; unknown keys raise, matching the loading style of
-    :mod:`track.v2.field_config`.
-"""
-
+"""Strict, single-source Pipeline TOML configuration loader."""
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
+import math
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from types import UnionType
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
-from ..errors import ConfigError
 from ..detect import IntersectConfig
-from ..models import (
-    RefineConfig,
-    ClipConfig,
-    FittingConfig,
-    NetworkConfig,
-    ProjectionConfig,
-    RuntimeConfig,
-)
+from ..errors import ConfigError
+from ..field_config import load_field_config
+from ..models import (ClipConfig, FieldConfig, FittingConfig, NetworkConfig,
+                      ProjectionConfig, RefineConfig, RuntimeConfig)
+from . import PostgresConfig
 
 
-DEFAULT_PIPELINE_CONFIG_PATH = Path(__file__).resolve().parent / "pipeline.toml"
-
-# ZH: 顶层 TOML 节名白名单，防止 section 名打错字被静默忽略。
-# EN: Top-level section whitelist, so a typo'd section name is not silently ignored.
-_SECTIONS = (
-    "projection", "refine", "detect", "clip", "fitting", "network", "runtime",
-)
-_REMOVED_DETECT_KEYS = {
-    "use_orthogonal_candidates": "use_cross_track_candidates",
-    "dbscan_eps_m_ortho": None,
-    "dbscan_min_samples_ortho": None,
-}
-_STRICT_RUNTIME_INTS = {
-    "duckdb_threads",
-    "polars_threads",
-    "parquet_target_file_size_bytes",
-    "parquet_row_group_size_rows",
-    "artifact_gc_grace_days",
-}
+@dataclass(frozen=True, slots=True)
+class PathsConfig:
+    data_root: Path
+    parquet_directory: Path
+    duckdb_postgres_extension_path: Path
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class LoggingConfig:
+    directory: Path
+
+
+@dataclass(frozen=True, slots=True)
+class ParserConfig:
+    field_specs_path: Path
+    fields: FieldConfig
+
+
+@dataclass(frozen=True, slots=True)
+class ResourcesConfig:
+    verify_artifact_sha256: bool
+
+
+@dataclass(frozen=True, slots=True)
 class PipelineConfig:
-    """Composite of all per-stage configs plus the cross-cutting runtime config."""
-
+    postgres: PostgresConfig
+    paths: PathsConfig
+    logging: LoggingConfig
     projection: ProjectionConfig
+    parser: ParserConfig
     refine: RefineConfig
     detect: IntersectConfig
     clip: ClipConfig
     fitting: FittingConfig
     network: NetworkConfig
     runtime: RuntimeConfig
+    resources: ResourcesConfig
+
+    def effective_snapshot(self) -> dict[str, Any]:
+        """Return the complete effective non-secret configuration."""
+        return {
+            "semantic_config": {
+                "projection": self.projection.as_dict(),
+                "parser": {
+                    "field_specs": self.parser.fields.as_dict(),
+                },
+                "refine": self.refine.as_dict(),
+                "detect": self.detect.as_dict(),
+                "clip": self.clip.as_dict(),
+                "fitting": self.fitting.as_dict(),
+                "network": self.network.as_dict(),
+            },
+            "execution_config": {
+                "postgres": {
+                    "host": self.postgres.host,
+                    "port": self.postgres.port,
+                    "database": self.postgres.database,
+                    "user": self.postgres.user,
+                    "connect_timeout": self.postgres.connect_timeout,
+                    "sslmode": self.postgres.sslmode,
+                    "keepalives": self.postgres.keepalives,
+                    "keepalives_idle": self.postgres.keepalives_idle,
+                    "keepalives_interval": self.postgres.keepalives_interval,
+                    "keepalives_count": self.postgres.keepalives_count,
+                    "tcp_user_timeout": self.postgres.tcp_user_timeout,
+                },
+                "paths": {
+                    "data_root": str(self.paths.data_root),
+                    "parquet_directory": str(self.paths.parquet_directory),
+                    "duckdb_postgres_extension_path": str(
+                        self.paths.duckdb_postgres_extension_path
+                    ),
+                },
+                "logging": {"directory": str(self.logging.directory)},
+                "runtime": self.runtime.as_dict(),
+                "resources": dataclasses.asdict(self.resources),
+            },
+        }
+
+    def snapshot_parameters(self) -> dict[str, Any]:
+        """Return persisted configuration values plus a stable SHA-256 digest."""
+        snapshot = self.effective_snapshot()
+        canonical = json.dumps(
+            snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return {**snapshot, "config_digest": hashlib.sha256(canonical.encode()).hexdigest()}
 
 
-def _coerce(value: Any, default: Any, name: str) -> Any:
-    """Coerce a TOML scalar to the type of ``default``, raising on mismatch."""
-    if isinstance(default, bool):
-        if not isinstance(value, bool):
-            raise ConfigError(f"{name} must be a boolean")
-        return value
-    if isinstance(default, int):
-        try:
-            return int(value)
-        except (TypeError, ValueError) as exc:
-            raise ConfigError(f"{name} must be an integer") from exc
-    if isinstance(default, float):
-        try:
-            return float(value)
-        except (TypeError, ValueError) as exc:
-            raise ConfigError(f"{name} must be a number") from exc
-    if isinstance(default, tuple):
-        if not isinstance(value, (list, tuple)):
-            raise ConfigError(f"{name} must be an array")
+_SECTION_TYPES: dict[str, type[Any]] = {
+    "postgres": PostgresConfig, "paths": PathsConfig, "logging": LoggingConfig,
+    "projection": ProjectionConfig, "refine": RefineConfig, "detect": IntersectConfig,
+    "clip": ClipConfig, "fitting": FittingConfig, "network": NetworkConfig,
+    "runtime": RuntimeConfig, "resources": ResourcesConfig,
+}
+
+
+def _matches(value: Any, annotation: Any) -> bool:
+    origin = get_origin(annotation)
+    if origin in (Union, UnionType):
+        return any(_matches(value, item) for item in get_args(annotation))
+    if origin is tuple:
+        args = get_args(annotation)
+        return isinstance(value, list) and (len(args) == 2 and args[1] is Ellipsis
+            and all(_matches(v, args[0]) for v in value)
+            or len(args) == len(value) and all(_matches(v, t) for v, t in zip(value, args)))
+    if annotation is bool:
+        return type(value) is bool
+    if annotation is int:
+        return type(value) is int
+    if annotation is float:
+        return type(value) in (int, float)
+    if annotation is str:
+        return isinstance(value, str)
+    if annotation is Path:
+        return isinstance(value, str)
+    return True
+
+
+def _convert(value: Any, annotation: Any, base_dir: Path) -> Any:
+    if get_origin(annotation) is tuple:
         return tuple(value)
+    if annotation is float:
+        return float(value)
+    if annotation is Path:
+        path = Path(value)
+        return path if path.is_absolute() else (base_dir / path).resolve()
     return value
 
 
-def _build_section(base: Any, section: Any) -> Any:
-    """Build a dataclass instance from a TOML table, overlaying only present keys."""
-    cls = base.__class__.__name__
-    if not isinstance(section, dict):
-        raise ConfigError(f"[{cls}] section must be a table")
+def _collect_section(name: str, cls: type[Any], raw: Any, base_dir: Path,
+                     errors: list[str]) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        errors.append(f"{name}: section must be a table")
+        return {}
+    fields = {item.name: item for item in dataclasses.fields(cls)}
+    if cls is PostgresConfig:
+        fields.pop("password")
+    errors.extend(f"{name}.{key}: unknown key" for key in sorted(set(raw) - set(fields)))
+    errors.extend(f"{name}.{key}: missing required key" for key in sorted(set(fields) - set(raw)))
+    hints = get_type_hints(cls)
+    result = {}
+    for key in sorted(set(raw) & set(fields)):
+        annotation = hints[key]
+        if not _matches(raw[key], annotation):
+            errors.append(f"{name}.{key}: expected {annotation!s}")
+        else:
+            result[key] = _convert(raw[key], annotation, base_dir)
+    return result
 
-    known = {field.name for field in dataclasses.fields(base)}
-    unknown = set(section) - known
-    if unknown:
-        if isinstance(base, IntersectConfig) and unknown & _REMOVED_DETECT_KEYS.keys():
-            migrations = []
-            for key in sorted(unknown & _REMOVED_DETECT_KEYS.keys()):
-                replacement = _REMOVED_DETECT_KEYS[key]
-                if replacement is None:
-                    migrations.append(f"remove {key}")
-                else:
-                    migrations.append(f"rename {key} to {replacement}")
-            raise ConfigError(
-                f"[{cls}] removed Method 2 keys: {', '.join(migrations)}"
-            )
-        raise ConfigError(f"[{cls}] unknown keys: {', '.join(sorted(unknown))}")
 
-    overrides: dict[str, Any] = {}
-    for field in dataclasses.fields(base):
-        if field.name in section:
-            if field.name == "processing_srid":
-                value = section[field.name]
-                if isinstance(value, bool) or not isinstance(value, int):
-                    raise ConfigError(f"{cls}.processing_srid must be an integer")
-                overrides[field.name] = value
-                continue
-            if (
-                isinstance(base, RuntimeConfig)
-                and field.name in _STRICT_RUNTIME_INTS
-                and (
-                    isinstance(section[field.name], bool)
-                    or not isinstance(section[field.name], int)
-                )
-            ):
-                raise ConfigError(f"{cls}.{field.name} must be an integer")
-            overrides[field.name] = _coerce(
-                section[field.name], getattr(base, field.name), f"{cls}.{field.name}"
-            )
+def _validate(values: dict[str, dict[str, Any]], errors: list[str]) -> None:
+    positive = {"postgres.port", "postgres.connect_timeout", "postgres.keepalives_idle",
+        "postgres.keepalives_interval", "postgres.keepalives_count", "projection.source_srid",
+        "projection.processing_srid", "runtime.db_insert_batch", "runtime.db_stream_batch_size",
+        "runtime.relation_batch_size", "runtime.parquet_read_batch_size",
+        "runtime.validation_batch_size", "runtime.import_batch_size",
+        "runtime.csv_max_field_size", "runtime.encoding_sample_size", "runtime.progress_interval",
+        "runtime.duckdb_threads", "runtime.polars_threads", "runtime.artifact_gc_grace_days"}
+    non_negative = {"postgres.tcp_user_timeout", "runtime.parquet_target_file_size_bytes",
+                    "runtime.parquet_row_group_size_rows"}
+    for path in positive | non_negative:
+        section, key = path.split(".")
+        value = values.get(section, {}).get(key)
+        minimum = 0 if path in non_negative else 1
+        if value is not None and value < minimum:
+            errors.append(f"{path}: must be >= {minimum}")
+    strictly_positive = {
+        "refine.max_extension_m", "refine.max_gap_s", "detect.min_leg_m",
+        "detect.g_star_radius_m", "detect.dbscan_eps_m_turn",
+        "detect.cross_track_dbscan_eps_m", "detect.cross_track_grid_cell_m",
+        "detect.min_intersection_radius_m", "fitting.point_spacing_m",
+        "fitting.fit_sample_spacing_m", "runtime.progress_time_threshold_s",
+    }
+    non_negative_numbers = {
+        "refine.min_speed_mps", "refine.max_stationary_duration_s",
+        "detect.min_movement_speed_mps", "detect.merge_centroid_distance_m",
+        "detect.topology_radius_padding_m",
+    }
+    positive_integers = {
+        "refine.excluded_sample_max", "detect.turn_window",
+        "detect.dbscan_min_samples_turn", "detect.cross_track_dbscan_min_samples",
+        "detect.cross_track_pair_batch_size", "detect.cross_track_max_grid_cells_per_segment",
+        "detect.min_branches", "detect.min_observations", "detect.min_directed_transitions",
+        "detect.bearing_window", "detect.stream_batch_size", "fitting.min_clips_per_pair",
+        "runtime.mark_flush_every_n", "runtime.excluded_flush_threshold",
+        "runtime.refine_flush_point_threshold",
+    }
+    for path in strictly_positive | non_negative_numbers | positive_integers:
+        section, key = path.split(".")
+        value = values.get(section, {}).get(key)
+        minimum = 0 if path in non_negative_numbers else 0
+        if value is not None and (not math.isfinite(value) or
+                                  (value < minimum if path in non_negative_numbers else value <= minimum)):
+            operator = ">= 0" if path in non_negative_numbers else "> 0"
+            errors.append(f"{path}: must be finite and {operator}")
+    for path in ("projection.max_scale_error", "runtime.encoding_confidence"):
+        section, key = path.split(".")
+        value = values.get(section, {}).get(key)
+        if value is not None and not 0.0 <= value <= 1.0:
+            errors.append(f"{path}: must be in [0, 1]")
+    detect = values.get("detect", {})
+    angle_paths = ("refine.min_heading_delta_deg", "refine.max_heading_delta_deg",
+                   "detect.min_turn_deg", "detect.max_turn_deg",
+                   "detect.cross_track_straightness_deg", "detect.cross_track_min_angle_deg",
+                   "detect.cross_track_max_angle_deg", "detect.branch_threshold_deg")
+    for path in angle_paths:
+        section, key = path.split(".")
+        value = values.get(section, {}).get(key)
+        if value is not None and (not math.isfinite(value) or not 0.0 <= value <= 180.0):
+            errors.append(f"{path}: must be finite and in [0, 180]")
+    for path in ("detect.spatial_window_overlap",):
+        section, key = path.split(".")
+        value = values.get(section, {}).get(key)
+        if value is not None and not 0.0 <= value <= 1.0:
+            errors.append(f"{path}: must be in [0, 1]")
+    window = detect.get("spatial_window_size")
+    if window is not None and (len(window) != 2 or any(not math.isfinite(v) or v <= 0 for v in window)):
+        errors.append("detect.spatial_window_size: must contain two finite positive numbers")
+    for low, high in (("min_turn_deg", "max_turn_deg"),
+                      ("cross_track_min_angle_deg", "cross_track_max_angle_deg")):
+        if low in detect and high in detect and detect[low] > detect[high]:
+            errors.append(f"detect.{low}: must be <= detect.{high}")
+    refine = values.get("refine", {})
+    if ("min_heading_delta_deg" in refine and "max_heading_delta_deg" in refine
+            and refine["min_heading_delta_deg"] > refine["max_heading_delta_deg"]):
+        errors.append("refine.min_heading_delta_deg: must be <= refine.max_heading_delta_deg")
+    postgres = values.get("postgres", {})
+    if "port" in postgres and not 1 <= postgres["port"] <= 65535:
+        errors.append("postgres.port: must be in [1, 65535]")
+    for section, keys in {"postgres": ("host", "database", "user"),
+                          "runtime": ("default_text_encoding",)}.items():
+        for key in keys:
+            value = values.get(section, {}).get(key)
+            if value is not None and not value.strip():
+                errors.append(f"{section}.{key}: must be non-empty")
+    encodings = values.get("runtime", {}).get("fallback_encodings")
+    if encodings is not None and (not encodings or any(not item.strip() for item in encodings)):
+        errors.append("runtime.fallback_encodings: must be a non-empty list of non-empty strings")
+    paths = values.get("paths", {})
+    for key in ("data_root", "parquet_directory", "duckdb_postgres_extension_path"):
+        value = paths.get(key)
+        if value is not None and not value.is_absolute():
+            errors.append(f"paths.{key}: must be absolute")
+    if paths.get("data_root") == Path("/"):
+        errors.append("paths.data_root: must not be filesystem root")
+
+
+def load_pipeline_config(path: str | Path, *, postgres_password: str) -> PipelineConfig:
+    """Load one complete config file; never merge files or Python defaults."""
+    resolved = Path(path).resolve()
+    errors = ([] if postgres_password.strip() and postgres_password.strip() != "change-me" else
+              ["postgres.password: POSTGRES_PASSWORD is required and cannot be a placeholder"])
     try:
-        return dataclasses.replace(base, **overrides)
-    except ValueError as exc:
-        raise ConfigError(f"invalid [{cls}] configuration: {exc}") from exc
-
-
-def load_pipeline_config(path: str | Path | None = None) -> PipelineConfig:
-    """Load the pipeline config, falling back to the built-in ``pipeline.toml``.
-
-    ZH: 读取 pipeline TOML 并组装 PipelineConfig。``path`` 为 None 时使用内置
-        ``config/pipeline.toml``。文件缺失/格式错误/未知键时抛 ``ConfigError``。
-    EN: Read the pipeline TOML into a PipelineConfig. When ``path`` is None, use
-        the built-in ``config/pipeline.toml``. Raises ``ConfigError`` on missing
-        file, malformed TOML, or unknown keys.
-    """
-    resolved = Path(path) if path is not None else DEFAULT_PIPELINE_CONFIG_PATH
-    if not resolved.exists():
-        raise ConfigError(f"pipeline config not found: {resolved}")
-
-    try:
-        with resolved.open("rb") as fh:
-            payload = tomllib.load(fh)
+        with resolved.open("rb") as stream:
+            payload = tomllib.load(stream)
+    except FileNotFoundError:
+        raise ConfigError(f"pipeline config not found: {resolved}") from None
     except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"invalid TOML pipeline config: {resolved}") from exc
+        raise ConfigError(f"invalid TOML pipeline config: {resolved}: {exc}") from exc
     except OSError as exc:
-        raise ConfigError(f"cannot read pipeline config: {resolved}") from exc
-
-    unknown_top = set(payload) - set(_SECTIONS)
-    if unknown_top:
-        raise ConfigError(f"unknown pipeline config sections: {', '.join(sorted(unknown_top))}")
-
-    return PipelineConfig(
-        projection=_build_section(ProjectionConfig(), payload.get("projection", {})),
-        refine=_build_section(RefineConfig(), payload.get("refine", {})),
-        detect=_build_section(IntersectConfig(), payload.get("detect", {})),
-        clip=_build_section(ClipConfig(), payload.get("clip", {})),
-        fitting=_build_section(FittingConfig(), payload.get("fitting", {})),
-        network=_build_section(NetworkConfig(), payload.get("network", {})),
-        runtime=_build_section(RuntimeConfig(), payload.get("runtime", {})),
-    )
+        raise ConfigError(f"cannot read pipeline config: {resolved}: {exc}") from exc
+    expected = set(_SECTION_TYPES) | {"parser"}
+    errors.extend(f"{name}: unknown section" for name in sorted(set(payload) - expected))
+    errors.extend(f"{name}: missing required section" for name in sorted(expected - set(payload)))
+    values = {name: _collect_section(name, cls, payload.get(name), resolved.parent, errors)
+              for name, cls in _SECTION_TYPES.items()}
+    parser_raw = payload.get("parser")
+    parser_values = {}
+    if not isinstance(parser_raw, dict):
+        errors.append("parser: section must be a table")
+    else:
+        errors.extend(f"parser.{key}: unknown key"
+                      for key in sorted(set(parser_raw) - {"field_specs_path"}))
+        field_path = parser_raw.get("field_specs_path")
+        if not isinstance(field_path, str) or not field_path:
+            errors.append("parser.field_specs_path: expected non-empty string")
+        else:
+            parser_values["field_specs_path"] = (resolved.parent / field_path).resolve()
+    _validate(values, errors)
+    fields = None
+    if "field_specs_path" in parser_values:
+        try:
+            fields = load_field_config(parser_values["field_specs_path"])
+        except ConfigError as exc:
+            errors.append(f"parser.field_specs_path: {exc}")
+    values["postgres"]["password"] = postgres_password
+    built = {}
+    for name, cls in _SECTION_TYPES.items():
+        expected_count = len(dataclasses.fields(cls))
+        if cls is PostgresConfig:
+            expected_count -= 1
+        if len(values[name]) == expected_count + (1 if cls is PostgresConfig else 0):
+            try:
+                built[name] = cls(**values[name])
+            except (TypeError, ValueError) as exc:
+                errors.append(f"{name}: {exc}")
+    if errors:
+        raise ConfigError("invalid pipeline configuration:\n- " + "\n- ".join(errors))
+    return PipelineConfig(parser=ParserConfig(fields=fields, **parser_values), **built)

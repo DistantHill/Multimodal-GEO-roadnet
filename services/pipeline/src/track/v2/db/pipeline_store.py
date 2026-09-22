@@ -46,7 +46,6 @@ from ..models import (
 )
 
 
-_DEFAULT_BATCH_SIZE = 5000
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +114,7 @@ class PipelineStore(Protocol):
         subtrack_index: int,
         *,
         spatial_context: SpatialContext,
-        batch_size: int = _DEFAULT_BATCH_SIZE,
+        batch_size: int,
     ) -> RefineBatchResult: ...
 
     def start_detect_run(
@@ -132,7 +131,7 @@ class PipelineStore(Protocol):
         *,
         runtime: RuntimeConfig,
         data_root: Path | str,
-        batch_size: int = _DEFAULT_BATCH_SIZE,
+        batch_size: int,
     ) -> DetectPersistenceResult: ...
 
     def finish_detect(self, detect_id: str, *, status: str) -> None: ...
@@ -148,7 +147,8 @@ class PipelineStore(Protocol):
         publication_root: Path | str,
         data_root: Path | str,
         runtime: RuntimeConfig,
-        config: ClipConfig | None = None,
+        config: ClipConfig,
+        verify_sha256: bool,
     ) -> ClipResult: ...
 
     def start_fit_run(
@@ -157,6 +157,7 @@ class PipelineStore(Protocol):
         detect_id: str,
         clip_config: ClipConfig,
         fitting_config: FittingConfig,
+        parameters: dict[str, Any],
     ) -> str: ...
 
     def persist_fit_bundle(
@@ -250,7 +251,7 @@ class PostgresPipelineStore:
         subtrack_index: int,
         *,
         spatial_context: SpatialContext,
-        batch_size: int = _DEFAULT_BATCH_SIZE,
+        batch_size: int,
     ) -> RefineBatchResult:
         run_row = fetch_refine_run(self._conn, refine_id)
         if run_row.status != "running":
@@ -313,7 +314,7 @@ class PostgresPipelineStore:
         *,
         runtime: RuntimeConfig,
         data_root: Path | str,
-        batch_size: int = _DEFAULT_BATCH_SIZE,
+        batch_size: int,
     ) -> DetectPersistenceResult:
         spatial_context = result.spatial_context
         run_row = fetch_detect_row(self._conn, detect_id)
@@ -362,11 +363,12 @@ class PostgresPipelineStore:
         publication_root: Path | str,
         data_root: Path | str,
         runtime: RuntimeConfig,
-        config: ClipConfig | None = None,
+        config: ClipConfig,
+        verify_sha256: bool,
     ) -> ClipResult:
         return extract_clips_for_detect(
             self._conn, detect_id, publication_root=publication_root, data_root=data_root,
-            runtime=runtime, config=config,
+            runtime=runtime, config=config, verify_sha256=verify_sha256,
         )
 
     def start_fit_run(
@@ -375,12 +377,14 @@ class PostgresPipelineStore:
         detect_id: str,
         clip_config: ClipConfig,
         fitting_config: FittingConfig,
+        parameters: dict[str, Any],
     ) -> str:
         return create_fit_run(
             self._conn,
             detect_id=detect_id,
             clip_config=clip_config,
             fitting_config=fitting_config,
+            parameters=parameters,
         )
 
     def persist_fit_bundle(

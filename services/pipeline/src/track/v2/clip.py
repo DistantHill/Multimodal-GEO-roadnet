@@ -38,10 +38,10 @@ _EPS = 1e-9
 def extract_clips(
     source: ClipInput,
     *,
-    config: ClipConfig | None = None,
+    config: ClipConfig,
 ) -> ClipResult:
     """Assemble road fragments from already-resolved p/i/c sequences."""
-    cfg = config or ClipConfig()
+    cfg = config
     _validate_input(source)
     transformer = CoordinateTransformer(source.spatial_context)
     circles = _project_intersections(source.intersections, transformer)
@@ -95,7 +95,8 @@ def extract_clips_for_detect(
     publication_root: Path | str,
     data_root: Path | str,
     runtime: RuntimeConfig,
-    config: ClipConfig | None = None,
+    config: ClipConfig,
+    verify_sha256: bool,
 ) -> ClipResult:
     """Load and clip one completed Detect Run."""
     run = fetch_detect_row(conn, detect_id)
@@ -103,9 +104,9 @@ def extract_clips_for_detect(
         raise ValueError(f"Detect Run {detect_id} is not completed")
     with conn.cursor() as cur:
         registered = find_detect_artifact(cur, detect_id)
-    cfg = config or ClipConfig()
+    cfg = config
     transformer = CoordinateTransformer(run.spatial_context)
-    relation = ClipRelation(runtime, data_root)
+    relation = ClipRelation(runtime, data_root, batch_size=runtime.relation_batch_size)
     vehicles: set[str] = set()
     seen_subtracks: set[int] = set()
     counts: Counter[str] = Counter()
@@ -113,11 +114,12 @@ def extract_clips_for_detect(
     try:
         with DetectDatasetReader(
             publication_root, registered.descriptor, registered.state, runtime,
+            verify_sha256=verify_sha256,
         ) as reader:
             intersections = reader.intersections()
             circles = _project_intersections(intersections, transformer)
             _validate_input(ClipInput(intersections, (), run.spatial_context, detect_id))
-            tracks = reader.iter_tracks()
+            tracks = reader.iter_tracks(batch_size=runtime.parquet_read_batch_size)
             try:
                 for track in tracks:
                     if track.subtrack_index in seen_subtracks:

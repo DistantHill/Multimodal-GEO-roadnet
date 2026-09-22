@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -207,9 +209,10 @@ def test_refine_batch_does_not_clear_pending_data_after_failed_write() -> None:
         ),
     ):
         with pytest.raises(ValueError, match="write failed"):
-            store.persist_refine_batch(
-                "refine", [], subtracks, 1, spatial_context=CONTEXT
-            )
+                store.persist_refine_batch(
+                    "refine", [], subtracks, 1, spatial_context=CONTEXT,
+                    batch_size=runtime_config().db_insert_batch,
+                )
     assert len(subtracks) == 1
 
 
@@ -237,7 +240,7 @@ def test_detect_persistence_delegates_to_one_atomic_writer() -> None:
             return_value=counts,
         ) as persist,
     ):
-        runtime = RuntimeConfig()
+        runtime = runtime_config()
         actual = store.persist_detect(
             "detect", result, runtime=runtime, data_root="/data/runtime", batch_size=23,
         )

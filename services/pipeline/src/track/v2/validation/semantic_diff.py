@@ -449,7 +449,7 @@ def _result(
     }
 
 
-def compare_runs(conn: Any, baseline: dict[str, UUID], candidate: dict[str, UUID], *, batch_size: int = 2000) -> dict[str, Any]:
+def compare_runs(conn: Any, baseline: dict[str, UUID], candidate: dict[str, UUID], *, batch_size: int) -> dict[str, Any]:
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         return _result(tables=[], persisted_equivalent=False, error="preflight:batch_size")
     conn.execute("SET TRANSACTION READ ONLY")

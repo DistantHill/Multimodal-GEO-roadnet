@@ -26,6 +26,3 @@ roadnet-pipeline-init-db = "track.v2.cli.init_db:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-"track.v2.config" = ["*.toml"]

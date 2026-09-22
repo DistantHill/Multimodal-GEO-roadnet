@@ -27,7 +27,9 @@ from .models import (
 )
 
 
-def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInputReplay:
+def replay_centerline_inputs(
+    conn: object, centerline_id: int, *, batch_size: int,
+) -> CenterlineInputReplay:
     """Rebuild each fitting Clip from persisted crossing IDs and final order."""
     with conn.cursor() as cur:  # type: ignore[attr-defined]
         cur.execute(
@@ -73,7 +75,7 @@ def replay_centerline_inputs(conn: object, centerline_id: int) -> CenterlineInpu
     if detect.status != "completed":
         raise ValueError(f"Detect Run {detect_id} is not completed")
     verify_refine_source_fingerprint(conn, detect.refine_id)
-    tracks = fetch_resolved_clip_tracks(conn, str(detect_id))
+    tracks = fetch_resolved_clip_tracks(conn, str(detect_id), batch_size=batch_size)
     crossing_index: dict[int, tuple[int, int]] = {}
     for track_index, track in enumerate(tracks):
         for point_index, point in enumerate(track.points):

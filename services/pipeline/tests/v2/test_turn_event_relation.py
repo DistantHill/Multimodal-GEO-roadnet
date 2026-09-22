@@ -1,6 +1,8 @@
 """Normalized DuckDB TurnEvent relation behavior and corruption guards."""
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import inspect
 import json
 from dataclasses import replace
@@ -37,7 +39,7 @@ def _full_event(index: int = 0) -> TurnEvent:
 
 def _relation(tmp_path: Path, *, batch_size: int = 1) -> TurnEventRelation:
     return TurnEventRelation(
-        RuntimeConfig(
+        runtime_config(
             duckdb_memory_limit="128MB", duckdb_threads=1,
             duckdb_max_temp_directory_size="256MB",
         ),
@@ -267,19 +269,19 @@ def test_sealed_and_closed_lifecycle(tmp_path):
 @pytest.mark.parametrize("batch_size", [True, 0])
 def test_invalid_batch_size_is_rejected(tmp_path, batch_size):
     with pytest.raises(ValueError, match="batch_size"):
-        TurnEventRelation(RuntimeConfig(), tmp_path, batch_size=batch_size)
+        TurnEventRelation(runtime_config(), tmp_path, batch_size=batch_size)
 
 
 @pytest.mark.parametrize("root", ["relative", "/"])
 def test_unsafe_data_root_is_rejected(root):
     with pytest.raises(ValueError, match="absolute and non-root"):
-        TurnEventRelation(RuntimeConfig(), root)
+        TurnEventRelation(runtime_config(), root)
 
 
 @pytest.mark.parametrize("relation_id", [".", "..", "bad/name", "bad\x00name"])
 def test_unsafe_relation_identity_is_rejected(tmp_path, relation_id):
     with pytest.raises(ValueError, match="relation_id"):
-        TurnEventRelation(RuntimeConfig(), tmp_path, relation_id=relation_id)
+        TurnEventRelation(runtime_config(), tmp_path, relation_id=relation_id)
 
 
 def test_connection_failure_removes_only_its_empty_leaf(tmp_path, monkeypatch):
@@ -290,7 +292,7 @@ def test_connection_failure_removes_only_its_empty_leaf(tmp_path, monkeypatch):
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("open failed")),
     )
     with pytest.raises(RuntimeError, match="open failed"):
-        TurnEventRelation(RuntimeConfig(), tmp_path, relation_id="failed")
+        TurnEventRelation(runtime_config(), tmp_path, relation_id="failed")
     assert sibling.is_dir() and not (sibling.parent / "failed").exists()
 
 
@@ -300,7 +302,7 @@ def test_relation_identity_collision_fails_closed(tmp_path):
     marker = occupied / "owned-by-other-run"
     marker.write_text("keep")
     with pytest.raises(FileExistsError):
-        TurnEventRelation(RuntimeConfig(), tmp_path, relation_id="occupied")
+        TurnEventRelation(runtime_config(), tmp_path, relation_id="occupied")
     assert marker.read_text() == "keep"
 
 
@@ -310,7 +312,7 @@ def test_constructor_failure_after_connect_closes_and_cleans(tmp_path, monkeypat
     monkeypatch.setattr(turn_event_relation.duckdb, "connect", lambda **_kwargs: connection)
     monkeypatch.setattr(TurnEventRelation, "_create_schema", lambda _self: 1 / 0)
     with pytest.raises(ZeroDivisionError):
-        TurnEventRelation(RuntimeConfig(), tmp_path, relation_id="failed")
+        TurnEventRelation(runtime_config(), tmp_path, relation_id="failed")
     with pytest.raises(Exception):
         connection.execute("SELECT 1")
     assert not (tmp_path / "duckdb" / "turn-event-relations" / "failed").exists()

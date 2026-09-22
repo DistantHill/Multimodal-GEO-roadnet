@@ -78,13 +78,14 @@ class DetectDatasetReader:
             "FROM intersections ORDER BY intersection_id"
         )
         items: list[ClipIntersection] = []
-        while rows := result.fetchmany(4096):
+        while rows := result.fetchmany(self._runtime.parquet_read_batch_size):
             items.extend(ClipIntersection(int(row[0]), float(row[1]), float(row[2]),
                                           float(row[3])) for row in rows)
         return tuple(items)
 
-    def iter_tracks(self, *, batch_size: int = 4096) -> Iterator[ClipTrack]:
+    def iter_tracks(self, *, batch_size: int | None = None) -> Iterator[ClipTrack]:
         """Yield one Clip track at a time, retaining at most one subtrack and one batch."""
+        batch_size = self._runtime.parquet_read_batch_size if batch_size is None else batch_size
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise DetectParquetError("batch_size is invalid")
         result = self._require_open().execute("""

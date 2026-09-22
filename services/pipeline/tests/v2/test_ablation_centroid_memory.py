@@ -1,3 +1,4 @@
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
 """Source ablation keeps its full-cluster semantics without retaining payloads."""
 from dataclasses import replace
 import gc
@@ -63,7 +64,7 @@ def test_compact_ablation_matches_full_reclustering_reference(separation):
     x, y = _TEST_TRANSFORMER.forward(116., 39.)
     turns = [_event(i, x + i, y + i) for i in range(4)]
     crossings = [_crossing(i, x + separation + i, y + i) for i in range(4)]
-    config = IntersectConfig(
+    config = intersect_config(
         dbscan_eps_m_turn=20., dbscan_min_samples_turn=2,
         cross_track_dbscan_eps_m=20., cross_track_dbscan_min_samples=2,
         merge_centroid_distance_m=25.,
@@ -95,7 +96,7 @@ def test_full_reclustered_objects_are_released_before_next_source():
         return [rebuilt]
 
     with patch("track.v2.detect._build_candidate_clusters", side_effect=build):
-        actual = _annotate_source_ablation([base], [], [], IntersectConfig(), _TEST_TRANSFORMER)
+        actual = _annotate_source_ablation([base], [], [], intersect_config(), _TEST_TRANSFORMER)
     gc.collect()
     assert all(reference() is None for reference in refs)
     assert calls == [{"orthogonal_cross_track"}, {"turn"}]

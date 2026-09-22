@@ -54,7 +54,6 @@ def test_read_connection_is_timed_read_only_and_closes_after_handler_error(
 ) -> None:
     connection = FakeConnection()
     monkeypatch.setattr(database.psycopg, "connect", lambda **kwargs: connection)
-    monkeypatch.setenv("MAP_STATEMENT_TIMEOUT_MS", "12000")
     dependency = database.get_read_connection()
 
     assert next(dependency) is connection
@@ -69,9 +68,7 @@ def test_read_connection_is_timed_read_only_and_closes_after_handler_error(
     assert connection.closed is True
 
 
-def test_postgres_settings_have_a_connect_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("POSTGRES_HOST", raising=False)
-
+def test_postgres_settings_have_a_connect_timeout() -> None:
     settings = database.postgres_connection_settings()
 
     assert settings["connect_timeout"] == 5
@@ -84,7 +81,6 @@ def test_target_database_connection_does_not_mutate_default(monkeypatch):
         calls.append(kwargs)
         return connection
     monkeypatch.setattr(database.psycopg, "connect", connect)
-    monkeypatch.setenv("POSTGRES_DB", "roadnet")
     with database.open_read_connection("other' database"):
         pass
     assert calls[0]["dbname"] == "other' database"

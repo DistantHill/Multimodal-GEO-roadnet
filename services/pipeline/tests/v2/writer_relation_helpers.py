@@ -1,3 +1,4 @@
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
 """Small-test adapters for the production writer relation."""
 from contextlib import contextmanager
 from types import SimpleNamespace as NS
@@ -13,7 +14,7 @@ def run_resolved_sequence(
 ):
     """Exercise source resolution and return the small-fixture observation."""
     requests = []
-    with WriterRelation(RuntimeConfig(), data_root, detect_id, batch_size=batch_size) as relation:
+    with WriterRelation(runtime_config(), data_root, detect_id, batch_size=batch_size) as relation:
         for consumer, items in enumerate((result.turn_events, result.cross_track_candidates, pending)):
             for ordinal, item in enumerate(items):
                 refs = ((item.refined_point_ref,) if consumer == 0 else
@@ -42,7 +43,7 @@ def run_resolved_sequence(
 
 @contextmanager
 def prepared_turn_relation(result, mapping, membership, *, batch_size, data_root):
-    with WriterRelation(RuntimeConfig(), data_root, "d", batch_size=batch_size) as relation:
+    with WriterRelation(runtime_config(), data_root, "d", batch_size=batch_size) as relation:
         if not hasattr(result, "cross_track_candidates"):
             result.cross_track_candidates = []
         relation.collect_sources(result, [], (), {})

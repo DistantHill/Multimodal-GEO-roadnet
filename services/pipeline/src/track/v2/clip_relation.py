@@ -15,9 +15,10 @@ class ClipRelation(Sequence[TrackClip]):
     """Build once, validate, then repeatedly read ``TrackClip`` rows."""
 
     def __init__(
-        self, runtime: RuntimeConfig, data_root: str | Path, *, batch_size: int = 1024,
+        self, runtime: RuntimeConfig, data_root: str | Path, *, batch_size: int | None = None,
         relation_id: str | None = None,
     ) -> None:
+        batch_size = runtime.relation_batch_size if batch_size is None else batch_size
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("batch_size must be positive")
         root = Path(data_root)

@@ -1,6 +1,8 @@
 """Turn persistence consumes its event sequence once with bounded COPY batches."""
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 from contextlib import nullcontext, closing
 from types import SimpleNamespace
 import os
@@ -209,7 +211,7 @@ def test_turn_relation_survives_sparse_mapping_scan_and_batched_write(monkeypatc
     monkeypatch.setattr(writer, '_reserve_ids', reserve)
     monkeypatch.setattr(writer, '_copy_insert', copy)
     conn = SimpleNamespace(cursor=lambda: nullcontext(None))
-    with TurnEventRelation(RuntimeConfig(), tmp_path) as turns:
+    with TurnEventRelation(runtime_config(), tmp_path) as turns:
         for i in [1, 3]:
             value = event(i)
             turns.append(TurnEvent(
@@ -221,7 +223,7 @@ def test_turn_relation_survives_sparse_mapping_scan_and_batched_write(monkeypatc
         turns.seal()
         output = result(turns)
         output.cross_track_candidates = []
-        with WriterRelation(RuntimeConfig(), tmp_path, "d", batch_size=2) as ws:
+        with WriterRelation(runtime_config(), tmp_path, "d", batch_size=2) as ws:
             ws.collect_sources(output, [], (), {})
             count = writer._persist_resolved_sequence(conn, 'd', 'r', output, [], [], {}, batch_size=2, workspace=ws)
             assert count == 5

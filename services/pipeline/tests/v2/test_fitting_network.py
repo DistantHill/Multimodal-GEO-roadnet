@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import math
 import unittest
 from dataclasses import replace
@@ -11,9 +13,9 @@ from track.v2 import (
     ClipResult,
     ClipIntersection,
     TrackClip,
-    fit_centerlines,
-    fit_centerline_variants,
-    build_network,
+    fit_centerlines as _fit_centerlines,
+    fit_centerline_variants as _fit_centerline_variants,
+    build_network as _build_network,
 )
 from track.v2.models import (
     FittingConfig,
@@ -23,8 +25,23 @@ from track.v2.projection import CoordinateTransformer, create_spatial_context
 
 
 _METERS_PER_DEGREE = 111_319.49079327358
-_SPATIAL_CONTEXT = create_spatial_context(ProjectionConfig(processing_srid=3857))
+_SPATIAL_CONTEXT = create_spatial_context(projection_config(processing_srid=3857))
 _TRANSFORMER = CoordinateTransformer(_SPATIAL_CONTEXT)
+
+
+def fit_centerlines(*args, **kwargs):
+    kwargs.setdefault("config", fitting_config())
+    return _fit_centerlines(*args, **kwargs)
+
+
+def fit_centerline_variants(*args, **kwargs):
+    kwargs.setdefault("config", fitting_config())
+    return _fit_centerline_variants(*args, **kwargs)
+
+
+def build_network(*args, **kwargs):
+    kwargs.setdefault("config", network_config())
+    return _build_network(*args, **kwargs)
 
 
 def _lon(x_m: float) -> float:
@@ -154,7 +171,7 @@ class FittingStageTest(unittest.TestCase):
 
         bundle = fit_centerline_variants(
             _clip_result(forward, reverse),
-            config=FittingConfig(min_clips_per_pair=2),
+            config=fitting_config(min_clips_per_pair=2),
         )
 
         self.assertEqual(len(bundle.combined.centerlines), 1)

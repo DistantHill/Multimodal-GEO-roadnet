@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -268,20 +269,24 @@ class DeleteRunServiceTest(unittest.TestCase):
     def test_delete_cli_always_shuts_down_logger(self) -> None:
         from track.v2.cli import delete_run as delete_cli
 
-        config = SimpleNamespace(
+        postgres = SimpleNamespace(
             host="localhost", port=5432, database="track", user="postgres",
             password="", connect_timeout=5, sslmode="prefer",
         )
+        config = SimpleNamespace(
+            postgres=postgres,
+            logging=SimpleNamespace(directory=Path("/tmp/logs")),
+        )
         with (
             patch("sys.argv", ["track.v2.cli.delete_run", "--detect-id", DETECT_ID]),
-            patch.object(delete_cli, "default_postgres_config", return_value=config),
+            patch.object(delete_cli, "load_startup_config", return_value=config),
             patch.object(delete_cli, "init_logger") as init_logger,
             patch.object(delete_cli, "shutdown_logger") as shutdown_logger,
             patch.object(delete_cli, "pg_connect", side_effect=RuntimeError("offline")),
         ):
             self.assertEqual(delete_cli.main(), 2)
 
-        init_logger.assert_called_once_with()
+        init_logger.assert_called_once_with(config.logging.directory)
         shutdown_logger.assert_called_once_with()
 
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import os
 import json
 import re
@@ -38,7 +40,7 @@ def _ddl(value: str) -> str:
 def _config(dsn: str) -> PostgresConfig:
     from psycopg.conninfo import conninfo_to_dict
     values = conninfo_to_dict(dsn)
-    return PostgresConfig(
+    return postgres_config(
         host=values.get("host", "127.0.0.1"), port=int(values.get("port", 5432)),
         database=values.get("dbname", "postgres"), user=values.get("user", "postgres"),
         password=unquote(values.get("password", "")), sslmode=values.get("sslmode"),
@@ -124,7 +126,7 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
 
     handle = create_staging(tmp_path.resolve(), "detect", detect_id, uuid4())
     descriptor = export_detect_parquet(
-        conn, config, handle, RuntimeConfig(duckdb_threads=1), {"version": 1},
+        conn, config, handle, runtime_config(duckdb_threads=1), {"version": 1},
     )
     assert conn.execute(
         "SELECT status FROM detect_runs WHERE id=%s", (detect_id,),
@@ -148,7 +150,7 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
     expected_tracks = list(fetch_resolved_clip_tracks(conn, str(detect_id)))
     with DetectDatasetReader(
         tmp_path, registered.descriptor, registered.state,
-        RuntimeConfig(duckdb_threads=1),
+        runtime_config(duckdb_threads=1),
     ) as reader:
         assert list(reader.intersections()) == expected_intersections
         assert list(reader.iter_tracks(batch_size=1)) == expected_tracks
@@ -157,7 +159,7 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
         fetch_detect_row(conn, str(detect_id)).spatial_context, str(detect_id),
     )
     for include_boundaries in (True, False):
-        clip_config = ClipConfig(include_boundary_clips=include_boundaries)
+        clip_config = clip_config(include_boundary_clips=include_boundaries)
         expected_clip = extract_clips(oracle_input, config=clip_config)
         with (
             patch("track.v2.db.source_table.verify_refine_source_fingerprint",
@@ -169,7 +171,7 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
         ):
             actual_clip = extract_clips_for_detect(
                 conn, str(detect_id), publication_root=tmp_path, data_root=tmp_path,
-                runtime=RuntimeConfig(duckdb_threads=1), config=clip_config,
+                runtime=runtime_config(duckdb_threads=1), config=clip_config,
             )
         try:
             assert actual_clip.as_dict() == expected_clip.as_dict()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import json
 import math
 import os
@@ -44,7 +46,7 @@ def _postgres_config(dsn: str, schema: str) -> PostgresConfig:
     from psycopg.conninfo import conninfo_to_dict
 
     values = conninfo_to_dict(dsn)
-    return PostgresConfig(
+    return postgres_config(
         host=values.get("host", "127.0.0.1"),
         port=int(values.get("port", 5432)),
         database=values.get("dbname", "postgres"),
@@ -142,7 +144,7 @@ def _seed(
 def _export(conn, config, root: Path, run_id: UUID, fingerprint: dict[str, object]):
     handle = create_staging(root.resolve(), "refine", run_id, uuid4())
     descriptor = export_refine_parquet(
-        conn, config, handle, RuntimeConfig(duckdb_threads=1), fingerprint,
+        conn, config, handle, runtime_config(duckdb_threads=1), fingerprint,
     )
     return handle, descriptor
 
@@ -256,7 +258,7 @@ def test_real_reader_tracks_match_legacy_postgres_detect_input(refine_database, 
         source_table=source_table, refine_id=str(run_id), spatial_context=spatial,
     ))
     with RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         columnar = list(reader.iter_tracks(source_table, batch_size=2))
 

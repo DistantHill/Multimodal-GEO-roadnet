@@ -35,9 +35,29 @@ from track.v2.parser import (
     get_database,
 )
 from track.v2.parser import PostgresTrajectorySourceHandle
+from .config_factory import pipeline_config
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
+
+_CONFIG = pipeline_config()
+
+
+def _field_config():
+    return _CONFIG.parser.fields
+
+
+def _get_database(source):
+    return get_database(source, field_config=_CONFIG.parser.fields, runtime=_CONFIG.runtime)
+
+
+def _detect_encoding(path, *, hint_encoding):
+    runtime = _CONFIG.runtime
+    return detect_encoding(
+        path, hint_encoding=hint_encoding, sample_size=runtime.encoding_sample_size,
+        min_confidence=runtime.encoding_confidence,
+        default_encoding=runtime.default_text_encoding, fallback=runtime.fallback_encodings,
+    )
 
 
 def _make_csv(tmpdir: str, filename: str, content: str, encoding: str = "utf-8") -> Path:
@@ -73,7 +93,8 @@ class DefaultTomlLoadingTest(unittest.TestCase):
     """P0-01: Default TOML loads and parses correctly."""
 
     def test_default_toml_loads(self):
-        specs = load_field_config(None).specs
+        path = Path(__file__).resolve().parents[2] / "config" / "field_specs.toml"
+        specs = load_field_config(path).specs
         self.assertIsInstance(specs, list)
         self.assertTrue(len(specs) > 0)
         canonicals = {s.canonical for s in specs}
@@ -89,11 +110,19 @@ class CustomTomlOverrideTest(unittest.TestCase):
             toml_path = Path(td) / "custom.toml"
             toml_path.write_text(
                 """
+[quality]
+sample_errors_max = 50
+max_consecutive_errors = 50
+max_error_ratio = 1.0
+
 [[field]]
 canonical = "vehicle_id"
 aliases = ["custom_vid"]
 required = true
 type = "str"
+unit_scale = 1.0
+has_default = false
+extra = false
 """,
                 encoding="utf-8",
             )
@@ -110,6 +139,22 @@ class TomlMissingTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load_field_config(Path("/nonexistent/path.toml")).specs
 
+    def test_field_errors_are_aggregated(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "invalid.toml"
+            path.write_text(
+                "[quality]\nsample_errors_max = 0\nunknown = 1\n"
+                "[[field]]\ncanonical = ''\naliases = []\nrequired = 'yes'\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ConfigError) as raised:
+                load_field_config(path)
+            message = str(raised.exception)
+            self.assertIn("quality.unknown", message)
+            self.assertIn("quality.max_consecutive_errors", message)
+            self.assertIn("field[0].canonical", message)
+            self.assertIn("field[0].type", message)
+
 
 class Utf8BomCsvTest(unittest.TestCase):
     """P0-04: UTF-8 BOM CSV is correctly detected and read."""
@@ -117,7 +162,7 @@ class Utf8BomCsvTest(unittest.TestCase):
     def test_utf8_bom_csv(self):
         with tempfile.TemporaryDirectory() as td:
             csv_path = _make_csv(td, "test.csv", "﻿vid,lng,lat,included_angle,gps_speed,gps_time_a\n", encoding="utf-8-sig")
-            encoding = detect_encoding(csv_path, hint_encoding=None)
+            encoding = _detect_encoding(csv_path, hint_encoding=None)
             self.assertIn(encoding, ("utf-8-sig", "utf-8"))
 
 
@@ -129,7 +174,7 @@ class GbkEncodingTest(unittest.TestCase):
             header = "vid,lng,lat,included_angle,gps_speed,gps_time_a\n"
             for enc, name in [("gbk", "GBK"), ("gb18030", "GB18030")]:
                 csv_path = _make_csv(td, f"test_{name}.csv", header, encoding=enc)
-                detected = detect_encoding(csv_path, hint_encoding=None)
+                detected = _detect_encoding(csv_path, hint_encoding=None)
                 # Should be recognized as CJK
                 self.assertIsNotNone(detected)
 
@@ -140,7 +185,7 @@ class Hfm130CsvTest(unittest.TestCase):
     def test_hfm_aliases(self):
         # Hfm_130pts.csv has columns: vid, lng, lat, included_angle, gps_speed, gps_time_a
         # The default TOML should match these via aliases
-        specs = load_field_config(None).specs
+        specs = _field_config().specs
         mapping = build_field_mapping(
             specs,
             ["vid", "lng", "lat", "included_angle", "gps_speed", "gps_time_a"],
@@ -165,7 +210,7 @@ class GuijiTop10wCsvTest(unittest.TestCase):
             "terminal_status", "vehicle_status", "alarm_status", "acc_status",
             "included_angle", "gps_time", "sim_number",
         ]
-        specs = load_field_config(None).specs
+        specs = _field_config().specs
         mapping = build_field_mapping(specs, columns, None)
         for core in ("vehicle_id", "lon", "lat", "heading", "timestamp"):
             self.assertIn(core, mapping.canonical_to_source, f"missing {core}")
@@ -176,9 +221,12 @@ class FieldSelectionRequiredTest(unittest.TestCase):
 
     def test_missing_without_selector(self):
         specs = [
-            FieldSpec(canonical="vehicle_id", aliases=("vid",), required=True, type="str"),
-            FieldSpec(canonical="lon", aliases=("lng",), required=True, type="float"),
-            FieldSpec(canonical="lat", aliases=("lat",), required=True, type="float"),
+            FieldSpec(canonical="vehicle_id", aliases=("vid",), required=True, type="str",
+                      unit_scale=1.0, default=None, extra=False),
+            FieldSpec(canonical="lon", aliases=("lng",), required=True, type="float",
+                      unit_scale=1.0, default=None, extra=False),
+            FieldSpec(canonical="lat", aliases=("lat",), required=True, type="float",
+                      unit_scale=1.0, default=None, extra=False),
         ]
         with self.assertRaises(FieldSelectionRequired) as ctx:
             build_field_mapping(specs, ["vehicle_id", "lng"], None)  # missing "lat"
@@ -190,7 +238,7 @@ class FakeSelectorTest(unittest.TestCase):
     """P0-09: Fake selector resolves missing field mapping."""
 
     def test_fake_selector_binds_fields(self):
-        specs = load_field_config(None).specs
+        specs = _field_config().specs
         mapping = build_field_mapping(
             specs,
             ["custom_id", "custom_lng", "custom_lat", "custom_angle", "custom_speed", "custom_time"],
@@ -218,7 +266,7 @@ class CsvPointRefTest(unittest.TestCase):
                 "v1,116.0,39.0,90,40,1700000000000\n",
             )
             source = CsvSource(csv_path)
-            handle = get_database(source)
+            handle = _get_database(source)
             try:
                 points = list(handle.iter_points())
             finally:
@@ -262,7 +310,7 @@ class FakePostgresCursorTest(unittest.TestCase):
         with patch.dict("sys.modules", {"psycopg": mock_psycopg}):
             # This will exercise the handle creation path
             try:
-                handle = get_database(source)
+                handle = _get_database(source)
                 self.assertIsNotNone(handle.field_mapping)
             except Exception:
                 # Expected — mock cursor may not support full iteration
@@ -311,7 +359,7 @@ class TrajectoryOrderErrorTest(unittest.TestCase):
                 "v1,116,39,90,40,1700000000000\n",  # ts=1700000000 (倒退)
             )
             source = CsvSource(csv_path)
-            handle = get_database(source)
+            handle = _get_database(source)
             try:
                 with self.assertRaises(TrajectoryOrderError) as ctx:
                     list(handle.iter_points())
@@ -333,7 +381,7 @@ class CoreFieldSkipTest(unittest.TestCase):
                 "v1,,39,90,40,1700000000000\n",
             )
             source = CsvSource(csv_path)
-            handle = get_database(source)
+            handle = _get_database(source)
             try:
                 points = list(handle.iter_points())
                 report = handle.get_report()
@@ -355,7 +403,7 @@ class HeadingSpeedWarnTest(unittest.TestCase):
                 "v1,116,39,90,,1700000000000\n",
             )
             source = CsvSource(csv_path)
-            handle = get_database(source)
+            handle = _get_database(source)
             try:
                 points = list(handle.iter_points())
             finally:
@@ -376,7 +424,7 @@ class ConsecutiveErrorThresholdTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             csv_path = _make_csv(td, "test.csv", csv_content)
             source = CsvSource(csv_path)
-            handle = get_database(source)
+            handle = _get_database(source)
             try:
                 with self.assertRaises(DataSourceCorrupted):
                     list(handle.iter_points())
@@ -422,7 +470,7 @@ class ReadReportSerializationTest(unittest.TestCase):
                 "v3,118,37,180,50,1700000002000\n",
             )
             source = CsvSource(csv_path)
-            handle = get_database(source)
+            handle = _get_database(source)
 
             # Before iteration: initial report has all zeros
             self.assertEqual(handle.read_report.total_rows, 0)
@@ -454,7 +502,7 @@ class ContextManagerTest(unittest.TestCase):
                 "v1,116,39,90,40,1700000000000\n",
             )
             source = CsvSource(csv_path)
-            with get_database(source) as handle:
+            with _get_database(source) as handle:
                 points = list(handle.iter_points())
                 self.assertEqual(len(points), 1)
             # handle is closed after with block
@@ -472,7 +520,7 @@ class IterPointsRepeatableTest(unittest.TestCase):
                 "v1,116,39,90,40,1700000000000\n",
             )
             source = CsvSource(csv_path)
-            handle = get_database(source)
+            handle = _get_database(source)
             p1 = list(handle.iter_points())
             p2 = list(handle.iter_points())
             self.assertEqual(len(p1), len(p2))
@@ -484,7 +532,7 @@ class ExtraFieldTest(unittest.TestCase):
     """P0-21: TOML extra=true fields appear in TrajectoryPoint.extra."""
 
     def test_extra_fields_present(self):
-        specs = load_field_config(None).specs
+        specs = _field_config().specs
         # Check that road_id and altitude have extra=True in spec
         extra_specs = [s for s in specs if s.extra]
         self.assertTrue(len(extra_specs) > 0, "should have extra fields defined")
@@ -497,7 +545,7 @@ class ExtraFieldTest(unittest.TestCase):
                 "v1,116,39,90,40,1700000000000,R001,100.5\n",
             )
             source = CsvSource(csv_path)
-            handle = get_database(source)
+            handle = _get_database(source)
             try:
                 points = list(handle.iter_points())
             finally:
@@ -519,7 +567,7 @@ class HeadingNormalizationTest(unittest.TestCase):
                 "v1,116,39,730,40,1700000000000\n",  # 730° → 10°
             )
             source = CsvSource(csv_path)
-            handle = get_database(source)
+            handle = _get_database(source)
             try:
                 points = list(handle.iter_points())
             finally:

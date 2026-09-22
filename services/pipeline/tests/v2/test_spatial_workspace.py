@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .config_factory import intersect_config, intersect_run_config
+
 import math
 from unittest.mock import patch
 
@@ -100,7 +102,7 @@ def _projected_bounds(
 
 def test_capacity_guard_runs_before_grid_allocation() -> None:
     tracks = _crossing_tracks()
-    cfg = IntersectConfig(cross_track_max_grid_cells_per_segment=1)
+    cfg = intersect_config(cross_track_max_grid_cells_per_segment=1)
 
     with patch(
         "track.v2.candidate_patches._build_grid",
@@ -121,7 +123,7 @@ def test_memory_windows_match_legacy_window_queries() -> None:
     all_points = [point for track in tracks.values() for point in track]
     all_points.sort(key=lambda point: (point.vehicle_id, point.timestamp))
     extent = _projected_bounds(115.98, 38.98, 116.02, 39.02)
-    cfg = IntersectConfig(
+    cfg = intersect_run_config(
         spatial_window_size=(1_000.0, 1_000.0),
         spatial_window_overlap=0.15,
     )

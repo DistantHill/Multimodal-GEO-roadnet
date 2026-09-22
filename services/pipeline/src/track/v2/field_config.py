@@ -8,16 +8,13 @@ from .errors import ConfigError, FieldSelectionRequired
 from .models import ColumnSelector, FieldConfig, FieldMapping, FieldSpec
 
 
-DEFAULT_FIELD_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "default_field_specs.toml"
 VALID_FIELD_TYPES = frozenset({"str", "float", "int", "timestamp"})
 
 
-def load_field_config(path: str | Path | None = None) -> FieldConfig:
-    resolved = Path(path) if path is not None else DEFAULT_FIELD_CONFIG_PATH
+def load_field_config(path: str | Path) -> FieldConfig:
+    resolved = Path(path)
     if not resolved.exists():
-        if path is None:
-            raise ConfigError("built-in default_field_specs.toml is missing")
-        raise ConfigError(f"custom field config not found: {resolved}")
+        raise ConfigError(f"field config not found: {resolved}")
 
     try:
         with resolved.open("rb") as f:
@@ -27,23 +24,42 @@ def load_field_config(path: str | Path | None = None) -> FieldConfig:
     except OSError as exc:
         raise ConfigError(f"cannot read field config: {resolved}") from exc
 
-    field_entries = payload.get("fields", payload.get("field"))
+    errors: list[str] = []
+    errors.extend(f"{key}: unknown top-level key" for key in sorted(set(payload) - {"quality", "field"}))
+    field_entries = payload.get("field")
+    specs: list[FieldSpec] = []
     if not isinstance(field_entries, list) or not field_entries:
-        raise ConfigError("field config must contain [[field]] or [[fields]] entries")
-
-    specs = [_parse_spec(entry) for entry in field_entries]
-    quality = payload.get("quality") or {}
+        errors.append("field: must contain at least one [[field]] entry")
+    else:
+        for index, entry in enumerate(field_entries):
+            spec = _parse_spec(entry, index, errors)
+            if spec is not None:
+                specs.append(spec)
+    quality = payload.get("quality")
+    quality_values: dict[str, Any] = {}
+    quality_keys = {"sample_errors_max", "max_consecutive_errors", "max_error_ratio"}
     if not isinstance(quality, dict):
-        raise ConfigError("[quality] must be a table")
-
-    return FieldConfig(
-        specs=specs,
-        sample_errors_max=_positive_int(quality.get("sample_errors_max", 50), "sample_errors_max"),
-        max_consecutive_errors=_positive_int(
-            quality.get("max_consecutive_errors", 50), "max_consecutive_errors"
-        ),
-        max_error_ratio=_ratio(quality.get("max_error_ratio", 1.0), "max_error_ratio"),
-    )
+        errors.append("quality: missing required table")
+    else:
+        errors.extend(f"quality.{key}: unknown key" for key in sorted(set(quality) - quality_keys))
+        errors.extend(f"quality.{key}: missing required key" for key in sorted(quality_keys - set(quality)))
+        for key in ("sample_errors_max", "max_consecutive_errors"):
+            value = quality.get(key)
+            if type(value) is not int or value <= 0:
+                errors.append(f"quality.{key}: must be an integer > 0")
+            else:
+                quality_values[key] = value
+        value = quality.get("max_error_ratio")
+        if type(value) not in (int, float) or not 0.0 <= value <= 1.0:
+            errors.append("quality.max_error_ratio: must be a number in [0, 1]")
+        else:
+            quality_values["max_error_ratio"] = float(value)
+    canonicals = [spec.canonical for spec in specs]
+    for canonical in sorted({item for item in canonicals if canonicals.count(item) > 1}):
+        errors.append(f"field.{canonical}: canonical name is duplicated")
+    if errors:
+        raise ConfigError("invalid field configuration:\n- " + "\n- ".join(errors))
+    return FieldConfig(specs=specs, **quality_values)
 
 
 def build_field_mapping(
@@ -79,33 +95,42 @@ def build_field_mapping(
     return FieldMapping(specs=list(specs), canonical_to_source=canonical_to_source)
 
 
-def _parse_spec(entry: Any) -> FieldSpec:
+def _parse_spec(entry: Any, index: int, errors: list[str]) -> FieldSpec | None:
+    prefix = f"field[{index}]"
     if not isinstance(entry, dict):
-        raise ConfigError("each field spec must be a TOML table")
-
+        errors.append(f"{prefix}: must be a table")
+        return None
+    required_keys = {"canonical", "aliases", "required", "type", "unit_scale", "has_default", "extra"}
+    allowed = required_keys | {"default"}
+    errors.extend(f"{prefix}.{key}: unknown key" for key in sorted(set(entry) - allowed))
+    errors.extend(f"{prefix}.{key}: missing required key" for key in sorted(required_keys - set(entry)))
     canonical = entry.get("canonical")
     aliases = entry.get("aliases")
-    field_type = entry.get("type", "float")
+    field_type = entry.get("type")
     if not isinstance(canonical, str) or not canonical:
-        raise ConfigError("field canonical must be a non-empty string")
+        errors.append(f"{prefix}.canonical: must be a non-empty string")
     if not isinstance(aliases, list) or not aliases or not all(isinstance(item, str) for item in aliases):
-        raise ConfigError(f"{canonical}: aliases must be a non-empty string list")
+        errors.append(f"{prefix}.aliases: must be a non-empty string list")
     if field_type not in VALID_FIELD_TYPES:
-        raise ConfigError(f"{canonical}: unsupported field type {field_type!r}")
-
-    try:
-        unit_scale = float(entry.get("unit_scale", 1.0))
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(f"{canonical}: unit_scale must be numeric") from exc
-
+        errors.append(f"{prefix}.type: unsupported field type {field_type!r}")
+    unit_scale = entry.get("unit_scale")
+    if type(unit_scale) not in (int, float) or unit_scale <= 0:
+        errors.append(f"{prefix}.unit_scale: must be a number > 0")
+    for key in ("required", "has_default", "extra"):
+        if type(entry.get(key)) is not bool:
+            errors.append(f"{prefix}.{key}: must be a boolean")
+    has_default = entry.get("has_default")
+    if has_default is True and "default" not in entry:
+        errors.append(f"{prefix}.default: required when has_default is true")
+    if has_default is False and "default" in entry:
+        errors.append(f"{prefix}.default: forbidden when has_default is false")
+    if any(message.startswith(prefix) for message in errors):
+        return None
     return FieldSpec(
         canonical=canonical,
         aliases=tuple(aliases),
-        required=bool(entry.get("required", True)),
-        type=str(field_type),
-        unit_scale=unit_scale,
-        default=entry.get("default"),
-        extra=bool(entry.get("extra", False)),
+        required=entry["required"], type=field_type, unit_scale=float(unit_scale),
+        default=entry.get("default"), extra=entry["extra"],
     )
 
 
@@ -126,23 +151,3 @@ def _match_alias(
 
 def _missing_required(specs: list[FieldSpec], mapping: dict[str, str]) -> list[str]:
     return [spec.canonical for spec in specs if spec.required and spec.canonical not in mapping]
-
-
-def _positive_int(value: Any, name: str) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(f"{name} must be a positive integer") from exc
-    if parsed <= 0:
-        raise ConfigError(f"{name} must be a positive integer")
-    return parsed
-
-
-def _ratio(value: Any, name: str) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(f"{name} must be in [0, 1]") from exc
-    if not 0.0 <= parsed <= 1.0:
-        raise ConfigError(f"{name} must be in [0, 1]")
-    return parsed

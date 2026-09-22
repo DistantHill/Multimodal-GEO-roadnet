@@ -31,7 +31,7 @@
 
 ```sh
 docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm pipeline \
-  python -m pipeline init-db --database roadnet --migrate-refine
+  python -m pipeline init-db --migrate-refine
 ```
 
 迁移在一个事务内改名表、列、索引、约束、触发器及关联函数，并更新版本登记。

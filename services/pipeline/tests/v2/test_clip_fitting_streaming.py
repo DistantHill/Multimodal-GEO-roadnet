@@ -1,3 +1,4 @@
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
 """Columnar Clip/Fitting streaming preserves geometry, ordering and ownership."""
 import math
 import inspect
@@ -9,11 +10,11 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from track.v2.clip import extract_clips, extract_clips_for_detect
+from track.v2.clip import extract_clips as _extract_clips, extract_clips_for_detect as _extract_clips_for_detect
 from track.v2.db.queries import fetch_resolved_clip_tracks
 from track.v2.fitting import (
     _OrientedClip, _fit_pair_stream, _orient_clip, _resample_at_progress,
-    _resample_at_spacing, _xy_polyline_length, fit_centerline_variants,
+    _resample_at_spacing, _xy_polyline_length, fit_centerline_variants as _fit_centerline_variants,
 )
 from track.v2.models import Centerline, ClipInput, ClipTrack, FittingConfig, RuntimeConfig
 from track.v2.projection import CoordinateTransformer
@@ -21,6 +22,22 @@ from .test_clip import _CONTEXT, _point
 from .test_fitting_network import _clip, _clip_result, _TRANSFORMER
 
 _EPS = 1e-9
+
+
+def extract_clips(*args, **kwargs):
+    kwargs.setdefault("config", clip_config())
+    return _extract_clips(*args, **kwargs)
+
+
+def extract_clips_for_detect(*args, **kwargs):
+    kwargs.setdefault("config", clip_config())
+    kwargs.setdefault("verify_sha256", False)
+    return _extract_clips_for_detect(*args, **kwargs)
+
+
+def fit_centerline_variants(*args, **kwargs):
+    kwargs.setdefault("config", fitting_config())
+    return _fit_centerline_variants(*args, **kwargs)
 
 
 def test_streamed_clip_result_matches_memory_and_serializes(tmp_path):
@@ -42,7 +59,7 @@ def test_streamed_clip_result_matches_memory_and_serializes(tmp_path):
     ):
         actual = extract_clips_for_detect(
             conn, "detect", publication_root="/parquet", data_root=tmp_path,
-            runtime=RuntimeConfig(),
+            runtime=runtime_config(),
         )
     try:
         assert actual.as_dict() == expected.as_dict()
@@ -58,13 +75,13 @@ def test_streamed_pair_is_exact_reference_median(count, tmp_path):
                    [(0, i), (40, i * i), (200, -i)][::1 if i % 2 == 0 else -1])
              for i in range(count)]
     oriented = [_orient_clip(clip, _TRANSFORMER)[0] for clip in clips]
-    cfg = FittingConfig()
+    cfg = fitting_config()
     expected = _reference_fit_pair((1, 2), oriented, cfg, _TRANSFORMER)
     actual = _fit_pair_stream((1, 2), lambda: iter(oriented), count, cfg, _TRANSFORMER)
     assert actual == expected
     result = _clip_result(*clips)
     from track.v2.clip_relation import ClipRelation
-    with ClipRelation(RuntimeConfig(), tmp_path) as sequence:
+    with ClipRelation(runtime_config(), tmp_path) as sequence:
         for clip in clips:
             sequence.append(clip)
         sequence.seal()
@@ -84,11 +101,11 @@ def test_pair_sampling_rejects_changed_count_and_uses_multiple_blocks(monkeypatc
 
     monkeypatch.setattr(fitting, "_FIT_BLOCK_BYTES", 48)
     assert _fit_pair_stream(
-        (1, 2), read_clips, 3, FittingConfig(fit_sample_spacing_m=5), _TRANSFORMER,
+        (1, 2), read_clips, 3, fitting_config(fit_sample_spacing_m=5), _TRANSFORMER,
     )
     assert calls > 2
     with pytest.raises(ValueError, match="count changed"):
-        _fit_pair_stream((1, 2), lambda: iter(oriented[:2]), 3, FittingConfig(), _TRANSFORMER)
+        _fit_pair_stream((1, 2), lambda: iter(oriented[:2]), 3, fitting_config(), _TRANSFORMER)
 
 
 def test_clip_and_fitting_do_not_use_legacy_spill_implementations():
@@ -166,7 +183,7 @@ class Connection:
 
 
 def _reader(conn):
-    return fetch_resolved_clip_tracks(conn, "d")
+    return fetch_resolved_clip_tracks(conn, "d", batch_size=2000)
 
 
 def test_resolved_reader_streams_subtracks_inherits_leading_crossing_vehicle_and_closes():
@@ -281,5 +298,5 @@ def test_pair_sampling_does_not_overwrite_outer_heartbeat_counts():
     with heartbeat.operation_heartbeat("outer fitting"):
         heartbeat.heartbeat_progress(7, total=10, unit="交叉口对")
         before = heartbeat._current.get().status
-        assert _fit_pair_stream((1, 2), lambda: iter([oriented]), 1, FittingConfig(), _TRANSFORMER)
+        assert _fit_pair_stream((1, 2), lambda: iter([oriented]), 1, fitting_config(), _TRANSFORMER)
         assert heartbeat._current.get().status == before

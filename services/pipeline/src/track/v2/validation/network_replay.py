@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
 import hashlib
 import json
 import math
@@ -15,7 +15,7 @@ from ..network import build_network
 from ..db.cursors import declare_full_scan_cursor
 
 
-EXPECTED_NETWORK_SHA256 = "1ffc98060cfce360c05aeca0ab73ec39a545cb420df003c50d977f58138bcbd0"
+EXPECTED_NETWORK_SHA256 = "4986ebfd9cc1f481f488b86f22c59384c363aded58b391f240f47ab6d220fbef"
 
 
 class NetworkReplayError(RuntimeError):
@@ -45,7 +45,7 @@ def _validate_contract() -> str:
     config_fields = fields(NetworkConfig)
     if (len(config_fields) != 1 or config_fields[0].name != "include_isolated_nodes"
             or get_type_hints(NetworkConfig).get(config_fields[0].name) is not bool
-            or config_fields[0].default is not True):
+            or config_fields[0].default is not MISSING):
         raise NetworkReplayError("NetworkConfig domain changed")
     return actual
 
@@ -167,7 +167,7 @@ def _normalized_tables(
 
 def replay_network(
     conn: Any, detect_id: UUID, fit_id: UUID, identity_rows: list[tuple[Any, ...]],
-    *, batch_size: int = 2000,
+    *, batch_size: int,
 ) -> ReplayResult:
     """Replay both values of the anchored Network configuration domain."""
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:

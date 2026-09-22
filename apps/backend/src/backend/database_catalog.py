@@ -3,14 +3,16 @@
 from typing import Any
 
 import psycopg
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from .database import get_read_connection, open_read_connection
 
 router = APIRouter(prefix="/api/v1/map/databases", tags=["map"])
 
 
-def table_counts(target: Any, rows: list[Any]) -> list[dict[str, Any]]:
+def table_counts(
+    target: Any, rows: list[Any], *, exact_count_max_rows: int
+) -> list[dict[str, Any]]:
     result = []
     for schema, name, estimate, kind in rows:
         entry = {
@@ -19,7 +21,7 @@ def table_counts(target: Any, rows: list[Any]) -> list[dict[str, Any]]:
             "row_count": estimate if estimate >= 0 else None,
             "row_count_is_estimate": True,
         }
-        if estimate < 50_000:  # Includes -1: no statistics, not necessarily empty.
+        if estimate < exact_count_max_rows:  # Includes -1: no statistics, not necessarily empty.
             try:
                 # A savepoint isolates timeout/permission errors from other tables.
                 with target.transaction():
@@ -44,6 +46,7 @@ def databases(connection: Any = Depends(get_read_connection)) -> dict[str, Any]:
 
 @router.get("/tables")
 def tables(
+    request: Request,
     database_name: str = Query(min_length=1, max_length=63),
     connection: Any = Depends(get_read_connection),
 ) -> dict[str, Any]:
@@ -60,7 +63,10 @@ def tables(
                 "AND n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema' "
                 "ORDER BY n.nspname, c.relname"
             ).fetchall()
-            entries = table_counts(target, rows)
+            entries = table_counts(
+                target, rows,
+                exact_count_max_rows=request.app.state.config.map.catalog_exact_count_max_rows,
+            )
     except psycopg.Error as exc:
         raise HTTPException(503, detail={
             "error": "database_catalog_failed",

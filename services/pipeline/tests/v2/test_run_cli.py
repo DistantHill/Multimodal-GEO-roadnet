@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .config_factory import pipeline_config
+
 import unittest
 from unittest.mock import patch
 
@@ -9,14 +11,12 @@ from track.v2.config import PostgresConfig
 
 class RunCliV3Test(unittest.TestCase):
     def setUp(self) -> None:
-        self.config = PostgresConfig(
-            host="localhost", port=5432, database="track", user="track", password="",
-        )
+        self.config = pipeline_config()
 
     def test_main_forwards_reused_refine_run(self) -> None:
         with (
             patch("sys.argv", ["track.v2.cli.run", "--refine-id", "11111111-1111-1111-1111-111111111111"]),
-            patch("track.v2.cli.run.default_postgres_config", return_value=self.config),
+            patch("track.v2.cli.run.load_startup_config", return_value=self.config),
             patch("track.v2.cli.run.init_logger"),
             patch("track.v2.cli.run.shutdown_logger") as shutdown_logger,
             patch("track.v2.cli.run.run_pipeline", return_value={}) as run_pipeline,
@@ -28,26 +28,19 @@ class RunCliV3Test(unittest.TestCase):
             self.config,
             source_table=None,
             refine_id="11111111-1111-1111-1111-111111111111",
-            config_path=None,
-            processing_srid=None,
         )
         shutdown_logger.assert_called_once_with()
 
-    def test_main_forwards_processing_srid_for_new_run(self) -> None:
+    def test_main_rejects_processing_srid_override_for_new_run(self) -> None:
         with (
             patch(
                 "sys.argv",
                 ["track.v2.cli.run", "--source-table", "raw_points", "--processing-srid", "32650"],
             ),
-            patch("track.v2.cli.run.default_postgres_config", return_value=self.config),
-            patch("track.v2.cli.run.init_logger"),
-            patch("track.v2.cli.run.shutdown_logger"),
-            patch("track.v2.cli.run.run_pipeline", return_value={}) as run_pipeline,
-            patch("track.v2.cli.run._print_write_summary"),
+            self.assertRaises(SystemExit) as caught,
         ):
-            self.assertEqual(main(), 0)
-
-        self.assertEqual(run_pipeline.call_args.kwargs["processing_srid"], 32650)
+            main()
+        self.assertEqual(caught.exception.code, 2)
 
     def test_main_rejects_projection_override_for_reused_refine_run(self) -> None:
         with (
@@ -59,7 +52,6 @@ class RunCliV3Test(unittest.TestCase):
                     "--processing-srid", "32650",
                 ],
             ),
-            patch("track.v2.cli.run.default_postgres_config", return_value=self.config),
         ):
             with self.assertRaises(SystemExit) as caught:
                 main()
@@ -68,7 +60,7 @@ class RunCliV3Test(unittest.TestCase):
     def test_main_preserves_exit_code_and_cleanup_on_wrapper_failure(self) -> None:
         with (
             patch("sys.argv", ["track.v2.cli.run", "--refine-id", "11111111-1111-1111-1111-111111111111"]),
-            patch("track.v2.cli.run.default_postgres_config", return_value=self.config),
+            patch("track.v2.cli.run.load_startup_config", return_value=self.config),
             patch("track.v2.cli.run.init_logger"),
             patch("track.v2.cli.run.shutdown_logger") as shutdown_logger,
             patch("track.v2.cli.run.run_pipeline", side_effect=RuntimeError("failed")),

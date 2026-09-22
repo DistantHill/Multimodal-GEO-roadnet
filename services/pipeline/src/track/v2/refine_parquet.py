@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
-import os
 from pathlib import Path
 import shutil
 from collections.abc import Iterable, Iterator
@@ -126,13 +125,14 @@ class RefineDatasetReader:
             self._temp_directory = None
 
     def iter_subtrack_batches(
-        self, vehicle_id: str, subtrack_index: int, *, batch_size: int = 4096,
+        self, vehicle_id: str, subtrack_index: int, *, batch_size: int | None = None,
     ) -> Iterator[tuple[tuple[Any, ...], ...]]:
         """Yield bounded row batches ordered across kept and injected points."""
         if self._connection is None:
             raise RefineParquetError("dataset reader is not open")
         if not isinstance(vehicle_id, str) or not vehicle_id or isinstance(subtrack_index, bool):
             raise RefineParquetError("vehicle_id and subtrack_index are required")
+        batch_size = self._runtime.parquet_read_batch_size if batch_size is None else batch_size
         if (not isinstance(subtrack_index, int) or isinstance(batch_size, bool)
                 or not isinstance(batch_size, int) or batch_size < 1):
             raise RefineParquetError("subtrack_index and batch_size are invalid")
@@ -176,12 +176,13 @@ class RefineDatasetReader:
         return int(row[0])
 
     def iter_tracks(
-        self, source_table: str, *, batch_size: int = 4096,
+        self, source_table: str, *, batch_size: int | None = None,
     ) -> Iterator[list[TrajectoryPoint]]:
         """Yield validated Detect input, retaining at most one track and one batch."""
         connection = self._require_open()
         if not isinstance(source_table, str) or not source_table.strip():
             raise RefineParquetError("source_table is required")
+        batch_size = self._runtime.parquet_read_batch_size if batch_size is None else batch_size
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise RefineParquetError("batch_size is invalid")
         result = connection.execute("""
@@ -210,12 +211,13 @@ class RefineDatasetReader:
 
     def iter_topology_tracks(
         self, source_table: str, windows: Iterable[SpatialWindow], *,
-        batch_size: int = 4096,
+        batch_size: int | None = None,
     ) -> Iterator[TopologyTrackSelection]:
         """Yield complete subtracks whose adjacent segments intersect each bbox."""
         connection = self._require_open()
         if not isinstance(source_table, str) or not source_table.strip():
             raise RefineParquetError("source_table is required")
+        batch_size = self._runtime.parquet_read_batch_size if batch_size is None else batch_size
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise RefineParquetError("batch_size is invalid")
         canonical: list[tuple[int, tuple[int, ...], float, float, float, float]] = []
@@ -303,7 +305,7 @@ class RefineDatasetReader:
             connection.execute(f"DROP TABLE IF EXISTS {table}")
 
     def iter_turn_candidates(
-        self, source_table: str, cfg: Any, *, batch_size: int = 4096,
+        self, source_table: str, cfg: Any, *, batch_size: int | None = None,
     ) -> Iterator[TurnEvent]:
         """Yield SQL-filtered turn candidates without materializing all points."""
         connection = self._require_open()
@@ -312,6 +314,7 @@ class RefineDatasetReader:
         w = cfg.turn_window
         if isinstance(w, bool) or not isinstance(w, int) or w < 1:
             raise RefineParquetError("turn_window must be a positive integer")
+        batch_size = self._runtime.parquet_read_batch_size if batch_size is None else batch_size
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise RefineParquetError("batch_size is invalid")
         thresholds = (cfg.min_turn_deg, cfg.max_turn_deg, cfg.min_leg_m,
@@ -425,9 +428,10 @@ class RefineDatasetReader:
                 event_index += 1
 
     def iter_cross_track_segments(
-        self, source_table: str, cfg: Any, *, batch_size: int = 4096,
+        self, source_table: str, cfg: Any, *, batch_size: int | None = None,
     ) -> Iterator[_CrossTrackSegment]:
         """Yield straight adjacent segments prepared by spillable DuckDB SQL."""
+        batch_size = self._runtime.parquet_read_batch_size if batch_size is None else batch_size
         connection, threshold = self._validate_cross_track_request(
             source_table, cfg, batch_size,
         )
@@ -447,9 +451,10 @@ class RefineDatasetReader:
                 yield self._decode_cross_track_segment(row, source_table)
 
     def iter_cross_track_pair_batches(
-        self, source_table: str, cfg: Any, *, batch_size: int = 4096,
+        self, source_table: str, cfg: Any, *, batch_size: int | None = None,
     ) -> Iterator[tuple[tuple[_CrossTrackSegment, _CrossTrackSegment], ...]]:
         """Yield stable conservative intersection pairs for the exact NumPy kernel."""
+        batch_size = self._runtime.parquet_read_batch_size if batch_size is None else batch_size
         connection, threshold = self._validate_cross_track_request(
             source_table, cfg, batch_size,
         )
@@ -813,10 +818,16 @@ def _relation(postgres_sql: str, table: str) -> str:
     )
 
 
-def _open_duckdb(runtime: RuntimeConfig, temp_directory: Path) -> duckdb.DuckDBPyConnection:
-    extension = Path(os.environ.get("DUCKDB_POSTGRES_EXTENSION_PATH", ""))
+def _open_duckdb(
+    runtime: RuntimeConfig,
+    temp_directory: Path,
+    postgres_extension_path: Path,
+) -> duckdb.DuckDBPyConnection:
+    extension = postgres_extension_path
     if not extension.is_absolute() or not extension.is_file():
-        raise RefineParquetError("DUCKDB_POSTGRES_EXTENSION_PATH must name a bundled absolute file")
+        raise RefineParquetError(
+            "paths.duckdb_postgres_extension_path must name a bundled absolute file"
+        )
     temp_directory.mkdir(parents=True, exist_ok=True)
     connection = duckdb.connect(database=":memory:", config={
         "autoinstall_known_extensions": "false", "autoload_known_extensions": "false",
@@ -860,6 +871,7 @@ def _validate_schema(descriptor: ArtifactDescriptor) -> None:
 def export_refine_parquet(
     conn: Any, postgres: PostgresConfig, handle: StagingDataset,
     runtime: RuntimeConfig, source_fingerprint: dict[str, object],
+    *, data_root: Path, postgres_extension_path: Path,
 ) -> ArtifactDescriptor:
     """Write and inspect staging only; never publish, commit, rollback, or finish.
 
@@ -873,13 +885,16 @@ def export_refine_parquet(
     source_table, srid, result_schema = _run_metadata(conn, handle.run_id)
     contract = validate_source_table(conn, source_table)
     postgres_sql = _postgres_query(handle.run_id, contract, srid, result_schema)
-    data_root = Path(os.environ.get("DATA_ROOT", "/data"))
     outputs = {
         name: f"{name}/part-00000.parquet" for name in REFINE_PARQUET_V1
     }
     # C05a deliberately writes one file per logical table. Target file sizing
     # remains zero/engine-default until the benchmark introduces partitioning.
-    with _open_duckdb(runtime, data_root / "duckdb" / str(handle.run_id)) as connection:
+    with _open_duckdb(
+        runtime,
+        data_root / "duckdb" / str(handle.run_id),
+        postgres_extension_path,
+    ) as connection:
         connection.execute(
             f"ATTACH {_literal(postgres.dsn())} AS authoritative_pg "
             "(TYPE postgres, READ_ONLY)"

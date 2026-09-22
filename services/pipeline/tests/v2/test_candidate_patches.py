@@ -1,6 +1,8 @@
 """Patch boundaries must not change candidates, provenance or reader lifetime."""
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -76,7 +78,7 @@ def test_track_patches_are_lazy_keep_tracks_intact_and_emit_tail():
 @pytest.mark.parametrize("batch_size", [1, 2, 5, 100])
 def test_turn_candidates_are_independent_of_patch_size(batch_size):
     tracks = _turn_tracks()
-    cfg = IntersectConfig(stream_batch_size=batch_size, turn_window=1, min_leg_m=10)
+    cfg = intersect_config(stream_batch_size=batch_size, turn_window=1, min_leg_m=10)
     expected = detect_turn_patch(tracks, cfg)
     assert len(expected) == len(tracks)
     assert [e.event_calculate_index for e in expected] == list(range(len(tracks)))
@@ -97,7 +99,7 @@ def _cross_tracks():
 @pytest.mark.parametrize("cell_m", [10.0, 100.0, 1000.0])
 def test_grid_and_overflow_patches_preserve_reference_candidates(batch_size, cell_m):
     tracks = _cross_tracks()
-    cfg = IntersectConfig(
+    cfg = intersect_config(
         cross_track_pair_batch_size=batch_size,
         cross_track_grid_cell_m=cell_m,
         cross_track_max_grid_cells_per_segment=8,
@@ -112,7 +114,7 @@ def test_grid_and_overflow_patches_preserve_reference_candidates(batch_size, cel
 
 
 def test_mixed_grid_and_overflow_schedule_pairs_once_under_the_patch_bound():
-    cfg = IntersectConfig(cross_track_max_grid_cells_per_segment=8)
+    cfg = intersect_config(cross_track_max_grid_cells_per_segment=8)
     segments, _ = _prepare_segments(_cross_tracks(), _TRANSFORMER, cfg)
     index = build_cross_track_index(segments, cell_m=100.0, max_cells=8)
     assert index.grid
@@ -145,7 +147,7 @@ def test_consumed_turn_patch_is_released_before_producer_builds_next_patch():
             references.append(weakref.ref(points[2]))
             yield str(index), points
 
-    cfg = IntersectConfig(stream_batch_size=2, turn_window=1, min_leg_m=10)
+    cfg = intersect_config(stream_batch_size=2, turn_window=1, min_leg_m=10)
     events = extract_turn_candidates(iter_track_patches(source(), cfg.stream_batch_size), cfg)
     gc.collect()
     assert len(events) == 4

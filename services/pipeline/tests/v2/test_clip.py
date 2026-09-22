@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 from types import SimpleNamespace
 import unittest
 from unittest.mock import ANY, MagicMock, patch
@@ -11,8 +13,8 @@ from track.v2 import (
     ClipInput,
     ClipIntersection,
     ClipTrack,
-    extract_clips,
-    extract_clips_for_detect,
+    extract_clips as _extract_clips,
+    extract_clips_for_detect as _extract_clips_for_detect,
 )
 from track.v2 import clip as clip_module
 from track.v2.models import ResolvedTrackPoint, RuntimeConfig, SpatialContext
@@ -29,6 +31,17 @@ _CONTEXT = SpatialContext(
     },
 )
 _TRANSFORMER = CoordinateTransformer(_CONTEXT)
+
+
+def extract_clips(*args, **kwargs):
+    kwargs.setdefault("config", clip_config())
+    return _extract_clips(*args, **kwargs)
+
+
+def extract_clips_for_detect(*args, **kwargs):
+    kwargs.setdefault("config", clip_config())
+    kwargs.setdefault("verify_sha256", False)
+    return _extract_clips_for_detect(*args, **kwargs)
 
 
 def _point(
@@ -132,7 +145,7 @@ class ResolvedSequenceClipTest(unittest.TestCase):
 
         result = extract_clips(
             _input(points, intersections=circles),
-            config=ClipConfig(include_boundary_clips=False),
+            config=clip_config(include_boundary_clips=False),
         )
 
         self.assertEqual(len(result.clips), 1)
@@ -183,7 +196,7 @@ class ResolvedSequenceClipTest(unittest.TestCase):
         )
         result = extract_clips(
             _input(points, intersections=circles),
-            config=ClipConfig(include_boundary_clips=False),
+            config=clip_config(include_boundary_clips=False),
         )
         self.assertEqual([clip.clip_type for clip in result.clips], ["between_intersection"])
 
@@ -261,10 +274,12 @@ class DetectClipLoadTest(unittest.TestCase):
         ):
             result = extract_clips_for_detect(
                 conn, "detect-1", publication_root="/parquet", data_root="/tmp",
-                runtime=RuntimeConfig(),
+                runtime=runtime_config(),
             )
 
-        factory.assert_called_once_with("/parquet", "descriptor", "present", ANY)
+        factory.assert_called_once_with(
+            "/parquet", "descriptor", "present", ANY, verify_sha256=False,
+        )
         reader.__exit__.assert_called_once()
         conn.commit.assert_not_called()
         self.assertEqual(result.detect_id, "detect-1")
@@ -286,7 +301,7 @@ class DetectClipLoadTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "deleted"):
                 extract_clips_for_detect(
                     conn, "detect-1", publication_root="/parquet",
-                    data_root="/tmp", runtime=RuntimeConfig(),
+                    data_root="/tmp", runtime=runtime_config(),
                 )
         spool.close.assert_called_once_with()
 
@@ -308,7 +323,7 @@ class DetectClipLoadTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "broken relation"):
                 extract_clips_for_detect(
                     MagicMock(), "detect-1", publication_root="/parquet",
-                    data_root="/tmp", runtime=RuntimeConfig(),
+                    data_root="/tmp", runtime=runtime_config(),
                 )
         reader.__exit__.assert_called_once()
         spool.close.assert_called_once_with()
@@ -322,7 +337,7 @@ class DetectClipLoadTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "is not completed"):
                 extract_clips_for_detect(
                     object(), "detect-1", publication_root="/parquet",
-                    data_root="/tmp", runtime=RuntimeConfig(),
+                    data_root="/tmp", runtime=runtime_config(),
                 )
         fetch.assert_not_called()
 

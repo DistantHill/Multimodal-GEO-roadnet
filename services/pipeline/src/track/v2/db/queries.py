@@ -829,6 +829,8 @@ def fetch_intersections(conn: object, detect_id: str) -> list[ClipIntersection]:
 def fetch_resolved_clip_tracks(
     conn: object,
     detect_id: str,
+    *,
+    batch_size: int,
 ) -> Iterator[ClipTrack]:
     """Stream complete subtracks from the final p/i/c sequence for Clip without reconstructing roots."""
     run = fetch_detect_row(conn, detect_id)
@@ -870,7 +872,7 @@ def fetch_resolved_clip_tracks(
     current_vehicle = ""
     points: list[ResolvedTrackPoint] = []
     with conn.cursor(name=f"clip_tracks_{uuid.uuid4().hex}") as cur:
-        cur.itersize = 2000
+        cur.itersize = batch_size
         declare_full_scan_cursor(conn, cur, query, (detect_id,))
         for row_count, row in enumerate(cur, 1):
             if row_count % 10_000 == 0:

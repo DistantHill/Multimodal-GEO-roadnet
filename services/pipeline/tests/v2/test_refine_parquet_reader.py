@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import hashlib
 import json
 import math
@@ -118,7 +120,7 @@ def _published_tracks(tmp_path: Path, tracks):
 def test_reader_uses_only_manifest_files_and_merges_one_vehicle_subtrack(tmp_path) -> None:
     descriptor = _published(tmp_path)
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         batches = list(reader.iter_subtrack_batches("v1", 4, batch_size=2))
         assert [len(batch) for batch in batches] == [2, 1]
@@ -134,13 +136,13 @@ def test_reader_uses_only_manifest_files_and_merges_one_vehicle_subtrack(tmp_pat
     extra.chmod(0o444)
     extra.parent.chmod(0o555)
     with pytest.raises(Exception, match="manifest"):
-        refine_parquet.RefineDatasetReader(tmp_path, descriptor, "present", RuntimeConfig())
+        refine_parquet.RefineDatasetReader(tmp_path, descriptor, "present", runtime_config())
 
 
 def test_track_count_validates_source_and_counts_subtrack_identities(tmp_path) -> None:
     descriptor = _published(tmp_path)
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         assert reader.track_count() == 3
         assert reader.track_count() == 3
@@ -149,7 +151,7 @@ def test_track_count_validates_source_and_counts_subtrack_identities(tmp_path) -
 def test_reader_adapts_all_tracks_across_batches_and_queries_extent(tmp_path) -> None:
     descriptor = _published(tmp_path)
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         tracks = list(reader.iter_tracks("public.source_points", batch_size=2))
         assert [(track[0].vehicle_id, track[0].refined_point_ref.subtrack_index,
@@ -184,7 +186,7 @@ def test_topology_windows_select_complete_tracks_with_stable_deduplication(tmp_p
         SpatialWindow(-5, -0.5, 5, 0.5),
     ]
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
         data_root=tmp_path,
     ) as reader:
         selected = list(reader.iter_topology_tracks("source", windows, batch_size=1))
@@ -202,7 +204,7 @@ def test_topology_windows_select_complete_tracks_with_stable_deduplication(tmp_p
 def test_topology_track_rebuild_preserves_kept_injected_order(tmp_path) -> None:
     descriptor = _published(tmp_path)
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         selected = list(reader.iter_topology_tracks(
             "public.source", [SpatialWindow(10, 20, 10, 20)], batch_size=1,
@@ -224,7 +226,7 @@ def test_topology_selection_order_matches_legacy_text_track_key(tmp_path) -> Non
     descriptor = _published_tracks(tmp_path, tracks)
     expected = sorted(f"{vehicle}\0{subtrack}" for vehicle, subtrack, _ in tracks)
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         actual = [selection.track_key for selection in reader.iter_topology_tracks(
             "source", [SpatialWindow(0, 0, 0, 0)], batch_size=1,
@@ -241,7 +243,7 @@ def test_topology_segment_aabb_uses_closed_window_edges(tmp_path, points, matche
     track = [(index, x, y, 0) for index, (x, y) in enumerate(points)]
     descriptor = _published_tracks(tmp_path, [("edge", 0, track)])
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         selected = list(reader.iter_topology_tracks(
             "source", [SpatialWindow(0, 0, 1, 1)], batch_size=1,
@@ -252,7 +254,7 @@ def test_topology_segment_aabb_uses_closed_window_edges(tmp_path, points, matche
 def test_topology_windows_reject_invalid_inputs_and_require_open_reader(tmp_path) -> None:
     descriptor = _published(tmp_path)
     reader = refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(), data_root=tmp_path,
+        tmp_path, descriptor, "present", runtime_config(), data_root=tmp_path,
     )
     with pytest.raises(refine_parquet.RefineParquetError, match="not open"):
         list(reader.iter_topology_tracks("source", []))
@@ -274,7 +276,7 @@ def test_topology_generator_close_drops_window_table_and_allows_reuse(tmp_path) 
         ("a", 0, [(0, -1, 0, 0), (1, 1, 0, 0)]),
     ])
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         iterator = reader.iter_topology_tracks(
             "source", [SpatialWindow(0, 0, 0, 0)], batch_size=1,
@@ -300,7 +302,7 @@ def test_reader_temp_directory_is_explicit_isolated_and_cleaned(tmp_path) -> Non
     sibling.mkdir(parents=True)
     marker = sibling / "owned-elsewhere"
     marker.write_text("keep")
-    runtime = RuntimeConfig(
+    runtime = runtime_config(
         duckdb_memory_limit="64MB", duckdb_threads=1,
         duckdb_max_temp_directory_size="1GB",
     )
@@ -324,13 +326,14 @@ def test_reader_temp_directory_is_explicit_isolated_and_cleaned(tmp_path) -> Non
     assert marker.read_text() == "keep"
     with pytest.raises(refine_parquet.RefineParquetError, match="absolute"):
         refine_parquet.RefineDatasetReader(
-            publication, descriptor, "present", RuntimeConfig(),
+            publication, descriptor, "present", runtime_config(),
             data_root=Path("relative"),
         )
 
 
 def _adapter_reader(rows, owner):
     reader = object.__new__(refine_parquet.RefineDatasetReader)
+    reader._runtime = runtime_config()
     result = Mock()
     result.fetchmany.side_effect = [rows, []]
     connection = Mock()
@@ -381,7 +384,7 @@ def test_adapter_rejects_sequence_gap_and_non_finite_or_out_of_range_values() ->
 def test_reader_rejects_non_present_unknown_tables_and_schema(tmp_path) -> None:
     descriptor = _published(tmp_path)
     with pytest.raises(Exception, match="not present"):
-        refine_parquet.RefineDatasetReader(tmp_path, descriptor, "deleted", RuntimeConfig())
+        refine_parquet.RefineDatasetReader(tmp_path, descriptor, "deleted", runtime_config())
     manifest = json.loads(descriptor.manifest_json)
     manifest["tables"][0]["name"] = "unknown_points"
     changed = ArtifactDescriptor.create(
@@ -390,7 +393,7 @@ def test_reader_rejects_non_present_unknown_tables_and_schema(tmp_path) -> None:
         source_fingerprint=json.loads(descriptor.source_fingerprint_json), manifest=manifest,
     )
     with pytest.raises(refine_parquet.RefineParquetError, match="logical tables"):
-        refine_parquet.RefineDatasetReader(tmp_path, changed, "present", RuntimeConfig())
+        refine_parquet.RefineDatasetReader(tmp_path, changed, "present", runtime_config())
     manifest = json.loads(descriptor.manifest_json)
     manifest["tables"][0]["schema"][0]["type"] = "VARCHAR"
     manifest["tables"][0]["schema_fingerprint"] = hashlib.sha256(
@@ -403,12 +406,13 @@ def test_reader_rejects_non_present_unknown_tables_and_schema(tmp_path) -> None:
     )
     with pytest.raises(Exception, match="schema"):
         refine_parquet.RefineDatasetReader(
-            tmp_path, schema_changed, "present", RuntimeConfig(),
+            tmp_path, schema_changed, "present", runtime_config(),
         )
 
 
 def test_batch_api_uses_bounded_fetchmany_not_fetchall() -> None:
     reader = object.__new__(refine_parquet.RefineDatasetReader)
+    reader._runtime = runtime_config()
     result = Mock()
     result.fetchmany.side_effect = [[("first",)], [("second",)], []]
     connection = Mock()
@@ -437,10 +441,10 @@ def test_duckdb_turn_candidates_match_python_oracle_across_batches(tmp_path, win
         ("elapsed", 4, [(0, 0, 0, 0), (0, 20, 0, 0), (0, 20, 20, 90)]),
     ]
     descriptor = _published_tracks(tmp_path, tracks)
-    cfg = IntersectConfig(turn_window=window, min_turn_deg=45, max_turn_deg=170,
+    cfg = intersect_config(turn_window=window, min_turn_deg=45, max_turn_deg=170,
                           min_leg_m=19, min_movement_speed_mps=1)
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         expected = detect_turn_patch(
             {f"{t[0]}\0{t[1]}": t for t in reader.iter_tracks("public.source", batch_size=2)},
@@ -469,15 +473,15 @@ def test_duckdb_turn_thresholds_are_inclusive_and_config_is_strict(tmp_path) -> 
         ("edge", 0, [(0, 0, 0, 0), (10, 0, 10, 90), (20, 10, 10, 90)]),
     ])
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
-        cfg = IntersectConfig(turn_window=1, min_turn_deg=90, max_turn_deg=90,
+        cfg = intersect_config(turn_window=1, min_turn_deg=90, max_turn_deg=90,
                               min_leg_m=10, min_movement_speed_mps=1)
         assert len(list(reader.iter_turn_candidates("source", cfg))) == 1
         for invalid in (
-            IntersectConfig(turn_window=0),
-            IntersectConfig(min_leg_m=float("nan")),
-            IntersectConfig(min_turn_deg=100, max_turn_deg=90),
+            intersect_config(turn_window=0),
+            intersect_config(min_leg_m=float("nan")),
+            intersect_config(min_turn_deg=100, max_turn_deg=90),
         ):
             with pytest.raises(refine_parquet.RefineParquetError, match="turn"):
                 list(reader.iter_turn_candidates("source", invalid))
@@ -507,10 +511,10 @@ def test_duckdb_turn_boundary_fallback_matches_python_oracle(tmp_path) -> None:
         ("neg-above-max", 12, [(0, 0, 120, above_max), (10, 10, 120, 0),
                                 (20, 20, 120, 0)]),
     ])
-    cfg = IntersectConfig(turn_window=1, min_turn_deg=45, max_turn_deg=170,
+    cfg = intersect_config(turn_window=1, min_turn_deg=45, max_turn_deg=170,
                           min_leg_m=1, min_movement_speed_mps=0)
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         tracks = {f"{t[0]}\0{t[1]}": t for t in reader.iter_tracks("source")}
         expected = detect_turn_patch(tracks, cfg)
@@ -529,10 +533,10 @@ def test_duckdb_turn_unstable_resultant_forces_python_oracle(tmp_path) -> None:
         ("unstable", 0, [(0, 0, 0, 0), (10, 10, 0, 180), (20, 20, 0, 90),
                           (30, 30, 0, 270), (40, 40, 0, 0)]),
     ])
-    cfg = IntersectConfig(turn_window=2, min_turn_deg=0, max_turn_deg=180,
+    cfg = intersect_config(turn_window=2, min_turn_deg=0, max_turn_deg=180,
                           min_leg_m=1, min_movement_speed_mps=0)
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         tracks = {"unstable": next(reader.iter_tracks("source"))}
         expected = detect_turn_patch(tracks, cfg)
@@ -551,10 +555,10 @@ def test_duckdb_turn_internal_rows_do_not_call_python_exact_helper(tmp_path) -> 
     descriptor = _published_tracks(tmp_path, [
         ("internal", 0, [(0, 0, 0, 0), (10, 10, 0, 90), (20, 20, 0, 90)]),
     ])
-    cfg = IntersectConfig(turn_window=1, min_turn_deg=45, max_turn_deg=170,
+    cfg = intersect_config(turn_window=1, min_turn_deg=45, max_turn_deg=170,
                           min_leg_m=1, min_movement_speed_mps=0)
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader, patch.object(refine_parquet, "_circular_mean_deg") as exact:
         actual = list(reader.iter_turn_candidates("source", cfg, batch_size=1))
     assert len(actual) == 1
@@ -571,14 +575,14 @@ def test_duckdb_cross_track_segments_match_q49_oracle(tmp_path) -> None:
         ("b", 3, [(4, 0, 1, 180), (5, -1, 1, 178), (6, -2, 1, 174)]),
     ]
     descriptor = _published_tracks(tmp_path, tracks)
-    cfg = IntersectConfig(cross_track_straightness_deg=2)
+    cfg = intersect_config(cross_track_straightness_deg=2)
     transformer = CoordinateTransformer(SpatialContext(
         4326, 32650,
         {"coordinate_semantics_version": 2, "enforce_area_of_use": True,
          "max_scale_error": .01},
     ))
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         oracle_tracks = {
             f"{track[0].vehicle_id}\0{track[0].refined_point_ref.subtrack_index}": track
@@ -625,14 +629,14 @@ def test_duckdb_cross_track_pairs_conservatively_reduce_aabb_oracle(
         ("g", 70, [(14, 5, -1e-13, 90), (15, 5, 1e-13, 90)]),  # near-degenerate
     ]
     descriptor = _published_tracks(tmp_path, tracks)
-    cfg = IntersectConfig(cross_track_grid_cell_m=10,
+    cfg = intersect_config(cross_track_grid_cell_m=10,
                           cross_track_max_grid_cells_per_segment=3)
     transformer = CoordinateTransformer(SpatialContext(
         4326, 32650, {"coordinate_semantics_version": 2,
                       "enforce_area_of_use": True, "max_scale_error": .01},
     ))
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         oracle_tracks = {
             f"{track[0].vehicle_id}\0{track[0].refined_point_ref.subtrack_index}": track
@@ -653,7 +657,7 @@ def test_duckdb_cross_track_pairs_conservatively_reduce_aabb_oracle(
         ))
         compatibility_batches = list(reader.iter_cross_track_pair_batches(
             "public.source",
-            IntersectConfig(cross_track_grid_cell_m=1,
+            intersect_config(cross_track_grid_cell_m=1,
                             cross_track_max_grid_cells_per_segment=1),
             batch_size=batch_size,
         ))
@@ -701,7 +705,7 @@ def test_columnar_cross_track_exact_kernel_matches_q49_oracle(tmp_path, batch_si
         ("e", 50, [(10, -100, -4, 90), (11, -100, 4, 90)]),  # overflow pair
         ("f", 60, [(12, 5, -1e-13, 90), (13, 5, 1e-13, 90)]),  # near-degenerate
     ])
-    cfg = IntersectConfig(
+    cfg = intersect_config(
         cross_track_pair_batch_size=batch_size,
         cross_track_grid_cell_m=5,
         cross_track_max_grid_cells_per_segment=2,
@@ -713,7 +717,7 @@ def test_columnar_cross_track_exact_kernel_matches_q49_oracle(tmp_path, batch_si
                       "enforce_area_of_use": True, "max_scale_error": .01},
     ))
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         tracks = {
             f"{track[0].vehicle_id}\0{track[0].refined_point_ref.subtrack_index}": track
@@ -724,7 +728,7 @@ def test_columnar_cross_track_exact_kernel_matches_q49_oracle(tmp_path, batch_si
             reader, "source", transformer, cfg,
         )
         with CrossCandidateRelation(
-            RuntimeConfig(duckdb_threads=1), tmp_path,
+            runtime_config(duckdb_threads=1), tmp_path,
         ) as candidate_store:
             stored = extract_columnar_cross_track_candidates(
                 reader, "source", transformer, cfg, candidate_store=candidate_store,
@@ -756,7 +760,7 @@ def test_columnar_cross_track_does_not_seal_caller_store_on_error() -> None:
     store = Mock()
     with pytest.raises(RuntimeError, match="planner failed"):
         extract_columnar_cross_track_candidates(
-            reader, "source", Mock(), IntersectConfig(), candidate_store=store,
+            reader, "source", Mock(), intersect_config(), candidate_store=store,
         )
     store.seal.assert_not_called()
     store.close.assert_not_called()
@@ -768,22 +772,23 @@ def test_duckdb_cross_track_pairs_empty_single_vehicle_and_strict_config(tmp_pat
         ("a", 1, [(2, 0, -1, 90), (3, 0, 1, 90)]),
     ])
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
-        assert list(reader.iter_cross_track_pair_batches("source", IntersectConfig())) == []
+        assert list(reader.iter_cross_track_pair_batches("source", intersect_config())) == []
         for cfg, match in (
-            (IntersectConfig(cross_track_grid_cell_m=float("nan")), "cell size"),
-            (IntersectConfig(cross_track_grid_cell_m=0), "cell size"),
-            (IntersectConfig(cross_track_max_grid_cells_per_segment=0), "maximum grid"),
+            (intersect_config(cross_track_grid_cell_m=float("nan")), "cell size"),
+            (intersect_config(cross_track_grid_cell_m=0), "cell size"),
+            (intersect_config(cross_track_max_grid_cells_per_segment=0), "maximum grid"),
         ):
             with pytest.raises(refine_parquet.RefineParquetError, match=match):
                 list(reader.iter_cross_track_pair_batches("source", cfg))
         with pytest.raises(refine_parquet.RefineParquetError, match="batch_size"):
-            list(reader.iter_cross_track_pair_batches("source", IntersectConfig(), batch_size=0))
+            list(reader.iter_cross_track_pair_batches("source", intersect_config(), batch_size=0))
 
 
 def test_cross_track_pair_api_never_fetches_all() -> None:
     reader = object.__new__(refine_parquet.RefineDatasetReader)
+    reader._runtime = runtime_config()
     reader._descriptor = Mock(refine_id=uuid4())
     validation, materialized, analyzed, result, dropped = (Mock() for _ in range(5))
     validation.fetchone.return_value = (0,)
@@ -792,7 +797,7 @@ def test_cross_track_pair_api_never_fetches_all() -> None:
     connection.execute.side_effect = [validation, materialized, analyzed, result, dropped]
     reader._connection = connection
     assert list(reader.iter_cross_track_pair_batches(
-        "source", IntersectConfig(), batch_size=1,
+        "source", intersect_config(), batch_size=1,
     )) == []
     result.fetchmany.assert_called_once_with(1)
     assert not result.fetchall.called
@@ -800,7 +805,7 @@ def test_cross_track_pair_api_never_fetches_all() -> None:
     assert create_sql.startswith("CREATE TEMP TABLE cross_track_straight_")
     assert create_sql.count("FROM refine_points") == 1
     assert "end_x <> x" not in create_sql
-    default = IntersectConfig()
+    default = intersect_config()
     assert create_parameters == [default.cross_track_straightness_deg]
     assert connection.execute.call_args_list[2].args[0].startswith("ANALYZE cross_track_straight_")
     sql, parameters = connection.execute.call_args_list[3].args
@@ -822,9 +827,9 @@ def test_cross_track_pair_temp_table_cleanup_and_reader_reuse(tmp_path) -> None:
         ("a", 0, [(0, -1, 0, 0), (1, 1, 0, 0)]),
         ("b", 1, [(2, 0, -1, 90), (3, 0, 1, 90)]),
     ])
-    cfg = IntersectConfig()
+    cfg = intersect_config()
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         count_sql = """
           SELECT count(*) FROM duckdb_tables()
@@ -873,12 +878,12 @@ def test_cross_track_production_payload_plan_leads_with_aabb_range(tmp_path) -> 
                     else self.connection.execute(query, params))
 
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         proxy = ExplainProxy(reader._connection)
         reader._connection = proxy
         assert list(reader.iter_cross_track_pair_batches(
-            "source", IntersectConfig(), batch_size=7,
+            "source", intersect_config(), batch_size=7,
         )) == []
         assert proxy.query is not None and proxy.plan is not None
         assert "SELECT a.* EXCLUDE" in proxy.query
@@ -899,11 +904,11 @@ def test_cross_track_pair_generator_close_after_reader_close_is_safe(tmp_path) -
         ("b", 1, [(2, 0, -1, 90), (3, 0, 1, 90)]),
     ])
     reader = refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     )
     with reader:
         iterator = reader.iter_cross_track_pair_batches(
-            "source", IntersectConfig(), batch_size=1,
+            "source", intersect_config(), batch_size=1,
         )
         assert len(next(iterator)) == 1
     iterator.close()
@@ -912,6 +917,7 @@ def test_cross_track_pair_generator_close_after_reader_close_is_safe(tmp_path) -
 def test_cross_track_segment_api_is_bounded_and_validates_config() -> None:
     owner = uuid4()
     reader = object.__new__(refine_parquet.RefineDatasetReader)
+    reader._runtime = runtime_config()
     validation = Mock()
     validation.fetchone.return_value = (0,)
     result = Mock()
@@ -922,14 +928,14 @@ def test_cross_track_segment_api_is_bounded_and_validates_config() -> None:
     reader._descriptor = Mock(refine_id=owner)
 
     assert list(reader.iter_cross_track_segments(
-        "source", IntersectConfig(), batch_size=1,
+        "source", intersect_config(), batch_size=1,
     )) == []
     result.fetchmany.assert_called_with(1)
     assert not result.fetchall.called
     for threshold in (float("nan"), -1, 181, True):
         with pytest.raises(refine_parquet.RefineParquetError, match="straightness"):
             list(reader.iter_cross_track_segments(
-                "source", IntersectConfig(cross_track_straightness_deg=threshold),
+                "source", intersect_config(cross_track_straightness_deg=threshold),
             ))
 
 
@@ -938,25 +944,25 @@ def test_cross_track_segments_reject_global_subtrack_vehicle_mixing(tmp_path) ->
         ("a", 7, [(0, 0, 0, 0)]), ("b", 7, [(1, 1, 0, 0)]),
     ])
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         with pytest.raises(refine_parquet.RefineParquetError, match="corrupt"):
-            list(reader.iter_cross_track_segments("source", IntersectConfig()))
+            list(reader.iter_cross_track_segments("source", intersect_config()))
 
 
 def test_cross_track_segments_reject_null_on_single_point_track(tmp_path) -> None:
     descriptor = _published_tracks(tmp_path, [("a", 0, [(0, None, 0, 0)])])
     with refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1),
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         with pytest.raises(refine_parquet.RefineParquetError, match="corrupt"):
-            list(reader.iter_cross_track_segments("source", IntersectConfig()))
+            list(reader.iter_cross_track_segments("source", intersect_config()))
 
 
 def test_reader_closes_connection_when_view_creation_fails(tmp_path, monkeypatch) -> None:
     descriptor = _published(tmp_path)
     reader = refine_parquet.RefineDatasetReader(
-        tmp_path, descriptor, "present", RuntimeConfig(), data_root=tmp_path,
+        tmp_path, descriptor, "present", runtime_config(), data_root=tmp_path,
     )
     connection = Mock()
     connection.execute.side_effect = duckdb.IOException("view probe")

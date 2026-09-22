@@ -19,6 +19,7 @@ import argparse
 import getpass
 import hashlib
 import json
+import os
 import statistics
 import time
 from datetime import datetime, timezone
@@ -26,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from ..clip import extract_clips
-from ..config import PostgresConfig, connect, default_postgres_config
+from ..config import PostgresConfig, connect
 from ..db.queries import (
     fetch_detect_row,
     fetch_intersections,
@@ -290,15 +291,14 @@ def _find_regressions(current: dict[str, Any], baseline: dict[str, Any]) -> list
 
 
 def build_parser() -> argparse.ArgumentParser:
-    defaults = default_postgres_config()
     parser = argparse.ArgumentParser(description="Audit schema-v4 storage and A65 timings")
-    parser.add_argument("--host", default=defaults.host)
-    parser.add_argument("--port", type=int, default=defaults.port)
-    parser.add_argument("--database", default=defaults.database)
-    parser.add_argument("--user", default=defaults.user)
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--database", required=True)
+    parser.add_argument("--user", required=True)
     parser.add_argument("--ask-password", action="store_true")
-    parser.add_argument("--connect-timeout", type=int, default=defaults.connect_timeout)
-    parser.add_argument("--sslmode", default=defaults.sslmode)
+    parser.add_argument("--connect-timeout", type=int, required=True)
+    parser.add_argument("--sslmode")
     parser.add_argument("--detect-id")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--pipeline-stats", type=Path)
@@ -314,7 +314,7 @@ def main() -> int:
     password = (
         getpass.getpass("PostgreSQL password: ")
         if args.ask_password
-        else default_postgres_config().password
+        else os.environ["POSTGRES_PASSWORD"]
     )
     config = PostgresConfig(
         host=args.host,
@@ -324,6 +324,11 @@ def main() -> int:
         password=password,
         connect_timeout=args.connect_timeout,
         sslmode=args.sslmode,
+        keepalives=True,
+        keepalives_idle=60,
+        keepalives_interval=10,
+        keepalives_count=5,
+        tcp_user_timeout=30000,
     )
     report: dict[str, Any] = {
         "schema": "track.v2-schema-v4-a65-benchmark",

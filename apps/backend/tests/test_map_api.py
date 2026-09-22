@@ -15,6 +15,17 @@ from backend.map_api import (
     replay,
 )
 from backend.map_schemas import ClipRequest, ReplayRequest
+from backend.config import MapConfig
+
+
+MAP_CONFIG = MapConfig(layer_limit_default=1_000, layer_limit_max=5_000,
+                       catalog_exact_count_max_rows=50_000,
+                       replay_max_vehicles_default=25, replay_max_vehicles_max=100,
+                       replay_max_points_default=10_000, replay_max_points_max=50_000,
+                       replay_selection_ids_max=1_000,
+                       clip_max_vehicles_default=50, clip_max_vehicles_max=200,
+                       clip_max_points_default=20_000, clip_max_points_max=100_000,
+                       clip_feature_limit=1_000)
 
 
 def feature_collection(**metadata: Any) -> dict[str, Any]:
@@ -76,6 +87,7 @@ def test_layer_query_parses_bbox_context_and_limit() -> None:
         fit_id=None,
         limit=25,
         store=store,
+        map_config=MAP_CONFIG,
     )
 
     assert store.layer_calls == [{
@@ -102,6 +114,7 @@ def test_layer_query_rejects_invalid_bbox(bbox: str) -> None:
             fit_id=None,
             limit=25,
             store=store,
+            map_config=MAP_CONFIG,
         )
     assert caught.value.status_code == 422
     assert store.layer_calls == []
@@ -110,8 +123,9 @@ def test_layer_query_rejects_invalid_bbox(bbox: str) -> None:
 def test_replay_accepts_external_and_internal_id_namespaces() -> None:
     store = FakeMapStore()
     source_request = ReplayRequest(source_row_keys=["external-7", "9"])
-    replay(source_request, store=store)
-    assert store.replay_request == source_request
+    replay(source_request, store=store, map_config=MAP_CONFIG)
+    assert store.replay_request.max_vehicles == 25
+    assert store.replay_request.max_points == 10_000
 
     with pytest.raises(ValidationError, match="resolved_point_ids requires detect_id"):
         ReplayRequest(resolved_point_ids=[7, 9])
@@ -120,8 +134,8 @@ def test_replay_accepts_external_and_internal_id_namespaces() -> None:
         detect_id=UUID("12345678-1234-5678-1234-567812345678"),
         resolved_point_ids=[7, 9],
     )
-    replay(resolved_request, store=store)
-    assert store.replay_request == resolved_request
+    replay(resolved_request, store=store, map_config=MAP_CONFIG)
+    assert store.replay_request.max_vehicles == 25
 
 
 def test_replay_requires_exactly_one_selection() -> None:
@@ -153,8 +167,35 @@ def test_clip_forwards_valid_request() -> None:
         detect_id=UUID("12345678-1234-5678-1234-567812345678"),
         intersection_ids=[1, 2],
     )
-    clip(request, store=store)
-    assert store.clip_request == request
+    clip(request, store=store, map_config=MAP_CONFIG)
+    assert store.clip_request.max_vehicles == 50
+    assert store.clip_request.max_points == 20_000
+
+
+@pytest.mark.parametrize(
+    ("operation", "payload"),
+    [
+        ("replay", ReplayRequest(source_row_keys=["1"], max_vehicles=101)),
+        ("replay", ReplayRequest(source_row_keys=["1"], max_points=50_001)),
+        ("clip", ClipRequest(
+            detect_id=UUID("12345678-1234-5678-1234-567812345678"),
+            intersection_ids=[1, 2], max_vehicles=201,
+        )),
+        ("clip", ClipRequest(
+            detect_id=UUID("12345678-1234-5678-1234-567812345678"),
+            intersection_ids=[1, 2], max_points=100_001,
+        )),
+    ],
+)
+def test_replay_and_clip_reject_values_above_configured_limits(
+    operation: str, payload: ReplayRequest | ClipRequest,
+) -> None:
+    with pytest.raises(HTTPException) as caught:
+        if operation == "replay":
+            replay(payload, store=FakeMapStore(), map_config=MAP_CONFIG)
+        else:
+            clip(payload, store=FakeMapStore(), map_config=MAP_CONFIG)
+    assert caught.value.status_code == 422
 
 
 def test_store_not_found_is_an_http_404() -> None:
@@ -168,6 +209,7 @@ def test_store_not_found_is_an_http_404() -> None:
             fit_id=None,
             limit=25,
             store=store,
+            map_config=MAP_CONFIG,
         )
     assert caught.value.status_code == 404
     assert caught.value.detail == "no completed Detect Run is available"

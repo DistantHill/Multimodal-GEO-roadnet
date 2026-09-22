@@ -1,78 +1,80 @@
-# Default field specifications for track.v2 Parser 0.
-# Each [[field]] entry maps one canonical field to source column aliases.
-#
-# canonical    = internal name used by all downstream code
-# aliases      = list of possible source column names (first match wins)
-# required     = if true, this field MUST be mapped (missing → ERROR or FieldSelectionRequired)
-# type         = "str" | "float" | "int" | "timestamp"
-# unit_scale   = multiplier applied to the raw value after parsing
-# default      = fallback value when field is missing and required=false
-# extra        = if true, store in TrajectoryPoint.extra dict (not a core field)
-#
-# Core fields: point_ref, vehicle_id, timestamp, lon, lat, heading, speed, extra
-
+# Parser 字段映射；修改后必须重启 Pipeline。
 [quality]
-sample_errors_max = 50
-max_consecutive_errors = 50
-max_error_ratio = 1.0
+sample_errors_max = 50 # 错误样本上限；>=1；执行语义。
+max_consecutive_errors = 50 # 连续错误上限；>=1；解析语义。
+max_error_ratio = 1.0 # 最大错误比例；0..1；解析语义。
 
 [[field]]
 canonical = "vehicle_id"
 aliases = ["vid", "vehicle_id", "veh_id", "vehicleid"]
 required = true
 type = "str"
-
+unit_scale = 1.0
+has_default = false
+extra = false
 [[field]]
 canonical = "lon"
 aliases = ["lng", "lon", "longitude", "x"]
 required = true
 type = "float"
-
+unit_scale = 1.0
+has_default = false
+extra = false
 [[field]]
 canonical = "lat"
 aliases = ["lat", "latitude", "y"]
 required = true
 type = "float"
-
+unit_scale = 1.0
+has_default = false
+extra = false
 [[field]]
 canonical = "heading"
 aliases = ["included_angle", "heading", "heading_deg", "direction", "bearing", "angle"]
 required = false
 type = "float"
 unit_scale = 1.0
+has_default = true
 default = 0.0
-
+extra = false
 [[field]]
 canonical = "speed"
 aliases = ["gps_speed", "speed", "speed_kmh", "velocity", "spd"]
 required = false
 type = "float"
-unit_scale = 0.277778   # km/h → m/s
+unit_scale = 0.277778
+has_default = true
 default = 0.0
-
+extra = false
 [[field]]
 canonical = "timestamp"
 aliases = ["gps_time_a", "gps_time", "gps_timestamp_ms", "standard_time", "time", "timestamp", "observed_at"]
 required = true
 type = "timestamp"
-
+unit_scale = 1.0
+has_default = false
+extra = false
 [[field]]
 canonical = "road_id"
 aliases = ["road_id", "road_id_suite", "roadid"]
 required = false
 type = "str"
+unit_scale = 1.0
+has_default = false
 extra = true
-
 [[field]]
 canonical = "altitude"
 aliases = ["altitude", "alt", "elevation"]
 required = false
 type = "float"
+unit_scale = 1.0
+has_default = false
 extra = true
-
 [[field]]
 canonical = "vss_speed"
 aliases = ["vss_speed"]
 required = false
 type = "float"
+unit_scale = 1.0
+has_default = false
 extra = true

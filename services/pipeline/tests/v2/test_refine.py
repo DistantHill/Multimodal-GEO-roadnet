@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from track.v2.refine import refine_vehicle
+from track.v2.refine import refine_vehicle as _refine_vehicle
 from track.v2.refine import (
     RefineConfig,
     RefineResult,
-    refine,
+    refine as _refine,
     _split_by_gaps,
     _exclude_stationary,
     ray_intersection,
@@ -23,7 +25,7 @@ from track.v2.models import (
     SpatialContext,
     TrajectoryPoint,
 )
-from track.v2.parser import CsvSource, get_database
+from track.v2.parser import CsvSource, get_database as _get_database
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -33,6 +35,24 @@ _SPATIAL_CONTEXT = SpatialContext(
     processing_srid=32650,
     projection_config={"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": 0.01},
 )
+
+
+def get_database(source, **kwargs):
+    from .config_factory import pipeline_config
+    config = pipeline_config()
+    kwargs.setdefault("field_config", config.parser.fields)
+    kwargs.setdefault("runtime", config.runtime)
+    return _get_database(source, **kwargs)
+
+
+def refine(*args, **kwargs):
+    kwargs.setdefault("config", refine_config())
+    return _refine(*args, **kwargs)
+
+
+def refine_vehicle(*args, **kwargs):
+    kwargs.setdefault("config", refine_config())
+    return _refine_vehicle(*args, **kwargs)
 
 
 def _make_csv(tmpdir: str, filename: str, content: str, encoding: str = "utf-8") -> Path:
@@ -160,7 +180,7 @@ class RefineVehicleAggregationTest(unittest.TestCase):
 
         result = refine_vehicle(
             points,
-            config=RefineConfig(max_gap_s=120.0),
+            config=refine_config(max_gap_s=120.0),
             spatial_context=_SPATIAL_CONTEXT,
         )
 
@@ -190,7 +210,7 @@ class RefineVehicleAggregationTest(unittest.TestCase):
             _make_point("v1", "5", 1105.0, 116.1, 39.0, 90.0, 0.1),
             _make_point("v1", "6", 1115.0, 116.1, 39.0, 90.0, 0.1),
         ]
-        cfg = RefineConfig(
+        cfg = refine_config(
             max_gap_s=50.0,
             min_speed_mps=0.3,
             max_stationary_duration_s=10.0,
@@ -220,7 +240,7 @@ class StationaryExclusionTest(unittest.TestCase):
             _make_point("v1", "4", 1400.0, 116.0, 39.0, 90.0, 0.1),
             _make_point("v1", "5", 1430.0, 116.0, 39.1, 90.0, 10.0),  # moving now
         ]
-        cfg = RefineConfig(min_speed_mps=0.3, max_stationary_duration_s=300.0)
+        cfg = refine_config(min_speed_mps=0.3, max_stationary_duration_s=300.0)
         active, excluded = _exclude_stationary(points, cfg)
         # Duration of stationary: 1400 - 1000 = 400s > 300 → exclude interior
         self.assertGreaterEqual(len(excluded), 1)
@@ -231,7 +251,7 @@ class StationaryExclusionTest(unittest.TestCase):
             _make_point("v1", "2", 1030.0, 116.0, 39.0, 90.0, 0.1),
             _make_point("v1", "3", 1060.0, 116.0, 39.0, 90.0, 10.0),
         ]
-        cfg = RefineConfig(min_speed_mps=0.3, max_stationary_duration_s=300.0)
+        cfg = refine_config(min_speed_mps=0.3, max_stationary_duration_s=300.0)
         active, excluded = _exclude_stationary(points, cfg)
         # Duration: 1060 - 1000 = 60s < 300 → not excluded
         self.assertEqual(len(excluded), 0)
@@ -259,7 +279,7 @@ class TrackModelFormatPrintRefineTest(unittest.TestCase):
 
     def test_refine_config_format_print(self):
         import io
-        cfg = RefineConfig(max_gap_s=120.0, min_speed_mps=0.3)
+        cfg = refine_config(max_gap_s=120.0, min_speed_mps=0.3)
         buf = io.StringIO()
         cfg.format_print(title="Refine Config", file=buf)
         self.assertIn("Refine Config", buf.getvalue())

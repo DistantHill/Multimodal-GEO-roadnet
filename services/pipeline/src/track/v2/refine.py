@@ -33,7 +33,7 @@ def refine_vehicle(
     vehicle_points: list[TrajectoryPoint],
     *,
     spatial_context: SpatialContext,
-    config: RefineConfig | None = None,
+    config: RefineConfig,
     _transformer: CoordinateTransformer | None = None,
 ) -> RefineIncrementalResult:
     """Refine one vehicle's trajectory points.
@@ -41,7 +41,7 @@ def refine_vehicle(
     ZH: 处理单辆车的轨迹点：按时间间隙切分子轨迹、去除静止段、注入正交候选点。
         返回该车辆的全部精炼结果，不累积全局状态。
     """
-    cfg = config or RefineConfig()
+    cfg = config
     kept_points: list[TrajectoryPoint] = []
     excluded_points: list[ExcludedPoint] = []
     derived_points: list[DerivedPoint] = []
@@ -110,14 +110,14 @@ def refine(
     source: TrajectorySourceHandle,
     *,
     spatial_context: SpatialContext,
-    config: RefineConfig | None = None,
+    config: RefineConfig,
 ) -> RefineResult:
     """Refine all trajectories from a source handle.
 
     ZH: 对数据源中的全部车辆轨迹执行精炼。内部调用 ``refine_vehicle()`` 逐车处理，
         累积全局统计和输出。
     """
-    cfg = config or RefineConfig()
+    cfg = config
     active: list[TrajectoryPoint] = []
     excluded: list[ExcludedPoint] = []
     kept_subtracks: list[list[TrajectoryPoint]] = []

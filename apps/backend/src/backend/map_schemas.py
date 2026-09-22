@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+if TYPE_CHECKING:
+    from .config import MapConfig
 
 
 BBox = tuple[float, float, float, float]
@@ -41,8 +44,8 @@ class ReplayRequest(BaseModel):
     source_row_keys: list[str] | None = None
     resolved_point_ids: list[int] | None = None
     bbox: BBox | None = None
-    max_vehicles: int = Field(default=25, ge=1, le=100)
-    max_points: int = Field(default=10_000, ge=2, le=50_000)
+    max_vehicles: int | None = Field(default=None, ge=1)
+    max_points: int | None = Field(default=None, ge=2)
 
     @field_validator("source_row_keys")
     @classmethod
@@ -51,8 +54,6 @@ class ReplayRequest(BaseModel):
             return None
         if not value:
             raise ValueError("source_row_keys must not be empty")
-        if len(value) > 1_000:
-            raise ValueError("source_row_keys accepts at most 1000 values")
         normalized = [str(item) for item in value]
         if any(not item for item in normalized):
             raise ValueError("source_row_keys must contain non-empty strings")
@@ -67,8 +68,6 @@ class ReplayRequest(BaseModel):
             return None
         if not value:
             raise ValueError("resolved_point_ids must not be empty")
-        if len(value) > 1_000:
-            raise ValueError("resolved_point_ids accepts at most 1000 values")
         if any(item <= 0 for item in value):
             raise ValueError("resolved_point_ids must contain positive integers")
         if len(set(value)) != len(value):
@@ -103,8 +102,8 @@ class ClipRequest(BaseModel):
     database_name: str | None = Field(default=None, min_length=1, max_length=63)
     detect_id: UUID
     intersection_ids: list[int] = Field(min_length=2, max_length=2)
-    max_vehicles: int = Field(default=50, ge=1, le=200)
-    max_points: int = Field(default=20_000, ge=2, le=100_000)
+    max_vehicles: int | None = Field(default=None, ge=1)
+    max_points: int | None = Field(default=None, ge=2)
 
     @field_validator("intersection_ids")
     @classmethod
@@ -121,3 +120,41 @@ class FeatureCollection(BaseModel):
     crs: dict[str, Any]
     features: list[dict[str, Any]]
     metadata: dict[str, Any]
+
+
+def resolve_replay_limits(request: ReplayRequest, config: "MapConfig") -> ReplayRequest:
+    """Return a request with configured defaults after enforcing its resource budget."""
+    for name, values in (
+        ("source_row_keys", request.source_row_keys),
+        ("resolved_point_ids", request.resolved_point_ids),
+    ):
+        if values is not None and len(values) > config.replay_selection_ids_max:
+            raise ValueError(
+                f"{name} accepts at most {config.replay_selection_ids_max} values"
+            )
+    max_vehicles = request.max_vehicles or config.replay_max_vehicles_default
+    max_points = request.max_points or config.replay_max_points_default
+    if max_vehicles > config.replay_max_vehicles_max:
+        raise ValueError(
+            f"max_vehicles must not exceed configured maximum {config.replay_max_vehicles_max}"
+        )
+    if max_points > config.replay_max_points_max:
+        raise ValueError(
+            f"max_points must not exceed configured maximum {config.replay_max_points_max}"
+        )
+    return request.model_copy(update={"max_vehicles": max_vehicles, "max_points": max_points})
+
+
+def resolve_clip_limits(request: ClipRequest, config: "MapConfig") -> ClipRequest:
+    """Return a request with configured defaults after enforcing its resource budget."""
+    max_vehicles = request.max_vehicles or config.clip_max_vehicles_default
+    max_points = request.max_points or config.clip_max_points_default
+    if max_vehicles > config.clip_max_vehicles_max:
+        raise ValueError(
+            f"max_vehicles must not exceed configured maximum {config.clip_max_vehicles_max}"
+        )
+    if max_points > config.clip_max_points_max:
+        raise ValueError(
+            f"max_points must not exceed configured maximum {config.clip_max_points_max}"
+        )
+    return request.model_copy(update={"max_vehicles": max_vehicles, "max_points": max_points})

@@ -7,14 +7,6 @@ import hashlib
 import json
 import math
 import uuid
-
-# ZH: 提高 CSV 字段上限至 10 MB（默认 131 KB），防止合法大字段触发 _csv.Error，
-#     同时避免超大值在遇到损坏行（引号不配对）时导致无限 buffering 和 PermissionError。
-# EN: Raise CSV field size limit to 10 MB (default 131 KB) to allow legit large fields
-#     while preventing infinite buffering / PermissionError on malformed rows (unbalanced quotes).
-_MAX_FIELD_SIZE = 10 * 1024 * 1024  # 10 MB
-if _MAX_FIELD_SIZE > csv.field_size_limit():
-    csv.field_size_limit(_MAX_FIELD_SIZE)
 import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -30,7 +22,7 @@ from .errors import (
     TrajectoryOrderError,
     V2Error,
 )
-from .field_config import build_field_mapping, load_field_config
+from .field_config import build_field_mapping
 from .models import (
     ColumnSelector,
     CsvSource,
@@ -47,10 +39,6 @@ from .models import (
 )
 
 
-DEFAULT_ENCODING_SAMPLE_SIZE = 64 * 1024
-DEFAULT_ENCODING_CONFIDENCE = 0.5
-DEFAULT_TEXT_ENCODING = "utf-8-sig"
-
 _BOM_ENCODINGS: tuple[tuple[bytes, str], ...] = (
     (b"\xff\xfe\x00\x00", "utf-32"),
     (b"\x00\x00\xfe\xff", "utf-32"),
@@ -58,18 +46,15 @@ _BOM_ENCODINGS: tuple[tuple[bytes, str], ...] = (
     (b"\xfe\xff", "utf-16"),
     (b"\xef\xbb\xbf", "utf-8-sig"),
 )
-_FALLBACK_ENCODINGS = ("gb18030", "gbk", "cp936", "big5")
-
-
 def get_database(
     source: CsvSource | PostgresSource,
     *,
-    field_config: str | Path | None = None,
+    field_config: FieldConfig,
+    runtime: RuntimeConfig,
     selector: ColumnSelector | None = None,
-    runtime: RuntimeConfig | None = None,
 ) -> "BaseTrajectorySourceHandle":
-    config = load_field_config(field_config)
-    if runtime is not None and runtime.csv_max_field_size > csv.field_size_limit():
+    config = field_config
+    if runtime.csv_max_field_size > csv.field_size_limit():
         csv.field_size_limit(runtime.csv_max_field_size)
     if isinstance(source, CsvSource):
         return CsvTrajectorySourceHandle(source, config, selector, runtime)
@@ -220,11 +205,10 @@ class CsvTrajectorySourceHandle(BaseTrajectorySourceHandle):
         source: CsvSource,
         config: FieldConfig,
         selector: ColumnSelector | None,
-        runtime: RuntimeConfig | None = None,
+        runtime: RuntimeConfig,
     ) -> None:
         self._source = source
         self._path = Path(source.path)
-        runtime = runtime or RuntimeConfig()
         self._encoding = detect_encoding(
             self._path,
             hint_encoding=source.encoding,
@@ -665,11 +649,11 @@ def parse_row(
 def detect_encoding(
     file_path: str | Path,
     *,
-    hint_encoding: str | None = None,
-    sample_size: int = DEFAULT_ENCODING_SAMPLE_SIZE,
-    min_confidence: float = DEFAULT_ENCODING_CONFIDENCE,
-    default_encoding: str = DEFAULT_TEXT_ENCODING,
-    fallback: tuple[str, ...] = _FALLBACK_ENCODINGS,
+    hint_encoding: str | None,
+    sample_size: int,
+    min_confidence: float,
+    default_encoding: str,
+    fallback: tuple[str, ...],
 ) -> str:
     path = Path(file_path)
     with path.open("rb") as f:
@@ -702,12 +686,12 @@ def detect_encoding(
 def open_text_auto(
     file_path: str | Path,
     *,
-    encoding: str | None = None,
+    encoding: str,
     newline: str | None = None,
     errors: str = "strict",
 ) -> TextIO:
     path = Path(file_path)
-    return path.open("r", encoding=encoding or detect_encoding(path), newline=newline, errors=errors)
+    return path.open("r", encoding=encoding, newline=newline, errors=errors)
 
 
 def _required_str(

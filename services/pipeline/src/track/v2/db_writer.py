@@ -132,9 +132,11 @@ def create_fit_run(
     detect_id: str,
     clip_config: ClipConfig,
     fitting_config: FittingConfig,
+    parameters: dict[str, Any],
 ) -> str:
     fit_id = str(uuid.uuid4())
     parameters = {
+        **parameters,
         "clip": clip_config.as_dict(),
         "fitting": fitting_config.as_dict(),
     }
@@ -242,7 +244,7 @@ def insert_trajectory_points(
     points: list[TrajectoryPoint],
     *,
     table: str = "trajectory_points",
-    batch_size: int = _BATCH,
+    batch_size: int,
 ) -> dict[tuple[str, str], int]:
     """Standalone CSV importer helper; Pipeline itself is table-only in v3."""
     if not points:

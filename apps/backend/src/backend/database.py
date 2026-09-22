@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 from collections.abc import Iterator
 from typing import Any
@@ -8,17 +7,30 @@ from typing import Any
 import psycopg
 from track.v2.db.schema import SCHEMA_VERSION, require_current_schema
 
+from .config import BackendConfig
+
+
+_config: BackendConfig | None = None
+
+
+def configure_database(config: BackendConfig) -> None:
+    global _config
+    _config = config
+
+
+def _require_config() -> BackendConfig:
+    if _config is None:
+        raise RuntimeError("Backend database configuration has not been initialized")
+    return _config
+
 
 def postgres_connection_settings() -> dict[str, Any]:
     """Return the shared PostgreSQL connection settings for the Backend."""
-    return {
-        "host": os.getenv("POSTGRES_HOST", "postgres"),
-        "port": int(os.getenv("POSTGRES_PORT", "5432")),
-        "dbname": os.getenv("POSTGRES_DB", "roadnet"),
-        "user": os.getenv("POSTGRES_USER", "roadnet"),
-        "password": os.getenv("POSTGRES_PASSWORD", "change-me"),
-        "connect_timeout": 5,
-    }
+    postgres = _require_config().postgres
+    return {"host": postgres.host, "port": postgres.port,
+            "dbname": postgres.database, "user": postgres.user,
+            "password": postgres.password,
+            "connect_timeout": postgres.connect_timeout_seconds}
 
 
 def verify_runtime_schema() -> None:
@@ -46,8 +58,7 @@ def open_read_connection(database_name: str | None = None) -> Iterator[Any]:
     connection = psycopg.connect(**settings)
     try:
         connection.execute("SET TRANSACTION READ ONLY")
-        requested_timeout = int(os.getenv("MAP_STATEMENT_TIMEOUT_MS", "10000"))
-        statement_timeout_ms = min(60_000, max(100, requested_timeout))
+        statement_timeout_ms = _require_config().postgres.statement_timeout_ms
         connection.execute(
             "SELECT set_config('statement_timeout', %s, true)",
             (f"{statement_timeout_ms}ms",),

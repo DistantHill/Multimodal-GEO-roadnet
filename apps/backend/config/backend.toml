@@ -1,0 +1,47 @@
+# Backend non-secret configuration. Changes take effect only after restart.
+
+[postgres]
+# Compose service name or DNS host.
+host = "postgres"
+# TCP port, 1..65535.
+port = 5432
+# Default business database.
+database = "roadnet"
+# Login role; its password is supplied only by POSTGRES_PASSWORD.
+user = "roadnet"
+# Connection establishment timeout in seconds, 1..300.
+connect_timeout_seconds = 5
+# Read-only map query timeout in milliseconds, 100..60000.
+statement_timeout_ms = 10000
+
+[qdrant]
+# Compose service name or DNS host.
+host = "qdrant"
+# HTTP port, 1..65535.
+port = 6333
+
+[map]
+# Default and maximum number of features returned by a layer request.
+layer_limit_default = 1000
+layer_limit_max = 5000
+# Tables below this planner estimate receive an exact COUNT(*) in the catalog.
+catalog_exact_count_max_rows = 50000
+replay_max_vehicles_default = 25 # Replay 默认车辆数；>=1 且不超过 maximum；执行语义。
+replay_max_vehicles_max = 100 # Replay 车辆数上限；>=1；资源保护。
+replay_max_points_default = 10000 # Replay 默认点数；>=1 且不超过 maximum；执行语义。
+replay_max_points_max = 50000 # Replay 点数上限；>=1；资源保护。
+replay_selection_ids_max = 1000 # Replay 单次选择 ID 上限；>=1；资源保护。
+clip_max_vehicles_default = 50 # Clip 默认车辆数；>=1 且不超过 maximum；执行语义。
+clip_max_vehicles_max = 200 # Clip 车辆数上限；>=1；资源保护。
+clip_max_points_default = 20000 # Clip 默认点数；>=1 且不超过 maximum；执行语义。
+clip_max_points_max = 100000 # Clip 点数上限；>=1；资源保护。
+clip_feature_limit = 1000 # Clip 响应要素上限；>=1；资源保护。
+[health]
+# Dependency probes use deliberately short timeouts, in seconds.
+postgres_timeout_seconds = 2
+qdrant_timeout_seconds = 2.0
+
+[runtime]
+# Public service metadata.
+title = "Roadnet Backend"
+version = "0.3.0"

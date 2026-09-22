@@ -7,6 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 COPY pyproject.toml ./
 COPY src ./src
+COPY config ./config
 COPY --from=pipeline_source pyproject.toml /opt/pipeline/pyproject.toml
 COPY --from=pipeline_source src /opt/pipeline/src
 RUN pip install --no-cache-dir /opt/pipeline

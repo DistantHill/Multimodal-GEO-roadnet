@@ -18,7 +18,7 @@ class ComposePathsTest(unittest.TestCase):
         environment = dict(os.environ)
         for key in (
             "DATA_ROOT", "PARQUET_ROOT", "PIPELINE_LOG_DIR", "PIPELINE_LOG_PATH",
-            "MODEL_ROOT", "TRACK_LOG_DIR", "TRACK_LOG_PATH",
+            "MODEL_ROOT", "TRACK_LOG_DIR", "TRACK_LOG_PATH", "PIPELINE_CONFIG_PATH",
         ):
             environment.pop(key, None)
         environment.update({
@@ -41,6 +41,8 @@ class ComposePathsTest(unittest.TestCase):
             "DATA_ROOT": "/host/runtime",
             "MODEL_ROOT": "/host/models",
         }
+        environment.pop("PIPELINE_CONFIG_PATH", None)
+        environment.pop("BACKEND_CONFIG_PATH", None)
         result = subprocess.run(
             ["docker", "compose", "--env-file", os.devnull, "-f",
              str(ROOT / "infra/docker" / f"compose.{mode}.yml"),
@@ -54,8 +56,12 @@ class ComposePathsTest(unittest.TestCase):
         for target, expected in (("/data", data), ("/data/parquet", parquet), ("/data/logs", logs)):
             self.assertEqual(mounts[target]["type"], "bind")
             self.assertEqual(mounts[target]["source"], expected)
-        self.assertEqual(pipeline["environment"]["TRACK_LOG_DIR"], "/data/logs")
-        self.assertEqual(pipeline["environment"]["PARQUET_ROOT"], "/data/parquet")
+        self.assertEqual(
+            pipeline["environment"]["PIPELINE_CONFIG_PATH"],
+            "/app/config/pipeline.toml",
+        )
+        self.assertNotIn("TRACK_LOG_DIR", pipeline["environment"])
+        self.assertNotIn("PARQUET_ROOT", pipeline["environment"])
         self.assertNotIn("TRACK_LOG_PATH", pipeline["environment"])
 
     def test_default_subdirectories_follow_host_data_root(self):
@@ -102,6 +108,10 @@ class ComposePathsTest(unittest.TestCase):
                     self.assertIn("default", config["services"][service]["networks"])
                     self.assertIn("roadnet_services", config["services"][service]["networks"])
                 self.assertNotIn("roadnet_services", config["services"]["frontend"]["networks"])
+                self.assertEqual(
+                    config["services"]["backend"]["environment"]["BACKEND_CONFIG_PATH"],
+                    "/app/config/backend.toml",
+                )
 
 
 if __name__ == "__main__":

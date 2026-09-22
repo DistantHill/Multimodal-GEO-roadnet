@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import json
 from pathlib import Path
 from unittest.mock import Mock
@@ -78,7 +80,7 @@ def test_copy_writes_every_table_even_when_empty_and_builds_v1_manifest(tmp_path
         for name in detect_parquet.DETECT_PARQUET_V1:
             output = handle.path / name / "part-00000.parquet"
             relation = _select(name, empty=True).replace("?", f"'{handle.run_id}'")
-            detect_parquet._copy(connection, relation, output, name, RuntimeConfig())
+            detect_parquet._copy(connection, relation, output, name, runtime_config())
             outputs[name] = output
         detect_parquet._validate_data(connection, outputs)
     descriptor = detect_parquet.build_descriptor(
@@ -104,7 +106,7 @@ def test_validation_rejects_noncontiguous_sequence(tmp_path):
             )
             if name == "resolved_points":
                 relation = relation.replace("0::BIGINT AS sequence_in_subtrack", "1::BIGINT AS sequence_in_subtrack")
-            detect_parquet._copy(connection, relation, output, name, RuntimeConfig())
+            detect_parquet._copy(connection, relation, output, name, runtime_config())
             outputs[name] = output
         with pytest.raises(detect_parquet.DetectParquetError, match="Clip input semantics"):
             detect_parquet._validate_data(connection, outputs)

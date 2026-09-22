@@ -9,10 +9,10 @@ an ambiguous meaning behind a new API.
 from __future__ import annotations
 
 import argparse
-import getpass
 from typing import Any
 
-from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
+from ..config import PostgresConfig, connect as pg_connect
+from ._startup import load_startup_config
 from ..logger import init_logger, shutdown_logger
 
 
@@ -2152,21 +2152,14 @@ def create_tables(
 
 
 def main() -> int:
-    defaults = default_postgres_config()
     parser = argparse.ArgumentParser(
         description="Initialize the destructive track.v2 PostgreSQL schema v7."
     )
-    parser.add_argument("--host", default=defaults.host)
-    parser.add_argument("--port", type=int, default=defaults.port)
-    parser.add_argument("--database", default=defaults.database)
-    parser.add_argument("--user", default=defaults.user)
     parser.add_argument(
         "--ask-password",
         action="store_true",
         help="Prompt for a password instead of using the environment value.",
     )
-    parser.add_argument("--connect-timeout", type=int, default=defaults.connect_timeout)
-    parser.add_argument("--sslmode", default=defaults.sslmode)
     migration = parser.add_mutually_exclusive_group()
     migration.add_argument(
         "--reset",
@@ -2183,23 +2176,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    password = (
-        getpass.getpass("PostgreSQL password: ")
-        if args.ask_password
-        else defaults.password
-    )
-    config = PostgresConfig(
-        host=args.host,
-        port=args.port,
-        database=args.database,
-        user=args.user,
-        password=password,
-        connect_timeout=args.connect_timeout,
-        sslmode=args.sslmode,
-    )
+    pipeline_config = load_startup_config(ask_password=args.ask_password)
+    config = pipeline_config.postgres
 
     print(f"连接目标 / Target: {config.safe_dsn()}")
-    init_logger()
+    init_logger(pipeline_config.logging.directory)
     try:
         if args.reset:
             reset_tables(config)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, pipeline_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import json
 import os
 from pathlib import Path
@@ -123,13 +125,13 @@ def test_copy_writes_real_typed_files_including_empty_injected(tmp_path):
     with duckdb.connect() as connection:
         refine_parquet._copy_table(
             connection, f"SELECT {common}, 'source-7'::VARCHAR AS source_row_key",
-            handle.path / "kept_points/part-00000.parquet", "kept_points", RuntimeConfig(),
+            handle.path / "kept_points/part-00000.parquet", "kept_points", runtime_config(),
         )
         refine_parquet._copy_table(
             connection,
             f"SELECT {common}, 'orthogonal'::VARCHAR AS generated_reason, "
             "0::INTEGER AS after_sequence_in_subtrack WHERE false",
-            handle.path / "injected_points/part-00000.parquet", "injected_points", RuntimeConfig(),
+            handle.path / "injected_points/part-00000.parquet", "injected_points", runtime_config(),
         )
 
     descriptor = refine_parquet.build_descriptor(
@@ -168,7 +170,9 @@ def test_export_rejects_invalid_run_before_opening_duckdb(tmp_path, row, message
 
     with pytest.raises(refine_parquet.RefineParquetError, match=message):
         refine_parquet.export_refine_parquet(
-            conn, PostgresConfig(), _handle(tmp_path), RuntimeConfig(), {"version": 1},
+            conn, postgres_config(), _handle(tmp_path), runtime_config(), {"version": 1},
+            data_root=tmp_path,
+            postgres_extension_path=pipeline_config().paths.duckdb_postgres_extension_path,
         )
 
     opened.assert_not_called()
@@ -179,7 +183,7 @@ def test_export_rejects_invalid_run_before_opening_duckdb(tmp_path, row, message
 def test_open_duckdb_requires_absolute_bundled_extension(tmp_path, monkeypatch):
     monkeypatch.setenv("DUCKDB_POSTGRES_EXTENSION_PATH", "relative.extension")
     with pytest.raises(refine_parquet.RefineParquetError, match="absolute"):
-        refine_parquet._open_duckdb(RuntimeConfig(), tmp_path)
+        refine_parquet._open_duckdb(runtime_config(), tmp_path, Path("relative.extension"))
 
 
 def test_open_duckdb_loads_bundled_extension_with_network_install_disabled(tmp_path):
@@ -187,7 +191,8 @@ def test_open_duckdb_loads_bundled_extension_with_network_install_disabled(tmp_p
     if not extension:
         pytest.skip("test requires the Pipeline image's bundled extension")
     with refine_parquet._open_duckdb(
-        RuntimeConfig(duckdb_memory_limit="128MB", duckdb_threads=1), tmp_path,
+        runtime_config(duckdb_memory_limit="128MB", duckdb_threads=1), tmp_path,
+        Path(extension),
     ) as connection:
         loaded = connection.execute(
             "SELECT loaded FROM duckdb_extensions() "

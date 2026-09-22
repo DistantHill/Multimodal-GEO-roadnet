@@ -1,7 +1,7 @@
 # Schema v7 migrations
 
 `track.v2` 数据库结构（schema）v4 将 Clean 统一改名为 Refine。v3 可执行
-`python -m pipeline init-db --database roadnet --migrate-refine`，在一个事务内
+`python -m pipeline init-db --migrate-refine`，在一个事务内
 保留数据、改名并依次升级至 v7。v4/v5/v6 使用 `--migrate-artifacts` 升至 v7。
 执行前停止相关读写服务，完成后一起部署 Pipeline、Backend 和客户端。具体步骤见
 [迁移说明](../../../docs/refine-migration-and-performance.md)。

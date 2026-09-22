@@ -9,28 +9,17 @@ from track.v2.logger import _resolve_log_path
 
 
 class LoggerPathTest(unittest.TestCase):
-    def test_default_path_uses_timestamped_filename(self) -> None:
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch("track.v2.logger.datetime") as mocked_datetime,
-            patch("track.v2.logger.os.getpid", return_value=4242),
-        ):
-            mocked_datetime.now.return_value = datetime(2026, 8, 31, 9, 8, 7, 654321)
-            path = _resolve_log_path()
-
-        self.assertEqual(
-            path,
-            Path("generated/20260831_090807_654321_pid-4242_log.txt"),
-        )
+    def test_missing_configured_path_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "log_path must be provided"):
+            _resolve_log_path()
 
     def test_log_directory_keeps_timestamped_filename(self) -> None:
         with (
-            patch.dict("os.environ", {"TRACK_LOG_DIR": "/data/logs"}, clear=True),
             patch("track.v2.logger.datetime") as mocked_datetime,
             patch("track.v2.logger.os.getpid", return_value=4242),
         ):
             mocked_datetime.now.return_value = datetime(2026, 8, 31, 9, 8, 7, 654321)
-            path = _resolve_log_path()
+            path = _resolve_log_path("/data/logs")
 
         self.assertEqual(
             path,
@@ -39,32 +28,20 @@ class LoggerPathTest(unittest.TestCase):
 
     def test_same_timestamp_uses_pid_to_separate_processes(self) -> None:
         with (
-            patch.dict("os.environ", {"TRACK_LOG_DIR": "/data/logs"}, clear=True),
             patch("track.v2.logger.datetime") as mocked_datetime,
             patch("track.v2.logger.os.getpid", side_effect=[101, 202]),
         ):
             mocked_datetime.now.return_value = datetime(2026, 8, 31, 9, 8, 7, 654321)
-            first = _resolve_log_path()
-            second = _resolve_log_path()
+            first = _resolve_log_path("/data/logs")
+            second = _resolve_log_path("/data/logs")
 
         self.assertNotEqual(first, second)
         self.assertIn("pid-101", first.name)
         self.assertIn("pid-202", second.name)
 
-    def test_explicit_path_has_priority_over_environment(self) -> None:
-        with patch.dict(
-            "os.environ",
-            {
-                "TRACK_LOG_PATH": "/data/logs/environment.log",
-                "TRACK_LOG_DIR": "/data/logs",
-            },
-            clear=True,
-        ):
-            explicit = _resolve_log_path("custom/run.log")
-            configured = _resolve_log_path()
-
+    def test_explicit_file_path_is_preserved(self) -> None:
+        explicit = _resolve_log_path("custom/run.log")
         self.assertEqual(explicit, Path("custom/run.log"))
-        self.assertEqual(configured, Path("/data/logs/environment.log"))
 
 
 if __name__ == "__main__":

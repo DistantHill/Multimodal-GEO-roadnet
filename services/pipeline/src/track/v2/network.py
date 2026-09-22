@@ -21,10 +21,10 @@ def build_network(
     fits: FitResult,
     intersections: Iterable[ClipIntersection],
     *,
-    config: NetworkConfig | None = None,
+    config: NetworkConfig,
 ) -> NetworkResult:
     """Build an undirected physical-road graph from fitted centerlines."""
-    cfg = config or NetworkConfig()
+    cfg = config
     intersections_by_id = _intersection_map(intersections)
     degrees = {intersection_id: 0 for intersection_id in intersections_by_id}
     edges: list[NetworkEdge] = []

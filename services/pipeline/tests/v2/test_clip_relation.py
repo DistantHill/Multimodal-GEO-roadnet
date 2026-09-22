@@ -1,6 +1,8 @@
 """Normalized DuckDB Clip relation behavior and corruption guards."""
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import inspect
 from pathlib import Path
 
@@ -33,7 +35,7 @@ def _clip(
 
 def _relation(tmp_path: Path, *, batch_size: int = 1) -> ClipRelation:
     return ClipRelation(
-        RuntimeConfig(
+        runtime_config(
             duckdb_memory_limit="128MB", duckdb_threads=1,
             duckdb_max_temp_directory_size="256MB",
         ),
@@ -128,18 +130,18 @@ def test_sealed_and_closed_lifecycle(tmp_path):
 @pytest.mark.parametrize("batch_size", [True, 0])
 def test_invalid_batch_size_is_rejected(tmp_path, batch_size):
     with pytest.raises(ValueError, match="batch_size"):
-        ClipRelation(RuntimeConfig(), tmp_path, batch_size=batch_size)
+        ClipRelation(runtime_config(), tmp_path, batch_size=batch_size)
 
 
 @pytest.mark.parametrize("relation_id", [".", "..", "bad/name", "bad\x00name"])
 def test_unsafe_relation_identity_is_rejected(tmp_path, relation_id):
     with pytest.raises(ValueError, match="relation_id"):
-        ClipRelation(RuntimeConfig(), tmp_path, relation_id=relation_id)
+        ClipRelation(runtime_config(), tmp_path, relation_id=relation_id)
 
 
 def test_relative_data_root_is_rejected():
     with pytest.raises(ValueError, match="absolute"):
-        ClipRelation(RuntimeConfig(), "relative")
+        ClipRelation(runtime_config(), "relative")
 
 
 def test_connection_failure_removes_only_its_empty_leaf(tmp_path, monkeypatch):
@@ -150,7 +152,7 @@ def test_connection_failure_removes_only_its_empty_leaf(tmp_path, monkeypatch):
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("open failed")),
     )
     with pytest.raises(RuntimeError, match="open failed"):
-        ClipRelation(RuntimeConfig(), tmp_path, relation_id="failed")
+        ClipRelation(runtime_config(), tmp_path, relation_id="failed")
     assert sibling.is_dir()
     assert not (sibling.parent / "failed").exists()
 
@@ -161,7 +163,7 @@ def test_relation_identity_collision_fails_closed(tmp_path):
     marker = occupied / "owned-by-other-run"
     marker.write_text("keep")
     with pytest.raises(FileExistsError):
-        ClipRelation(RuntimeConfig(), tmp_path, relation_id="occupied")
+        ClipRelation(runtime_config(), tmp_path, relation_id="occupied")
     assert marker.read_text() == "keep"
 
 

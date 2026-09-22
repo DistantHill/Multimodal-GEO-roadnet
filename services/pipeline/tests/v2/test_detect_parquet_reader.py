@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import hashlib
 import json
 from pathlib import Path
@@ -90,7 +92,7 @@ def _make_writable(descriptor, tmp_path):
 
 def test_reader_builds_stable_clip_models_across_batches(tmp_path):
     descriptor = _published(tmp_path)
-    with DetectDatasetReader(tmp_path, descriptor, "present", RuntimeConfig(duckdb_threads=1)) as reader:
+    with DetectDatasetReader(tmp_path, descriptor, "present", runtime_config(duckdb_threads=1)) as reader:
         assert [item.intersection_id for item in reader.intersections()] == [30]
         tracks = list(reader.iter_tracks(batch_size=1))
         assert [(track.vehicle_id, track.trip_id, track.subtrack_index,
@@ -104,7 +106,7 @@ def test_reader_builds_stable_clip_models_across_batches(tmp_path):
 
 def test_empty_detect_dataset_is_valid(tmp_path):
     descriptor = _published(tmp_path, empty=True)
-    with DetectDatasetReader(tmp_path, descriptor, "present", RuntimeConfig()) as reader:
+    with DetectDatasetReader(tmp_path, descriptor, "present", runtime_config()) as reader:
         assert reader.intersections() == ()
         assert list(reader.iter_tracks(batch_size=1)) == []
 
@@ -126,23 +128,23 @@ def test_reader_rejects_unknown_manifest_shapes(tmp_path, mutation, message):
         ).hexdigest()
     changed = _descriptor(descriptor, manifest)
     with pytest.raises(Exception, match=message):
-        DetectDatasetReader(tmp_path, changed, "present", RuntimeConfig())
+        DetectDatasetReader(tmp_path, changed, "present", runtime_config())
 
 
 def test_reader_rejects_deleted_wrong_owner_missing_extra_and_writable(tmp_path):
     descriptor = _published(tmp_path)
     with pytest.raises(Exception, match="not present"):
-        DetectDatasetReader(tmp_path, descriptor, "deleted", RuntimeConfig())
+        DetectDatasetReader(tmp_path, descriptor, "deleted", runtime_config())
     wrong = ArtifactDescriptor.create(
         id=descriptor.id, stage="refine", refine_id=uuid4(), relative_path=descriptor.relative_path,
         source_fingerprint={"version": 1}, manifest=json.loads(descriptor.manifest_json),
     )
     with pytest.raises(Exception):
-        DetectDatasetReader(tmp_path, wrong, "present", RuntimeConfig())
+        DetectDatasetReader(tmp_path, wrong, "present", runtime_config())
     root = tmp_path / descriptor.relative_path
     _make_writable(descriptor, tmp_path)
     with pytest.raises(Exception, match="writable"):
-        DetectDatasetReader(tmp_path, descriptor, "present", RuntimeConfig())
+        DetectDatasetReader(tmp_path, descriptor, "present", runtime_config())
     extra = root / "extra.parquet"
     extra.write_bytes(b"bad")
     extra.chmod(0o444)
@@ -150,13 +152,13 @@ def test_reader_rejects_deleted_wrong_owner_missing_extra_and_writable(tmp_path)
         child.chmod(0o555 if child.is_dir() else 0o444)
     root.chmod(0o555)
     with pytest.raises(Exception, match="manifest"):
-        DetectDatasetReader(tmp_path, descriptor, "present", RuntimeConfig())
+        DetectDatasetReader(tmp_path, descriptor, "present", runtime_config())
     root.chmod(0o755)
     extra.unlink()
     (root / "resolved_points/part.parquet").unlink()
     root.chmod(0o555)
     with pytest.raises(Exception, match="missing|manifest"):
-        DetectDatasetReader(tmp_path, descriptor, "present", RuntimeConfig())
+        DetectDatasetReader(tmp_path, descriptor, "present", runtime_config())
 
 
 def test_relation_validation_rejects_owner_sequence_and_crossing_corruption(tmp_path):
@@ -194,7 +196,7 @@ def test_relation_validation_rejects_owner_sequence_and_crossing_corruption(tmp_
             if item["name"] == table:
                 item["files"][0]["byte_count"] = path.stat().st_size
         changed = _descriptor(descriptor, manifest)
-        reader = DetectDatasetReader(publication_root, changed, "present", RuntimeConfig())
+        reader = DetectDatasetReader(publication_root, changed, "present", runtime_config())
         with pytest.raises(DetectParquetError, match="Clip input semantics"):
             reader.__enter__()
         assert reader._connection is None

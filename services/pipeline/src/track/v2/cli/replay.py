@@ -7,10 +7,9 @@ Centerlines carry their own completed Fit/Detect context.
 from __future__ import annotations
 
 import argparse
-import getpass
 import uuid
 
-from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
+from ..config import connect as pg_connect
 from ..db.schema import require_current_schema
 from ..logger import init_logger, shutdown_logger
 from ..output import error_payload, print_json
@@ -22,6 +21,7 @@ from ..replay import (
     ReplayTarget,
     replay_centerline_inputs,
 )
+from ._startup import load_startup_config
 
 
 def _uuid_arg(value: str) -> str:
@@ -68,7 +68,6 @@ def _internal_id(parser: argparse.ArgumentParser, value: str) -> int:
 
 
 def main() -> int:
-    defaults = default_postgres_config()
     parser = argparse.ArgumentParser(
         description="Replay one persisted schema-v4 entity to verified source rows."
     )
@@ -81,26 +80,13 @@ def main() -> int:
         required=True,
         help="Internal database ID, or source_row_key for source/excluded points.",
     )
-    parser.add_argument("--host", default=defaults.host)
-    parser.add_argument("--port", type=int, default=defaults.port)
-    parser.add_argument("--database", default=defaults.database)
-    parser.add_argument("--user", default=defaults.user)
     parser.add_argument("--ask-password", action="store_true")
-    parser.add_argument("--connect-timeout", type=int, default=defaults.connect_timeout)
-    parser.add_argument("--sslmode", default=defaults.sslmode)
     args = parser.parse_args()
     target = _target_from_args(parser, args)
 
-    config = PostgresConfig(
-        host=args.host,
-        port=args.port,
-        database=args.database,
-        user=args.user,
-        password=getpass.getpass("PostgreSQL password: ") if args.ask_password else defaults.password,
-        connect_timeout=args.connect_timeout,
-        sslmode=args.sslmode,
-    )
-    init_logger()
+    pipeline_config = load_startup_config(ask_password=args.ask_password)
+    config = pipeline_config.postgres
+    init_logger(pipeline_config.logging.directory)
     try:
         try:
             with pg_connect(config) as conn:

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from .config_factory import (clip_config, detect_context, fitting_config, intersect_config,
+                             intersect_run_config, network_config, pipeline_config,
+                             postgres_config, projection_config, refine_config, runtime_config)
+
 import math
 import random
 import tempfile
@@ -274,7 +278,7 @@ class IntersectReportTest(unittest.TestCase):
 
 class IntersectConfigStageIdentityTest(unittest.TestCase):
     def test_config_uses_refine_id_without_run_id_alias(self):
-        config = IntersectConfig(refine_id="refine-9")
+        config = detect_context(refine_id="refine-9")
 
         self.assertEqual(config.refine_id, "refine-9")
         self.assertFalse(hasattr(config, "run_id"))
@@ -304,7 +308,7 @@ class PairedSegmentIntersectionTest(unittest.TestCase):
 
     def test_pair_batches_never_exceed_the_configured_limit(self):
         """Dense cells remain memory bounded before exact geometry runs."""
-        pair_batch_size = IntersectConfig().cross_track_pair_batch_size
+        pair_batch_size = intersect_config().cross_track_pair_batch_size
         side = math.isqrt(pair_batch_size) + 1
         batches = list(_iter_cross_track_pair_batches(
             list(range(side)), list(range(side)), pair_batch_size,
@@ -345,7 +349,7 @@ class PairedSegmentIntersectionTest(unittest.TestCase):
             _TEST_TRANSFORMER, "forward", wraps=_TEST_TRANSFORMER.forward
         ) as project:
             segments, vehicle_count = _prepare_cross_track_segments(
-                {"A": track}, _TEST_TRANSFORMER, IntersectConfig(),
+                {"A": track}, _TEST_TRANSFORMER, intersect_config(),
             )
 
         self.assertEqual(vehicle_count, 1)
@@ -512,7 +516,7 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
 
     def _historical_oracle(self, tracks, origin_lon=116.0, origin_lat=39.0):
         return _extract_orthogonal_cross_track_candidates_legacy(
-            tracks, origin_lon, origin_lat, IntersectConfig(),
+            tracks, origin_lon, origin_lat, intersect_config(),
             vehicle_aabb_prefilter=False,
         )
 
@@ -522,7 +526,7 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
         telemetry = {}
         with patch("track.v2._cross_track_legacy._iter_bounded_segment_intersections") as kernel:
             candidates, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
-                tracks, 116, 39, IntersectConfig(), telemetry=telemetry,
+                tracks, 116, 39, intersect_config(), telemetry=telemetry,
             )
         self.assertEqual((candidates, pairs, total), ([], 1, 1))
         kernel.assert_not_called()
@@ -540,7 +544,7 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
             wraps=_iter_bounded_segment_intersections,
         ) as kernel:
             candidates, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
-                tracks, 116, 39, IntersectConfig(), telemetry=telemetry,
+                tracks, 116, 39, intersect_config(), telemetry=telemetry,
             )
         self.assertEqual((pairs, total), (1, 1))
         self.assertTrue(kernel.called)
@@ -568,7 +572,7 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
             wraps=_iter_bounded_segment_intersections,
         ) as kernel:
             actual, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
-                tracks, 116.0, 39.0, IntersectConfig(), telemetry=telemetry,
+                tracks, 116.0, 39.0, intersect_config(), telemetry=telemetry,
             )
 
         self.assertEqual((pairs, total), (oracle_pairs, oracle_total))
@@ -606,7 +610,7 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
             wraps=_iter_bounded_segment_intersections,
         ) as kernel:
             actual, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
-                tracks, 116.0, 39.0, IntersectConfig(), telemetry=telemetry,
+                tracks, 116.0, 39.0, intersect_config(), telemetry=telemetry,
             )
 
         self.assertEqual((pairs, total), (3, 3))
@@ -638,7 +642,7 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
             "track.v2._cross_track_legacy._iter_bounded_segment_intersections",
         ) as kernel:
             candidates, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
-                tracks, 116.0, 39.0, IntersectConfig(), telemetry=telemetry,
+                tracks, 116.0, 39.0, intersect_config(), telemetry=telemetry,
             )
 
         self.assertEqual((candidates, pairs, total), ([], 105, 105))
@@ -941,7 +945,7 @@ class CrossTrackWindowProgressTest(unittest.TestCase):
     """Method 3 reports window-level progress even for small windows."""
 
     def test_cross_track_windows_prints_current_and_total_window(self):
-        cfg = IntersectConfig(
+        cfg = intersect_run_config(
             spatial_window_size=(1_000.0, 1_000.0),
             spatial_window_overlap=0.0,
         )
@@ -965,7 +969,7 @@ class CrossTrackWindowProgressTest(unittest.TestCase):
             _make_point("B", "77", 10.0, origin_lon - 0.001, origin_lat, 90.0, 8.0, "table_b"),
             _make_point("B", "78", 20.0, origin_lon + 0.001, origin_lat, 90.0, 8.0, "table_b"),
         ]
-        cfg = IntersectConfig(
+        cfg = intersect_run_config(
             spatial_window_size=(1_000.0, 1_000.0),
             spatial_window_overlap=0.15,
             cross_track_dbscan_min_samples=1,
@@ -998,7 +1002,10 @@ class GroupByVehicleTest(unittest.TestCase):
                 "v2,116.1,39.1,180,30,2000\n",
             )
             source = CsvSource(csv_path)
-            handle = get_database(source)
+            handle = get_database(
+                source, field_config=pipeline_config().parser.fields,
+                runtime=runtime_config(),
+            )
             tracks = _group_by_vehicle(handle)
             self.assertEqual(len(tracks), 2)
             self.assertIn("v1", tracks)
@@ -1021,11 +1028,15 @@ class ProjectionContextContractTest(unittest.TestCase):
 
     def test_detect_requires_explicit_run_spatial_context(self):
         with self.assertRaisesRegex(V2Error, "requires.*SpatialContext"):
-            detect_intersections(self._Handle())
+            detect_intersections(
+                self._Handle(), config=intersect_config(), context=detect_context(),
+                runtime=runtime_config(),
+            )
 
     def test_empty_result_carries_parent_run_spatial_context(self):
         result = detect_intersections(
-            self._Handle(), spatial_context=_TEST_SPATIAL_CONTEXT
+            self._Handle(), config=intersect_config(), context=detect_context(),
+            runtime=runtime_config(), spatial_context=_TEST_SPATIAL_CONTEXT,
         )
 
         self.assertEqual(result.spatial_context, _TEST_SPATIAL_CONTEXT)
@@ -1034,7 +1045,8 @@ class ProjectionContextContractTest(unittest.TestCase):
         with self.assertRaisesRegex(V2Error, "does not match"):
             detect_intersections(
                 self._Handle(spatial_context=object()),
-                spatial_context=_TEST_SPATIAL_CONTEXT,
+                config=intersect_config(), context=detect_context(),
+                runtime=runtime_config(), spatial_context=_TEST_SPATIAL_CONTEXT,
             )
 
     def test_projection_is_independent_of_which_source_point_arrives_first(self):
@@ -1066,7 +1078,9 @@ class ProjectionContextContractTest(unittest.TestCase):
         with self.assertRaisesRegex(V2Error, "requires refine_id"):
             detect_intersections(
                 conn=object(),
-                config=IntersectConfig(query_active_from_db=True),
+                config=intersect_config(),
+                context=detect_context(query_active_from_db=True),
+                runtime=runtime_config(),
             )
 
     def test_formal_db_detect_requires_runtime_and_data_root(self):
@@ -1083,8 +1097,9 @@ class ProjectionContextContractTest(unittest.TestCase):
         ):
             detect_intersections(
                 conn=object(),
-                config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
-                refine_reader=reader,
+                config=intersect_config(),
+                context=detect_context(query_active_from_db=True, refine_id="refine-1"),
+                runtime=runtime_config(), refine_reader=reader,
             )
 
     def test_formal_db_detect_requires_columnar_reader(self):
@@ -1099,8 +1114,9 @@ class ProjectionContextContractTest(unittest.TestCase):
         ):
             detect_intersections(
                 conn=object(),
-                config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
-                runtime=RuntimeConfig(), data_root=Path(tempfile.mkdtemp()),
+                config=intersect_config(),
+                context=detect_context(query_active_from_db=True, refine_id="refine-1"),
+                runtime=runtime_config(), data_root=Path(tempfile.mkdtemp()),
             )
         fingerprint.assert_not_called()
 
@@ -1122,8 +1138,9 @@ class ProjectionContextContractTest(unittest.TestCase):
         ):
             detect_intersections(
                 conn=object(),
-                config=IntersectConfig(query_active_from_db=True, refine_id=refine.refine_id),
-                refine_reader=reader,
+                config=intersect_config(),
+                context=detect_context(query_active_from_db=True, refine_id=refine.refine_id),
+                runtime=runtime_config(), refine_reader=reader,
             )
         compute.assert_not_called()
 
@@ -1131,8 +1148,8 @@ class ProjectionContextContractTest(unittest.TestCase):
         reader = MagicMock()
         reader.extent.return_value = None
         result = _detect_intersections_db(
-            object(), IntersectConfig(), _TEST_SPATIAL_CONTEXT,
-            runtime=RuntimeConfig(), data_root=Path(tempfile.mkdtemp()),
+            object(), intersect_config(), _TEST_SPATIAL_CONTEXT,
+            runtime=runtime_config(), data_root=Path(tempfile.mkdtemp()),
             refine_reader=reader,
         )
         reader.iter_tracks.assert_not_called()
@@ -1148,7 +1165,7 @@ class ProjectionContextContractTest(unittest.TestCase):
             patch("track.v2.candidate_extraction.build_cross_track_index") as build_index,
         ):
             actual = _extract_cross_track_db(
-                reader, IntersectConfig(source_table="source"), _TEST_TRANSFORMER,
+                reader, intersect_run_config(source_table="source"), _TEST_TRANSFORMER,
             )
         self.assertIs(actual, expected)
         columnar.assert_called_once()
@@ -1158,7 +1175,7 @@ class ProjectionContextContractTest(unittest.TestCase):
     def test_disabled_formal_parquet_cross_track_does_not_read_pair_planner(self):
         reader = MagicMock()
         actual = _extract_cross_track_db(
-            reader, IntersectConfig(use_cross_track_candidates=False), _TEST_TRANSFORMER,
+            reader, intersect_run_config(use_cross_track_candidates=False), _TEST_TRANSFORMER,
         )
         self.assertEqual(actual, [])
         reader.iter_cross_track_pair_batches.assert_not_called()
@@ -1175,15 +1192,18 @@ class ProjectionContextContractTest(unittest.TestCase):
         with patch("track.v2.detect.fetch_refine_run_row", return_value=refine):
             with self.assertRaisesRegex(V2Error, "does not match"):
                 detect_intersections(
-                    conn=object(), config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
-                    spatial_context=different,
+                    conn=object(), config=intersect_config(),
+                    context=detect_context(query_active_from_db=True, refine_id="refine-1"),
+                    runtime=runtime_config(), spatial_context=different,
                 )
             with self.assertRaisesRegex(V2Error, "source_table"):
                 detect_intersections(
                     conn=object(),
-                    config=IntersectConfig(
+                    config=intersect_config(),
+                    context=detect_context(
                         query_active_from_db=True, refine_id="refine-1", source_table="wrong",
                     ),
+                    runtime=runtime_config(),
                 )
 
     def test_formal_db_detect_rejects_unready_refine_and_table_overrides_before_reads(self):
@@ -1199,7 +1219,9 @@ class ProjectionContextContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(V2Error, "completed immutable-source"):
                     detect_intersections(
                         conn=object(),
-                        config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
+                        config=intersect_config(),
+                        context=detect_context(query_active_from_db=True, refine_id="refine-1"),
+                        runtime=runtime_config(),
                     )
 
         refine = SimpleNamespace(
@@ -1217,9 +1239,11 @@ class ProjectionContextContractTest(unittest.TestCase):
                 with self.assertRaisesRegex(V2Error, "does not belong|must use"):
                     detect_intersections(
                         conn=object(),
-                        config=IntersectConfig(
+                        config=intersect_config(),
+                        context=detect_context(
                             query_active_from_db=True, refine_id="refine-1", **override,
                         ),
+                        runtime=runtime_config(),
                     )
     def test_in_memory_handle_does_not_trust_unscoped_existing_xy(self):
         point = replace(
@@ -1277,7 +1301,7 @@ class TurnDetectionTest(unittest.TestCase):
             "v1", origin_lon, origin_lat, approach_bearing=0.0, exit_bearing=90.0
         )
         tracks = {"v1": track}
-        cfg = IntersectConfig(turn_window=2, min_turn_deg=45.0, max_turn_deg=170.0,
+        cfg = intersect_config(turn_window=2, min_turn_deg=45.0, max_turn_deg=170.0,
                               min_leg_m=20.0, min_movement_speed_mps=1.0)
         events = _detect_turn_events(_with_processing_xy(tracks), cfg)
         self.assertGreaterEqual(len(events), 1, "Should detect at least one turn event")
@@ -1302,7 +1326,7 @@ class TurnDetectionTest(unittest.TestCase):
                 generated_reason=GeneratedReason.HEADING_ORTHOGONAL,
             ),
         )
-        cfg = IntersectConfig(
+        cfg = intersect_config(
             use_cross_track_candidates=False,
             turn_window=2,
             min_turn_deg=45.0,
@@ -1353,7 +1377,7 @@ class TurnDetectionTest(unittest.TestCase):
                 generated_reason=GeneratedReason.HEADING_ORTHOGONAL,
             ),
         )
-        cfg = IntersectConfig(
+        cfg = intersect_config(
             use_cross_track_candidates=False,
             min_leg_m=20.0,
             min_movement_speed_mps=1.0,
@@ -1383,7 +1407,7 @@ class TurnDetectionTest(unittest.TestCase):
             )
             ts += 10.0
         tracks = _with_processing_xy({"v1": points})
-        cfg = IntersectConfig()
+        cfg = intersect_config()
         events = _detect_turn_events(tracks, cfg)
         self.assertEqual(len(events), 0)
 
@@ -1395,7 +1419,7 @@ class TurnDetectionTest(unittest.TestCase):
             "v1", origin_lon, origin_lat, approach_bearing=0.0, exit_bearing=30.0
         )
         tracks = {"v1": track}
-        cfg = IntersectConfig(min_turn_deg=45.0, min_leg_m=20.0, min_movement_speed_mps=1.0)
+        cfg = intersect_config(min_turn_deg=45.0, min_leg_m=20.0, min_movement_speed_mps=1.0)
         events = _detect_turn_events(_with_processing_xy(tracks), cfg)
         self.assertEqual(len(events), 0, "30° turn should be filtered by min_turn_deg=45")
 
@@ -1407,7 +1431,7 @@ class TurnDetectionTest(unittest.TestCase):
             "v1", origin_lon, origin_lat, approach_bearing=0.0, exit_bearing=180.0
         )
         tracks = {"v1": track}
-        cfg = IntersectConfig(max_turn_deg=170.0, min_leg_m=20.0, min_movement_speed_mps=1.0)
+        cfg = intersect_config(max_turn_deg=170.0, min_leg_m=20.0, min_movement_speed_mps=1.0)
         events = _detect_turn_events(_with_processing_xy(tracks), cfg)
         # U-turn of 180° should NOT be detected (above max_turn_deg)
         for e in events:
@@ -1427,7 +1451,7 @@ class TurnDetectionTest(unittest.TestCase):
             )
             ts += 10.0
         tracks = _with_processing_xy({"v1": points})
-        cfg = IntersectConfig(min_leg_m=35.0, min_turn_deg=45.0, min_movement_speed_mps=0.5)
+        cfg = intersect_config(min_leg_m=35.0, min_turn_deg=45.0, min_movement_speed_mps=0.5)
         events = _detect_turn_events(tracks, cfg)
         self.assertEqual(len(events), 0, "Short legs should be filtered")
 
@@ -1520,7 +1544,7 @@ class GetisOrdGStarTest(unittest.TestCase):
             event.event_calculate_index: 0.0 if std == 0.0 else (count - mean) / std
             for event, count in zip(events, expected_counts)
         }
-        cfg = IntersectConfig(g_star_radius_m=radius, g_star_min_z=0.5, min_turn_deg=45.0)
+        cfg = intersect_config(g_star_radius_m=radius, g_star_min_z=0.5, min_turn_deg=45.0)
         expected_selected = [
             event.event_calculate_index for event in events
             if expected_z[event.event_calculate_index] >= cfg.g_star_min_z
@@ -1602,7 +1626,7 @@ class GetisOrdGStarTest(unittest.TestCase):
             event.event_calculate_index: 0.0 if std == 0.0 else (count - mean) / std
             for event, count in zip(events, expected_counts)
         }
-        cfg = IntersectConfig(g_star_radius_m=1.0, g_star_min_z=0.5, min_turn_deg=45.0)
+        cfg = intersect_config(g_star_radius_m=1.0, g_star_min_z=0.5, min_turn_deg=45.0)
         expected_selected = [
             event.event_calculate_index for event in events
             if expected_z[event.event_calculate_index] >= cfg.g_star_min_z
@@ -1631,7 +1655,7 @@ class HotspotSelectionTest(unittest.TestCase):
             TurnEvent(4, "v5", 1004, 117, 40, 5000, 5000, 0, 90, 90, 90),  # far away
             TurnEvent(5, "v6", 1005, 117, 40, 5100, 5100, 0, 90, 90, 90),  # far away
         ]
-        cfg = IntersectConfig(g_star_radius_m=200.0, g_star_min_z=0.5, min_turn_deg=45.0)
+        cfg = intersect_config(g_star_radius_m=200.0, g_star_min_z=0.5, min_turn_deg=45.0)
         selected = _select_hotspot_events(events, cfg)
         self.assertGreaterEqual(len(selected), 1, "Clustered events should have z >= 0.5")
         # Event 3 has turn=20 < 45, should be excluded
@@ -1918,7 +1942,7 @@ class CrossTrackCandidateTest(unittest.TestCase):
         }
 
         candidates, pair_count, total_pairs = _extract_orthogonal_cross_track_candidates(
-            tracks, _TEST_TRANSFORMER, IntersectConfig(),
+            tracks, _TEST_TRANSFORMER, intersect_config(),
         )
 
         self.assertEqual(len(candidates), 1)
@@ -1957,7 +1981,7 @@ class CrossTrackCandidateTest(unittest.TestCase):
         }
 
         candidates, pair_count, total_pairs = _extract_orthogonal_cross_track_candidates(
-            tracks, _TEST_TRANSFORMER, IntersectConfig(),
+            tracks, _TEST_TRANSFORMER, intersect_config(),
         )
 
         self.assertEqual((pair_count, total_pairs), (3, 3))
@@ -1988,7 +2012,7 @@ class CrossTrackCandidateTest(unittest.TestCase):
         }
 
         candidates, _, _ = _extract_orthogonal_cross_track_candidates(
-            tracks, _TEST_TRANSFORMER, IntersectConfig(),
+            tracks, _TEST_TRANSFORMER, intersect_config(),
         )
 
         self.assertEqual(len(candidates), 1)
@@ -2015,7 +2039,7 @@ class CrossTrackCandidateTest(unittest.TestCase):
             }
             with self.assertRaises(ProjectionError):
                 _extract_orthogonal_cross_track_candidates(
-                    tracks, _TEST_TRANSFORMER, IntersectConfig(),
+                    tracks, _TEST_TRANSFORMER, intersect_config(),
                 )
 
     def test_oversized_aabb_uses_bounded_fallback_without_losing_hit(self):
@@ -2032,11 +2056,11 @@ class CrossTrackCandidateTest(unittest.TestCase):
             ],
         }
         segments, _ = _prepare_cross_track_segments(
-            tracks, _TEST_TRANSFORMER, IntersectConfig(),
+            tracks, _TEST_TRANSFORMER, intersect_config(),
         )
-        max_grid_cells = IntersectConfig().cross_track_max_grid_cells_per_segment
+        max_grid_cells = intersect_config().cross_track_max_grid_cells_per_segment
         index = build_cross_track_index(
-            segments, cell_m=IntersectConfig().cross_track_grid_cell_m, max_cells=max_grid_cells,
+            segments, cell_m=intersect_config().cross_track_grid_cell_m, max_cells=max_grid_cells,
         )
         grid, overflow_ids = index.grid, index.overflow_segment_ids
         self.assertEqual(overflow_ids, [0, 1])
@@ -2046,10 +2070,10 @@ class CrossTrackCandidateTest(unittest.TestCase):
         )
 
         legacy = _extract_orthogonal_cross_track_candidates_legacy(
-            tracks, origin_lon, origin_lat, IntersectConfig(),
+            tracks, origin_lon, origin_lat, intersect_config(),
         )
         bounded = _extract_orthogonal_cross_track_candidates(
-            tracks, _TEST_TRANSFORMER, IntersectConfig(),
+            tracks, _TEST_TRANSFORMER, intersect_config(),
         )
         self.assertEqual(legacy[1:], bounded[1:])
         self.assertEqual(_candidate_keys(legacy[0]), _candidate_keys(bounded[0]))
@@ -2057,7 +2081,7 @@ class CrossTrackCandidateTest(unittest.TestCase):
     def test_seeded_cross_track_differential_preserves_candidate_provenance(self):
         """Fixed-CRS broad phase preserves legacy segment-pair ownership."""
         origin_lon, origin_lat = 116.0, 39.0
-        cfg = IntersectConfig(cross_track_dbscan_min_samples=1)
+        cfg = intersect_config(cross_track_dbscan_min_samples=1)
 
         for seed in range(20):
             rng = random.Random(seed)
@@ -2145,7 +2169,7 @@ class TopologyExtractionTest(unittest.TestCase):
 
     def test_global_segments_route_complete_subtracks_to_topology_query_boxes(self):
         """A segment hit routes its complete, originally ordered subtrack."""
-        cfg = IntersectConfig(
+        cfg = intersect_config(
             min_intersection_radius_m=100.0,
             topology_radius_padding_m=0.0,
         )
@@ -2198,7 +2222,7 @@ class TopologyExtractionTest(unittest.TestCase):
         )
 
     def test_topology_from_tracks_extracts_complete_routed_subtrack(self):
-        cfg = IntersectConfig(
+        cfg = intersect_config(
             min_intersection_radius_m=100.0,
             topology_radius_padding_m=0.0,
         )
@@ -2236,7 +2260,7 @@ class TopologyExtractionTest(unittest.TestCase):
         self.assertEqual(observations, [])
 
     def test_reader_topology_matches_index_for_duplicate_windows_and_track_order(self):
-        cfg = IntersectConfig(
+        cfg = intersect_run_config(
             source_table="source", min_intersection_radius_m=50.0,
             topology_radius_padding_m=0.0, bearing_window=1,
         )
@@ -2286,14 +2310,14 @@ class TopologyExtractionTest(unittest.TestCase):
         reader.iter_turn_candidates.return_value = iter(())
         reader.iter_topology_tracks.return_value = (_ for _ in ())
         reader.track_count.return_value = 7
-        cfg = IntersectConfig(
+        cfg = intersect_run_config(
             source_table="source", use_turn_events=False,
             use_cross_track_candidates=False,
         )
         with tempfile.TemporaryDirectory() as directory:
             result = _detect_intersections_db(
                 object(), cfg, _TEST_SPATIAL_CONTEXT,
-                runtime=RuntimeConfig(), data_root=directory, refine_reader=reader,
+                runtime=runtime_config(), data_root=directory, refine_reader=reader,
             )
         try:
             self.assertEqual(result.report.track_count, 7)
@@ -2302,7 +2326,7 @@ class TopologyExtractionTest(unittest.TestCase):
             result.close()
 
     def test_reader_topology_closes_selection_iterator_on_geometry_failure(self):
-        cfg = IntersectConfig(min_intersection_radius_m=50.0)
+        cfg = intersect_run_config(min_intersection_radius_m=50.0)
         cluster = HotspotCluster(
             cluster_calculate_index=0, centroid_x=0.0, centroid_y=0.0,
             centroid_lon=0.0, centroid_lat=0.0, radius_m=1.0,
@@ -2334,7 +2358,7 @@ class TopologyExtractionTest(unittest.TestCase):
 
     def test_segments_with_outer_endpoints_still_produce_entry_and_exit(self):
         """Each boundary segment remains real when its outer point misses the window."""
-        cfg = IntersectConfig(
+        cfg = intersect_config(
             min_intersection_radius_m=50.0,
             topology_radius_padding_m=0.0,
             bearing_window=1,
@@ -2378,7 +2402,7 @@ class TopologyExtractionTest(unittest.TestCase):
 
     def test_same_vehicle_subtracks_do_not_form_a_synthetic_segment(self):
         """Window routing retains track keys instead of regrouping by vehicle."""
-        cfg = IntersectConfig(
+        cfg = intersect_config(
             min_intersection_radius_m=50.0,
             topology_radius_padding_m=0.0,
             bearing_window=1,
@@ -2428,7 +2452,7 @@ class TopologyExtractionTest(unittest.TestCase):
 
     def test_long_segment_crosses_circle_when_both_endpoints_miss_window(self):
         """AABB routing retains a two-root segment with no endpoint in the box."""
-        cfg = IntersectConfig(
+        cfg = intersect_config(
             min_intersection_radius_m=50.0,
             topology_radius_padding_m=0.0,
             bearing_window=1,
@@ -2552,8 +2576,9 @@ class TopologyExtractionTest(unittest.TestCase):
         ):
             result = detect_intersections(
                 conn=object(),
-                config=IntersectConfig(query_active_from_db=True, refine_id="refine-1"),
-                runtime=RuntimeConfig(), data_root=Path(tempfile.mkdtemp()),
+                config=intersect_config(),
+                context=detect_context(query_active_from_db=True, refine_id="refine-1"),
+                runtime=runtime_config(), data_root=Path(tempfile.mkdtemp()),
                 refine_reader=reader,
             )
 
@@ -2644,7 +2669,7 @@ class SourceAblationTest(unittest.TestCase):
                       i * 2.0, i * 2.0, 0, 90, 90, 90)
             for i in range(4)
         ]
-        cfg = IntersectConfig(dbscan_eps_m_turn=100.0, dbscan_min_samples_turn=3)
+        cfg = intersect_config(dbscan_eps_m_turn=100.0, dbscan_min_samples_turn=3)
         clusters = _cluster_dbscan(
             events,
             _TEST_TRANSFORMER,
@@ -2689,7 +2714,7 @@ class SourceAblationTest(unittest.TestCase):
                 heading=0.0,
                 speed=10.0,
             ))
-        cfg = IntersectConfig(
+        cfg = intersect_config(
             cross_track_dbscan_eps_m=100.0,
             cross_track_dbscan_min_samples=2,
         )
@@ -2740,8 +2765,11 @@ class EndToEndTest(unittest.TestCase):
             csv_path = _make_csv(td, "cross.csv", "\n".join(rows) + "\n")
 
             source = CsvSource(csv_path)
-            handle = get_database(source)
-            result = detect_intersections(handle, config=IntersectConfig(
+            handle = get_database(
+                source, field_config=pipeline_config().parser.fields,
+                runtime=runtime_config(),
+            )
+            result = detect_intersections(handle, config=intersect_config(
                 use_turn_events=True,
                 use_cross_track_candidates=False,  # Only Method 1 for this test
                 turn_window=2,
@@ -2750,7 +2778,8 @@ class EndToEndTest(unittest.TestCase):
                 g_star_radius_m=500.0, g_star_min_z=-1.0,  # lenient to catch all
                 dbscan_eps_m_turn=500.0, dbscan_min_samples_turn=2,
                 min_branches=2, min_observations=2, min_directed_transitions=2,
-            ), spatial_context=_TEST_SPATIAL_CONTEXT)
+            ), context=detect_context(), runtime=runtime_config(),
+                spatial_context=_TEST_SPATIAL_CONTEXT)
             handle.close()
 
             self.assertGreaterEqual(len(result.turn_events), 4,
@@ -2772,9 +2801,13 @@ class EndToEndTest(unittest.TestCase):
             csv_path = _make_csv(td, "straight.csv", "\n".join(rows) + "\n")
 
             source = CsvSource(csv_path)
-            handle = get_database(source)
+            handle = get_database(
+                source, field_config=pipeline_config().parser.fields,
+                runtime=runtime_config(),
+            )
             result = detect_intersections(
-                handle, spatial_context=_TEST_SPATIAL_CONTEXT
+                handle, config=intersect_config(), context=detect_context(),
+                runtime=runtime_config(), spatial_context=_TEST_SPATIAL_CONTEXT,
             )
             handle.close()
 
@@ -2793,14 +2826,18 @@ class EndToEndTest(unittest.TestCase):
                 "B,116.001,39.0,90,8,20",
             ]
             csv_path = _make_csv(td, "cross_track.csv", "\n".join(rows) + "\n")
-            handle = get_database(CsvSource(csv_path))
+            handle = get_database(
+                CsvSource(csv_path), field_config=pipeline_config().parser.fields,
+                runtime=runtime_config(),
+            )
             result = detect_intersections(
                 handle,
-                config=IntersectConfig(
+                config=intersect_config(
                     use_turn_events=False,
                     cross_track_dbscan_min_samples=1,
                 ),
-                spatial_context=_TEST_SPATIAL_CONTEXT,
+                context=detect_context(),
+                runtime=runtime_config(), spatial_context=_TEST_SPATIAL_CONTEXT,
             )
             handle.close()
 
@@ -2815,10 +2852,14 @@ class EndToEndTest(unittest.TestCase):
             self.skipTest(f"Hfm_130pts.csv not found at {hfm_path}")
 
         source = CsvSource(hfm_path)
-        handle = get_database(source)
+        handle = get_database(
+            source, field_config=pipeline_config().parser.fields,
+            runtime=runtime_config(),
+        )
         # Run with default config
         result = detect_intersections(
-            handle, spatial_context=_TEST_SPATIAL_CONTEXT
+            handle, config=intersect_config(), context=detect_context(),
+            runtime=runtime_config(), spatial_context=_TEST_SPATIAL_CONTEXT,
         )
         handle.close()
 

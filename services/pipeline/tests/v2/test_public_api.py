@@ -1,18 +1,37 @@
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, pipeline_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
 
 import track.v2 as v2
-from track.v2.refine import refine
+from track.v2.refine import refine as _refine
 from track.v2.errors import DataSourceCorrupted
 
 
 _SPATIAL_CONTEXT = v2.create_spatial_context(
-    v2.ProjectionConfig(processing_srid=32650)
+    projection_config(processing_srid=32650)
 )
+
+
+def _get_database(source, **kwargs):
+    config = pipeline_config()
+    field_path = kwargs.pop("field_config", None)
+    if field_path is not None:
+        from track.v2.field_config import load_field_config
+        kwargs["field_config"] = load_field_config(field_path)
+    else:
+        kwargs["field_config"] = config.parser.fields
+    kwargs.setdefault("runtime", config.runtime)
+    return v2.get_database(source, **kwargs)
+
+
+def refine(*args, **kwargs):
+    kwargs.setdefault("config", refine_config())
+    return _refine(*args, **kwargs)
 
 
 def _make_csv(tmpdir: str, content: str) -> Path:
@@ -37,7 +56,7 @@ class ParserQualityBehaviorTest(unittest.TestCase):
                 "vid,lng,lat,included_angle,gps_speed,standard_time\n"
                 "v1,116,39,90,36,2023-03-01 12:46:15\n",
             )
-            handle = v2.get_database(v2.CsvSource(csv_path))
+            handle = _get_database(v2.CsvSource(csv_path))
             try:
                 point = list(handle.iter_points())[0]
             finally:
@@ -52,7 +71,7 @@ class ParserQualityBehaviorTest(unittest.TestCase):
                 "vid,lng,lat,included_angle,gps_speed,gps_time_a\n"
                 "v1,116,39,bad,-5,1700000000000\n",
             )
-            handle = v2.get_database(v2.CsvSource(csv_path))
+            handle = _get_database(v2.CsvSource(csv_path))
             try:
                 points = list(handle.iter_points())
                 report = handle.get_report()
@@ -74,12 +93,12 @@ class ParserQualityBehaviorTest(unittest.TestCase):
             )
             config_path = Path(td) / "field_specs.toml"
             config_path.write_text(
-                Path(v2.__file__).resolve().parent.joinpath("config/default_field_specs.toml").read_text(
+                (Path(__file__).resolve().parents[2] / "config" / "field_specs.toml").read_text(
                     encoding="utf-8"
                 ).replace("max_error_ratio = 1.0", "max_error_ratio = 0.4"),
                 encoding="utf-8",
             )
-            handle = v2.get_database(v2.CsvSource(csv_path), field_config=config_path)
+            handle = _get_database(v2.CsvSource(csv_path), field_config=config_path)
             try:
                 with self.assertRaises(DataSourceCorrupted):
                     list(handle.iter_points())
@@ -103,7 +122,7 @@ class FakePostgresStreamingTest(unittest.TestCase):
             query="select vid,lng,lat,included_angle,gps_speed,gps_time_a from points order by vid,gps_time_a",
             connection_factory=factory,
         )
-        handle = v2.get_database(source)
+        handle = _get_database(source)
         try:
             points = list(handle.iter_points())
         finally:
@@ -124,11 +143,11 @@ class RefineContractTest(unittest.TestCase):
                 "v1,116,39,90,36,1700000000000\n"
                 "v1,116.001,39,90,36,1700000200000\n",
             )
-            handle = v2.get_database(v2.CsvSource(csv_path))
+            handle = _get_database(v2.CsvSource(csv_path))
             try:
                 result = refine(
                     handle,
-                    config=v2.RefineConfig(max_gap_s=120.0),
+                    config=refine_config(max_gap_s=120.0),
                     spatial_context=_SPATIAL_CONTEXT,
                 )
                 vehicle_ids = [point.vehicle_id for point in result.active.iter_points()]

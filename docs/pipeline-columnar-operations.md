@@ -6,6 +6,13 @@
 
 ## 存储与路径
 
+Pipeline 的非敏感运行配置集中在 `services/pipeline/config/pipeline.toml`，
+字段定义集中在 `services/pipeline/config/field_specs.toml`。运行入口只在启动时读取
+`PIPELINE_CONFIG_PATH` 指向的完整 TOML；不支持多文件合并、逐项环境变量覆盖或
+CLI 覆盖。修改配置后必须重新创建或重启 Pipeline 进程；运行中的 Run 保持原配置
+快照，不会热重载。数据库密码仅由根目录 `.env` 中的 `POSTGRES_PASSWORD` 注入；
+旧 `TRACK_PG_*` 与逐项 `POSTGRES_*` 非敏感配置不再兼容。
+
 PostgreSQL 是源数据、Run 状态、制品登记和最终业务结果的权威存储。Refine 与 Detect
 成功后各发布不可变 Parquet 数据集，作为下游的大表输入；Parquet 不是可修改的第二套
 业务数据库。不得覆盖、修补或重新生成已发布 Run 的单个 part 文件，重算必须使用新的

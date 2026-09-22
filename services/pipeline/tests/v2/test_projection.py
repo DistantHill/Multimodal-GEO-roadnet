@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+
 import unittest
 
 from track.v2.models import ProjectionConfig, SpatialContext
@@ -20,28 +22,28 @@ from track.v2.projection import (
 
 class SpatialContextTest(unittest.TestCase):
     def test_new_run_requires_explicit_processing_srid(self) -> None:
-        with self.assertRaisesRegex(ProjectionError, "processing_srid is required"):
-            create_spatial_context(ProjectionConfig())
+        with self.assertRaisesRegex(TypeError, "processing_srid"):
+            ProjectionConfig(source_srid=4326, enforce_area_of_use=True, max_scale_error=0.01)
 
     def test_processing_crs_must_be_projected_metres(self) -> None:
         with self.assertRaisesRegex(ProjectionError, "projected CRS"):
-            create_spatial_context(ProjectionConfig(processing_srid=4326))
+            create_spatial_context(projection_config(processing_srid=4326))
 
     def test_processing_crs_must_have_east_and_north_horizontal_axes(self) -> None:
         # EPSG:2053 uses westing/southing axes. Euclidean distances remain
         # meaningful, but the pipeline's +x-east/+y-north bearing convention
         # would be false even with always_xy=True.
         with self.assertRaisesRegex(ProjectionError, r"\+x east and \+y north"):
-            create_spatial_context(ProjectionConfig(processing_srid=2053))
+            create_spatial_context(projection_config(processing_srid=2053))
 
     def test_northing_easting_declared_axis_order_is_accepted(self) -> None:
         # always_xy normalizes EPSG:3414's declared northing/easting order.
-        context = create_spatial_context(ProjectionConfig(processing_srid=3414))
+        context = create_spatial_context(projection_config(processing_srid=3414))
 
         self.assertEqual(context.processing_srid, 3414)
 
     def test_known_utm_coordinate_and_round_trip(self) -> None:
-        context = create_spatial_context(ProjectionConfig(processing_srid=32650))
+        context = create_spatial_context(projection_config(processing_srid=32650))
         transformer = CoordinateTransformer(context)
 
         x, y = transformer.forward(117.0, 0.0)
@@ -56,13 +58,13 @@ class SpatialContextTest(unittest.TestCase):
         self.assertAlmostEqual(east_y, 0.0, places=6)
 
     def test_utm_area_of_use_is_validated_against_data_bounds(self) -> None:
-        context = create_spatial_context(ProjectionConfig(processing_srid=32650))
+        context = create_spatial_context(projection_config(processing_srid=32650))
         transformer = CoordinateTransformer(context)
         with self.assertRaisesRegex(ProjectionError, "area of use"):
             transformer.validate_bounds((110.0, 36.0, 116.0, 39.0))
 
     def test_geographic_bounds_must_be_ordered(self) -> None:
-        context = create_spatial_context(ProjectionConfig(processing_srid=32650))
+        context = create_spatial_context(projection_config(processing_srid=32650))
         transformer = CoordinateTransformer(context)
 
         for bounds in (
@@ -74,7 +76,7 @@ class SpatialContextTest(unittest.TestCase):
                     transformer.validate_bounds(bounds)
 
     def test_antimeridian_area_of_use_accepts_either_valid_side(self) -> None:
-        context = create_spatial_context(ProjectionConfig(
+        context = create_spatial_context(projection_config(
             processing_srid=3338,
             max_scale_error=1.0,
         ))
@@ -86,7 +88,7 @@ class SpatialContextTest(unittest.TestCase):
             transformer.validate_bounds((0.0, 60.0, 0.0, 60.0))
 
     def test_inverse_bounds_contains_projected_window_corners(self) -> None:
-        context = create_spatial_context(ProjectionConfig(processing_srid=32650))
+        context = create_spatial_context(projection_config(processing_srid=32650))
         transformer = CoordinateTransformer(context)
         projected = (400000.0, 4300000.0, 402000.0, 4302000.0)
 
@@ -101,7 +103,7 @@ class SpatialContextTest(unittest.TestCase):
                 self.assertGreaterEqual(north, lat)
 
     def test_inverse_bounds_contains_horizontal_edge_central_meridian_extremum(self) -> None:
-        context = create_spatial_context(ProjectionConfig(processing_srid=32650))
+        context = create_spatial_context(projection_config(processing_srid=32650))
         transformer = CoordinateTransformer(context)
 
         bounds = transformer.inverse_bounds((250000.0, 4300000.0, 750000.0, 4400000.0))
@@ -111,7 +113,7 @@ class SpatialContextTest(unittest.TestCase):
         self.assertGreaterEqual(bounds[3], lat)
 
     def test_inverse_bounds_rejects_antimeridian_footprint(self) -> None:
-        context = create_spatial_context(ProjectionConfig(processing_srid=32660))
+        context = create_spatial_context(projection_config(processing_srid=32660))
         transformer = CoordinateTransformer(context)
         with self.assertRaisesRegex(ProjectionError, "antimeridian|local domain"):
             transformer.inverse_bounds((
@@ -120,14 +122,14 @@ class SpatialContextTest(unittest.TestCase):
             ))
 
     def test_inverse_bounds_rejects_far_tm_sheet_coordinates(self) -> None:
-        context = create_spatial_context(ProjectionConfig(processing_srid=32650))
+        context = create_spatial_context(projection_config(processing_srid=32650))
         transformer = CoordinateTransformer(context)
         with self.assertRaisesRegex(ProjectionError, "local projected domain"):
             transformer.inverse_bounds((
                 12322388.235970555, -33228288.425446153,
                 12331267.070719512, -28689717.062269293,
             ))
-        extreme = CoordinateTransformer(create_spatial_context(ProjectionConfig(processing_srid=32660)))
+        extreme = CoordinateTransformer(create_spatial_context(projection_config(processing_srid=32660)))
         with self.assertRaisesRegex(ProjectionError, "central-meridian domain"):
             extreme.inverse_bounds((
                 -359443.54391068325, 9970379.183979101,
@@ -184,12 +186,12 @@ class SpatialContextTest(unittest.TestCase):
         # 9 degrees from zone 49's central meridian at the equator has about
         # 1.2146% scale error: query policy accepts it, Run default rejects it.
         _validate_query_scale(32649, (120.0, 0.0, 120.0, 0.0))
-        run = CoordinateTransformer(create_spatial_context(ProjectionConfig(processing_srid=32649)))
+        run = CoordinateTransformer(create_spatial_context(projection_config(processing_srid=32649)))
         with self.assertRaisesRegex(ProjectionError, "area of use|scale distortion"):
             run.validate_bounds((120.0, 0.0, 120.0, 0.0))
 
     def test_global_metre_label_does_not_hide_web_mercator_distortion(self) -> None:
-        context = create_spatial_context(ProjectionConfig(processing_srid=3857))
+        context = create_spatial_context(projection_config(processing_srid=3857))
         transformer = CoordinateTransformer(context)
         with self.assertRaisesRegex(ProjectionError, "scale distortion"):
             transformer.validate_bounds((116.0, 39.0, 116.1, 39.1))
@@ -197,7 +199,7 @@ class SpatialContextTest(unittest.TestCase):
     def test_tissot_principal_scale_catches_oblique_distortion(self) -> None:
         # At this EPSG:5633 location meridional/parallel scales are within 1%,
         # while the Tissot principal scales differ from one by about 3.2%.
-        context = create_spatial_context(ProjectionConfig(processing_srid=5633))
+        context = create_spatial_context(projection_config(processing_srid=5633))
         transformer = CoordinateTransformer(context)
 
         with self.assertRaisesRegex(ProjectionError, "scale distortion"):

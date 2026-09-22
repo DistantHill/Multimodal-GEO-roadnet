@@ -40,6 +40,7 @@ See the current
 for the active design, measured results, and accepted trade-offs.
 
 Schema v3 removed the old `pipeline_runs` migration and runtime compatibility
-branches. `TRACK_PG_*` names remain live environment aliases only.
+branches. The later configuration-centralization cutover also removed the live
+`TRACK_PG_*` aliases; this document records them only as import provenance.
 `_cross_track_legacy.py` is a frozen benchmark oracle, not the production Detect
 implementation or a runtime fallback.

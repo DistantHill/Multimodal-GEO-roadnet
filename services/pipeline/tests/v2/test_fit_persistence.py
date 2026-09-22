@@ -12,6 +12,7 @@ from track.v2.models import (
     SpatialContext,
     TrackClip,
 )
+from .config_factory import fitting_config
 
 
 _SPATIAL_CONTEXT = SpatialContext(
@@ -147,7 +148,7 @@ class FitPersistenceTest(unittest.TestCase):
             spatial_context=_SPATIAL_CONTEXT,
             detect_id="detect-1",
         )
-        bundle = fit_centerline_variants(clips)
+        bundle = fit_centerline_variants(clips, config=fitting_config())
         conn = _Connection()
 
         ids = insert_centerline_bundle(
@@ -230,7 +231,7 @@ class FitPersistenceTest(unittest.TestCase):
 
         ids = insert_centerline_bundle(
             conn,
-            fit_centerline_variants(clips),
+            fit_centerline_variants(clips, config=fitting_config()),
             clips,
             fit_id="fit-1",
             detect_id="detect-1",
@@ -251,7 +252,7 @@ class FitPersistenceTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "incomplete id mapping"):
             insert_centerline_bundle(
                 conn,
-                fit_centerline_variants(clips),
+                fit_centerline_variants(clips, config=fitting_config()),
                 clips,
                 fit_id="fit-1",
                 detect_id="detect-1",

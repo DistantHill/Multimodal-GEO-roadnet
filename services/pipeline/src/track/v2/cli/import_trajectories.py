@@ -9,69 +9,44 @@ EN: Standalone CSV → trajectory_points import CLI. Runs only Parser parsing +
 Usage / 用法::
 
     python -m track.v2.cli.import_trajectories --csv track/data/guiji_20230301_top10w.csv --ask-password
-    python -m track.v2.cli.import_trajectories --csv data.csv --host 127.0.0.1 --port 15432 --database trajectory --user track_user --ask-password
+    python -m track.v2.cli.import_trajectories --csv data.csv --ask-password
 """
 
 from __future__ import annotations
 
 import argparse
-import getpass
 import time
 
-from ..config import PostgresConfig, connect as pg_connect, default_postgres_config
-from ..config.pipeline_config import load_pipeline_config
+from ..config import connect as pg_connect
 from ..logger import init_logger, shutdown_logger
 from ..models import CsvSource
 from .. import get_database
 from ..db_writer import insert_trajectory_points
+from ._startup import load_startup_config
 
 
 # ── Import logic ─────────────────────────────────────────────────────
 
 
 def main() -> int:
-    # ZH: 从 .env 加载默认连接参数，CLI 参数可覆盖
-    # EN: Load defaults from .env; CLI args take precedence
-    _env = default_postgres_config()
-    pc = load_pipeline_config()
-
     parser = argparse.ArgumentParser(
         description="Import CSV trajectory data into the trajectory_points table."
     )
     parser.add_argument("--csv", required=True, help="Path to input CSV file")
-    parser.add_argument("--host", default=_env.host)
-    parser.add_argument("--port", type=int, default=_env.port)
-    parser.add_argument("--database", default=_env.database)
-    parser.add_argument("--user", default=_env.user)
     parser.add_argument(
         "--ask-password", action="store_true",
-        help="Prompt for password interactively (secure, no echo). Overrides .env password."
+        help="Prompt for password interactively instead of using POSTGRES_PASSWORD."
     )
-    parser.add_argument("--connect-timeout", type=int, default=_env.connect_timeout)
-    parser.add_argument("--sslmode", default=_env.sslmode)
     parser.add_argument(
         "--table", default="trajectory_points",
         help="目标表名 / Target table name (default: trajectory_points)."
     )
     args = parser.parse_args()
 
-    # ── Resolve password: CLI prompt > .env > empty ──
-    if args.ask_password:
-        password = getpass.getpass("PostgreSQL password: ")
-    else:
-        password = _env.password
+    pc = load_startup_config(ask_password=args.ask_password)
+    db_config = pc.postgres
 
-    db_config = PostgresConfig(
-        host=args.host,
-        port=args.port,
-        database=args.database,
-        user=args.user,
-        password=password,
-        connect_timeout=args.connect_timeout,
-        sslmode=args.sslmode,
-    )
-
-    init_logger()
+    init_logger(pc.logging.directory)
 
     print(f"数据源 / Source CSV: {args.csv}")
     print(f"连接目标 / Target:    {db_config.safe_dsn()}")
@@ -82,7 +57,11 @@ def main() -> int:
 
         # ── Parser: read CSV ──
         source = CsvSource(path=args.csv)
-        handle = get_database(source, runtime=pc.runtime)
+        handle = get_database(
+            source,
+            field_config=pc.parser.fields,
+            runtime=pc.runtime,
+        )
 
         # ── Stream insert: 每批 BATCH_SIZE 行边读边写 / batch-insert as we read ──
         total_parsed = 0

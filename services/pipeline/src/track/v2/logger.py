@@ -15,7 +15,7 @@ Usage / 用法::
     from ..logger import init_logger, shutdown_logger
 
     def main() -> int:
-        init_logger()
+        init_logger(config.logging.directory)
         try:
             print("这条同时出现在终端和日志文件 / This appears in the terminal and log")
         finally:
@@ -222,15 +222,12 @@ _tee = _TeeStream()  # singleton tee instance
 
 
 def _resolve_log_path(log_path: str | Path | None = None) -> Path:
-    """Resolve an explicit path or create a process-specific timestamped path."""
-    if log_path is not None:
-        return Path(log_path)
-
-    configured_path = os.environ.get("TRACK_LOG_PATH")
-    if configured_path:
-        return Path(configured_path)
-
-    log_dir = Path(os.environ.get("TRACK_LOG_DIR") or "generated")
+    """Resolve an explicit file or create a process-specific file in a directory."""
+    if log_path is None:
+        raise ValueError("log_path must be provided from the loaded pipeline configuration")
+    log_dir = Path(log_path)
+    if log_dir.suffix:
+        return log_dir
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     return log_dir / f"{timestamp}_pid-{os.getpid()}_log.txt"
 
@@ -247,9 +244,7 @@ def init_logger(
         opens the log file. Idempotent — subsequent calls only update level/Live.
 
     Args:
-        log_path: log 文件路径；None → 读 TRACK_LOG_PATH 环境变量 →
-                  在 TRACK_LOG_DIR（默认 generated）下生成
-                  <timestamp>_pid-<pid>_log.txt
+        log_path: 由 Pipeline TOML 提供的日志目录，或显式日志文件路径。
         level: 最低日志级别
 
     Returns:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .config_factory import intersect_run_config
+
 import pytest
 from unittest.mock import patch
 
@@ -70,7 +72,7 @@ def test_complete_stage_reference_matches_db_subtrack_keys_and_vehicle_identity(
         point("B", 3, 500000.0, 4319800.0, 0.0),
         point("B", 3, 500000.0, 4320200.0, 0.0),
     ]
-    cfg = IntersectConfig(use_turn_events=False, cross_track_grid_cell_m=100.0)
+    cfg = intersect_run_config(use_turn_events=False, cross_track_grid_cell_m=100.0)
     window = SpatialWindow(499000.0, 4319000.0, 501000.0, 4321000.0)
     results = []
     with patch("track.v2.detect._query_active_points_in_window", return_value=points):

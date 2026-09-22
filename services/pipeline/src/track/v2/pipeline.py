@@ -8,18 +8,15 @@ this module and remains responsible only for command-line concerns.
 from __future__ import annotations
 
 import time
-import os
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass, replace
-from pathlib import Path
 from uuid import uuid4
 
 import psycopg
 
 from .refine import refine_vehicle
 from .artifact_publication import abandon_staging, create_staging, publish
-from .config import PostgresConfig, connect as pg_connect
-from .config.pipeline_config import load_pipeline_config
+from .config import PipelineConfig, connect as pg_connect
 from .db.pipeline_store import PipelineStore, PostgresPipelineStore
 from .db.artifact_registry import find_refine_artifact
 from .db.schema import require_current_schema
@@ -30,7 +27,7 @@ from .db.source_table import (
     verify_refine_source_fingerprint,  # compatibility seam; Detect owns invocation
 )
 from .fitting import fit_centerline_variants
-from .detect import detect_intersections
+from .detect import DetectRuntimeContext, detect_intersections
 from .detect_parquet import export_detect_parquet
 from .logger import log_info
 from .heartbeat import operation_heartbeat
@@ -56,11 +53,8 @@ from .refine_parquet import RefineDatasetReader, export_refine_parquet
 class PipelineInput:
     """Inputs accepted by the database-backed pipeline runner."""
 
-    db_config: PostgresConfig
     source_table: str | None = None
     refine_id: str | None = None
-    config_path: str | Path | None = None
-    processing_srid: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,24 +66,6 @@ class PipelineResult:
 
 def _noop_event_sink(_event: PipelineEvent) -> None:
     """Default sink for non-CLI callers."""
-
-
-def _parquet_root() -> Path:
-    root = Path(os.environ.get("PARQUET_ROOT", "")) if "PARQUET_ROOT" in os.environ else (
-        Path(os.environ.get("DATA_ROOT", "/data")) / "parquet"
-    )
-    if not root.is_absolute():
-        raise ValueError("PARQUET_ROOT must be absolute")
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def _data_root() -> Path:
-    root = Path(os.environ.get("DATA_ROOT", "/data"))
-    if not root.is_absolute() or root == Path(root.anchor):
-        raise ValueError("DATA_ROOT must be an absolute non-root path")
-    root.mkdir(parents=True, exist_ok=True)
-    return root
 
 
 def _fail_running_refine(store: PipelineStore, refine_id: str) -> None:
@@ -104,22 +80,20 @@ def _fail_running_refine(store: PipelineStore, refine_id: str) -> None:
 
 def run_pipeline(
     pipeline_input: PipelineInput,
+    config: PipelineConfig,
     *,
     emit: EventSink | None = None,
 ) -> PipelineResult:
     """Run the full pipeline with its existing write and commit ordering."""
     sink: EventSink = _noop_event_sink if emit is None else emit
-    db_config = pipeline_input.db_config
+    db_config = config.postgres
     source_table = pipeline_input.source_table
     refine_id = pipeline_input.refine_id
-    config_path = pipeline_input.config_path
-
-    pc = load_pipeline_config(config_path)
+    pc = config
+    config_parameters = pc.snapshot_parameters()
 
     if sum(value is not None for value in (source_table, refine_id)) != 1:
         raise ValueError("exactly one of source_table or refine_id is required")
-    if refine_id is not None and pipeline_input.processing_srid is not None:
-        raise ValueError("a reused Refine Run inherits processing_srid and cannot override it")
 
     stats: dict[str, float | int | str | list[int]] = {}
     t_start = time.perf_counter()
@@ -146,13 +120,11 @@ def run_pipeline(
             source_label = f"postgresql://{db_config.database}/{source_table}"
             spatial_context = create_spatial_context(
                 pc.projection,
-                processing_srid=pipeline_input.processing_srid,
+                processing_srid=pc.projection.processing_srid,
             )
             refine_id = store.start_refine_run(
                 source_table=source_table,
-                parameters={
-                    "refine_max_gap_s": pc.refine.max_gap_s,
-                },
+                parameters=config_parameters,
                 spatial_context=spatial_context,
             )
             store.commit()
@@ -177,7 +149,11 @@ def run_pipeline(
                 live_refine = EventProgressAdapter(refine_stage, sink)
                 live_refine.start()
                 _emit_message(sink, f"  数据源 / Source: {source_label}")
-                handle = get_database(source, runtime=pc.runtime)
+                handle = get_database(
+                    source,
+                    field_config=pc.parser.fields,
+                    runtime=pc.runtime,
+                )
                 try:
                     t_count = time.perf_counter()
                     total_rows = handle.count_rows()
@@ -309,10 +285,12 @@ def run_pipeline(
                 # Run deliberately remains running.
                 store.commit()
                 staging = create_staging(
-                    _parquet_root(), "refine", refine_id, uuid4(),
+                    pc.paths.parquet_directory, "refine", refine_id, uuid4(),
                 )
                 descriptor = export_refine_parquet(
                     conn, db_config, staging, pc.runtime, source_fingerprint,
+                    data_root=pc.paths.data_root,
+                    postgres_extension_path=pc.paths.duckdb_postgres_extension_path,
                 )
                 # Close the exporter's transaction before taking an independent
                 # post-export source view.
@@ -348,7 +326,7 @@ def run_pipeline(
 
         detect_id = store.start_detect_run(
             refine_id=refine_id,
-            parameters={},
+            parameters=config_parameters,
         )
         stats["detect_id"] = detect_id
         store.commit()
@@ -364,8 +342,7 @@ def run_pipeline(
         )
         live_intersect = EventProgressAdapter(detect_stage, sink, completion_pending=True)
         live_intersect.start()
-        icfg = replace(
-            pc.detect,
+        detect_context = DetectRuntimeContext(
             query_active_from_db=True,
             db_table=source_table,
             kept_table="kept_trajectory_points",
@@ -378,18 +355,20 @@ def run_pipeline(
         detect_published = False
         iresult = None
         try:
-            detect_data_root = _data_root()
+            detect_data_root = pc.paths.data_root
             detect_compute_started = time.perf_counter()
             with store.connection.cursor() as cur:
                 registered = find_refine_artifact(cur, refine_id)
             reader = RefineDatasetReader(
-                _parquet_root(), registered.descriptor, registered.state, pc.runtime,
+                pc.paths.parquet_directory, registered.descriptor, registered.state, pc.runtime,
+                verify_sha256=pc.resources.verify_artifact_sha256,
                 data_root=detect_data_root,
             )
             with reader:
                 iresult = detect_intersections(
                     conn=store.connection,
-                    config=icfg,
+                    config=pc.detect,
+                    context=detect_context,
                     refine_reader=reader,
                     runtime=pc.runtime,
                     data_root=detect_data_root,
@@ -454,10 +433,12 @@ def run_pipeline(
                 conn, str(refine_id), detect_source_contract,
             )
             detect_staging = create_staging(
-                _parquet_root(), "detect", detect_id, uuid4(),
+                pc.paths.parquet_directory, "detect", detect_id, uuid4(),
             )
             detect_descriptor = export_detect_parquet(
                 conn, db_config, detect_staging, pc.runtime, source_fingerprint,
+                data_root=pc.paths.data_root,
+                postgres_extension_path=pc.paths.duckdb_postgres_extension_path,
             )
             # Close the exporter's psycopg snapshot before checking a new view.
             store.rollback()
@@ -546,8 +527,10 @@ def run_pipeline(
         clip_config = pc.clip
         clip_assembly_started = time.perf_counter()
         clip_result = store.load_clip(
-            detect_id, publication_root=_parquet_root(), data_root=_data_root(), runtime=pc.runtime,
+            detect_id, publication_root=pc.paths.parquet_directory,
+            data_root=pc.paths.data_root, runtime=pc.runtime,
             config=clip_config,
+            verify_sha256=pc.resources.verify_artifact_sha256,
         )
         close_clips = getattr(clip_result.clips, "close", None)
         if close_clips is not None:
@@ -576,6 +559,7 @@ def run_pipeline(
             detect_id=detect_id,
             clip_config=clip_config,
             fitting_config=fitting_config,
+            parameters=config_parameters,
         )
         stats["fit_id"] = fit_id
         store.commit()

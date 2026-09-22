@@ -1,169 +1,96 @@
-"""Pipeline TOML config loader tests."""
-
+"""Strict Pipeline TOML loader tests."""
 from __future__ import annotations
 
-import tempfile
-import unittest
+from dataclasses import MISSING, fields, replace
 from pathlib import Path
 
-from track.v2.config.pipeline_config import load_pipeline_config
+import pytest
+
+from .config_factory import pipeline_config
+from track.v2.config import PostgresConfig, load_pipeline_config
 from track.v2.errors import ConfigError
 from track.v2.detect import IntersectConfig
-from track.v2.models import (
-    RefineConfig,
-    ClipConfig,
-    FittingConfig,
-    NetworkConfig,
-    ProjectionConfig,
-    RuntimeConfig,
-)
-from track.v2.pipeline import _should_flush_refine_batch
+from track.v2.models import (ClipConfig, FieldConfig, FieldSpec, FittingConfig, NetworkConfig,
+                             ProjectionConfig, RefineConfig, RuntimeConfig)
 
 
-class DefaultPipelineConfigTest(unittest.TestCase):
-    def test_builtin_toml_matches_dataclass_defaults(self):
-        """The checked-in TOML must reproduce every dataclass default exactly."""
-        pc = load_pipeline_config()
-        self.assertEqual(pc.projection, ProjectionConfig())
-        self.assertEqual(pc.refine, RefineConfig())
-        self.assertEqual(pc.detect, IntersectConfig())
-        self.assertEqual(pc.clip, ClipConfig())
-        self.assertEqual(pc.fitting, FittingConfig())
-        self.assertEqual(pc.network, NetworkConfig())
-        self.assertEqual(pc.runtime, RuntimeConfig())
-
-    def test_columnar_runtime_defaults(self):
-        runtime = load_pipeline_config().runtime
-        self.assertEqual(runtime.duckdb_memory_limit, "1GB")
-        self.assertEqual(runtime.duckdb_threads, 4)
-        self.assertEqual(runtime.duckdb_max_temp_directory_size, "50GB")
-        self.assertEqual(runtime.polars_threads, 4)
-        self.assertEqual(runtime.parquet_target_file_size_bytes, 0)
-        self.assertEqual(runtime.parquet_row_group_size_rows, 0)
-        self.assertEqual(runtime.artifact_gc_grace_days, 7)
+CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "pipeline.toml"
+FIELD_PATH = CONFIG_PATH.with_name("field_specs.toml")
+CONFIG_TYPES = (PostgresConfig, ProjectionConfig, RefineConfig, IntersectConfig,
+                ClipConfig, FittingConfig, NetworkConfig, RuntimeConfig, FieldConfig, FieldSpec)
 
 
-class PipelineConfigOverrideTest(unittest.TestCase):
-    def test_section_key_override_keeps_other_defaults(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "pipeline.toml"
-            path.write_text("[refine]\nmax_gap_s = 999.0\n", encoding="utf-8")
-            pc = load_pipeline_config(path)
-            self.assertEqual(pc.refine.max_gap_s, 999.0)
-            self.assertEqual(pc.refine.min_speed_mps, RefineConfig().min_speed_mps)
-            self.assertEqual(pc.detect, IntersectConfig())
-
-    def test_array_field_coerced_to_tuple(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "pipeline.toml"
-            path.write_text("[detect]\nspatial_window_size = [1.0, 2.0]\n", encoding="utf-8")
-            pc = load_pipeline_config(path)
-            self.assertEqual(pc.detect.spatial_window_size, (1.0, 2.0))
-
-    def test_fallback_encodings_coerced_to_tuple(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "pipeline.toml"
-            path.write_text('[runtime]\nfallback_encodings = ["utf-8"]\n', encoding="utf-8")
-            pc = load_pipeline_config(path)
-            self.assertEqual(pc.runtime.fallback_encodings, ("utf-8",))
-
-    def test_processing_srid_override(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "pipeline.toml"
-            path.write_text("[projection]\nprocessing_srid = 32650\n", encoding="utf-8")
-            pc = load_pipeline_config(path)
-            self.assertEqual(pc.projection.processing_srid, 32650)
-
-    def test_refine_point_threshold_flushes_before_vehicle_limit(self):
-        runtime = RuntimeConfig(
-            mark_flush_every_n=2000,
-            excluded_flush_threshold=2000,
-            refine_flush_point_threshold=10,
-        )
-
-        self.assertFalse(_should_flush_refine_batch(
-            pending_excluded_count=0,
-            pending_point_count=9,
-            vehicle_count=1,
-            runtime=runtime,
-        ))
-        self.assertTrue(_should_flush_refine_batch(
-            pending_excluded_count=0,
-            pending_point_count=10,
-            vehicle_count=1,
-            runtime=runtime,
-        ))
+def _config_text() -> str:
+    return CONFIG_PATH.read_text(encoding="utf-8").replace(
+        'field_specs_path = "field_specs.toml"',
+        f'field_specs_path = "{FIELD_PATH}"',
+    )
 
 
-class PipelineConfigErrorTest(unittest.TestCase):
-    def _write(self, content: str) -> str:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        path = Path(tmp.name) / "pipeline.toml"
-        path.write_text(content, encoding="utf-8")
-        return str(path)
-
-    def test_unknown_section_raises(self):
-        path = self._write("[bogus]\nx = 1\n")
-        with self.assertRaises(ConfigError):
-            load_pipeline_config(path)
-
-    def test_unknown_key_raises(self):
-        path = self._write("[refine]\nnot_a_field = 1\n")
-        with self.assertRaises(ConfigError):
-            load_pipeline_config(path)
-
-    def test_removed_method_2_keys_report_migration(self):
-        path = self._write(
-            "[detect]\n"
-            "use_orthogonal_candidates = true\n"
-            "dbscan_eps_m_ortho = 100.0\n"
-        )
-        with self.assertRaisesRegex(
-            ConfigError,
-            "rename use_orthogonal_candidates to use_cross_track_candidates",
-        ) as raised:
-            load_pipeline_config(path)
-        self.assertIn("remove dbscan_eps_m_ortho", str(raised.exception))
-
-    def test_wrong_type_raises(self):
-        path = self._write("[runtime]\ndb_insert_batch = \"not-an-int\"\n")
-        with self.assertRaises(ConfigError):
-            load_pipeline_config(path)
-
-    def test_new_runtime_integer_limits_are_strict(self):
-        invalid_values = (
-            "duckdb_threads = true",
-            "duckdb_threads = 5",
-            "polars_threads = 0",
-            "parquet_target_file_size_bytes = -1",
-            "parquet_row_group_size_rows = -1",
-            "artifact_gc_grace_days = 0",
-        )
-        for value in invalid_values:
-            with self.subTest(value=value):
-                path = self._write(f"[runtime]\n{value}\n")
-                with self.assertRaises(ConfigError):
-                    load_pipeline_config(path)
-
-    def test_duckdb_capacity_limits_reject_invalid_values(self):
-        for value in ('"-1GB"', '"nanGB"', '"12 elephants"', '1'):
-            with self.subTest(value=value):
-                path = self._write(
-                    f"[runtime]\nduckdb_max_temp_directory_size = {value}\n"
-                )
-                with self.assertRaises(ConfigError):
-                    load_pipeline_config(path)
-
-    def test_processing_srid_wrong_type_raises(self):
-        path = self._write('[projection]\nprocessing_srid = "32650"\n')
-        with self.assertRaises(ConfigError):
-            load_pipeline_config(path)
-
-    def test_missing_file_raises(self):
-        with self.assertRaises(ConfigError):
-            load_pipeline_config(Path("/definitely/missing/pipeline.toml"))
+def _write(tmp_path: Path, transform=lambda text: text) -> Path:
+    path = tmp_path / "pipeline.toml"
+    path.write_text(transform(_config_text()), encoding="utf-8")
+    return path
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_checked_in_complete_config_loads() -> None:
+    config = pipeline_config()
+    assert config.projection.processing_srid == 32649
+    assert config.runtime.duckdb_threads == 4
+    assert len(config.parser.fields.specs) == 9
+
+
+def test_tunable_dataclasses_have_no_python_defaults() -> None:
+    context_fields = {"query_active_from_db", "db_table", "kept_table", "source_table",
+                      "refine_id", "live_status"}
+    for cls in CONFIG_TYPES:
+        for item in fields(cls):
+            if cls is IntersectConfig and item.name in context_fields:
+                continue
+            assert item.default is MISSING and item.default_factory is MISSING, (
+                f"{cls.__name__}.{item.name} owns a Python default"
+            )
+
+
+def test_paths_are_resolved_relative_to_main_toml() -> None:
+    config = pipeline_config()
+    assert config.logging.directory == (CONFIG_PATH.parent / "../generated").resolve()
+
+
+def test_unknown_missing_type_and_range_errors_are_aggregated(tmp_path: Path) -> None:
+    path = _write(tmp_path, lambda text: text
+        .replace("[refine]", "[refine]\nunknown_value = 1")
+        .replace("max_gap_s = 120.0", "# max_gap_s removed")
+        .replace("duckdb_threads = 4", 'duckdb_threads = "many"')
+        .replace("port = 5432", "port = 70000"))
+    with pytest.raises(ConfigError) as raised:
+        load_pipeline_config(path, postgres_password="secret")
+    message = str(raised.value)
+    assert "refine.unknown_value: unknown key" in message
+    assert "refine.max_gap_s: missing required key" in message
+    assert "runtime.duckdb_threads: expected" in message
+    assert "postgres.port: must be in [1, 65535]" in message
+
+
+@pytest.mark.parametrize("password", ["", "change-me"])
+def test_password_is_required_and_placeholder_is_rejected(password: str) -> None:
+    with pytest.raises(ConfigError, match="POSTGRES_PASSWORD"):
+        load_pipeline_config(CONFIG_PATH, postgres_password=password)
+
+
+def test_cross_field_errors_are_aggregated(tmp_path: Path) -> None:
+    path = _write(tmp_path, lambda text: text
+        .replace("min_turn_deg = 45.0", "min_turn_deg = 175.0")
+        .replace("min_heading_delta_deg = 80.0", "min_heading_delta_deg = 120.0")
+        .replace("max_heading_delta_deg = 100.0", "max_heading_delta_deg = 90.0"))
+    with pytest.raises(ConfigError) as raised:
+        load_pipeline_config(path, postgres_password="secret")
+    message = str(raised.value)
+    assert "detect.min_turn_deg" in message
+    assert "refine.min_heading_delta_deg" in message
+
+
+def test_loaded_config_is_immutable() -> None:
+    config = pipeline_config()
+    with pytest.raises(Exception):
+        config.runtime = replace(config.runtime, duckdb_threads=1)

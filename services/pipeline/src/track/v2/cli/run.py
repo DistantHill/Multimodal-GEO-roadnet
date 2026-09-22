@@ -7,37 +7,32 @@ the PostgreSQL ``source_table``/Refine replay entrypoint and reporting seam.
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import sys
 import uuid
 from pathlib import Path
 
-from ..config import PostgresConfig, default_postgres_config
+from ..config import PipelineConfig
 from ..logger import init_logger, shutdown_logger
 from ..pipeline import PipelineInput, PipelineResult, run_pipeline as _run_pipeline
+from ._startup import load_startup_config
 from .pipeline_reporter import PipelineReporter
 
 
 def run_pipeline(
-    db_config: PostgresConfig,
+    config: PipelineConfig,
     *,
     source_table: str | None = None,
     refine_id: str | None = None,
-    config_path: str | Path | None = None,
-    processing_srid: int | None = None,
 ) -> dict[str, float | int | str | list[int]]:
-    """Compatibility adapter for the historical CLI runner signature."""
+    """Run with a configuration object already loaded at the process boundary."""
     pipeline_input = PipelineInput(
-        db_config=db_config,
         source_table=source_table,
         refine_id=refine_id,
-        config_path=config_path,
-        processing_srid=processing_srid,
     )
     reporter = PipelineReporter()
     try:
-        result: PipelineResult = _run_pipeline(pipeline_input, emit=reporter)
+        result: PipelineResult = _run_pipeline(pipeline_input, config, emit=reporter)
         return result.stats
     finally:
         reporter.close()
@@ -55,8 +50,6 @@ def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-    _env = default_postgres_config()
-
     parser = argparse.ArgumentParser(
         description="Run track.v2 through Network."
     )
@@ -69,24 +62,9 @@ def main() -> int:
         "--refine-id", metavar="UUID", type=_uuid_arg,
         help="复用一个已完成 Refine Run，只创建新的 Detect Run / Reuse one completed Refine Run."
     )
-    parser.add_argument("--host", default=_env.host)
-    parser.add_argument("--port", type=int, default=_env.port)
-    parser.add_argument("--database", default=_env.database)
-    parser.add_argument("--user", default=_env.user)
     parser.add_argument(
         "--ask-password", action="store_true",
-        help="Prompt for password interactively (secure, no echo). Overrides .env password."
-    )
-    parser.add_argument("--connect-timeout", type=int, default=_env.connect_timeout)
-    parser.add_argument("--sslmode", default=_env.sslmode)
-    parser.add_argument(
-        "--config", metavar="PATH", default=None,
-        help="pipeline 配置 TOML 路径 / pipeline config TOML path "
-             "(default: track/v2/config/pipeline.toml)."
-    )
-    parser.add_argument(
-        "--processing-srid", type=int, default=None, metavar="EPSG",
-        help="本次新 Refine Run 的固定米制投影 EPSG / projected metre CRS for a new Refine Run.",
+        help="Prompt for password interactively instead of using POSTGRES_PASSWORD."
     )
     parser.add_argument(
         "--stats-json",
@@ -97,43 +75,23 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.refine_id and args.processing_srid is not None:
-        parser.error(
-            "--refine-id 继承已有投影，不可覆盖 --processing-srid / "
-            "a reused Refine Run inherits its projection"
-        )
-
-    if args.ask_password:
-        password = getpass.getpass("PostgreSQL password: ")
-    else:
-        password = _env.password
-
-    db_config = PostgresConfig(
-        host=args.host,
-        port=args.port,
-        database=args.database,
-        user=args.user,
-        password=password,
-        connect_timeout=args.connect_timeout,
-        sslmode=args.sslmode,
-    )
+    config = load_startup_config(ask_password=args.ask_password)
+    db_config = config.postgres
 
     source_label = (
         f"refine:{args.refine_id}" if args.refine_id
         else f"postgresql://{db_config.database}/{args.source_table}"
     )
-    log_path = init_logger()
+    log_path = init_logger(config.logging.directory)
     print(f"日志文件 / Log file: {log_path}")
     print(f"数据源 / Source: {source_label}")
     print(f"连接目标 / Target: {db_config.safe_dsn()}")
 
     try:
         stats = run_pipeline(
-            db_config,
+            config,
             source_table=args.source_table,
             refine_id=str(args.refine_id) if args.refine_id else None,
-            config_path=args.config,
-            processing_srid=args.processing_srid,
         )
         _print_write_summary(stats)
         if args.stats_json is not None:

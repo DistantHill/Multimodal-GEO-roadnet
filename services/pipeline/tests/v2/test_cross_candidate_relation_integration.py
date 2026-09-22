@@ -1,3 +1,6 @@
+from .config_factory import (clip_config, fitting_config, intersect_config,
+                             intersect_run_config, network_config, postgres_config,
+                             projection_config, refine_config, runtime_config)
 """Isolated prototype: exact eager/lazy member chain and output lifetime parity."""
 from array import array
 from contextlib import ExitStack
@@ -23,7 +26,7 @@ from .test_detect import _TEST_SPATIAL_CONTEXT, _TEST_TRANSFORMER
 
 
 def membership_rows(tmp_path, clusters, ids):
-    with WriterRelation(RuntimeConfig(), tmp_path, "membership", batch_size=3) as relation:
+    with WriterRelation(runtime_config(), tmp_path, "membership", batch_size=3) as relation:
         relation.resolve_sources()
         relation.prepare_annotations(clusters, ids, [])
         return relation._connection.execute("""
@@ -66,7 +69,7 @@ def candidates(count=17):
 
 
 def stored(tmp_path, values):
-    spool = CrossCandidateRelation(RuntimeConfig(), tmp_path)
+    spool = CrossCandidateRelation(runtime_config(), tmp_path)
     for candidate in values:
         spool.append(candidate)
     spool.seal()
@@ -90,7 +93,7 @@ def test_complete_pipeline_matches_eager_order_refs_ablation_and_writer_membersh
     turns = [replace(_event(7 + i * 101, values[i].x, values[i].y),
                      point_ref=PointRef("turn-source", str(i % 2), True),
                      source_ids=("turn-event-source",)) for i in range(4)]
-    cfg = detect.IntersectConfig(
+    cfg = intersect_config(
         g_star_min_z=-100., g_star_radius_m=15.,
         dbscan_eps_m_turn=2., dbscan_min_samples_turn=2,
         cross_track_dbscan_eps_m=2., cross_track_dbscan_min_samples=2,
@@ -143,7 +146,7 @@ def test_cross_dbscan_uses_same_kernel_and_compact_float_arrays(tmp_path, count)
 
 def test_lazy_members_merge_and_provenance_do_not_retain_decoded_payloads(tmp_path):
     values = candidates(129)
-    cfg = detect.IntersectConfig(cross_track_dbscan_eps_m=2., cross_track_dbscan_min_samples=2,
+    cfg = intersect_config(cross_track_dbscan_eps_m=2., cross_track_dbscan_min_samples=2,
                                 dbscan_eps_m_turn=2., dbscan_min_samples_turn=2,
                                 merge_centroid_distance_m=100.)
     real_decode = CrossCandidateRelation._decode.__func__
@@ -211,7 +214,7 @@ def test_manual_reference_source_ids_and_duplicate_order_survive_lazy_merge(tmp_
 @pytest.mark.parametrize("failure", [RuntimeError("ablation failed"), KeyboardInterrupt()])
 def test_ablation_failure_closes_only_its_pass(tmp_path, failure):
     values = candidates()
-    cfg = detect.IntersectConfig(cross_track_dbscan_eps_m=2., cross_track_dbscan_min_samples=2)
+    cfg = intersect_config(cross_track_dbscan_eps_m=2., cross_track_dbscan_min_samples=2)
     with stored(tmp_path, values) as spool:
         main = detect._build_candidate_clusters([], spool, cfg, _TEST_TRANSFORMER)
         before = serialized(main)
@@ -233,14 +236,14 @@ def test_ablation_failure_closes_only_its_pass(tmp_path, failure):
 
 
 def test_sorted_relation_to_result_writes_same_rows(tmp_path):
-    cfg = detect.IntersectConfig(cross_track_pair_batch_size=3, use_turn_events=False,
+    cfg = intersect_config(cross_track_pair_batch_size=3, use_turn_events=False,
                                  cross_track_dbscan_min_samples=1)
     expected = [replace(
         value,
         from_segment_start=RefinedPointRef("kept", index * 2 + 1, index, 0),
         to_segment_start=RefinedPointRef("kept", index * 2 + 2, index, 0),
     ) for index, value in enumerate(candidates(8), 1)]
-    spool = CrossCandidateRelation(RuntimeConfig(), tmp_path)
+    spool = CrossCandidateRelation(runtime_config(), tmp_path)
     try:
         for value in expected:
             spool.append(value)
@@ -275,7 +278,7 @@ def test_sorted_relation_to_result_writes_same_rows(tmp_path):
             def capture(_cursor, _table, _columns, values, **kwargs):
                 assert len(values) <= 3
                 copied.extend(values)
-            with WriterRelation(RuntimeConfig(), tmp_path, "run", batch_size=3) as relation:
+            with WriterRelation(runtime_config(), tmp_path, "run", batch_size=3) as relation:
                 relation.collect_sources(output, [], (), ids)
                 for (kind, point_id, subtrack), rid in resolved.items():
                     relation.add_mapping(RefinedPointRef(kind, point_id, subtrack, 0), rid)
@@ -306,7 +309,7 @@ def test_sorted_relation_to_result_writes_same_rows(tmp_path):
 @pytest.mark.parametrize("failure", [RuntimeError("stage failed"), KeyboardInterrupt()])
 def test_db_owner_closes_all_spools_on_failure(tmp_path, monkeypatch, phase, failure):
     monkeypatch.setenv("DATA_ROOT", str(tmp_path))
-    cfg = detect.IntersectConfig(use_turn_events=False, cross_track_dbscan_min_samples=1)
+    cfg = intersect_run_config(use_turn_events=False, cross_track_dbscan_min_samples=1)
     reader = MagicMock()
     reader.extent.return_value = (0., 0., 1., 1.)
     reader.iter_cross_track_pair_batches.return_value = iter(())
@@ -318,7 +321,7 @@ def test_db_owner_closes_all_spools_on_failure(tmp_path, monkeypatch, phase, fai
         stack.enter_context(patch.object(detect, target, side_effect=failure))
         with pytest.raises(type(failure)):
             detect._detect_intersections_db(
-                object(), cfg, _TEST_SPATIAL_CONTEXT, runtime=RuntimeConfig(),
+                object(), cfg, _TEST_SPATIAL_CONTEXT, runtime=runtime_config(),
                 data_root=tmp_path, refine_reader=reader,
             )
     assert not list(tmp_path.glob("duckdb/turn-event-relations/*"))
@@ -327,7 +330,7 @@ def test_db_owner_closes_all_spools_on_failure(tmp_path, monkeypatch, phase, fai
 
 def test_summary_merge_and_reference_lengths_do_not_decode_members_again(tmp_path):
     values = candidates()
-    cfg = detect.IntersectConfig(
+    cfg = intersect_config(
         dbscan_eps_m_turn=2., dbscan_min_samples_turn=2,
         cross_track_dbscan_eps_m=2., cross_track_dbscan_min_samples=2,
         merge_centroid_distance_m=100.,

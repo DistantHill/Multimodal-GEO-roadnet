@@ -19,20 +19,14 @@ EPSG:4326。
 
 ## 配置
 
-新 Clean Run 必须显式选择投影，不能从首点或数据中心猜测。例如：
-
-```sh
-python -m pipeline run \
-  --source-table public.day01 \
-  --processing-srid 32650
-```
-
-也可使用区域配置文件：
+新 Refine Run 必须在完整 Pipeline TOML 中显式选择投影，不能从首点或数据中心猜测，
+也不支持 CLI 或逐项环境变量覆盖。仓库 `services/pipeline/config/pipeline.toml` 默认使用
+EPSG:32649；切换区域时应提供另一份完整 TOML：
 
 ```toml
 [projection]
 source_srid = 4326
-processing_srid = 32650
+processing_srid = 32649
 enforce_area_of_use = true
 max_scale_error = 0.01
 ```
@@ -151,7 +145,7 @@ v3 是破坏性切换，不提供 v1/v2 原地迁移，也不接受未标记的�
 初始化前必须核对实际 database、user 与 schema，然后显式全量 reset：
 
 ```sh
-python -m pipeline init-db --database roadnet --reset
+python -m pipeline init-db --reset
 ```
 
 reset 只创建 schema version 3。Pipeline 与 Backend 启动时会校验版本，不匹配

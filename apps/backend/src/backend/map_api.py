@@ -14,20 +14,21 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 import psycopg
 from pyproj import CRS, Proj, Transformer
 
-from .database import get_read_connection, open_read_connection, require_current_schema
-from .map_schemas import BBox, ClipRequest, FeatureCollection, ReplayRequest, parse_bbox
+from .database import _require_config, get_read_connection, open_read_connection, require_current_schema
+from .config import MapConfig
+from .map_schemas import (
+    BBox, ClipRequest, FeatureCollection, ReplayRequest, parse_bbox,
+    resolve_clip_limits, resolve_replay_limits,
+)
 
 
 router = APIRouter(prefix="/api/v1/map", tags=["map"])
 
 _CRS = {"type": "name", "properties": {"name": "EPSG:4326"}}
-_LAYER_LIMIT_DEFAULT = 1_000
-_LAYER_LIMIT_MAX = 5_000
-_CLIP_FEATURE_LIMIT = 1_000
 _EPS = 1e-9
 _COORDINATE_SEMANTICS_VERSION = 2
 _SOURCE_KEY_TYPES = {
@@ -371,6 +372,7 @@ class PostgresMapStore:
         )
 
     def replay(self, request: ReplayRequest) -> dict[str, Any]:
+        request = resolve_replay_limits(request, _require_config().map)
         if request.database_name is not None:
             return self._query_database("replay", request)
         self._validate_database(request.database_name)
@@ -450,6 +452,8 @@ class PostgresMapStore:
         )
 
     def clip(self, request: ClipRequest) -> dict[str, Any]:
+        map_config = _require_config().map
+        request = resolve_clip_limits(request, map_config)
         if request.database_name is not None:
             return self._query_database("clip", request)
         self._validate_database(request.database_name)
@@ -482,7 +486,7 @@ class PostgresMapStore:
                 context.detect_id,
                 transformer,
             ):
-                if len(features) >= _CLIP_FEATURE_LIMIT:
+                if len(features) >= map_config.clip_feature_limit:
                     clips_truncated = True
                     break
                 features.append(feature)
@@ -1068,6 +1072,10 @@ def run_catalog(store: Any = Depends(get_map_store)) -> dict[str, Any]:
     }
 
 
+def get_map_config(request: Request) -> MapConfig:
+    return request.app.state.config.map
+
+
 @router.get("/layers/{layer_id}", response_model=FeatureCollection)
 def read_layer(
     layer_id: str,
@@ -1075,10 +1083,16 @@ def read_layer(
     detect_id: UUID | None = None,
     fit_id: UUID | None = None,
     refine_id: UUID | None = None,
-    limit: int = Query(default=_LAYER_LIMIT_DEFAULT, ge=1, le=_LAYER_LIMIT_MAX),
+    limit: int | None = Query(default=None, ge=1),
     store: MapStore = Depends(get_map_store),
+    map_config: MapConfig = Depends(get_map_config),
 ) -> dict[str, Any]:
     try:
+        resolved_limit = map_config.layer_limit_default if limit is None else limit
+        if resolved_limit > map_config.layer_limit_max:
+            raise ValueError(
+                f"limit must not exceed configured maximum {map_config.layer_limit_max}"
+            )
         if refine_id is not None:
             if detect_id is None or store._fetchone(
                 "SELECT 1 FROM detect_runs WHERE id = %s AND refine_id = %s",
@@ -1095,7 +1109,7 @@ def read_layer(
             bbox=parse_bbox(bbox),
             detect_id=str(detect_id) if detect_id else None,
             fit_id=str(fit_id) if fit_id else None,
-            limit=limit,
+            limit=resolved_limit,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1106,9 +1120,15 @@ def read_layer(
 
 
 @router.post("/replay", response_model=FeatureCollection)
-def replay(request: ReplayRequest, store: MapStore = Depends(get_map_store)) -> dict[str, Any]:
+def replay(
+    request: ReplayRequest,
+    store: MapStore = Depends(get_map_store),
+    map_config: MapConfig = Depends(get_map_config),
+) -> dict[str, Any]:
     try:
-        return store.replay(request)
+        return store.replay(resolve_replay_limits(request, map_config))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except MapNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except MapDataError as exc:
@@ -1116,9 +1136,15 @@ def replay(request: ReplayRequest, store: MapStore = Depends(get_map_store)) -> 
 
 
 @router.post("/clip", response_model=FeatureCollection)
-def clip(request: ClipRequest, store: MapStore = Depends(get_map_store)) -> dict[str, Any]:
+def clip(
+    request: ClipRequest,
+    store: MapStore = Depends(get_map_store),
+    map_config: MapConfig = Depends(get_map_config),
+) -> dict[str, Any]:
     try:
-        return store.clip(request)
+        return store.clip(resolve_clip_limits(request, map_config))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except MapNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except MapDataError as exc:

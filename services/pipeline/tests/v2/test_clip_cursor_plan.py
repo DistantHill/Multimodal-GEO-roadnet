@@ -111,7 +111,7 @@ def test_intersection_lookup_preserves_missing_candidates_and_point_order():
         patch("track.v2.db.queries.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s")),
         patch("track.v2.db.queries.validate_source_table", return_value=SimpleNamespace(quoted_table='"s"', key_sql_type="bigint")),
     ):
-        tracks = list(fetch_resolved_clip_tracks(conn, "d"))
+        tracks = list(fetch_resolved_clip_tracks(conn, "d", batch_size=2000))
     assert [point.resolved_point_id for point in tracks[0].points] == [1, 2, 3, 4]
     assert [point.intersection_id for point in tracks[0].points] == [None, 10, None, None]
     assert [point.crossing_id for point in tracks[0].points] == [None, 101, 102, None]

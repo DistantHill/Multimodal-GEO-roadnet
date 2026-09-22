@@ -18,6 +18,7 @@ from track.v2.validation.network_replay import ReplayResult
 from track.v2.validation.semantic_diff import (
     TABLES, canonical_endpoint_pair, compare_rows, compare_runs,
 )
+from .config_factory import pipeline_config, runtime_config
 
 
 class _Cursor:
@@ -173,7 +174,7 @@ def test_shared_live_source_is_verified_once_before_table_reads(monkeypatch) -> 
     )
     conn = _Connection()
     runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
-    result = compare_runs(conn, runs, runs)
+    result = compare_runs(conn, runs, runs, batch_size=runtime_config().validation_batch_size)
     assert calls == [str(runs["refine"])]
     assert result["persisted_equivalent"] is True
 
@@ -185,7 +186,7 @@ def test_live_source_failure_is_structured_and_opens_no_table_cursor(monkeypatch
     monkeypatch.setattr(semantic_diff, "verify_refine_source_fingerprint", fail)
     conn = _Connection()
     runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
-    result = compare_runs(conn, runs, runs)
+    result = compare_runs(conn, runs, runs, batch_size=runtime_config().validation_batch_size)
     assert result["error"] == "preflight:live_source_fingerprint:ValueError"
     assert result["persisted_equivalent"] is result["acceptance_passed"] is False
     assert conn.rows_opened == 0
@@ -201,7 +202,7 @@ def test_network_mismatch_is_separate_from_persisted_equivalence(monkeypatch) ->
                     ReplayResult(changed, {"side": "candidate"})))
     monkeypatch.setattr(semantic_diff, "replay_network", lambda *_args, **_kwargs: next(replays))
     runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
-    result = compare_runs(_Connection(), runs, runs)
+    result = compare_runs(_Connection(), runs, runs, batch_size=runtime_config().validation_batch_size)
     assert result["persisted_equivalent"] is True
     assert result["complete_scope"] is True
     assert result["network_parameterized_equivalent"] == {
@@ -216,7 +217,7 @@ def test_network_replay_error_preserves_persisted_result(monkeypatch) -> None:
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("invalid replay")),
     )
     runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
-    result = compare_runs(_Connection(), runs, runs)
+    result = compare_runs(_Connection(), runs, runs, batch_size=runtime_config().validation_batch_size)
     assert result["persisted_equivalent"] is True
     assert result["complete_scope"] is result["acceptance_passed"] is False
     assert result["error"] == "network_replay:RuntimeError"
@@ -271,9 +272,12 @@ def test_cli_never_reports_full_acceptance_for_persisted_only(monkeypatch, capsy
     connection = MagicMock()
     connection.__enter__.return_value = connection
     monkeypatch.setattr(semantic_diff_cli.psycopg, "connect", lambda _dsn: connection)
+    monkeypatch.setattr(
+        semantic_diff_cli, "load_startup_config", lambda **_kwargs: pipeline_config()
+    )
     monkeypatch.setattr(semantic_diff_cli, "compare_runs", lambda *_args, **_kwargs: result)
     monkeypatch.setattr(sys, "argv", [
-        "semantic-diff", "--dsn", "postgresql://unused",
+        "semantic-diff",
         *[item for side in ("baseline", "candidate") for kind in ("refine", "detect", "fit")
           for item in (f"--{side}-{kind}-id", str(runs[kind]))],
     ])
@@ -379,7 +383,7 @@ def test_incompatible_lineage_fails_before_source_or_table_reads(
     changed[index] = {"different": True} if index != 3 else "other.source"
     conn = _Connection(tuple(changed))
     runs = {kind: uuid4() for kind in ("refine", "detect", "fit")}
-    result = compare_runs(conn, runs, runs)
+    result = compare_runs(conn, runs, runs, batch_size=runtime_config().validation_batch_size)
     assert result["error"] == f"preflight:{category}"
     assert source_checks == []
     assert conn.rows_opened == 0

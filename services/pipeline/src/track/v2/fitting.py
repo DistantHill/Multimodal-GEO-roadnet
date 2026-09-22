@@ -40,7 +40,7 @@ class _OrientedClip:
 def fit_centerlines(
     clips: ClipResult,
     *,
-    config: FittingConfig | None = None,
+    config: FittingConfig,
 ) -> FitResult:
     """Fit one centerline for every connected intersection pair.
 
@@ -52,9 +52,9 @@ def fit_centerlines(
 
 
 def _fit_centerlines(
-    clips: ClipResult, *, config: FittingConfig | None, reverse: bool | None,
+    clips: ClipResult, *, config: FittingConfig, reverse: bool | None,
 ) -> FitResult:
-    cfg = config or FittingConfig()
+    cfg = config
     _validate_config(cfg)
     transformer = CoordinateTransformer(clips.spatial_context)
     grouped: dict[tuple[int, int], int] = {}
@@ -142,7 +142,7 @@ def _fit_centerlines(
 def fit_centerline_variants(
     clips: ClipResult,
     *,
-    config: FittingConfig | None = None,
+    config: FittingConfig,
 ) -> CenterlineFitBundle:
     """Fit the combined physical line and both observed travel directions."""
     combined = fit_centerlines(clips, config=config)
@@ -155,7 +155,7 @@ def _fit_direction(
     clips: ClipResult,
     *,
     reverse: bool,
-    config: FittingConfig | None,
+    config: FittingConfig,
 ) -> FitResult:
     fitted = _fit_centerlines(clips, config=config, reverse=reverse)
     centerlines = tuple(

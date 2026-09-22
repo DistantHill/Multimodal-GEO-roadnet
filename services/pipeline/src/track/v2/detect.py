@@ -1,6 +1,6 @@
 """Detect — Intersection candidate detection and topology extraction.
 
-detect_intersections(source, *, config=None, spatial_context=...) → IntersectResult
+detect_intersections(source, *, config=..., spatial_context=...) → IntersectResult
 
 Two complementary methods feed into the same topology verification:
   Method 1 (turn events): Bearing-change detection → Getis-Ord G* → DBSCAN
@@ -114,59 +114,75 @@ class IntersectConfig(TrackModel):
     """
 
     # ── Mode toggles ───────────────────────────────────────────────
-    use_turn_events: bool = True
-    use_cross_track_candidates: bool = True
+    use_turn_events: bool
+    use_cross_track_candidates: bool
 
     # ── Turn event detection (Method 1) ────────────────────────────
-    turn_window: int = 2
-    min_turn_deg: float = 45.0
-    max_turn_deg: float = 170.0
-    min_leg_m: float = 35.0
-    min_movement_speed_mps: float = 1.5
+    turn_window: int
+    min_turn_deg: float
+    max_turn_deg: float
+    min_leg_m: float
+    min_movement_speed_mps: float
 
     # ── Getis-Ord G* hotspot scoring ───────────────────────────────
-    g_star_radius_m: float = 180.0
-    g_star_min_z: float = 0.5
+    g_star_radius_m: float
+    g_star_min_z: float
 
     # ── DBSCAN (per method) ────────────────────────────────────────
-    dbscan_eps_m_turn: float = 140.0
-    dbscan_min_samples_turn: int = 4
+    dbscan_eps_m_turn: float
+    dbscan_min_samples_turn: int
 
     # ── Cross-track orthogonal detection (Method 3) ──────────────────
-    cross_track_straightness_deg: float = 15.0
-    cross_track_min_angle_deg: float = 80.0
-    cross_track_max_angle_deg: float = 100.0
-    cross_track_dbscan_eps_m: float = 100.0
-    cross_track_dbscan_min_samples: int = 3
+    cross_track_straightness_deg: float
+    cross_track_min_angle_deg: float
+    cross_track_max_angle_deg: float
+    cross_track_dbscan_eps_m: float
+    cross_track_dbscan_min_samples: int
     # Structural memory bounds owned by candidate_patches.py.
-    cross_track_grid_cell_m: float = 100.0
-    cross_track_pair_batch_size: int = 65_536
-    cross_track_max_grid_cells_per_segment: int = 25
+    cross_track_grid_cell_m: float
+    cross_track_pair_batch_size: int
+    cross_track_max_grid_cells_per_segment: int
 
     # ── Cluster merge ──────────────────────────────────────────────
-    merge_centroid_distance_m: float = 80.0
+    merge_centroid_distance_m: float
 
     # ── Topology verification (shared) ─────────────────────────────
-    min_intersection_radius_m: float = 90.0
-    topology_radius_padding_m: float = 70.0
-    branch_threshold_deg: float = 35.0
-    min_branches: int = 3
-    min_observations: int = 6
-    min_directed_transitions: int = 3
-    bearing_window: int = 2
+    min_intersection_radius_m: float
+    topology_radius_padding_m: float
+    branch_threshold_deg: float
+    min_branches: int
+    min_observations: int
+    min_directed_transitions: int
+    bearing_window: int
 
     # ── Spatial sliding window (DB mode) ───────────────────────────
-    query_active_from_db: bool = False
-    db_table: str = "trajectory_points"
-    kept_table: str | None = None
-    source_table: str | None = None
-    refine_id: str | None = None
-    spatial_window_size: tuple[float, float] = (2000.0, 2000.0)
-    spatial_window_overlap: float = 0.15
-    stream_batch_size: int = 1000
+    spatial_window_size: tuple[float, float]
+    spatial_window_overlap: float
+    stream_batch_size: int
 
-    # ── Live status display (optional, set by CLI for dynamic terminal output) ──
-    live_status: Any = None
+
+@dataclass(frozen=True)
+class DetectRuntimeContext:
+    """Per-run dependencies and identity; never loaded from static TOML."""
+
+    query_active_from_db: bool
+    db_table: str
+    kept_table: str | None
+    source_table: str | None
+    refine_id: str | None
+    live_status: Any
+
+
+@dataclass(frozen=True)
+class _IntersectRunConfig(IntersectConfig):
+    """Internal view combining immutable tuning with one run's context."""
+
+    query_active_from_db: bool
+    db_table: str
+    kept_table: str | None
+    source_table: str | None
+    refine_id: str | None
+    live_status: Any
 
 
 # ── Result ─────────────────────────────────────────────────────────────
@@ -640,11 +656,12 @@ def _cluster_pipeline(
 def detect_intersections(
     source: TrajectorySourceHandle | None = None,
     *,
-    config: IntersectConfig | None = None,
+    config: IntersectConfig,
+    context: DetectRuntimeContext,
     conn: Any = None,
     spatial_context: SpatialContext | None = None,
     refine_reader: RefineDatasetReader | None = None,
-    runtime: RuntimeConfig | None = None,
+    runtime: RuntimeConfig,
     data_root: str | Path | None = None,
 ) -> IntersectResult:
     """Run intersection detection and topology extraction.
@@ -659,7 +676,15 @@ def detect_intersections(
         supplies columnar turn candidates, cross-track segment pairs and
         complete subtracks for Topology window verification.
     """
-    cfg = config or IntersectConfig()
+    cfg = _IntersectRunConfig(
+        **config.as_dict(),
+        query_active_from_db=context.query_active_from_db,
+        db_table=context.db_table,
+        kept_table=context.kept_table,
+        source_table=context.source_table,
+        refine_id=context.refine_id,
+        live_status=context.live_status,
+    )
     if conn is not None and cfg.query_active_from_db:
         if cfg.refine_id is None:
             raise V2Error("formal DB Detect requires refine_id")
@@ -1409,10 +1434,14 @@ def _detect_intersections_db(
     """Run columnar DB Detect and transfer relation ownership to its result."""
     if refine_reader is None:
         raise V2Error("formal DB Detect requires a RefineDatasetReader")
-    event_store = TurnEventRelation(runtime, data_root)
+    event_store = TurnEventRelation(
+        runtime, data_root, batch_size=runtime.relation_batch_size,
+    )
     candidate_store = None
     try:
-        candidate_store = CrossCandidateRelation(runtime, data_root)
+        candidate_store = CrossCandidateRelation(
+            runtime, data_root, batch_size=runtime.relation_batch_size,
+        )
         result = _run_columnar_db_detect(
             cfg, spatial_context, refine_reader, event_store=event_store,
             candidate_store=candidate_store,

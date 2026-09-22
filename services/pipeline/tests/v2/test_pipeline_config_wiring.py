@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from .config_factory import clip_config, fitting_config, network_config, pipeline_config, projection_config
+
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -23,7 +26,7 @@ from track.v2.projection import create_spatial_context
 
 
 REFINE_ID = "11111111-1111-1111-1111-111111111111"
-_PROJECTION_CONFIG = ProjectionConfig(processing_srid=3857)
+_PROJECTION_CONFIG = projection_config(processing_srid=3857)
 _SPATIAL_CONTEXT = create_spatial_context(_PROJECTION_CONFIG)
 
 
@@ -115,7 +118,7 @@ class _ConfigRecordingStore:
 
     def load_clip(
         self, detect_id: str, *, publication_root: object,
-        data_root: object, runtime: object, config: object,
+        data_root: object, runtime: object, config: object, verify_sha256: bool,
     ) -> object:
         self.loaded_clip_publication_root = publication_root
         self.loaded_clip_data_root = data_root
@@ -129,6 +132,7 @@ class _ConfigRecordingStore:
         detect_id: str,
         clip_config: object,
         fitting_config: object,
+        parameters: dict[str, object],
     ) -> str:
         self.fit_clip_config = clip_config
         self.fit_fitting_config = fitting_config
@@ -143,20 +147,15 @@ class _ConfigRecordingStore:
 
 class PipelineConfigWiringTest(unittest.TestCase):
     def test_non_default_stage_configs_are_used_by_loader_store_and_algorithms(self) -> None:
-        db_config = PostgresConfig(
-            host="localhost", port=5432, database="track", user="track", password="",
-        )
-        clip_config = ClipConfig(include_boundary_clips=False)
-        fitting_config = FittingConfig(point_spacing_m=17.0)
-        network_config = NetworkConfig(include_isolated_nodes=False)
-        pipeline_config = PipelineConfig(
+        configured_clip = clip_config(include_boundary_clips=False)
+        configured_fitting = fitting_config(point_spacing_m=17.0)
+        configured_network = network_config(include_isolated_nodes=False)
+        configured_pipeline = replace(
+            pipeline_config(),
             projection=_PROJECTION_CONFIG,
-            refine=RefineConfig(),
-            detect=IntersectConfig(),
-            clip=clip_config,
-            fitting=fitting_config,
-            network=network_config,
-            runtime=RuntimeConfig(),
+            clip=configured_clip,
+            fitting=configured_fitting,
+            network=configured_network,
         )
         store = _ConfigRecordingStore()
         intersections = _empty_intersect_result()
@@ -164,7 +163,6 @@ class PipelineConfigWiringTest(unittest.TestCase):
         reader.__enter__.return_value = reader
 
         with (
-            patch("track.v2.pipeline.load_pipeline_config", return_value=pipeline_config),
             patch("track.v2.pipeline.pg_connect", return_value=_Connection()),
             patch("track.v2.pipeline.PostgresPipelineStore", return_value=store),
             patch("track.v2.pipeline.require_current_schema"),
@@ -185,24 +183,25 @@ class PipelineConfigWiringTest(unittest.TestCase):
             patch("track.v2.pipeline._add_clip_stats"),
             patch("track.v2.pipeline._add_fit_stats"),
             patch("track.v2.pipeline._add_network_stats"),
-            patch("track.v2.pipeline._parquet_root", return_value=Path("/tmp/parquet")),
-            patch("track.v2.pipeline._data_root", return_value=Path("/tmp/data")),
         ):
-            run_pipeline(PipelineInput(db_config, refine_id=REFINE_ID))
+            run_pipeline(PipelineInput(refine_id=REFINE_ID), configured_pipeline)
 
-        self.assertIs(store.loaded_clip_config, clip_config)
-        self.assertEqual(store.loaded_clip_publication_root, Path("/tmp/parquet"))
-        self.assertEqual(store.loaded_clip_data_root, Path("/tmp/data"))
-        self.assertIs(store.loaded_clip_runtime, pipeline_config.runtime)
-        self.assertIs(store.persist_detect_runtime, pipeline_config.runtime)
-        self.assertEqual(store.persist_detect_data_root, Path("/tmp/data"))
-        self.assertIs(store.fit_clip_config, clip_config)
-        self.assertIs(store.fit_fitting_config, fitting_config)
-        fit.assert_called_once_with(store.clip_result, config=fitting_config)
+        self.assertIs(store.loaded_clip_config, configured_clip)
+        self.assertEqual(
+            store.loaded_clip_publication_root,
+            configured_pipeline.paths.parquet_directory,
+        )
+        self.assertEqual(store.loaded_clip_data_root, configured_pipeline.paths.data_root)
+        self.assertIs(store.loaded_clip_runtime, configured_pipeline.runtime)
+        self.assertIs(store.persist_detect_runtime, configured_pipeline.runtime)
+        self.assertEqual(store.persist_detect_data_root, configured_pipeline.paths.data_root)
+        self.assertIs(store.fit_clip_config, configured_clip)
+        self.assertIs(store.fit_fitting_config, configured_fitting)
+        fit.assert_called_once_with(store.clip_result, config=configured_fitting)
         network.assert_called_once_with(
             store.fit_bundle.combined,
             store.clip_result.intersections,
-            config=network_config,
+            config=configured_network,
         )
 
 

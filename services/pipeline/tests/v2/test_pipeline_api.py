@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .config_factory import pipeline_config
+
 import unittest
 from dataclasses import FrozenInstanceError, is_dataclass
 from unittest.mock import MagicMock, patch
@@ -12,12 +14,10 @@ from track.v2.pipeline import PipelineInput, PipelineResult
 
 class PipelineApiTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.config = PostgresConfig(
-            host="localhost", port=5432, database="track", user="track", password="",
-        )
+        self.config = pipeline_config()
 
     def test_public_types_are_frozen_dataclasses(self) -> None:
-        pipeline_input = PipelineInput(self.config, source_table="raw_points")
+        pipeline_input = PipelineInput(source_table="raw_points")
         result = PipelineResult(stats={"detect_id": "detect-1"})
 
         self.assertTrue(is_dataclass(PipelineInput))
@@ -43,10 +43,8 @@ class PipelineApiTest(unittest.TestCase):
 
         self.assertEqual(stats, pipeline_result.stats)
         run.assert_called_once_with(
-            PipelineInput(
-                db_config=self.config,
-                source_table="raw_points",
-            ),
+            PipelineInput(source_table="raw_points"),
+            self.config,
             emit=reporter,
         )
         reporter.close.assert_called_once_with()
@@ -64,7 +62,8 @@ class PipelineApiTest(unittest.TestCase):
             cli_run_pipeline(self.config, source_table="raw_points")
 
         run.assert_called_once_with(
-            PipelineInput(db_config=self.config, source_table="raw_points"),
+            PipelineInput(source_table="raw_points"),
+            self.config,
             emit=reporter,
         )
         reporter.close.assert_called_once_with()

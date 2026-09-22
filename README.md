@@ -38,7 +38,9 @@ docker compose --env-file .env -f infra/docker/compose.dev.yml up -d --build
 - PostgreSQL 主机映射默认是 `15432`，容器内服务名和端口仍是 `postgres:5432`。
 - Qdrant 主机映射默认是 `16333`，容器内服务名和端口仍是 `qdrant:6333`。
 
-宿主机端口映射与容器内连接配置分开：`POSTGRES_PORT`/`QDRANT_PORT` 是容器内端口，`POSTGRES_HOST_PORT`/`QDRANT_HOST_PORT` 仅用于开发机发布端口。
+宿主机端口映射与容器内连接配置分开：`POSTGRES_HOST_PORT` 和
+`QDRANT_HOST_PORT` 仅用于开发机发布端口；容器内主机、端口、数据库名和用户均由
+各服务的 TOML 配置。
 
 前端源码通过 bind mount 热更新，`frontend_node_modules` 使用 Docker named volume。Backend 和 Pipeline 也分别使用独立源码挂载和独立 Docker build context。
 
@@ -65,9 +67,17 @@ QGIS 3.44 LTR 插件源码位于 `apps/qgis-plugin/roadnet_tools/`。开发机�
 
 ## 配置与运行时数据
 
-真实 `.env` 不提交 Git。复制 `.env.example` 后按需修改；生产环境必须设置非示例的 `POSTGRES_PASSWORD` 和外部 `DATA_ROOT`。
+真实 `.env` 不提交 Git。复制 `.env.example` 后设置密码、宿主机挂载、端口及两个服务
+配置路径；生产环境必须设置非示例的 `POSTGRES_PASSWORD` 和外部 `DATA_ROOT`。
 
-`DATA_ROOT` 保存可丢弃的 Pipeline 工作区、中间文件和运行产物；当前宿主机使用
+Pipeline 的完整非敏感配置位于 `services/pipeline/config/pipeline.toml`，字段定义位于
+`services/pipeline/config/field_specs.toml`；Backend 配置位于 `apps/backend/config/backend.toml`。
+TOML 是非敏感参数的唯一权威来源，`.env` 只保存秘密、Compose 宿主机值和
+`PIPELINE_CONFIG_PATH` / `BACKEND_CONFIG_PATH`。每个进程只在启动时加载一次；修改
+TOML 后必须重新创建或重启对应服务，运行中的 Pipeline Run 不会热重载。不支持
+旧的逐项环境变量、`TRACK_PG_*` 别名或 CLI 配置覆盖。
+
+`DATA_ROOT` 仅作为 Compose 宿主机挂载根目录，保存可丢弃的 Pipeline 工作区、中间文件和运行产物；当前宿主机使用
 `/data/tmp/road-network`，并挂载到容器 `/data`。原始或公共数据集放在
 `/data/datasets`，最终交付物放在 `/data/export`，均不混入临时工作区。模型权重是
 独立持久资产，使用 `/data/service-data/vision/models`，不进入代码仓库。
@@ -96,7 +106,9 @@ PostgreSQL 与 Qdrant 不再由项目 Compose 创建。独立编排文件为
 `/data/services`，其中 `.env` 必须保持为本机私有文件；项目 Compose 只通过外部网络
 `roadnet-services` 使用服务名 `postgres` 和 `qdrant` 访问数据库。
 
-Pipeline 的数据库配置优先读取进程中的来源兼容变量 `TRACK_PG_*`，其次读取标准 Compose 变量 `POSTGRES_HOST`、`POSTGRES_PORT`、`POSTGRES_DB`、`POSTGRES_USER`、`POSTGRES_PASSWORD`。这只是环境变量别名兼容，不代表旧执行架构仍受支持；代码不再提供默认数据库密码。
+Pipeline 和 Backend 的数据库主机、端口、数据库名、用户及超时等非敏感值从各自 TOML
+读取；只有 `POSTGRES_PASSWORD` 由根目录 `.env` 注入。缺少密码、仍为占位值或配置文件无效时，
+服务在启动阶段直接失败。
 
 ## Pipeline 运行
 
@@ -107,7 +119,7 @@ Pipeline 的数据库配置优先读取进程中的来源兼容变量 `TRACK_PG_
 
 ```sh
 docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm pipeline \
-  python -m pipeline init-db --database roadnet --reset
+  python -m pipeline init-db --reset
 ```
 
 初始化器创建 `track.v2` schema version 7。无迁移选项时，它只接受空库或
@@ -125,8 +137,7 @@ Refine 改名涉及数据库、CLI、配置和前后端字段；升级步骤、�
 ```sh
 make pipeline-help
 docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm pipeline \
-  python -m pipeline run --source-table public.day01 \
-  --processing-srid 32650
+  python -m pipeline run --source-table public.day01
 ```
 
 输入使用 `--source-table` 或 `--refine-id` 二选一。来源表接受
@@ -154,7 +165,9 @@ python -m pipeline artifacts reconcile --apply
 Parquet。曾手工安装旧 patch ledger 的环境仅参考
 [PostgreSQL 迁移说明](db/postgres/migrations/README.md)清理。
 
-`32650` 仅是北京所在 UTM 分区的命令示例，不是项目默认值。新 Refine Run 必须按完整数据范围明确选择米制投影；也可在自定义 `pipeline.toml` 的 `[projection]` 中配置。使用 `--refine-id UUID` 时会继承原 Run 的投影，不能覆盖。选择与迁移规则见 [Run 级投影上下文](docs/run-projection-context.md)。
+新 Refine Run 使用 `pipeline.toml` 中的 `[projection]` 配置，仓库配置为 EPSG:32649；区域变化时应替换
+完整 TOML，不能用 CLI 覆盖。使用 `--refine-id UUID` 时会继承原 Run 的投影，不能覆盖。
+选择与迁移规则见 [Run 级投影上下文](docs/run-projection-context.md)。
 
 ## 常用命令
 

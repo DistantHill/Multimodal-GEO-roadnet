@@ -41,6 +41,7 @@ RUN pip install --no-cache-dir --progress-bar off --timeout 600 --retries 10 \
 
 COPY pyproject.toml ./
 COPY src ./src
+COPY config ./config
 COPY scripts ./scripts
 RUN pip install --no-cache-dir --progress-bar off --no-deps --no-build-isolation .
 
