@@ -14,8 +14,8 @@ def load_refine_spatial_context(
     conn: object, refine_id: str,
 ) -> tuple[str, SpatialContext, dict[str, object] | None]:
     row = fetch_refine_run_row(conn, refine_id)
-    if row.status != "complete":
-        raise ValueError(f"Refine Run must be complete: {row.status}")
+    if row.status != "completed":
+        raise ValueError(f"Refine Run must be completed: {row.status}")
     return row.source_table, row.spatial_context, row.source_fingerprint
 
 

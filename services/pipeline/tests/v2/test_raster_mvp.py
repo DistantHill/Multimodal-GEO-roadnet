@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import uuid
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -177,6 +178,30 @@ def test_point_source_uses_detect_union_and_binds_refine_twice(monkeypatch):
     assert "kept_trajectory_points" in conn.read_cursor.query
     assert conn.read_cursor.params == (
         "trajectory_points", "refine-A", "public.injected_points", "refine-A")
+
+
+def test_point_source_accepts_completed_refine_run(monkeypatch):
+    from track.v2.models import SpatialContext
+    from track.v2.raster import point_source
+
+    context = SpatialContext(4326, 32649, {"coordinate_semantics_version": 2})
+    fingerprint = {"algorithm": "sha256", "digest": "sample"}
+    monkeypatch.setattr(point_source, "fetch_refine_run_row", lambda *_: SimpleNamespace(
+        status="completed", source_table="trajectory_points",
+        spatial_context=context, source_fingerprint=fingerprint))
+
+    assert point_source.load_refine_spatial_context(object(), "refine-A") == (
+        "trajectory_points", context, fingerprint)
+
+
+def test_point_source_rejects_unfinished_refine_run(monkeypatch):
+    from track.v2.raster import point_source
+
+    monkeypatch.setattr(point_source, "fetch_refine_run_row", lambda *_: SimpleNamespace(
+        status="running"))
+
+    with pytest.raises(ValueError, match="must be completed: running"):
+        point_source.load_refine_spatial_context(object(), "refine-A")
 
 
 def test_runner_writes_verified_geotiffs_and_publishes_complete(tmp_path, monkeypatch):
