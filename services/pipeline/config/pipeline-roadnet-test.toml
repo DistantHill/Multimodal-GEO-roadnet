@@ -108,3 +108,20 @@ artifact_gc_grace_days = 7 # 产物 GC 宽限期；天，>=1；执行语义。
 
 [resources]
 verify_artifact_sha256 = false # 读取产物时校验 SHA-256；布尔；执行语义。
+
+[raster]
+resolution_m = 1.0
+count_mode = "raw"
+point_kernel = "none"
+clip_quantile = 0.95
+quantile_method = "linear"
+normalizer = "sqrt"
+channel_encoder = "gray_repeat"
+tile_size_px = 1024
+overlap_px = 256
+edge_mode = "pad"
+materialize_rgb_geotiff = false
+stream_batch_size = 10000
+block_size_px = 512
+max_cells = 100000000
+memory_budget_bytes = 1073741824

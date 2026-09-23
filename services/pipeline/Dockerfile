@@ -25,6 +25,11 @@ RUN detected_arch="$(dpkg --print-architecture)" \
 
 FROM python:3.12-slim
 
+# Rasterio's bundled GDAL links against libexpat on the slim runtime image.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends libexpat1 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

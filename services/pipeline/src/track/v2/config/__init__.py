@@ -55,7 +55,7 @@ def connect(config: PostgresConfig):
     return psycopg.connect(config.dsn())
 
 
-from .pipeline_config import (  # noqa: E402
+from .pipeline_config_loader import (  # noqa: E402
     LoggingConfig, ParserConfig, PathsConfig, PipelineConfig, ResourcesConfig,
     load_pipeline_config,
 )

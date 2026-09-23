@@ -57,7 +57,7 @@ def serve(config: PipelineConfig) -> int:
 def main() -> int:
     delegated_commands = {
         "artifacts", "delete-run", "import-trajectories", "init-db", "replay",
-        "run", "semantic-diff",
+        "run", "semantic-diff", "rasterize",
     }
     if len(sys.argv) > 1 and sys.argv[1] in delegated_commands:
         command, forwarded = sys.argv[1], sys.argv[2:]
@@ -73,6 +73,8 @@ def main() -> int:
             from track.v2.cli.delete_run import main as delegated_main
         elif command == "import-trajectories":
             from track.v2.cli.import_trajectories import main as delegated_main
+        elif command == "rasterize":
+            from track.v2.cli.rasterize import main as delegated_main
         else:
             from track.v2.cli.replay import main as delegated_main
 

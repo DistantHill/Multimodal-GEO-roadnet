@@ -16,6 +16,7 @@ from ..errors import ConfigError
 from ..field_config import load_field_config
 from ..models import (ClipConfig, FieldConfig, FittingConfig, NetworkConfig,
                       ProjectionConfig, RefineConfig, RuntimeConfig)
+from ..raster.models import RasterConfig
 from . import PostgresConfig
 
 
@@ -56,6 +57,7 @@ class PipelineConfig:
     network: NetworkConfig
     runtime: RuntimeConfig
     resources: ResourcesConfig
+    raster: RasterConfig
 
     def effective_snapshot(self) -> dict[str, Any]:
         """Return the complete effective non-secret configuration."""
@@ -70,6 +72,7 @@ class PipelineConfig:
                 "clip": self.clip.as_dict(),
                 "fitting": self.fitting.as_dict(),
                 "network": self.network.as_dict(),
+                "raster": self.raster.semantic_dict(),
             },
             "execution_config": {
                 "postgres": {
@@ -95,6 +98,7 @@ class PipelineConfig:
                 "logging": {"directory": str(self.logging.directory)},
                 "runtime": self.runtime.as_dict(),
                 "resources": dataclasses.asdict(self.resources),
+                "raster": self.raster.execution_dict(),
             },
         }
 
@@ -111,7 +115,7 @@ _SECTION_TYPES: dict[str, type[Any]] = {
     "postgres": PostgresConfig, "paths": PathsConfig, "logging": LoggingConfig,
     "projection": ProjectionConfig, "refine": RefineConfig, "detect": IntersectConfig,
     "clip": ClipConfig, "fitting": FittingConfig, "network": NetworkConfig,
-    "runtime": RuntimeConfig, "resources": ResourcesConfig,
+    "runtime": RuntimeConfig, "resources": ResourcesConfig, "raster": RasterConfig,
 }
 
 
@@ -170,6 +174,12 @@ def _collect_section(name: str, cls: type[Any], raw: Any, base_dir: Path,
 
 
 def _validate(values: dict[str, dict[str, Any]], errors: list[str]) -> None:
+    raster = values.get("raster", {})
+    if raster and len(raster) == len(dataclasses.fields(RasterConfig)):
+        try:
+            RasterConfig(**raster)
+        except ValueError as exc:
+            errors.append(str(exc))
     positive = {"postgres.port", "postgres.connect_timeout", "postgres.keepalives_idle",
         "postgres.keepalives_interval", "postgres.keepalives_count", "projection.source_srid",
         "projection.processing_srid", "runtime.db_insert_batch", "runtime.db_stream_batch_size",

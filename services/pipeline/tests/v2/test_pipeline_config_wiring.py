@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from track.v2.config import PostgresConfig
-from track.v2.config.pipeline_config import PipelineConfig
+from track.v2.config.pipeline_config_loader import PipelineConfig
 from track.v2.db.pipeline_store import DetectPersistenceResult
 from track.v2.db_writer import RefineRunRecord
 from track.v2.detect import IntersectConfig, IntersectResult

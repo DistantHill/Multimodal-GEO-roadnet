@@ -108,3 +108,20 @@ artifact_gc_grace_days = 7 # 产物 GC 宽限期；天，>=1；执行语义。
 
 [resources]
 verify_artifact_sha256 = false # 读取产物时校验 SHA-256；布尔；执行语义。
+
+[raster]
+resolution_m = 1.0 # 栅格分辨率；米，>0；算法语义。
+count_mode = "raw" # 计数方式；本轮仅 raw；算法语义。
+point_kernel = "none" # 点核；本轮仅 none；算法语义。
+clip_quantile = 0.95 # 全局非零单元分位数；本轮固定 0.95；算法语义。
+quantile_method = "linear" # 分位数插值；本轮仅 linear；算法语义。
+normalizer = "sqrt" # 灰度映射；本轮仅 sqrt；算法语义。
+channel_encoder = "gray_repeat" # RGB 编码；本轮仅灰度复制；算法语义。
+tile_size_px = 1024 # 训练切片边长；像素，>0；算法语义。
+overlap_px = 256 # 训练切片重叠；像素，小于 tile_size_px；算法语义。
+edge_mode = "pad" # 边缘处理；本轮仅 pad；算法语义。
+materialize_rgb_geotiff = false # 是否写出 RGB GeoTIFF；布尔；输出语义。
+stream_batch_size = 10000 # 点读取批量；>=1；执行语义。
+block_size_px = 512 # GeoTIFF 块边长；像素，>=1；执行语义。
+max_cells = 100000000 # 栅格单元上限；>=1；资源约束。
+memory_budget_bytes = 1073741824 # 栅格内存预算；字节，>=1；资源约束。

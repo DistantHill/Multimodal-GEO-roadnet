@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from track.v2.config import PostgresConfig
-from track.v2.config.pipeline_config import PipelineConfig
+from track.v2.config.pipeline_config_loader import PipelineConfig
 from track.v2.db.pipeline_store import RefineBatchResult, DetectPersistenceResult
 from track.v2.db.source_table import SourceTableContract
 from track.v2.db_writer import RefineRunRecord
