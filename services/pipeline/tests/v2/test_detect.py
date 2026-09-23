@@ -51,9 +51,10 @@ from track.v2.detect import (
     _compute_getis_ord_g_star,
     _detect_turn_events,
     _detect_intersections_db,
+    _run_columnar_db_detect,
     _extract_entry_exit_observations_batch,
-    _extract_cross_track_db,
     _extract_cross_track_windows,
+    extract_columnar_cross_track_candidates,
     _getis_local_counts_grid,
     _getis_local_counts_scan,
     _group_cluster_items,
@@ -1157,27 +1158,38 @@ class ProjectionContextContractTest(unittest.TestCase):
 
     def test_formal_parquet_cross_track_uses_columnar_pairs_not_disk_index(self):
         reader = MagicMock()
-        expected = []
+        reader.iter_cross_track_pair_batches.return_value = iter(())
         with (
-            patch("track.v2.detect.extract_columnar_cross_track_candidates",
-                  return_value=expected) as columnar,
             patch("track.v2.detect_candidates._prepare_segments") as prepare,
             patch("track.v2.detect_candidates.build_cross_track_index") as build_index,
         ):
-            actual = _extract_cross_track_db(
-                reader, intersect_run_config(source_table="source"), _TEST_TRANSFORMER,
+            actual = extract_columnar_cross_track_candidates(
+                reader,
+                "source",
+                _TEST_TRANSFORMER,
+                intersect_run_config(source_table="source"),
             )
-        self.assertIs(actual, expected)
-        columnar.assert_called_once()
+        self.assertEqual(actual, [])
         prepare.assert_not_called()
         build_index.assert_not_called()
 
     def test_disabled_formal_parquet_cross_track_does_not_read_pair_planner(self):
         reader = MagicMock()
-        actual = _extract_cross_track_db(
-            reader, intersect_run_config(use_cross_track_candidates=False), _TEST_TRANSFORMER,
-        )
-        self.assertEqual(actual, [])
+        cfg = intersect_run_config(use_cross_track_candidates=False)
+        reader.extent.return_value = (0.0, 0.0, 1.0, 1.0)
+        reader.iter_turn_candidates.return_value = iter(())
+        reader.track_count.return_value = 0
+        with (
+            patch("track.v2.detect.extract_columnar_cross_track_candidates") as columnar,
+            patch("track.v2.detect._cluster_pipeline", return_value=([], [])),
+            patch("track.v2.detect._build_topologies_from_tracks", return_value=([], [], [])),
+        ):
+            _run_columnar_db_detect(
+                cfg,
+                _TEST_SPATIAL_CONTEXT,
+                reader,
+            )
+        columnar.assert_not_called()
         reader.iter_cross_track_pair_batches.assert_not_called()
 
     def test_formal_db_detect_rejects_assertion_and_source_mismatch(self):
@@ -2562,7 +2574,7 @@ class TopologyExtractionTest(unittest.TestCase):
                 ),
             ),
             patch(
-                "track.v2.detect._extract_cross_track_db",
+                "track.v2.detect.extract_columnar_cross_track_candidates",
                 return_value=[],
             ),
             patch(

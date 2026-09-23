@@ -316,7 +316,7 @@ def test_db_owner_closes_all_spools_on_failure(tmp_path, monkeypatch, phase, fai
     reader.iter_topology_tracks.return_value = iter(())
     reader.track_count.return_value = 0
     with ExitStack() as stack:
-        target = {"reader": "_extract_cross_track_db", "clustering": "_cluster_pipeline",
+        target = {"reader": "extract_columnar_cross_track_candidates", "clustering": "_cluster_pipeline",
                   "topology": "_build_topologies_from_tracks"}[phase]
         stack.enter_context(patch.object(detect, target, side_effect=failure))
         with pytest.raises(type(failure)):

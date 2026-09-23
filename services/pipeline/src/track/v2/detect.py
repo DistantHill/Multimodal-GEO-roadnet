@@ -935,24 +935,6 @@ def _extract_cross_track_memory_windows(
     return candidates
 
 
-def _extract_cross_track_db(
-    reader: RefineDatasetReader,
-    cfg: IntersectConfig,
-    transformer: CoordinateTransformer,
-    *,
-    live_status: Any = None,
-    perf: PerfTracker | None = None,
-    candidate_store: CrossCandidateRelation | None = None,
-) -> Sequence[CrossTrackCandidate]:
-    """Extract DB-mode candidates exclusively through the columnar reader."""
-    if not cfg.use_cross_track_candidates:
-        return []
-    return extract_columnar_cross_track_candidates(
-        reader, cfg.source_table or cfg.db_table, transformer, cfg,
-        live_status=live_status, candidate_store=candidate_store,
-    )
-
-
 def _extract_cross_track_windows(
     conn: Any, cfg: IntersectConfig,
     extent: tuple[float, float, float, float],
@@ -1513,13 +1495,17 @@ def _run_columnar_db_detect(
     # ── Stream columnar cross-track segment pairs ─────────────────
     t_stage = time.perf_counter()
     with tracker.stage("cross_track_global"):
-        cross_candidates = _extract_cross_track_db(
-            refine_reader,
-            cfg,
-            transformer,
-            live_status=live,
-            perf=tracker,
-            candidate_store=candidate_store,
+        cross_candidates = (
+            extract_columnar_cross_track_candidates(
+                refine_reader,
+                cfg.source_table or cfg.db_table,
+                transformer,
+                cfg,
+                live_status=live,
+                candidate_store=candidate_store,
+            )
+            if cfg.use_cross_track_candidates
+            else []
         )
 
     # ── Shared: cluster pipeline (G* + DBSCAN + merge + ablation) ───

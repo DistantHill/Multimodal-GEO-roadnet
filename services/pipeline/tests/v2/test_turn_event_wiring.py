@@ -140,7 +140,7 @@ def test_db_result_survives_columnar_run_and_cross_holds_no_full_turns(tmp_path,
 
     with (
         patch("track.v2.detect.TurnEventRelation", OwnedSequence),
-        patch("track.v2.detect._extract_cross_track_db", side_effect=cross),
+        patch("track.v2.detect.extract_columnar_cross_track_candidates", side_effect=cross),
         patch("track.v2.detect._build_topologies_from_tracks", side_effect=lambda clusters, *_a, **_kw: ([], clusters, [])),
     ):
         result = _detect_intersections_db(
