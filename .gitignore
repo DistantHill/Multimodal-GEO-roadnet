@@ -54,5 +54,6 @@ exports/
 .DS_Store
 .idea/
 .vscode/
+.devcontainer/
 *.swp
 *.swo

@@ -3,7 +3,7 @@
 host = "postgres" # 数据库主机；非空；部署语义。
 port = 5432 # 数据库端口；1..65535；部署语义。
 database = "roadnet" # 数据库名；非空；部署语义。
-user = "postgres" # 数据库用户；非空；部署语义。密码仅来自 POSTGRES_PASSWORD。
+user = "roadnet" # 数据库用户；非空；部署语义。密码仅来自 POSTGRES_PASSWORD。
 connect_timeout = 10 # 连接超时；秒，>=1；执行语义。
 sslmode = "prefer" # libpq SSL 模式；部署语义。
 keepalives = true # 启用 TCP keepalive；布尔；执行语义。
@@ -18,7 +18,7 @@ parquet_directory = "/data/parquet" # Parquet 目录；绝对路径；部署语�
 duckdb_postgres_extension_path = "/opt/duckdb/extensions/v1.5.5/linux_amd64/postgres_scanner.duckdb_extension" # DuckDB 扩展；绝对文件；部署语义。
 
 [logging]
-directory = "../generated" # 日志目录；相对路径按本 TOML 所在目录解析；执行语义。
+directory = "/data/logs" # 日志目录；相对路径按本 TOML 所在目录解析；执行语义。
 
 [projection]
 source_srid = 4326 # 输入坐标系 EPSG；正整数；算法语义。
