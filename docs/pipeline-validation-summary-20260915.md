@@ -75,7 +75,7 @@
 
 | 范围 | 已实现行为及主要文件 | 取舍与边界 |
 | --- | --- | --- |
-| 候选职责拆分 | `candidate_patches.py` 管分批，`candidate_extraction.py` 管提取调度、全局编号和进度；`turn_events.py`、`cross_track.py` 保留单批内核；去除旧 method 名称混淆 | 当前数据库路径单 Python 进程，批次串行；分批不等于多进程。`stream_batch_size` 为 1000 |
+| 候选职责拆分 | `candidate_patches.py` 管分批，`detect_candidates.py` 管提取调度、全局编号和进度；`turn_events.py`、`cross_track.py` 保留单批内核；去除旧 method 名称混淆 | 当前数据库路径单 Python 进程，批次串行；分批不等于多进程。`stream_batch_size` 为 1000 |
 | 磁盘空间工作区 | `detect_workspace.py` 暂存轨迹、线段、候选；R-tree、航向桶及覆盖索引减少配对和读取；命中后解码完整来源 | 减少驻留对象，增加 SQLite 文件和 I/O；不承担断电恢复职责 |
 | 转向、候选及成员暂存 | `clip_spool.py`、`cross_member_store.py`、`detect.py` 使用可重复遍历的磁盘序列、紧凑 XY 与延迟成员视图，缓存来源统计，消融比较仅保存质心 | 避免全部候选及成员对象常驻；拓扑等其他集合仍可能增长 |
 | 紧凑 DBSCAN | `dbscan_storage.py` 与 `detect.py` 使用整数数组、活动索引链、三态 bytearray；保留全局升序入栈和后进先出扩展 | 语义回归通过；仍为随候选数增长的全局算法，不是固定内存保证 |

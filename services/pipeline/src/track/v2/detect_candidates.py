@@ -168,7 +168,7 @@ def extract_cross_track_candidates(
     return candidates, total_pairs, total_pairs
 
 
-@observed_operation("列式跨轨迹候选提取")
+@observed_operation("列式轨迹交点候选提取")
 def extract_columnar_cross_track_candidates(
     reader: Any,
     source_table: str,

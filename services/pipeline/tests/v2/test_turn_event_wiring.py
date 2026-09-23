@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from track.v2.candidate_extraction import extract_turn_candidates
+from track.v2.detect_candidates import extract_turn_candidates
 from track.v2.candidate_patches import iter_track_patches
 from track.v2.models import RuntimeConfig
 from track.v2.turn_event_relation import TurnEventRelation

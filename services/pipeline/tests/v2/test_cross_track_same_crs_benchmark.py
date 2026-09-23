@@ -8,7 +8,7 @@ from unittest.mock import patch
 from track.v2.cross_track import (
     extract_cross_track_candidates_reference,
 )
-from track.v2.candidate_extraction import (
+from track.v2.detect_candidates import (
     extract_cross_track_candidates,
 )
 from track.v2.db.queries import SpatialWindow

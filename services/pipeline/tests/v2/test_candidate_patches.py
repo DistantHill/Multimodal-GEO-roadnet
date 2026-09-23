@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from track.v2.candidate_extraction import extract_cross_track_candidates, extract_turn_candidates
+from track.v2.detect_candidates import extract_cross_track_candidates, extract_turn_candidates
 from track.v2.candidate_patches import (
     build_cross_track_index,
     iter_cross_track_patches,

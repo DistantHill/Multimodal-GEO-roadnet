@@ -49,7 +49,7 @@ from ._geometry import (
 )
 from .exceptions import V2Error
 from .candidate_patches import iter_track_patches
-from .candidate_extraction import (
+from .detect_candidates import (
     extract_columnar_cross_track_candidates, extract_cross_track_candidates,
     extract_turn_candidates,
 )

@@ -19,7 +19,7 @@ from track.v2.db.queries import SpatialWindow
 from track.v2.detect import IntersectConfig
 from track.v2.cross_track import _prepare_segments
 from track.v2.cross_candidate_relation import CrossCandidateRelation
-from track.v2.candidate_extraction import (
+from track.v2.detect_candidates import (
     extract_columnar_cross_track_candidates, extract_cross_track_candidates,
 )
 from track.v2.models import RuntimeConfig, SpatialContext

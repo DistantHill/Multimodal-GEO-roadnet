@@ -8,7 +8,7 @@ Detect 先提取转向事件（turn events）和跨轨迹候选（cross-track ca
 | `services/pipeline/src/track/v2/candidate_patches.py` | 完整轨迹分块；空间网格构建、容量检查、线段对分块、规范归属去重及长线段回退调度 |
 | `services/pipeline/src/track/v2/turn_events.py` | `detect_turn_patch` 计算一个轨迹任务块中的转向事件 |
 | `services/pipeline/src/track/v2/cross_track.py` | 准备有效线段；`detect_cross_track_patch` 对指定线段对执行精确求交并保留来源追溯信息 |
-| `services/pipeline/src/track/v2/candidate_extraction.py` | 调用检测内核、汇总候选、统一编号、报告进度和心跳 |
+| `services/pipeline/src/track/v2/detect_candidates.py` | 调用检测内核、汇总候选、统一编号、报告进度和心跳 |
 | `services/pipeline/src/track/v2/detect.py` | 连接读取、候选提取、全局聚类和拓扑验证阶段 |
 
 转向路径由 `iter_track_patches` 按 `stream_batch_size` 输出完整轨迹任务块，

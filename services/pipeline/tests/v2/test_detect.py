@@ -34,7 +34,7 @@ from track.v2.candidate_patches import (
     _iter_cross_vehicle_pair_batches,
     _iter_pair_batches as _iter_cross_track_pair_batches,
 )
-from track.v2.candidate_extraction import (
+from track.v2.detect_candidates import (
     extract_cross_track_candidates as _extract_orthogonal_cross_track_candidates,
 )
 from track.v2 import _cross_track_legacy as cross_track_legacy_module
@@ -1161,8 +1161,8 @@ class ProjectionContextContractTest(unittest.TestCase):
         with (
             patch("track.v2.detect.extract_columnar_cross_track_candidates",
                   return_value=expected) as columnar,
-            patch("track.v2.candidate_extraction._prepare_segments") as prepare,
-            patch("track.v2.candidate_extraction.build_cross_track_index") as build_index,
+            patch("track.v2.detect_candidates._prepare_segments") as prepare,
+            patch("track.v2.detect_candidates.build_cross_track_index") as build_index,
         ):
             actual = _extract_cross_track_db(
                 reader, intersect_run_config(source_table="source"), _TEST_TRANSFORMER,

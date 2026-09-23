@@ -11,7 +11,7 @@ import pytest
 
 from track.v2._geometry import _to_lonlat
 from track.v2.candidate_patches import CrossTrackCapacityError
-from track.v2.candidate_extraction import extract_cross_track_candidates
+from track.v2.detect_candidates import extract_cross_track_candidates
 from track.v2.db.queries import SpatialWindowIterator
 from track.v2.detect import (
     IntersectConfig,
