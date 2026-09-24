@@ -1180,7 +1180,7 @@ class ProjectionContextContractTest(unittest.TestCase):
         reader.iter_turn_candidates.return_value = iter(())
         reader.track_count.return_value = 0
         with (
-            patch("track.v2.detect.extract_columnar_cross_track_candidates") as columnar,
+            patch("track.v2.detect.run_grid_cross_track_task") as columnar,
             patch("track.v2.detect._cluster_pipeline", return_value=([], [])),
             patch("track.v2.detect._build_topologies_from_tracks", return_value=([], [], [])),
         ):
@@ -2574,7 +2574,7 @@ class TopologyExtractionTest(unittest.TestCase):
                 ),
             ),
             patch(
-                "track.v2.detect.extract_columnar_cross_track_candidates",
+                "track.v2.detect.run_grid_cross_track_task",
                 return_value=[],
             ),
             patch(
@@ -2588,6 +2588,7 @@ class TopologyExtractionTest(unittest.TestCase):
         ):
             result = detect_intersections(
                 conn=object(),
+                connect_worker=lambda: object(),
                 config=intersect_config(),
                 context=detect_context(query_active_from_db=True, refine_id="refine-1"),
                 runtime=runtime_config(), data_root=Path(tempfile.mkdtemp()),

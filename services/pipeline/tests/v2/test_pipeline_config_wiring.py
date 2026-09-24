@@ -63,6 +63,9 @@ class _Connection:
 class _ConfigRecordingStore:
     def __init__(self) -> None:
         self.connection = MagicMock()
+        self.connection.info.get_parameters.return_value = {
+            "host": "postgres", "dbname": "roadnet", "user": "roadnet",
+        }
         self.refine_record = RefineRunRecord(
             id=REFINE_ID,
             source_table="raw_points",
@@ -173,7 +176,7 @@ class PipelineConfigWiringTest(unittest.TestCase):
             ),
             patch("track.v2.detect_stage.find_refine_artifact", return_value=MagicMock()),
             patch("track.v2.detect_stage.RefineDatasetReader", return_value=reader),
-            patch("track.v2.detect_stage.detect_intersections", return_value=intersections),
+            patch("track.v2.detect_stage.detect_intersections", return_value=intersections) as detect,
             patch("track.v2.detect_stage.create_staging", return_value=MagicMock(stage="detect")),
             patch("track.v2.detect_stage.export_detect_parquet", return_value=MagicMock()),
             patch("track.v2.detect_stage.publish"),
@@ -184,6 +187,13 @@ class PipelineConfigWiringTest(unittest.TestCase):
             patch("track.v2.network_stage.build_network", return_value=MagicMock()) as network,
         ):
             run_pipeline(PipelineInput(refine_id=REFINE_ID), configured_pipeline)
+
+        with patch("psycopg.connect") as connect:
+            detect.call_args.kwargs["connect_worker"]()
+        connect.assert_called_once_with(
+            host="postgres", dbname="roadnet", user="roadnet",
+            password=configured_pipeline.postgres.password,
+        )
 
         self.assertIs(store.loaded_clip_config, configured_clip)
         self.assertEqual(

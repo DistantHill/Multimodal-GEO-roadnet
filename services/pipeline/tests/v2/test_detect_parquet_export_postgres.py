@@ -22,7 +22,7 @@ from track.v2.db.queries import fetch_intersections, fetch_resolved_clip_tracks
 from track.v2.db.queries import fetch_detect_row
 from track.v2.db.artifact_registry import find_detect_artifact
 from track.v2.db.pipeline_store import PostgresPipelineStore
-from track.v2.detect_parquet import export_detect_parquet
+from track.v2.detect_parquet_export import export_detect_parquet
 from track.v2.detect_parquet_reader import DetectDatasetReader
 from track.v2.clip import extract_clips, extract_clips_for_detect
 from track.v2.models import ClipConfig, ClipInput, RuntimeConfig

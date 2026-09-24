@@ -199,6 +199,7 @@ def _validate(values: dict[str, dict[str, Any]], errors: list[str]) -> None:
         "refine.max_extension_m", "refine.max_gap_s", "detect.min_leg_m",
         "detect.g_star_radius_m", "detect.dbscan_eps_m_turn",
         "detect.cross_track_dbscan_eps_m", "detect.cross_track_grid_cell_m",
+        "detect.cross_track_task_grid_m",
         "detect.min_intersection_radius_m", "fitting.point_spacing_m",
         "fitting.fit_sample_spacing_m", "runtime.progress_time_threshold_s",
     }
@@ -211,6 +212,7 @@ def _validate(values: dict[str, dict[str, Any]], errors: list[str]) -> None:
         "refine.excluded_sample_max", "detect.turn_window",
         "detect.dbscan_min_samples_turn", "detect.cross_track_dbscan_min_samples",
         "detect.cross_track_pair_batch_size", "detect.cross_track_max_grid_cells_per_segment",
+        "detect.cross_track_task_threads",
         "detect.min_branches", "detect.min_observations", "detect.min_directed_transitions",
         "detect.bearing_window", "detect.stream_batch_size", "fitting.min_clips_per_pair",
         "runtime.mark_flush_every_n", "runtime.excluded_flush_threshold",
@@ -230,6 +232,8 @@ def _validate(values: dict[str, dict[str, Any]], errors: list[str]) -> None:
         if value is not None and not 0.0 <= value <= 1.0:
             errors.append(f"{path}: must be in [0, 1]")
     detect = values.get("detect", {})
+    if detect.get("cross_track_task_threads", 4) > 8:
+        errors.append("detect.cross_track_task_threads: must be <= 8")
     angle_paths = ("refine.min_heading_delta_deg", "refine.max_heading_delta_deg",
                    "detect.min_turn_deg", "detect.max_turn_deg",
                    "detect.cross_track_straightness_deg", "detect.cross_track_min_angle_deg",

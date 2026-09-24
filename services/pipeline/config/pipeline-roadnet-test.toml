@@ -58,6 +58,8 @@ cross_track_dbscan_min_samples = 3 # 交叉 DBSCAN 最少样本；>=1；算法�
 cross_track_grid_cell_m = 100.0 # 空间网格边长；米，>0；算法及执行语义。
 cross_track_pair_batch_size = 65536 # 线段对批大小；>=1；执行语义。
 cross_track_max_grid_cells_per_segment = 25 # 单线段最大网格数；>=1；执行语义。
+cross_track_task_grid_m = 5000.0 # 跨轨迹任务网格边长；米，>0；算法语义。
+cross_track_task_threads = 4 # 跨轨迹任务线程数；1..8；执行语义。
 merge_centroid_distance_m = 80.0 # 聚类合并距离；米，>=0；算法语义。
 min_intersection_radius_m = 90.0 # 最小路口半径；米，>0；算法语义。
 topology_radius_padding_m = 70.0 # 拓扑半径增量；米，>=0；算法语义。

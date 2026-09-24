@@ -13,7 +13,7 @@ from .db.artifact_registry import find_refine_artifact
 from .db.pipeline_store import DetectPersistenceResult, PipelineStore
 from .db.source_table import calculate_source_fingerprint, validate_source_table
 from .detect import DetectRuntimeContext, IntersectConfig, IntersectResult, detect_intersections
-from .detect_parquet import export_detect_parquet
+from .detect_parquet_export import export_detect_parquet
 from .heartbeat import operation_heartbeat
 from .logger import log_info
 from .models import RuntimeConfig
@@ -25,7 +25,7 @@ from .stage_types import DetectStageRef, DetectStageResult, RefineStageRef
 
 _STAGE_LABEL = (
     "Detect: 交叉口检测 / Intersection Detection "
-    "(单次加载 + 全局索引 / Shared workspace + global index)"
+    "(转向 Parquet + 跨轨迹网格 / Turn Parquet + cross-track grids)"
 )
 
 
@@ -76,8 +76,21 @@ def run_detect_stage(
             data_root=paths_config.data_root,
         )
         with reader:
+            connect_worker = None
+            if detect_config.use_cross_track_candidates:
+                import psycopg
+
+                worker_parameters = dict(store.connection.info.get_parameters())
+                worker_parameters.pop("password", None)
+
+                def connect_worker():
+                    return psycopg.connect(
+                        **worker_parameters, password=postgres_config.password,
+                    )
+
             result = detect_intersections(
                 conn=store.connection,
+                connect_worker=connect_worker,
                 config=detect_config,
                 context=context,
                 refine_reader=reader,

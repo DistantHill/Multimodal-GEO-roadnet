@@ -309,20 +309,28 @@ def test_sorted_relation_to_result_writes_same_rows(tmp_path):
 @pytest.mark.parametrize("failure", [RuntimeError("stage failed"), KeyboardInterrupt()])
 def test_db_owner_closes_all_spools_on_failure(tmp_path, monkeypatch, phase, failure):
     monkeypatch.setenv("DATA_ROOT", str(tmp_path))
-    cfg = intersect_run_config(use_turn_events=False, cross_track_dbscan_min_samples=1)
+    cfg = intersect_run_config(
+        use_turn_events=False, cross_track_dbscan_min_samples=1,
+        refine_id="refine-1",
+    )
     reader = MagicMock()
     reader.extent.return_value = (0., 0., 1., 1.)
     reader.iter_cross_track_pair_batches.return_value = iter(())
     reader.iter_topology_tracks.return_value = iter(())
     reader.track_count.return_value = 0
     with ExitStack() as stack:
-        target = {"reader": "extract_columnar_cross_track_candidates", "clustering": "_cluster_pipeline",
+        target = {"reader": "run_grid_cross_track_task", "clustering": "_cluster_pipeline",
                   "topology": "_build_topologies_from_tracks"}[phase]
+        if phase != "reader":
+            stack.enter_context(patch.object(
+                detect, "run_grid_cross_track_task", return_value=[],
+            ))
         stack.enter_context(patch.object(detect, target, side_effect=failure))
         with pytest.raises(type(failure)):
             detect._detect_intersections_db(
                 object(), cfg, _TEST_SPATIAL_CONTEXT, runtime=runtime_config(),
                 data_root=tmp_path, refine_reader=reader,
+                connect_worker=lambda: object(),
             )
     assert not list(tmp_path.glob("duckdb/turn-event-relations/*"))
     assert not list(tmp_path.glob("duckdb/cross-candidate-relations/*"))

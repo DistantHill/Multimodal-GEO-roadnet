@@ -10,7 +10,7 @@ import duckdb
 
 from .artifact_parquet import validate_published
 from .db.artifact_registry import ArtifactDescriptor
-from .detect_parquet import DetectParquetError, _literal, _validate_schema
+from .detect_parquet_export import DetectParquetError, _literal, _validate_schema
 from .models import ClipIntersection, ClipTrack, ResolvedTrackPoint, RuntimeConfig
 
 

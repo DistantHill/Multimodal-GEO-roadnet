@@ -14,7 +14,7 @@ import pytest
 from track.v2 import artifact_publication
 from track.v2.artifact_parquet import build_descriptor
 from track.v2.db.artifact_registry import ArtifactDescriptor, canonical_json
-from track.v2.detect_parquet import DETECT_PARQUET_V1, DetectParquetError
+from track.v2.detect_parquet_export import DETECT_PARQUET_V1, DetectParquetError
 from track.v2.detect_parquet_reader import DetectDatasetReader
 from track.v2.models import RuntimeConfig
 

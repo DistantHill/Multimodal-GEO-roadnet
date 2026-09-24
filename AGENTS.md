@@ -31,6 +31,8 @@ Use Python 3.11+, four-space indentation, type hints where practical, and `snake
 
 Backend and Pipeline tests use `pytest`. Name files `test_*.py` and test behavior, not implementation details. Run `make test` before submitting. Add regression coverage for path, configuration, API, or migration changes; no threshold is configured.
 
+本项目的 Pipeline 冒烟测试使用 `services/pipeline/config/pipeline-roadnet-test.toml`；Pipeline 全量测试使用 `services/pipeline/config/pipeline.toml`。提到“冒烟测试”或“全量测试”时按此配置区分，并在测试记录中注明实际使用的配置。
+
 ## Commits and Pull Requests
 
 This checkout has no valid Git history, so no convention can be inferred. Use concise imperative messages, preferably Conventional Commit style (for example, `feat: add pipeline run endpoint`). PRs should explain architectural impact, list validation commands, identify configuration or data-directory changes, and include UI screenshots when relevant. Never commit `.env`, credentials, runtime data, model weights, database files, or Qdrant storage.

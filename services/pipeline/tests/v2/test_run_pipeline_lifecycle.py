@@ -60,6 +60,7 @@ def _empty_intersect_result() -> IntersectResult:
 class _Connection:
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self.info = SimpleNamespace(get_parameters=lambda: {"host": "postgres"})
 
     def __enter__(self) -> "_Connection":
         return self

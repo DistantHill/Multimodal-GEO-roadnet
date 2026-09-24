@@ -37,7 +37,29 @@ def test_checked_in_complete_config_loads() -> None:
     config = pipeline_config()
     assert config.projection.processing_srid == 32649
     assert config.runtime.duckdb_threads == 4
+    assert config.detect.cross_track_task_grid_m == 5000.0
+    assert config.detect.cross_track_task_threads == 4
     assert len(config.parser.fields.specs) == 9
+
+
+@pytest.mark.parametrize("value", ["0.0", "-1.0", "inf", "nan"])
+def test_detect_task_grid_size_requires_finite_positive_number(tmp_path: Path, value: str) -> None:
+    path = _write(tmp_path, lambda text: text.replace(
+        "cross_track_task_grid_m = 5000.0", f"cross_track_task_grid_m = {value}",
+    ))
+    with pytest.raises(ConfigError, match="detect.cross_track_task_grid_m"):
+        load_pipeline_config(path, postgres_password="secret")
+
+
+@pytest.mark.parametrize("value", ["0", "9", "true"])
+def test_detect_task_threads_requires_integer_between_one_and_eight(
+    tmp_path: Path, value: str,
+) -> None:
+    path = _write(tmp_path, lambda text: text.replace(
+        "cross_track_task_threads = 4", f"cross_track_task_threads = {value}",
+    ))
+    with pytest.raises(ConfigError, match="detect.cross_track_task_threads"):
+        load_pipeline_config(path, postgres_password="secret")
 
 
 def test_tunable_dataclasses_have_no_python_defaults() -> None:
@@ -52,9 +74,13 @@ def test_tunable_dataclasses_have_no_python_defaults() -> None:
             )
 
 
-def test_paths_are_resolved_relative_to_main_toml() -> None:
-    config = pipeline_config()
-    assert config.logging.directory == (CONFIG_PATH.parent / "../generated").resolve()
+def test_paths_are_resolved_relative_to_main_toml(tmp_path: Path) -> None:
+    assert pipeline_config().logging.directory == Path("/data/logs")
+    path = _write(tmp_path, lambda text: text.replace(
+        'directory = "/data/logs"', 'directory = "../generated"',
+    ))
+    config = load_pipeline_config(path, postgres_password="secret")
+    assert config.logging.directory == (path.parent / "../generated").resolve()
 
 
 def test_unknown_missing_type_and_range_errors_are_aggregated(tmp_path: Path) -> None:

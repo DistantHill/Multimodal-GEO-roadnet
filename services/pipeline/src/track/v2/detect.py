@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from .refine_parquet import RefineDatasetReader
 
 from .logger import log_info
+from .grid_cross_track_candidates import run_grid_cross_track_task
 from .heartbeat import heartbeat_progress, observed_operation, operation_heartbeat
 
 from ._perf import PerfTracker, TimedStage, timed_iter, track_for_loops
@@ -159,6 +160,8 @@ class IntersectConfig(TrackModel):
     spatial_window_size: tuple[float, float]
     spatial_window_overlap: float
     stream_batch_size: int
+    cross_track_task_grid_m: float
+    cross_track_task_threads: int
 
 
 @dataclass(frozen=True)
@@ -659,6 +662,7 @@ def detect_intersections(
     config: IntersectConfig,
     context: DetectRuntimeContext,
     conn: Any = None,
+    connect_worker: Callable[[], Any] | None = None,
     spatial_context: SpatialContext | None = None,
     refine_reader: RefineDatasetReader | None = None,
     runtime: RuntimeConfig,
@@ -718,7 +722,7 @@ def detect_intersections(
             raise V2Error("formal DB Detect requires runtime and data_root")
         return _detect_intersections_db(
             conn, cfg, refine.spatial_context, runtime=runtime, data_root=data_root,
-            refine_reader=refine_reader,
+            refine_reader=refine_reader, connect_worker=connect_worker,
         )
     elif source is not None:
         if spatial_context is None:
@@ -1412,6 +1416,7 @@ def _detect_intersections_db(
     runtime: RuntimeConfig,
     data_root: str | Path,
     refine_reader: RefineDatasetReader | None = None,
+    connect_worker: Callable[[], Any] | None = None,
 ) -> IntersectResult:
     """Run columnar DB Detect and transfer relation ownership to its result."""
     if refine_reader is None:
@@ -1426,7 +1431,9 @@ def _detect_intersections_db(
         )
         result = _run_columnar_db_detect(
             cfg, spatial_context, refine_reader, event_store=event_store,
-            candidate_store=candidate_store,
+            candidate_store=candidate_store, conn=conn,
+            refine_id=getattr(cfg, "refine_id", None),
+            connect_worker=connect_worker,
         )
         if result.turn_events is not event_store:
             # Empty input and test/reference seams can return in-memory output.
@@ -1450,6 +1457,9 @@ def _run_columnar_db_detect(
     *,
     event_store: TurnEventRelation | None = None,
     candidate_store: CrossCandidateRelation | None = None,
+    conn: Any = None,
+    refine_id: str | None = None,
+    connect_worker: Callable[[], Any] | None = None,
 ) -> IntersectResult:
     """Run DB Detect through Refine columnar readers and bounded relations."""
     # ── Spatial extent ──────────────────────────────────────────────
@@ -1492,21 +1502,28 @@ def _run_columnar_db_detect(
             elapsed=time.perf_counter() - t_stage,
         )
 
-    # ── Stream columnar cross-track segment pairs ─────────────────
+    # ── Grid cross-track candidates from this Refine Run ───────────
     t_stage = time.perf_counter()
     with tracker.stage("cross_track_global"):
-        cross_candidates = (
-            extract_columnar_cross_track_candidates(
-                refine_reader,
-                cfg.source_table or cfg.db_table,
-                transformer,
-                cfg,
-                live_status=live,
+        if cfg.use_cross_track_candidates:
+            if conn is None or refine_id is None or connect_worker is None:
+                raise V2Error("formal DB cross-track requires connection, refine_id, and worker connector")
+            cross_candidates = run_grid_cross_track_task(
+                refine_id, extent, spatial_context, transformer, cfg,
+                connect_worker=connect_worker,
+                grid_cell_size_m=cfg.cross_track_task_grid_m,
+                thread_count=cfg.cross_track_task_threads,
+                max_segments=200_000,
+                max_segment_bytes=268_435_456,
+                max_grid_memberships=2_000_000,
+                max_overflow_pair_space=20_000_000,
+                max_candidates=500_000,
+                max_result_bytes=536_870_912,
                 candidate_store=candidate_store,
+                live_status=live,
             )
-            if cfg.use_cross_track_candidates
-            else []
-        )
+        else:
+            cross_candidates = []
 
     # ── Shared: cluster pipeline (G* + DBSCAN + merge + ablation) ───
     if live is not None:
