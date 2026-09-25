@@ -74,48 +74,26 @@ SQL 先以 4326 Geometry 的保守 bbox 使用现有 GiST 粗筛，再把原始�
 
 `ST_SetSRID` 只能标注已有坐标的 CRS，不能代替坐标变换。
 
-## 双轨 cross-track 验证
+## 历史验证入口（已停用）
 
-同 CRS 算法等价/性能门禁使用 dense reference 与 optimized 实现，但两者的每个
-线段端点和交点都处于相同 processing CRS。身份、来源、成员和顺序严格相等；
-x/y 使用绝对 `1e-6 m`、lon/lat 使用绝对 `1e-9 degree` 起始预算，并在报告中
-记录实际最大差值。完整性能门禁仍要求至少 500k 点和至少三次重复：
+历史 cross-track 等价/性能门禁比较 dense reference 与 optimized 实现；身份、来源、
+成员和顺序严格相等，x/y 使用绝对 `1e-6 m`、lon/lat 使用绝对 `1e-9 degree`
+预算。长时性能门禁曾要求至少 500k 点和三次重复。手工基准目录已按 2026-09-25
+决定从仓库删除，当前不再提供该性能门禁的命令入口；历史测量和 QA 证据仍保留在
+相应历史记录中。当前回归测试只运行小型确定性 fixture，验证 reference 与 optimized
+候选的身份和坐标一致性。
 
-```sh
-python -m track.v2.manual_thin_benchmark.manual_bench_cross_track_inner \
-  --processing-srid 32650 --repetitions 3 \
-  --write-baseline cross_track_500k.json --require-target --version CODE_VERSION
-```
-
-该 benchmark 在第一次查询前开启 PostgreSQL `REPEATABLE READ READ ONLY` 事务，
-extent、完整消费字段/Geometry 的输入哈希及全部重复均绑定同一数据库快照。多
-subtrack 的历史四元稳定排序保留为前缀，仅在原先键冲突时追加 track rank
-tie-break；因此只可能明确化旧有歧义项的顺序。
-
-legacy → fixed CRS 是独立的可审计快照差异报告。坐标位移使用 WGS84 椭球距离；
-候选、cluster、Clip 有序成员、Clip 长度和 fitting 顶点分别报告。快照未包含的
-阶段明确为 `not_evaluated`。写报告不会审批或覆盖已有文件：
+legacy → fixed CRS 快照差异报告曾使用独立手工脚本。坐标位移使用 WGS84 椭球距离；
+候选、cluster、Clip 有序成员、Clip 长度和 fitting 顶点分别报告。以下只记录旧流程的
+输入/审批语义，不再提供可执行入口：
 
 输入文件采用 `track.v2-projection-snapshot-v1`，并要求 `provenance.source`、
 `provenance.algorithm` 和 `crs`；各已提供阶段还必须包含完整必需字段。NaN/Inf、
 非法经纬度、负长度或半成品阶段会失败，而不会被报告成零差异。
 
-```sh
-python -m track.v2.manual_thin_benchmark.projection_difference_report report \
-  --legacy legacy.json --fixed fixed.json --output projection-diff.json \
-  --version "$(git rev-parse HEAD)"
-```
-
-首次或结构变化结果保持 `pending_review`。人工审阅后，必须使用单独命令生成绑定
-具体 report hash 与 input-pair hash 的不可覆盖审批记录；本次修复不替用户执行：
-
-```sh
-python -m track.v2.manual_thin_benchmark.projection_difference_report accept \
-  --report projection-diff.json --output projection-diff.approval.json \
-  --accepted-by REVIEWER --reason REVIEW_REASON
-python -m track.v2.manual_thin_benchmark.projection_difference_report verify \
-  --report projection-diff.json --approval projection-diff.approval.json
-```
+首次或结构变化结果当时保持 `pending_review`。人工审阅后，旧流程使用独立命令生成绑定
+具体 report hash 与 input-pair hash 的不可覆盖审批记录。相关手工脚本已移除，以上流程
+仅作历史说明，不可在当前工作区执行。
 
 报告只能评估快照实际提供的阶段；它不会从 schema v3 复活 v1/v2 数据，也不代表
 对真实投影变化基线的自动接受。

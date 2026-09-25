@@ -17,6 +17,9 @@ htmlcov/
 venv/
 env/
 
+# Temporary manual debugging modules and directories are not tracked
+**/manual_*
+
 # Node / frontend build output
 node_modules/
 dist/
