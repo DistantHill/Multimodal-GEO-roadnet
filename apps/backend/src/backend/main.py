@@ -11,8 +11,8 @@ from fastapi import FastAPI
 
 from .config import BackendConfig, load_backend_config_from_environment
 from .database import configure_database, postgres_connection_settings, verify_runtime_schema
-from .map_api import router as map_router
-from .database_catalog import router as database_catalog_router
+from .api.map_routes import router as map_router
+from .api.database_catalog import router as database_catalog_router
 
 
 @asynccontextmanager

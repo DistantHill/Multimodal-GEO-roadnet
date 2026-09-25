@@ -5,7 +5,7 @@ from typing import Any
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from .database import get_read_connection, open_read_connection
+from ..database import get_read_connection, open_read_connection
 
 router = APIRouter(prefix="/api/v1/map/databases", tags=["map"])
 

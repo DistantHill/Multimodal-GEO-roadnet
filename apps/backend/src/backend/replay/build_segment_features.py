@@ -1,9 +1,10 @@
 """Classify only source segments adjacent to selected points as participants."""
 
-from .map_api import MapDataError, _track_feature
+from ..map_errors import MapDataError
+from .track_points import build_track_feature
 
 
-def segment_features(store, grouped, request, detect_id):
+def build_segment_features(store, grouped, request, detect_id):
     selected_ids = set(request.resolved_point_ids or [])
     selected_keys = set(request.source_row_keys or [])
     crossing_ids = [point.crossing_id for points in grouped.values() for point in points
@@ -40,7 +41,7 @@ def segment_features(store, grouped, request, detect_id):
                 points[start].resolved_point_id in starts
                 or selected(points[start]) or selected(points[end])
             )
-            feature = _track_feature(key, segment, detect_id)
+            feature = build_track_feature(key, segment, detect_id)
             feature["id"] = f"{feature['id']}:segment:{start}"
             feature["properties"].update(
                 replay_role="highlight" if participating else "context",

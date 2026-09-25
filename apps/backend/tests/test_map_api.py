@@ -7,14 +7,14 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from backend.map_api import (
+from backend.api.map_routes import (
     MapNotFoundError,
     clip,
     layer_catalog,
     read_layer,
     replay,
 )
-from backend.map_schemas import ClipRequest, ReplayRequest
+from backend.api.map_contracts import ClipRequest, ReplayRequest
 from backend.config import MapConfig
 
 
@@ -50,6 +50,12 @@ class FakeMapStore:
             "layers": [{"id": "resolved_subtrack_points"}],
             "default_context": {"detect_id": "detect-latest", "fit_id": None},
         }
+
+    def validate_layer_context(self, refine_id: str, detect_id: str | None, fit_id: str | None) -> None:
+        return None
+
+    def run_catalog(self) -> dict[str, Any]:
+        return {}
 
     def read_layer(self, layer_id: str, **kwargs: Any) -> dict[str, Any]:
         if self.error:

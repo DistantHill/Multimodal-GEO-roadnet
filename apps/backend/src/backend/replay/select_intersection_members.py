@@ -3,16 +3,17 @@
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
-from .map_api import MapDataError, MapNotFoundError, _feature, _feature_collection
+from ..map_errors import MapDataError, MapNotFoundError
+from ..map_features import create_map_feature, create_map_feature_collection
 
 if TYPE_CHECKING:
-    from .map_api import PostgresMapStore
-    from .map_schemas import ReplayRequest
+    from ..stores.map_layers import PostgresMapStore
+    from ..api.map_contracts import ReplayRequest
 
 
 def replay_intersection(store: "PostgresMapStore", request: "ReplayRequest") -> dict[str, Any]:
     from track.v2.models import PointRef, TrajectoryPoint
-    from track.v2.replay import replay_points
+    from track.v2.validation.resolve_point_references import replay_points
 
     row = store._fetchone(
         "SELECT detect_id::text, candidate_intersection_id FROM intersections WHERE id = %s",
@@ -85,14 +86,14 @@ def replay_intersection(store: "PostgresMapStore", request: "ReplayRequest") -> 
         tracks[point.vehicle_id].append(point)
     replayed = replay_points(points, dict(tracks))
     features = [
-        _feature(point.extra["resolved_point_id"],
+        create_map_feature(point.extra["resolved_point_id"],
                  {"type": "Point", "coordinates": [point.lon, point.lat]},
                  **point.extra, vehicle_id=point.vehicle_id, timestamp=point.timestamp,
                  intersection_id=request.intersection_id, detect_id=detect_id,
                  candidate_intersection_id=candidate_id)
         for point in replayed
     ]
-    return _feature_collection(features, operation="replay", selection="intersection_id",
+    return create_map_feature_collection(features, operation="replay", selection="intersection_id",
                                intersection_id=request.intersection_id, detect_id=detect_id,
                                candidate_intersection_id=candidate_id,
                                returned_point_count=len(features), truncated=False)

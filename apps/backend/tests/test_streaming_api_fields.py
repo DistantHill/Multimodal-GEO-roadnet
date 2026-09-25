@@ -6,7 +6,8 @@ import json
 
 import pytest
 
-from backend.map_api import PostgresMapStore, run_catalog
+from backend.api.map_routes import run_catalog
+from backend.stores.map_layers import PostgresMapStore
 
 
 REFINE_ID = "12345678-1234-5678-1234-567812345670"
@@ -15,8 +16,9 @@ FIT_ID = "12345678-1234-5678-1234-567812345672"
 POINT = {"type": "Point", "coordinates": [120.1, 30.2]}
 
 
-class RunCatalogStore:
+class RunCatalogStore(PostgresMapStore):
     def __init__(self, *, empty: bool = False) -> None:
+        super().__init__(None)
         self.empty = empty
         self.queries: list[str] = []
 

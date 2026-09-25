@@ -4,7 +4,7 @@ import pytest
 from fastapi import HTTPException
 import psycopg
 
-from backend.database_catalog import databases, tables, table_counts
+from backend.api.database_catalog import databases, tables, table_counts
 
 
 def request():
@@ -26,7 +26,7 @@ def test_tables_use_statistics_not_counts():
     target.__enter__.return_value.execute.return_value.fetchall.return_value = [
         ("public", "points", 50000, "r"), ("other", "points", 80000, "r"),
     ]
-    with patch("backend.database_catalog.open_read_connection", return_value=target) as opened:
+    with patch("backend.api.database_catalog.open_read_connection", return_value=target) as opened:
         result = tables(request(), "test' name", connection)
     opened.assert_called_once_with("test' name")
     assert result["row_count_is_estimate"] is True
@@ -74,7 +74,7 @@ def test_missing_database():
 
 
 def test_connection_error_does_not_expose_credentials():
-    with patch("backend.database_catalog.open_read_connection", side_effect=psycopg.OperationalError("secret")):
+    with patch("backend.api.database_catalog.open_read_connection", side_effect=psycopg.OperationalError("secret")):
         with pytest.raises(HTTPException) as error:
             tables(request(), "denied", Mock())
     assert error.value.status_code == 503

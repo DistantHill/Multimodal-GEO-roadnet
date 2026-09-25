@@ -4,8 +4,9 @@ from unittest.mock import Mock
 import pytest
 from pydantic import ValidationError
 
-from backend.map_api import MapDataError, MapNotFoundError, PostgresMapStore
-from backend.map_schemas import ReplayRequest
+from backend.map_errors import MapDataError, MapNotFoundError
+from backend.stores.map_layers import PostgresMapStore
+from backend.api.map_contracts import ReplayRequest
 
 
 DETECT_ID = "12345678-1234-5678-1234-567812345678"
@@ -29,10 +30,10 @@ def member(point_id, source_key, timestamp, injected_id=None):
 
 
 def test_intersection_reuses_pipeline_helper_and_preserves_injected_identity(monkeypatch):
-    from track.v2 import replay
+    from track.v2.validation import resolve_point_references
 
-    helper = Mock(wraps=replay.replay_points)
-    monkeypatch.setattr(replay, "replay_points", helper)
+    helper = Mock(wraps=resolve_point_references.replay_points)
+    monkeypatch.setattr(resolve_point_references, "replay_points", helper)
     store = make_store([member(1, "7", 20), member(2, None, 10, injected_id=7)])
     result = store.replay(ReplayRequest(intersection_id=5))
     helper.assert_called_once()

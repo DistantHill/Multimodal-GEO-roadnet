@@ -3,8 +3,9 @@ from unittest.mock import Mock
 import pytest
 from fastapi import HTTPException
 
-from backend.map_api import run_catalog, read_layer
+from backend.api.map_routes import run_catalog, read_layer
 from backend.config import MapConfig
+from backend.map_errors import MapDataError
 
 
 MAP_CONFIG = MapConfig(layer_limit_default=1_000, layer_limit_max=5_000,
@@ -20,17 +21,17 @@ MAP_CONFIG = MapConfig(layer_limit_default=1_000, layer_limit_max=5_000,
 def test_run_catalog_preserves_parent_relationships():
     store = Mock()
     timestamp = "2026-09-11T12:00:00+00:00"
-    store._fetchall.side_effect = [[("c1", timestamp)], [("d1", "c1", timestamp)], [("f1", "d1", timestamp)]]
+    store.run_catalog.return_value = {"refine": [{"id": "c1", "started_at": timestamp}], "detect": [{"id": "d1", "refine_id": "c1", "started_at": timestamp}], "fit": [{"id": "f1", "detect_id": "d1", "started_at": timestamp}]}
     result = run_catalog(store)
     assert result == {"refine": [{"id": "c1", "started_at": timestamp}],
                       "detect": [{"id": "d1", "refine_id": "c1", "started_at": timestamp}],
                       "fit": [{"id": "f1", "detect_id": "d1", "started_at": timestamp}]}
-    assert all("status = 'completed'" in call.args[0] for call in store._fetchall.call_args_list)
+    store.run_catalog.assert_called_once_with()
 
 
 def test_layer_rejects_mismatched_refine_before_loading():
     store = Mock()
-    store._fetchone.return_value = None
+    store.validate_layer_context.side_effect = MapDataError("mismatch")
     with pytest.raises(HTTPException) as error:
         read_layer("intersections", bbox=None, detect_id="d1", fit_id=None,
                    refine_id="c2", limit=10, store=store, map_config=MAP_CONFIG)

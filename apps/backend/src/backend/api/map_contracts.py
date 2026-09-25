@@ -7,7 +7,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 if TYPE_CHECKING:
-    from .config import MapConfig
+    from ..config import MapConfig
 
 
 BBox = tuple[float, float, float, float]

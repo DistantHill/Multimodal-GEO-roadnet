@@ -89,13 +89,13 @@ def test_target_database_connection_does_not_mutate_default(monkeypatch):
 
 
 def test_schema_guard_accepts_only_current_track_v2_schema() -> None:
-    assert database.SCHEMA_VERSION == 7
-    current = ScriptedConnection([("pipeline_schema_versions",), (7,)])
+    assert database.SCHEMA_VERSION == 8
+    current = ScriptedConnection([("pipeline_schema_versions",), (8,)])
     database.require_current_schema(current)
     assert current.cursor_instance.executions[1][1] == ("track.v2",)
 
     stale = ScriptedConnection([("pipeline_schema_versions",), (2,)])
-    with pytest.raises(RuntimeError, match="expected v7, got v2"):
+    with pytest.raises(RuntimeError, match="expected v8, got v2"):
         database.require_current_schema(stale)
 
     missing = ScriptedConnection([(None,)])

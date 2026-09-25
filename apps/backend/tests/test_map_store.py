@@ -6,20 +6,12 @@ from uuid import UUID
 
 import pytest
 
-from backend.map_api import (
-    MapDataError,
-    MapNotFoundError,
-    PostgresMapStore,
-    _RefineContext,
-    _CoordinateTransformer,
-    _DetectContext,
-    _Intersection,
-    _TrackPoint,
-    _clip_track,
-    _complete_tracks,
-    _limit_selected_tracks,
-)
-from backend.map_schemas import ClipRequest, ReplayRequest
+from backend.map_errors import MapDataError, MapNotFoundError
+from backend.stores.map_layers import PostgresMapStore, _DetectContext, _RefineContext, _limit_selected_tracks
+from backend.replay.build_clip_features import ClipIntersection, CoordinateTransformer, _clip_track
+from backend.replay.track_points import TrackPoint, complete_track_groups
+
+from backend.api.map_contracts import ClipRequest, ReplayRequest
 
 
 _EMPTY_FINGERPRINT = {
@@ -46,7 +38,7 @@ _DETECT = _DetectContext(
     processing_srid=3857,
     projection_config=_PROJECTION_CONFIG,
 )
-_TRANSFORMER = _CoordinateTransformer(_DETECT)
+_TRANSFORMER = CoordinateTransformer(_DETECT)
 _METERS_PER_DEGREE = 111_319.49079327358
 
 
@@ -139,8 +131,8 @@ def track_point(
     crossing_id: int | None = None,
     intersection_id: int | None = None,
     crossing_type: int | None = None,
-) -> _TrackPoint:
-    return _TrackPoint(
+) -> TrackPoint:
+    return TrackPoint(
         resolved_point_id=resolved_point_id,
         source_row_key=source_row_key,
         lon=_lon(x_m),
@@ -152,14 +144,14 @@ def track_point(
     )
 
 
-def intersections() -> list[_Intersection]:
+def intersections() -> list[ClipIntersection]:
     return [
-        _Intersection(101, _lon(-50.0), 0.0, 20.0),
-        _Intersection(202, _lon(50.0), 0.0, 20.0),
+        ClipIntersection(101, _lon(-50.0), 0.0, 20.0),
+        ClipIntersection(202, _lon(50.0), 0.0, 20.0),
     ]
 
 
-def clip_points() -> list[_TrackPoint]:
+def clip_points() -> list[TrackPoint]:
     return [
         track_point(1, -100.0, source_row_key="source-a"),
         track_point(
@@ -426,8 +418,8 @@ def test_clip_track_batches_same_position_exit_then_entry_without_false_road() -
         track_point(5, 100.0),
     ]
     custom_intersections = [
-        _Intersection(101, _lon(-50.0), 0.0, 20.0),
-        _Intersection(202, _lon(-10.0), 0.0, 20.0),
+        ClipIntersection(101, _lon(-50.0), 0.0, 20.0),
+        ClipIntersection(202, _lon(-10.0), 0.0, 20.0),
     ]
 
     features = _clip_track(
@@ -464,7 +456,7 @@ def test_source_fingerprint_rejects_missing_referenced_row() -> None:
 
 def test_coordinate_transformer_rejects_invalid_context_and_distortion() -> None:
     with pytest.raises(MapDataError, match="area of use"):
-        _CoordinateTransformer(
+        CoordinateTransformer(
             _DetectContext(
                 "detect",
                 _REFINE,
@@ -479,7 +471,7 @@ def test_coordinate_transformer_rejects_invalid_context_and_distortion() -> None
         ).forward_many([(110.0, 36.0), (116.0, 39.0)])
 
     with pytest.raises(MapDataError, match="scale distortion"):
-        _CoordinateTransformer(
+        CoordinateTransformer(
             _DetectContext(
                 "detect",
                 _REFINE,
@@ -501,7 +493,7 @@ def test_point_limit_drops_partial_final_track() -> None:
         resolved_row(2, "b", 3, 0.01),
         resolved_row(2, "b", 4, 0.011),
     ]
-    grouped, truncated = _complete_tracks(rows, 3)
+    grouped, truncated = complete_track_groups(rows, 3)
     assert truncated is True
     assert list(grouped) == [("a", 1)]
 
