@@ -18,7 +18,6 @@ from collections.abc import Iterable, Iterator
 import numpy as np
 
 from .exceptions import V2Error
-from .models import TrajectoryPoint
 
 
 # ── Earth radius (approximate, city-scale) ────────────────────────────
@@ -496,13 +495,3 @@ def _branch_angle_from_center(
 ) -> float:
     """Bearing from center to boundary point, representing a branch direction."""
     return _bearing_deg(center, boundary_point)
-
-
-def _point_xy(point: TrajectoryPoint) -> tuple[float, float]:
-    """Return one point's Run-scoped processing coordinates."""
-    if point.x is None or point.y is None:
-        raise V2Error(
-            "trajectory point is missing processing-CRS x/y; project the track "
-            "with the Run SpatialContext before running Detect"
-        )
-    return float(point.x), float(point.y)

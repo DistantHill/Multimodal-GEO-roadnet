@@ -1,111 +1,51 @@
-from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
-"""Source ablation keeps its full-cluster semantics without retaining payloads."""
-from dataclasses import replace
+"""Ablation retains centroid columns, releasing rebuilt cluster payloads."""
 import gc
 import weakref
+from dataclasses import replace
 from unittest.mock import patch
-
+import numpy as np
 import pytest
-
-from track.v2.intersections.detect_intersections import (
-    IntersectConfig,
-    _annotate_source_ablation,
-    _build_candidate_clusters,
-    _cluster_sources,
-    _is_cluster_rediscovered,
-    _with_source_provenance,
-)
-from track.v2.models import CrossTrackCandidate, HotspotCluster, PointRef, TurnEvent
-from .test_detect import _TEST_TRANSFORMER
+from .config_factory import intersect_config
+from .detect_columns_helpers import TRANSFORMER
+from track.v2.models import HotspotCluster, MemberBatch
+from track.v2.candidates.detect_turn_events import empty_turn_batch
+from track.v2.candidates.detect_cross_track_pairs import empty_cross_batch
+from track.v2.intersections.detect_intersections import _annotate_source_ablation
 
 
-def _old_annotation(clusters, turns, crossings, config):
-    """The previous implementation retained complete reclustered objects."""
-    reclustered = {
-        source: _build_candidate_clusters(
-            turns, crossings, config, _TEST_TRANSFORMER,
-            disabled_sources={source},
-        )
-        for source in sorted({source for cluster in clusters for source in _cluster_sources(cluster)})
-    }
-    return [
-        _with_source_provenance(
-            cluster,
-            critical_sources=tuple(
-                source for source in _cluster_sources(cluster)
-                if not _is_cluster_rediscovered(
-                    cluster, reclustered[source],
-                    distance_m=config.merge_centroid_distance_m,
-                )
-            ),
-        )
-        for cluster in clusters
-    ]
-
-
-def _event(index, x, y):
-    lon, lat = _TEST_TRANSFORMER.inverse(x, y)
-    return TurnEvent(index, f"v{index}", float(index), lon, lat, x, y, 0, 90, 90, 90)
-
-
-def _crossing(index, x, y):
-    lon, lat = _TEST_TRANSFORMER.inverse(x, y)
-    return CrossTrackCandidate(
-        point_ref=PointRef("s", str(index), stable=True),
-        from_segment_start_point_ref=PointRef("s", f"a{index}", stable=True),
-        to_segment_start_point_ref=PointRef("s", f"b{index}", stable=True),
-        vehicle_id=f"cross{index}", timestamp=float(index), lon=lon, lat=lat,
-        x=x, y=y, heading=0., speed=10.,
-    )
-
-
-@pytest.mark.parametrize("separation", [0., 10., 1000.])
-def test_compact_ablation_matches_full_reclustering_reference(separation):
-    x, y = _TEST_TRANSFORMER.forward(116., 39.)
-    turns = [_event(i, x + i, y + i) for i in range(4)]
-    crossings = [_crossing(i, x + separation + i, y + i) for i in range(4)]
-    config = intersect_config(
-        dbscan_eps_m_turn=20., dbscan_min_samples_turn=2,
-        cross_track_dbscan_eps_m=20., cross_track_dbscan_min_samples=2,
-        merge_centroid_distance_m=25.,
-    )
-    clusters = _build_candidate_clusters(turns, crossings, config, _TEST_TRANSFORMER)
-    expected = _old_annotation(clusters, turns, crossings, config)
-    assert _annotate_source_ablation(clusters, turns, crossings, config, _TEST_TRANSFORMER) == expected
-
-
-def test_full_reclustered_objects_are_released_before_next_source():
-    base = HotspotCluster(
-        cluster_calculate_index=0, centroid_x=0., centroid_y=0.,
-        centroid_lon=116., centroid_lat=39., radius_m=25.,
-        algorithm_sources=("orthogonal_cross_track", "turn"),
-    )
-    refs = []
-    calls = []
-
-    def build(*_args, disabled_sources, **_kwargs):
-        gc.collect()
-        assert all(reference() is None for reference in refs)
-        calls.append(disabled_sources)
-        event = _event(len(calls), 0., 0.)
-        point_ref = PointRef("only-in-reclustered-result", str(len(calls)), stable=True)
-        rebuilt = replace(
-            base, events=(event,), source_point_refs={"turn": (point_ref,)},
-        )
-        refs.extend((weakref.ref(rebuilt), weakref.ref(event), weakref.ref(point_ref)))
+def test_rebuilt_clusters_are_released_between_source_passes():
+    cluster=HotspotCluster(0,0.,0.,0.,0.,1.,algorithm_sources=("orthogonal_cross_track","turn"))
+    references=[]; sources=[]
+    def build(*args,disabled_sources,**kwargs):
+        gc.collect(); assert all(value() is None for value in references)
+        sources.append(disabled_sources)
+        members=MemberBatch(np.asarray(["turn"]),np.asarray([0],dtype=np.int64),np.asarray([0],dtype=np.int64),np.asarray(["source"]),np.asarray([True]))
+        rebuilt=replace(cluster,members=members)
+        references.extend((weakref.ref(rebuilt),weakref.ref(members.calculation_index),weakref.ref(members.kind)))
         return [rebuilt]
-
-    with patch("track.v2.intersections.detect_intersections._build_candidate_clusters", side_effect=build):
-        actual = _annotate_source_ablation([base], [], [], intersect_config(), _TEST_TRANSFORMER)
-    gc.collect()
-    assert all(reference() is None for reference in refs)
-    assert calls == [{"orthogonal_cross_track"}, {"turn"}]
-    assert actual[0].critical_sources == ()
+    with patch("track.v2.intersections.detect_intersections._build_candidate_clusters",side_effect=build):
+        output=_annotate_source_ablation([cluster],empty_turn_batch(),empty_cross_batch(),intersect_config(),TRANSFORMER)
+    assert sources==[{"orthogonal_cross_track"},{"turn"}]
+    assert output[0].critical_sources==()
+    gc.collect(); assert all(value() is None for value in references)
 
 
-def test_rediscovery_still_accepts_full_clusters_and_includes_distance_boundary():
-    cluster = HotspotCluster(0, 0., 0., 116., 39., 1.)
-    other = replace(cluster, centroid_x=3., centroid_y=4.)
-    assert _is_cluster_rediscovered(cluster, [other], distance_m=5.)
-    assert not _is_cluster_rediscovered(cluster, [other], distance_m=4.999)
-    assert not _is_cluster_rediscovered(cluster, [], distance_m=5.)
+@pytest.mark.parametrize("separation,critical",[(0.,()),(10.,()),(1000.,("orthogonal_cross_track","turn"))])
+def test_compact_ablation_preserves_independent_expected_source_criticality(separation,critical):
+    from .test_detect_algorithm_regressions import _events
+    from track.v2.intersections.detect_intersections import _build_candidate_clusters
+    turns=_events([[i,i] for i in range(4)])
+    cross=_events([[separation+i,i] for i in range(4)],cross=True)
+    config=intersect_config(dbscan_eps_m_turn=20.,dbscan_min_samples_turn=2,cross_track_dbscan_eps_m=20.,cross_track_dbscan_min_samples=2,merge_centroid_distance_m=25.)
+    clusters=_build_candidate_clusters(turns,cross,config,TRANSFORMER)
+    annotated=_annotate_source_ablation(clusters,turns,cross,config,TRANSFORMER)
+    assert tuple(sorted(source for cluster in annotated for source in cluster.critical_sources))==critical
+
+
+@pytest.mark.parametrize("distance,critical",[(5.,()),(4.999,("turn",))])
+def test_rediscovery_includes_distance_boundary(distance,critical):
+    cluster=HotspotCluster(0,0.,0.,0.,0.,1.,algorithm_sources=("turn",))
+    other=replace(cluster,centroid_x=3.,centroid_y=4.)
+    with patch("track.v2.intersections.detect_intersections._build_candidate_clusters",return_value=[other]):
+        result=_annotate_source_ablation([cluster],empty_turn_batch(),empty_cross_batch(),intersect_config(merge_centroid_distance_m=distance),TRANSFORMER)
+    assert result[0].critical_sources==critical

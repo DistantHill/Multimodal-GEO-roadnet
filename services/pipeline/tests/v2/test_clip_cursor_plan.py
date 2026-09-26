@@ -8,6 +8,7 @@ import pytest
 from track.v2.intersections.query_results import fetch_resolved_clip_tracks
 from track.v2.db.plan_full_scan_cursor import declare_full_scan_cursor
 from .test_clip_fitting_streaming import Connection
+from .test_clip import _CONTEXT
 
 
 def test_default_full_scan_does_not_touch_nested_loop_setting():
@@ -108,13 +109,13 @@ def test_intersection_lookup_preserves_missing_candidates_and_point_order():
             (4, 1, 3, "v", 1., 2., None, None, None)]
     conn = Connection(rows)
     with (
-        patch("track.v2.intersections.query_results.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s")),
+        patch("track.v2.intersections.query_results.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s", spatial_context=_CONTEXT)),
         patch("track.v2.intersections.query_results.validate_source_table", return_value=SimpleNamespace(quoted_table='"s"', key_sql_type="bigint")),
     ):
         tracks = list(fetch_resolved_clip_tracks(conn, "d", batch_size=2000))
-    assert [point.resolved_point_id for point in tracks[0].points] == [1, 2, 3, 4]
-    assert [point.intersection_id for point in tracks[0].points] == [None, 10, None, None]
-    assert [point.crossing_id for point in tracks[0].points] == [None, 101, 102, None]
+    assert tracks[0].resolved_point_ids.tolist() == [1, 2, 3, 4]
+    assert [int(identifier) if valid else None for identifier, valid in zip(tracks[0].intersection_ids, tracks[0].intersection_valid)] == [None, 10, None, None]
+    assert [int(identifier) if valid else None for identifier, valid in zip(tracks[0].crossing_ids, tracks[0].crossing_valid)] == [None, 101, 102, None]
     assert conn.fraction == "0.37"
     assert conn.value.closed
 

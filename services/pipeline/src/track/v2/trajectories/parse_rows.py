@@ -23,7 +23,7 @@ def _parse_row_from_tuple(
     source_id: str,
     pk_idx: int | None,
 ) -> tuple[tuple, list[ParseIssue]]:
-    """ZH: PG 元组快速解析路径——跳过 _row_to_dict dict 分配 + _raw_value 双 dict 查找，
+    """ZH: PG 元组快速解析路径——跳过行映射分配及重复列查找，
         直接用 tuple[row_idx] 索引。保留 parse_row 全部校验语义。
     EN: Fast-path tuple parser for PG rows — skips per-row dict allocation and
         double dict lookup in _raw_value. Preserves all parse_row validation.

@@ -11,6 +11,7 @@ from urllib.parse import unquote
 from uuid import uuid4
 
 import duckdb
+import numpy as np
 import pytest
 from unittest.mock import patch
 
@@ -154,7 +155,8 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
         runtime_config(duckdb_threads=1),
     ) as reader:
         assert list(reader.intersections()) == expected_intersections
-        assert list(reader.iter_tracks(batch_size=1)) == expected_tracks
+        actual_tracks = list(reader.iter_tracks(batch_size=1))
+        assert [track.as_dict() for track in actual_tracks] == [track.as_dict() for track in expected_tracks]
     oracle_input = ClipInput(
         tuple(expected_intersections), tuple(expected_tracks),
         fetch_detect_row(conn, str(detect_id)).spatial_context, str(detect_id),
@@ -177,7 +179,7 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
             )
         try:
             assert actual_clip.as_dict() == expected_clip.as_dict()
-            assert tuple(actual_clip.clips) == expected_clip.clips
+            assert [clip.as_dict() for clip in actual_clip.clips] == [clip.as_dict() for clip in expected_clip.clips]
             assert actual_clip.report == expected_clip.report
             assert actual_clip.intersections == expected_clip.intersections
         finally:
@@ -197,9 +199,11 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
         (item.intersection_id, item.lon, item.lat, item.radius_m) for item in expected_intersections
     ]
     assert actual_points == [
-        (point.resolved_point_id, point.lon, point.lat, point.crossing_id,
-         point.intersection_id, point.crossing_type)
-        for track in expected_tracks for point in track.points
+        (int(track.resolved_point_ids[i]), float(track.lonlat[i,0]), float(track.lonlat[i,1]),
+         int(track.crossing_ids[i]) if track.crossing_valid[i] else None,
+         int(track.intersection_ids[i]) if track.intersection_valid[i] else None,
+         int(track.crossing_types[i]) if track.crossing_valid[i] else None)
+        for track in expected_tracks for i in range(len(track.xy))
     ]
     assert descriptor.detect_id == detect_id
 

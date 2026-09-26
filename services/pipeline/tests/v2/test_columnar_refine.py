@@ -36,3 +36,11 @@ def test_zero_and_negative_source_keys_are_valid():
                             config=RefineConfig(100, 45, 135, 50, 1, 20, 10))
     assert result.subtracks[0].source_row_key.tolist() == [0, -1]
     assert result.subtracks[0].source_row_key_valid.tolist() == [True, True]
+
+
+def test_extra_column_preserves_nested_json_values_as_one_dimensional():
+    from track.v2.trajectories.read_source import _extra_column
+    values = [[1, 2], [3, 4]]
+    column = _extra_column(values)
+    assert column.shape == (2,)
+    assert column.tolist() == values

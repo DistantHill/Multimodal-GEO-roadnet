@@ -12,7 +12,6 @@ from track.v2.validation.replay_lineage import (
     PostgresReplayStore,
     ReplayService,
     ReplayTarget,
-    _replay_fit_endpoint,
     _stringify_source_row_key,
 )
 
@@ -72,38 +71,6 @@ def test_missing_target_is_reported_without_legacy_fallback() -> None:
     )
     assert trace.status == "not_found"
     assert trace.errors[0].code == "target_not_found"
-
-
-def test_fit_endpoint_is_a_persisted_crossing_not_an_interpolation() -> None:
-    point = SimpleNamespace(
-        resolved_point_id=10,
-        crossing_id=20,
-        intersection_id=30,
-        crossing_type=0,
-        lon=116.1,
-        lat=39.1,
-    )
-
-    endpoint = _replay_fit_endpoint(point, expected_type=0)
-
-    assert endpoint.resolved_point_id == 10
-    assert endpoint.crossing_id == 20
-    assert endpoint.kind == "exit"
-    assert endpoint.lon == 116.1
-    assert not hasattr(endpoint, "segment_fraction")
-
-
-def test_fit_endpoint_rejects_wrong_crossing_type() -> None:
-    point = SimpleNamespace(
-        resolved_point_id=10,
-        crossing_id=20,
-        intersection_id=30,
-        crossing_type=1,
-        lon=116.1,
-        lat=39.1,
-    )
-    with pytest.raises(ValueError, match="resolved exit crossing"):
-        _replay_fit_endpoint(point, expected_type=0)
 
 
 class _NoQueryConnection:

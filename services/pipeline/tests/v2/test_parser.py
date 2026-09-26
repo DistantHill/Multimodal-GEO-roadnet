@@ -252,8 +252,8 @@ class FakeSelectorTest(unittest.TestCase):
             self.assertIn(core, mapping.canonical_to_source)
 
 
-class CsvPointRefTest(unittest.TestCase):
-    """P0-10: CSV PointRef is stable and uses row number."""
+class CsvSourceIdentityTest(unittest.TestCase):
+    """P0-10: CSV source identity is stable and uses row number."""
 
     def test_csv_pointref_stable(self):
         with tempfile.TemporaryDirectory() as td:
@@ -516,7 +516,7 @@ class IterPointsRepeatableTest(unittest.TestCase):
 
 
 class ExtraFieldTest(unittest.TestCase):
-    """P0-21: TOML extra=true fields appear in TrajectoryPoint.extra."""
+    """P0-21: TOML extra=true fields appear in SourceBatch extra columns."""
 
     def test_extra_fields_present(self):
         specs = _field_config().specs

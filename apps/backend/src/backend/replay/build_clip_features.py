@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import numpy as np
 from typing import Any, Protocol
 
 from pyproj import CRS, Proj, Transformer
 
 from ..map_errors import MapDataError
 from ..map_features import create_map_feature
-from .track_points import TrackPoint
+from .track_points import TrackBatch
 
 
 _EPS = 1e-9
@@ -88,27 +89,22 @@ class CoordinateTransformer:
         )
         self._max_scale_error = max_scale_error
 
-    def forward_many(
-        self,
-        coordinates: list[tuple[float, float]],
-    ) -> list[tuple[float, float]]:
-        if not coordinates:
-            return []
-        if any(
-            not (math.isfinite(lon) and math.isfinite(lat))
-            or not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0)
-            for lon, lat in coordinates
-        ):
+    def forward_many(self, coordinates: np.ndarray) -> np.ndarray:
+        if coordinates.shape != (len(coordinates), 2) or coordinates.dtype != np.float64:
+            raise MapDataError("coordinates must be float64 (N,2)")
+        if not len(coordinates):
+            return np.empty((0,2), dtype=np.float64)
+        if (not np.isfinite(coordinates).all() or np.any(np.abs(coordinates[:,0]) > 180)
+                or np.any(np.abs(coordinates[:,1]) > 90)):
             raise MapDataError("input contains invalid EPSG:4326 coordinates")
-        lons = [coordinate[0] for coordinate in coordinates]
-        lats = [coordinate[1] for coordinate in coordinates]
-        self._validate_bounds((min(lons), min(lats), max(lons), max(lats)))
+        self._validate_bounds((float(coordinates[:,0].min()), float(coordinates[:,1].min()),
+                               float(coordinates[:,0].max()), float(coordinates[:,1].max())))
         try:
-            xs, ys = self._forward.transform(lons, lats, errcheck=True)
+            xs, ys = self._forward.transform(coordinates[:,0], coordinates[:,1], errcheck=True)
         except Exception as exc:
             raise MapDataError("coordinates could not be projected") from exc
-        result = [(float(x), float(y)) for x, y in zip(xs, ys, strict=True)]
-        if any(not (math.isfinite(x) and math.isfinite(y)) for x, y in result):
+        result = np.column_stack((xs,ys))
+        if not np.isfinite(result).all():
             raise MapDataError("coordinates could not be projected")
         return result
 
@@ -158,122 +154,75 @@ class CoordinateTransformer:
                 )
 
 def _clip_track(
-    key: tuple[str, int],
-    points: list[TrackPoint],
-    intersections: list[ClipIntersection],
-    requested: set[int],
-    detect_id: str,
-    transformer: CoordinateTransformer,
+    key: tuple[str, int], points: TrackBatch, intersections: list[ClipIntersection],
+    requested: set[int], detect_id: str, transformer: CoordinateTransformer,
 ) -> list[dict[str, Any]]:
     if len(points) < 2:
         return []
-    projected = transformer.forward_many(
-        [(points[0].lon, points[0].lat)]
-        + [(item.lon, item.lat) for item in intersections]
-    )
-    first_x, first_y = projected[0]
-    active = {
-        item.intersection_id
-        for item, (center_x, center_y) in zip(intersections, projected[1:], strict=True)
-        if math.hypot(first_x - center_x, first_y - center_y) < item.radius_m - _EPS
-    }
-    event_indexes = [
-        index for index, point in enumerate(points) if point.crossing_id is not None
-    ]
-    features: list[dict[str, Any]] = []
-    open_point: TrackPoint | None = None
+    if np.any(points.crossing_valid != points.intersection_valid):
+        raise MapDataError(f"subtrack {key[1]} has invalid crossing metadata")
+    xy = transformer.forward_many(points.lonlat)
+    centers = transformer.forward_many(np.asarray([(item.lon,item.lat) for item in intersections], dtype=np.float64).reshape(-1,2))
+    first_x,first_y = xy[0]
+    active = {item.intersection_id for item,(cx,cy) in zip(intersections,centers,strict=True)
+              if math.hypot(first_x-cx, first_y-cy) < item.radius_m-_EPS}
+    events = np.flatnonzero(points.crossing_valid).tolist()
+    features = []
+    open_point: int | None = None
     open_index = 0
     cursor = 0
-    while cursor < len(event_indexes):
-        first = event_indexes[cursor]
-        batch_indexes = [first]
+    while cursor < len(events):
+        first = events[cursor]
+        batch = [first]
         cursor += 1
-        while cursor < len(event_indexes):
-            index = event_indexes[cursor]
-            previous = event_indexes[cursor - 1]
-            if index != previous + 1 or not _same_position(points[first], points[index]):
+        while cursor < len(events):
+            index = events[cursor]
+            if index != events[cursor-1]+1 or not np.all(np.abs(points.lonlat[first]-points.lonlat[index]) <= 1e-12):
                 break
-            batch_indexes.append(index)
+            batch.append(index)
             cursor += 1
-        batch = [points[index] for index in batch_indexes]
         before_empty = not active
-        exits = sorted(
-            (point for point in batch if point.crossing_type == 0),
-            key=lambda point: (point.intersection_id or -1, point.crossing_id or -1),
-        )
-        entries = sorted(
-            (point for point in batch if point.crossing_type == 1),
-            key=lambda point: (point.intersection_id or -1, point.crossing_id or -1),
-        )
-        if len(exits) + len(entries) != len(batch):
+        ordering = lambda i: (int(points.intersection_ids[i]) or -1, int(points.crossing_ids[i]) or -1)
+        exits = sorted((i for i in batch if points.crossing_types[i] == 0), key=ordering)
+        entries = sorted((i for i in batch if points.crossing_types[i] == 1), key=ordering)
+        if len(exits)+len(entries) != len(batch):
             raise MapDataError(f"subtrack {key[1]} has invalid crossing metadata")
-        for point in exits:
-            assert point.intersection_id is not None
-            if point.intersection_id not in active:
-                raise MapDataError(
-                    f"subtrack {key[1]} exits inactive intersection {point.intersection_id}"
-                )
-            active.remove(point.intersection_id)
-        for point in entries:
-            assert point.intersection_id is not None
-            if point.intersection_id in active:
-                raise MapDataError(
-                    f"subtrack {key[1]} re-enters active intersection {point.intersection_id}"
-                )
-            active.add(point.intersection_id)
+        for index in exits:
+            identifier = int(points.intersection_ids[index])
+            if identifier not in active:
+                raise MapDataError(f"subtrack {key[1]} exits inactive intersection {identifier}")
+            active.remove(identifier)
+        for index in entries:
+            identifier = int(points.intersection_ids[index])
+            if identifier in active:
+                raise MapDataError(f"subtrack {key[1]} re-enters active intersection {identifier}")
+            active.add(identifier)
         after_empty = not active
         if not before_empty and after_empty:
-            open_point = exits[-1]
-            open_index = batch_indexes[-1]
+            open_point,open_index = exits[-1],batch[-1]
         elif before_empty and not after_empty:
             if open_point is not None:
-                end_point = entries[0]
-                if {open_point.intersection_id, end_point.intersection_id} == requested:
-                    segment = points[open_index : batch_indexes[0] + 1]
-                    coordinates = [[point.lon, point.lat] for point in segment]
-                    distance = _polyline_distance(coordinates, transformer)
+                end = entries[0]
+                if {int(points.intersection_ids[open_point]), int(points.intersection_ids[end])} == requested:
+                    stop = batch[0]+1
+                    distance = float(np.linalg.norm(np.diff(xy[open_index:stop], axis=0), axis=1).sum())
                     if distance > _EPS:
-                        ordinal = len(features)
-                        features.append(
-                            create_map_feature(
-                                f"{detect_id}:{key[1]}:{ordinal}",
-                                {"type": "LineString", "coordinates": coordinates},
-                                vehicle_id=key[0],
-                                subtrack_index=key[1],
-                                clip_type="between_intersection",
-                                from_intersection_id=open_point.intersection_id,
-                                to_intersection_id=end_point.intersection_id,
-                                start_crossing_id=open_point.crossing_id,
-                                end_crossing_id=end_point.crossing_id,
-                                resolved_point_ids=[
-                                    point.resolved_point_id for point in segment[1:-1]
-                                ],
-                                source_row_keys=[
-                                    point.source_row_key for point in segment[1:-1]
-                                ],
-                                distance_m=distance,
-                                point_count=len(segment),
-                            )
-                        )
+                        segment = points.slice(open_index,stop)
+                        features.append(create_map_feature(
+                            f"{detect_id}:{key[1]}:{len(features)}",
+                            {"type":"LineString", "coordinates":segment.lonlat.tolist()},
+                            vehicle_id=key[0],subtrack_index=key[1],clip_type="between_intersection",
+                            from_intersection_id=int(points.intersection_ids[open_point]),
+                            to_intersection_id=int(points.intersection_ids[end]),
+                            start_crossing_id=int(points.crossing_ids[open_point]),end_crossing_id=int(points.crossing_ids[end]),
+                            resolved_point_ids=[int(value) if valid else None for value,valid in zip(segment.resolved_point_ids[1:-1],segment.resolved_valid[1:-1])],
+                            source_row_keys=[str(value) if valid else None for value,valid in zip(segment.source_row_keys[1:-1],segment.source_valid[1:-1])],
+                            distance_m=distance,point_count=len(segment),
+                        ))
             open_point = None
         elif before_empty and after_empty:
             raise MapDataError(f"subtrack {key[1]} has a no-op crossing batch")
     return features
-
-def _same_position(left: TrackPoint, right: TrackPoint) -> bool:
-    return abs(left.lon - right.lon) <= 1e-12 and abs(left.lat - right.lat) <= 1e-12
-
-def _polyline_distance(
-    coordinates: list[list[float]],
-    transformer: CoordinateTransformer,
-) -> float:
-    projected = transformer.forward_many(
-        [(coordinate[0], coordinate[1]) for coordinate in coordinates]
-    )
-    return sum(
-        math.hypot(right[0] - left[0], right[1] - left[1])
-        for left, right in zip(projected, projected[1:])
-    )
 
 def _longitude_bounds_within_area(
     lon_min: float,
@@ -290,7 +239,7 @@ def _longitude_bounds_within_area(
 
 
 def build_clip_features(
-    grouped_tracks: dict[tuple[str, int], list[TrackPoint]],
+    grouped_tracks: dict[tuple[str, int], TrackBatch],
     intersections: list[ClipIntersection],
     requested_intersection_ids: set[int],
     context: ClipProjectionContext,

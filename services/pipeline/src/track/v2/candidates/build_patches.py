@@ -10,13 +10,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from ..intersections.performance_timing import PerfTracker
-from ..models import TrajectoryPoint
+from ..models import RefinementSubtrack
 
-if TYPE_CHECKING:
-    from .detect_cross_track_pairs import _CrossTrackSegment
 
-CellSpan = tuple[int, int, int, int]
-TrackPatch = dict[str, list[TrajectoryPoint]]
+TrackPatch = dict[int, RefinementSubtrack]
 
 
 class CrossTrackCapacityError(RuntimeError):
@@ -27,7 +24,7 @@ CROSS_TRACK_OVERFLOW_PAIR_LIMIT = 20_000_000
 
 
 def iter_track_patches(
-    tracks: Iterable[tuple[str, list[TrajectoryPoint]]],
+    tracks: Iterable[tuple[int, RefinementSubtrack]],
     batch_size: int,
 ) -> Iterator[TrackPatch]:
     """Keep each track intact; emit bounded patches, including the final tail.
@@ -43,20 +40,25 @@ def iter_track_patches(
         if len(patch) >= batch_size:
             yield patch
             patch = {}
+            del track
     if patch:
         yield patch
 
 
 @dataclass
 class CrossTrackIndex:
-    spans: list[CellSpan | None]
-    vehicle_ranks: np.ndarray
+    spans: np.ndarray
+    finite: np.ndarray
+    representable: np.ndarray
+    subtrack_indices: np.ndarray
     grid: dict[tuple[int, int], list[int]]
     overflow_segment_ids: list[int]
 
 
 def build_cross_track_index(
-    segments: list[_CrossTrackSegment],
+    starts: np.ndarray,
+    ends: np.ndarray,
+    subtrack_indices: np.ndarray,
     *,
     cell_m: float,
     max_cells: int,
@@ -65,12 +67,26 @@ def build_cross_track_index(
     telemetry: dict[str, int | float] | None = None,
 ) -> CrossTrackIndex:
     """Check capacity before allocating grid memberships, then build the index."""
-    spans = [_grid_span(s.x1, s.y1, s.x2, s.y2, cell_m) for s in segments]
+    starts = np.asarray(starts, dtype=np.float64)
+    ends = np.asarray(ends, dtype=np.float64)
+    subtrack_indices = np.asarray(subtrack_indices, dtype=np.int64)
+    if starts.shape != ends.shape or starts.shape != (len(subtrack_indices), 2):
+        raise ValueError("segment columns have inconsistent shapes")
+    spans=np.zeros((len(starts),4),dtype=np.int64)
+    finite=np.isfinite(starts).all(axis=1)&np.isfinite(ends).all(axis=1)
+    representable=finite.copy()
+    limits=np.iinfo(np.int64)
+    for i in np.flatnonzero(finite):
+        quotients=(min(starts[i,0],ends[i,0])/cell_m,max(starts[i,0],ends[i,0])/cell_m,min(starts[i,1],ends[i,1])/cell_m,max(starts[i,1],ends[i,1])/cell_m)
+        if not all(math.isfinite(value) and limits.min<=math.floor(value)<=limits.max for value in quotients):
+            representable[i]=False
+        else:
+            spans[i]=tuple(math.floor(value) for value in quotients)
     if max_grid_memberships is not None or max_overflow_pair_space is not None:
         indexed_memberships, overflow_count = _estimate_grid_capacity(
-            spans, max_cells,
+            spans, finite, representable, max_cells,
         )
-        overflow_pair_space = overflow_count * len(segments)
+        overflow_pair_space = overflow_count * len(starts)
         if telemetry is not None:
             telemetry["grid_memberships_estimate"] = indexed_memberships
             telemetry["overflow_segments"] = overflow_count
@@ -93,10 +109,12 @@ def build_cross_track_index(
                 f"{overflow_pair_space:,} segment pairs; "
                 f"budget is {max_overflow_pair_space:,}"
             )
-    grid, overflow_ids = _build_grid(spans, max_cells)
+    grid, overflow_ids = _build_grid(spans, finite, representable, max_cells)
     return CrossTrackIndex(
         spans,
-        np.array([s.vehicle_rank for s in segments], dtype=np.int64),
+        finite,
+        representable,
+        subtrack_indices,
         grid,
         overflow_ids,
     )
@@ -108,28 +126,28 @@ def iter_cross_track_patches(
     *,
     perf: PerfTracker | None = None,
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-    """Yield canonical cross-vehicle pairs once, bounded by the patch size.
+    """Yield canonical cross-subtrack pairs once, bounded by the patch size.
 
     Multi-cell pairs belong to their minimum shared cell. Long segments use
     the same bounded pair stream, with overflow/overflow duplicates removed.
     """
     if batch_size <= 0:
         raise ValueError("cross-track patch size must be positive")
-    min_cx = np.array([s[0] if s is not None else -1 for s in index.spans], dtype=np.int64)
-    min_cy = np.array([s[2] if s is not None else -1 for s in index.spans], dtype=np.int64)
+    min_cx = index.spans[:,0]
+    min_cy = index.spans[:,2]
     cells = sorted(index.grid)
     cell_iter = perf.timed_iter(cells, name="cross_track_grid_cells", total=len(cells)) if perf else cells
     for cell_x, cell_y in cell_iter:
         seg_ids = np.asarray(index.grid[(cell_x, cell_y)], dtype=np.int64)
         if len(seg_ids) < 2:
             continue
-        for ids_a, ids_b in _iter_cross_vehicle_pair_batches(seg_ids, index.vehicle_ranks, batch_size):
+        for ids_a, ids_b in _iter_cross_subtrack_pair_batches(seg_ids, index.subtrack_indices, batch_size):
             keep = np.maximum(min_cx[ids_a], min_cx[ids_b]) == cell_x
             keep &= np.maximum(min_cy[ids_a], min_cy[ids_b]) == cell_y
             if np.any(keep):
                 yield ids_a[keep], ids_b[keep]
     yield from _iter_overflow_pair_batches(
-        index.spans, index.vehicle_ranks, index.overflow_segment_ids, batch_size,
+        index.finite, index.subtrack_indices, index.overflow_segment_ids, batch_size,
     )
 
 
@@ -151,44 +169,26 @@ def _grid_span(
     )
 
 
-def _estimate_grid_capacity(
-    spans: list[CellSpan | None],
-    max_cells: int,
-) -> tuple[int, int]:
-    """Return indexed memberships and overflow count without allocating a grid."""
-    memberships = 0
-    overflow_count = 0
-    for span in spans:
-        if span is None:
-            continue
-        cell_min_x, cell_max_x, cell_min_y, cell_max_y = span
-        cell_count = (cell_max_x - cell_min_x + 1) * (cell_max_y - cell_min_y + 1)
-        if cell_count > max_cells:
-            overflow_count += 1
-        else:
-            memberships += cell_count
-    return memberships, overflow_count
+def _estimate_grid_capacity(spans,finite,representable,max_cells):
+    memberships=overflow=0
+    for i in np.flatnonzero(finite):
+        if not representable[i]: overflow+=1; continue
+        x0,x1,y0,y1=(int(value) for value in spans[i])
+        count=(x1-x0+1)*(y1-y0+1)
+        if count>max_cells: overflow+=1
+        else: memberships+=count
+    return memberships,overflow
 
 
-def _build_grid(
-    spans: list[CellSpan | None],
-    max_cells: int,
-) -> tuple[dict[tuple[int, int], list[int]], list[int]]:
-    """Assign bounded AABBs to cells and retain long spans for exact fallback."""
-    grid: dict[tuple[int, int], list[int]] = defaultdict(list)
-    overflow_segment_ids: list[int] = []
-    for segment_id, span in enumerate(spans):
-        if span is None:
-            continue
-        cell_min_x, cell_max_x, cell_min_y, cell_max_y = span
-        cell_count = (cell_max_x - cell_min_x + 1) * (cell_max_y - cell_min_y + 1)
-        if cell_count > max_cells:
-            overflow_segment_ids.append(segment_id)
-            continue
-        for cell_x in range(cell_min_x, cell_max_x + 1):
-            for cell_y in range(cell_min_y, cell_max_y + 1):
-                grid[(cell_x, cell_y)].append(segment_id)
-    return grid, overflow_segment_ids
+def _build_grid(spans,finite,representable,max_cells):
+    grid=defaultdict(list); overflow=[]
+    for i in np.flatnonzero(finite):
+        if not representable[i]: overflow.append(int(i)); continue
+        x0,x1,y0,y1=(int(value) for value in spans[i])
+        if (x1-x0+1)*(y1-y0+1)>max_cells: overflow.append(int(i)); continue
+        for x in range(x0,x1+1):
+            for y in range(y0,y1+1): grid[(x,y)].append(int(i))
+    return grid,overflow
 
 
 def _iter_pair_batches(
@@ -209,25 +209,25 @@ def _iter_pair_batches(
         yield a_ids[flat // len(b_ids)], b_ids[flat % len(b_ids)]
 
 
-def _iter_cross_vehicle_pair_batches(
+def _iter_cross_subtrack_pair_batches(
     segment_ids: list[int] | np.ndarray,
-    vehicle_ranks: np.ndarray,
+    subtrack_indices: np.ndarray,
     batch_size: int,
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-    """Yield only canonical cross-vehicle pairs from rank-ordered segments."""
+    """Yield only canonical cross-subtrack pairs from rank-ordered segments."""
     ids = np.asarray(segment_ids, dtype=np.int64)
     if len(ids) < 2:
         return
-    ranks = vehicle_ranks[ids]
+    ranks = subtrack_indices[ids]
     if np.any(ranks[1:] < ranks[:-1]):
-        raise ValueError("cross-track segment ids must be ordered by vehicle rank")
+        raise ValueError("cross-track segment ids must be ordered by subtrack index")
 
     batch_a = np.empty(batch_size, dtype=np.int64)
     batch_b = np.empty(batch_size, dtype=np.int64)
     pending = 0
     for position, segment_id in enumerate(ids):
-        first_other_vehicle = int(np.searchsorted(ranks, ranks[position], side="right"))
-        candidates = ids[first_other_vehicle:]
+        first_other_subtrack = int(np.searchsorted(ranks, ranks[position], side="right"))
+        candidates = ids[first_other_subtrack:]
         candidate_offset = 0
         while candidate_offset < len(candidates):
             take = min(batch_size - pending, len(candidates) - candidate_offset)
@@ -245,27 +245,24 @@ def _iter_cross_vehicle_pair_batches(
 
 
 def _iter_overflow_pair_batches(
-    spans: list[CellSpan | None],
-    vehicle_ranks: np.ndarray,
+    finite: np.ndarray,
+    subtrack_indices: np.ndarray,
     overflow_segment_ids: list[int],
     batch_size: int,
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
     """Yield every long-AABB pair once under the standard batch bound."""
-    finite_segment_ids = [
-        segment_id for segment_id, span in enumerate(spans)
-        if span is not None
-    ]
+    finite_segment_ids = np.flatnonzero(finite)
     overflow_ids = set(overflow_segment_ids)
     a_ids: list[int] = []
     b_ids: list[int] = []
     for overflow_id in overflow_segment_ids:
-        overflow_rank = vehicle_ranks[overflow_id]
+        overflow_rank = subtrack_indices[overflow_id]
         for other_id in finite_segment_ids:
-            if other_id == overflow_id or vehicle_ranks[other_id] == overflow_rank:
+            if other_id == overflow_id or subtrack_indices[other_id] == overflow_rank:
                 continue
             if other_id in overflow_ids and other_id < overflow_id:
                 continue
-            other_rank = vehicle_ranks[other_id]
+            other_rank = subtrack_indices[other_id]
             if overflow_rank < other_rank:
                 a_ids.append(overflow_id)
                 b_ids.append(other_id)

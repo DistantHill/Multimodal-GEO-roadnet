@@ -1,225 +1,100 @@
-"""Cross-track segment preparation and exact detection for one pair patch.
-
-Spatial indexing, patch scheduling and result aggregation live outside this
-module. The historical implementations remain available as benchmark oracles.
-"""
+"""Array-only segment preparation and bounded exact cross-subtrack geometry."""
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import fields
 from typing import Any
-
 import numpy as np
-
-from .._geometry import _angle_delta_deg, _paired_segment_intersections
-from ..models import CrossTrackCandidate, TrajectoryPoint
+from .._geometry import _paired_segment_intersections
+from ..models import CrossCandidateBatch, RefinementSubtrack
 from ..projection import CoordinateTransformer
-from ..diagnostics.reference_cross_track_candidates import (
-    extract_cross_track_candidates_legacy,
-    extract_cross_track_candidates_reference,
-)
 
 
-@dataclass(frozen=True)
-class _CrossTrackSegment:
-    """One source segment plus the data needed for bounded matching."""
+def empty_cross_batch() -> CrossCandidateBatch:
+    floats = {"timestamp", "heading", "speed"}
+    values = {}
+    for item in fields(CrossCandidateBatch):
+        name = item.name
+        if name in {"xy", "lonlat"}:
+            values[name] = np.empty((0, 2), dtype=np.float64)
+        elif name.endswith("_valid"):
+            values[name] = np.empty(0, dtype=np.bool_)
+        elif name in floats:
+            values[name] = np.empty(0, dtype=np.float64)
+        elif name == "calculation_index" or name.endswith(("subtrack_index", "point_index", "refine_point_id", "source_row_key")):
+            values[name] = np.empty(0, dtype=np.int64)
+        else:
+            values[name] = np.empty(0, dtype=object)
+    return CrossCandidateBatch(**values)
 
-    vehicle_id: str
-    vehicle_rank: int
-    track_rank: int
-    segment_index: int
-    start: TrajectoryPoint
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-    heading: float
-    timestamp: float
+
+def concatenate_cross_batches(batches: list[CrossCandidateBatch]) -> CrossCandidateBatch:
+    if not batches:
+        return empty_cross_batch()
+    return CrossCandidateBatch(**{item.name: np.concatenate([getattr(batch, item.name) for batch in batches]) for item in fields(CrossCandidateBatch)})
 
 
-def _prepare_segments(
-    tracks: dict[str, list[TrajectoryPoint]],
-    transformer: CoordinateTransformer,
-    cfg: Any,
-) -> tuple[list[_CrossTrackSegment], int]:
-    """Preserve straight-segment filtering in stable vehicle order."""
-    actual_vehicle_ids = sorted({
-        track[0].vehicle_id for track in tracks.values() if track
-    })
-    vehicle_rank_by_id = {
-        vehicle_id: rank for rank, vehicle_id in enumerate(actual_vehicle_ids)
+def _prepare_segments(tracks: dict[int, RefinementSubtrack], transformer: CoordinateTransformer, cfg: Any):
+    """Each segment is an index into aligned columns; no segment row wrappers."""
+    pieces: dict[str, list[np.ndarray]] = {name: [] for name in (
+        "starts", "ends", "heading", "timestamp", "speed", "vehicle_id", "subtrack_index",
+        "point_index", "point_kind", "refine_point_id", "refine_point_id_valid",
+        "source_id", "source_row_key", "source_row_key_valid", "generated_reason",
+    )}
+    seen: set[int] = set()
+    for track in sorted(tracks.values(), key=lambda value: value.subtrack_index):
+        if track.subtrack_index in seen:
+            raise ValueError("duplicate Run-scoped subtrack identity")
+        seen.add(track.subtrack_index)
+        if not np.isfinite(track.xy).all() or not np.isfinite(track.lonlat).all():
+            raise ValueError("subtrack geometry contains non-finite coordinates")
+        delta = (track.heading[1:] - track.heading[:-1] + 180) % 360 - 180
+        ids = np.flatnonzero(np.abs(delta) <= cfg.cross_track_straightness_deg)
+        pieces["starts"].append(track.xy[ids]); pieces["ends"].append(track.xy[ids + 1])
+        for name in ("heading", "timestamp", "speed", "source_row_key", "source_row_key_valid", "refine_point_id", "refine_point_id_valid", "generated_reason"):
+            pieces[name].append(getattr(track, name)[ids])
+        pieces["point_kind"].append(track.kind[ids]); pieces["point_index"].append(ids)
+        pieces["vehicle_id"].append(np.full(len(ids), track.vehicle_id, dtype=object))
+        pieces["source_id"].append(np.full(len(ids), track.source_id, dtype=object))
+        pieces["subtrack_index"].append(np.full(len(ids), track.subtrack_index, dtype=np.int64))
+    columns = {}
+    for name, arrays in pieces.items():
+        if arrays:
+            columns[name] = np.concatenate(arrays)
+        elif name in {"starts", "ends"}:
+            columns[name] = np.empty((0, 2), dtype=np.float64)
+        else:
+            columns[name] = np.empty(0, dtype=np.int64 if name in {"subtrack_index", "point_index", "refine_point_id", "source_row_key"} else np.bool_ if name.endswith("_valid") else np.float64 if name in {"heading", "timestamp", "speed"} else object)
+    return columns, len(seen)
+
+
+def intersect_cross_track_patch(starts, ends, headings, segment_ids_a, segment_ids_b, cfg):
+    return _paired_segment_intersections(starts[segment_ids_a], ends[segment_ids_a], headings[segment_ids_a], starts[segment_ids_b], ends[segment_ids_b], headings[segment_ids_b], cfg.cross_track_min_angle_deg, cfg.cross_track_max_angle_deg)
+
+
+def build_cross_track_patch_candidates(segments, segment_ids_a, segment_ids_b, xs, ys, hit_indices, transformer, *, first_index=0):
+    a = segment_ids_a[hit_indices]; b = segment_ids_b[hit_indices]
+    if np.any(segments["subtrack_index"][a] == segments["subtrack_index"][b]):
+        raise ValueError("cross-track pair belongs to one subtrack")
+    xy = np.column_stack((xs, ys)); values = {
+        "calculation_index": np.arange(first_index, first_index + len(a), dtype=np.int64),
+        "xy": xy, "lonlat": transformer.inverse_many(xy),
+        "timestamp": (segments["timestamp"][a] + segments["timestamp"][b]) / 2,
+        "heading": segments["heading"][a], "speed": segments["speed"][a],
     }
-    per_track: list[
-        tuple[str, str, int, int, list[tuple[int, float, float, float, float]]]
-    ] = []
-    for track_rank, track_key in enumerate(sorted(tracks)):
-        track = tracks[track_key]
-        if not track:
-            continue
-        vehicle_id = track[0].vehicle_id
-        raw_segments: list[tuple[int, float, float, float, float]] = []
-        projected_points: dict[int, tuple[float, float]] = {}
-
-        def point_xy(point_index: int) -> tuple[float, float]:
-            projected = projected_points.get(point_index)
-            if projected is None:
-                point = track[point_index]
-                if (point.x is None) != (point.y is None):
-                    raise ValueError("trajectory point must provide both processing x and y")
-                projected = (
-                    (float(point.x), float(point.y))
-                    if point.x is not None
-                    else transformer.forward(point.lon, point.lat)
-                )
-                projected_points[point_index] = projected
-            return projected
-
-        for segment_index in range(len(track) - 1):
-            start = track[segment_index]
-            end = track[segment_index + 1]
-            if abs(_angle_delta_deg(start.heading, end.heading)) > cfg.cross_track_straightness_deg:
-                continue
-            x1, y1 = point_xy(segment_index)
-            x2, y2 = point_xy(segment_index + 1)
-            raw_segments.append((segment_index, x1, y1, x2, y2))
-        if raw_segments:
-            per_track.append((
-                track_key,
-                vehicle_id,
-                vehicle_rank_by_id[vehicle_id],
-                track_rank,
-                raw_segments,
-            ))
-
-    segments: list[_CrossTrackSegment] = []
-    for track_key, vehicle_id, vehicle_rank, track_rank, raw_segments in per_track:
-        track = tracks[track_key]
-        for segment_index, x1, y1, x2, y2 in raw_segments:
-            start = track[segment_index]
-            segments.append(_CrossTrackSegment(
-                vehicle_id=vehicle_id,
-                vehicle_rank=vehicle_rank,
-                track_rank=track_rank,
-                segment_index=segment_index,
-                start=start,
-                x1=x1,
-                y1=y1,
-                x2=x2,
-                y2=y2,
-                heading=start.heading,
-                timestamp=start.timestamp,
-            ))
-    return segments, len(actual_vehicle_ids)
+    for prefix, ids in (("from", a), ("to", b)):
+        for name in ("vehicle_id", "subtrack_index", "point_index", "point_kind", "refine_point_id", "refine_point_id_valid", "source_id", "source_row_key", "source_row_key_valid", "generated_reason"):
+            values[f"{prefix}_{name}"] = segments[name][ids]
+    return CrossCandidateBatch(**values)
 
 
-def detect_cross_track_patch(
-    segments: list[_CrossTrackSegment],
-    starts: np.ndarray,
-    ends: np.ndarray,
-    headings: np.ndarray,
-    segment_ids_a: np.ndarray,
-    segment_ids_b: np.ndarray,
-    cfg: Any,
-    transformer: CoordinateTransformer,
-) -> list[tuple[tuple[int, ...], CrossTrackCandidate]]:
-    """Compute exact intersections for one externally scheduled segment-pair patch."""
-    xs, ys, hit_indices = intersect_cross_track_patch(
-        starts, ends, headings, segment_ids_a, segment_ids_b, cfg,
-    )
-    return list(iter_cross_track_patch_candidates(
-        segments, segment_ids_a, segment_ids_b, xs, ys, hit_indices, transformer,
-    ))
+def detect_cross_track_patch(segments, starts, ends, headings, segment_ids_a, segment_ids_b, cfg, transformer):
+    xs, ys, hits = intersect_cross_track_patch(starts, ends, headings, segment_ids_a, segment_ids_b, cfg)
+    return build_cross_track_patch_candidates(segments, segment_ids_a, segment_ids_b, xs, ys, hits, transformer)
 
 
-def intersect_cross_track_patch(
-    starts: np.ndarray,
-    ends: np.ndarray,
-    headings: np.ndarray,
-    segment_ids_a: np.ndarray,
-    segment_ids_b: np.ndarray,
-    cfg: Any,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Run the exact numeric kernel without loading source point objects."""
-    return _paired_segment_intersections(
-        starts[segment_ids_a],
-        ends[segment_ids_a],
-        headings[segment_ids_a],
-        starts[segment_ids_b],
-        ends[segment_ids_b],
-        headings[segment_ids_b],
-        cfg.cross_track_min_angle_deg,
-        cfg.cross_track_max_angle_deg,
-    )
+# Historical entry points share the array implementation and preserve algorithm rules.
+def extract_cross_track_candidates_legacy(*args, **kwargs):
+    from .collect_candidates import extract_cross_track_candidates
+    return extract_cross_track_candidates(*args, **kwargs)
 
-
-def build_cross_track_patch_candidates(
-    segments: Sequence[_CrossTrackSegment] | Mapping[int, _CrossTrackSegment],
-    segment_ids_a: np.ndarray,
-    segment_ids_b: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    hit_indices: np.ndarray,
-    transformer: CoordinateTransformer,
-) -> list[tuple[tuple[int, ...], CrossTrackCandidate]]:
-    """Build candidate provenance only for exact hits; this performs no I/O."""
-    return list(iter_cross_track_patch_candidates(
-        segments, segment_ids_a, segment_ids_b, xs, ys, hit_indices, transformer,
-    ))
-
-
-def iter_cross_track_patch_candidates(
-    segments: Sequence[_CrossTrackSegment] | Mapping[int, _CrossTrackSegment],
-    segment_ids_a: np.ndarray,
-    segment_ids_b: np.ndarray,
-    xs: np.ndarray,
-    ys: np.ndarray,
-    hit_indices: np.ndarray,
-    transformer: CoordinateTransformer,
-) -> Iterator[tuple[tuple[int, ...], CrossTrackCandidate]]:
-    """Yield candidate provenance in exact-kernel hit order without another list."""
-    for x, y, hit_index in zip(xs, ys, hit_indices):
-        segment_a = segments[int(segment_ids_a[hit_index])]
-        segment_b = segments[int(segment_ids_b[hit_index])]
-        yield (
-            (
-                segment_a.vehicle_rank,
-                segment_b.vehicle_rank,
-                segment_a.segment_index,
-                segment_b.segment_index,
-                segment_a.track_rank,
-                segment_b.track_rank,
-            ),
-            _candidate_from_segments(
-                segment_a,
-                segment_b,
-                float(x),
-                float(y),
-                transformer,
-            ),
-        )
-
-
-def _candidate_from_segments(
-    segment_a: _CrossTrackSegment,
-    segment_b: _CrossTrackSegment,
-    x: float,
-    y: float,
-    transformer: CoordinateTransformer,
-) -> CrossTrackCandidate:
-    """Build the public candidate payload from one canonical hit."""
-    lon, lat = transformer.inverse(x, y)
-    return CrossTrackCandidate(
-        point_ref=segment_a.start.point_ref,
-        from_segment_start_point_ref=segment_a.start.point_ref,
-        to_segment_start_point_ref=segment_b.start.point_ref,
-        vehicle_id=f"{segment_a.vehicle_id}|{segment_b.vehicle_id}",
-        timestamp=(segment_a.timestamp + segment_b.timestamp) / 2.0,
-        lon=lon,
-        lat=lat,
-        x=x,
-        y=y,
-        heading=segment_a.heading,
-        speed=segment_a.start.speed,
-        from_segment_start=segment_a.start.refined_point_ref,
-        to_segment_start=segment_b.start.refined_point_ref,
-    )
+extract_cross_track_candidates_reference = extract_cross_track_candidates_legacy

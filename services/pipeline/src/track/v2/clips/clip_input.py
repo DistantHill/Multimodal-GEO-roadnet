@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
-from itertools import islice
+import numpy as np
 from pathlib import Path
 from uuid import uuid4
 
 import duckdb
 
-from ..models import ClipEndpoint, ClipPoint, RuntimeConfig, TrackClip
+from ..models import RuntimeConfig, TrackClip
 
 
 class ClipRelation(Sequence[TrackClip]):
@@ -68,11 +68,13 @@ class ClipRelation(Sequence[TrackClip]):
                 end_kind VARCHAR, end_lon DOUBLE, end_lat DOUBLE,
                 end_intersection_id BIGINT, end_crossing_id BIGINT,
                 distance_m DOUBLE, point_count BIGINT, subtrack_index BIGINT,
-                clip_ordinal_in_track BIGINT
+                clip_ordinal_in_track BIGINT, start_index BIGINT, end_index BIGINT,
+                interior_start BIGINT, interior_end BIGINT,
+                start_x DOUBLE, start_y DOUBLE, end_x DOUBLE, end_y DOUBLE
             );
             CREATE TABLE clip_points (
                 clip_ordinal BIGINT NOT NULL, point_ordinal BIGINT,
-                resolved_point_id BIGINT, lon DOUBLE, lat DOUBLE
+                resolved_point_id BIGINT, lon DOUBLE, lat DOUBLE, x DOUBLE, y DOUBLE
             )
         """)
 
@@ -84,23 +86,31 @@ class ClipRelation(Sequence[TrackClip]):
         connection.execute("BEGIN")
         try:
             connection.execute(
-                "INSERT INTO clips VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO clips VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     ordinal, clip.clip_id, clip.vehicle_id, clip.trip_id, clip.clip_type,
-                    clip.start.kind, clip.start.lon, clip.start.lat,
-                    clip.start.intersection_id, clip.start.crossing_id,
-                    clip.end.kind, clip.end.lon, clip.end.lat,
-                    clip.end.intersection_id, clip.end.crossing_id,
+                    clip.start_kind, float(clip.lonlat[0, 0]), float(clip.lonlat[0, 1]),
+                    clip.start_intersection_id, clip.start_crossing_id,
+                    clip.end_kind, float(clip.lonlat[-1, 0]), float(clip.lonlat[-1, 1]),
+                    clip.end_intersection_id, clip.end_crossing_id,
                     clip.distance_m, clip.point_count, clip.subtrack_index,
-                    clip.clip_ordinal_in_track,
+                    clip.clip_ordinal_in_track, clip.start_index, clip.end_index,
+                    clip.interior_start, clip.interior_end,
+                    float(clip.xy[0,0]), float(clip.xy[0,1]),
+                    float(clip.xy[-1,0]), float(clip.xy[-1,1]),
                 ),
             )
-            point_rows = (
-                (ordinal, point_ordinal, point.resolved_point_id, point.lon, point.lat)
-                for point_ordinal, point in enumerate(clip.points)
-            )
-            while batch := tuple(islice(point_rows, self._batch_size)):
-                connection.executemany("INSERT INTO clip_points VALUES (?, ?, ?, ?, ?)", batch)
+            for lo in range(0, len(clip.resolved_point_ids), self._batch_size):
+                hi = min(lo+self._batch_size, len(clip.resolved_point_ids))
+                connection.execute(
+                    "INSERT INTO clip_points SELECT ?, unnest(?::BIGINT[]), "
+                    "unnest(?::BIGINT[]), unnest(?::DOUBLE[]), unnest(?::DOUBLE[]), "
+                    "unnest(?::DOUBLE[]), unnest(?::DOUBLE[])",
+                    (ordinal, np.arange(lo, hi, dtype=np.int64).tolist(),
+                     clip.resolved_point_ids[lo:hi].tolist(),
+                     clip.lonlat[lo+1:hi+1,0].tolist(), clip.lonlat[lo+1:hi+1,1].tolist(),
+                     clip.xy[lo+1:hi+1,0].tolist(), clip.xy[lo+1:hi+1,1].tolist()),
+                )
             connection.execute("COMMIT")
         except Exception:
             connection.execute("ROLLBACK")
@@ -149,6 +159,16 @@ class ClipRelation(Sequence[TrackClip]):
                OR c.point_count IS NULL OR c.point_count <> coalesce(p.n, 0) + 2
                OR c.subtrack_index IS NULL OR c.subtrack_index<0
                OR c.clip_ordinal_in_track IS NULL OR c.clip_ordinal_in_track<0
+               OR c.start_index IS NULL OR c.start_index<0
+               OR c.end_index IS NULL OR c.end_index<c.start_index
+               OR c.interior_start IS NULL OR c.interior_start<c.start_index+1
+               OR c.interior_end IS NULL OR c.interior_end<c.interior_start
+               OR c.interior_end>c.end_index
+               OR c.interior_end-c.interior_start<>coalesce(p.n,0)
+               OR c.start_x IS NULL OR NOT isfinite(c.start_x)
+               OR c.start_y IS NULL OR NOT isfinite(c.start_y)
+               OR c.end_x IS NULL OR NOT isfinite(c.end_x)
+               OR c.end_y IS NULL OR NOT isfinite(c.end_y)
                OR coalesce(p.ordinals, 0) <> coalesce(p.n, 0)
                OR (coalesce(p.n, 0) > 0 AND
                    (p.lo <> 0 OR p.hi <> p.n - 1 OR p.unique_ordinals <> p.n))
@@ -167,6 +187,7 @@ class ClipRelation(Sequence[TrackClip]):
             WHERE c.ordinal IS NULL OR p.point_ordinal IS NULL OR p.resolved_point_id IS NULL
                OR p.lon IS NULL OR NOT isfinite(p.lon) OR abs(p.lon)>180
                OR p.lat IS NULL OR NOT isfinite(p.lat) OR abs(p.lat)>90
+               OR p.x IS NULL OR NOT isfinite(p.x) OR p.y IS NULL OR NOT isfinite(p.y)
         """).fetchone()[0]
         ordinal_error = connection.execute("""
             SELECT count(*) FROM (
@@ -256,35 +277,34 @@ class ClipRelation(Sequence[TrackClip]):
         connection = self._require_sealed()
         cursor = connection.cursor()
         try:
-            cursor.execute(
-                "SELECT c.*,p.point_ordinal,p.resolved_point_id,p.lon,p.lat "
-                "FROM clips c LEFT JOIN clip_points p ON p.clip_ordinal=c.ordinal "
-                f"{where} ORDER BY {order_by},p.point_ordinal", params,
-            )
-            current: tuple[object, ...] | None = None
-            points: list[ClipPoint] = []
+            cursor.execute(f"SELECT c.* FROM clips c {where} ORDER BY {order_by}", params)
             while rows := cursor.fetchmany(self._batch_size):
                 for row in rows:
-                    scalar = row[:19]
-                    if current is not None and scalar[0] != current[0]:
-                        yield self._decode(current, points)
-                        points = []
-                    current = scalar
-                    if row[19] is not None:
-                        points.append(ClipPoint(row[20], row[21], row[22]))
-            if current is not None:
-                yield self._decode(current, points)
+                    values = connection.execute(
+                        "SELECT resolved_point_id,lon,lat,x,y FROM clip_points "
+                        "WHERE clip_ordinal=? ORDER BY point_ordinal", (row[0],),
+                    ).fetchnumpy()
+                    yield self._decode(row, values)
         finally:
             cursor.close()
 
     @staticmethod
-    def _decode(row: tuple[object, ...], points: list[ClipPoint]) -> TrackClip:
+    def _decode(row: tuple[object, ...], values: dict[str, np.ndarray]) -> TrackClip:
+        count = len(values["resolved_point_id"])
+        lonlat = np.empty((count+2, 2), dtype=np.float64)
+        xy = np.empty_like(lonlat)
+        lonlat[0], lonlat[-1] = (row[6],row[7]), (row[11],row[12])
+        xy[0], xy[-1] = (row[23],row[24]), (row[25],row[26])
+        lonlat[1:-1,0], lonlat[1:-1,1] = values["lon"], values["lat"]
+        xy[1:-1,0], xy[1:-1,1] = values["x"], values["y"]
         return TrackClip(
             clip_id=row[1], vehicle_id=row[2], trip_id=row[3], clip_type=row[4],
-            start=ClipEndpoint(row[5], row[6], row[7], row[8], row[9]),
-            end=ClipEndpoint(row[10], row[11], row[12], row[13], row[14]),
-            points=tuple(points), distance_m=row[15], point_count=row[16],
-            subtrack_index=row[17], clip_ordinal_in_track=row[18],
+            start_kind=row[5], start_intersection_id=row[8], start_crossing_id=row[9],
+            end_kind=row[10], end_intersection_id=row[13], end_crossing_id=row[14],
+            xy=xy, lonlat=lonlat, resolved_point_ids=values["resolved_point_id"],
+            distance_m=row[15], point_count=row[16], subtrack_index=row[17],
+            clip_ordinal_in_track=row[18], start_index=row[19], end_index=row[20],
+            interior_start=row[21], interior_end=row[22],
         )
 
     def _require_sealed(self) -> duckdb.DuckDBPyConnection:

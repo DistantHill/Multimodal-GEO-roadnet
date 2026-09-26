@@ -25,8 +25,8 @@ def _select(table: str, *, empty: bool = False) -> str:
     values = {
         "resolved_points": [
             "?::UUID", "10::BIGINT", "1::INTEGER", "0::BIGINT", "0::BIGINT",
-            "'vehicle-a'::VARCHAR", "120.0::DOUBLE", "30.0::DOUBLE", "'kept'::VARCHAR",
-            "20::BIGINT", "'source-20'::VARCHAR", "NULL::BIGINT", "NULL::BIGINT",
+            "'vehicle-a'::VARCHAR", "120.0::DOUBLE", "30.0::DOUBLE", "100.0::DOUBLE", "200.0::DOUBLE", "'kept'::VARCHAR",
+            "20::BIGINT", "20::BIGINT", "NULL::BIGINT", "NULL::BIGINT",
             "NULL::SMALLINT",
         ],
         "intersections": [
@@ -50,7 +50,7 @@ def test_v1_schema_is_flat_explicit_and_clip_scoped():
     ]
     assert [column.name for column in detect_parquet_export.DETECT_PARQUET_V1["resolved_points"]] == [
         "detect_id", "resolved_point_id", "subtrack_index", "sequence_in_subtrack",
-        "refined_sequence_in_subtrack", "vehicle_id", "lon", "lat", "point_kind",
+        "refined_sequence_in_subtrack", "vehicle_id", "lon", "lat", "x", "y", "point_kind",
         "refined_point_id", "source_row_key", "crossing_id", "intersection_id",
         "crossing_type",
     ]
@@ -65,7 +65,10 @@ def test_queries_are_owner_scoped_stable_and_preserve_clip_relations():
     assert "COALESCE(k.vehicle_id, ip.vehicle_id, sk.vehicle_id, sip.vehicle_id)" in queries[
         "resolved_points"
     ]
-    assert "k.source_row_key::text AS source_row_key" in queries["resolved_points"]
+    assert "k.source_row_key AS source_row_key" in queries["resolved_points"]
+    assert "rf.processing_srid" in queries["resolved_points"]
+    assert "ip.x, c.crossing_x) AS x" in queries["resolved_points"]
+    assert "ip.y, c.crossing_y) AS y" in queries["resolved_points"]
     assert "s.id=k.source_row_key" in queries["resolved_points"]
     assert "k.source_row_key::bigint" not in queries["resolved_points"]
     assert "r.crossing_point_id=c.id" in queries["entry_exit_points"]

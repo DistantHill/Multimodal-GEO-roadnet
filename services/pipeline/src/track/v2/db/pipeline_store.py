@@ -41,8 +41,7 @@ from ..models import (
     CenterlineFitBundle,
     ClipConfig,
     ClipResult,
-    ExcludedIndex,
-    ExcludedPoint,
+    ExcludedBatch,
     FittingConfig,
     RefinementSubtrack,
     RuntimeConfig,
@@ -113,7 +112,7 @@ class PipelineStore(Protocol):
     def persist_refine_batch(
         self,
         refine_id: str,
-        pending_excluded: list[ExcludedPoint],
+        pending_excluded: list[ExcludedBatch],
         pending_subtracks: list[RefinementSubtrack],
         subtrack_index: int,
         *,
@@ -250,7 +249,7 @@ class PostgresPipelineStore:
     def persist_refine_batch(
         self,
         refine_id: str,
-        pending_excluded: list[ExcludedPoint],
+        pending_excluded: list[ExcludedBatch],
         pending_subtracks: list[RefinementSubtrack],
         subtrack_index: int,
         *,
@@ -265,12 +264,9 @@ class PostgresPipelineStore:
                 f"Refine Run {refine_id} SpatialContext does not match the batch"
             )
         if pending_excluded:
-            insert_excluded_points(
-                self._conn,
-                ExcludedIndex(items=list(pending_excluded)),
-                refine_id=refine_id,
-                batch_size=batch_size,
-            )
+            for excluded in pending_excluded:
+                insert_excluded_points(self._conn, excluded, refine_id=refine_id,
+                                       batch_size=batch_size)
             pending_excluded.clear()
 
         kept_count = 0

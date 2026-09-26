@@ -32,7 +32,7 @@ _FIT_BLOCK_BYTES = 16 * 1024 * 1024
 @dataclass(frozen=True, slots=True)
 class _OrientedClip:
     value: TrackClip
-    points_xy: tuple[tuple[float, float], ...]
+    points_xy: np.ndarray
     was_reversed: bool
 
 
@@ -79,7 +79,7 @@ def _fit_centerlines(
                     issues.append(FitIssue(None, None, "unsupported_clip_type", clip.clip_id))
                     continue
                 eligible_count += 1
-                start_id, end_id = clip.start.intersection_id, clip.end.intersection_id
+                start_id, end_id = clip.start_intersection_id, clip.end_intersection_id
                 pair = None
                 if start_id is not None and end_id is not None and start_id != end_id:
                     pair = (min(start_id, end_id), max(start_id, end_id))
@@ -172,7 +172,7 @@ def _fit_direction(
                 else centerline.to_intersection_id
             ),
             points=(
-                tuple(reversed(centerline.points)) if reverse else centerline.points
+                centerline.points[::-1] if reverse else centerline.points
             ),
             # ``fit_centerlines`` reports counts against its canonical
             # low-id → high-id direction.  Once the directed reverse variant
@@ -195,7 +195,7 @@ def _fit_direction(
 
 
 def _matches_direction(clip: TrackClip, reverse: bool) -> bool:
-    start_id, end_id = clip.start.intersection_id, clip.end.intersection_id
+    start_id, end_id = clip.start_intersection_id, clip.end_intersection_id
     return (
         clip.clip_type == "between_intersection" and start_id is not None
         and end_id is not None and start_id != end_id and ((start_id > end_id) == reverse)
@@ -215,26 +215,20 @@ def _orient_clip(
     clip: TrackClip,
     transformer: CoordinateTransformer,
 ) -> tuple[_OrientedClip | None, FitIssue | None]:
-    start_id = clip.start.intersection_id
-    end_id = clip.end.intersection_id
+    start_id = clip.start_intersection_id
+    end_id = clip.end_intersection_id
     if start_id is None or end_id is None:
         return None, FitIssue(start_id, end_id, "missing_intersection_endpoint", clip.clip_id)
     if start_id == end_id:
         return None, FitIssue(start_id, end_id, "same_intersection_endpoint", clip.clip_id)
 
-    points = [(clip.start.lon, clip.start.lat)]
-    points.extend((point.lon, point.lat) for point in clip.points)
-    points.append((clip.end.lon, clip.end.lat))
-    if any(not (math.isfinite(lon) and math.isfinite(lat)) for lon, lat in points):
+    if not np.isfinite(clip.xy).all() or not np.isfinite(clip.lonlat).all():
         return None, FitIssue(start_id, end_id, "invalid_geometry", clip.clip_id)
-
     was_reversed = start_id > end_id
-    if was_reversed:
-        points.reverse()
-    points_xy = tuple(transformer.forward_many(points))
-    if _xy_polyline_length(np.asarray(points_xy)) <= _EPS:
+    points_xy = clip.xy[::-1] if was_reversed else clip.xy
+    if _xy_polyline_length(points_xy) <= _EPS:
         return None, FitIssue(min(start_id, end_id), max(start_id, end_id), "zero_length_geometry", clip.clip_id)
-    return _OrientedClip(replace(clip, points=()), points_xy, was_reversed), None
+    return _OrientedClip(clip, points_xy, was_reversed), None
 
 
 def _fit_pair_stream(
@@ -285,7 +279,7 @@ def _fit_pair_stream(
         return None
     return Centerline(
         from_intersection_id=pair[0], to_intersection_id=pair[1],
-        points=tuple(transformer.inverse(float(x), float(y)) for x, y in spaced_xy),
+        points=transformer.inverse_many(spaced_xy),
         length_m=_xy_polyline_length(spaced_xy), source_clip_ids=tuple(source_ids),
         forward_clip_count=forward, reverse_clip_count=count-forward,
     )

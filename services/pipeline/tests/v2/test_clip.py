@@ -6,6 +6,7 @@ from .config_factory import (clip_config, fitting_config, intersect_config, netw
 
 from types import SimpleNamespace
 import unittest
+import numpy as np
 from unittest.mock import ANY, MagicMock, patch
 
 from track.v2 import (
@@ -17,7 +18,7 @@ from track.v2 import (
     extract_clips_for_detect as _extract_clips_for_detect,
 )
 from track.v2.clips import extract_clips as clip_module
-from track.v2.models import ResolvedTrackPoint, RuntimeConfig, SpatialContext
+from track.v2.models import RuntimeConfig, SpatialContext
 from track.v2.projection import CoordinateTransformer
 
 
@@ -51,16 +52,20 @@ def _point(
     crossing_id: int | None = None,
     intersection_id: int | None = None,
     crossing_type: int | None = None,
-) -> ResolvedTrackPoint:
+) -> tuple:
     lon, lat = _TRANSFORMER.inverse(x_m, 0.0)
-    return ResolvedTrackPoint(
-        resolved_point_id=resolved_point_id,
-        lon=lon,
-        lat=lat,
-        crossing_id=crossing_id,
-        intersection_id=intersection_id,
-        crossing_type=crossing_type,
-    )
+    return (resolved_point_id, lon, lat, crossing_id, intersection_id, crossing_type)
+
+
+def _track(vehicle: str, trip: str, points: tuple, subtrack: int) -> ClipTrack:
+    lonlat = np.asarray([(p[1],p[2]) for p in points], dtype=np.float64)
+    return ClipTrack(vehicle, trip, _TRANSFORMER.forward_many(lonlat), lonlat,
+        np.asarray([p[0] for p in points], dtype=np.int64),
+        np.asarray([p[3] or 0 for p in points], dtype=np.int64),
+        np.asarray([p[4] or 0 for p in points], dtype=np.int64),
+        np.asarray([p[5] if p[5] is not None else -1 for p in points], dtype=np.int8),
+        np.asarray([p[3] is not None for p in points], dtype=np.bool_),
+        np.asarray([p[4] is not None for p in points], dtype=np.bool_), subtrack)
 
 
 def _crossing(
@@ -70,7 +75,7 @@ def _crossing(
     crossing_id: int,
     intersection_id: int,
     crossing_type: int,
-) -> ResolvedTrackPoint:
+) -> tuple:
     return _point(
         resolved_point_id,
         x_m,
@@ -81,7 +86,7 @@ def _crossing(
 
 
 def _input(
-    points: tuple[ResolvedTrackPoint, ...],
+    points: tuple[tuple, ...],
     *,
     intersections: tuple[ClipIntersection, ...] = (),
     detect_id: str | None = "detect-1",
@@ -89,7 +94,7 @@ def _input(
 ) -> ClipInput:
     return ClipInput(
         intersections=intersections,
-        tracks=(ClipTrack("vehicle-1", "subtrack:1", points, subtrack_index),),
+        tracks=(_track("vehicle-1", "subtrack:1", points, subtrack_index),),
         spatial_context=_CONTEXT,
         detect_id=detect_id,
     )
@@ -98,8 +103,8 @@ def _input(
 class ResolvedSequenceClipTest(unittest.TestCase):
     def test_two_intersections_produce_boundary_and_between_clips(self) -> None:
         circles = (
-            ClipIntersection(10, _point(100, -100.0).lon, 0.0, 20.0),
-            ClipIntersection(20, _point(101, 100.0).lon, 0.0, 20.0),
+            ClipIntersection(10, _point(100, -100.0)[1], 0.0, 20.0),
+            ClipIntersection(20, _point(101, 100.0)[1], 0.0, 20.0),
         )
         points = (
             _point(1, -200.0),
@@ -120,10 +125,10 @@ class ResolvedSequenceClipTest(unittest.TestCase):
             ["boundary_end", "between_intersection", "boundary_start"],
         )
         between = result.clips[1]
-        self.assertEqual((between.start.kind, between.end.kind), ("exit", "entry"))
-        self.assertEqual((between.start.crossing_id, between.end.crossing_id), (31, 32))
-        self.assertEqual([point.resolved_point_id for point in between.points], [5])
-        self.assertFalse(hasattr(between.points[0], "timestamp"))
+        self.assertEqual((between.start_kind, between.end_kind), ("exit", "entry"))
+        self.assertEqual((between.start_crossing_id, between.end_crossing_id), (31, 32))
+        self.assertEqual(between.resolved_point_ids.tolist(), [5])
+        self.assertFalse(between.xy.flags.writeable)
         self.assertEqual(result.report.between_intersection_clips, 1)
         self.assertEqual(result.report.boundary_end_clips, 1)
         self.assertEqual(result.report.boundary_start_clips, 1)
@@ -131,8 +136,8 @@ class ResolvedSequenceClipTest(unittest.TestCase):
 
     def test_two_point_between_clip_is_valid_sparse_evidence(self) -> None:
         circles = (
-            ClipIntersection(10, _point(100, -50.0).lon, 0.0, 20.0),
-            ClipIntersection(20, _point(101, 50.0).lon, 0.0, 20.0),
+            ClipIntersection(10, _point(100, -50.0)[1], 0.0, 20.0),
+            ClipIntersection(20, _point(101, 50.0)[1], 0.0, 20.0),
         )
         points = (
             _point(1, -100.0),
@@ -150,7 +155,7 @@ class ResolvedSequenceClipTest(unittest.TestCase):
 
         self.assertEqual(len(result.clips), 1)
         self.assertEqual(result.clips[0].clip_type, "between_intersection")
-        self.assertEqual(result.clips[0].points, ())
+        self.assertEqual(len(result.clips[0].resolved_point_ids), 0)
         self.assertEqual(result.clips[0].point_count, 2)
         self.assertGreater(result.clips[0].distance_m, 0.0)
 
@@ -169,8 +174,8 @@ class ResolvedSequenceClipTest(unittest.TestCase):
 
         self.assertEqual([clip.clip_type for clip in result.clips], ["full_track"])
         clip = result.clips[0]
-        self.assertEqual((clip.start.kind, clip.end.kind), ("boundary", "boundary"))
-        self.assertEqual(clip.points, ())
+        self.assertEqual((clip.start_kind, clip.end_kind), ("boundary", "boundary"))
+        self.assertEqual(len(clip.resolved_point_ids), 0)
         self.assertEqual(result.report.full_track_clips, 1)
 
     def test_track_entirely_inside_circle_produces_no_clip(self) -> None:
@@ -182,8 +187,8 @@ class ResolvedSequenceClipTest(unittest.TestCase):
 
     def test_boundaries_can_be_suppressed_without_dropping_between_clip(self) -> None:
         circles = (
-            ClipIntersection(10, _point(100, -50.0).lon, 0.0, 10.0),
-            ClipIntersection(20, _point(101, 50.0).lon, 0.0, 10.0),
+            ClipIntersection(10, _point(100, -50.0)[1], 0.0, 10.0),
+            ClipIntersection(20, _point(101, 50.0)[1], 0.0, 10.0),
         )
         points = (
             _point(1, -100.0),
@@ -203,7 +208,7 @@ class ResolvedSequenceClipTest(unittest.TestCase):
     def test_same_position_exit_entry_batch_does_not_create_false_road(self) -> None:
         circles = (
             ClipIntersection(10, 0.0, 0.0, 20.0),
-            ClipIntersection(20, _point(100, 30.0).lon, 0.0, 20.0),
+            ClipIntersection(20, _point(100, 30.0)[1], 0.0, 20.0),
         )
         points = (
             _point(1, 0.0),
@@ -216,7 +221,7 @@ class ResolvedSequenceClipTest(unittest.TestCase):
         result = extract_clips(_input(points, intersections=circles))
 
         self.assertEqual([clip.clip_type for clip in result.clips], ["boundary_start"])
-        self.assertEqual(result.clips[0].start.crossing_id, 13)
+        self.assertEqual(result.clips[0].start_crossing_id, 13)
 
     def test_invalid_state_transition_fails_instead_of_silently_pairing(self) -> None:
         points = (
@@ -238,7 +243,7 @@ class ResolvedSequenceClipTest(unittest.TestCase):
             )
 
     def test_duplicate_subtrack_and_invalid_radius_are_rejected(self) -> None:
-        track = ClipTrack("v", "s", (_point(1, -10.0), _point(2, 10.0)), 7)
+        track = _track("v", "s", (_point(1, -10.0), _point(2, 10.0)), 7)
         with self.assertRaisesRegex(ValueError, "duplicate ClipTrack subtrack"):
             extract_clips(ClipInput((), (track, track), _CONTEXT))
         with self.assertRaisesRegex(ValueError, "radius must be positive"):
@@ -259,7 +264,7 @@ class DetectClipLoadTest(unittest.TestCase):
             refine_id="refine-1",
             spatial_context=_CONTEXT,
         )
-        tracks = (ClipTrack("v", "s", (_point(1, -10.0), _point(2, 10.0)), 1),)
+        tracks = (_track("v", "s", (_point(1, -10.0), _point(2, 10.0)), 1),)
         reader = MagicMock()
         reader.__enter__.return_value = reader
         reader.intersections.return_value = ()

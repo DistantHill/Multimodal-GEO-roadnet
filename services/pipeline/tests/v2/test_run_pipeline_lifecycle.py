@@ -3,6 +3,7 @@ from __future__ import annotations
 from .config_factory import (clip_config, fitting_config, intersect_config, network_config, pipeline_config, postgres_config, projection_config, refine_config, runtime_config)
 
 import unittest
+import numpy as np
 from contextlib import ExitStack
 from dataclasses import replace
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from track.v2.db.write_refine_results import RefineRunRecord
 from track.v2.intersections.detect_intersections import IntersectConfig, IntersectResult
 from track.v2.models import (
     RefineConfig,
+    SourceBatch,
     ClipConfig,
     FittingConfig,
     IntersectReport,
@@ -692,11 +694,13 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertEqual(self.events[-3:], ["get_refine", "finish_refine:failed", "commit"])
 
     def test_projection_bounds_failure_closes_source_and_marks_run_failed(self) -> None:
-        point = SimpleNamespace(lon=116.0, lat=39.0)
+        batch = SourceBatch("source", "v", np.array([[116.,39.]]), np.array([0.]),
+                            np.array([0.]), np.array([10.]), np.array([1],dtype=np.int64),
+                            np.array([True]), np.array([""],dtype=object))
 
         class _OneTrackStream(_EmptyStream):
             def iter_vehicle_tracks(self):
-                return iter(([point],))
+                return iter((batch,))
 
         transformer = MagicMock()
         transformer.validate_bounds.side_effect = ValueError("outside projection bounds")

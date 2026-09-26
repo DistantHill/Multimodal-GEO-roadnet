@@ -3,12 +3,11 @@ from __future__ import annotations
 from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
 
 import math
+import numpy as np
 import unittest
 from dataclasses import replace
 
 from track.v2 import (
-    ClipEndpoint,
-    ClipPoint,
     ClipReport,
     ClipResult,
     ClipIntersection,
@@ -48,53 +47,19 @@ def _lon(x_m: float) -> float:
     return _TRANSFORMER.inverse(x_m, 0.0)[0]
 
 
-def _endpoint(
-    kind: str,
-    intersection_id: int,
-    x_m: float,
-    y_m: float,
-) -> ClipEndpoint:
-    lon, lat = (
-        _TRANSFORMER.inverse(x_m, y_m)
-        if math.isfinite(x_m) and math.isfinite(y_m)
-        else (x_m, y_m)
-    )
-    return ClipEndpoint(
-        kind=kind,
-        lon=lon,
-        lat=lat,
-        intersection_id=intersection_id,
-        crossing_id=intersection_id * 10 + (1 if kind == "entry" else 0),
-    )
-
-
-def _point(resolved_point_id: int, x_m: float, y_m: float) -> ClipPoint:
-    lon, lat = _TRANSFORMER.inverse(x_m, y_m)
-    return ClipPoint(resolved_point_id=resolved_point_id, lon=lon, lat=lat)
-
-
-def _clip(
-    clip_id: str,
-    start_intersection_id: int,
-    end_intersection_id: int,
-    coords_m: list[tuple[float, float]],
-) -> TrackClip:
-    vehicle_id = f"vehicle-{clip_id}"
-    start_x, start_y = coords_m[0]
-    end_x, end_y = coords_m[-1]
+def _clip(clip_id: str, start_intersection_id: int, end_intersection_id: int,
+          coords_m: list[tuple[float, float]]) -> TrackClip:
+    xy = np.asarray(coords_m, dtype=np.float64)
+    lonlat = np.asarray([_TRANSFORMER.inverse(x,y) if np.isfinite((x,y)).all() else (x,y)
+                         for x,y in xy], dtype=np.float64)
     return TrackClip(
-        clip_id=clip_id,
-        vehicle_id=vehicle_id,
-        trip_id=f"trip-{clip_id}",
-        clip_type="between_intersection",
-        start=_endpoint("exit", start_intersection_id, start_x, start_y),
-        end=_endpoint("entry", end_intersection_id, end_x, end_y),
-        points=tuple(
-            _point(index, x_m, y_m)
-            for index, (x_m, y_m) in enumerate(coords_m[1:-1], start=1)
-        ),
-        distance_m=200.0,
-        point_count=len(coords_m),
+        clip_id=clip_id, vehicle_id=f"vehicle-{clip_id}", trip_id=f"trip-{clip_id}",
+        clip_type="between_intersection", xy=xy, lonlat=lonlat,
+        resolved_point_ids=np.arange(1,len(xy)-1,dtype=np.int64),
+        start_index=0, end_index=len(xy)-1, interior_start=1, interior_end=len(xy)-1,
+        start_kind="exit", end_kind="entry", start_intersection_id=start_intersection_id,
+        end_intersection_id=end_intersection_id, start_crossing_id=start_intersection_id*10,
+        end_crossing_id=end_intersection_id*10+1, distance_m=200., point_count=len(xy),
     )
 
 
@@ -130,7 +95,7 @@ class FittingStageTest(unittest.TestCase):
 
         bundle = fit_centerline_variants(clips)
 
-        self.assertEqual(bundle.combined, fit_centerlines(clips))
+        self.assertEqual(bundle.combined.as_dict(), fit_centerlines(clips).as_dict())
         self.assertEqual(bundle.combined.centerlines[0].variant, "combined")
         self.assertEqual(bundle.a_to_b.centerlines[0].variant, "directed")
         self.assertEqual(bundle.b_to_a.centerlines[0].variant, "directed")
@@ -203,17 +168,7 @@ class FittingStageTest(unittest.TestCase):
         first_pair = _clip("10-20", 10, 20, [(0, 0), (125, 0)])
         second_pair = _clip("20-30", 20, 30, [(200, 0), (300, 0)])
         boundary = _clip("boundary", 10, 20, [(0, 20), (125, 20)])
-        boundary = TrackClip(
-            clip_id=boundary.clip_id,
-            vehicle_id=boundary.vehicle_id,
-            trip_id=boundary.trip_id,
-            clip_type="boundary_start",
-            start=boundary.start,
-            end=boundary.end,
-            points=boundary.points,
-            distance_m=boundary.distance_m,
-            point_count=boundary.point_count,
-        )
+        boundary = replace(boundary, clip_type="boundary_start")
 
         result = fit_centerlines(_clip_result(first_pair, second_pair, boundary))
 
@@ -296,7 +251,7 @@ class NetworkStageTest(unittest.TestCase):
             (edge.from_intersection_id, edge.to_intersection_id),
             (10, 20),
         )
-        self.assertEqual(edge.points, fits.centerlines[0].points)
+        self.assertIs(edge.points, fits.centerlines[0].points)
         self.assertEqual(edge.source_clip_count, 1)
         self.assertEqual(network.report.isolated_node_count, 0)
 

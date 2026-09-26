@@ -351,7 +351,7 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
 
             # ── 预计算：列名→位置，用于元组快速路径跳过 dict 分配 ──
             #     Pre-compute column→position index for tuple fast-path
-            #     (avoids per-row _row_to_dict + _raw_value double lookup).
+            #     (avoids per-row mapping construction and repeated column lookup).
             col_index: dict[str, int] = {name: i for i, name in enumerate(columns)}
             specs = self._mapping.specs_by_canonical
             # 构建 canonical→tuple_index 的子集（仅含 spec 中定义的 canonical 字段）
@@ -581,12 +581,6 @@ def _configure_postgres_session(conn: Any) -> None:
         _close_quietly(cur)
 
 
-def _row_to_dict(row: Any, columns: list[str]) -> dict[str, Any]:
-    if isinstance(row, dict):
-        return dict(row)
-    return dict(zip(columns, row))
-
-
 def source_row_hash(row: dict[str, Any]) -> str:
     """Return a stable identity hash used by the standalone CSV parser.
 
@@ -652,6 +646,12 @@ class StreamVehicleSource:
         self.close()
 
 
+def _extra_column(values: list) -> np.ndarray:
+    column = np.empty(len(values), dtype=object)
+    column[:] = values
+    return column
+
+
 def _source_batch(source_id: str, vehicle_id: str, columns: list[list],
                   extra_columns: dict[str, list]) -> SourceBatch:
     return SourceBatch(
@@ -663,5 +663,5 @@ def _source_batch(source_id: str, vehicle_id: str, columns: list[list],
         np.asarray(columns[7], dtype=np.int64),
         np.asarray(columns[8], dtype=np.bool_),
         np.asarray(columns[9], dtype=object),
-        {name: np.asarray(values, dtype=object) for name, values in extra_columns.items()},
+        {name: _extra_column(values) for name, values in extra_columns.items()},
     )

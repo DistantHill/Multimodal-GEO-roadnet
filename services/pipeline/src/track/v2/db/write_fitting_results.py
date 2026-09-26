@@ -137,15 +137,15 @@ def insert_centerline_bundle(
             clip = get_clip(clip_id)
             if clip.clip_type != "between_intersection":
                 raise ValueError("only between_intersection clips may back a centerline")
-            if clip.start.crossing_id is None or clip.end.crossing_id is None:
+            if clip.start_crossing_id is None or clip.end_crossing_id is None:
                 raise ValueError("centerline source clips require crossing IDs")
             manifest_rows.append((
                 centerline_id,
                 detect_id,
                 ordinal,
-                clip.start.crossing_id,
-                clip.end.crossing_id,
-                clip.start.intersection_id != centerline.from_intersection_id,
+                clip.start_crossing_id,
+                clip.end_crossing_id,
+                clip.start_intersection_id != centerline.from_intersection_id,
             ))
     with conn.cursor() as cur:
         _copy_insert(

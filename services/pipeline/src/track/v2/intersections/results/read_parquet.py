@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 import json
 import math
+import numpy as np
 from pathlib import Path
 import duckdb
 
@@ -12,7 +13,7 @@ from ...artifacts.parquet_manifest import validate_published
 from ...artifacts.parquet_sql import quote_sql_literal
 from ...db.artifact_registry import ArtifactDescriptor
 from .export_to_parquet import DetectParquetError, _validate_schema
-from ...models import ClipIntersection, ClipTrack, ResolvedTrackPoint, RuntimeConfig
+from ...models import ClipIntersection, ClipTrack, RuntimeConfig
 
 
 class DetectDatasetReader:
@@ -57,7 +58,7 @@ class DetectDatasetReader:
                 paths = [str(final / item["relative_path"]) for item in table["files"]]
                 literals = ", ".join(quote_sql_literal(path) for path in paths)
                 self._connection.execute(
-                    f"CREATE TEMP VIEW {table['name']} AS "
+                    f"CREATE VIEW {table['name']} AS "
                     f"SELECT * FROM read_parquet([{literals}])"
                 )
             self._validate_relations()
@@ -89,40 +90,30 @@ class DetectDatasetReader:
         batch_size = self._runtime.parquet_read_batch_size if batch_size is None else batch_size
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise DetectParquetError("batch_size is invalid")
-        result = self._require_open().execute("""
-          SELECT resolved_point_id, subtrack_index, sequence_in_subtrack, vehicle_id,
-                 lon, lat, crossing_id, intersection_id, crossing_type
-          FROM resolved_points
-          ORDER BY subtrack_index, sequence_in_subtrack, resolved_point_id
-        """)
-        current: int | None = None
-        vehicle = ""
-        points: list[ResolvedTrackPoint] = []
-        while rows := result.fetchmany(batch_size):
-            for row in rows:
-                subtrack = int(row[1])
-                if current is not None and subtrack != current:
-                    yield self._track(current, vehicle, points)
-                    points, vehicle = [], ""
-                current = subtrack
-                current_vehicle = str(row[3])
-                if vehicle and current_vehicle != vehicle:
-                    raise DetectParquetError(f"subtrack {subtrack} contains multiple vehicles")
-                vehicle = current_vehicle
-                points.append(ResolvedTrackPoint(
-                    resolved_point_id=int(row[0]), lon=float(row[4]), lat=float(row[5]),
-                    crossing_id=None if row[6] is None else int(row[6]),
-                    intersection_id=None if row[7] is None else int(row[7]),
-                    crossing_type=None if row[8] is None else int(row[8]),
-                ))
-        if current is not None:
-            yield self._track(current, vehicle, points)
-
-    def _track(self, subtrack: int, vehicle: str,
-               points: list[ResolvedTrackPoint]) -> ClipTrack:
-        if not vehicle:
-            raise DetectParquetError(f"subtrack {subtrack} has no source vehicle")
-        return ClipTrack(vehicle, f"{vehicle}:subtrack-{subtrack:04d}", tuple(points), subtrack)
+        connection = self._require_open()
+        cursor = connection.cursor()
+        try:
+            cursor.execute("SELECT subtrack_index, min(vehicle_id), count(*) FROM resolved_points GROUP BY subtrack_index ORDER BY subtrack_index")
+            while tracks := cursor.fetchmany(batch_size):
+                for subtrack, vehicle, count in tracks:
+                    columns = connection.execute(
+                        "SELECT resolved_point_id,lon,lat,x,y,crossing_id,intersection_id,crossing_type FROM resolved_points WHERE subtrack_index=? ORDER BY sequence_in_subtrack,resolved_point_id", (subtrack,),
+                    ).fetchnumpy()
+                    valid = ~np.ma.getmaskarray(columns["crossing_id"])
+                    def integers(name: str, dtype: object = np.int64) -> np.ndarray:
+                        return np.asarray(np.ma.filled(columns[name], 0), dtype=dtype)
+                    yield ClipTrack(
+                        vehicle_id=str(vehicle), trip_id=f"{vehicle}:subtrack-{subtrack:04d}",
+                        subtrack_index=int(subtrack),
+                        xy=np.column_stack((columns["x"],columns["y"])),
+                        lonlat=np.column_stack((columns["lon"],columns["lat"])),
+                        resolved_point_ids=integers("resolved_point_id"),
+                        crossing_ids=integers("crossing_id"), intersection_ids=integers("intersection_id"),
+                        crossing_types=integers("crossing_type", np.int8), crossing_valid=valid,
+                        intersection_valid=~np.ma.getmaskarray(columns["intersection_id"]),
+                    )
+        finally:
+            cursor.close()
 
     def _require_open(self) -> duckdb.DuckDBPyConnection:
         if self._connection is None:
@@ -137,7 +128,8 @@ class DetectDatasetReader:
             SELECT count(*) n FROM resolved_points WHERE detect_id IS DISTINCT FROM ?::UUID
               OR resolved_point_id IS NULL OR subtrack_index IS NULL
               OR sequence_in_subtrack IS NULL OR vehicle_id IS NULL OR vehicle_id=''
-              OR lon IS NULL OR lat IS NULL
+              OR lon IS NULL OR lat IS NULL OR x IS NULL OR y IS NULL
+              OR NOT isfinite(x) OR NOT isfinite(y)
               OR NOT isfinite(lon) OR NOT isfinite(lat) OR lon NOT BETWEEN -180 AND 180
               OR lat NOT BETWEEN -90 AND 90 OR point_kind IS NULL
               OR point_kind NOT IN ('kept','injected','crossing')

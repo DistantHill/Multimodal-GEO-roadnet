@@ -16,8 +16,8 @@ def _point(point_id, sequence, x, *, kind=0):
     }
 
 
-def _row(vehicle, point, prev=None, next_=None):
-    result = {"vehicle_id": vehicle, "subtrack_index": 1, **point}
+def _row(vehicle, point, prev=None, next_=None, *, subtrack=1):
+    result = {"vehicle_id": vehicle, "subtrack_index": subtrack, **point}
     for prefix, neighbor in (("prev_", prev), ("next_", next_)):
         for key in point:
             result[prefix + key] = None if neighbor is None else neighbor[key]
@@ -25,7 +25,7 @@ def _row(vehicle, point, prev=None, next_=None):
 
 
 def _batch(*rows):
-    return {name: tuple(row[name] for row in rows) for name in rows[0]}
+    return {name: np.asarray([row[name] for row in rows], dtype=object) for name in rows[0]}
 
 
 def test_build_grid_segments_deduplicates_both_hit_endpoints_and_sorts():
@@ -35,25 +35,22 @@ def test_build_grid_segments_deduplicates_both_hit_endpoints_and_sorts():
     other_first = _point(30, 0, 0.0)
     other_next = _point(31, 1, 1.0)
     batches = [
-        _batch(_row("z", other_first, next_=other_next),
+        _batch(_row("z", other_first, next_=other_next, subtrack=2),
                _row("a", first, next_=injected)),
         _batch(_row("a", injected, prev=first, next_=third)),
     ]
 
     result = build_grid_segments(batches, max_segments=3, max_bytes=100_000)
 
-    assert result["vehicle_id"] == ("a", "a", "z")
-    assert result["segment_identity"] == (
-        ("a", 1, 0, 10, 1, 20),
-        ("a", 1, 1, 20, 0, 11),
-        ("z", 1, 0, 30, 0, 31),
-    )
+    assert result["vehicle_id"].tolist() == ["a", "a", "z"]
+    np.testing.assert_array_equal(result["segment_identity"], [[1, 0, 10, 1, 20], [1, 1, 20, 0, 11], [2, 0, 30, 0, 31]])
     np.testing.assert_array_equal(result["x_start"], [0.0, 1.0, 0.0])
     np.testing.assert_array_equal(result["x_end"], [1.0, 2.0, 1.0])
-    assert result["start_point_kind"] == ("kept", "injected", "kept")
+    assert result["start_point_kind"].tolist() == ["kept", "injected", "kept"]
     assert result["start_source_id"][1] == "public.injected_points"
     assert result["start_generated_reason"][1] == "test"
-    assert result["start_source_row_key"] == ("10", None, "30")
+    assert result["start_source_row_key"].tolist() == [10, 0, 30]
+    assert result["start_source_row_key"].dtype == np.int64
 
 
 def test_build_grid_segments_budget_fails_without_retry():

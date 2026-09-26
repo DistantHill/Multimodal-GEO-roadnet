@@ -11,6 +11,7 @@ dependencies = [
   "fastapi>=0.115,<1",
   "psycopg[binary]>=3.2,<4",
   "pyproj>=3.7,<4",
+  "numpy>=2,<3",
   "uvicorn[standard]>=0.34,<1",
 ]
 

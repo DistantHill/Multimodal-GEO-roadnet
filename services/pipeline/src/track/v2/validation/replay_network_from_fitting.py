@@ -6,6 +6,7 @@ from dataclasses import MISSING, dataclass, fields
 import hashlib
 import json
 import math
+import numpy as np
 from pathlib import Path
 from typing import Any, get_type_hints
 from uuid import UUID, uuid4
@@ -110,14 +111,13 @@ def _centerlines(rows: list[tuple[Any, ...]]) -> tuple[Centerline, ...]:
             raise NetworkReplayError("combined centerline counts are invalid")
         try:
             geometry = json.loads(raw_geometry)
-            coordinates = tuple(tuple(float(value) for value in point)
-                                for point in geometry["coordinates"])
+            coordinates = np.asarray(geometry["coordinates"], dtype=np.float64)
             length = float(raw_length)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise NetworkReplayError("combined centerline geometry is invalid") from exc
         if (geometry.get("type") != "LineString" or len(coordinates) < 2
-                or any(len(point) != 2 or not all(math.isfinite(value) for value in point)
-                       for point in coordinates)
+                or coordinates.ndim != 2 or coordinates.shape[1] != 2
+                or not np.isfinite(coordinates).all()
                 or not math.isfinite(length) or length <= 0):
             raise NetworkReplayError("combined centerline geometry is invalid")
         seen.add((raw_from, raw_to))
@@ -142,10 +142,10 @@ def _normalized_tables(
         left, right = identities[edge.from_intersection_id], identities[edge.to_intersection_id]
         reverse = left > right
         pair = (right, left) if reverse else (left, right)
-        points = tuple(reversed(edge.points)) if reverse else edge.points
+        points = edge.points[::-1] if reverse else edge.points
         forward = edge.reverse_clip_count if reverse else edge.forward_clip_count
         backward = edge.forward_clip_count if reverse else edge.reverse_clip_count
-        geometry = json.dumps({"type": "LineString", "coordinates": points},
+        geometry = json.dumps({"type": "LineString", "coordinates": points.tolist()},
                               separators=(",", ":"))
         edges.append((_key("edge", *pair), geometry, edge.length_m,
                       edge.source_clip_count, forward, backward))

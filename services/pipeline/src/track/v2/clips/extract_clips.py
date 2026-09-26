@@ -7,6 +7,7 @@ p/i/c order and never solves segment/circle intersections again.
 from __future__ import annotations
 
 import math
+import numpy as np
 from collections import Counter
 from pathlib import Path
 
@@ -18,14 +19,11 @@ from ..intersections.query_results import fetch_detect_row
 from ..intersections.results.read_parquet import DetectDatasetReader
 from ..models import (
     ClipConfig,
-    ClipEndpoint,
     ClipInput,
     ClipIntersection,
-    ClipPoint,
     ClipReport,
     ClipResult,
     ClipTrack,
-    ResolvedTrackPoint,
     RuntimeConfig,
     TrackClip,
 )
@@ -49,7 +47,7 @@ def extract_clips(
     skipped = 0
 
     for track in source.tracks:
-        if len(track.points) < 2:
+        if len(track.xy) < 2:
             skipped += 1
             continue
         track_clips, track_skipped = _extract_track_clips(
@@ -127,7 +125,7 @@ def extract_clips_for_detect(
                     seen_subtracks.add(track.subtrack_index)
                     vehicles.add(track.vehicle_id)
                     _validate_input(ClipInput((), (track,), run.spatial_context, detect_id))
-                    if len(track.points) < 2:
+                    if len(track.xy) < 2:
                         skipped += 1
                         continue
                     track_clips, track_skipped = _extract_track_clips(
@@ -169,7 +167,7 @@ def _project_intersections(
     transformer: CoordinateTransformer,
 ) -> dict[int, tuple[float, float, float]]:
     projected = transformer.forward_many(
-        (intersection.lon, intersection.lat) for intersection in intersections
+        np.asarray([(intersection.lon, intersection.lat) for intersection in intersections], dtype=np.float64).reshape(-1, 2)
     )
     return {
         intersection.intersection_id: (x, y, intersection.radius_m)
@@ -177,215 +175,98 @@ def _project_intersections(
     }
 
 
-def _initial_active_set(
-    point: ResolvedTrackPoint,
-    circles: dict[int, tuple[float, float, float]],
-    transformer: CoordinateTransformer,
-) -> set[int]:
-    x, y = transformer.forward(point.lon, point.lat)
-    return {
-        intersection_id
-        for intersection_id, (center_x, center_y, radius) in circles.items()
-        if math.hypot(x - center_x, y - center_y) < radius - _EPS
-    }
-
-
 def _extract_track_clips(
     track: ClipTrack,
     circles: dict[int, tuple[float, float, float]],
     transformer: CoordinateTransformer,
-    *,
-    include_boundaries: bool,
-    detect_id: str | None,
+    *, include_boundaries: bool, detect_id: str | None,
 ) -> tuple[list[TrackClip], int]:
-    points = track.points
-    active = _initial_active_set(points[0], circles, transformer)
-    event_indexes = [
-        index for index, point in enumerate(points) if point.crossing_id is not None
-    ]
+    x, y = track.xy[0]
+    active = {identifier for identifier, (cx, cy, radius) in circles.items()
+              if math.hypot(x-cx, y-cy) < radius-_EPS}
+    event_indexes = np.flatnonzero(track.crossing_valid).tolist()
     clips: list[TrackClip] = []
     skipped = 0
-
-    open_endpoint: ClipEndpoint | None = None
+    open_index: int | None = 0 if not active and include_boundaries else None
     open_after_index = 1
-    if not active and include_boundaries:
-        open_endpoint = _boundary_endpoint(points[0])
 
-    def append_clip(
-        start: ClipEndpoint,
-        end: ClipEndpoint,
-        interior_start: int,
-        interior_end: int,
-        clip_type: str,
-    ) -> None:
+    def append_clip(start: int, end: int, lo: int, hi: int, clip_type: str) -> None:
         nonlocal skipped
-        interior = tuple(
-            ClipPoint(
-                resolved_point_id=point.resolved_point_id,
-                lon=point.lon,
-                lat=point.lat,
-            )
-            for point in points[interior_start:interior_end]
-        )
-        geometry = [(start.lon, start.lat)]
-        geometry.extend((point.lon, point.lat) for point in interior)
-        geometry.append((end.lon, end.lat))
-        distance = _polyline_distance_m(geometry, transformer)
+        # A simultaneous crossing batch may choose an endpoint outside the
+        # consecutive interior range; gather only those two boundary members.
+        if start == lo-1 and end == hi:
+            xy, lonlat = track.xy[start:end+1], track.lonlat[start:end+1]
+        else:
+            xy = np.concatenate((track.xy[start:start+1], track.xy[lo:hi], track.xy[end:end+1]))
+            lonlat = np.concatenate((track.lonlat[start:start+1], track.lonlat[lo:hi], track.lonlat[end:end+1]))
+        distance = float(np.linalg.norm(np.diff(xy, axis=0), axis=1).sum())
         if distance <= _EPS:
             skipped += 1
             return
         ordinal = len(clips)
+        valid_start, valid_end = track.crossing_valid[start], track.crossing_valid[end]
         clips.append(TrackClip(
-            clip_id=(
-                f"{detect_id or 'memory'}:{track.vehicle_id}:"
-                f"{track.subtrack_index}:{ordinal:04d}"
-            ),
-            vehicle_id=track.vehicle_id,
-            trip_id=track.trip_id,
-            clip_type=clip_type,
-            start=start,
-            end=end,
-            points=interior,
-            distance_m=distance,
-            point_count=len(interior) + 2,
-            subtrack_index=track.subtrack_index,
+            clip_id=f"{detect_id or 'memory'}:{track.vehicle_id}:{track.subtrack_index}:{ordinal:04d}",
+            vehicle_id=track.vehicle_id, trip_id=track.trip_id, clip_type=clip_type,
+            xy=xy, lonlat=lonlat, resolved_point_ids=track.resolved_point_ids[lo:hi],
+            start_index=start, end_index=end, interior_start=lo, interior_end=hi,
+            start_kind=("entry" if track.crossing_types[start] == 1 else "exit") if valid_start else "boundary",
+            end_kind=("entry" if track.crossing_types[end] == 1 else "exit") if valid_end else "boundary",
+            start_intersection_id=int(track.intersection_ids[start]) if valid_start else None,
+            end_intersection_id=int(track.intersection_ids[end]) if valid_end else None,
+            start_crossing_id=int(track.crossing_ids[start]) if valid_start else None,
+            end_crossing_id=int(track.crossing_ids[end]) if valid_end else None,
+            distance_m=distance, point_count=len(xy), subtrack_index=track.subtrack_index,
             clip_ordinal_in_track=ordinal,
         ))
 
     cursor = 0
     while cursor < len(event_indexes):
-        batch_start_pos = cursor
-        first_index = event_indexes[cursor]
+        batch_start = cursor
+        first = event_indexes[cursor]
         cursor += 1
         while cursor < len(event_indexes):
-            candidate_index = event_indexes[cursor]
-            if not _same_position(points[first_index], points[candidate_index]):
+            candidate = event_indexes[cursor]
+            if not np.all(np.abs(track.lonlat[first]-track.lonlat[candidate]) <= 1e-12):
                 break
-            # Only consecutive crossing rows form a simultaneous event batch.
-            if candidate_index != event_indexes[cursor - 1] + 1:
+            if candidate != event_indexes[cursor-1]+1:
                 break
             cursor += 1
-        batch_indexes = event_indexes[batch_start_pos:cursor]
-        batch = [points[index] for index in batch_indexes]
+        batch = event_indexes[batch_start:cursor]
         before_empty = not active
-
-        exits = sorted(
-            (point for point in batch if point.crossing_type == 0),
-            key=lambda point: (point.intersection_id or -1, point.crossing_id or -1),
-        )
-        entries = sorted(
-            (point for point in batch if point.crossing_type == 1),
-            key=lambda point: (point.intersection_id or -1, point.crossing_id or -1),
-        )
-        if len(exits) + len(entries) != len(batch):
+        key = lambda index: (int(track.intersection_ids[index]) or -1, int(track.crossing_ids[index]) or -1)
+        exits = sorted((i for i in batch if track.crossing_types[i] == 0), key=key)
+        entries = sorted((i for i in batch if track.crossing_types[i] == 1), key=key)
+        if len(exits)+len(entries) != len(batch):
             raise ValueError(f"subtrack {track.subtrack_index} has invalid crossing type")
-        for point in exits:
-            assert point.intersection_id is not None
-            if point.intersection_id not in active:
-                raise ValueError(
-                    f"subtrack {track.subtrack_index} exits inactive intersection "
-                    f"{point.intersection_id}"
-                )
-            active.remove(point.intersection_id)
-        for point in entries:
-            assert point.intersection_id is not None
-            if point.intersection_id in active:
-                raise ValueError(
-                    f"subtrack {track.subtrack_index} re-enters active intersection "
-                    f"{point.intersection_id}"
-                )
-            active.add(point.intersection_id)
-
+        for index in exits:
+            identifier = int(track.intersection_ids[index])
+            if identifier not in active:
+                raise ValueError(f"subtrack {track.subtrack_index} exits inactive intersection {identifier}")
+            active.remove(identifier)
+        for index in entries:
+            identifier = int(track.intersection_ids[index])
+            if identifier in active:
+                raise ValueError(f"subtrack {track.subtrack_index} re-enters active intersection {identifier}")
+            active.add(identifier)
         after_empty = not active
         if before_empty and not after_empty:
-            if open_endpoint is not None:
-                endpoint = _crossing_endpoint(entries[0])
-                clip_type = (
-                    "boundary_end"
-                    if open_endpoint.crossing_id is None
-                    else "between_intersection"
-                )
-                append_clip(
-                    open_endpoint,
-                    endpoint,
-                    open_after_index,
-                    batch_indexes[0],
-                    clip_type,
-                )
-            open_endpoint = None
+            if open_index is not None:
+                clip_type = "between_intersection" if track.crossing_valid[open_index] else "boundary_end"
+                append_clip(open_index, entries[0], open_after_index, batch[0], clip_type)
+            open_index = None
         elif not before_empty and after_empty:
-            open_endpoint = _crossing_endpoint(exits[-1])
-            open_after_index = batch_indexes[-1] + 1
-        # If both states are nonempty, this batch lies in overlapping circles
-        # and cannot delimit a road fragment. Empty→empty would mean Detect
-        # persisted a non-state-changing root, which is an invalid sequence.
+            open_index = exits[-1]
+            open_after_index = batch[-1]+1
         elif before_empty and after_empty:
-            raise ValueError(
-                f"subtrack {track.subtrack_index} has a no-op crossing batch"
-            )
-
+            raise ValueError(f"subtrack {track.subtrack_index} has a no-op crossing batch")
     if not event_indexes:
         if not active and include_boundaries:
-            append_clip(
-                _boundary_endpoint(points[0]),
-                _boundary_endpoint(points[-1]),
-                1,
-                len(points) - 1,
-                "full_track",
-            )
-        # Entirely inside one or more circles intentionally produces no Clip.
+            append_clip(0, len(track.xy)-1, 1, len(track.xy)-1, "full_track")
         return clips, skipped
-
-    if not active and open_endpoint is not None and include_boundaries:
-        append_clip(
-            open_endpoint,
-            _boundary_endpoint(points[-1]),
-            open_after_index,
-            len(points) - 1,
-            "boundary_start",
-        )
+    if not active and open_index is not None and include_boundaries:
+        append_clip(open_index, len(track.xy)-1, open_after_index, len(track.xy)-1, "boundary_start")
     return clips, skipped
-
-
-def _crossing_endpoint(point: ResolvedTrackPoint) -> ClipEndpoint:
-    if (
-        point.crossing_id is None
-        or point.intersection_id is None
-        or point.crossing_type not in (0, 1)
-    ):
-        raise ValueError("resolved crossing metadata is incomplete")
-    return ClipEndpoint(
-        kind="entry" if point.crossing_type == 1 else "exit",
-        lon=point.lon,
-        lat=point.lat,
-        intersection_id=point.intersection_id,
-        crossing_id=point.crossing_id,
-    )
-
-
-def _boundary_endpoint(point: ResolvedTrackPoint) -> ClipEndpoint:
-    return ClipEndpoint(
-        kind="boundary",
-        lon=point.lon,
-        lat=point.lat,
-        intersection_id=None,
-        crossing_id=None,
-    )
-
-
-def _same_position(left: ResolvedTrackPoint, right: ResolvedTrackPoint) -> bool:
-    return abs(left.lon - right.lon) <= 1e-12 and abs(left.lat - right.lat) <= 1e-12
-
-
-def _polyline_distance_m(
-    points: list[tuple[float, float]],
-    transformer: CoordinateTransformer,
-) -> float:
-    xy = transformer.forward_many(points)
-    return sum(
-        math.hypot(right[0] - left[0], right[1] - left[1])
-        for left, right in zip(xy, xy[1:])
-    )
 
 
 def _validate_input(source: ClipInput) -> None:
@@ -403,14 +284,9 @@ def _validate_input(source: ClipInput) -> None:
         if track.subtrack_index in seen_subtracks:
             raise ValueError(f"duplicate ClipTrack subtrack {track.subtrack_index}")
         seen_subtracks.add(track.subtrack_index)
-        resolved_ids = [point.resolved_point_id for point in track.points]
-        if len(resolved_ids) != len(set(resolved_ids)):
+        if len(track.resolved_point_ids) != len(np.unique(track.resolved_point_ids)):
             raise ValueError(f"subtrack {track.subtrack_index} repeats a resolved point")
-        for point in track.points:
-            if not (math.isfinite(point.lon) and math.isfinite(point.lat)):
-                raise ValueError(f"subtrack {track.subtrack_index} has invalid coordinates")
-            is_crossing = point.crossing_id is not None
-            if is_crossing != (
-                point.intersection_id is not None and point.crossing_type in (0, 1)
-            ):
-                raise ValueError("resolved crossing metadata must be all-or-none")
+        if not np.isfinite(track.xy).all() or not np.isfinite(track.lonlat).all():
+            raise ValueError(f"subtrack {track.subtrack_index} has invalid coordinates")
+        if np.any(track.crossing_valid != track.intersection_valid) or np.any(track.crossing_valid & ~np.isin(track.crossing_types, (0, 1))):
+            raise ValueError("resolved crossing metadata must be all-or-none")

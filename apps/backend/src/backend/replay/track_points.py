@@ -1,79 +1,92 @@
-"""Track point grouping shared by map replay and Clip projections."""
-
+"""Columnar track grouping shared by map replay and Clip projections."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
-
+import numpy as np
 from ..map_features import create_map_feature
 
 
 @dataclass(frozen=True, slots=True)
-class TrackPoint:
-    resolved_point_id: int | None
-    source_row_key: str | None
-    lon: float
-    lat: float
-    point_kind: str
-    crossing_id: int | None = None
-    intersection_id: int | None = None
-    crossing_type: int | None = None
+class TrackBatch:
+    lonlat: np.ndarray
+    resolved_point_ids: np.ndarray
+    resolved_valid: np.ndarray
+    source_row_keys: np.ndarray
+    source_valid: np.ndarray
+    point_kinds: np.ndarray
+    crossing_ids: np.ndarray
+    intersection_ids: np.ndarray
+    crossing_types: np.ndarray
+    crossing_valid: np.ndarray
+    intersection_valid: np.ndarray
 
-def group_track_rows(rows: list[Any]) -> dict[tuple[str, int], list[TrackPoint]]:
-    grouped: dict[tuple[str, int], list[TrackPoint]] = {}
+    def __post_init__(self) -> None:
+        n = len(self.lonlat)
+        if self.lonlat.shape != (n, 2) or self.lonlat.dtype != np.float64:
+            raise ValueError("lonlat must be float64 (N,2)")
+        for item in fields(self):
+            value = getattr(self, item.name)
+            if item.name != "lonlat" and value.shape != (n,):
+                raise ValueError(f"{item.name} must have shape (N,)")
+            if item.name.endswith("_valid") and value.dtype != np.bool_:
+                raise ValueError(f"{item.name} must be boolean")
+            if item.name in {"resolved_point_ids", "source_row_keys", "crossing_ids", "intersection_ids"} and value.dtype != np.int64:
+                raise ValueError(f"{item.name} must be int64")
+            value.flags.writeable = False
+
+    def __len__(self) -> int:
+        return len(self.lonlat)
+
+    def slice(self, start: int, stop: int) -> TrackBatch:
+        return TrackBatch(*(getattr(self, item.name)[start:stop] for item in fields(self)))
+
+
+def group_track_rows(rows: list[Any]) -> dict[tuple[str, int], TrackBatch]:
+    columns: dict[tuple[str, int], list[list]] = {}
     for row in rows:
         key = (str(row[1]), int(row[0]))
-        grouped.setdefault(key, []).append(
-            TrackPoint(
-                resolved_point_id=int(row[2]) if row[2] is not None else None,
-                source_row_key=str(row[3]) if row[3] is not None else None,
-                lon=float(row[4]),
-                lat=float(row[5]),
-                point_kind=str(row[6]),
-                crossing_id=int(row[7]) if row[7] is not None else None,
-                intersection_id=int(row[8]) if row[8] is not None else None,
-                crossing_type=int(row[9]) if row[9] is not None else None,
-            )
+        target = columns.setdefault(key, [[] for _ in range(8)])
+        for column, value in zip(target, row[2:], strict=True):
+            column.append(value)
+    grouped = {}
+    for key, data in columns.items():
+        def identities(index: int) -> tuple[np.ndarray, np.ndarray]:
+            return (np.asarray([value if value is not None else 0 for value in data[index]], dtype=np.int64),
+                    np.asarray([value is not None for value in data[index]], dtype=np.bool_))
+        resolved, resolved_valid = identities(0)
+        source, source_valid = identities(1)
+        crossing, crossing_valid = identities(5)
+        intersection, intersection_valid = identities(6)
+        grouped[key] = TrackBatch(
+            np.column_stack((data[2], data[3])).astype(np.float64), resolved, resolved_valid,
+            source, source_valid, np.asarray(data[4]), crossing, intersection,
+            np.asarray([value if value is not None else -1 for value in data[7]], dtype=np.int8),
+            crossing_valid, intersection_valid,
         )
     return grouped
 
-def complete_track_groups(
-    rows: list[Any],
-    max_points: int,
-) -> tuple[dict[tuple[str, int], list[TrackPoint]], bool]:
+
+def complete_track_groups(rows: list[Any], max_points: int) -> tuple[dict[tuple[str, int], TrackBatch], bool]:
     truncated = len(rows) > max_points
     kept = rows[:max_points]
     if truncated and kept:
         last_key = (str(kept[-1][1]), int(kept[-1][0]))
         next_key = (str(rows[max_points][1]), int(rows[max_points][0]))
         if next_key == last_key:
-            kept = [
-                row
-                for row in kept
-                if (str(row[1]), int(row[0])) != last_key
-            ]
+            kept = [row for row in kept if (str(row[1]), int(row[0])) != last_key]
     return group_track_rows(kept), truncated
 
-def build_track_feature(
-    key: tuple[str, int],
-    points: list[TrackPoint],
-    detect_id: str | None,
-) -> dict[str, Any]:
-    coordinates = [[point.lon, point.lat] for point in points]
-    geometry: dict[str, Any]
-    if len(coordinates) == 1:
-        geometry = {"type": "Point", "coordinates": coordinates[0]}
-    else:
-        geometry = {"type": "LineString", "coordinates": coordinates}
+
+def build_track_feature(key: tuple[str, int], points: TrackBatch, detect_id: str | None) -> dict[str, Any]:
+    coordinates = points.lonlat.tolist()
+    geometry = {"type": "Point", "coordinates": coordinates[0]} if len(points) == 1 else {
+        "type": "LineString", "coordinates": coordinates}
     return create_map_feature(
-        f"{key[0]}:{key[1]}",
-        geometry,
-        vehicle_id=key[0],
-        subtrack_index=key[1],
-        detect_id=detect_id,
-        resolved_point_ids=[point.resolved_point_id for point in points],
-        source_row_keys=[point.source_row_key for point in points],
-        point_kinds=[point.point_kind for point in points],
-        crossing_ids=[point.crossing_id for point in points],
+        f"{key[0]}:{key[1]}", geometry, vehicle_id=key[0], subtrack_index=key[1], detect_id=detect_id,
+        resolved_point_ids=[int(value) if valid else None for value,valid in zip(points.resolved_point_ids, points.resolved_valid)],
+        source_row_keys=[str(value) if valid else None for value,valid in zip(points.source_row_keys, points.source_valid)],
+        point_kinds=points.point_kinds.tolist(),
+        crossing_ids=[int(value) if valid else None for value,valid in zip(points.crossing_ids, points.crossing_valid)],
         point_count=len(points),
     )

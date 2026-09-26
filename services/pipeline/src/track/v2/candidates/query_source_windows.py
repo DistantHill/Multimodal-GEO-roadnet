@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import math
 import time
+import numpy as np
+from ..trajectories.subtrack_columns import refinement_subtrack_from_columns
 from typing import Any, Iterator
 
 from ..telemetry.heartbeat import observed_operation, heartbeat_progress
 from ..models import (
     HotspotCluster,
-    PointRef,
-    RefinedPointRef,
     SpatialContext,
-    TrajectoryPoint,
+    RefinementSubtrack,
 )
 from ..projection import (
     CoordinateTransformer,
@@ -28,30 +28,6 @@ from ..db._point_query_fragments import (
 )
 
 
-def row_to_dict(row: Any) -> dict[str, Any]:
-    """Convert a DB cursor row (unified schema-v4 p/i format) to a dict.
-
-    ZH: 将统一 14 列格式的 DB 游标行转为 dict。
-        替代交叉口检测逻辑中重复的 ``rows.append({...})``。
-    """
-    return {
-        "vehicle_id": row[0],
-        "timestamp": float(row[1]),
-        "lon": float(row[2]),
-        "lat": float(row[3]),
-        "heading": float(row[4]),
-        "speed": float(row[5]),
-        "source_id": row[6],
-        "source_row_key": row[7],
-        "extra": row[8] if isinstance(row[8], dict) else {},
-        "generated_reason": row[9],
-        "x": float(row[10]),
-        "y": float(row[11]),
-        "point_kind": int(row[12]),
-        "row_id": int(row[13]),
-        "subtrack_index": int(row[14]),
-        "anchor_sequence": int(row[15]),
-    }
 
 def build_spatial_extent_sql(
     table: str = "trajectory_points",
@@ -164,7 +140,7 @@ def build_active_in_window_sql(
             f"       x, y, point_kind, row_id, subtrack_index, anchor_sequence "
             f"FROM ("
             f"  SELECT ktp.vehicle_id, tp.timestamp, tp.lon, tp.lat, tp.heading, tp.speed, "
-            f"         %s::text AS source_id, ktp.source_row_key::text AS source_row_key, {extra} AS extra, "
+            f"         %s::text AS source_id, ktp.source_row_key::bigint AS source_row_key, {extra} AS extra, "
             f"         ''::text AS generated_reason, "
             f"         ST_X({projected_tp}) AS x, ST_Y({projected_tp}) AS y, "
             f"         0 AS point_kind, ktp.id AS row_id, ktp.subtrack_index, "
@@ -321,7 +297,7 @@ def _query_active_points_in_window(
     spatial_context: SpatialContext,
     telemetry: dict[str, int | float] | None = None,
     _transformer: CoordinateTransformer | None = None,
-) -> list[TrajectoryPoint]:
+) -> list[RefinementSubtrack]:
     """Query active trajectory points + injected points in a spatial window.
 
     ZH: 先以反投影并加密边界的 4326 bbox 使用原始 Geometry GiST 粗筛，
@@ -331,7 +307,8 @@ def _query_active_points_in_window(
         kept 模式 (``kept_table`` 非空) 时 trajectory 分支 JOIN 精炼结果表，
         首参绑定 ``ktp.refine_id``（而非 raw 模式的 source_id）。
     """
-    rows: list[dict[str, Any]] = []
+    grouped_columns: dict[tuple[str, int], list[list]] = {}
+    row_count = 0
     has_refine_id = refine_id is not None
     if kept_table is not None and refine_id is None:
         raise ValueError("kept_table requires refine_id")
@@ -380,16 +357,19 @@ def _query_active_points_in_window(
         for row_count, row in enumerate(cur, 1):
             if row_count % 10_000 == 0:
                 heartbeat_progress(row_count)
-            rows.append(row_to_dict(row))
+            key = (str(row[0]), int(row[14]))
+            columns = grouped_columns.setdefault(key, [[] for _ in range(16)])
+            for column, item in zip(columns, row):
+                column.append(item)
 
     # DB ORDER BY 已保证 (vehicle_id, timestamp) 有序，无需 Python 侧再排
     if telemetry is not None:
         telemetry["query_seconds"] = telemetry.get("query_seconds", 0.0) + (
             time.perf_counter() - query_started
         )
-        telemetry["queried_rows"] = telemetry.get("queried_rows", 0) + len(rows)
+        telemetry["queried_rows"] = telemetry.get("queried_rows", 0) + row_count
         materialization_started = time.perf_counter()
-    points = _build_points_from_rows(rows)
+    points = _build_tracks_from_columns(grouped_columns, raw=kept_table is None)
     _validate_materialized_points(points, spatial_context)
     if telemetry is not None:
         telemetry["materialization_seconds"] = telemetry.get(
@@ -398,30 +378,21 @@ def _query_active_points_in_window(
     return points
 
 def _validate_materialized_points(
-    points: list[TrajectoryPoint],
+    points: list[RefinementSubtrack],
     spatial_context: SpatialContext,
 ) -> None:
     """Validate exactly the rows read by a raw/diagnostic window query."""
     if not points:
         return
-    bounds: tuple[float, float, float, float] | None = None
-    for point in points:
-        if point.x is None or point.y is None or not all(math.isfinite(value) for value in (
-            point.lon, point.lat, point.x, point.y,
-        )):
-            raise ValueError("queried point has non-finite lon/lat/processing x/y")
-        if not (-180.0 <= point.lon <= 180.0 and -90.0 <= point.lat <= 90.0):
-            raise ValueError("queried point longitude/latitude is outside EPSG:4326")
-        bounds = (
-            (point.lon, point.lat, point.lon, point.lat)
-            if bounds is None
-            else (
-                min(bounds[0], point.lon), min(bounds[1], point.lat),
-                max(bounds[2], point.lon), max(bounds[3], point.lat),
-            )
-        )
-    assert bounds is not None
-    CoordinateTransformer(spatial_context).validate_bounds(bounds)
+    bounds=None
+    for track in points:
+        if not (np.isfinite(track.xy).all() and np.isfinite(track.lonlat).all()): raise ValueError("queried geometry contains non-finite coordinates")
+        lon=track.lonlat[:,0]; lat=track.lonlat[:,1]
+        if np.any((lon < -180)|(lon > 180)|(lat < -90)|(lat > 90)): raise ValueError("queried coordinates outside EPSG:4326")
+        if len(track):
+            current=(float(lon.min()),float(lat.min()),float(lon.max()),float(lat.max()))
+            bounds=current if bounds is None else (min(bounds[0],current[0]),min(bounds[1],current[1]),max(bounds[2],current[2]),max(bounds[3],current[3]))
+    if bounds is not None: CoordinateTransformer(spatial_context).validate_bounds(bounds)
 
 def _query_active_points_near_cluster(
     conn: Any,
@@ -433,7 +404,7 @@ def _query_active_points_near_cluster(
     source_table: str | None = None,
     refine_id: str | None = None,
     spatial_context: SpatialContext,
-) -> list[TrajectoryPoint]:
+) -> list[RefinementSubtrack]:
     """Query active points within *radius_m* of a cluster centroid.
 
     ZH: 委托 ``_query_active_points_in_window``，将 cluster centroid + radius_m
@@ -456,49 +427,30 @@ def _query_active_points_near_cluster(
         spatial_context=spatial_context,
     )
 
-def _build_points_from_rows(rows: list[dict[str, Any]]) -> list[TrajectoryPoint]:
-    """Convert DB row dicts to TrajectoryPoint objects."""
-    points: list[TrajectoryPoint] = []
-    refined_sequences: dict[int, int] = {}
-    for r in rows:
-        subtrack_index = int(r["subtrack_index"])
-        refined_sequence = refined_sequences.get(subtrack_index, 0)
-        is_injected = int(r["point_kind"]) == 1
-        points.append(TrajectoryPoint(
-            point_ref=PointRef(
-                source_id=r["source_id"],
-                source_row_key=r["source_row_key"],
-                stable=not is_injected,
-                generated_reason=str(r.get("generated_reason") or ""),
-            ),
-            vehicle_id=r["vehicle_id"],
-            timestamp=r["timestamp"],
-            lon=r["lon"],
-            lat=r["lat"],
-            heading=r["heading"],
-            speed=r["speed"],
-            extra=r["extra"],
-            x=r["x"],
-            y=r["y"],
-            refined_point_ref=RefinedPointRef(
-                point_kind="injected" if is_injected else "kept",
-                point_id=int(r["row_id"]),
-                subtrack_index=subtrack_index,
-                refined_sequence_in_subtrack=refined_sequence,
-            ),
-        ))
-        refined_sequences[subtrack_index] = refined_sequence + 1
-    return points
-
-def _tracks_from_points(points: list[TrajectoryPoint]) -> dict[str, list[TrajectoryPoint]]:
-    """Group points by globally unique Refine subtrack, retaining vehicle IDs."""
-    tracks: dict[str, list[TrajectoryPoint]] = {}
-    for tp in points:
-        subtrack_index = (
-            tp.refined_point_ref.subtrack_index
-            if tp.refined_point_ref is not None
-            else 1
-        )
-        key = f"{tp.vehicle_id}\x00{subtrack_index}"
-        tracks.setdefault(key, []).append(tp)
+def _build_tracks_from_columns(grouped_columns, *, raw=False):
+    """Publish grouped columns; raw diagnostic queries have a local partition."""
+    tracks=[]
+    seen_partitions=set()
+    for ordinal, ((vehicle_id, subtrack), columns) in enumerate(grouped_columns.items(), 1):
+        if raw:
+            subtrack=ordinal
+        elif subtrack in seen_partitions:
+            raise ValueError("subtrack contains multiple vehicles")
+        seen_partitions.add(subtrack)
+        kind=np.where(np.asarray(columns[12],dtype=np.int8)==0,"p","i")
+        source_keys=np.zeros(len(kind),dtype=np.int64)
+        kept=np.flatnonzero(kind=="p")
+        source_keys[kept]=np.asarray([columns[7][i] for i in kept],dtype=np.int64)
+        tracks.append(refinement_subtrack_from_columns(
+            vehicle_id=vehicle_id,subtrack_index=subtrack,source_id=str(columns[6][0]),
+            xy=np.column_stack((columns[10],columns[11])).astype(np.float64),
+            lonlat=np.column_stack((columns[2],columns[3])).astype(np.float64),
+            timestamp=np.asarray(columns[1],dtype=np.float64),heading=np.asarray(columns[4],dtype=np.float64),
+            speed=np.asarray(columns[5],dtype=np.float64),kind=kind,source_row_key=source_keys,
+            refine_point_id=np.asarray(columns[13],dtype=np.int64),after_sequence=np.asarray(columns[15],dtype=np.int64),
+            generated_reason=np.asarray([reason or "" for reason in columns[9]],dtype=object)))
     return tracks
+
+
+def _tracks_from_points(points):
+    return {track.subtrack_index:track for track in points}

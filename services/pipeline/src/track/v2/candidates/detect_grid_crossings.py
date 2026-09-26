@@ -9,19 +9,18 @@ from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
 from threading import Lock, local
-from types import SimpleNamespace
 from typing import Any, Callable
 
 import numpy as np
 
 from ..db.fetch_refine_points_in_grid import fetch_points_in_grid
-from ..models import CrossTrackCandidate, PointRef, RefinedPointRef
+from ..models import CrossCandidateBatch
 from ..projection import CoordinateTransformer
 from ..telemetry.console_logging import log_info
 from .build_patches import (
     CrossTrackCapacityError, build_cross_track_index, iter_cross_track_patches,
 )
-from .detect_cross_track_pairs import intersect_cross_track_patch
+from .detect_cross_track_pairs import (intersect_cross_track_patch, build_cross_track_patch_candidates, concatenate_cross_batches)
 from .grid import create_grid
 from .grid_segments import GridSegmentBudgetError, build_grid_segments
 
@@ -80,17 +79,13 @@ def iter_grid_crossings(
     if not (np.isfinite(start).all() and np.isfinite(end).all()
             and np.isfinite(headings).all()):
         raise ValueError("segment coordinates and headings must be finite")
-    ranks = {vehicle: rank for rank, vehicle in enumerate(sorted(set(vehicle_ids)))}
-    proxies = [
-        SimpleNamespace(
-            x1=float(start[index, 0]), y1=float(start[index, 1]),
-            x2=float(end[index, 0]), y2=float(end[index, 1]),
-            vehicle_rank=ranks[vehicle_ids[int(original)]],
-        )
-        for index, original in enumerate(retained)
-    ]
+    partitions = np.asarray(segments["subtrack_index"], dtype=np.int64)[retained]
+    # Pair ordering follows the Run-scoped subtrack identity, independently of vehicle.
+    order = np.argsort(partitions, kind="stable")
+    retained = retained[order]
+    start, end, headings, partitions = start[order], end[order], headings[order], partitions[order]
     index = build_cross_track_index(
-        proxies, cell_m=cell_m, max_cells=max_cells,
+        start, end, partitions, cell_m=cell_m, max_cells=max_cells,
         max_grid_memberships=max_grid_memberships,
         max_overflow_pair_space=max_overflow_pair_space,
     )
@@ -106,89 +101,30 @@ def iter_grid_crossings(
             "x": xs, "y": ys,
             "segment_index_a": original_a,
             "segment_index_b": original_b,
-            "segment_identity_a": tuple(identities[int(i)] for i in original_a),
-            "segment_identity_b": tuple(identities[int(i)] for i in original_b),
+            "segment_identity_a": identities[original_a],
+            "segment_identity_b": identities[original_b],
         }
 
 
-def iter_grid_candidates(
-    segments: Mapping[str, np.ndarray | tuple[Any, ...]],
-    crossing_batches: Iterable[Mapping[str, np.ndarray | tuple[Any, ...]]],
-    transformer: CoordinateTransformer,
-) -> Iterator[tuple[tuple[Any, Any], CrossTrackCandidate]]:
-    """Build candidate provenance for exact hits without numbering or merging.
-
-    Each yield is ``((segment_identity_a, segment_identity_b), candidate)``.
-    The pair key lets a later grid merger remove duplicate segment-pair hits.
-    """
-    identities = segments["segment_identity"]
-    vehicle_ids = segments["vehicle_id"]
+def iter_grid_candidates(segments, crossing_batches, transformer):
+    """Yield aligned candidate arrays, preserving source and segment identities."""
+    size = len(segments["subtrack_index"])
+    columns = {
+        "vehicle_id": np.asarray(segments["vehicle_id"], dtype=object),
+        "subtrack_index": segments["subtrack_index"],
+        "point_index": segments["start_refined_sequence_in_subtrack"],
+        "point_kind": np.where(np.asarray(segments["start_point_kind"]) == "kept", "p", "i"),
+        "refine_point_id": segments["start_point_id"],
+        "refine_point_id_valid": np.ones(size, dtype=np.bool_),
+        "source_id": np.asarray(segments["start_source_id"], dtype=object),
+        "source_row_key": np.asarray(segments["start_source_row_key"], dtype=np.int64),
+        "source_row_key_valid": np.asarray(segments["start_point_kind"]) == "kept",
+        "generated_reason": np.asarray(segments["start_generated_reason"], dtype=object),
+        "timestamp": segments["timestamp"], "heading": segments["heading"], "speed": segments["speed"],
+    }
     for batch in crossing_batches:
-        size = len(batch["x"])
-        if any(len(batch[name]) != size for name in (
-            "y", "segment_index_a", "segment_index_b",
-            "segment_identity_a", "segment_identity_b",
-        )):
-            raise ValueError("crossing batch columns have inconsistent lengths")
-        for hit_index in range(size):
-            segment_a = int(batch["segment_index_a"][hit_index])
-            segment_b = int(batch["segment_index_b"][hit_index])
-            if not (0 <= segment_a < len(identities)
-                    and 0 <= segment_b < len(identities)):
-                raise IndexError("crossing segment index is outside columns")
-            pair_identity = (identities[segment_a], identities[segment_b])
-            if pair_identity != (
-                batch["segment_identity_a"][hit_index],
-                batch["segment_identity_b"][hit_index],
-            ):
-                raise ValueError("crossing segment identity differs from columns")
-            if vehicle_ids[segment_a] >= vehicle_ids[segment_b]:
-                raise ValueError("crossing segments must be in canonical vehicle order")
-
-            refs = []
-            refined_refs = []
-            for segment_index in (segment_a, segment_b):
-                kind = segments["start_point_kind"][segment_index]
-                point_id = int(segments["start_point_id"][segment_index])
-                source_id = segments["start_source_id"][segment_index]
-                source_key = segments["start_source_row_key"][segment_index]
-                reason = segments["start_generated_reason"][segment_index]
-                if kind == "kept":
-                    if not isinstance(source_id, str) or not isinstance(source_key, str):
-                        raise ValueError("kept segment start has no source reference")
-                    point_ref = PointRef(source_id, source_key, True)
-                elif kind == "injected":
-                    if not isinstance(reason, str) or not reason:
-                        raise ValueError("injected segment start has no reason")
-                    point_ref = PointRef(
-                        "public.injected_points", str(point_id), False,
-                        generated_reason=reason,
-                    )
-                else:
-                    raise ValueError("segment start point_kind is invalid")
-                refs.append(point_ref)
-                refined_refs.append(RefinedPointRef(
-                    kind, point_id,
-                    int(segments["subtrack_index"][segment_index]),
-                    int(segments["start_refined_sequence_in_subtrack"][segment_index]),
-                ))
-            x = float(batch["x"][hit_index])
-            y = float(batch["y"][hit_index])
-            lon, lat = transformer.inverse(x, y)
-            candidate = CrossTrackCandidate(
-                point_ref=refs[0],
-                from_segment_start_point_ref=refs[0],
-                to_segment_start_point_ref=refs[1],
-                vehicle_id=f"{vehicle_ids[segment_a]}|{vehicle_ids[segment_b]}",
-                timestamp=(float(segments["timestamp"][segment_a])
-                           + float(segments["timestamp"][segment_b])) / 2.0,
-                lon=lon, lat=lat, x=x, y=y,
-                heading=float(segments["heading"][segment_a]),
-                speed=float(segments["speed"][segment_a]),
-                from_segment_start=refined_refs[0],
-                to_segment_start=refined_refs[1],
-            )
-            yield pair_identity, candidate
+        a, b = batch["segment_index_a"], batch["segment_index_b"]
+        yield build_cross_track_patch_candidates(columns, a, b, batch["x"], batch["y"], np.arange(len(a)), transformer)
 
 def run_grid_cross_track_task(
     refine_id: Any,
@@ -236,147 +172,98 @@ def run_grid_cross_track_task(
         if candidate_store is not None:
             candidate_store.seal()
             return candidate_store
-        return []
+        return concatenate_cross_batches([])
 
     thread_state = local()
-    opened_connections: list[Any] = []
+    opened_connections = []
     connection_lock = Lock()
     budget_lock = Lock()
-    result_count = 0
-    result_bytes = 0
-    attempts: dict[tuple[int, int], int] = {}
-    merged: dict[tuple[Any, Any], CrossTrackCandidate] = {}
-    done_count = 0
-    segment_count = 0
+    result_count = result_bytes = done_count = segment_count = 0
+    attempts = {}
+    batches = []
+    seen_pairs = np.empty((0, 4), dtype=np.int64)
 
-    def worker(grid_index: tuple[int, int]) -> tuple[list[tuple[Any, CrossTrackCandidate, int]], int]:
+    def worker(grid_index):
         nonlocal result_count, result_bytes
-        worker_conn = getattr(thread_state, "connection", None)
-        if worker_conn is None or worker_conn.closed:
-            worker_conn = connect_worker()
-            thread_state.connection = worker_conn
+        conn = getattr(thread_state, "connection", None)
+        if conn is None or conn.closed:
+            conn = connect_worker()
+            thread_state.connection = conn
             with connection_lock:
-                opened_connections.append(worker_conn)
-        reserved: list[tuple[Any, CrossTrackCandidate, int]] = []
+                opened_connections.append(conn)
+        found = []
+        reserved_count = reserved_bytes = 0
         try:
-            with worker_conn.transaction():
-                batches = fetch_points_in_grid(
-                    worker_conn, grid_index, grids, refine_id, spatial_context,
-                )
-                segments = build_grid_segments(
-                    batches, max_segments=max_segments, max_bytes=max_segment_bytes,
-                )
-                crossings = iter_grid_crossings(
-                    segments, cfg,
-                    max_grid_memberships=max_grid_memberships,
-                    max_overflow_pair_space=max_overflow_pair_space,
-                )
-                for pair, candidate in iter_grid_candidates(
-                    segments, crossings, transformer,
-                ):
-                    # The estimate includes the candidate object graph, pair
-                    # identity, dict/list references, and sorting references.
-                    cost = (1024 + sys.getsizeof(candidate)
-                            + sys.getsizeof(pair)
-                            + sum(sys.getsizeof(item) for key in pair for item in key))
+            with conn.transaction():
+                segments = build_grid_segments(fetch_points_in_grid(conn, grid_index, grids, refine_id, spatial_context), max_segments=max_segments, max_bytes=max_segment_bytes)
+                crossings = iter_grid_crossings(segments, cfg, max_grid_memberships=max_grid_memberships, max_overflow_pair_space=max_overflow_pair_space)
+                for batch in iter_grid_candidates(segments, crossings, transformer):
+                    # Array buffers plus object-string slots; no candidate object graph.
+                    cost = sum(getattr(batch, name).nbytes for name in batch.__dataclass_fields__)
+                    cost += 256 * len(batch)
                     with budget_lock:
-                        if (result_count + 1 > max_candidates
-                                or result_bytes + cost > max_result_bytes):
-                            raise GridSegmentBudgetError(
-                                "cross-track candidate result budget exceeded"
-                            )
-                        result_count += 1
-                        result_bytes += cost
-                    reserved.append((pair, candidate, cost))
-            return reserved, len(segments["segment_identity"])
+                        if result_count + len(batch) > max_candidates or result_bytes + cost > max_result_bytes:
+                            raise GridSegmentBudgetError("cross-track candidate result budget exceeded")
+                        result_count += len(batch); result_bytes += cost
+                    reserved_count += len(batch); reserved_bytes += cost
+                    found.append(batch)
+            return found, len(segments["subtrack_index"])
         except Exception:
             with budget_lock:
-                result_count -= len(reserved)
-                result_bytes -= sum(item[2] for item in reserved)
+                result_count -= reserved_count; result_bytes -= reserved_bytes
             raise
 
-    def progress() -> None:
-        nonlocal last_log_at
-        running = ", ".join(
-            f"({col},{row})" for col, row in sorted(active.values())
-        )
-        now = time.monotonic()
-        detail = (f"跨轨迹网格：{done_count}/{total} 完成，"
-                  f"{segment_count} 线段，{len(merged)} 候选；"
-                  f"运行中 {running or '无'}")
-        if live_status is not None:
-            live_status.update(
-                detail=detail, elapsed=now - started,
-                stage="Detect: 跨轨迹网格",
-            )
-        if now - last_log_at >= 3.0:
-            log_info(f"{detail}；耗时 {now - started:.1f}s")
-            last_log_at = now
-
-    active: dict[Any, tuple[int, int]] = {}
+    active = {}
     try:
         with ThreadPoolExecutor(max_workers=thread_count) as pool:
             while pending or active:
                 while pending and len(active) < thread_count:
-                    grid_index = pending.popleft()
-                    grids[grid_index[0]][grid_index[1]].status = "running"
-                    active[pool.submit(worker, grid_index)] = grid_index
-                finished, _ = wait(active, timeout=3.0,
-                                   return_when=FIRST_COMPLETED)
-                if not finished:
-                    progress()
-                    continue
+                    cell = pending.popleft()
+                    grids[cell[0]][cell[1]].status = "running"
+                    active[pool.submit(worker, cell)] = cell
+                finished, _ = wait(active, timeout=3.0, return_when=FIRST_COMPLETED)
+                now = time.monotonic()
+                if now - last_log_at >= 3.0:
+                    log_info(f"跨轨迹网格：{done_count}/{total} 完成，{len(active)} 运行中，耗时 {now-started:.1f}s")
+                    last_log_at = now
                 for future in finished:
-                    grid_index = active.pop(future)
-                    cell = grids[grid_index[0]][grid_index[1]]
+                    cell = active.pop(future)
                     try:
-                        results, grid_segments = future.result()
+                        found, count = future.result()
                     except Exception as exc:
-                        cell.status = "failed"
-                        if isinstance(exc, (
-                            GridSegmentBudgetError, CrossTrackCapacityError,
-                            MemoryError, ValueError, TypeError,
-                        )):
+                        if isinstance(exc, (GridSegmentBudgetError, CrossTrackCapacityError, MemoryError, ValueError, TypeError)) or attempts.get(cell, 0) >= 2:
                             raise
-                        tried = attempts.get(grid_index, 0)
-                        if tried >= 2:
-                            raise
-                        attempts[grid_index] = tried + 1
-                        cell.status = "todo"
-                        pending.appendleft(grid_index)
-                        progress()
+                        attempts[cell] = attempts.get(cell, 0) + 1
+                        pending.appendleft(cell)
                         continue
-                    with budget_lock:
-                        for pair, candidate, cost in results:
-                            if pair in merged:
-                                result_count -= 1
-                                result_bytes -= cost
-                            else:
-                                merged[pair] = candidate
-                    cell.status = "done"
-                    done_count += 1
-                    segment_count += grid_segments
-                    progress()
+                    for batch in found:
+                        identities=np.column_stack((batch.from_subtrack_index,batch.to_subtrack_index,batch.from_point_index,batch.to_point_index))
+                        all_identities = np.concatenate((seen_pairs, identities))
+                        _, first = np.unique(all_identities, axis=0, return_index=True)
+                        first.sort()
+                        keep = first[first >= len(seen_pairs)] - len(seen_pairs)
+                        seen_pairs = all_identities[first]
+                        duplicates=len(batch)-len(keep)
+                        if duplicates:
+                            cost=sum(getattr(batch,name).nbytes for name in batch.__dataclass_fields__)+256*len(batch)
+                            with budget_lock:
+                                result_count-=duplicates; result_bytes-=cost*duplicates//max(1,len(batch))
+                        if len(keep): batches.append(batch.take(np.asarray(keep,dtype=np.int64)))
+                    grids[cell[0]][cell[1]].status = "done"
+                    segment_count += count; done_count += 1
+                if live_status is not None:
+                    live_status.update(detail=f"跨轨迹网格：{done_count}/{total} 完成，{segment_count} 线段，{result_count} 候选", elapsed=time.monotonic()-started, stage="Detect: 跨轨迹网格")
     finally:
-        for worker_conn in opened_connections:
-            worker_conn.close()
-
-    if any(cell.status != "done" for column in grids for cell in column):
-        raise RuntimeError("cross-track grid task ended before all grids were done")
-    ordered = sorted(merged.items(), key=lambda item: (
-        item[0][0][0], item[0][1][0],
-        item[1].from_segment_start.subtrack_index,
-        item[1].from_segment_start.refined_sequence_in_subtrack,
-        item[1].to_segment_start.subtrack_index,
-        item[1].to_segment_start.refined_sequence_in_subtrack,
-        item[0],
-    ))
-    numbered = (
-        replace(candidate, cross_track_calculate_index=index)
-        for index, (_pair, candidate) in enumerate(ordered)
-    )
+        for conn in opened_connections:
+            conn.close()
+    combined = concatenate_cross_batches(batches)
+    if len(combined):
+        identity = np.column_stack((combined.from_subtrack_index, combined.to_subtrack_index, combined.from_point_index, combined.to_point_index))
+        _, unique = np.unique(identity, axis=0, return_index=True)
+        combined = combined.take(unique)
+        order = np.lexsort((combined.to_point_index, combined.from_point_index, combined.to_subtrack_index, combined.from_subtrack_index))
+        combined = replace(combined.take(order), calculation_index=np.arange(len(combined), dtype=np.int64))
     if candidate_store is not None:
-        candidate_store.extend(numbered)
-        candidate_store.seal()
+        candidate_store.extend([combined]); candidate_store.seal()
         return candidate_store
-    return list(numbered)
+    return combined

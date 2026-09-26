@@ -6,22 +6,15 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import numpy as np
 
 from track.v2.db.pipeline_store import (
     RefineBatchResult,
     DetectPersistenceResult,
     PostgresPipelineStore,
 )
-from track.v2.models import (
-    DerivedPoint,
-    ExcludedPoint,
-    GeneratedReason,
-    PointRef,
-    RefinementSubtrack,
-    RuntimeConfig,
-    SpatialContext,
-    TrajectoryPoint,
-)
+from track.v2.models import ExcludedBatch, RefinementSubtrack, SpatialContext
+
 
 
 CONTEXT = SpatialContext(
@@ -46,21 +39,17 @@ class _Connection:
         self.events.append("rollback")
 
 
-def _point(key: str, *, injected: bool = False) -> TrajectoryPoint:
-    cls = DerivedPoint if injected else TrajectoryPoint
-    return cls(
-        point_ref=PointRef(
-            "source",
-            key,
-            not injected,
-            generated_reason=(GeneratedReason.HEADING_ORTHOGONAL if injected else ""),
-        ),
-        vehicle_id="v1",
-        timestamp=float(key),
-        lon=116.0,
-        lat=39.0,
-        heading=0.0,
-        speed=10.0,
+def _track(vehicle: str, subtrack: int, keys: list[int], *, injected: bool = False) -> RefinementSubtrack:
+    n = len(keys)
+    kind = np.full(n, "p")
+    if injected:
+        kind[-1] = "i"
+    return RefinementSubtrack(
+        vehicle, subtrack, "source", np.zeros((n,2)), np.tile([116.,39.], (n,1)),
+        np.asarray(keys, dtype=np.float64), np.zeros(n), np.full(n,10.), kind,
+        np.asarray(keys,dtype=np.int64), kind == "p", np.zeros(n,dtype=np.int64),
+        np.zeros(n,dtype=bool), np.where(kind == "i", "heading_orthogonal", ""),
+        np.where(kind == "i", 0, -1).astype(np.int64),
     )
 
 
@@ -153,10 +142,10 @@ def test_detect_artifact_completion_rejects_wrong_stage_or_owner(descriptor) -> 
 
 def test_refine_batch_assigns_globally_increasing_subtrack_ids() -> None:
     store = PostgresPipelineStore(object())
-    excluded = [ExcludedPoint(PointRef("source", "9", True), "stationary", 116, 39)]
+    excluded = [ExcludedBatch("source", np.array([9],dtype=np.int64), np.array(["stationary"]), np.array([[116.,39.]]))]
     subtracks = [
-        RefinementSubtrack("v1", 99, [_point("1"), _point("2", injected=True)]),
-        RefinementSubtrack("v2", 1, [_point("3")]),
+        _track("v1",99,[1,2],injected=True),
+        _track("v2",1,[3]),
     ]
     calls: list[str] = []
     with (
@@ -197,7 +186,7 @@ def test_refine_batch_assigns_globally_increasing_subtrack_ids() -> None:
 
 def test_refine_batch_does_not_clear_pending_data_after_failed_write() -> None:
     store = PostgresPipelineStore(object())
-    subtracks = [RefinementSubtrack("v1", 1, [_point("1")])]
+    subtracks = [_track("v1",1,[1])]
     with (
         patch(
             "track.v2.db.pipeline_store.fetch_refine_run",

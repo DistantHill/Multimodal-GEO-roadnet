@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import numpy as np
 from typing import Any
 from uuid import UUID
 
@@ -9,7 +10,7 @@ import pytest
 from backend.map_errors import MapDataError, MapNotFoundError
 from backend.stores.map_layers import PostgresMapStore, _DetectContext, _RefineContext, _limit_selected_tracks
 from backend.replay.build_clip_features import ClipIntersection, CoordinateTransformer, _clip_track
-from backend.replay.track_points import TrackPoint, complete_track_groups
+from backend.replay.track_points import TrackBatch, complete_track_groups, group_track_rows
 
 from backend.api.map_contracts import ClipRequest, ReplayRequest
 
@@ -131,17 +132,8 @@ def track_point(
     crossing_id: int | None = None,
     intersection_id: int | None = None,
     crossing_type: int | None = None,
-) -> TrackPoint:
-    return TrackPoint(
-        resolved_point_id=resolved_point_id,
-        source_row_key=source_row_key,
-        lon=_lon(x_m),
-        lat=0.0,
-        point_kind=point_kind,
-        crossing_id=crossing_id,
-        intersection_id=intersection_id,
-        crossing_type=crossing_type,
-    )
+) -> tuple:
+    return (resolved_point_id,source_row_key,_lon(x_m),0.,point_kind,crossing_id,intersection_id,crossing_type)
 
 
 def intersections() -> list[ClipIntersection]:
@@ -151,9 +143,9 @@ def intersections() -> list[ClipIntersection]:
     ]
 
 
-def clip_points() -> list[TrackPoint]:
+def clip_points() -> list[tuple]:
     return [
-        track_point(1, -100.0, source_row_key="source-a"),
+        track_point(1, -100.0, source_row_key="1"),
         track_point(
             2,
             -70.0,
@@ -170,7 +162,7 @@ def clip_points() -> list[TrackPoint]:
             intersection_id=101,
             crossing_type=0,
         ),
-        track_point(4, 0.0, source_row_key="source-b"),
+        track_point(4, 0.0, source_row_key="2"),
         track_point(
             5,
             30.0,
@@ -187,7 +179,7 @@ def clip_points() -> list[TrackPoint]:
             intersection_id=202,
             crossing_type=0,
         ),
-        track_point(7, 100.0, source_row_key="source-c"),
+        track_point(7, 100.0, source_row_key="3"),
     ]
 
 
@@ -288,8 +280,8 @@ def test_resolved_replay_reports_missing_ids_and_returns_full_track() -> None:
         [["int8"]],
         [["vehicle-1", 7, 1]],
         [
-            resolved_row(7, "vehicle-1", 1, 120.0, source_row_key="external-1"),
-            resolved_row(7, "vehicle-1", 2, 120.001, source_row_key="external-2"),
+            resolved_row(7, "vehicle-1", 1, 120.0, source_row_key="1"),
+            resolved_row(7, "vehicle-1", 2, 120.001, source_row_key="2"),
         ],
     )
     request = ReplayRequest(
@@ -305,7 +297,7 @@ def test_resolved_replay_reports_missing_ids_and_returns_full_track() -> None:
     assert result["metadata"]["missing_resolved_point_ids"] == [99]
     feature = result["features"][0]
     assert feature["properties"]["resolved_point_ids"] == [1, 2]
-    assert feature["properties"]["source_row_keys"] == ["external-1", "external-2"]
+    assert feature["properties"]["source_row_keys"] == ["1", "2"]
     for sql, _ in connection.executions:
         assert "WITH referenced" not in sql
         assert "subtrack_vehicle" not in sql
@@ -321,22 +313,22 @@ def test_source_key_replay_works_without_detect_context() -> None:
     connection = ScriptedConnection(
         [["refine-1", "public.source_points", _EMPTY_FINGERPRINT]],
         [["int8"]],
-        [["vehicle-1", 7, "external-1"]],
+        [["vehicle-1", 7, "1"]],
         [
-            resolved_row(7, "vehicle-1", 0, 120.0, source_row_key="external-1"),
+            resolved_row(7, "vehicle-1", 0, 120.0, source_row_key="1"),
             resolved_row(7, "vehicle-1", 0, 120.001, source_row_key=None,
                          point_kind="injected"),
         ],
     )
 
     result = PostgresMapStore(connection).replay(
-        ReplayRequest(source_row_keys=["external-1"], max_points=10)
+        ReplayRequest(source_row_keys=["1"], max_points=10)
     )
 
     assert result["metadata"]["detect_id"] is None
     assert result["metadata"]["missing_source_row_keys"] == []
     assert result["features"][0]["properties"]["source_row_keys"] == [
-        "external-1",
+        "1",
         None,
     ]
 
@@ -360,20 +352,7 @@ def test_store_clip_reads_resolved_crossings_and_returns_between_clip() -> None:
         [item.intersection_id, item.lon, item.lat, item.radius_m]
         for item in intersections()
     ]
-    rows = [
-        resolved_row(
-            7,
-            "vehicle-1",
-            point.resolved_point_id or 0,
-            point.lon,
-            source_row_key=point.source_row_key,
-            point_kind=point.point_kind,
-            crossing_id=point.crossing_id,
-            intersection_id=point.intersection_id,
-            crossing_type=point.crossing_type,
-        )
-        for point in clip_points()
-    ]
+    rows = [(7,"vehicle-1", *row) for row in clip_points()]
     connection = ScriptedConnection(
         [detect_row(detect_id, "refine-1")],
         [["int8"]],
@@ -399,7 +378,7 @@ def test_store_clip_reads_resolved_crossings_and_returns_between_clip() -> None:
     assert feature["properties"]["start_crossing_id"] == 12
     assert feature["properties"]["end_crossing_id"] == 13
     assert feature["properties"]["resolved_point_ids"] == [4]
-    assert feature["properties"]["source_row_keys"] == ["source-b"]
+    assert feature["properties"]["source_row_keys"] == ["2"]
 
 
 def test_clip_track_batches_same_position_exit_then_entry_without_false_road() -> None:
@@ -426,7 +405,7 @@ def test_clip_track_batches_same_position_exit_then_entry_without_false_road() -
 
     features = _clip_track(
         ("vehicle-1", 7),
-        points,
+        group_track_rows([(7,"vehicle-1", *row) for row in points])[("vehicle-1",7)],
         custom_intersections,
         {101, 202},
         "detect-1",
@@ -470,7 +449,7 @@ def test_coordinate_transformer_rejects_invalid_context_and_distortion() -> None
                     "max_scale_error": 1.0,
                 },
             )
-        ).forward_many([(110.0, 36.0), (116.0, 39.0)])
+        ).forward_many(np.array([(110.0, 36.0), (116.0, 39.0)],dtype=np.float64))
 
     with pytest.raises(MapDataError, match="scale distortion"):
         CoordinateTransformer(
@@ -485,7 +464,7 @@ def test_coordinate_transformer_rejects_invalid_context_and_distortion() -> None
                     "max_scale_error": 0.01,
                 },
             )
-        ).forward_many([(116.0, 39.0), (116.1, 39.1)])
+        ).forward_many(np.array([(116.0, 39.0), (116.1, 39.1)],dtype=np.float64))
 
 
 def test_point_limit_drops_partial_final_track() -> None:

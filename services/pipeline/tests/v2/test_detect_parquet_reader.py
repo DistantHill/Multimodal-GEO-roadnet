@@ -9,6 +9,7 @@ from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import duckdb
+import numpy as np
 import pytest
 
 from track.v2.artifacts import publish_dataset as publish_dataset
@@ -22,10 +23,10 @@ from track.v2.models import RuntimeConfig
 def _sql(table: str, owner: UUID, *, empty: bool = False) -> str:
     rows = {
         "resolved_points": [
-            (10, 4, 0, "vehicle-a", 120.0, 30.0, "kept", 20, "source-20", None, None, None),
+            (10, 4, 0, "vehicle-a", 120.0, 30.0, "kept", 20, 20, None, None, None),
             (11, 4, 1, "vehicle-a", 120.1, 30.1, "crossing", None, None, 40, 30, 1),
             (12, 4, 2, "vehicle-a", 120.2, 30.2, "injected", 21, None, None, None, None),
-            (20, 9, 0, "vehicle-b", 121.0, 31.0, "kept", 22, "source-22", None, None, None),
+            (20, 9, 0, "vehicle-b", 121.0, 31.0, "kept", 22, 22, None, None, None),
         ],
         "intersections": [(30, 120.1, 30.1, 12.0)],
         "entry_exit_points": [(40, 30, 11, 10, 1, 1.0, 2.0, 120.1, 30.1)],
@@ -37,7 +38,8 @@ def _sql(table: str, owner: UUID, *, empty: bool = False) -> str:
         if table == "resolved_points":
             resolved, subtrack, sequence, vehicle, lon, lat, kind, refined, source, crossing, intersection, crossing_type = row
             row = (owner, resolved, subtrack, sequence,
-                   None if kind == "crossing" else sequence, vehicle, lon, lat, kind,
+                   None if kind == "crossing" else sequence, vehicle, lon, lat,
+                   1. if kind == "crossing" else lon*10, 2. if kind == "crossing" else lat*10, kind,
                    refined, source, crossing, intersection, crossing_type)
         else:
             row = (owner, *row)
@@ -96,12 +98,12 @@ def test_reader_builds_stable_clip_models_across_batches(tmp_path):
         assert [item.intersection_id for item in reader.intersections()] == [30]
         tracks = list(reader.iter_tracks(batch_size=1))
         assert [(track.vehicle_id, track.trip_id, track.subtrack_index,
-                 [point.resolved_point_id for point in track.points]) for track in tracks] == [
+                 track.resolved_point_ids.tolist()) for track in tracks] == [
             ("vehicle-a", "vehicle-a:subtrack-0004", 4, [10, 11, 12]),
             ("vehicle-b", "vehicle-b:subtrack-0009", 9, [20]),
         ]
-        assert tracks[0].points[1].crossing_id == 40
-        assert tracks[0].points[1].intersection_id == 30
+        assert tracks[0].crossing_ids[1] == 40
+        assert tracks[0].intersection_ids[1] == 30
 
 
 def test_empty_detect_dataset_is_valid(tmp_path):
@@ -170,6 +172,7 @@ def test_relation_validation_rejects_owner_sequence_and_crossing_corruption(tmp_
         ("resolved_points", "UPDATE data SET sequence_in_subtrack=8 WHERE resolved_point_id=10", []),
         ("resolved_points", "UPDATE data SET vehicle_id='other' WHERE resolved_point_id=11", []),
         ("resolved_points", "UPDATE data SET lon='NaN' WHERE resolved_point_id=10", []),
+        ("resolved_points", "UPDATE data SET x='NaN' WHERE resolved_point_id=10", []),
         ("resolved_points", "UPDATE data SET resolved_point_id=NULL WHERE resolved_point_id=10", []),
         ("resolved_points", "UPDATE data SET point_kind=NULL WHERE resolved_point_id=10", []),
         ("entry_exit_points", "UPDATE data SET resolved_point_id=12 WHERE crossing_id=40", []),
@@ -213,9 +216,19 @@ def test_q44_reader_uses_duckdb_and_bounded_python_models_only():
     owner = uuid4()
     reader._descriptor = Mock(detect_id=owner)
     result = Mock()
-    result.fetchmany.side_effect = [[(1, 2, 0, "v", 120.0, 30.0, None, None, None)], []]
+    cursor = Mock()
+    cursor.fetchmany.side_effect = [[(2,"v",1)], []]
+    result.fetchnumpy.return_value = {
+        "resolved_point_id":np.array([1],dtype=np.int64),
+        "lon":np.array([120.]),"lat":np.array([30.]),"x":np.array([1.]),"y":np.array([2.]),
+        "crossing_id":np.ma.array([0],mask=[True]),
+        "intersection_id":np.ma.array([0],mask=[True]),
+        "crossing_type":np.ma.array([0],mask=[True]),
+    }
     connection = Mock()
+    connection.cursor.return_value = cursor
     connection.execute.return_value = result
     reader._connection = connection
     assert next(reader.iter_tracks(batch_size=1)).trip_id == "v:subtrack-0002"
     assert not result.fetchall.called
+    result.fetchnumpy.assert_called_once()

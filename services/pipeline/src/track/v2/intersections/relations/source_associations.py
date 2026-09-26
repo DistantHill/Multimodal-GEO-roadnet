@@ -12,8 +12,7 @@ from uuid import uuid4
 import duckdb
 import numpy as np
 
-from ..member_sequences import iter_member_identities
-from ...models import RuntimeConfig
+from ...models import RuntimeConfig, TurnBatch, CrossCandidateBatch
 
 
 @contextmanager
@@ -181,37 +180,10 @@ class WriterRelation:
             raise RuntimeError("writer relation is resolved")
         return connection
 
-    def add_request(self, consumer: int, ordinal: int, endpoint: int, ref: object) -> None:
-        connection = self._require_appendable()
-        connection.execute(
-            "INSERT INTO source_requests VALUES (?,?,?,?,?,?,?)",
-            (self._request_order, ref.point_kind, ref.point_id, ref.subtrack_index,
-             consumer, ordinal, endpoint),
-        )
-        self._request_order += 1
-
     def _register_batch(self, columns: dict[str, np.ndarray]) -> str:
         relation = f"writer_batch_{uuid4().hex}"
         self._require_open().register(relation, columns)
         return relation
-
-    @staticmethod
-    def _float_batch(rows, names: tuple[str, ...]) -> dict[str, np.ndarray]:
-        result = {}
-        for name in names:
-            values, nulls, nans = _float_arrays([getattr(row, name) for row in rows])
-            result[name], result[f"{name}_null"], result[f"{name}_nan"] = (
-                values, nulls, nans,
-            )
-        return result
-
-    @staticmethod
-    def _float_select(names: tuple[str, ...]) -> str:
-        return ",".join(
-            f"CASE WHEN {name}_null THEN NULL WHEN {name}_nan "
-            f"THEN 'NaN'::DOUBLE ELSE {name} END"
-            for name in names
-        )
 
     def _insert_batch(self, relations, statements: tuple[str, ...]) -> None:
         connection = self._require_appendable()
@@ -239,197 +211,75 @@ class WriterRelation:
         finally:
             connection.unregister(relation)
 
-    def collect_sources(self, result, pending, crossing_ids, candidate_ids) -> None:
-        connection = self._require_appendable()
-        annotation_order = connection.execute(
-            "SELECT count(*) FROM annotation_requests"
-        ).fetchone()[0]
-        with _closing_optional(iter(result.turn_events)) as turns:
-            def validate_turn(event):
-                if event.refined_point_ref is None:
-                    raise ValueError("a persisted turn event requires a stable resolved point")
-            while batch := _next_validated_batch(turns, self._batch_size, validate_turn):
-                start = self.counts[0]
-                ordinals = np.arange(start, start + len(batch), dtype=np.int64)
-                refs = [event.refined_point_ref for event in batch]
-                relation = self._register_batch({
-                    "request_order": np.arange(
-                        self._request_order, self._request_order + len(batch), dtype=np.int64,
-                    ),
-                    "point_kind": _string_array(ref.point_kind for ref in refs),
-                    "point_id": _integer_array([ref.point_id for ref in refs])[0],
-                    "subtrack_index": _integer_array([ref.subtrack_index for ref in refs])[0],
-                    "ordinal": ordinals,
-                    "annotation_order": np.arange(
-                        annotation_order, annotation_order + len(batch), dtype=np.int64,
-                    ),
-                    "calculation_index": _integer_array(
-                        [event.event_calculate_index for event in batch]
-                    )[0],
-                    **self._float_batch(batch, (
-                        "entry_bearing", "exit_bearing", "turn_deg", "score",
-                    )),
-                })
-                self._insert_batch(relation, (
-                    "INSERT INTO source_requests SELECT request_order,point_kind,point_id,"
-                    "subtrack_index,0,ordinal,0 FROM {relation} ORDER BY request_order",
-                    "INSERT INTO turn_raw SELECT ordinal," + self._float_select((
-                        "entry_bearing", "exit_bearing", "turn_deg", "score",
-                    )) + " FROM {relation} ORDER BY ordinal",
-                    "INSERT INTO annotation_requests SELECT annotation_order,'turn',"
-                    "calculation_index,ordinal FROM {relation} ORDER BY annotation_order",
-                ))
-                self._request_order += len(batch)
-                annotation_order += len(batch)
-                self.counts[0] += len(batch)
-        with _closing_optional(iter(result.cross_track_candidates)) as crosses:
-            def validate_cross(candidate):
-                if (candidate.from_segment_start is None
-                        or candidate.to_segment_start is None):
-                    raise ValueError("a persisted track cross requires stable segment starts")
-            while batch := _next_validated_batch(crosses, self._batch_size, validate_cross):
-                start = self.counts[1]
-                ordinals = np.arange(start, start + len(batch), dtype=np.int64)
-                raw_columns = {
-                    "ordinal": ordinals,
-                    "annotation_order": np.arange(
-                        annotation_order, annotation_order + len(batch), dtype=np.int64,
-                    ),
-                    "calculation_index": _integer_array(
-                        [candidate.cross_track_calculate_index for candidate in batch]
-                    )[0],
-                    **self._float_batch(batch, ("x", "y", "lon", "lat")),
-                }
-                refs = [
-                    (ref, ordinal, endpoint)
-                    for candidate, ordinal in zip(batch, ordinals, strict=True)
-                    for endpoint, ref in enumerate((candidate.from_segment_start,
-                                                    candidate.to_segment_start))
-                ]
-                source_columns = {
-                    "request_order": np.arange(
-                        self._request_order, self._request_order + len(refs), dtype=np.int64,
-                    ),
-                    "point_kind": _string_array(item[0].point_kind for item in refs),
-                    "point_id": _integer_array([item[0].point_id for item in refs])[0],
-                    "subtrack_index": _integer_array([item[0].subtrack_index for item in refs])[0],
-                    "ordinal": np.asarray([item[1] for item in refs], dtype=np.int64),
-                    "endpoint": np.asarray([item[2] for item in refs], dtype=np.int32),
-                }
-                raw_relation = self._register_batch(raw_columns)
-                try:
-                    source_relation = self._register_batch(source_columns)
-                except BaseException:
-                    connection.unregister(raw_relation)
-                    raise
-                self._insert_batch((raw_relation, source_relation), (
-                    "INSERT INTO source_requests SELECT request_order,point_kind,point_id,"
-                    "subtrack_index,1,ordinal,endpoint FROM {relation1} ORDER BY request_order",
-                    "INSERT INTO cross_raw SELECT ordinal," + self._float_select(
-                        ("x", "y", "lon", "lat"),
-                    ) + " FROM {relation0} ORDER BY ordinal",
-                    "INSERT INTO annotation_requests SELECT annotation_order,'cross',"
-                    "calculation_index,ordinal FROM {relation0} ORDER BY annotation_order",
-                ))
-                self._request_order += len(refs)
-                annotation_order += len(batch)
-                self.counts[1] += len(batch)
-        with _closing_optional(iter(pending)) as pending_iterator, \
-             _closing_optional(iter(crossing_ids)) as id_iterator:
-            paired = zip(pending_iterator, id_iterator, strict=True)
-            def validate_crossing(item):
-                if item[0][1].segment_start is None:
-                    raise ValueError("a persisted crossing requires a stable segment start")
-            while batch := _next_validated_batch(paired, self._batch_size, validate_crossing):
-                start = self.counts[2]
-                ordinals = np.arange(start, start + len(batch), dtype=np.int64)
-                refs = [item[0][1].segment_start for item in batch]
-                crossing_values, crossing_nulls = _integer_array(
-                    [item[1] for item in batch], nullable=True,
-                )
-                candidate_values, candidate_nulls = _integer_array([
-                    candidate_ids[item[0][0].cluster_calculate_index] for item in batch
-                ], nullable=True)
-                relation = self._register_batch({
-                    "request_order": np.arange(
-                        self._request_order, self._request_order + len(batch), dtype=np.int64,
-                    ),
-                    "point_kind": _string_array(ref.point_kind for ref in refs),
-                    "point_id": _integer_array([ref.point_id for ref in refs])[0],
-                    "subtrack_index": _integer_array([ref.subtrack_index for ref in refs])[0],
-                    "ordinal": ordinals,
-                    "crossing_id": crossing_values, "crossing_id_null": crossing_nulls,
-                    "candidate_id": candidate_values, "candidate_id_null": candidate_nulls,
-                    "is_entry": np.asarray(
-                        [int(item[0][1].is_entry) for item in batch], dtype=np.int32,
-                    ),
-                    **self._float_batch(
-                        [item[0][1] for item in batch],
-                        ("crossing_x", "crossing_y", "crossing_lon", "crossing_lat"),
-                    ),
-                })
-                self._insert_batch(relation, (
-                    "INSERT INTO source_requests SELECT request_order,point_kind,point_id,"
-                    "subtrack_index,2,ordinal,0 FROM {relation} ORDER BY request_order",
-                    "INSERT INTO crossing_raw SELECT ordinal,"
-                    "CASE WHEN crossing_id_null THEN NULL ELSE crossing_id END,"
-                    "CASE WHEN candidate_id_null THEN NULL ELSE candidate_id END,is_entry,"
-                    + self._float_select((
-                        "crossing_x", "crossing_y", "crossing_lon", "crossing_lat",
-                    )) + " FROM {relation} ORDER BY ordinal",
-                ))
-                self._request_order += len(batch)
-                self.counts[2] += len(batch)
+    @staticmethod
+    def _float_columns(columns):
+        result={}
+        for name,values in columns.items():
+            data=np.asarray(np.ma.getdata(values),dtype=np.float64)
+            null=np.ma.getmaskarray(values)
+            nan=np.isnan(data)&~null
+            result[name]=np.where(nan|null,0.0,data)
+            result[name+"_null"]=null
+            result[name+"_nan"]=nan
+        return result
 
-    def add_mapping(self, ref: object, resolved_id: int) -> None:
-        self._require_appendable().execute(
-            "INSERT INTO source_mappings VALUES (?,?,?,?,?)",
-            (self._mapping_order, ref.point_kind, ref.point_id, ref.subtrack_index,
-             resolved_id),
-        )
-        self._mapping_order += 1
+    @staticmethod
+    def _float_sql(names):
+        return ",".join(f"CASE WHEN {name}_null THEN NULL WHEN {name}_nan THEN 'NaN'::DOUBLE ELSE {name} END" for name in names)
 
-    def add_mappings(self, mappings: Iterable[tuple[object, int]]) -> None:
-        """Insert source mappings in bounded committed batches."""
-        connection = self._require_appendable()
-        with _closing_optional(iter(mappings)) as iterator:
-            while batch := list(islice(iterator, self._batch_size)):
-                for ref, resolved_id in batch:
-                    values = (ref.point_id, ref.subtrack_index, resolved_id)
-                    if (not isinstance(ref.point_kind, str)
-                            or any(isinstance(value, bool) or not isinstance(value, Integral)
-                                   or not -(2**63) <= int(value) < 2**63
-                                   for value in values)):
-                        raise TypeError("source mapping fields have invalid types")
-                start = self._mapping_order
-                relation = f"source_mapping_batch_{uuid4().hex}"
-                columns = {
-                    "mapping_order": np.arange(start, start + len(batch), dtype=np.int64),
-                    "point_kind": np.asarray(
-                        [item[0].point_kind for item in batch], dtype=np.str_,
-                    ),
-                    "point_id": np.asarray([item[0].point_id for item in batch], dtype=np.int64),
-                    "subtrack_index": np.asarray(
-                        [item[0].subtrack_index for item in batch], dtype=np.int64,
-                    ),
-                    "resolved_id": np.asarray([item[1] for item in batch], dtype=np.int64),
-                }
-                connection.register(relation, columns)
-                try:
-                    connection.execute("BEGIN TRANSACTION")
-                    try:
-                        connection.execute(f"""
-                          INSERT INTO source_mappings
-                          SELECT mapping_order,point_kind,point_id,subtrack_index,resolved_id
-                          FROM {relation} ORDER BY mapping_order
-                        """)
-                        connection.execute("COMMIT")
-                    except BaseException:
-                        connection.execute("ROLLBACK")
-                        raise
-                finally:
-                    connection.unregister(relation)
-                self._mapping_order += len(batch)
+    def collect_sources(self, result, pending, crossing_ids, candidate_ids):
+        from ..detect_intersections import _batches
+        annotation_order=sum(self.counts[:2])
+        for consumer, events in ((0,result.turn_events),(1,result.cross_track_candidates)):
+            with _closing_optional(_batches(events)) as iterator:
+                for original in iterator:
+                    for start in range(0,len(original),self._batch_size):
+                        batch=original.take(np.arange(start,min(start+self._batch_size,len(original))))
+                        size=len(batch); ordinals=np.arange(self.counts[consumer],self.counts[consumer]+size,dtype=np.int64)
+                        if consumer==0:
+                            if not np.all(batch.refine_point_id_valid): raise ValueError("persisted turn requires stable resolved point")
+                            sources={"point_kind":np.where(batch.point_kind=="p","kept","injected"),"point_id":batch.refine_point_id,"subtrack_index":batch.subtrack_index,"ordinal":ordinals,"endpoint":np.zeros(size,dtype=np.int64)}
+                            raw={"ordinal":ordinals,"entry_bearing":batch.entry_bearing,"exit_bearing":batch.exit_bearing,"turn_deg":batch.turn_deg,"score":batch.score}
+                            kind="turn"
+                        else:
+                            if not (np.all(batch.from_refine_point_id_valid) and np.all(batch.to_refine_point_id_valid)): raise ValueError("persisted cross requires stable segment starts")
+                            sources={"point_kind":np.concatenate((np.where(batch.from_point_kind=="p","kept","injected"),np.where(batch.to_point_kind=="p","kept","injected"))),"point_id":np.concatenate((batch.from_refine_point_id,batch.to_refine_point_id)),"subtrack_index":np.concatenate((batch.from_subtrack_index,batch.to_subtrack_index)),"ordinal":np.tile(ordinals,2),"endpoint":np.repeat(np.arange(2,dtype=np.int64),size)}
+                            raw={"ordinal":ordinals,"x":batch.xy[:,0],"y":batch.xy[:,1],"lon":batch.lonlat[:,0],"lat":batch.lonlat[:,1]}
+                            kind="cross"
+                        float_names=("entry_bearing","exit_bearing","turn_deg","score") if consumer==0 else ("x","y","lon","lat")
+                        raw={"ordinal":ordinals,**self._float_columns({name:raw[name] for name in float_names})}
+                        sources["request_order"]=np.arange(self._request_order,self._request_order+len(sources["point_id"]),dtype=np.int64)
+                        source_relation=self._register_batch(sources); raw_relation=self._register_batch(raw)
+                        annotation_relation=self._register_batch({"request_order":np.arange(annotation_order,annotation_order+size,dtype=np.int64),"calculation_index":batch.calculation_index,"ordinal":ordinals})
+                        self._insert_batch((source_relation,raw_relation,annotation_relation),(
+                            f"INSERT INTO source_requests SELECT request_order,point_kind,point_id,subtrack_index,{consumer},ordinal,endpoint FROM {{relation0}} ORDER BY request_order",
+                            f"INSERT INTO {kind}_raw SELECT ordinal,{self._float_sql(float_names)} FROM {{relation1}} ORDER BY ordinal",
+                            f"INSERT INTO annotation_requests SELECT request_order,'{kind}',calculation_index,ordinal FROM {{relation2}} ORDER BY request_order"))
+                        self._request_order+=len(sources["point_id"]); self.counts[consumer]+=size; annotation_order+=size
+        for cluster,crossings in pending:
+            ids=np.asanyarray(crossing_ids[cluster.cluster_calculate_index])
+            if ids.dtype!=np.int64 or len(ids)!=len(crossings): raise ValueError("crossing ID columns must be aligned int64")
+            for start in range(0,len(crossings),self._batch_size):
+                stop=min(start+self._batch_size,len(crossings)); size=stop-start
+                if not np.all(crossings.refine_point_id_valid[start:stop]): raise ValueError("persisted crossing requires stable segment start")
+                ordinal=np.arange(self.counts[2],self.counts[2]+size,dtype=np.int64)
+                candidate=candidate_ids[cluster.cluster_calculate_index]
+                floats=self._float_columns({"x":crossings.xy[start:stop,0],"y":crossings.xy[start:stop,1],"lon":crossings.lonlat[start:stop,0],"lat":crossings.lonlat[start:stop,1]})
+                relation=self._register_batch({"request_order":np.arange(self._request_order,self._request_order+size,dtype=np.int64),"point_kind":np.where(crossings.point_kind[start:stop]=="p","kept","injected"),"point_id":crossings.refine_point_id[start:stop],"subtrack_index":crossings.subtrack_index[start:stop],"ordinal":ordinal,"crossing_id":np.asarray(np.ma.getdata(ids[start:stop]),dtype=np.int64),"crossing_id_null":np.ma.getmaskarray(ids[start:stop]),"candidate_id":np.full(size,0 if candidate is None else candidate,dtype=np.int64),"candidate_id_null":np.full(size,candidate is None,dtype=np.bool_),"is_entry":crossings.is_entry[start:stop].astype(np.int32),**floats})
+                self._insert_batch(relation,("INSERT INTO source_requests SELECT request_order,point_kind,point_id,subtrack_index,2,ordinal,0 FROM {relation} ORDER BY request_order","INSERT INTO crossing_raw SELECT ordinal,CASE WHEN crossing_id_null THEN NULL ELSE crossing_id END,CASE WHEN candidate_id_null THEN NULL ELSE candidate_id END,is_entry,"+self._float_sql(("x","y","lon","lat"))+" FROM {relation} ORDER BY ordinal"))
+                self._request_order+=size; self.counts[2]+=size
+
+    def add_mappings(self, point_kind, point_id, subtrack_index, resolved_ids):
+        for column in (point_id,subtrack_index,resolved_ids):
+            if not isinstance(column,np.ndarray) or column.dtype!=np.int64: raise TypeError("mapping identity columns must be int64")
+        if not isinstance(point_kind,np.ndarray) or point_kind.ndim!=1 or any(not isinstance(value,str) for value in point_kind): raise TypeError("point_kind must be a string column")
+        size=len(point_id)
+        if any(len(value)!=size for value in (point_kind,subtrack_index,resolved_ids)): raise ValueError("source mapping columns differ in length")
+        for start in range(0,size,self._batch_size):
+            stop=min(start+self._batch_size,size)
+            columns={"mapping_order":np.arange(self._mapping_order,self._mapping_order+stop-start,dtype=np.int64),"point_kind":np.asarray(point_kind[start:stop]),"point_id":np.asarray(point_id[start:stop],dtype=np.int64),"subtrack_index":np.asarray(subtrack_index[start:stop],dtype=np.int64),"resolved_id":np.asarray(resolved_ids[start:stop],dtype=np.int64)}
+            self._insert_batch(self._register_batch(columns),("INSERT INTO source_mappings SELECT * FROM {relation} ORDER BY mapping_order",))
+            self._mapping_order+=stop-start
 
     def resolve_sources(self) -> None:
         connection = self._require_open()
@@ -478,81 +328,23 @@ class WriterRelation:
             ORDER BY request_order
         """, ())
 
-    def prepare_annotations(self, clusters, candidate_ids, hotspots) -> None:
-        """Associate annotation requests with the first candidate and last hotspot."""
-        connection = self._require_open()
-        if not self._resolved:
-            raise RuntimeError("writer relation is not resolved")
-        if self._annotations_prepared:
-            raise RuntimeError("writer annotations are already prepared")
+    def prepare_annotations(self, clusters, candidate_ids, hotspots):
+        connection=self._require_open()
+        if not self._resolved: raise RuntimeError("writer relation is not resolved")
+        if self._annotations_prepared: raise RuntimeError("writer annotations are already prepared")
         connection.execute("BEGIN TRANSACTION")
         try:
-            encounter = 0
-            member_batch = []
-
-            def flush_members() -> None:
-                if not member_batch:
-                    return
-                self._insert_registered({
-                    "kind": _string_array(item[0] for item in member_batch),
-                    "calculation_index": _integer_array(
-                        [item[1] for item in member_batch]
-                    )[0],
-                    "encounter": _integer_array([item[2] for item in member_batch])[0],
-                    "candidate_id": _integer_array([item[3] for item in member_batch])[0],
-                }, """
-                  INSERT INTO members
-                  SELECT kind,calculation_index,encounter,candidate_id
-                  FROM {relation} ORDER BY encounter
-                """)
-                member_batch.clear()
-
-            with _closing_optional(iter(clusters)) as cluster_iterator:
-                for cluster in cluster_iterator:
-                    candidate_id = candidate_ids[cluster.cluster_calculate_index]
-                    identities = iter_member_identities(cluster.events)
-                    with _closing_optional(identities):
-                        for source, event_index, cross_index in identities:
-                            if source == "turn":
-                                kind, calculation_index = "turn", event_index
-                            elif source == "orthogonal_cross_track" and cross_index is not None:
-                                kind, calculation_index = "cross", cross_index
-                            else:
-                                continue
-                            member_batch.append((
-                                kind, calculation_index, encounter, candidate_id,
-                            ))
-                            encounter += 1
-                            if len(member_batch) == self._batch_size:
-                                flush_members()
-            flush_members()
-            hotspot_batch = []
-
-            def flush_hotspots() -> None:
-                if not hotspot_batch:
-                    return
-                values, nulls, nans = _float_arrays(item[2] for item in hotspot_batch)
-                self._insert_registered({
-                    "calculation_index": _integer_array(
-                        [item[0] for item in hotspot_batch]
-                    )[0],
-                    "input_ordinal": _integer_array([item[1] for item in hotspot_batch])[0],
-                    "z": values, "z_null": nulls, "z_nan": nans,
-                }, """
-                  INSERT INTO hotspots
-                  SELECT calculation_index,input_ordinal,
-                         CASE WHEN z_null THEN NULL WHEN z_nan
-                              THEN 'NaN'::DOUBLE ELSE z END
-                  FROM {relation} ORDER BY input_ordinal
-                """)
-                hotspot_batch.clear()
-
-            with _closing_optional(iter(hotspots)) as hotspot_iterator:
-                for ordinal, event in enumerate(hotspot_iterator):
-                    hotspot_batch.append((event.event_calculate_index, ordinal, event.g_star_z))
-                    if len(hotspot_batch) == self._batch_size:
-                        flush_hotspots()
-            flush_hotspots()
+            encounter=0
+            for cluster in clusters:
+                members=cluster.members
+                if members is None: continue
+                for start in range(0,len(members),self._batch_size):
+                    stop=min(start+self._batch_size,len(members)); size=stop-start
+                    self._insert_registered({"kind":np.where(members.kind[start:stop]=="orthogonal_cross_track","cross",members.kind[start:stop]),"calculation_index":members.calculation_index[start:stop],"encounter":np.arange(encounter,encounter+size,dtype=np.int64),"candidate_id":np.full(size,candidate_ids[cluster.cluster_calculate_index],dtype=np.int64)},"INSERT INTO members SELECT * FROM {relation} ORDER BY encounter")
+                    encounter+=size
+            for start in range(0,len(hotspots),self._batch_size):
+                stop=min(start+self._batch_size,len(hotspots))
+                self._insert_registered({"calculation_index":hotspots.calculation_index[start:stop],"input_ordinal":np.arange(start,stop,dtype=np.int64),"z":np.where(np.isnan(hotspots.g_star_z[start:stop]),0.0,hotspots.g_star_z[start:stop]),"nan":np.isnan(hotspots.g_star_z[start:stop]),"valid":hotspots.g_star_z_valid[start:stop]},"INSERT INTO hotspots SELECT calculation_index,input_ordinal,CASE WHEN NOT valid THEN NULL WHEN nan THEN 'NaN'::DOUBLE ELSE z END FROM {relation} ORDER BY input_ordinal")
             conflict = connection.execute("""
                 SELECT calculation_index FROM (
                     SELECT calculation_index,encounter,candidate_id,

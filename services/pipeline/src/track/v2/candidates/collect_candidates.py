@@ -1,279 +1,138 @@
-"""Run scheduled candidate patches and merge results before global clustering."""
+"""Schedule array candidate kernels and collect business batches."""
 from __future__ import annotations
 
 import time
-from collections.abc import Iterable, Sequence
+from contextlib import nullcontext
 from dataclasses import replace
-from typing import Any, TYPE_CHECKING
-
 import numpy as np
-
-from ..intersections.performance_timing import PerfTracker
-from .build_patches import TrackPatch, build_cross_track_index, iter_cross_track_patches
-from .detect_cross_track_pairs import (
-    _prepare_segments, detect_cross_track_patch, intersect_cross_track_patch,
-    iter_cross_track_patch_candidates,
-)
-from ..telemetry.heartbeat import heartbeat_progress, observed_operation, operation_heartbeat
 from ..telemetry.console_logging import log_info
-from ..models import CrossTrackCandidate, TrajectoryPoint, TurnEvent
-from ..projection import CoordinateTransformer
-from .detect_turn_events import detect_turn_patch
-from .turn_event_relation import TurnEventRelation
-from .cross_track_relation import CrossCandidateRelation
-
-if TYPE_CHECKING:
-    from ..intersections.detect_intersections import IntersectConfig
-    from ..trajectories.results.read_parquet import RefineDatasetReader
+from ..telemetry.heartbeat import heartbeat_progress, observed_operation, operation_heartbeat
+from .build_patches import build_cross_track_index, iter_cross_track_patches
+from .detect_cross_track_pairs import _prepare_segments, detect_cross_track_patch, concatenate_cross_batches
+from .detect_turn_events import detect_turn_patch, concatenate_turn_batches
 
 
-def extract_turn_candidates(
-    patches: Iterable[TrackPatch],
-    cfg: IntersectConfig,
-    *,
-    live_status: Any = None,
-    perf: PerfTracker | None = None,
-    event_store: TurnEventRelation | None = None,
-) -> Sequence[TurnEvent]:
-    """Consume all patches, preserving event order and assigning global IDs.
-
-    Patches are still consumed with turn detection disabled so the DB reader
-    can populate the workspace used by cross-track detection and topology.
-    """
-    events: list[TurnEvent] | TurnEventRelation = (
-        [] if event_store is None else event_store
-    )
-    track_count = 0
+def extract_turn_candidates(patches, cfg, *, event_store=None, live_status=None, perf=None):
+    batches = []
+    count = track_count = 0
     started = last_progress = time.perf_counter()
     log_info("── 轨迹处理 / Tracks and turn candidates ...")
     with operation_heartbeat("轨迹读取与转向候选提取"):
         for patch in patches:
-            # The long-lived reader scope includes work performed across yield.
-            # Keep its cumulative elapsed time and row count through every patch.
             if cfg.use_turn_events:
-                for event in detect_turn_patch(patch, cfg, perf=perf):
-                    numbered = replace(event, event_calculate_index=len(events))
-                    if event_store is None:
-                        events.append(numbered)
-                    else:
-                        event_store.append(numbered)
+                batch = detect_turn_patch(patch, cfg, perf=perf)
+                batch = replace(batch, calculation_index=batch.calculation_index + count)
+                count += len(batch)
+                if event_store is None:
+                    batches.append(batch)
+                else:
+                    event_store.append_batch(batch)
             track_count += len(patch)
             now = time.perf_counter()
             if live_status is not None and now - last_progress >= 3.0:
-                live_status.update(
-                    detail=f"轨迹处理：{track_count:,} 轨迹，{len(events):,} 转向事件",
-                    elapsed=now - started,
-                    stage="Detect: 转向候选 / Turn candidates",
-                )
+                live_status.update(detail=f"轨迹处理：{track_count:,} 轨迹，{count:,} 转向事件",
+                                   elapsed=now-started, stage="Detect: 转向候选 / Turn candidates")
                 last_progress = now
-            # Do not retain the previous full patch while the producer builds
-            # the next one. Events retain provenance, not trajectory objects.
             del patch
     if event_store is not None:
         event_store.seal()
-    log_info(f"── 轨迹处理: {track_count:,} 轨迹/tracks → "
-             f"{len(events):,} 转向事件/turn events "
-             f"({time.perf_counter() - started:.1f}s)")
-    return events
+    log_info(f"── 轨迹处理: {track_count:,} 轨迹/tracks → {count:,} 转向事件/turn events ({time.perf_counter()-started:.1f}s)")
+    return event_store if event_store is not None else concatenate_turn_batches(batches)
 
 
 @observed_operation("跨轨迹候选提取")
-def extract_cross_track_candidates(
-    tracks: dict[str, list[TrajectoryPoint]],
-    transformer: CoordinateTransformer,
-    cfg: Any,
-    live_status: Any = None,
-    *,
-    sub_detail: bool = False,
-    perf: PerfTracker | None = None,
-    telemetry: dict[str, int | float] | None = None,
-    max_grid_memberships: int | None = None,
-    max_overflow_pair_space: int | None = None,
-) -> tuple[list[CrossTrackCandidate], int, int]:
-    """Return cross-track candidates in stable vehicle/segment order.
-
-    The optional budgets are used by DB mode before building a global index.
-    They deliberately default to ``None`` so handle mode and the historical
-    bounded-overflow behaviour remain unchanged.
-    """
-    extraction_started = time.perf_counter() if telemetry is not None else 0.0
-    segment_started = time.perf_counter() if telemetry is not None else 0.0
-    segments, vehicle_count = _prepare_segments(tracks, transformer, cfg)
+def extract_cross_track_candidates(tracks, transformer, cfg, live_status=None, *,
+                                   max_grid_memberships=None, max_overflow_pair_space=None,
+                                   telemetry=None, perf=None, sub_detail=False):
+    extraction_started = time.perf_counter()
+    segment_started = time.perf_counter()
+    with perf.stage("segment_preparation") if perf is not None else nullcontext():
+        columns, partitions = _prepare_segments(tracks, transformer, cfg)
     if telemetry is not None:
-        telemetry["segment_build_seconds"] = telemetry.get(
-            "segment_build_seconds", 0.0,
-        ) + (time.perf_counter() - segment_started)
-        telemetry["segments"] = telemetry.get("segments", 0) + len(segments)
-    if vehicle_count < 2:
-        return [], 0, 0
-
-    total_pairs = vehicle_count * (vehicle_count - 1) // 2
-    array_started = time.perf_counter() if telemetry is not None else 0.0
+        telemetry["segment_build_seconds"] = telemetry.get("segment_build_seconds",0.0) + time.perf_counter()-segment_started
+        telemetry["segments"] = telemetry.get("segments",0) + len(columns["starts"])
+    array_started = time.perf_counter()
     with operation_heartbeat("跨轨迹空间网格构建"):
-        index = build_cross_track_index(
-            segments,
-            cell_m=cfg.cross_track_grid_cell_m,
-            max_cells=cfg.cross_track_max_grid_cells_per_segment,
-            max_grid_memberships=max_grid_memberships,
-            max_overflow_pair_space=max_overflow_pair_space,
-            telemetry=telemetry,
-        )
-    starts = np.array([(s.x1, s.y1) for s in segments], dtype=float)
-    ends = np.array([(s.x2, s.y2) for s in segments], dtype=float)
-    headings = np.array([s.heading for s in segments], dtype=float)
+        index = build_cross_track_index(columns["starts"], columns["ends"], columns["subtrack_index"],
+                                        cell_m=cfg.cross_track_grid_cell_m,
+                                        max_cells=cfg.cross_track_max_grid_cells_per_segment,
+                                        max_grid_memberships=max_grid_memberships,
+                                        max_overflow_pair_space=max_overflow_pair_space, telemetry=telemetry)
+    total_pairs = partitions*(partitions-1)//2
     if telemetry is not None:
-        telemetry["array_build_seconds"] = telemetry.get("array_build_seconds", 0.0) + (
-            time.perf_counter() - array_started
-        )
-        telemetry["vehicle_pairs"] = telemetry.get("vehicle_pairs", 0) + total_pairs
-
-    ordered_candidates: list[tuple[tuple[int, ...], CrossTrackCandidate]] = []
-    started = time.perf_counter()
-    last_progress = started
-    completed_pairs = 0
-    for ids_a, ids_b in iter_cross_track_patches(index, cfg.cross_track_pair_batch_size, perf=perf):
-        ordered_candidates.extend(detect_cross_track_patch(
-            segments, starts, ends, headings, ids_a, ids_b, cfg, transformer,
-        ))
-        completed_pairs += len(ids_a)
-        heartbeat_progress(completed_pairs, unit="线段对")
-        now = time.perf_counter()
-        if live_status is not None and now - last_progress >= 3.0:
-            detail = f"跨轨迹计算：{completed_pairs:,} 线段对，{len(ordered_candidates):,} 候选"
-            if sub_detail:
-                live_status.update(sub_detail=detail, elapsed=now - started)
-            else:
-                live_status.update(detail=detail, elapsed=now - started)
-            last_progress = now
-
-    ordered_candidates.sort(key=lambda item: item[0])
-    candidates = [
-        replace(candidate, cross_track_calculate_index=index)
-        for index, (_key, candidate) in enumerate(ordered_candidates)
-    ]
-    elapsed = time.perf_counter() - started
-    _emit_progress(
-        live_status,
-        total_pairs,
-        total_pairs,
-        len(candidates),
-        elapsed,
-        sub_detail=sub_detail,
-        final=True,
-    )
+        telemetry["array_build_seconds"] = telemetry.get("array_build_seconds",0.0) + time.perf_counter()-array_started
+        telemetry["vehicle_pairs"] = telemetry.get("vehicle_pairs",0) + total_pairs
+    batches = []
+    completed_pairs = candidate_count = 0
+    started = last_progress = time.perf_counter()
+    iterator = iter(iter_cross_track_patches(index,cfg.cross_track_pair_batch_size,perf=perf))
+    try:
+        for ids_a,ids_b in iterator:
+            batch = detect_cross_track_patch(columns,columns["starts"],columns["ends"],columns["heading"],ids_a,ids_b,cfg,transformer)
+            batches.append(batch)
+            candidate_count += len(batch)
+            completed_pairs += len(ids_a)
+            heartbeat_progress(completed_pairs,unit="线段对")
+            now = time.perf_counter()
+            if live_status is not None and now-last_progress >= 3.0:
+                detail = f"跨轨迹计算：{completed_pairs:,} 线段对，{candidate_count:,} 候选"
+                live_status.update(**({"sub_detail":detail} if sub_detail else {"detail":detail}),elapsed=now-started)
+                last_progress = now
+    finally:
+        close = getattr(iterator,"close",None)
+        if close is not None:
+            close()
+    result = concatenate_cross_batches(batches)
+    if len(result):
+        order = np.lexsort((result.to_point_index,result.from_point_index,result.to_subtrack_index,result.from_subtrack_index))
+        result = replace(result.take(order),calculation_index=np.arange(len(result),dtype=np.int64))
+    _emit_progress(live_status,total_pairs,total_pairs,len(result),time.perf_counter()-started,sub_detail=sub_detail,final=True)
     if telemetry is not None:
-        telemetry["cross_track_seconds"] = telemetry.get(
-            "cross_track_seconds", 0.0,
-        ) + (time.perf_counter() - extraction_started)
-        telemetry["output_candidates"] = telemetry.get("output_candidates", 0) + len(candidates)
-    return candidates, total_pairs, total_pairs
+        telemetry["cross_track_seconds"] = telemetry.get("cross_track_seconds",0.0) + time.perf_counter()-extraction_started
+        telemetry["output_candidates"] = telemetry.get("output_candidates",0) + len(result)
+    return result,total_pairs,total_pairs
 
 
 @observed_operation("列式轨迹交点候选提取")
-def extract_columnar_cross_track_candidates(
-    reader: RefineDatasetReader,
-    source_table: str,
-    transformer: CoordinateTransformer,
-    cfg: Any,
-    *,
-    live_status: Any = None,
-    candidate_store: CrossCandidateRelation | None = None,
-) -> Sequence[CrossTrackCandidate]:
-    """Run the existing exact NumPy kernel on bounded DuckDB pair batches."""
-    result: list[CrossTrackCandidate] | CrossCandidateRelation = (
-        [] if candidate_store is None else candidate_store
-    )
-    pair_count = 0
+def extract_columnar_cross_track_candidates(reader, source_table, transformer, cfg, *,
+                                         candidate_store=None, live_status=None):
+    batches = []
+    count = pair_count = 0
     started = last_progress = time.perf_counter()
-    batches = reader.iter_cross_track_pair_batches(
-        source_table, cfg, batch_size=cfg.cross_track_pair_batch_size,
-    )
-    iterator = iter(batches)
+    iterator = iter(reader.iter_cross_track_pair_batches(source_table,cfg,batch_size=cfg.cross_track_pair_batch_size))
     try:
-        for batch in iterator:
-            size = len(batch)
-            segments = {
-                index: segment
-                for pair_index, pair in enumerate(batch)
-                for index, segment in ((pair_index * 2, pair[0]),
-                                       (pair_index * 2 + 1, pair[1]))
-            }
-            starts = np.asarray(
-                [(segments[index].x1, segments[index].y1) for index in range(size * 2)],
-                dtype=float,
-            )
-            ends = np.asarray(
-                [(segments[index].x2, segments[index].y2) for index in range(size * 2)],
-                dtype=float,
-            )
-            headings = np.asarray(
-                [segments[index].heading for index in range(size * 2)], dtype=float,
-            )
-            pair_a = np.arange(0, size * 2, 2, dtype=np.int64)
-            pair_b = pair_a + 1
-            xs, ys, hit_indices = intersect_cross_track_patch(
-                starts, ends, headings, pair_a, pair_b, cfg,
-            )
-            first_index = len(result)
-            numbered = (
-                replace(candidate, cross_track_calculate_index=first_index + offset)
-                for offset, (_key, candidate) in enumerate(
-                    iter_cross_track_patch_candidates(
-                        segments, pair_a, pair_b, xs, ys, hit_indices, transformer,
-                    )
-                )
-            )
+        for columns,ids_a,ids_b in iterator:
+            batch = detect_cross_track_patch(columns,columns["starts"],columns["ends"],columns["heading"],ids_a,ids_b,cfg,transformer)
+            batch = replace(batch,calculation_index=batch.calculation_index+count)
+            count += len(batch)
             if candidate_store is None:
-                result.extend(numbered)
+                batches.append(batch)
             else:
-                candidate_store.extend(
-                    numbered, batch_size=cfg.cross_track_pair_batch_size,
-                )
-            pair_count += size
-            heartbeat_progress(pair_count, unit="线段对")
+                candidate_store.append_batch(batch)
+            pair_count += len(ids_a)
+            heartbeat_progress(pair_count,unit="线段对")
             now = time.perf_counter()
-            if live_status is not None and now - last_progress >= 3.0:
-                live_status.update(
-                    detail=f"跨轨迹计算：{pair_count:,} 线段对，{len(result):,} 候选",
-                    elapsed=now - started,
-                )
+            if live_status is not None and now-last_progress >= 3.0:
+                live_status.update(detail=f"跨轨迹计算：{pair_count:,} 线段对，{count:,} 候选",elapsed=now-started)
                 last_progress = now
     finally:
-        close = getattr(iterator, "close", None)
+        close = getattr(iterator,"close",None)
         if close is not None:
             close()
     if candidate_store is not None:
         candidate_store.seal()
-    log_info(f"── 列式跨轨迹: {pair_count:,} 线段对 → {len(result):,} 候选 "
-             f"({time.perf_counter() - started:.1f}s)")
-    return result
+    log_info(f"── 列式跨轨迹: {pair_count:,} 线段对 → {count:,} 候选 ({time.perf_counter()-started:.1f}s)")
+    return candidate_store if candidate_store is not None else concatenate_cross_batches(batches)
 
 
-def _emit_progress(
-    live_status: Any,
-    pair_count: int,
-    total_pairs: int,
-    candidate_count: int,
-    elapsed: float,
-    *,
-    sub_detail: bool = False,
-    final: bool = False,
-) -> str:
-    """Emit the single cross-track progress format."""
-    detail = (
-        f"跨车求交/Cross-track:\t{pair_count:,}/{total_pairs:,}\t车辆对/pairs,\t"
-        f"{candidate_count:,}\t候选/candidates"
-    )
+def _emit_progress(live_status,pair_count,total_pairs,candidate_count,elapsed,*,sub_detail=False,final=False):
+    detail = f"跨轨迹求交/Cross-track:\t{pair_count:,}/{total_pairs:,}\t子轨迹对/pairs,\t{candidate_count:,}\t候选/candidates"
     line = detail if final else f"计算中：{detail}"
     if live_status is not None:
         if sub_detail:
-            live_status.update(sub_detail=line, elapsed=elapsed)
+            live_status.update(sub_detail=line,elapsed=elapsed)
         else:
-            live_status.update(
-                progress=(pair_count / total_pairs) if total_pairs else 0.0,
-                detail=line,
-                elapsed=elapsed,
-            )
+            live_status.update(progress=pair_count/total_pairs if total_pairs else 0.0,detail=line,elapsed=elapsed)
     else:
         print(f"    ... {line} ({elapsed:.1f}s)")
     return detail

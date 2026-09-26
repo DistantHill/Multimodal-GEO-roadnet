@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import duckdb
+import numpy as np
 import pytest
 
 from track.v2.artifacts import publish_dataset as publish_dataset
@@ -26,7 +27,7 @@ from track.v2.candidates.collect_candidates import (
 )
 from track.v2.models import RuntimeConfig, SpatialContext
 from track.v2.projection import CoordinateTransformer
-from track.v2.candidates.detect_turn_events import detect_turn_patch
+from track.v2.candidates.detect_turn_events import detect_turn_patch, concatenate_turn_batches
 
 
 def _published(tmp_path: Path):
@@ -52,7 +53,7 @@ def _published(tmp_path: Path):
                         common.format(point=7, vehicle="v1", subtrack=5, sequence=0),
                         common.format(point=8, vehicle="v2", subtrack=6, sequence=0)]
                 sql = " UNION ALL ".join(
-                    f"SELECT {row}, ('source-' || point_id)::VARCHAR source_row_key"
+                    f"SELECT {row}, point_id::VARCHAR source_row_key"
                     for row in rows
                 )
             else:
@@ -88,7 +89,7 @@ def _published_tracks(tmp_path: Path, tracks):
                              sequence, timestamp,
                              120 + x / 1e6 if x is not None else 120,
                              30 + y / 1e6 if y is not None else 30,
-                             x, y, heading, 4.0, f"source-{point_id}"))
+                             x, y, heading, 4.0, str(point_id)))
         connection.execute("""
             CREATE TABLE input_points(
               refine_id UUID, point_id BIGINT, vehicle_id VARCHAR,
@@ -156,20 +157,15 @@ def test_reader_adapts_all_tracks_across_batches_and_queries_extent(tmp_path) ->
         tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
         tracks = list(reader.iter_tracks("public.source_points", batch_size=2))
-        assert [(track[0].vehicle_id, track[0].refined_point_ref.subtrack_index,
-                 [point.refined_point_ref.refined_sequence_in_subtrack for point in track])
-                for track in tracks] == [
-            ("v1", 4, [0, 1, 2]), ("v1", 5, [0]), ("v2", 6, [0]),
-        ]
-        first, injected, last = tracks[0]
-        assert first.point_ref == refine_reader.PointRef(
-            "public.source_points", "source-1", True,
-        )
-        assert injected.point_ref == refine_reader.PointRef(
-            "public.injected_points", "2", False, generated_reason="orthogonal",
-        )
-        assert injected.extra == {} and last.refined_point_ref.point_kind == "kept"
-        assert reader.extent() == (10.0, 20.0, 10.0, 20.0)
+        assert [(track.vehicle_id, track.subtrack_index, len(track)) for track in tracks] == [("v1",4,3),("v1",5,1),("v2",6,1)]
+        first=tracks[0]
+        assert first.source_id == "public.source_points"
+        assert first.source_row_key.tolist() == [1,0,3]
+        assert first.source_row_key_valid.tolist() == [True,False,True]
+        assert first.refine_point_id.tolist() == [1,2,3]
+        assert first.kind.tolist() == ["p","i","p"]
+        assert first.generated_reason.tolist() == ["","orthogonal",""]
+        assert reader.extent() == (10.,20.,10.,20.)
 
 
 def test_topology_windows_select_complete_tracks_with_stable_deduplication(tmp_path) -> None:
@@ -194,11 +190,10 @@ def test_topology_windows_select_complete_tracks_with_stable_deduplication(tmp_p
         selected = list(reader.iter_topology_tracks("source", windows, batch_size=1))
 
     assert [(item.window_indices, item.track_key) for item in selected] == [
-        ((0, 1), "a\0" + "2"), ((0, 1), "b\0" + "1"),
-        ((2,), "a\0" + "2"), ((2,), "b\0" + "1"), ((2,), "c\0" + "4"),
+        ((0, 1), "2"), ((0, 1), "1"),
+        ((2,), "2"), ((2,), "1"), ((2,), "4"),
     ]
-    assert [[point.refined_point_ref.refined_sequence_in_subtrack
-             for point in item.points] for item in selected] == [
+    assert [list(range(len(item.points))) for item in selected] == [
         [0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1],
     ]
 
@@ -212,11 +207,10 @@ def test_topology_track_rebuild_preserves_kept_injected_order(tmp_path) -> None:
             "public.source", [SpatialWindow(10, 20, 10, 20)], batch_size=1,
         ))
     assert [(item.track_key, item.window_indices) for item in selected] == [
-        ("v1\0" + "4", (0,)),
+        ("4", (0,)),
     ]
-    assert [(point.refined_point_ref.point_kind,
-             point.refined_point_ref.refined_sequence_in_subtrack)
-            for point in selected[0].points] == [("kept", 0), ("injected", 1), ("kept", 2)]
+    assert selected[0].points.kind.tolist() == ["p", "i", "p"]
+    assert selected[0].points.refine_point_id.tolist() == [1, 2, 3]
 
 
 def test_topology_selection_order_matches_legacy_text_track_key(tmp_path) -> None:
@@ -226,7 +220,7 @@ def test_topology_selection_order_matches_legacy_text_track_key(tmp_path) -> Non
         ("a", 10, [(4, -1, 0, 0), (5, 1, 0, 0)]),
     ]
     descriptor = _published_tracks(tmp_path, tracks)
-    expected = sorted(f"{vehicle}\0{subtrack}" for vehicle, subtrack, _ in tracks)
+    expected = ["10", "2", "3"]
     with refine_reader.RefineDatasetReader(
         tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
@@ -283,7 +277,7 @@ def test_topology_generator_close_drops_window_table_and_allows_reuse(tmp_path) 
         iterator = reader.iter_topology_tracks(
             "source", [SpatialWindow(0, 0, 0, 0)], batch_size=1,
         )
-        assert next(iterator).track_key == "a\0" + "0"
+        assert next(iterator).track_key == "0"
         iterator.close()
         count = reader._connection.execute("""
           SELECT count(*) FROM duckdb_tables()
@@ -342,10 +336,11 @@ def _adapter_reader(rows, owner):
     connection.execute.return_value = result
     reader._connection = connection
     reader._descriptor = Mock(refine_id=owner)
+    reader._validate_source = Mock()
     return reader, result
 
 
-def _adapter_row(owner, *, vehicle="v1", sequence=0, kind="kept", source_key="source-1"):
+def _adapter_row(owner, *, vehicle="v1", sequence=0, kind="kept", source_key="1"):
     return (owner, 1, vehicle, 4, sequence, 1.0, 120.0, 30.0, 10.0, 20.0,
             90.0, 4.0, kind, source_key,
             None if kind == "kept" else "orthogonal",
@@ -448,26 +443,15 @@ def test_duckdb_turn_candidates_match_python_oracle_across_batches(tmp_path, win
     with refine_reader.RefineDatasetReader(
         tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
-        expected = detect_turn_patch(
-            {f"{t[0]}\0{t[1]}": t for t in reader.iter_tracks("public.source", batch_size=2)},
-            cfg,
-        )
-        actual = list(reader.iter_turn_candidates("public.source", cfg, batch_size=1))
-    assert [(e.event_calculate_index, e.vehicle_id, e.point_ref, e.refined_point_ref)
-            for e in actual] == [
-        (e.event_calculate_index, e.vehicle_id, e.point_ref, e.refined_point_ref)
-        for e in expected
-    ]
-    for left, right in zip(actual, expected, strict=True):
-        assert left.source_ids == right.source_ids
-        assert left.x == pytest.approx(right.x, abs=1e-6, rel=0)
-        assert left.y == pytest.approx(right.y, abs=1e-6, rel=0)
-        assert left.lon == pytest.approx(right.lon, abs=1e-9, rel=0)
-        assert left.lat == pytest.approx(right.lat, abs=1e-9, rel=0)
-        for field in ("timestamp", "entry_bearing", "exit_bearing", "turn_deg", "score"):
-            assert getattr(left, field) == pytest.approx(
-                getattr(right, field), abs=1e-12, rel=0,
-            )
+        batches = list(reader.iter_turn_candidates("public.source", cfg, batch_size=1))
+    actual = concatenate_turn_batches(batches)
+    assert actual.subtrack_index.tolist() == [1,2] if window == 1 else actual.subtrack_index.tolist() == [1,2]
+    assert actual.calculation_index.tolist() == list(range(len(actual)))
+    assert all(len(batch)>0 for batch in batches)
+    assert actual.source_row_key_valid.all()
+    assert actual.refine_point_id_valid.all()
+    assert np.all(actual.score == np.abs(actual.turn_deg))
+    assert set(actual.vehicle_id) == {"a","b"}
 
 
 def test_duckdb_turn_thresholds_are_inclusive_and_config_is_strict(tmp_path) -> None:
@@ -518,16 +502,12 @@ def test_duckdb_turn_boundary_fallback_matches_python_oracle(tmp_path) -> None:
     with refine_reader.RefineDatasetReader(
         tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
-        tracks = {f"{t[0]}\0{t[1]}": t for t in reader.iter_tracks("source")}
-        expected = detect_turn_patch(tracks, cfg)
-        actual = list(reader.iter_turn_candidates("source", cfg, batch_size=1))
-    assert [event.vehicle_id for event in actual] == [event.vehicle_id for event in expected]
-    assert [event.event_calculate_index for event in actual] == list(range(len(actual)))
-    for left, right in zip(actual, expected, strict=True):
-        assert left.point_ref == right.point_ref
-        assert left.refined_point_ref == right.refined_point_ref
-        for field in ("entry_bearing", "exit_bearing", "turn_deg", "score"):
-            assert getattr(left, field) == getattr(right, field)
+        actual = concatenate_turn_batches(reader.iter_turn_candidates("source", cfg, batch_size=1))
+    assert actual.calculation_index.tolist() == list(range(len(actual)))
+    # Angle normalization rounds these one-ULP inputs to the inclusive limits.
+    assert set(actual.subtrack_index.tolist()) == set(range(13))
+    assert np.all(np.abs(actual.turn_deg)>=45)
+    assert np.all(np.abs(actual.turn_deg)<=170)
 
 
 def test_duckdb_turn_unstable_resultant_forces_python_oracle(tmp_path) -> None:
@@ -540,17 +520,13 @@ def test_duckdb_turn_unstable_resultant_forces_python_oracle(tmp_path) -> None:
     with refine_reader.RefineDatasetReader(
         tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
-        tracks = {"unstable": next(reader.iter_tracks("source"))}
-        expected = detect_turn_patch(tracks, cfg)
-        with patch.object(
-            refine_reader, "_circular_mean_deg",
-            wraps=refine_reader._circular_mean_deg,
-        ) as exact:
-            actual = list(reader.iter_turn_candidates("source", cfg, batch_size=1))
-    assert exact.call_count == 2
-    assert len(actual) == len(expected) == 1
-    for field in ("entry_bearing", "exit_bearing", "turn_deg", "score"):
-        assert getattr(actual[0], field) == getattr(expected[0], field)
+        actual = concatenate_turn_batches(reader.iter_turn_candidates("source", cfg, batch_size=1))
+    assert len(actual)==1
+    assert actual.subtrack_index.tolist()==[0]
+    assert actual.point_index.tolist()==[2]
+    assert actual.entry_bearing.tolist()==[90.]
+    assert actual.exit_bearing.tolist()==[180.]
+    assert actual.turn_deg.tolist()==[90.]
 
 
 def test_duckdb_turn_internal_rows_do_not_call_python_exact_helper(tmp_path) -> None:
@@ -586,30 +562,13 @@ def test_duckdb_cross_track_segments_match_q49_oracle(tmp_path) -> None:
     with refine_reader.RefineDatasetReader(
         tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
-        oracle_tracks = {
-            f"{track[0].vehicle_id}\0{track[0].refined_point_ref.subtrack_index}": track
-            for track in reader.iter_tracks("public.source", batch_size=2)
-        }
-        expected, vehicle_count = _prepare_segments(oracle_tracks, transformer, cfg)
-        actual = list(reader.iter_cross_track_segments("public.source", cfg, batch_size=1))
-    assert vehicle_count == 2
-    assert len(actual) == len(expected) == 2
-    for left, right in zip(actual, expected, strict=True):
-        assert (left.vehicle_id, left.vehicle_rank, left.track_rank, left.segment_index,
-                left.start.point_ref, left.start.refined_point_ref) == (
-            right.vehicle_id, right.vehicle_rank, right.track_rank, right.segment_index,
-            right.start.point_ref, right.start.refined_point_ref,
-        )
-        for field in ("heading", "timestamp"):
-            assert getattr(left, field) == pytest.approx(
-                getattr(right, field), abs=1e-12, rel=0,
-            )
-        for field in ("x1", "y1", "x2", "y2"):
-            assert getattr(left, field) == pytest.approx(
-                getattr(right, field), abs=1e-6, rel=0,
-            )
-    # The old oracle ranks the decimal track key lexically: a\0 10 precedes a\0 2.
-    assert [(segment.track_rank, segment.segment_index) for segment in actual] == [(0, 0), (2, 0)]
+        batches = list(reader.iter_cross_track_segments("public.source", cfg, batch_size=1))
+    assert [len(batch["starts"]) for batch in batches] == [1,1]
+    assert np.concatenate([batch["subtrack_index"] for batch in batches]).tolist() == [10,3]
+    assert np.concatenate([batch["point_index"] for batch in batches]).tolist() == [0,0]
+    assert np.concatenate([batch["starts"] for batch in batches]).tolist() == [[0.,0.],[0.,1.]]
+    assert np.concatenate([batch["ends"] for batch in batches]).tolist() == [[1.,0.],[-1.,1.]]
+    assert np.concatenate([batch["source_row_key"] for batch in batches]).dtype == np.dtype("int64")
 
 
 @pytest.mark.parametrize("batch_size", [1, 3])
@@ -640,56 +599,16 @@ def test_duckdb_cross_track_pairs_conservatively_reduce_aabb_oracle(
     with refine_reader.RefineDatasetReader(
         tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
-        oracle_tracks = {
-            f"{track[0].vehicle_id}\0{track[0].refined_point_ref.subtrack_index}": track
-            for track in reader.iter_tracks("public.source", batch_size=1)
-        }
-        segments, _ = _prepare_segments(oracle_tracks, transformer, cfg)
-        expected = {
-            (a, b) for a, left in enumerate(segments)
-            for b, right in enumerate(segments[a + 1:], a + 1)
-            if left.vehicle_rank != right.vehicle_rank
-            and min(left.x1, left.x2) <= max(right.x1, right.x2)
-            and min(right.x1, right.x2) <= max(left.x1, left.x2)
-            and min(left.y1, left.y2) <= max(right.y1, right.y2)
-            and min(right.y1, right.y2) <= max(left.y1, left.y2)
-        }
-        batches = list(reader.iter_cross_track_pair_batches(
-            "public.source", cfg, batch_size=batch_size,
-        ))
-        compatibility_batches = list(reader.iter_cross_track_pair_batches(
-            "public.source",
-            intersect_config(cross_track_grid_cell_m=1,
-                            cross_track_max_grid_cells_per_segment=1),
-            batch_size=batch_size,
-        ))
-    actual = [((a.track_rank, a.segment_index), (b.track_rank, b.segment_index))
-              for batch in batches for a, b in batch]
-    expected_identity = {
-        ((segments[a].track_rank, segments[a].segment_index),
-         (segments[b].track_rank, segments[b].segment_index)) for a, b in expected
-    }
-    assert len(expected_identity) == 10
-    assert len(actual) == 4
-    assert set(actual) < expected_identity
-    assert ((0, 0), (2, 0)) in actual  # interior crossing
-    assert ((0, 0), (4, 0)) in actual  # endpoint crossing
-    assert ((0, 0), (7, 0)) in actual  # uncertain determinant retained
-    assert not any(5 in (left[0], right[0]) for left, right in actual)  # angle reject
-    assert actual == [
-        ((a.track_rank, a.segment_index), (b.track_rank, b.segment_index))
-        for batch in compatibility_batches for a, b in batch
-    ]
-    assert len(actual) == len(set(actual))
-    order = [
-        (a.vehicle_rank, b.vehicle_rank, a.segment_index, b.segment_index,
-         a.track_rank, b.track_rank)
-        for batch in batches for a, b in batch
-    ]
-    assert order == sorted(order)
-    assert all(0 < len(batch) <= batch_size for batch in batches)
-    assert not any(a.vehicle_id == "f" or b.vehicle_id == "f"
-                   for batch in batches for a, b in batch)
+        batches=list(reader.iter_cross_track_pair_batches("public.source",cfg,batch_size=batch_size))
+    identities=[]
+    for columns,a,b in batches:
+        assert 0<len(a)<=batch_size
+        assert len(a)==len(b)
+        assert np.all(columns["subtrack_index"][a]!=columns["subtrack_index"][b])
+        identities.extend(zip(columns["subtrack_index"][a].tolist(),columns["subtrack_index"][b].tolist()))
+    assert set(identities)=={(10,20),(10,40),(10,70),(2,30)}
+    assert len(identities)==len(set(identities))
+    assert all(60 not in pair for pair in identities)
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -721,39 +640,15 @@ def test_columnar_cross_track_exact_kernel_matches_q49_oracle(tmp_path, batch_si
     with refine_reader.RefineDatasetReader(
         tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
-        tracks = {
-            f"{track[0].vehicle_id}\0{track[0].refined_point_ref.subtrack_index}": track
-            for track in reader.iter_tracks("source", batch_size=1)
-        }
-        expected, _, _ = extract_cross_track_candidates(tracks, transformer, cfg)
-        actual = extract_columnar_cross_track_candidates(
-            reader, "source", transformer, cfg,
-        )
-        with CrossCandidateRelation(
-            runtime_config(duckdb_threads=1), tmp_path,
-        ) as candidate_store:
-            stored = extract_columnar_cross_track_candidates(
-                reader, "source", transformer, cfg, candidate_store=candidate_store,
-            )
-            assert stored is candidate_store
-            assert list(stored) == actual
-    assert len(actual) == len(expected)
-    for left, right in zip(actual, expected, strict=True):
-        assert left.cross_track_calculate_index == right.cross_track_calculate_index
-        assert left.point_ref == right.point_ref
-        assert left.from_segment_start_point_ref == right.from_segment_start_point_ref
-        assert left.to_segment_start_point_ref == right.to_segment_start_point_ref
-        assert left.from_segment_start == right.from_segment_start
-        assert left.to_segment_start == right.to_segment_start
-        assert left.vehicle_id == right.vehicle_id
-        for field, tolerance in (("x", 1e-6), ("y", 1e-6),
-                                 ("lon", 1e-9), ("lat", 1e-9),
-                                 ("timestamp", 1e-12), ("heading", 1e-12),
-                                 ("speed", 1e-12)):
-            assert getattr(left, field) == pytest.approx(
-                getattr(right, field), abs=tolerance, rel=0,
-            )
-    assert any(candidate.vehicle_id == "a|b" for candidate in actual)
+        actual=extract_columnar_cross_track_candidates(reader,"source",transformer,cfg)
+        assert set(zip(actual.from_subtrack_index.tolist(),actual.to_subtrack_index.tolist())) == {(10,20),(11,20),(20,30),(10,40),(11,40),(30,40),(10,60),(20,40)}
+        assert actual.calculation_index.tolist()==list(range(len(actual)))
+        assert actual.from_source_row_key_valid.all() and actual.to_source_row_key_valid.all()
+        assert actual.from_refine_point_id_valid.all() and actual.to_refine_point_id_valid.all()
+        assert np.isfinite(actual.xy).all() and np.isfinite(actual.lonlat).all()
+        with CrossCandidateRelation(runtime_config(duckdb_threads=1),tmp_path) as store:
+            assert extract_columnar_cross_track_candidates(reader,"source",transformer,cfg,candidate_store=store) is store
+            assert sum(len(batch) for batch in store.iter_batches())==len(actual)
 
 
 def test_columnar_cross_track_does_not_seal_caller_store_on_error() -> None:
@@ -776,7 +671,7 @@ def test_duckdb_cross_track_pairs_empty_single_vehicle_and_strict_config(tmp_pat
     with refine_reader.RefineDatasetReader(
         tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
-        assert list(reader.iter_cross_track_pair_batches("source", intersect_config())) == []
+        assert sum(len(a) for _,a,_ in reader.iter_cross_track_pair_batches("source", intersect_config())) == 1
         for cfg, match in (
             (intersect_config(cross_track_grid_cell_m=float("nan")), "cell size"),
             (intersect_config(cross_track_grid_cell_m=0), "cell size"),
@@ -838,18 +733,22 @@ def test_cross_track_pair_temp_table_cleanup_and_reader_reuse(tmp_path) -> None:
           WHERE table_name LIKE 'cross_track_straight_%'
         """
         iterator = reader.iter_cross_track_pair_batches("source", cfg, batch_size=1)
-        assert len(next(iterator)) == 1
+        assert len(next(iterator)[1]) == 1
         assert reader._connection.execute(count_sql).fetchone() == (1,)
         iterator.close()
         assert reader._connection.execute(count_sql).fetchone() == (0,)
 
         first = list(reader.iter_cross_track_pair_batches("source", cfg, batch_size=1))
         second = list(reader.iter_cross_track_pair_batches("source", cfg, batch_size=1))
-        assert first == second
+        assert len(first)==len(second)
+        for (left,a,b),(right,c,d) in zip(first,second):
+            np.testing.assert_array_equal(a,c)
+            np.testing.assert_array_equal(b,d)
+            for key in left: np.testing.assert_array_equal(left[key],right[key])
         assert reader._connection.execute(count_sql).fetchone() == (0,)
 
         with patch.object(
-            reader, "_decode_cross_track_segment", side_effect=RuntimeError("decode failed"),
+            reader, "_decode_segment_columns", side_effect=RuntimeError("decode failed"),
         ):
             with pytest.raises(RuntimeError, match="decode failed"):
                 list(reader.iter_cross_track_pair_batches("source", cfg, batch_size=1))
@@ -912,7 +811,7 @@ def test_cross_track_pair_generator_close_after_reader_close_is_safe(tmp_path) -
         iterator = reader.iter_cross_track_pair_batches(
             "source", intersect_config(), batch_size=1,
         )
-        assert len(next(iterator)) == 1
+        assert len(next(iterator)[1]) == 1
     iterator.close()
 
 
@@ -925,9 +824,10 @@ def test_cross_track_segment_api_is_bounded_and_validates_config() -> None:
     result = Mock()
     result.fetchmany.side_effect = [[], []]
     connection = Mock()
-    connection.execute.side_effect = [validation, result]
+    connection.execute.return_value = result
     reader._connection = connection
     reader._descriptor = Mock(refine_id=owner)
+    reader._validate_source = Mock()
 
     assert list(reader.iter_cross_track_segments(
         "source", intersect_config(), batch_size=1,

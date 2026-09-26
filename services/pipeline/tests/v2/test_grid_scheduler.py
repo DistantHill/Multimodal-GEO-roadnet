@@ -7,7 +7,10 @@ from uuid import uuid4
 import pytest
 
 from track.v2.candidates import detect_grid_crossings
-from track.v2.models import CrossTrackCandidate, PointRef, RefinedPointRef
+import numpy as np
+from .detect_columns_helpers import subtrack, TRANSFORMER
+from .config_factory import intersect_config
+from track.v2.candidates.collect_candidates import extract_cross_track_candidates
 
 
 class _WorkerConnection:
@@ -22,16 +25,11 @@ class _WorkerConnection:
 
 
 def _candidate():
-    first = PointRef("public.source_points", "1", True)
-    second = PointRef("public.source_points", "2", True)
-    return CrossTrackCandidate(
-        point_ref=first, from_segment_start_point_ref=first,
-        to_segment_start_point_ref=second, vehicle_id="a|b",
-        timestamp=1.0, lon=110.0, lat=20.0, x=1.0, y=2.0,
-        heading=90.0, speed=5.0,
-        from_segment_start=RefinedPointRef("kept", 1, 1, 0),
-        to_segment_start=RefinedPointRef("kept", 2, 2, 0),
-    )
+    batch, _, _ = extract_cross_track_candidates(
+        {1: subtrack([[-10, 0], [10, 0]], subtrack_index=1, headings=[90, 90]),
+         2: subtrack([[0, -10], [0, 10]], subtrack_index=2, headings=[0, 0])},
+        TRANSFORMER, intersect_config())
+    return batch
 
 
 def test_grid_scheduler_retries_then_deduplicates_and_writes_on_main_thread(monkeypatch):
@@ -69,12 +67,11 @@ def test_grid_scheduler_retries_then_deduplicates_and_writes_on_main_thread(monk
 
     monkeypatch.setattr(detect_grid_crossings, "fetch_points_in_grid", fetch)
     monkeypatch.setattr(detect_grid_crossings, "build_grid_segments", lambda batches, **_kw:
-                        {"grid": batches[0], "segment_identity": (1, 2)})
+                        {"grid": batches[0], "subtrack_index": np.array([1, 2]), "segment_identity": np.array([[1, 2]])})
     monkeypatch.setattr(detect_grid_crossings, "iter_grid_crossings", lambda segments, *_a, **_kw:
                         [segments["grid"]])
-    pair = (("a", 1, 0, 1, 0, 2), ("b", 2, 0, 2, 0, 3))
     monkeypatch.setattr(detect_grid_crossings, "iter_grid_candidates", lambda *_args:
-                        [(pair, _candidate())])
+                        [_candidate()])
     updates = []
     status = SimpleNamespace(update=lambda **kwargs: updates.append(kwargs))
     store = SimpleNamespace(items=[], sealed=False)
@@ -94,7 +91,7 @@ def test_grid_scheduler_retries_then_deduplicates_and_writes_on_main_thread(monk
 
     assert result is store and store.sealed
     assert len(store.items) == 1
-    assert store.items[0].cross_track_calculate_index == 0
+    assert store.items[0].calculation_index.tolist() == [0]
     assert attempts == {(0, 0): 1, (1, 0): 2}
     assert all(cell.status == "done" for column in grids for cell in column)
     assert opened and all(conn.closed for conn in opened)
@@ -132,12 +129,11 @@ def test_grid_scheduler_caps_worker_candidate_results_without_retry(monkeypatch)
         return [grid_index]
     monkeypatch.setattr(detect_grid_crossings, "fetch_points_in_grid", fetch)
     monkeypatch.setattr(detect_grid_crossings, "build_grid_segments", lambda _batches, **_kw:
-                        {"segment_identity": (1, 2)})
+                        {"subtrack_index": np.array([1, 2]), "segment_identity": np.array([[1, 2]])})
     monkeypatch.setattr(detect_grid_crossings, "iter_grid_crossings", lambda *_args, **_kw:
                         [object()])
-    pair = (("a", 1, 0, 1, 0, 2), ("b", 2, 0, 2, 0, 3))
     monkeypatch.setattr(detect_grid_crossings, "iter_grid_candidates", lambda *_args:
-                        [(pair, _candidate())])
+                        [_candidate()])
     with pytest.raises(detect_grid_crossings.GridSegmentBudgetError, match="candidate result"):
         detect_grid_crossings.run_grid_cross_track_task(
             uuid4(), (0.0, 0.0, 1.0, 1.0), None, None, None,

@@ -13,7 +13,7 @@ from ..database import _require_config, open_read_connection, require_current_sc
 from ..map_errors import MapDataError, MapDatabaseNotFoundError, MapNotFoundError, MapSchemaMismatchError
 from ..map_features import create_map_feature, create_map_feature_collection
 from ..replay.build_clip_features import ClipIntersection, build_clip_features
-from ..replay.track_points import TrackPoint, complete_track_groups
+from ..replay.track_points import complete_track_groups
 
 @dataclass(frozen=True, slots=True)
 class _RefineContext:

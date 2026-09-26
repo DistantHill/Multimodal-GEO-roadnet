@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from typing import Any
+import numpy as np
 
 from ..telemetry.heartbeat import observed_operation, heartbeat_progress
-from ..models import PointRef, RefinedPointRef, SpatialContext, TrajectoryPoint
+from ..models import SpatialContext, RefinementSubtrack
+from ..trajectories.subtrack_columns import refinement_subtrack_from_columns
 from ..db.source_table import validate_source_table
 from ..db._point_query_fragments import _INJECTED_SOURCE_ID
 
@@ -17,7 +19,7 @@ def fetch_refine_points(
     refine_id: str,
     *,
     spatial_context: SpatialContext,
-) -> dict[tuple[str, int], list[TrajectoryPoint]]:
+) -> dict[tuple[str, int], RefinementSubtrack]:
     """Load one Refine Run's frozen kept members and injected points."""
     contract = validate_source_table(conn, table)
     processing_srid = int(spatial_context.processing_srid)
@@ -62,7 +64,7 @@ def fetch_refine_points_for_subtracks(
     subtracks: set[tuple[str, int]],
     *,
     spatial_context: SpatialContext,
-) -> dict[tuple[str, int], list[TrajectoryPoint]]:
+) -> dict[tuple[str, int], RefinementSubtrack]:
     """Load only the frozen Refine Run subtracks named by a replay manifest."""
     if not subtracks:
         return {}
@@ -122,7 +124,7 @@ def _group_points(
     sql: str,
     params: tuple[object, ...],
     refine_id: str,
-) -> dict[tuple[str, int], list[TrajectoryPoint]]:
+) -> dict[tuple[str, int], RefinementSubtrack]:
     """Execute *sql* and locally order points within each subtrack.
 
     Avoiding a global PostgreSQL sort is material for large Refine runs: the join
@@ -130,69 +132,38 @@ def _group_points(
     Subtracks are small, so ordering their members independently in Python has
     the same semantics with much lower sort pressure.
     """
-    grouped_rows: dict[
-        tuple[str, int],
-        list[tuple[int, int, int, TrajectoryPoint]],
-    ] = {}
-    with conn.cursor() as cur:  # type: ignore[attr-defined]
+    grouped_columns: dict[tuple[str, int], list[list]] = {}
+    with conn.cursor() as cur:
         cur.execute(sql, params)
         for row_count, row in enumerate(cur, 1):
             if row_count % 10_000 == 0:
                 heartbeat_progress(row_count)
-            vehicle_id = str(row[0])
-            subtrack_index = int(row[1])
-            if row[5] is None or row[6] is None:
-                raise ValueError(
-                    f"Refine Run {refine_id} has missing source references"
-                )
             if any(row[index] is None for index in range(7, 12)):
-                raise ValueError(
-                    f"Refine Run {refine_id} references a missing source row"
-                )
-            generated_reason = str(row[13])
-            is_injected = int(row[3]) == 1
-            point = TrajectoryPoint(
-                point_ref=PointRef(
-                    "public.injected_points" if is_injected else str(row[5]),
-                    str(row[4]) if is_injected else str(row[6]),
-                    stable=not generated_reason,
-                    generated_reason=generated_reason,
-                ),
-                vehicle_id=vehicle_id,
-                timestamp=float(row[7]),
-                lon=float(row[8]),
-                lat=float(row[9]),
-                heading=float(row[10]),
-                speed=float(row[11]),
-                extra=row[12] if isinstance(row[12], dict) else {},
-                x=float(row[14]),
-                y=float(row[15]),
-            )
-            grouped_rows.setdefault((vehicle_id, subtrack_index), []).append(
-                (int(row[2]), int(row[3]), int(row[4]), point)
-            )
-    grouped: dict[tuple[str, int], list[TrajectoryPoint]] = {}
-    for key, rows in grouped_rows.items():
-        ordered = sorted(rows, key=lambda item: item[:3])
-        grouped[key] = [
-            TrajectoryPoint(
-                point_ref=item[3].point_ref,
-                vehicle_id=item[3].vehicle_id,
-                timestamp=item[3].timestamp,
-                lon=item[3].lon,
-                lat=item[3].lat,
-                heading=item[3].heading,
-                speed=item[3].speed,
-                extra=item[3].extra,
-                x=item[3].x,
-                y=item[3].y,
-                refined_point_ref=RefinedPointRef(
-                    point_kind="injected" if item[1] == 1 else "kept",
-                    point_id=item[2],
-                    subtrack_index=key[1],
-                    refined_sequence_in_subtrack=sequence,
-                ),
-            )
-            for sequence, item in enumerate(ordered)
-        ]
+                raise ValueError(f"Refine Run {refine_id} references a missing source row")
+            key = (str(row[0]), int(row[1]))
+            columns = grouped_columns.setdefault(key, [[] for _ in range(16)])
+            for column, value in zip(columns, row):
+                column.append(value)
+    grouped = {}
+    for key, lists in grouped_columns.items():
+        columns = [np.asarray(values, dtype=object) for values in lists]
+        order = np.lexsort((columns[4].astype(np.int64), columns[3].astype(np.int64),
+                            columns[2].astype(np.int64)))
+        columns = [column[order] for column in columns]
+        injected = columns[3].astype(np.int64) == 1
+        grouped[key] = refinement_subtrack_from_columns(
+            vehicle_id=key[0], subtrack_index=key[1], source_id=table_source(columns),
+            xy=np.column_stack((columns[14], columns[15])).astype(np.float64),
+            lonlat=np.column_stack((columns[8], columns[9])).astype(np.float64),
+            timestamp=columns[7].astype(np.float64), heading=columns[10].astype(np.float64),
+            speed=columns[11].astype(np.float64), kind=np.where(injected, 'i', 'p'),
+            source_row_key=np.where(injected, 0, columns[6]).astype(np.int64),
+            refine_point_id=columns[4].astype(np.int64),
+            after_sequence=np.where(injected, columns[2], -1).astype(np.int64),
+            generated_reason=columns[13])
     return grouped
+
+
+def table_source(columns: list[np.ndarray]) -> str:
+    kept = np.flatnonzero(columns[3].astype(np.int64) == 0)
+    return str(columns[5][int(kept[0])]) if len(kept) else str(columns[5][0])

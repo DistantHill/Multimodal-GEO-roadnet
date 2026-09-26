@@ -50,7 +50,7 @@ class PublicApiTest(unittest.TestCase):
         )
         self.assertTrue(callable(refine))
         self.assertTrue(hasattr(v2, "CsvSource"))
-        self.assertTrue(hasattr(v2, "TrajectoryPoint"))
+        self.assertTrue(hasattr(v2, "SourceBatch"))
 
 
 class ParserQualityBehaviorTest(unittest.TestCase):
@@ -63,11 +63,11 @@ class ParserQualityBehaviorTest(unittest.TestCase):
             )
             handle = _get_database(v2.CsvSource(csv_path))
             try:
-                point = list(handle.iter_points())[0]
+                point = list(handle.iter_vehicle_batches())[0]
             finally:
                 handle.close()
-            self.assertGreater(point.timestamp, 1_600_000_000)
-            self.assertLess(point.timestamp, 1_800_000_000)
+            self.assertGreater(point.timestamp[0], 1_600_000_000)
+            self.assertLess(point.timestamp[0], 1_800_000_000)
 
     def test_bad_optional_heading_and_speed_warn_but_keep_row(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -78,13 +78,13 @@ class ParserQualityBehaviorTest(unittest.TestCase):
             )
             handle = _get_database(v2.CsvSource(csv_path))
             try:
-                points = list(handle.iter_points())
+                points = list(handle.iter_vehicle_batches())
                 report = handle.get_report()
             finally:
                 handle.close()
             self.assertEqual(len(points), 1)
-            self.assertEqual(points[0].heading, 0.0)
-            self.assertEqual(points[0].speed, 0.0)
+            self.assertEqual(points[0].heading[0], 0.0)
+            self.assertEqual(points[0].speed[0], 0.0)
             self.assertGreaterEqual(report.warn_count, 2)
             self.assertEqual(report.error_count, 0)
 
@@ -106,7 +106,7 @@ class ParserQualityBehaviorTest(unittest.TestCase):
             handle = _get_database(v2.CsvSource(csv_path), field_config=config_path)
             try:
                 with self.assertRaises(DataSourceCorrupted):
-                    list(handle.iter_points())
+                    list(handle.iter_vehicle_batches())
             finally:
                 handle.close()
 
@@ -129,13 +129,13 @@ class FakePostgresStreamingTest(unittest.TestCase):
         )
         handle = _get_database(source)
         try:
-            points = list(handle.iter_points())
+            points = list(handle.iter_vehicle_batches())
         finally:
             handle.close()
         self.assertEqual(len(points), 1)
         self.assertEqual([fraction for conn in connections for fraction in conn.declared_fractions], ["0.37"])
         self.assertTrue(all(conn.fraction == "0.37" for conn in connections))
-        self.assertFalse(points[0].point_ref.stable)
+        self.assertFalse(points[0].source_stable[0])
         self.assertTrue(all(not cursor.fetchall_called for conn in connections for cursor in conn.cursors))
 
 
@@ -155,10 +155,10 @@ class RefineContractTest(unittest.TestCase):
                     config=refine_config(max_gap_s=120.0),
                     spatial_context=_SPATIAL_CONTEXT,
                 )
-                vehicle_ids = [point.vehicle_id for point in result.active.iter_points()]
+                vehicle_ids = [track.vehicle_id for track in result.subtracks]
             finally:
                 handle.close()
-            self.assertEqual(vehicle_ids, ["v1_seg01", "v1_seg02"])
+            self.assertEqual(vehicle_ids, ["v1", "v1"])
 
 
 class _FakePgConfig:

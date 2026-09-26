@@ -32,9 +32,10 @@ DETECT_PARQUET_V1 = {
         ParquetColumn("refined_sequence_in_subtrack", "BIGINT", required=False),
         ParquetColumn("vehicle_id", "VARCHAR"),
         ParquetColumn("lon", "DOUBLE"), ParquetColumn("lat", "DOUBLE"),
+        ParquetColumn("x", "DOUBLE"), ParquetColumn("y", "DOUBLE"),
         ParquetColumn("point_kind", "VARCHAR"),
         ParquetColumn("refined_point_id", "BIGINT", required=False),
-        ParquetColumn("source_row_key", "VARCHAR", required=False),
+        ParquetColumn("source_row_key", "BIGINT", required=False),
         ParquetColumn("crossing_id", "BIGINT", required=False),
         ParquetColumn("intersection_id", "BIGINT", required=False),
         ParquetColumn("crossing_type", "SMALLINT", required=False),
@@ -90,17 +91,21 @@ def _queries(detect_id: UUID, schema: str, source: str, key_type: str) -> dict[s
     intersections = f"{schema}.intersections"
     candidates = f"{schema}.candidate_intersections"
     detects = f"{schema}.detect_runs"
+    refines = f"{schema}.refine_runs"
     resolved = f"""
 SELECT r.detect_id, r.id AS resolved_point_id, r.subtrack_index,
  r.sequence_in_subtrack, r.refined_sequence_in_subtrack,
  COALESCE(k.vehicle_id, ip.vehicle_id, sk.vehicle_id, sip.vehicle_id) AS vehicle_id,
  COALESCE(s.lon, ip.lon, c.crossing_lon) AS lon,
  COALESCE(s.lat, ip.lat, c.crossing_lat) AS lat,
+ COALESCE(ST_X(ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), rf.processing_srid)), ip.x, c.crossing_x) AS x,
+ COALESCE(ST_Y(ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), rf.processing_srid)), ip.y, c.crossing_y) AS y,
  CASE WHEN r.kept_point_id IS NOT NULL THEN 'kept'
       WHEN r.injected_point_id IS NOT NULL THEN 'injected' ELSE 'crossing' END AS point_kind,
  COALESCE(r.kept_point_id, r.injected_point_id) AS refined_point_id,
- k.source_row_key::text AS source_row_key, c.id AS crossing_id, i.id AS intersection_id, c.crossing_type
+ k.source_row_key AS source_row_key, c.id AS crossing_id, i.id AS intersection_id, c.crossing_type
 FROM {base} r JOIN {detects} d ON d.id=r.detect_id
+JOIN {refines} rf ON rf.id=d.refine_id
 LEFT JOIN {kept} k ON k.id=r.kept_point_id AND k.refine_id=d.refine_id
 LEFT JOIN {source} s ON s.id=k.source_row_key
 LEFT JOIN {injected} ip ON ip.id=r.injected_point_id AND ip.refine_id=d.refine_id
@@ -193,7 +198,8 @@ def _validate_data(connection: duckdb.DuckDBPyConnection, outputs: dict[str, Pat
         )
     invalid = connection.execute("""
       SELECT count(*) FROM resolved_points
-      WHERE NOT isfinite(lon) OR NOT isfinite(lat) OR lon NOT BETWEEN -180 AND 180
+      WHERE NOT isfinite(x) OR NOT isfinite(y)
+         OR NOT isfinite(lon) OR NOT isfinite(lat) OR lon NOT BETWEEN -180 AND 180
          OR lat NOT BETWEEN -90 AND 90 OR point_kind NOT IN ('kept','injected','crossing')
          OR (point_kind='crossing') != (crossing_id IS NOT NULL AND intersection_id IS NOT NULL
              AND crossing_type IN (0,1) AND refined_point_id IS NULL

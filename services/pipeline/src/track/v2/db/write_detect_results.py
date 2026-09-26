@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+import numpy as np
 from contextlib import closing, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +12,7 @@ from typing import Any, Iterator
 
 from ..intersections.detect_intersections import IntersectResult
 from ..intersections.relations.source_associations import WriterRelation
-from ..models import HotspotCluster, RefinedPointRef, RuntimeConfig, SpatialContext
+from ..models import HotspotCluster, RuntimeConfig, SpatialContext
 from ..telemetry.heartbeat import heartbeat_progress, observed_operation
 from .insert_batches import (
     _BATCH, _copy_insert, _chunked_template, _chunked_template_returning,
@@ -37,9 +38,19 @@ class DetectWriteCounts:
 
 
 @dataclass(frozen=True, slots=True)
-class _RefineMember:
-    identity: RefinedPointRef
-    vehicle_id: str
+class WriterCrossingIDs:
+    """Cluster-local calculation identity columns mapped to PostgreSQL IDs."""
+    cluster_index: np.ndarray
+    local_index: np.ndarray
+    persistent_id: np.ndarray
+
+    def resolve(self, cluster_index: int, local_index: int) -> int:
+        start=int(np.searchsorted(self.cluster_index,cluster_index,side="left"))
+        stop=int(np.searchsorted(self.cluster_index,cluster_index,side="right"))
+        position=start+int(np.searchsorted(self.local_index[start:stop],local_index))
+        if position>=stop or self.local_index[position]!=local_index:
+            raise KeyError((cluster_index,local_index))
+        return int(self.persistent_id[position])
 
 
 def create_detect_run(
@@ -121,25 +132,20 @@ def _persist_detect_result(conn, detect_id, result, *, batch_size, workspace):
         for cluster, candidate_id in zip(ordered_clusters, candidate_ids, strict=True)
     }
 
-    pending_crossings: list[tuple[HotspotCluster, Any]] = [
-        (cluster, crossing)
-        for cluster in ordered_clusters
-        for crossing in cluster.crossing_points
-    ]
-    crossing_calculation_keys = [
-        (cluster.cluster_calculate_index, crossing.crossing_calculate_index)
-        for cluster, crossing in pending_crossings
-    ]
-    _require_unique(crossing_calculation_keys, "candidate crossing calculation keys")
+    pending_crossings = [(cluster,cluster.crossing_points) for cluster in ordered_clusters if cluster.crossing_points is not None]
+    crossing_count=sum(len(batch) for _,batch in pending_crossings)
+    cluster_indices=np.concatenate([np.full(len(batch),cluster.cluster_calculate_index,dtype=np.int64) for cluster,batch in pending_crossings]) if pending_crossings else np.empty(0,dtype=np.int64)
+    local_indices=np.concatenate([batch.calculation_index for _,batch in pending_crossings]) if pending_crossings else np.empty(0,dtype=np.int64)
+    order=np.lexsort((local_indices,cluster_indices))
+    sorted_clusters=cluster_indices[order]; sorted_locals=local_indices[order]
+    if np.any((sorted_clusters[1:]==sorted_clusters[:-1])&(sorted_locals[1:]==sorted_locals[:-1])): raise ValueError("candidate crossing calculation keys must be unique")
     with conn.cursor() as cur:
-        crossing_ids = _reserve_ids(
-            cur,
-            "candidate_entry_exit_points",
-            len(pending_crossings),
-        )
-    crossing_id_by_calculation = dict(
-        zip(crossing_calculation_keys, crossing_ids, strict=True)
-    )
+        crossing_ids=_reserve_ids(cur,"candidate_entry_exit_points",crossing_count)
+    crossing_id_by_calculation=WriterCrossingIDs(sorted_clusters,sorted_locals,np.asarray(crossing_ids,dtype=np.int64)[order])
+    crossing_ids_by_cluster={}; offset=0
+    for cluster,batch in pending_crossings:
+        crossing_ids_by_cluster[cluster.cluster_calculate_index]=np.asarray(crossing_ids[offset:offset+len(batch)],dtype=np.int64)
+        offset+=len(batch)
 
     complete_topologies = sorted(
         (topology for topology in result.topologies if topology.is_complete),
@@ -161,7 +167,7 @@ def _persist_detect_result(conn, detect_id, result, *, batch_size, workspace):
         if cluster.cluster_calculate_index in intersection_by_calculation
     ]
 
-    workspace.collect_sources(result, pending_crossings, crossing_ids, candidate_by_calculation)
+    workspace.collect_sources(result, pending_crossings, crossing_ids_by_cluster, candidate_by_calculation)
     resolved_sequence_started = time.perf_counter()
     resolved_point_count = _persist_resolved_sequence(
         conn,
@@ -210,7 +216,7 @@ def _persist_detect_result(conn, detect_id, result, *, batch_size, workspace):
         tracks_cross_count=tracks_cross_count,
         turn_event_count=turn_event_count,
         candidate_intersection_count=len(ordered_clusters),
-        candidate_entry_exit_point_count=len(pending_crossings),
+        candidate_entry_exit_point_count=crossing_count,
         intersection_count=len(complete_topologies),
         entry_exit_point_count=entry_exit_count,
         resolved_sequence_elapsed_s=resolved_sequence_elapsed,
@@ -221,7 +227,7 @@ def _iter_refine_member_batches(
     conn: Any,
     refine_id: str,
     batch_size: int,
-) -> Iterator[list[_RefineMember]]:
+) -> Iterator[dict[str, np.ndarray]]:
     """Read one ordered Refine snapshot without libpq/Python materializing it."""
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
@@ -246,26 +252,14 @@ def _iter_refine_member_batches(
         current_vehicle: str | None = None
         sequence = 0
         while raw_rows := cur.fetchmany(batch_size):
-            members: list[_RefineMember] = []
-            for kind, point_id, vehicle, subtrack, _anchor in raw_rows:
-                subtrack = int(subtrack)
-                vehicle = str(vehicle)
-                if subtrack != current_subtrack:
-                    current_subtrack, current_vehicle = subtrack, vehicle
-                    sequence = 0
-                elif vehicle != current_vehicle:
-                    raise ValueError(f"a subtrack contains multiple vehicles: {subtrack}")
-                members.append(_RefineMember(
-                    identity=RefinedPointRef(
-                        point_kind=str(kind),  # type: ignore[arg-type]
-                        point_id=int(point_id),
-                        subtrack_index=subtrack,
-                        refined_sequence_in_subtrack=sequence,
-                    ),
-                    vehicle_id=vehicle,
-                ))
-                sequence += 1
-            yield members
+            sequences=[]
+            for kind,point_id,vehicle,subtrack,_anchor in raw_rows:
+                subtrack=int(subtrack); vehicle=str(vehicle)
+                if subtrack!=current_subtrack:
+                    current_subtrack,current_vehicle=subtrack,vehicle; sequence=0
+                elif vehicle!=current_vehicle: raise ValueError(f"a subtrack contains multiple vehicles: {subtrack}")
+                sequences.append(sequence); sequence+=1
+            yield {"point_kind":np.asarray([row[0] for row in raw_rows]),"point_id":np.asarray([row[1] for row in raw_rows],dtype=np.int64),"subtrack_index":np.asarray([row[3] for row in raw_rows],dtype=np.int64),"refined_sequence":np.asarray(sequences,dtype=np.int64)}
 
 
 @observed_operation("写入 Detect 解析序列")
@@ -276,7 +270,7 @@ def _persist_resolved_sequence(
     result: IntersectResult,
     pending_crossings: list[tuple[HotspotCluster, Any]],
     complete_crossings: list[tuple[HotspotCluster, Any]],
-    crossing_id_by_calculation: dict[tuple[int, int], int],
+    crossing_id_by_calculation: WriterCrossingIDs,
     *,
     batch_size: int,
     workspace: WriterRelation,
@@ -285,42 +279,38 @@ def _persist_resolved_sequence(
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
 
-    # Only c events, already present in the Detect result, need random access.
-    by_subtrack: dict[int, list[tuple[tuple[Any, ...], int]]] = {}
-    for ordinal, (cluster, crossing) in enumerate(complete_crossings):
-        identity = crossing.segment_start
-        if identity is None:
-            raise ValueError("a persisted crossing requires a stable segment start")
-        crossing_id = crossing_id_by_calculation[
-            (cluster.cluster_calculate_index, crossing.crossing_calculate_index)
-        ]
-        by_subtrack.setdefault(identity.subtrack_index, []).append((
-            (
-                identity.refined_sequence_in_subtrack + crossing.segment_fraction,
-                0 if crossing.segment_fraction >= 1.0 - 1e-12 else 2,
-                0 if not crossing.is_entry else 1,
-                cluster.cluster_calculate_index,
-                crossing_id,
-            ),
-            ordinal,
-        ))
-    for events in by_subtrack.values():
-        events.sort(key=lambda item: item[0])
-    crossing_sequences: dict[int, int] = {}
+    complete_offsets=[]
+    parts={name:[] for name in ("subtrack","progress","placement","direction","cluster","crossing_id")}
+    offset=0
+    for cluster,batch in complete_crossings:
+        if not np.all(batch.refine_point_id_valid): raise ValueError("persisted crossing requires stable segment start")
+        complete_offsets.append(offset); offset+=len(batch)
+        parts["subtrack"].append(batch.subtrack_index)
+        parts["progress"].append(batch.point_index+batch.segment_fraction)
+        parts["placement"].append(np.where(batch.segment_fraction>=1.0-1e-12,0,2))
+        parts["direction"].append(batch.is_entry.astype(np.int8))
+        parts["cluster"].append(np.full(len(batch),cluster.cluster_calculate_index,dtype=np.int64))
+        parts["crossing_id"].append(np.fromiter((crossing_id_by_calculation.resolve(cluster.cluster_calculate_index,int(index)) for index in batch.calculation_index),dtype=np.int64,count=len(batch)))
+    ordering={name:np.concatenate(values) if values else np.empty(0,dtype=np.float64 if name=="progress" else np.int64) for name,values in parts.items()}
+    order=np.lexsort((ordering["crossing_id"],ordering["cluster"],ordering["direction"],ordering["placement"],ordering["progress"],ordering["subtrack"]))
+    subtracks,starts=np.unique(ordering["subtrack"][order],return_index=True)
+    stops=np.r_[starts[1:],len(order)]
+    by_subtrack={int(subtrack):order[start:stop] for subtrack,start,stop in zip(subtracks,starts,stops)}
+    crossing_sequences=np.zeros(offset,dtype=np.int64)
     columns = [
         "id", "detect_id", "subtrack_index", "refined_sequence_in_subtrack",
         "sequence_in_subtrack", "kept_point_id", "injected_point_id", "crossing_point_id",
     ]
     count = 0
     current_subtrack: int | None = None
-    current_events: list[tuple[tuple[Any, ...], int]] = []
+    current_events=np.empty(0,dtype=np.int64)
     event_index = 0
     sequence = 0
 
     def finish_subtrack() -> None:
         nonlocal event_index, sequence
         while event_index < len(current_events):
-            crossing_sequences[current_events[event_index][1]] = sequence
+            crossing_sequences[current_events[event_index]] = sequence
             event_index += 1
             sequence += 1
 
@@ -328,37 +318,21 @@ def _persist_resolved_sequence(
     try:
         for members in batches:
             with conn.cursor() as cur:
-                ids = _reserve_ids(cur, "resolved_subtrack_points", len(members))
-                rows: list[tuple[Any, ...]] = []
-                for member, resolved_id in zip(members, ids, strict=True):
-                    identity = member.identity
-                    if identity.subtrack_index != current_subtrack:
-                        finish_subtrack()
-                        current_subtrack = identity.subtrack_index
-                        current_events = by_subtrack.pop(current_subtrack, [])
-                        event_index = sequence = 0
-                    point_key = (
-                        float(identity.refined_sequence_in_subtrack), 1, -1, -1, resolved_id,
-                    )
-                    while (
-                        event_index < len(current_events)
-                        and current_events[event_index][0] < point_key
-                    ):
-                        crossing_sequences[current_events[event_index][1]] = sequence
-                        event_index += 1
-                        sequence += 1
-                    rows.append((
-                        resolved_id, detect_id, identity.subtrack_index,
-                        identity.refined_sequence_in_subtrack, sequence,
-                        identity.point_id if identity.point_kind == "kept" else None,
-                        identity.point_id if identity.point_kind == "injected" else None,
-                        None,
-                    ))
-                    sequence += 1
-                workspace.add_mappings(
-                    (member.identity, resolved_id)
-                    for member, resolved_id in zip(members, ids, strict=True)
-                )
+                size=len(members["point_id"])
+                ids=_reserve_ids(cur,"resolved_subtrack_points",size)
+                rows=[]
+                for i,resolved_id in enumerate(ids):
+                    subtrack=int(members["subtrack_index"][i]); refined_sequence=int(members["refined_sequence"][i])
+                    if subtrack!=current_subtrack:
+                        finish_subtrack(); current_subtrack=subtrack; current_events=by_subtrack.pop(subtrack,np.empty(0,dtype=np.int64)); event_index=sequence=0
+                    point_key=(float(refined_sequence),1,-1,-1,resolved_id)
+                    def before_point(index):
+                        return (ordering["progress"][index],ordering["placement"][index],ordering["direction"][index],ordering["cluster"][index],ordering["crossing_id"][index])<point_key
+                    while event_index<len(current_events) and before_point(current_events[event_index]):
+                        crossing_sequences[current_events[event_index]]=sequence; event_index+=1; sequence+=1
+                    kept=members["point_kind"][i]=="kept"; point_id=int(members["point_id"][i])
+                    rows.append((resolved_id,detect_id,subtrack,refined_sequence,sequence,point_id if kept else None,point_id if not kept else None,None)); sequence+=1
+                workspace.add_mappings(members["point_kind"],members["point_id"],members["subtrack_index"],np.asarray(ids,dtype=np.int64))
                 _copy_insert(cur, "resolved_subtrack_points", columns, rows, observe=False)
                 count += len(rows)
                 heartbeat_progress(count)
@@ -368,25 +342,14 @@ def _persist_resolved_sequence(
     workspace.resolve_sources()
     if by_subtrack:
         raise ValueError("a persisted crossing references a missing Refine subtrack")
-    # Allocate c IDs only after every p/i ID, as in the original writer.
-    for start in range(0, len(complete_crossings), batch_size):
-        crossings = complete_crossings[start:start + batch_size]
-        with conn.cursor() as cur:
-            ids = _reserve_ids(cur, "resolved_subtrack_points", len(crossings))
-            rows = []
-            for ordinal, ((cluster, crossing), resolved_id) in enumerate(
-                zip(crossings, ids, strict=True), start,
-            ):
-                rows.append((
-                    resolved_id, detect_id, crossing.segment_start.subtrack_index,
-                    None, crossing_sequences[ordinal], None, None,
-                    crossing_id_by_calculation[
-                        (cluster.cluster_calculate_index, crossing.crossing_calculate_index)
-                    ],
-                ))
-            _copy_insert(cur, "resolved_subtrack_points", columns, rows, observe=False)
-            count += len(rows)
-            heartbeat_progress(count)
+    # Allocate c IDs after every p/i ID, retaining resolved sequence semantics.
+    for (cluster,batch),offset in zip(complete_crossings,complete_offsets):
+        for start in range(0,len(batch),batch_size):
+            stop=min(start+batch_size,len(batch))
+            with conn.cursor() as cur:
+                ids=_reserve_ids(cur,"resolved_subtrack_points",stop-start)
+                rows=[(resolved_id,detect_id,int(batch.subtrack_index[i]),None,crossing_sequences[offset+i],None,None,crossing_id_by_calculation.resolve(cluster.cluster_calculate_index,int(batch.calculation_index[i]))) for i,resolved_id in zip(range(start,stop),ids)]
+                _copy_insert(cur,"resolved_subtrack_points",columns,rows,observe=False); count+=len(rows); heartbeat_progress(count)
     return count
 
 
@@ -556,62 +519,28 @@ def _insert_entry_exit_points(
     detect_id: str,
     result: IntersectResult,
     intersection_ids: dict[int, int],
-    crossing_ids: dict[tuple[int, int], int],
+    crossing_ids: WriterCrossingIDs,
 ) -> int:
-    rows: list[tuple[Any, ...]] = []
-    crossings = {
-        (cluster.cluster_calculate_index, crossing.crossing_calculate_index): crossing
-        for cluster in result.clusters
-        for crossing in cluster.crossing_points
-    }
-    for observation in result.observations:
-        intersection_id = intersection_ids.get(observation.cluster_calculate_index)
-        if intersection_id is None:
-            continue
-        if (
-            observation.entry_crossing_calculate_index is None
-            or observation.exit_crossing_calculate_index is None
-        ):
-            continue
-        entry_key = (
-            observation.cluster_calculate_index,
-            observation.entry_crossing_calculate_index,
-        )
-        exit_key = (
-            observation.cluster_calculate_index,
-            observation.exit_crossing_calculate_index,
-        )
-        entry = crossings.get(entry_key)
-        exit = crossings.get(exit_key)
-        if entry is None or exit is None:
-            raise ValueError("entry/exit observation references an unknown crossing")
-        if not entry.is_entry or exit.is_entry:
-            raise ValueError("entry/exit observation crossing types must be entry/exit")
-        if (
-            entry.vehicle_id != exit.vehicle_id
-            or entry.subtrack_index != exit.subtrack_index
-        ):
-            raise ValueError("entry/exit observation crossings must share one subtrack")
-        if entry.segment_start is None or exit.segment_start is None:
-            raise ValueError("entry/exit observation requires stable segment starts")
-        entry_progress = (
-            entry.segment_start.refined_sequence_in_subtrack
-            + entry.segment_fraction
-        )
-        exit_progress = (
-            exit.segment_start.refined_sequence_in_subtrack
-            + exit.segment_fraction
-        )
-        if entry_progress >= exit_progress:
-            raise ValueError("entry crossing must precede exit crossing")
-        rows.append((
-            detect_id,
-            intersection_id,
-            observation.entry_bearing,
-            observation.exit_bearing,
-            crossing_ids[entry_key],
-            crossing_ids[exit_key],
-        ))
+    rows=[]
+    crossings={cluster.cluster_calculate_index:cluster.crossing_points for cluster in result.clusters}
+    for observations in result.observations:
+        cluster_index=observations.cluster_calculate_index
+        intersection_id=intersection_ids.get(cluster_index)
+        if intersection_id is None: continue
+        batch=crossings.get(cluster_index)
+        if batch is None: raise ValueError("observation references unknown crossing batch")
+        crossing_order=np.argsort(batch.calculation_index)
+        local_indices=batch.calculation_index[crossing_order]
+        for i in range(len(observations)):
+            if not (observations.entry_crossing_calculate_index_valid[i] and observations.exit_crossing_calculate_index_valid[i]): continue
+            entry_key=(cluster_index,int(observations.entry_crossing_calculate_index[i])); exit_key=(cluster_index,int(observations.exit_crossing_calculate_index[i]))
+            positions=np.searchsorted(local_indices,np.asarray([entry_key[1],exit_key[1]],dtype=np.int64))
+            if np.any(positions>=len(local_indices)) or not np.array_equal(local_indices[positions],np.asarray([entry_key[1],exit_key[1]],dtype=np.int64)): raise ValueError("observation references unknown crossing")
+            a,b=crossing_order[positions]
+            if not batch.is_entry[a] or batch.is_entry[b]: raise ValueError("observation types must be entry/exit")
+            if batch.subtrack_index[a]!=batch.subtrack_index[b] or batch.vehicle_id[a]!=batch.vehicle_id[b]: raise ValueError("observation crossings must share one subtrack")
+            if batch.point_index[a]+batch.segment_fraction[a]>=batch.point_index[b]+batch.segment_fraction[b]: raise ValueError("entry crossing must precede exit")
+            rows.append((detect_id,intersection_id,float(observations.entry_bearing[i]),float(observations.exit_bearing[i]),crossing_ids.resolve(*entry_key),crossing_ids.resolve(*exit_key)))
     with conn.cursor() as cur:
         _copy_insert(
             cur,
@@ -623,10 +552,6 @@ def _insert_entry_exit_points(
             rows,
         )
     return len(rows)
-
-
-def _refine_key(identity: RefinedPointRef) -> tuple[str, int, int]:
-    return identity.point_kind, identity.point_id, identity.subtrack_index
 
 
 def _assign_unique(mapping: dict[int, int], key: int, value: int) -> None:

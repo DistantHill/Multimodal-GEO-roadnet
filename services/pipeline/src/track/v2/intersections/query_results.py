@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import math
+import numpy as np
 import uuid
 from dataclasses import dataclass
 from typing import Iterator
 
 from ..telemetry.heartbeat import observed_operation, heartbeat_progress
-from ..models import ClipIntersection, ClipTrack, ResolvedTrackPoint, SpatialContext
-from ..projection import spatial_context_from_values
+from ..models import ClipIntersection, ClipTrack, SpatialContext
+from ..projection import CoordinateTransformer, spatial_context_from_values
 from ..db.source_table import validate_source_table
 from ..db.plan_full_scan_cursor import declare_full_scan_cursor
 
@@ -110,7 +111,9 @@ def fetch_resolved_clip_tracks(
                COALESCE(source.lat, injected.lat, crossing.crossing_lat) AS lat,
                crossing.id AS crossing_id,
                crossing.candidate_intersection_id,
-               crossing.crossing_type
+               crossing.crossing_type,
+               COALESCE(ST_X(ST_Transform(ST_SetSRID(ST_MakePoint(source.lon, source.lat), 4326), {run.spatial_context.processing_srid})), injected.x, crossing.crossing_x) AS x,
+               COALESCE(ST_Y(ST_Transform(ST_SetSRID(ST_MakePoint(source.lon, source.lat), 4326), {run.spatial_context.processing_srid})), injected.y, crossing.crossing_y) AS y
           FROM resolved_subtrack_points AS resolved
           LEFT JOIN kept_trajectory_points AS kept
             ON kept.id = resolved.kept_point_id
@@ -126,7 +129,20 @@ def fetch_resolved_clip_tracks(
     """
     current_subtrack: int | None = None
     current_vehicle = ""
-    points: list[ResolvedTrackPoint] = []
+    points: list[tuple[object, ...]] = []
+
+    def build_track() -> ClipTrack:
+        lonlat = np.asarray([(row[4], row[5]) for row in points], dtype=np.float64)
+        valid = np.asarray([row[6] is not None for row in points], dtype=np.bool_)
+        return ClipTrack(
+            vehicle_id=current_vehicle, trip_id=f"{current_vehicle}:subtrack-{current_subtrack:04d}",
+            xy=np.asarray([(row[9],row[10]) for row in points], dtype=np.float64), lonlat=lonlat,
+            resolved_point_ids=np.asarray([row[0] for row in points], dtype=np.int64),
+            crossing_ids=np.asarray([row[6] if row[6] is not None else 0 for row in points], dtype=np.int64),
+            intersection_ids=np.asarray([intersection_ids.get(row[7], 0) for row in points], dtype=np.int64),
+            crossing_types=np.asarray([row[8] if row[8] is not None else 0 for row in points], dtype=np.int8),
+            crossing_valid=valid, intersection_valid=np.asarray([row[7] in intersection_ids for row in points], dtype=np.bool_), subtrack_index=current_subtrack,
+        )
     with conn.cursor(name=f"clip_tracks_{uuid.uuid4().hex}") as cur:
         cur.itersize = batch_size
         declare_full_scan_cursor(conn, cur, query, (detect_id,))
@@ -140,11 +156,7 @@ def fetch_resolved_clip_tracks(
             if current_subtrack is not None and subtrack_index != current_subtrack:
                 if not current_vehicle:
                     raise ValueError(f"subtrack {current_subtrack} has no source vehicle")
-                yield ClipTrack(
-                    vehicle_id=current_vehicle,
-                    trip_id=f"{current_vehicle}:subtrack-{current_subtrack:04d}",
-                    points=tuple(points), subtrack_index=current_subtrack,
-                )
+                yield build_track()
                 points = []
                 current_vehicle = ""
             elif (
@@ -157,20 +169,11 @@ def fetch_resolved_clip_tracks(
             current_subtrack = subtrack_index
             if vehicle_id is not None:
                 current_vehicle = vehicle_id
-            points.append(ResolvedTrackPoint(
-                resolved_point_id=int(row[0]), lon=float(row[4]), lat=float(row[5]),
-                crossing_id=None if row[6] is None else int(row[6]),
-                intersection_id=intersection_ids.get(row[7]),
-                crossing_type=None if row[8] is None else int(row[8]),
-            ))
+            points.append(row)
         if current_subtrack is not None:
             if not current_vehicle:
                 raise ValueError(f"subtrack {current_subtrack} has no source vehicle")
-            yield ClipTrack(
-                vehicle_id=current_vehicle,
-                trip_id=f"{current_vehicle}:subtrack-{current_subtrack:04d}",
-                points=tuple(points), subtrack_index=current_subtrack,
-            )
+            yield build_track()
 
 def _decode_json_object(value: object) -> dict[str, object]:
     """Decode PostgreSQL JSONB values returned as dicts or JSON strings."""

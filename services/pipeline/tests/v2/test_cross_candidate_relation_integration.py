@@ -1,393 +1,228 @@
-from .config_factory import (clip_config, fitting_config, intersect_config,
-                             intersect_run_config, network_config, postgres_config,
-                             projection_config, refine_config, runtime_config)
-"""Isolated prototype: exact eager/lazy member chain and output lifetime parity."""
-from array import array
+"""Cross column relation matches eager clustering and retains output ownership."""
 from contextlib import ExitStack
 from dataclasses import replace
 import gc
 import json
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace as NS
+from unittest.mock import MagicMock,patch
 import weakref
-
+import numpy as np
 import pytest
-
-import track.v2.intersections.detect_intersections as detect
-from track.v2.candidates.cross_track_relation import ClusterMemberSequence, CrossCandidateRelation
-from track.v2.intersections.member_sequences import ConcatSequence
-from track.v2.db.write_detect_results import _insert_tracks_cross, _refine_key
+from .config_factory import intersect_config,intersect_run_config,runtime_config
+from .detect_columns_helpers import CONTEXT,TRANSFORMER
+from .writer_relation_helpers import _batch,turn_batch
+from .test_cross_candidate_relation import concatenate,assert_batch_equal
+from track.v2.models import CrossCandidateBatch,MemberBatch,HotspotCluster
+from track.v2.candidates.cross_track_relation import CrossCandidateRelation
+from track.v2.candidates.detect_turn_events import empty_turn_batch
+from track.v2.candidates.detect_cross_track_pairs import empty_cross_batch
 from track.v2.intersections.relations.source_associations import WriterRelation
-from track.v2.models import RefinedPointRef, RuntimeConfig
-from track.v2.models import HotspotCluster, PointRef
-from .test_ablation_centroid_memory import _crossing, _event
-from .test_detect import _TEST_SPATIAL_CONTEXT, _TEST_TRANSFORMER
-
-
-
-def membership_rows(tmp_path, clusters, ids):
-    with WriterRelation(runtime_config(), tmp_path, "membership", batch_size=3) as relation:
-        relation.resolve_sources()
-        relation.prepare_annotations(clusters, ids, [])
-        return relation._connection.execute("""
-            SELECT kind,calculation_index,candidate_id FROM members
-            QUALIFY row_number() OVER (
-                PARTITION BY kind,calculation_index ORDER BY encounter
-            )=1 ORDER BY kind,calculation_index
-        """).fetchall()
-
-
-def eager_membership_rows(clusters, ids):
-    # Independent historical dictionary oracle, confined to small test data.
-    mappings = {"turn": {}, "cross": {}}
-    for cluster in clusters:
-        candidate_id = ids[cluster.cluster_calculate_index]
-        for event in cluster.events:
-            if event.source == "turn":
-                kind, index = "turn", event.event_calculate_index
-            elif event.source == "orthogonal_cross_track" and event.cross_track_calculate_index is not None:
-                kind, index = "cross", event.cross_track_calculate_index
-            else:
-                continue
-            previous = mappings[kind].get(index)
-            if previous is not None and previous != candidate_id:
-                raise ValueError(f"Detect entity {index} belongs to multiple candidates")
-            mappings[kind][index] = candidate_id
-    return sorted((kind, index, value) for kind, mapping in mappings.items() for index, value in mapping.items())
+from track.v2.db.write_detect_results import _insert_tracks_cross
+import track.v2.intersections.detect_intersections as detect
 
 
 def candidates(count=17):
-    x, y = _TEST_TRANSFORMER.forward(116., 39.)
-    # Two equally sized groups, exact eps contacts, duplicates and one noise.
-    return [replace(
-        _crossing(i, x + (i // 8) * 30 + (i % 4) * 2, y),
-        cross_track_calculate_index=i,
-        point_ref=PointRef("repeated", str(i % 3), True),
-    ) for i in range(count - 1)] + [replace(
-        _crossing(count - 1, x + 10000., y), cross_track_calculate_index=count - 1,
-    )]
+    index=np.arange(count,dtype=np.int64)
+    x,y=TRANSFORMER.forward(116.,39.)
+    xy=np.column_stack((x+(index//8)*30+(index%4)*2,np.full(count,y)))
+    xy[-1]=[x+10000,y]
+    return _batch(CrossCandidateBatch,count,calculation_index=index,xy=xy,lonlat=TRANSFORMER.inverse_many(xy),
+        from_source_id=np.full(count,'repeated'),to_source_id=np.full(count,'other'),
+        from_source_row_key=index%3,from_refine_point_id=index*2+1,to_refine_point_id=index*2+2,
+        from_subtrack_index=index+1,to_subtrack_index=index+count+1)
 
 
-def stored(tmp_path, values):
-    spool = CrossCandidateRelation(runtime_config(), tmp_path)
-    for candidate in values:
-        spool.append(candidate)
-    spool.seal()
-    return spool
+def turns_for(values,count=4):
+    xy=values.xy[:count].copy()
+    return turn_batch(count,xy=xy,lonlat=TRANSFORMER.inverse_many(xy),source_id=np.full(count,'turn-source'),source_row_key=np.arange(count,dtype=np.int64)%2)
+
+
+def stored(tmp_path,values):
+    spool=CrossCandidateRelation(runtime_config(),tmp_path,batch_size=3)
+    spool.append_batch(values); spool.seal(); return spool
 
 
 def serialized(clusters):
-    # String equality also checks emitted representation, key and member order.
-    return json.dumps([cluster.as_dict() for cluster in clusters], allow_nan=True)
+    return json.dumps([cluster.as_dict() for cluster in clusters],sort_keys=True)
 
 
-def cluster_pass_ids(spool):
-    return [row[0] for row in spool._connection.execute(
-        "SELECT DISTINCT pass_id FROM cross_candidate_members ORDER BY pass_id"
-    ).fetchall()]
+def membership_rows(tmp_path,clusters,ids):
+    with WriterRelation(runtime_config(),tmp_path,'membership',batch_size=3) as relation:
+        relation.resolve_sources(); relation.prepare_annotations(clusters,ids,empty_turn_batch())
+        return relation._connection.execute("SELECT kind,calculation_index,candidate_id FROM members QUALIFY row_number() OVER (PARTITION BY kind,calculation_index ORDER BY encounter)=1 ORDER BY kind,calculation_index").fetchall()
 
 
-@pytest.mark.parametrize("merge_distance", [0., 30., 100.])
-def test_complete_pipeline_matches_eager_order_refs_ablation_and_writer_membership(tmp_path, merge_distance):
-    values = candidates()
-    turns = [replace(_event(7 + i * 101, values[i].x, values[i].y),
-                     point_ref=PointRef("turn-source", str(i % 2), True),
-                     source_ids=("turn-event-source",)) for i in range(4)]
-    cfg = intersect_config(
-        g_star_min_z=-100., g_star_radius_m=15.,
-        dbscan_eps_m_turn=2., dbscan_min_samples_turn=2,
-        cross_track_dbscan_eps_m=2., cross_track_dbscan_min_samples=2,
-        merge_centroid_distance_m=merge_distance,
-    )
-    expected_hotspots, expected = detect._cluster_pipeline(turns, values, _TEST_TRANSFORMER, cfg)
-    with stored(tmp_path, values) as spool:
-        actual_hotspots, actual = detect._cluster_pipeline(turns, spool, _TEST_TRANSFORMER, cfg)
-        assert actual_hotspots == expected_hotspots
-        assert serialized(actual) == serialized(expected)
-        assert serialized(actual) == serialized(expected)  # pass remains reusable
-        assert len(cluster_pass_ids(spool)) == 1  # ablation passes were removed
-        assert spool[-1] == values[-1]  # noise retained independently of members
-        ids = {cluster.cluster_calculate_index: 100 + i for i, cluster in enumerate(actual)}
-        assert (membership_rows(tmp_path, actual, ids)
-                == membership_rows(tmp_path, expected, ids)
-                == eager_membership_rows(expected, ids))
-        for cluster, original in zip(actual, expected):
-            assert cluster.events == original.events
-            assert cluster.events[::-1] == original.events[::-1]
-            assert cluster.source_point_refs == original.source_point_refs
+def eager_membership_rows(clusters,ids):
+    mappings={}
+    for cluster in clusters:
+        members=cluster.members
+        if members is None: continue
+        for kind,index in zip(members.kind,members.calculation_index):
+            kind='cross' if kind=='orthogonal_cross_track' else str(kind)
+            key=(kind,int(index)); value=ids[cluster.cluster_calculate_index]
+            if key in mappings and mappings[key]!=value: raise ValueError('belongs to multiple candidates')
+            mappings[key]=value
+    return sorted((*key,value) for key,value in mappings.items())
 
 
-@pytest.mark.parametrize("count", [17, 273])
-def test_cross_dbscan_uses_same_kernel_and_compact_float_arrays(tmp_path, count):
-    values = candidates(count)
-    expected = detect._cluster_orthogonal_cross_track_candidates(
-        values, _TEST_TRANSFORMER, eps_m=2., min_samples=2,
-    )
-    real_dbscan = detect._run_dbscan
+@pytest.mark.parametrize('merge_distance',[0.,30.,100.])
+def test_complete_pipeline_matches_eager_order_refs_ablation_and_writer_membership(tmp_path,merge_distance):
+    values=candidates(); turns=turns_for(values)
+    cfg=intersect_config(g_star_min_z=-100.,g_star_radius_m=15.,dbscan_eps_m_turn=2.,dbscan_min_samples_turn=2,
+        cross_track_dbscan_eps_m=2.,cross_track_dbscan_min_samples=2,merge_centroid_distance_m=merge_distance)
+    expected_hotspots,expected=detect._cluster_pipeline(turns,values,TRANSFORMER,cfg)
+    with stored(tmp_path,values) as spool:
+        actual_hotspots,actual=detect._cluster_pipeline(turns,spool,TRANSFORMER,cfg)
+        from .test_turn_event_relation import assert_batch_equal as assert_turn_equal
+        assert_turn_equal(actual_hotspots,expected_hotspots)
+        assert serialized(actual)==serialized(expected)==serialized(actual)
+        assert_batch_equal(concatenate(spool.iter_batches()),values) # noise remains in relation
+        ids={cluster.cluster_calculate_index:100+i for i,cluster in enumerate(actual)}
+        assert membership_rows(tmp_path,actual,ids)==membership_rows(tmp_path,expected,ids)==eager_membership_rows(expected,ids)
+        for actual_cluster,expected_cluster in zip(actual,expected,strict=True):
+            for name in ('kind','calculation_index','member_order','source_id','source_id_valid'):
+                np.testing.assert_array_equal(getattr(actual_cluster.members,name),getattr(expected_cluster.members,name))
 
-    def compact(xs, ys, **kwargs):
-        assert isinstance(xs, array) and xs.typecode == "d"
-        assert isinstance(ys, array) and ys.typecode == "d"
-        assert all(type(value) is float for value in xs)
-        assert list(xs) == [candidate.x for candidate in values]
-        assert list(ys) == [candidate.y for candidate in values]
-        return real_dbscan(xs, ys, **kwargs)
 
-    with stored(tmp_path, values) as spool:
-        with patch.object(detect, "_run_dbscan", side_effect=compact), patch.object(
-            detect, "_group_cluster_items", side_effect=AssertionError("full object grouping"),
-        ):
-            actual = detect._cluster_orthogonal_cross_track_candidates(
-                spool, _TEST_TRANSFORMER, eps_m=2., min_samples=2,
-            )
-        assert serialized(actual) == serialized(expected)
-        assert all(isinstance(cluster.events, ClusterMemberSequence) for cluster in actual)
+@pytest.mark.parametrize('count',[17,273])
+def test_cross_dbscan_uses_same_kernel_and_compact_float_arrays(tmp_path,count):
+    values=candidates(count)
+    expected=detect._cluster_orthogonal_cross_track_candidates(values,TRANSFORMER,eps_m=2.,min_samples=2)
+    real=detect._run_dbscan
+    def compact(xs,ys,**kwargs):
+        assert isinstance(xs,np.ndarray) and xs.dtype==np.float64 and xs.ndim==1
+        assert isinstance(ys,np.ndarray) and ys.dtype==np.float64 and ys.ndim==1
+        np.testing.assert_array_equal(xs,values.xy[:,0]);np.testing.assert_array_equal(ys,values.xy[:,1])
+        return real(xs,ys,**kwargs)
+    with stored(tmp_path,values) as spool,patch.object(detect,'_run_dbscan',side_effect=compact):
+        actual=detect._cluster_orthogonal_cross_track_candidates(spool,TRANSFORMER,eps_m=2.,min_samples=2)
+    assert serialized(actual)==serialized(expected)
+    assert all(isinstance(cluster.members,MemberBatch) for cluster in actual)
 
 
 def test_lazy_members_merge_and_provenance_do_not_retain_decoded_payloads(tmp_path):
-    values = candidates(129)
-    cfg = intersect_config(cross_track_dbscan_eps_m=2., cross_track_dbscan_min_samples=2,
-                                dbscan_eps_m_turn=2., dbscan_min_samples_turn=2,
-                                merge_centroid_distance_m=100.)
-    real_decode = CrossCandidateRelation._decode.__func__
-    real_event = ClusterMemberSequence._event
-    decoded = []
-    wrapped = []
-
-    def observe_decode(cls, row):
-        candidate = real_decode(cls, row)
-        decoded.extend((weakref.ref(candidate), weakref.ref(candidate.point_ref)))
-        return candidate
-
-    def observe_event(candidate, index):
-        event = real_event(candidate, index)
-        wrapped.append(weakref.ref(event))
-        return event
-
-    with stored(tmp_path, values) as spool:
-        del values
-        with patch.object(CrossCandidateRelation, "_decode", new=classmethod(observe_decode)), patch.object(
-            ClusterMemberSequence, "_event", new=staticmethod(observe_event),
-        ):
-            clusters = detect._build_candidate_clusters([], spool, cfg, _TEST_TRANSFORMER)
-            gc.collect()
-            assert not decoded
-            assert not wrapped  # summary construction never needs TurnEvent payloads
-            assert all(reference() is None for reference in decoded + wrapped)
-            assert all(isinstance(cluster.events, ConcatSequence) for cluster in clusters)
-            # Supply turns so ablation also constructs and releases cross passes.
-            first = clusters[0]
-            turns = [_event(i, first.centroid_x, first.centroid_y) for i in range(4)]
-            combined = detect._build_candidate_clusters(turns, spool, cfg, _TEST_TRANSFORMER)
-            previous = cluster_pass_ids(spool)
-            annotated = detect._annotate_source_ablation(combined, turns, spool, cfg, _TEST_TRANSFORMER)
-            assert cluster_pass_ids(spool) == previous
-            gc.collect()
-            assert all(reference() is None for reference in decoded + wrapped)
+    values=candidates(129); cfg=intersect_config(cross_track_dbscan_eps_m=2.,cross_track_dbscan_min_samples=2,
+        dbscan_eps_m_turn=2.,dbscan_min_samples_turn=2,merge_centroid_distance_m=100.)
+    with stored(tmp_path,values) as spool:
+        reference=weakref.ref(values.xy); del values; gc.collect(); assert reference() is None
+        # Coordinate-only clustering must not read business payload batches.
+        with patch.object(spool,'iter_batches',side_effect=AssertionError('business payload decoded')):
+            clusters=detect._build_candidate_clusters(empty_turn_batch(),spool,cfg,TRANSFORMER)
+            turns=turn_batch(4,xy=np.tile([clusters[0].centroid_x,clusters[0].centroid_y],(4,1)))
+            combined=detect._build_candidate_clusters(turns,spool,cfg,TRANSFORMER)
+            annotated=detect._annotate_source_ablation(combined,turns,spool,cfg,TRANSFORMER)
             assert serialized(annotated)
-            assert decoded
-            assert wrapped  # explicit export is the point where events are decoded
-            gc.collect()
-            assert all(reference() is None for reference in decoded + wrapped)
+        assert all(isinstance(cluster.members,MemberBatch) for cluster in clusters)
 
 
 def test_manual_reference_source_ids_and_duplicate_order_survive_lazy_merge(tmp_path):
-    values = candidates()
-    with stored(tmp_path, values) as spool:
-        lazy = detect._cluster_orthogonal_cross_track_candidates(
-            spool, _TEST_TRANSFORMER, eps_m=2., min_samples=2,
-        )
-        eager = detect._cluster_orthogonal_cross_track_candidates(
-            values, _TEST_TRANSFORMER, eps_m=2., min_samples=2,
-        )
-        event = _event(31, lazy[0].centroid_x, lazy[0].centroid_y)
-        extra = PointRef("manual-only", "outside-events", True)
-        manual = HotspotCluster(91, event.x, event.y, event.lon, event.lat, 2.,
-                                events=(event,), source_point_refs={"turn": (extra, extra)})
-        actual = detect._merge_clusters([manual, *lazy], 100., _TEST_TRANSFORMER)
-        expected = detect._merge_clusters([manual, *eager], 100., _TEST_TRANSFORMER)
-        assert serialized(actual) == serialized(expected)
-        assert "manual-only" in actual[0].source_ids
-        assert list(actual[0].source_point_refs["turn"]) == [extra, extra]
+    values=candidates()
+    with stored(tmp_path,values) as spool:
+        lazy=detect._cluster_orthogonal_cross_track_candidates(spool,TRANSFORMER,eps_m=2.,min_samples=2)
+        eager=detect._cluster_orthogonal_cross_track_candidates(values,TRANSFORMER,eps_m=2.,min_samples=2)
+        first=lazy[0]
+        members=MemberBatch(np.asarray(['turn','turn']),np.asarray([31,31],dtype=np.int64),np.asarray([0,1],dtype=np.int64),np.asarray(['manual-only','manual-only']),np.asarray([True,True]))
+        manual=HotspotCluster(91,first.centroid_x,first.centroid_y,first.centroid_lon,first.centroid_lat,2.,members=members,
+            source_ids=('manual-only',),source_counts={'turn':2},algorithm_sources=('turn',))
+        actual=detect._merge_clusters([manual,*lazy],100.,TRANSFORMER)
+        expected=detect._merge_clusters([manual,*eager],100.,TRANSFORMER)
+        assert serialized(actual)==serialized(expected)
+        assert 'manual-only' in actual[0].source_ids
+        assert actual[0].members.source_id[actual[0].members.kind=='turn'].tolist()==['manual-only','manual-only']
+        assert actual[0].members.calculation_index[actual[0].members.kind=='turn'].tolist()==[31,31]
 
 
-@pytest.mark.parametrize("failure", [RuntimeError("ablation failed"), KeyboardInterrupt()])
-def test_ablation_failure_closes_only_its_pass(tmp_path, failure):
-    values = candidates()
-    cfg = intersect_config(cross_track_dbscan_eps_m=2., cross_track_dbscan_min_samples=2)
-    with stored(tmp_path, values) as spool:
-        main = detect._build_candidate_clusters([], spool, cfg, _TEST_TRANSFORMER)
-        before = serialized(main)
-        passes = cluster_pass_ids(spool)
-        # Add the turn source, forcing the first ablation to build cross members.
-        mixed = [replace(main[0], algorithm_sources=("turn", "orthogonal_cross_track"))]
-        real_build = detect._build_candidate_clusters
-
-        def fail(*args, **kwargs):
-            kwargs["disabled_sources"] = {"turn"}
-            real_build(*args, **kwargs)
-            raise failure
-
-        with patch.object(detect, "_build_candidate_clusters", side_effect=fail):
-            with pytest.raises(type(failure)):
-                detect._annotate_source_ablation(mixed, [], spool, cfg, _TEST_TRANSFORMER)
-        assert cluster_pass_ids(spool) == passes
-        assert serialized(main) == before
+@pytest.mark.parametrize('failure',[RuntimeError('ablation failed'),KeyboardInterrupt()])
+def test_ablation_failure_closes_only_its_pass(tmp_path,failure):
+    values=candidates();cfg=intersect_config(cross_track_dbscan_eps_m=2.,cross_track_dbscan_min_samples=2)
+    with stored(tmp_path,values) as spool:
+        main=detect._build_candidate_clusters(empty_turn_batch(),spool,cfg,TRANSFORMER);before=serialized(main)
+        mixed=[replace(main[0],algorithm_sources=('turn','orthogonal_cross_track'))]
+        real=detect._build_candidate_clusters
+        def fail(*args,**kwargs):
+            kwargs['disabled_sources']={'turn'};real(*args,**kwargs);raise failure
+        with patch.object(detect,'_build_candidate_clusters',side_effect=fail):
+            with pytest.raises(type(failure)):detect._annotate_source_ablation(mixed,empty_turn_batch(),spool,cfg,TRANSFORMER)
+        assert serialized(main)==before
+        assert_batch_equal(concatenate(spool.iter_batches()),values)
+        assert not spool._connection.execute("SELECT table_name FROM duckdb_tables() WHERE table_name LIKE '%member%'").fetchall()
 
 
 def test_sorted_relation_to_result_writes_same_rows(tmp_path):
-    cfg = intersect_config(cross_track_pair_batch_size=3, use_turn_events=False,
-                                 cross_track_dbscan_min_samples=1)
-    expected = [replace(
-        value,
-        from_segment_start=RefinedPointRef("kept", index * 2 + 1, index, 0),
-        to_segment_start=RefinedPointRef("kept", index * 2 + 2, index, 0),
-    ) for index, value in enumerate(candidates(8), 1)]
-    spool = CrossCandidateRelation(runtime_config(), tmp_path)
-    try:
-        for value in expected:
-            spool.append(value)
-        spool.seal()
-        actual = spool
-        assert actual is spool
-        assert actual == expected
-        _, eager_clusters = detect._cluster_pipeline([], expected, _TEST_TRANSFORMER, cfg)
-        _, lazy_clusters = detect._cluster_pipeline([], spool, _TEST_TRANSFORMER, cfg)
-        result = replace(detect._empty_intersect_result(_TEST_SPATIAL_CONTEXT), clusters=lazy_clusters,
-                         cross_track_candidates=spool)
-        eager = replace(result, clusters=eager_clusters, cross_track_candidates=expected)
-        assert result.as_dict() == eager.as_dict()
-        ids = {cluster.cluster_calculate_index: 100 + i for i, cluster in enumerate(lazy_clusters)}
-        assert membership_rows(tmp_path, lazy_clusters, ids) == eager_membership_rows(eager_clusters, ids)
-        refined = {_refine_key(ref) for candidate in expected
-                   for ref in (candidate.from_segment_start, candidate.to_segment_start)}
-        resolved = {ref: i + 1 for i, ref in enumerate(sorted(refined))}
-        expected_pairs = [tuple(sorted((resolved[_refine_key(candidate.from_segment_start)],
-                                        resolved[_refine_key(candidate.to_segment_start)])))
-                          for candidate in expected]
-        assert all(a != b for a, b in expected_pairs)
-        assert len(expected_pairs) == len(set(expected_pairs))
-
-        class Connection:
-            def cursor(self):
-                return ExitStack()
-
-        rows = []
-        for output in (result, eager):
-            copied = []
-            def capture(_cursor, _table, _columns, values, **kwargs):
-                assert len(values) <= 3
-                copied.extend(values)
-            with WriterRelation(runtime_config(), tmp_path, "run", batch_size=3) as relation:
-                relation.collect_sources(output, [], (), ids)
-                for (kind, point_id, subtrack), rid in resolved.items():
-                    relation.add_mapping(RefinedPointRef(kind, point_id, subtrack, 0), rid)
-                relation.resolve_sources()
-                relation.prepare_annotations(output.clusters, ids, output.hotspot_events)
-                with patch("track.v2.db.write_detect_results._copy_insert", side_effect=capture):
-                    _insert_tracks_cross(Connection(), "run", relation, batch_size=3)
+    cfg=intersect_config(cross_track_pair_batch_size=3,use_turn_events=False,cross_track_dbscan_min_samples=1)
+    expected=candidates(8)
+    with stored(tmp_path,expected) as spool:
+        _,eager_clusters=detect._cluster_pipeline(empty_turn_batch(),expected,TRANSFORMER,cfg)
+        _,lazy_clusters=detect._cluster_pipeline(empty_turn_batch(),spool,TRANSFORMER,cfg)
+        base=detect._empty_intersect_result(CONTEXT)
+        result=replace(base,clusters=lazy_clusters,cross_track_candidates=spool)
+        eager=replace(base,clusters=eager_clusters,cross_track_candidates=expected)
+        ids={cluster.cluster_calculate_index:100+i for i,cluster in enumerate(lazy_clusters)}
+        assert membership_rows(tmp_path,lazy_clusters,ids)==eager_membership_rows(eager_clusters,ids)
+        keys=[('kept',int(value),int(track)) for values,tracks in ((expected.from_refine_point_id,expected.from_subtrack_index),(expected.to_refine_point_id,expected.to_subtrack_index)) for value,track in zip(values,tracks)]
+        resolved={key:i+1 for i,key in enumerate(sorted(set(keys)))}
+        expected_pairs=[tuple(sorted((resolved[keys[i]],resolved[keys[i+len(expected)]]))) for i in range(len(expected))]
+        assert all(a!=b for a,b in expected_pairs) and len(expected_pairs)==len(set(expected_pairs))
+        rows=[]
+        for output in (result,eager):
+            copied=[]
+            def capture(cursor,table,columns,values,**kwargs): assert len(values)<=3;copied.extend(values)
+            with WriterRelation(runtime_config(),tmp_path,'run',batch_size=3) as relation:
+                relation.collect_sources(output,[],{},ids)
+                relation.add_mappings(np.asarray([key[0] for key in resolved]),np.asarray([key[1] for key in resolved],dtype=np.int64),np.asarray([key[2] for key in resolved],dtype=np.int64),np.asarray(list(resolved.values()),dtype=np.int64))
+                relation.resolve_sources();relation.prepare_annotations(output.clusters,ids,output.hotspot_events)
+                with patch('track.v2.db.write_detect_results._copy_insert',side_effect=capture):
+                    _insert_tracks_cross(NS(cursor=lambda:ExitStack()),'run',relation,batch_size=3)
             rows.append(copied)
-        membership = {index: value for kind, index, value in eager_membership_rows(eager_clusters, ids) if kind == "cross"}
-        expected_rows = []
-        for candidate in expected:
-            a, b = sorted((resolved[_refine_key(candidate.from_segment_start)],
-                           resolved[_refine_key(candidate.to_segment_start)]))
-            expected_rows.append(("run", membership.get(candidate.cross_track_calculate_index), a, b,
-                                  candidate.x, candidate.y, candidate.lon, candidate.lat))
-        assert rows[0] == rows[1] == expected_rows
-        assert result.as_dict() == eager.as_dict()
-        result.close()
-        result.close()
-        assert not list(tmp_path.glob("duckdb/cross-candidate-relations/*"))
-        with pytest.raises(RuntimeError):
-            list(lazy_clusters[0].events)
-    finally:
-        spool.close()
+        membership={index:value for kind,index,value in eager_membership_rows(eager_clusters,ids) if kind=='cross'}
+        expected_rows=[('run',membership.get(i),*expected_pairs[i],*expected.xy[i],*expected.lonlat[i]) for i in range(len(expected))]
+        assert rows[0]==rows[1]==expected_rows
+        assert json.loads(json.dumps(result.as_dict()))==json.loads(json.dumps(eager.as_dict()))
+        result.close();result.close()
+        assert not list(tmp_path.glob('duckdb/cross-event-relations/*'))
+        with pytest.raises(RuntimeError):list(spool.iter_batches())
+        # Members are independent published columns and remain readable after owning relation closes.
+        assert lazy_clusters[0].members.calculation_index.size>0
 
 
-@pytest.mark.parametrize("phase", ["reader", "clustering", "topology"])
-@pytest.mark.parametrize("failure", [RuntimeError("stage failed"), KeyboardInterrupt()])
-def test_db_owner_closes_all_spools_on_failure(tmp_path, monkeypatch, phase, failure):
-    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
-    cfg = intersect_run_config(
-        use_turn_events=False, cross_track_dbscan_min_samples=1,
-        refine_id="refine-1",
-    )
-    reader = MagicMock()
-    reader.extent.return_value = (0., 0., 1., 1.)
-    reader.iter_cross_track_pair_batches.return_value = iter(())
-    reader.iter_topology_tracks.return_value = iter(())
-    reader.track_count.return_value = 0
+@pytest.mark.parametrize('phase',['reader','clustering','topology'])
+@pytest.mark.parametrize('failure',[RuntimeError('stage failed'),KeyboardInterrupt()])
+def test_db_owner_closes_all_spools_on_failure(tmp_path,monkeypatch,phase,failure):
+    cfg=intersect_run_config(use_turn_events=False,cross_track_dbscan_min_samples=1,refine_id='refine-1')
+    reader=MagicMock();reader.extent.return_value=(0.,0.,1.,1.);reader.track_count.return_value=0
     with ExitStack() as stack:
-        target = {"reader": "run_grid_cross_track_task", "clustering": "_cluster_pipeline",
-                  "topology": "_build_topologies_from_tracks"}[phase]
-        if phase != "reader":
-            stack.enter_context(patch.object(
-                detect, "run_grid_cross_track_task", return_value=[],
-            ))
-        stack.enter_context(patch.object(detect, target, side_effect=failure))
+        target={'reader':'run_grid_cross_track_task','clustering':'_cluster_pipeline','topology':'_build_topologies_from_tracks'}[phase]
+        if phase!='reader':stack.enter_context(patch.object(detect,'run_grid_cross_track_task',return_value=empty_cross_batch()))
+        stack.enter_context(patch.object(detect,target,side_effect=failure))
         with pytest.raises(type(failure)):
-            detect._detect_intersections_db(
-                object(), cfg, _TEST_SPATIAL_CONTEXT, runtime=runtime_config(),
-                data_root=tmp_path, refine_reader=reader,
-                connect_worker=lambda: object(),
-            )
-    assert not list(tmp_path.glob("duckdb/turn-event-relations/*"))
-    assert not list(tmp_path.glob("duckdb/cross-candidate-relations/*"))
+            detect._detect_intersections_db(object(),cfg,CONTEXT,runtime=runtime_config(),data_root=tmp_path,refine_reader=reader,connect_worker=lambda:object())
+    assert not list(tmp_path.glob('duckdb/turn-event-relations/*'))
+    assert not list(tmp_path.glob('duckdb/cross-event-relations/*'))
 
 
 def test_summary_merge_and_reference_lengths_do_not_decode_members_again(tmp_path):
-    values = candidates()
-    cfg = intersect_config(
-        dbscan_eps_m_turn=2., dbscan_min_samples_turn=2,
-        cross_track_dbscan_eps_m=2., cross_track_dbscan_min_samples=2,
-        merge_centroid_distance_m=100.,
-    )
-    turns = [_event(i, values[i].x, values[i].y) for i in range(4)]
-    real_decode = CrossCandidateRelation._decode.__func__
-    decoded = 0
-
-    def count_decode(cls, row):
-        nonlocal decoded
-        decoded += 1
-        return real_decode(cls, row)
-
-    with stored(tmp_path, values) as spool:
-        with patch.object(CrossCandidateRelation, "_decode", new=classmethod(count_decode)):
-            crosses = detect._cluster_orthogonal_cross_track_candidates(
-                spool, _TEST_TRANSFORMER, eps_m=2., min_samples=2,
-            )
-        turn_clusters = detect._cluster_dbscan(
-            turns, _TEST_TRANSFORMER, eps_m=2., min_samples=2, source="turn",
-        )
-        # Narrow provenance summaries do not reconstruct candidate payloads.
-        assert decoded == 0
-        assert len(crosses) > 1
-        with patch.object(CrossCandidateRelation, "_decode", side_effect=AssertionError("decoded cached provenance")):
-            initial = detect._merge_clusters([*turn_clusters, *crosses], 100., _TEST_TRANSFORMER)
-            normalized = [detect._with_source_provenance(cluster) for cluster in initial]
-            assert sum(len(refs) for cluster in normalized for refs in cluster.source_point_refs.values()) == 16
-        before_ablation = decoded
-        with patch.object(CrossCandidateRelation, "_decode", new=classmethod(count_decode)):
-            annotated = detect._annotate_source_ablation(initial, turns, spool, cfg, _TEST_TRANSFORMER)
-        assert decoded == before_ablation
-        assert serialized(annotated) == serialized(detect._annotate_source_ablation(
-            detect._build_candidate_clusters(turns, values, cfg, _TEST_TRANSFORMER),
-            turns, values, cfg, _TEST_TRANSFORMER,
-        ))
+    values=candidates();cfg=intersect_config(dbscan_eps_m_turn=2.,dbscan_min_samples_turn=2,cross_track_dbscan_eps_m=2.,cross_track_dbscan_min_samples=2,merge_centroid_distance_m=100.)
+    turns=turns_for(values)
+    with stored(tmp_path,values) as spool,patch.object(spool,'iter_batches',side_effect=AssertionError('business payload decoded')):
+        crosses=detect._cluster_orthogonal_cross_track_candidates(spool,TRANSFORMER,eps_m=2.,min_samples=2)
+        turn_clusters=detect._cluster_dbscan(turns,TRANSFORMER,eps_m=2.,min_samples=2,source='turn')
+        assert len(crosses)>1
+        initial=detect._merge_clusters([*turn_clusters,*crosses],100.,TRANSFORMER)
+        assert sum(np.count_nonzero(cluster.members.kind=='orthogonal_cross_track') for cluster in initial)==16
+        assert sum(np.count_nonzero(cluster.members.kind=='turn') for cluster in initial)==4
+        annotated=detect._annotate_source_ablation(initial,turns,spool,cfg,TRANSFORMER)
+        expected=detect._annotate_source_ablation(detect._build_candidate_clusters(turns,values,cfg,TRANSFORMER),turns,values,cfg,TRANSFORMER)
+        assert serialized(annotated)==serialized(expected)
 
 
 def test_eager_and_lazy_membership_conflicts_still_raise(tmp_path):
-    values = candidates()
-    with stored(tmp_path, values) as spool:
-        lazy = detect._cluster_orthogonal_cross_track_candidates(spool, _TEST_TRANSFORMER, eps_m=2., min_samples=2)
-        eager = detect._cluster_orthogonal_cross_track_candidates(values, _TEST_TRANSFORMER, eps_m=2., min_samples=2)
-        for groups in (eager, lazy):
-            first = groups[0]
-            duplicate = replace(first, cluster_calculate_index=999)
-            ids = {first.cluster_calculate_index: 10, 999: 20}
-            with pytest.raises(ValueError, match="belongs to multiple candidates"):
-                membership_rows(tmp_path, [first, duplicate], ids)
-        with pytest.raises(ValueError, match="belongs to multiple candidates"):
-            eager_membership_rows([eager[0], replace(eager[0], cluster_calculate_index=999)],
-                                  {eager[0].cluster_calculate_index: 10, 999: 20})
+    values=candidates()
+    with stored(tmp_path,values) as spool:
+        lazy=detect._cluster_orthogonal_cross_track_candidates(spool,TRANSFORMER,eps_m=2.,min_samples=2)
+        eager=detect._cluster_orthogonal_cross_track_candidates(values,TRANSFORMER,eps_m=2.,min_samples=2)
+        for groups in (eager,lazy):
+            first=groups[0];duplicate=replace(first,cluster_calculate_index=999)
+            ids={first.cluster_calculate_index:10,999:20}
+            with pytest.raises(ValueError,match='belongs to multiple candidates'):membership_rows(tmp_path,[first,duplicate],ids)
+        with pytest.raises(ValueError,match='belongs to multiple candidates'):
+            eager_membership_rows([eager[0],replace(eager[0],cluster_calculate_index=999)],{eager[0].cluster_calculate_index:10,999:20})

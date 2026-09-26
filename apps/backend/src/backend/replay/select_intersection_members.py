@@ -1,4 +1,4 @@
-"""Bounded event-member selection using Pipeline's existing point replay helper."""
+"""Bounded event-member selection serialized directly at the API boundary."""
 
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
@@ -12,9 +12,6 @@ if TYPE_CHECKING:
 
 
 def replay_intersection(store: "PostgresMapStore", request: "ReplayRequest") -> dict[str, Any]:
-    from track.v2.models import PointRef, TrajectoryPoint
-    from track.v2.validation.resolve_point_references import replay_points
-
     row = store._fetchone(
         "SELECT detect_id::text, candidate_intersection_id FROM intersections WHERE id = %s",
         (request.intersection_id,),
@@ -65,34 +62,24 @@ def replay_intersection(store: "PostgresMapStore", request: "ReplayRequest") -> 
     )
     if len(rows) > request.max_points:
         raise MapDataError("交叉口构成点超过 max_points 上限，请提高上限后重试；未返回部分结果。")
-    points = []
-    tracks = defaultdict(list)
-    for row in rows:
+    # JSON is the bounded API output boundary; no Pipeline point graph is needed.
+    features = []
+    seen: set[tuple[str, str]] = set()
+    for row in sorted(rows, key=lambda row: (str(row[3]), float(row[4]) if row[4] is not None else 0)):
         point_id, source_key, injected_id, vehicle, timestamp, lon, lat, heading, speed, events = row
         if any(value is None for value in (vehicle, timestamp, lon, lat, heading, speed)):
             raise MapDataError("交叉口事件引用的构成点缺失，无法完整回放。")
-        # Separate kept/injected namespaces avoid collisions with source keys.
-        reference = PointRef(
-            source_id=f"{refine.refine_id}:" + ("injected" if injected_id is not None else "source"),
-            source_row_key=str(injected_id if injected_id is not None else source_key),
-            stable=True,
-        )
-        point = TrajectoryPoint(reference, str(vehicle), float(timestamp), float(lon), float(lat),
-                                float(heading), float(speed), extra={
-                                    "resolved_point_id": point_id, "source_row_key": source_key,
-                                    "injected_point_id": injected_id, "events": events,
-                                })
-        points.append(point)
-        tracks[point.vehicle_id].append(point)
-    replayed = replay_points(points, dict(tracks))
-    features = [
-        create_map_feature(point.extra["resolved_point_id"],
-                 {"type": "Point", "coordinates": [point.lon, point.lat]},
-                 **point.extra, vehicle_id=point.vehicle_id, timestamp=point.timestamp,
-                 intersection_id=request.intersection_id, detect_id=detect_id,
-                 candidate_intersection_id=candidate_id)
-        for point in replayed
-    ]
+        identity = ("injected" if injected_id is not None else "source",
+                    str(injected_id if injected_id is not None else source_key))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        features.append(create_map_feature(
+            point_id, {"type": "Point", "coordinates": [float(lon), float(lat)]},
+            resolved_point_id=point_id, source_row_key=source_key,
+            injected_point_id=injected_id, events=events, vehicle_id=str(vehicle),
+            timestamp=float(timestamp), intersection_id=request.intersection_id,
+            detect_id=detect_id, candidate_intersection_id=candidate_id))
     return create_map_feature_collection(features, operation="replay", selection="intersection_id",
                                intersection_id=request.intersection_id, detect_id=detect_id,
                                candidate_intersection_id=candidate_id,

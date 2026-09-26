@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import numpy as np
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -11,11 +12,8 @@ from ..intersections.query_results import fetch_detect_row, fetch_resolved_clip_
 from ..db.source_table import validate_source_table, verify_refine_source_fingerprint
 from ..models import (
     CenterlineInputReplay,
-    ClipPoint,
     ReplayFitClip,
-    ReplayFitEndpoint,
     TrackModel,
-    TrajectoryPoint,
 )
 
 def replay_centerline_inputs(
@@ -66,12 +64,11 @@ def replay_centerline_inputs(
     if detect.status != "completed":
         raise ValueError(f"Detect Run {detect_id} is not completed")
     verify_refine_source_fingerprint(conn, detect.refine_id)
-    tracks = fetch_resolved_clip_tracks(conn, str(detect_id), batch_size=batch_size)
+    tracks = tuple(fetch_resolved_clip_tracks(conn, str(detect_id), batch_size=batch_size))
     crossing_index: dict[int, tuple[int, int]] = {}
     for track_index, track in enumerate(tracks):
-        for point_index, point in enumerate(track.points):
-            if point.crossing_id is not None:
-                crossing_index[point.crossing_id] = (track_index, point_index)
+        for point_index in np.flatnonzero(track.crossing_valid):
+            crossing_index[int(track.crossing_ids[point_index])] = (track_index, int(point_index))
 
     clips: list[ReplayFitClip] = []
     for ordinal, start_crossing_id, end_crossing_id, reverse_direction in manifest_rows:
@@ -86,29 +83,21 @@ def replay_centerline_inputs(
                 f"Centerline {centerline_id} crossing order is inconsistent"
             )
         track = tracks[start_location[0]]
-        start_point = track.points[start_location[1]]
-        end_point = track.points[end_location[1]]
-        start = _replay_fit_endpoint(start_point, expected_type=0)
-        end = _replay_fit_endpoint(end_point, expected_type=1)
-        interior = tuple(
-            ClipPoint(
-                resolved_point_id=point.resolved_point_id,
-                lon=point.lon,
-                lat=point.lat,
-            )
-            for point in track.points[start_location[1] + 1 : end_location[1]]
-        )
-        clips.append(
-            ReplayFitClip(
-                input_ordinal=int(ordinal),
-                original_from_intersection_id=start.intersection_id,
-                original_to_intersection_id=end.intersection_id,
-                reverse_to_centerline_direction=bool(reverse_direction),
-                start=start,
-                interior_points=interior,
-                end=end,
-            )
-        )
+        start, end = start_location[1], end_location[1]
+        for index, expected in ((start, 0), (end, 1)):
+            if (not track.crossing_valid[index] or not track.intersection_valid[index]
+                    or track.crossing_types[index] != expected):
+                raise ValueError("Centerline manifest endpoint has invalid crossing type")
+        clips.append(ReplayFitClip(
+            input_ordinal=int(ordinal),
+            original_from_intersection_id=int(track.intersection_ids[start]),
+            original_to_intersection_id=int(track.intersection_ids[end]),
+            reverse_to_centerline_direction=bool(reverse_direction),
+            lonlat=track.lonlat[start:end+1], resolved_point_ids=track.resolved_point_ids[start:end+1],
+            start_crossing_id=int(track.crossing_ids[start]), end_crossing_id=int(track.crossing_ids[end]),
+            start_intersection_id=int(track.intersection_ids[start]), end_intersection_id=int(track.intersection_ids[end]),
+            start_kind="exit", end_kind="entry",
+        ))
     return CenterlineInputReplay(
         centerline_id=centerline_id,
         fit_id=str(fit_id),
@@ -123,27 +112,10 @@ def replay_centerline_inputs(
     )
 
 def _stringify_source_row_key(row: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Keep persisted BIGINT source identities aligned with PointRef/API strings."""
+    """Keep persisted BIGINT source identities aligned with API strings."""
     if row is not None and row.get("source_row_key") is not None:
         row["source_row_key"] = str(row["source_row_key"])
     return row
-
-def _replay_fit_endpoint(point: Any, *, expected_type: int) -> ReplayFitEndpoint:
-    if (
-        point.crossing_id is None
-        or point.intersection_id is None
-        or point.crossing_type != expected_type
-    ):
-        expected = "exit" if expected_type == 0 else "entry"
-        raise ValueError(f"Centerline manifest endpoint is not a resolved {expected} crossing")
-    return ReplayFitEndpoint(
-        resolved_point_id=point.resolved_point_id,
-        crossing_id=point.crossing_id,
-        intersection_id=point.intersection_id,
-        kind="exit" if expected_type == 0 else "entry",
-        lon=point.lon,
-        lat=point.lat,
-    )
 
 @dataclass(frozen=True)
 class ReplayTarget(TrackModel):

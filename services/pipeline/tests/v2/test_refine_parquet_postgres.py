@@ -237,7 +237,7 @@ def test_real_refine_export_publish_register_and_complete(refine_database, tmp_p
     _make_writable(result.final_path)
 
 
-def test_real_reader_tracks_match_legacy_postgres_detect_input(refine_database, tmp_path) -> None:
+def test_real_reader_preserves_source_and_injected_identity_columns(refine_database, tmp_path) -> None:
     conn, config, schema = refine_database
     run_id, fingerprint = _seed(conn, schema)
     conn.execute(
@@ -257,26 +257,22 @@ def test_real_reader_tracks_match_legacy_postgres_detect_input(refine_database, 
         "topology_bearing_semantics": "clockwise_degrees_from_processing_grid_north",
         "enforce_area_of_use": False, "max_scale_error": 0.05,
     })
-    legacy = list(_stream_vehicle_tracks_from_db(
-        conn, table=source_table, kept_table=f"{schema}.kept_trajectory_points",
-        source_table=source_table, refine_id=str(run_id), spatial_context=spatial,
-    ))
     with RefineDatasetReader(
         tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
     ) as reader:
-        columnar = list(reader.iter_tracks(source_table, batch_size=2))
-
-    def detect_fields(point):
-        return (
-            point.point_ref, point.vehicle_id, point.timestamp, point.lon, point.lat,
-            point.heading, point.speed, point.x, point.y, point.refined_point_ref,
-        )
-
-    assert [[detect_fields(point) for point in track] for track in columnar] == [
-        [detect_fields(point) for point in track] for track in legacy
-    ]
-    assert all(point.extra == {} for track in columnar for point in track)
-    assert any(point.extra for track in legacy for point in track if point.point_ref.stable)
+        tracks = list(reader.iter_tracks(source_table, batch_size=2))
+    assert len(tracks) == 1
+    track = tracks[0]
+    assert track.vehicle_id == "vehicle-a"
+    assert track.subtrack_index == 1
+    assert track.kind.tolist() == ["p", "i", "p"]
+    assert track.source_row_key[track.source_row_key_valid].tolist() == [10, 20]
+    assert track.timestamp.tolist() == [1000., 1001., 1002.]
+    assert track.after_sequence.tolist() == [-1, 0, -1]
+    assert track.refine_point_id_valid.all()
+    assert not track.xy.flags.writeable
+    assert track.xy.shape == (3, 2)
+    assert track.generated_reason[1] == "orthogonal_heading"
     _make_writable(handle.final_path)
 
 

@@ -8,8 +8,8 @@ from track.v2.candidates.detect_grid_crossings import iter_grid_crossings
 
 
 def _segments():
-    # Horizontal a crosses vertical b and e. The same-car vertical a is
-    # excluded; c is parallel and away; d fails the straightness threshold.
+    # Horizontal a crosses vertical b and e. The vertical a shares its
+    # subtrack and is excluded; c is parallel and away; d fails straightness.
     values = (
         ("a", 0.0, 0.0, 2.0, 0.0, 90.0, 90.0),
         ("a", 0.5, -1.0, 0.5, 1.0, 0.0, 0.0),
@@ -19,9 +19,11 @@ def _segments():
         ("e", 1.5, -1.0, 1.5, 1.0, 0.0, 0.0),
     )
     return {
-        "vehicle_id": tuple(row[0] for row in values),
-        "segment_identity": tuple((row[0], 1, 0, i * 2, 0, i * 2 + 1)
-                                  for i, row in enumerate(values)),
+        "vehicle_id": np.asarray([row[0] for row in values],dtype=object),
+        "subtrack_index": np.asarray([0,0,1,2,3,4],dtype=np.int64),
+        "segment_identity": np.column_stack((np.asarray([0,0,1,2,3,4],dtype=np.int64),
+            np.zeros(len(values),dtype=np.int64),np.arange(len(values),dtype=np.int64)*2,
+            np.zeros(len(values),dtype=np.int64),np.arange(len(values),dtype=np.int64)*2+1)),
         **{
             name: np.asarray([row[position] for row in values], dtype=np.float64)
             for name, position in (
@@ -54,14 +56,14 @@ def test_iter_grid_crossings_batches_only_cross_vehicle_exact_hits():
     assert len(batches) == 2
     assert all(len(batch["x"]) == 1 for batch in batches)
     hits = {
-        (batch["segment_identity_a"][0], batch["segment_identity_b"][0]):
+        (tuple(batch["segment_identity_a"][0]), tuple(batch["segment_identity_b"][0])):
         (float(batch["x"][0]), float(batch["y"][0]))
         for batch in batches
     }
     identities = segments["segment_identity"]
     assert hits == {
-        (identities[0], identities[2]): (1.0, 0.0),
-        (identities[0], identities[5]): (1.5, 0.0),
+        (tuple(identities[0]), tuple(identities[2])): (1.0, 0.0),
+        (tuple(identities[0]), tuple(identities[5])): (1.5, 0.0),
     }
     assert {int(batch["segment_index_a"][0]) for batch in batches} == {0}
     assert {int(batch["segment_index_b"][0]) for batch in batches} == {2, 5}
@@ -73,3 +75,27 @@ def test_iter_grid_crossings_preserves_bucket_capacity_error():
             _segments(), _cfg(), max_grid_memberships=0,
             max_overflow_pair_space=0,
         ))
+
+
+def test_same_vehicle_different_subtracks_are_exact_crossing_participants():
+    segments=_segments()
+    segments['subtrack_index'][1]=5
+    segments['segment_identity'][1,0]=5
+    batches=list(iter_grid_crossings(segments,_cfg(),max_grid_memberships=1000,max_overflow_pair_space=1000))
+    assert sum(len(batch['x']) for batch in batches)==3
+    assert sorted((float(x),float(y)) for batch in batches for x,y in zip(batch['x'],batch['y']))==[(.5,0.),(1.,0.),(1.5,0.)]
+    same_vehicle=[batch for batch in batches if {int(batch['segment_index_a'][0]),int(batch['segment_index_b'][0])}=={0,1}]
+    assert len(same_vehicle)==1
+    assert segments['vehicle_id'][0]==segments['vehicle_id'][1]=='a'
+    assert segments['subtrack_index'][0]!=segments['subtrack_index'][1]
+
+
+def test_same_subtrack_is_excluded_independently_of_vehicle_identity():
+    segments=_segments()
+    segments['subtrack_index'][2]=0
+    segments['segment_identity'][2,0]=0
+    batches=list(iter_grid_crossings(segments,_cfg(),max_grid_memberships=1000,max_overflow_pair_space=1000))
+    assert sum(len(batch['x']) for batch in batches)==1
+    assert batches[0]['segment_index_a'].tolist()==[0]
+    assert batches[0]['segment_index_b'].tolist()==[5]
+    assert segments['vehicle_id'][0]!=segments['vehicle_id'][2]

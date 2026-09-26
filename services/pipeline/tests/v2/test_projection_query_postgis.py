@@ -14,7 +14,7 @@ from track.v2.projection import CoordinateTransformer, QueryWindowRequest, build
 
 
 @pytest.mark.skipif(not os.environ.get("ROADNET_TEST_DSN"), reason="ROADNET_TEST_DSN is not set")
-def test_postgis_prefilter_matches_exact_oracle_and_returns_run_xy() -> None:
+def test_postgis_prefilter_keeps_known_members_and_returns_run_xy() -> None:
     import psycopg
 
     run_context = SpatialContext(
@@ -120,11 +120,11 @@ def test_postgis_prefilter_matches_exact_oracle_and_returns_run_xy() -> None:
             source_table="projection_raw", spatial_context=run_context,
         )
 
-    raw_ids = [point.point_ref.source_row_key for point in points if point.point_ref.stable]
+    raw_ids = [str(key) for track in points for key in track.source_row_key[track.source_row_key_valid]]
     assert raw_ids == oracle_raw == ["1"]
     assert {point.vehicle_id for point in points} == {"raw-inner", "injected-inner"}
     assert [point.vehicle_id for point in adjacent_points] == ["raw-inner"]
-    for point in points:
-        expected_x, expected_y = run_transformer.forward(point.lon, point.lat)
-        assert point.x == pytest.approx(expected_x, rel=0, abs=1e-6)
-        assert point.y == pytest.approx(expected_y, rel=0, abs=1e-6)
+    for track in points:
+        expected = run_transformer.forward_many(track.lonlat)
+        assert track.xy[:, 0] == pytest.approx(expected[:, 0], rel=0, abs=1e-6)
+        assert track.xy[:, 1] == pytest.approx(expected[:, 1], rel=0, abs=1e-6)

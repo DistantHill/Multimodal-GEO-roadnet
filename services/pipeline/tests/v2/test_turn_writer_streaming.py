@@ -10,54 +10,40 @@ import os
 import pytest
 
 from track.v2.db import write_detect_results as writer
-from track.v2.models import RefinedPointRef, TurnEvent
+import numpy as np
+from track.v2.models import TurnBatch
 from track.v2.models import RuntimeConfig
 from track.v2.intersections.relations.source_associations import WriterRelation
-from .writer_relation_helpers import prepared_turn_relation
-
-
-def event(index):
-    return SimpleNamespace(
-        event_calculate_index=index,
-        refined_point_ref=RefinedPointRef('kept', 100 + index, 1, index),
-        entry_bearing=index * 1.0, exit_bearing=index + 90.0,
-        turn_deg=90.0, score=index + .5,
-    )
+from .writer_relation_helpers import prepared_turn_relation, turn_batch, _batch
 
 
 class OnePassEvents:
-    def __init__(self, count, *, invalid_at=None):
-        self.count = count
-        self.invalid_at = invalid_at
-        self.iterations = 0
-        self.read = 0
-        self.closed = False
-
-    def __len__(self):
-        return self.count
-
-    def __iter__(self):
-        self.iterations += 1
-        assert self.iterations == 1, 'turn writer must not scan events twice'
+    def __init__(self,count,*,invalid_at=None):
+        self.count,self.invalid_at=count,invalid_at
+        self.iterations=self.read=0
+        self.closed=False
+    def __len__(self): return self.count
+    def iter_batches(self):
+        self.iterations+=1
+        assert self.iterations==1,'turn writer must not scan batches twice'
         try:
-            for index in range(self.count):
-                self.read += 1
-                value = event(index)
-                if index == self.invalid_at:
-                    value.refined_point_ref = None
-                yield value
-        finally:
-            self.closed = True
+            for start in range(0,self.count,2):
+                size=min(2,self.count-start)
+                valid=np.ones(size,dtype=np.bool_)
+                if self.invalid_at is not None and start<=self.invalid_at<start+size:
+                    valid[self.invalid_at-start]=False
+                self.read+=size
+                yield turn_batch(size,start=start,refine_point_id_valid=valid)
+        finally: self.closed=True
 
 
 def result(events):
-    return SimpleNamespace(turn_events=events, hotspot_events=[
-        SimpleNamespace(event_calculate_index=1, g_star_z=2.5),
-    ])
+    return SimpleNamespace(turn_events=events,hotspot_events=turn_batch(1,start=1,
+        g_star_z=np.asarray([2.5]),g_star_z_valid=np.asarray([True])))
 
 
 def mapping(count):
-    return {writer._refine_key(event(index).refined_point_ref): 200 + index for index in range(count)}
+    return {('kept',100+index,1):200+index for index in range(count)}
 
 
 @pytest.mark.parametrize('batch_size', [1, 2, 3, 20])
@@ -104,7 +90,7 @@ def test_turn_failure_stops_reading_and_closes_event_iterator(monkeypatch, tmp_p
     copies = []
     refs = mapping(6)
     if failure == 'missing_mapping':
-        del refs[writer._refine_key(event(2).refined_point_ref)]
+        del refs[('kept',102,1)]
 
     def copy(cur, table, columns, rows, **kwargs):
         copies.extend(rows)
@@ -133,7 +119,7 @@ def test_turn_failure_stops_reading_and_closes_event_iterator(monkeypatch, tmp_p
     # Source validation now precedes any turn COPY. COPY itself must still stop
     # its row consumer at the first failed batch and close that consumer.
     assert len(copies) == (2 if failure == 'copy' else 0)
-    assert events.read == (3 if failure == 'missing_ref' else 6)
+    assert events.read == (4 if failure == 'missing_ref' else 6)
     if failure == 'copy':
         assert resolved_read == [2] and resolved_closed == [True]
     assert events.closed
@@ -196,7 +182,8 @@ def test_turn_relation_survives_sparse_mapping_scan_and_batched_write(monkeypatc
 
     def members(*args):
         for start in range(0, 5, 2):
-            yield [writer._RefineMember(event(i).refined_point_ref, 'v') for i in range(start, min(start + 2, 5))]
+            indices=np.arange(start,min(start+2,5),dtype=np.int64)
+            yield {'point_kind':np.full(len(indices),'kept'),'point_id':100+indices,'subtrack_index':np.ones(len(indices),dtype=np.int64),'refined_sequence':indices}
 
     def reserve(cur, table, count):
         values = tuple(range(next_id[0], next_id[0] + count))
@@ -212,19 +199,14 @@ def test_turn_relation_survives_sparse_mapping_scan_and_batched_write(monkeypatc
     monkeypatch.setattr(writer, '_copy_insert', copy)
     conn = SimpleNamespace(cursor=lambda: nullcontext(None))
     with TurnEventRelation(runtime_config(), tmp_path) as turns:
-        for i in [1, 3]:
-            value = event(i)
-            turns.append(TurnEvent(
-                event_calculate_index=len(turns), vehicle_id="v", timestamp=float(i),
-                lon=120.0, lat=30.0, x=float(i), y=float(i), entry_bearing=value.entry_bearing,
-                exit_bearing=value.exit_bearing, turn_deg=value.turn_deg, score=value.turn_deg,
-                refined_point_ref=value.refined_point_ref,
-            ))
+        turns.append_batch(turn_batch(2,calculation_index=np.asarray([0,1],dtype=np.int64),
+            point_index=np.asarray([1,3],dtype=np.int64),refine_point_id=np.asarray([101,103],dtype=np.int64),score=np.full(2,90.)))
         turns.seal()
         output = result(turns)
-        output.cross_track_candidates = []
+        from track.v2.models import CrossCandidateBatch
+        output.cross_track_candidates = _batch(CrossCandidateBatch,0)
         with WriterRelation(runtime_config(), tmp_path, "d", batch_size=2) as ws:
-            ws.collect_sources(output, [], (), {})
+            ws.collect_sources(output, [], {}, {})
             count = writer._persist_resolved_sequence(conn, 'd', 'r', output, [], [], {}, batch_size=2, workspace=ws)
             assert count == 5
             assert list(ws.iter_resolved_sources(0)) == [(0, 0, 201), (1, 0, 203)]
@@ -232,4 +214,4 @@ def test_turn_relation_survives_sparse_mapping_scan_and_batched_write(monkeypatc
             assert writer._insert_turn_events(conn, 'd', ws, batch_size=1) == 2
             assert [row[2] for row in copied] == [201, 203]
         # The writer closes only its iterator; ownership stays with the result.
-        assert [value.event_calculate_index for value in turns] == [0, 1]
+        assert np.concatenate([batch.calculation_index for batch in turns.iter_batches()]).tolist() == [0,1]

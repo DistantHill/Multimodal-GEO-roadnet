@@ -26,11 +26,11 @@ _MODULE_EXPORTS = {
     "road_network.build_road_network": ("build_network",),
     "models": (
         "Centerline", "CenterlineFitBundle", "RefineConfig", "ClipConfig",
-        "ClipEndpoint", "ClipInput", "ClipIntersection", "ClipPoint", "ClipReport",
+        "ClipInput", "ClipIntersection", "ClipReport",
         "ClipResult", "ClipTrack", "CsvSource", "FitIssue", "FitReport", "FitResult",
         "FittingConfig", "NetworkConfig", "NetworkEdge", "NetworkIssue", "NetworkNode",
-        "NetworkReport", "NetworkResult", "PointRef", "PostgresSource", "ProjectionConfig",
-        "ResolvedTrackPoint", "SpatialContext", "TrackClip", "TrajectoryPoint",
+        "NetworkReport", "NetworkResult", "PostgresSource", "ProjectionConfig",
+        "SpatialContext", "TrackClip", "SourceBatch", "RefinementSubtrack", "ExcludedBatch",
     ),
     "trajectories.read_source": ("get_database",),
     "projection": (

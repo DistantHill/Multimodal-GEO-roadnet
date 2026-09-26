@@ -18,7 +18,7 @@ from track.v2.centerlines.fit_centerlines import (
 )
 from track.v2.models import Centerline, ClipInput, ClipTrack, FittingConfig, RuntimeConfig
 from track.v2.projection import CoordinateTransformer
-from .test_clip import _CONTEXT, _point
+from .test_clip import _CONTEXT, _point, _track
 from .test_fitting_network import _clip, _clip_result, _TRANSFORMER
 
 _EPS = 1e-9
@@ -41,7 +41,7 @@ def fit_centerline_variants(*args, **kwargs):
 
 
 def test_streamed_clip_result_matches_memory_and_serializes(tmp_path):
-    tracks = tuple(ClipTrack("v", f"s{i}", (_point(i * 2, -10), _point(i * 2 + 1, 10)), i)
+    tracks = tuple(_track("v", f"s{i}", (_point(i * 2, -10), _point(i * 2 + 1, 10)), i)
                    for i in range(1, 4))
     run = SimpleNamespace(status="completed", refine_id="r", spatial_context=_CONTEXT)
     expected = extract_clips(ClipInput((), tracks, _CONTEXT, "detect"))
@@ -63,8 +63,8 @@ def test_streamed_clip_result_matches_memory_and_serializes(tmp_path):
         )
     try:
         assert actual.as_dict() == expected.as_dict()
-        assert tuple(actual.clips) == expected.clips
-        assert tuple(actual.clips) == expected.clips
+        assert [clip.as_dict() for clip in actual.clips] == [clip.as_dict() for clip in expected.clips]
+        assert [clip.as_dict() for clip in actual.clips] == [clip.as_dict() for clip in expected.clips]
     finally:
         actual.clips.close()
 
@@ -78,14 +78,14 @@ def test_streamed_pair_is_exact_reference_median(count, tmp_path):
     cfg = fitting_config()
     expected = _reference_fit_pair((1, 2), oriented, cfg, _TRANSFORMER)
     actual = _fit_pair_stream((1, 2), lambda: iter(oriented), count, cfg, _TRANSFORMER)
-    assert actual == expected
+    assert actual.as_dict() == expected.as_dict()
     result = _clip_result(*clips)
     from track.v2.clips.clip_input import ClipRelation
     with ClipRelation(runtime_config(), tmp_path) as sequence:
         for clip in clips:
             sequence.append(clip)
         sequence.seal()
-        assert fit_centerline_variants(replace(result, clips=sequence)) == fit_centerline_variants(result)
+        assert fit_centerline_variants(replace(result, clips=sequence)).as_dict() == fit_centerline_variants(result).as_dict()
 
 
 def test_pair_sampling_rejects_changed_count_and_uses_multiple_blocks(monkeypatch):
@@ -163,7 +163,7 @@ class ControlCursor:
 
 class Connection:
     def __init__(self, rows):
-        self.value = Cursor(rows)
+        self.value = Cursor([(*row, *_TRANSFORMER.forward(float(row[4]),float(row[5]))) if len(row) == 9 else row for row in rows])
         self.fraction = "0.37"
 
     def cursor(self, *, name=None):
@@ -194,14 +194,14 @@ def test_resolved_reader_streams_subtracks_inherits_leading_crossing_vehicle_and
             (4, 2, 1, "w", 1., 2., None, None, None)]
     conn = Connection(rows)
     with (
-        patch("track.v2.intersections.query_results.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s")),
+        patch("track.v2.intersections.query_results.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s", spatial_context=_CONTEXT)),
         patch("track.v2.intersections.query_results.validate_source_table", return_value=SimpleNamespace(quoted_table='"s"', key_sql_type="bigint")),
     ):
         stream = _reader(conn)
         first = next(stream)
         assert conn.fraction == "0.37"
         assert first.vehicle_id == "v"
-        assert [point.resolved_point_id for point in first.points] == [1, 2]
+        assert first.resolved_point_ids.tolist() == [1, 2]
         assert conn.value.consumed == 3
         stream.close()
     assert conn.value.closed
@@ -212,7 +212,7 @@ def test_resolved_reader_rejects_mixed_vehicles_instead_of_dropping_track():
     conn = Connection([(1, 1, 0, "v", 1., 2., None, None, None),
                        (2, 1, 1, "w", 1., 2., None, None, None)])
     with (
-        patch("track.v2.intersections.query_results.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s")),
+        patch("track.v2.intersections.query_results.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s", spatial_context=_CONTEXT)),
         patch("track.v2.intersections.query_results.validate_source_table", return_value=SimpleNamespace(quoted_table='"s"', key_sql_type="bigint")),
         pytest.raises(ValueError, match="multiple vehicles"),
     ):
@@ -240,10 +240,7 @@ def _reference_fit_pair(
     spaced_xy = _resample_at_spacing(fitted_xy, config.point_spacing_m)
     if len(spaced_xy) < 2:
         return None
-    points = tuple(
-        transformer.inverse(float(x), float(y))
-        for x, y in spaced_xy
-    )
+    points = transformer.inverse_many(spaced_xy)
     return Centerline(
         from_intersection_id=pair[0],
         to_intersection_id=pair[1],

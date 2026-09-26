@@ -4,33 +4,41 @@ from __future__ import annotations
 from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
 
 import inspect
+import numpy as np
 from pathlib import Path
 
 import pytest
 
 from track.v2.clips import clip_input as clip_relation
 from track.v2.clips.clip_input import ClipRelation
-from track.v2.models import ClipEndpoint, ClipPoint, RuntimeConfig, TrackClip
+from track.v2.models import RuntimeConfig, TrackClip
 
 
 def _clip(
     clip_id: str, start_id: int | None = 1, end_id: int | None = 2,
-    *, points: tuple[ClipPoint, ...] = (), ordinal: int = 0,
+    *, points: tuple[tuple, ...] = (), ordinal: int = 0,
 ) -> TrackClip:
+    lonlat = np.asarray([(1.,2.), *((p[1],p[2]) for p in points), (3.,4.)], dtype=np.float64)
     return TrackClip(
         clip_id=clip_id, vehicle_id=f"v-{clip_id}", trip_id="trip",
         clip_type="between_intersection" if start_id is not None else "full_track",
-        start=ClipEndpoint(
-            "exit" if start_id is not None else "boundary", 1.0, 2.0,
-            start_id, 10 if start_id is not None else None,
-        ),
-        end=ClipEndpoint(
-            "entry" if end_id is not None else "boundary", 3.0, 4.0,
-            end_id, 20 if end_id is not None else None,
-        ),
-        points=points, distance_m=42.5, point_count=len(points) + 2,
-        subtrack_index=3, clip_ordinal_in_track=ordinal,
+        start_kind="exit" if start_id is not None else "boundary",
+        end_kind="entry" if end_id is not None else "boundary",
+        start_intersection_id=start_id, end_intersection_id=end_id,
+        start_crossing_id=10 if start_id is not None else None,
+        end_crossing_id=20 if end_id is not None else None,
+        xy=lonlat.copy(), lonlat=lonlat, resolved_point_ids=np.asarray([p[0] for p in points], dtype=np.int64),
+        start_index=0, end_index=len(points)+1, interior_start=1, interior_end=len(points)+1,
+        distance_m=42.5, point_count=len(points)+2, subtrack_index=3, clip_ordinal_in_track=ordinal,
     )
+
+
+def _same(actual: TrackClip, expected: TrackClip) -> bool:
+    assert actual.as_dict() == expected.as_dict()
+    np.testing.assert_array_equal(actual.xy, expected.xy)
+    np.testing.assert_array_equal(actual.lonlat, expected.lonlat)
+    assert not actual.xy.flags.writeable
+    return True
 
 
 def _relation(tmp_path: Path, *, batch_size: int = 1) -> ClipRelation:
@@ -54,7 +62,7 @@ def test_empty_relation_seals_and_repeats(tmp_path):
 
 
 def test_lossless_lookup_repeat_and_batch_one(tmp_path):
-    points = (ClipPoint(7, 1.5, 2.5), ClipPoint(8, 2.5, 3.5))
+    points = ((7, 1.5, 2.5), (8, 2.5, 3.5))
     clips = (_clip("b", points=points), _clip("a", 2, 1, ordinal=1), _clip("edge", None, None))
     with _relation(tmp_path) as relation:
         for clip in clips:
@@ -62,13 +70,14 @@ def test_lossless_lookup_repeat_and_batch_one(tmp_path):
         with pytest.raises(RuntimeError, match="not sealed"):
             list(relation)
         relation.seal()
-        assert tuple(relation) == tuple(relation) == clips
-        assert relation[0] == relation[-3] == clips[0]
-        assert relation[-1] == clips[-1]
-        assert relation[1:] == clips[1:]
+        assert all(_same(a, b) for a,b in zip(relation, clips, strict=True))
+        assert all(_same(a, b) for a,b in zip(relation, clips, strict=True))
+        assert _same(relation[0], clips[0]) and _same(relation[-3], clips[0])
+        assert _same(relation[-1], clips[-1])
+        assert all(_same(a,b) for a,b in zip(relation[1:], clips[1:], strict=True))
         with pytest.raises(IndexError):
             _ = relation[3]
-        assert relation.get_by_clip_id("b") == clips[0]
+        assert _same(relation.get_by_clip_id("b"), clips[0])
         with pytest.raises(KeyError):
             relation.get_by_clip_id("missing")
 
@@ -93,12 +102,12 @@ def test_pair_filter_direction_order_and_count(tmp_path):
         lambda r: (r.append(_clip("duplicate")), r.append(_clip("duplicate"))),
         lambda r: (r.append(_clip("bad-count")), r._connection.execute(
             "UPDATE clips SET point_count=99")),
-        lambda r: (r.append(_clip("bad-ordinal", points=(ClipPoint(1, 1.0, 2.0),))),
+        lambda r: (r.append(_clip("bad-ordinal", points=((1, 1.0, 2.0),))),
                    r._connection.execute("UPDATE clip_points SET point_ordinal=2")),
         lambda r: (r.append(_clip("bad-float")), r._connection.execute(
             "UPDATE clips SET start_lon='NaN'::DOUBLE")),
         lambda r: (r.append(_clip("orphan")), r._connection.execute(
-            "INSERT INTO clip_points VALUES (99,0,1,1.0,2.0)")),
+            "INSERT INTO clip_points VALUES (99,0,1,1.0,2.0,1.0,2.0)")),
         lambda r: (r.append(_clip("bad-endpoint")), r._connection.execute(
             "UPDATE clips SET start_crossing_id=NULL")),
     ],
@@ -188,9 +197,9 @@ def test_runtime_limits_and_engine_temp_are_applied(tmp_path):
 def test_q44_relation_uses_only_duckdb_columnar_storage():
     source = inspect.getsource(clip_relation).lower()
     assert "duckdb.connect" in source
-    assert "left join clip_points" in inspect.getsource(ClipRelation._iterate).lower()
+    assert "fetchnumpy" in inspect.getsource(ClipRelation._iterate).lower()
     assert "execute(" not in inspect.getsource(ClipRelation._decode).lower()
     append_source = inspect.getsource(ClipRelation.append).lower()
-    assert "executemany" in append_source and "islice" in append_source
+    assert "unnest" in append_source and "executemany" not in append_source
     for forbidden in ("sqlite", "pickle", "temporarydirectory", "memmap"):
         assert forbidden not in source

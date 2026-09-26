@@ -29,18 +29,17 @@ def member(point_id, source_key, timestamp, injected_id=None):
             120.1, 30.2, 90.0, 10.0, [{"kind": "turn_event", "id": 9}])
 
 
-def test_intersection_reuses_pipeline_helper_and_preserves_injected_identity(monkeypatch):
-    from track.v2.validation import resolve_point_references
-
-    helper = Mock(wraps=resolve_point_references.replay_points)
-    monkeypatch.setattr(resolve_point_references, "replay_points", helper)
+def test_intersection_preserves_injected_namespace_identity_and_time_order():
     store = make_store([member(1, "7", 20), member(2, None, 10, injected_id=7)])
     result = store.replay(ReplayRequest(intersection_id=5))
-    helper.assert_called_once()
     store._verify_source_fingerprint.assert_not_called()
     assert [feature["id"] for feature in result["features"]] == [2, 1]
     assert all(feature["geometry"]["type"] == "Point" for feature in result["features"])
     assert result["features"][0]["properties"]["candidate_intersection_id"] == 42
+    assert result["features"][0]["properties"]["injected_point_id"] == 7
+    assert result["features"][0]["properties"]["source_row_key"] is None
+    assert result["features"][1]["properties"]["source_row_key"] == "7"
+    assert result["features"][1]["properties"]["injected_point_id"] is None
     sql, params = store._fetchall.call_args.args
     assert "FROM turn_events" in sql and "FROM tracks_cross" in sql
     assert "successor.refined_sequence_in_subtrack = start.refined_sequence_in_subtrack + 1" in sql

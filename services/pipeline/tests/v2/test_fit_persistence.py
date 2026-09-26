@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import unittest
+import numpy as np
+from track.v2.projection import CoordinateTransformer
 
 from track.v2 import fit_centerline_variants
 from track.v2.db.write_fitting_results import insert_centerline_bundle
 from track.v2.models import (
-    ClipEndpoint,
-    ClipPoint,
     ClipReport,
     ClipResult,
     SpatialContext,
@@ -102,25 +102,17 @@ class _Connection:
         self.rollback_count += 1
 
 
-def _point(resolved_point_id: int, lon: float) -> ClipPoint:
-    return ClipPoint(resolved_point_id, lon, 0.0)
-
-
 def _clip(clip_id: str, start_id: int, end_id: int, reverse: bool) -> TrackClip:
-    vehicle = f"vehicle-{clip_id}"
-    start_lon, end_lon = ((2.0, 0.0) if reverse else (0.0, 2.0))
+    start_lon, end_lon = ((2.,0.) if reverse else (0.,2.))
+    lonlat = np.asarray([(start_lon,0.), (1.,0.), (end_lon,0.)], dtype=np.float64)
     return TrackClip(
-        clip_id=clip_id,
-        vehicle_id=vehicle,
-        trip_id=f"trip-{clip_id}",
-        clip_type="between_intersection",
-        start=ClipEndpoint("exit", start_lon, 0.0, start_id, 1000 + start_id),
-        end=ClipEndpoint("entry", end_lon, 0.0, end_id, 1000 + end_id),
-        points=(_point(2000 + start_id, 1.0),),
-        distance_m=200.0,
-        point_count=3,
-        subtrack_index=3,
-        clip_ordinal_in_track=4,
+        clip_id=clip_id, vehicle_id=f"vehicle-{clip_id}", trip_id=f"trip-{clip_id}",
+        clip_type="between_intersection", xy=CoordinateTransformer(_SPATIAL_CONTEXT).forward_many(lonlat),
+        lonlat=lonlat, resolved_point_ids=np.asarray([2000+start_id], dtype=np.int64),
+        start_index=0,end_index=2,interior_start=1,interior_end=2,
+        start_kind="exit",end_kind="entry",start_intersection_id=start_id,end_intersection_id=end_id,
+        start_crossing_id=1000+start_id,end_crossing_id=1000+end_id,
+        distance_m=200.,point_count=3,subtrack_index=3,clip_ordinal_in_track=4,
     )
 
 

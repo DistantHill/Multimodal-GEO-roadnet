@@ -1,163 +1,37 @@
-"""Regression tests for the DB-mode shared spatial workspace."""
-
-from __future__ import annotations
-
-from .config_factory import intersect_config, intersect_run_config
-
+"""Array workspace capacity and spatial-window boundary regressions."""
 import math
 from unittest.mock import patch
-
+import numpy as np
 import pytest
-
-from track.v2._geometry import _to_lonlat
+from .config_factory import intersect_config
+from .detect_columns_helpers import TRANSFORMER, subtrack
 from track.v2.candidates.build_patches import CrossTrackCapacityError
 from track.v2.candidates.collect_candidates import extract_cross_track_candidates
 from track.v2.candidates.query_source_windows import SpatialWindowIterator
-from track.v2.intersections.detect_intersections import (
-    IntersectConfig,
-    _cross_track_candidate_key,
-    _extract_cross_track_memory_windows,
-    _extract_cross_track_windows,
-    _project_tracks,
-)
-from track.v2.models import PointRef, SpatialContext, TrajectoryPoint
-from track.v2.projection import CoordinateTransformer
 
 
-_SPATIAL_CONTEXT = SpatialContext(
-    source_srid=4326,
-    processing_srid=32650,
-    projection_config={
-        "coordinate_semantics_version": 2,
-        "enforce_area_of_use": True,
-        "max_scale_error": 0.01,
-    },
-)
-_TRANSFORMER = CoordinateTransformer(_SPATIAL_CONTEXT)
+def _crossing_tracks():
+    return {1: subtrack([[0, -300], [0, 300]], subtrack_index=1, vehicle_id="A", headings=[0, 0]),
+            2: subtrack([[-300, 0], [300, 0]], subtrack_index=2, vehicle_id="B", headings=[90, 90])}
 
 
-class _QuietStatus:
-    def update(self, **_kwargs: object) -> None:
-        pass
-
-
-def _point(
-    vehicle_id: str,
-    key: str,
-    timestamp: float,
-    lon: float,
-    lat: float,
-    heading: float,
-) -> TrajectoryPoint:
-    return TrajectoryPoint(
-        PointRef("source", key, stable=True),
-        vehicle_id,
-        timestamp,
-        lon,
-        lat,
-        heading,
-        10.0,
-    )
-
-
-def _crossing_tracks(
-    origin_lon: float = 116.0,
-    origin_lat: float = 39.0,
-) -> dict[str, list[TrajectoryPoint]]:
-    a0 = _to_lonlat(0.0, -300.0, origin_lon, origin_lat)
-    a1 = _to_lonlat(0.0, 300.0, origin_lon, origin_lat)
-    b0 = _to_lonlat(-300.0, 0.0, origin_lon, origin_lat)
-    b1 = _to_lonlat(300.0, 0.0, origin_lon, origin_lat)
-    tracks = {
-        "A": [
-            _point("A", "a0", 0.0, *a0, 0.0),
-            _point("A", "a1", 1.0, *a1, 0.0),
-        ],
-        "B": [
-            _point("B", "b0", 0.0, *b0, 90.0),
-            _point("B", "b1", 1.0, *b1, 90.0),
-        ],
-    }
-    return _project_tracks(tracks, _TRANSFORMER)
-
-
-def _projected_bounds(
-    lon_min: float,
-    lat_min: float,
-    lon_max: float,
-    lat_max: float,
-) -> tuple[float, float, float, float]:
-    corners = _TRANSFORMER.forward_many(
-        (
-            (lon_min, lat_min),
-            (lon_min, lat_max),
-            (lon_max, lat_min),
-            (lon_max, lat_max),
-        )
-    )
-    xs = [point[0] for point in corners]
-    ys = [point[1] for point in corners]
-    return min(xs), min(ys), max(xs), max(ys)
-
-
-def test_capacity_guard_runs_before_grid_allocation() -> None:
-    tracks = _crossing_tracks()
-    cfg = intersect_config(cross_track_max_grid_cells_per_segment=1)
-
-    with patch(
-        "track.v2.candidates.build_patches._build_grid",
-        side_effect=AssertionError("grid must not be allocated"),
-    ):
+def test_capacity_guard_runs_before_grid_allocation():
+    with patch("track.v2.candidates.build_patches._build_grid", side_effect=AssertionError("grid must not be allocated")):
         with pytest.raises(CrossTrackCapacityError, match="overflow fallback"):
-            extract_cross_track_candidates(
-                tracks,
-                _TRANSFORMER,
-                cfg,
-                max_overflow_pair_space=1,
-            )
+            extract_cross_track_candidates(_crossing_tracks(), TRANSFORMER,
+                intersect_config(cross_track_max_grid_cells_per_segment=1), max_overflow_pair_space=1)
 
 
-def test_memory_windows_match_legacy_window_queries() -> None:
-    origin_lon, origin_lat = 116.0, 39.0
-    tracks = _crossing_tracks(origin_lon, origin_lat)
-    all_points = [point for track in tracks.values() for point in track]
-    all_points.sort(key=lambda point: (point.vehicle_id, point.timestamp))
-    extent = _projected_bounds(115.98, 38.98, 116.02, 39.02)
-    cfg = intersect_run_config(
-        spatial_window_size=(1_000.0, 1_000.0),
-        spatial_window_overlap=0.15,
-    )
-
-    def query(_conn: object, window: object, **_kwargs: object) -> list[TrajectoryPoint]:
-        return [
-            point
-            for point in all_points
-            if point.x is not None
-            and point.y is not None
-            and window.x_min <= point.x <= window.x_max
-            and window.y_min <= point.y <= window.y_max
-        ]
-
-    with patch("track.v2.intersections.detect_intersections._query_active_points_in_window", side_effect=query):
-        legacy = _extract_cross_track_windows(
-            object(),
-            cfg,
-            extent,
-            _SPATIAL_CONTEXT,
-            _TRANSFORMER,
-            live_status=_QuietStatus(),
-        )
-    memory = _extract_cross_track_memory_windows(
-        tracks,
-        cfg,
-        extent,
-        _TRANSFORMER,
-        live_status=_QuietStatus(),
-    )
-
-    assert [_cross_track_candidate_key(item) for item in memory] == [
-        _cross_track_candidate_key(item) for item in legacy
-    ]
+def test_memory_workspace_emits_one_crossing_with_run_partition_identity():
+    candidates, eligible, scheduled = extract_cross_track_candidates(_crossing_tracks(), TRANSFORMER, intersect_config())
+    assert eligible == scheduled == 1
+    assert len(candidates) == 1
+    assert candidates.from_subtrack_index.tolist() == [1]
+    assert candidates.to_subtrack_index.tolist() == [2]
+    assert candidates.from_vehicle_id.tolist() == ["A"]
+    assert candidates.to_vehicle_id.tolist() == ["B"]
+    np.testing.assert_array_equal(candidates.xy, [[0, 0]])
+    assert candidates.calculation_index.tolist() == [0]
 
 
 def test_window_shape_exact_multiple_has_no_phantom_column() -> None:
