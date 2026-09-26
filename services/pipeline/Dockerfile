@@ -26,9 +26,23 @@ RUN detected_arch="$(dpkg --print-architecture)" \
 FROM python:3.12-slim
 
 # Rasterio's bundled GDAL links against libexpat on the slim runtime image.
+USER root
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends libexpat1 \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates curl gzip libexpat1 tar \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Codex into the image so it is available without installing it at runtime.
+RUN curl -fsSL https://chatgpt.com/codex/install.sh \
+        -o /tmp/install-codex.sh \
+    && sed -i 's/RELEASES_ASSET_TIMEOUT=300/RELEASES_ASSET_TIMEOUT=900/' /tmp/install-codex.sh \
+    && CODEX_INSTALL_DIR=/usr/local/bin \
+       CODEX_HOME=/opt/codex \
+       CODEX_NON_INTERACTIVE=1 \
+       sh /tmp/install-codex.sh \
+    && chmod -R a+rX /opt/codex \
+    && rm -f /tmp/install-codex.sh \
+    && /usr/local/bin/codex --version
 
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
