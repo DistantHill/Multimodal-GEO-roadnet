@@ -216,8 +216,10 @@ def test_intersection_layer_uses_complete_detect_and_contributor_fields() -> Non
     layer_sql, params = connection.executions[2]
     assert "candidate.contributors" in layer_sql
     assert "ST_MakeEnvelope(%s, %s, %s, %s, 4326)" in layer_sql
+    assert "ST_Intersects(intersection.geom," in layer_sql
     assert "120.0" not in layer_sql
-    assert params == ("detect-latest", 120.0, 30.0, 121.0, 31.0, 101)
+    assert params == ("detect-latest", 120.0, 30.0, 121.0, 31.0,
+                      120.0, 30.0, 121.0, 31.0, 101, 0)
 
 
 def test_resolved_layer_exposes_both_identity_names_without_vehicle_storage() -> None:
@@ -276,7 +278,7 @@ def test_centerline_layer_resolves_latest_completed_fit() -> None:
 
     assert result["metadata"]["fit_id"] == "fit-latest"
     assert result["metadata"]["detect_id"] == "detect-owner"
-    assert connection.executions[1][1] == ("fit-latest", 6)
+    assert connection.executions[1][1] == ("fit-latest", 6, 0)
 
 
 def test_resolved_replay_reports_missing_ids_and_returns_full_track() -> None:

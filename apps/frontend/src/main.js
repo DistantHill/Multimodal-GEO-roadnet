@@ -1,5 +1,6 @@
 import OlMap from 'ol/Map.js';
 import { selectFeaturesInExtent, replayFocusFeatures } from './selection.js';
+import { planViewTiles, TileLayerLoader } from './map-tiles.js';
 import View from 'ol/View.js';
 import GeoJSON from 'ol/format/GeoJSON.js';
 import DragBox from 'ol/interaction/DragBox.js';
@@ -22,7 +23,6 @@ import {
   listMapLayers,
   listDatabases,
   listRuns,
-  loadMapLayer,
   requestClip,
   requestReplay,
 } from './map-api.js';
@@ -176,7 +176,7 @@ app.innerHTML = `
               <span class="action-card__icon">${icon('play', 20)}</span>
               <span class="action-card__copy">
                 <strong>Replay</strong>
-                <small id="replay-hint">选择轨迹点或框选范围</small>
+                <small id="replay-hint">选择轨迹点或一个以上交叉口</small>
               </span>
               <span class="action-card__arrow">→</span>
             </button>
@@ -246,6 +246,7 @@ const dom = {
 };
 
 const geoJson = new GeoJSON();
+const tileLoader = new TileLayerLoader();
 const view = new View({
   center: fromLonLat([104, 35]),
   zoom: 4.3,
@@ -309,6 +310,8 @@ const state = {
   busy: false,
   context: { detectId: null, fitId: null },
   layerAbortController: null,
+  viewportAbortController: null,
+  viewportTimer: null,
   layerRecords: new Map(),
   lastResult: null,
   selectionBbox: null,
@@ -499,7 +502,10 @@ function createLayerRecord(descriptor) {
       selectable: descriptor.selectable,
     },
   });
-  const record = { descriptor: { ...descriptor, role }, featureCount: 0, layer, source, status: 'loading' };
+  const record = {
+    descriptor: { ...descriptor, role }, featureCount: 0, layer, source,
+    status: 'loading', tileLoader,
+  };
   state.layerRecords.set(descriptor.id, record);
   map.getLayers().insertAt(Math.max(1, map.getLayers().getLength() - 1), layer);
   return record;
@@ -507,6 +513,9 @@ function createLayerRecord(descriptor) {
 
 async function loadLayers() {
   state.layerAbortController?.abort();
+  state.viewportAbortController?.abort();
+  clearTimeout(state.viewportTimer);
+  tileLoader.clear();
   state.layerAbortController = new AbortController();
   const { signal } = state.layerAbortController;
   const databaseName = state.databaseName;
@@ -524,6 +533,7 @@ async function loadLayers() {
       setServiceState('warning', '所选 Refine 暂无已完成 Detect');
       setStatus('请选择具有已完成 Detect 的 Refine ID');
       dom.mapNotice.hidden = false;
+      setMapLoading(false);
       return;
     }
     const catalog = await listMapLayers({ signal, databaseName });
@@ -534,6 +544,7 @@ async function loadLayers() {
       setServiceState('warning', '服务在线 · 无可用图层');
       setStatus('地图服务未返回业务图层');
       dom.mapNotice.hidden = false;
+      setMapLoading(false);
       return;
     }
 
@@ -543,85 +554,117 @@ async function loadLayers() {
     state.activeLayerId = preferred?.id || null;
     renderLayerTree();
 
-    const results = await Promise.allSettled(
-      catalog.layers.map(async (descriptor) => {
-        const requiredContext = descriptor.required_context || descriptor.requiredContext || [];
-        if (requiredContext.includes('fit_id') && !state.context.fitId) {
-          const record = state.layerRecords.get(descriptor.id);
-          record.status = 'ready';
-          record.featureCount = 0;
-          return;
-        }
-        const result = await loadMapLayer(descriptor.id, {
-          databaseName,
-          refineId: state.refineId,
-          detectId: state.context.detectId,
-          fitId: requiredContext.includes('fit_id') ? state.context.fitId : undefined,
-          signal,
-        });
-        if (signal.aborted) return;
-        const record = state.layerRecords.get(descriptor.id);
-        if (!record) return;
-
-        updateContext(result.metadata);
-        const features = geoJson.readFeatures(result.featureCollection, {
-          dataProjection: 'EPSG:4326',
-          featureProjection: 'EPSG:3857',
-        });
-        features.forEach((feature) => decorateFeature(feature, descriptor, result.metadata));
-        record.source.addFeatures(features);
-        record.featureCount = features.length;
-        record.status = 'ready';
-        record.metadata = result.metadata;
-        renderLayerTree();
-        updateFeatureTotal();
-      }),
-    );
-
-    if (signal.aborted) return;
-    const failed = results.filter((result) => result.status === 'rejected');
-    const loadedFeatures = getBusinessFeatureCount();
-    if (failed.length === results.length) throw failed[0].reason;
-
-    const bestActiveLayer = catalog.layers.find((descriptor) => {
-      const record = state.layerRecords.get(descriptor.id);
-      return descriptor.selectable && record?.status === 'ready' && record.featureCount > 0;
-    });
-    if (bestActiveLayer && state.layerRecords.get(state.activeLayerId)?.featureCount === 0) {
-      state.activeLayerId = bestActiveLayer.id;
-    }
-
-    if (failed.length) {
-      catalog.layers.forEach((descriptor, index) => {
-        if (results[index].status === 'rejected') {
-          const record = state.layerRecords.get(descriptor.id);
-          if (record) record.status = 'error';
-        }
-      });
-      showToast(`${failed.length} 个图层加载失败，其余图层仍可使用。`, 'warning');
-      setServiceState('warning', `服务在线 · ${failed.length} 个图层异常`);
-    } else {
-      setServiceState('online', '地图服务已连接');
-    }
-
-    renderLayerTree();
-    updateFeatureTotal();
-    if (loadedFeatures > 0) {
-      fitToData({ animate: false });
-      setStatus(`已加载 ${loadedFeatures.toLocaleString('zh-CN')} 个要素`);
-    } else {
-      dom.mapNotice.hidden = false;
-      setStatus('图层已连接，但当前上下文没有要素');
-    }
+    await loadViewportLayers();
   } catch (error) {
-    if (error.name === 'AbortError') return;
+    if (signal.aborted || error.name === 'AbortError') return;
     setServiceState('offline', '地图服务不可用');
+    setMapLoading(false);
     setStatus(error.message || '地图数据加载失败', true);
     dom.mapNotice.hidden = false;
     showToast(error.message || '地图数据加载失败', 'error');
-  } finally {
-    if (!signal.aborted) setMapLoading(false);
   }
+}
+
+function applyViewportResult(record, result) {
+  const otherFeatures = Array.from(state.layerRecords.values()).reduce((count, item) =>
+    item.tileLoader && item !== record ? count + item.featureCount : count, 0);
+  if (otherFeatures + result.featureCollection.features.length > 100_000) {
+    throw new Error('当前视口业务图层合计超过 100,000 个要素的内存上限；请放大地图后重试。');
+  }
+  const previous = new Map(record.source.getFeatures().map((feature) => [String(feature.getId()), feature]));
+  const features = geoJson.readFeatures(result.featureCollection, {
+    dataProjection: 'EPSG:4326', featureProjection: 'EPSG:3857',
+  }).map((feature) => {
+    decorateFeature(feature, record.descriptor, result.metadata);
+    return previous.get(String(feature.getId())) || feature;
+  });
+  record.source.clear();
+  record.source.addFeatures(features);
+  record.featureCount = features.length;
+  record.metadata = result.metadata;
+  renderLayerTree();
+  updateFeatureTotal();
+}
+
+async function loadViewportLayers() {
+  state.viewportAbortController?.abort();
+  const controller = new AbortController();
+  state.viewportAbortController = controller;
+  const { signal } = controller;
+  const records = Array.from(state.layerRecords.values()).filter((record) => record.tileLoader);
+  if (!records.length || !state.context.detectId) return;
+  const size = map.getSize();
+  if (!size || size[0] <= 0 || size[1] <= 0) {
+    setMapLoading(false);
+    return;
+  }
+  const extent = view.calculateExtent(size);
+  const plan = planViewTiles(extent, view.getZoom() || 0);
+  clearSelection();
+  records.forEach((record) => {
+    record.source.clear();
+    record.featureCount = 0;
+    record.metadata = null;
+    record.error = null;
+    record.status = record.layer.getVisible() ? 'loading' : 'hidden';
+  });
+  if (!plan.tiles.length) {
+    records.forEach((record) => { record.status = 'zoom'; record.error = plan.reason; });
+    setMapLoading(false);
+    setServiceState('online', '地图服务已连接 · 区域加载');
+    setStatus(plan.reason || '请放大到缩放级别 12 以上加载业务图层');
+    dom.mapNotice.hidden = true;
+    renderLayerTree();
+    updateFeatureTotal();
+    return;
+  }
+  setMapLoading(true);
+  dom.mapNotice.hidden = true;
+  setStatus(`正在加载当前视口的 ${plan.tiles.length} 个 tile…`);
+  renderLayerTree();
+  const context = {
+    databaseName: state.databaseName, refineId: state.refineId,
+    detectId: state.context.detectId, fitId: state.context.fitId,
+  };
+  const results = await Promise.allSettled(records.map(async (record) => {
+    if (!record.layer.getVisible()) return;
+    const required = record.descriptor.required_context || record.descriptor.requiredContext || [];
+    if (required.includes('fit_id') && !context.fitId) { record.status = 'ready'; return; }
+    try {
+      const result = await record.tileLoader.load(plan, {
+        ...context, layerId: record.descriptor.id,
+      }, {
+        signal,
+        onProgress: (partial) => {
+          if (!signal.aborted) applyViewportResult(record, partial);
+        },
+      });
+      if (signal.aborted) return;
+      record.status = 'ready';
+      applyViewportResult(record, result);
+    } catch (error) {
+      if (signal.aborted) return;
+      record.status = 'error';
+      record.error = error.message;
+      throw error;
+    }
+  }));
+  if (signal.aborted) return;
+  const failed = results.filter((result) => result.status === 'rejected');
+  setMapLoading(false);
+  renderLayerTree();
+  updateFeatureTotal();
+  setServiceState(failed.length ? 'warning' : 'online', failed.length
+    ? `区域加载 · ${failed.length} 个图层异常` : '地图服务已连接 · 区域加载');
+  setStatus(failed.length
+    ? `区域加载失败：${failed[0].reason.message}；点击刷新重试`
+    : `当前视口 tile 已加载 ${getBusinessFeatureCount().toLocaleString('zh-CN')} 个要素（非全库总数）`, !!failed.length);
+}
+
+function scheduleViewportLoad() {
+  state.viewportAbortController?.abort();
+  clearTimeout(state.viewportTimer);
+  state.viewportTimer = setTimeout(() => loadViewportLayers(), 180);
 }
 
 function removeBusinessLayers() {
@@ -673,9 +716,18 @@ function renderLayerTree() {
 function layerSubtitle(record) {
   if (record.descriptor.id === 'osm') return 'XYZ 瓦片底图';
   if (record.descriptor.id === 'tmp') return '内存临时结果';
-  if (record.status === 'loading') return '正在读取 GeoJSON…';
-  if (record.status === 'error') return '图层加载失败';
+  if (record.status === 'zoom') return escapeHtml(record.error || '请放大至 zoom 12');
+  if (record.status === 'hidden') return '已隐藏 · 暂停区域加载';
+  if (record.status === 'loading') {
+    const pages = (record.metadata?.loaded_page_count || 0) + (record.metadata?.pending_page_count || 0);
+    return `区域加载中 · tile ${record.metadata?.loaded_tile_count || 0}/${record.metadata?.tile_count || '…'} · 已读 ${pages} 页`;
+  }
+  if (record.status === 'error') return `区域加载失败 · ${escapeHtml(record.error || '点击刷新重试')}`;
   const geometry = record.descriptor.geometryType || inferRole(record.descriptor);
+  if (record.metadata?.tile_count) {
+    const count = record.featureCount.toLocaleString('zh-CN');
+    return `${geometry} · 当前视口 tile ${count} 个 · 非全库总数`;
+  }
   return `${geometry} · EPSG:4326`;
 }
 
@@ -702,6 +754,7 @@ function setLayerVisibility(layerId, visible) {
   if (!record) return;
   record.layer.setVisible(visible);
   if (!visible && state.activeLayerId === layerId) clearSelection();
+  if (record.tileLoader) scheduleViewportLoad();
   renderLayerTree();
 }
 
@@ -811,10 +864,16 @@ function updateActionState() {
       .map((feature) => firstValue(feature.get('_detectId'), state.context.detectId))
       .filter(isPresent),
   );
-  const intersectionReady = features.length === 1 && features[0].get('_layerRole') === 'intersection'
-    && isPresent(features[0].get('_intersectionId'));
+  const intersections = features.filter((feature) => feature.get('_layerRole') === 'intersection');
+  const intersectionIds = intersections.map((feature) => feature.get('_intersectionId')).filter(isPresent);
+  const detectIds = unique(
+    intersections.map((feature) => firstValue(feature.get('_detectId'), state.context.detectId)).filter(isPresent),
+  );
+  const intersectionReady = features.length > 0 && intersections.length === features.length
+    && unique(intersectionIds).length === features.length && detectIds.length === 1;
   const replayReady = !state.busy && (
     intersectionReady || (
+      intersections.length === 0 &&
       replayKeys.length > 0 &&
       replayKeys.length <= 1_000 &&
       (!allResolved || replayDetectIds.length === 1)
@@ -825,7 +884,13 @@ function updateActionState() {
   if (state.busy) {
     dom.replayHint.textContent = '正在处理请求…';
   } else if (intersectionReady) {
-    dom.replayHint.textContent = '按 intersection.id 回放交叉口构成点';
+    dom.replayHint.textContent = `回放 ${intersectionIds.length} 个交叉口构成点`;
+  } else if (intersections.length) {
+    dom.replayHint.textContent = intersections.length !== features.length
+      ? 'Replay 不支持混选交叉口与轨迹点'
+      : unique(intersectionIds).length !== features.length
+      ? '交叉口必须具有有效且互不重复的 intersection_id'
+      : '所选交叉口必须属于同一 Detect Run';
   } else if (replayKeys.length) {
     dom.replayHint.textContent = allResolved && replayDetectIds.length !== 1
       ? 'resolved point 必须属于同一 Detect Run'
@@ -836,26 +901,21 @@ function updateActionState() {
     dom.replayHint.textContent =
       '所选要素缺少统一的 source_row_key 或 resolved_point_id';
   } else {
-    dom.replayHint.textContent = '选择已加载的点或一个交叉口（按 ID 回放）';
+    dom.replayHint.textContent = '选择已加载的点或一个以上交叉口';
   }
 
-  const intersections = features.filter((feature) => feature.get('_layerRole') === 'intersection');
-  const intersectionIds = intersections.map((feature) => feature.get('_intersectionId')).filter(isPresent);
-  const detectIds = unique(
-    intersections.map((feature) => firstValue(feature.get('_detectId'), state.context.detectId)).filter(isPresent),
-  );
   const clipReady =
     !state.busy &&
     features.length === 2 &&
     intersections.length === 2 &&
-    intersectionIds.length === 2 &&
+    unique(intersectionIds).length === 2 &&
     detectIds.length === 1;
   dom.clipAction.disabled = !clipReady;
 
   if (state.busy) dom.clipHint.textContent = '正在处理请求…';
   else if (features.length !== 2) dom.clipHint.textContent = `需要恰好两个交叉口 · 当前 ${intersections.length}`;
   else if (intersections.length !== 2) dom.clipHint.textContent = '所选要素必须都是交叉口';
-  else if (intersectionIds.length !== 2) dom.clipHint.textContent = '交叉口缺少 intersection_id';
+  else if (unique(intersectionIds).length !== 2) dom.clipHint.textContent = '需要两个具有不同 intersection_id 的交叉口';
   else if (detectIds.length !== 1) dom.clipHint.textContent = '两个交叉口不属于同一 detect';
   else dom.clipHint.textContent = `Detect ${detectIds[0]} · 已就绪`;
 }
@@ -877,8 +937,9 @@ function unique(values) {
 async function runReplay() {
   if (dom.replayAction.disabled) return;
   const features = selectedFeatures.getFeatures().getArray();
-  const intersectionId = features.length === 1 && features[0].get('_layerRole') === 'intersection'
-    ? features[0].get('_intersectionId') : undefined;
+  const intersectionIds = features.length > 0 && features.every(
+    (feature) => feature.get('_layerRole') === 'intersection',
+  ) ? features.map((feature) => feature.get('_intersectionId')) : undefined;
   const resolvedPointIds = unique(
     features.map((feature) => feature.get('_resolvedPointId')).filter(isPresent),
   );
@@ -892,7 +953,7 @@ async function runReplay() {
     (feature) => isPresent(feature.get('_sourceRowKey')),
   );
   const detectIds = unique(
-    features.map((feature) => feature.get('_detectId')).filter(isPresent),
+    features.map((feature) => firstValue(feature.get('_detectId'), state.context.detectId)).filter(isPresent),
   );
   const activeMetadata = state.layerRecords.get(state.activeLayerId)?.metadata || {};
   const detectId = detectIds.length === 1
@@ -902,9 +963,9 @@ async function runReplay() {
   await runAnalysis('Replay', (signal) => requestReplay({
     databaseName: state.databaseName,
     detectId,
-    intersectionId,
-    resolvedPointIds: intersectionId !== undefined || !allResolved ? undefined : resolvedPointIds,
-    sourceRowKeys: intersectionId !== undefined || allResolved || !allSource ? undefined : sourceRowKeys,
+    intersectionIds,
+    resolvedPointIds: intersectionIds !== undefined || !allResolved ? undefined : resolvedPointIds,
+    sourceRowKeys: intersectionIds !== undefined || allResolved || !allSource ? undefined : sourceRowKeys,
   }, { signal }));
 }
 
@@ -919,8 +980,9 @@ async function runClip() {
 
 async function runAnalysis(name, request) {
   state.analysisAbortController?.abort();
-  state.analysisAbortController = new AbortController();
-  const { signal } = state.analysisAbortController;
+  const controller = new AbortController();
+  state.analysisAbortController = controller;
+  const { signal } = controller;
   state.busy = true;
   updateActionState();
   setStatus(`${name} 请求处理中…`);
@@ -932,13 +994,15 @@ async function runAnalysis(name, request) {
     updateContext(result.metadata);
     drawResult(name, result.featureCollection, result.metadata);
   } catch (error) {
-    if (error.name === 'AbortError') return;
+    if (signal.aborted || error.name === 'AbortError') return;
     setStatus(`${name} 失败：${error.message}`, true);
     showToast(`${name} 失败：${error.message}`, 'error');
   } finally {
-    state.busy = false;
-    dom.analysisFootnote.innerHTML = '结果仅绘制到 <b>tmp</b> 图层，不写入数据库。';
-    updateActionState();
+    if (state.analysisAbortController === controller) {
+      state.busy = false;
+      dom.analysisFootnote.innerHTML = '结果仅绘制到 <b>tmp</b> 图层，不写入数据库。';
+      updateActionState();
+    }
   }
 }
 
@@ -1120,6 +1184,10 @@ map.getViewport().addEventListener('mouseleave', () => {
 });
 view.on('change:resolution', updateMapStatus);
 view.on('change:center', updateMapStatus);
+view.on('change:resolution', scheduleViewportLoad);
+view.on('change:center', scheduleViewportLoad);
+map.on('moveend', scheduleViewportLoad);
+map.on('change:size', scheduleViewportLoad);
 
 window.addEventListener('keydown', (event) => {
   if (event.target.matches('input, textarea, select')) return;
@@ -1198,6 +1266,9 @@ dom.fitId.addEventListener('change', () => {
 async function refreshRuns() {
   state.runsAbortController?.abort();
   state.layerAbortController?.abort();
+  state.viewportAbortController?.abort();
+  clearTimeout(state.viewportTimer);
+  tileLoader.clear();
   state.analysisAbortController?.abort();
   clearSelection();
   clearResult();

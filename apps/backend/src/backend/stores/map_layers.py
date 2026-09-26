@@ -110,10 +110,11 @@ class PostgresMapStore:
         detect_id: str | None,
         fit_id: str | None,
         limit: int,
+        offset: int = 0,
     ) -> dict[str, Any]:
         if layer_id == "resolved_subtrack_points":
             context = self._resolve_detect(detect_id)
-            rows = self._resolved_point_layer(context, bbox, limit + 1)
+            rows = self._resolved_point_layer(context, bbox, limit + 1, offset)
             features = [
                 self._resolved_point_feature(row, context.detect_id)
                 for row in rows[:limit]
@@ -121,7 +122,7 @@ class PostgresMapStore:
             metadata = {"detect_id": context.detect_id, "refine_id": context.refine.refine_id}
         elif layer_id == "intersections":
             context = self._resolve_detect(detect_id)
-            rows = self._intersection_layer(context.detect_id, bbox, limit + 1)
+            rows = self._intersection_layer(context.detect_id, bbox, limit + 1, offset)
             features = [
                 self._intersection_feature(row, context.detect_id)
                 for row in rows[:limit]
@@ -129,7 +130,7 @@ class PostgresMapStore:
             metadata = {"detect_id": context.detect_id, "refine_id": context.refine.refine_id}
         elif layer_id == "entry_exit_points":
             context = self._resolve_detect(detect_id)
-            rows = self._entry_exit_layer(context.detect_id, bbox, limit + 1)
+            rows = self._entry_exit_layer(context.detect_id, bbox, limit + 1, offset)
             features = [
                 self._entry_exit_feature(row, context.detect_id)
                 for row in rows[:limit]
@@ -141,16 +142,19 @@ class PostgresMapStore:
                 raise MapNotFoundError(
                     f"completed Fit Run {resolved_fit_id} does not belong to Detect Run {detect_id}"
                 )
-            rows = self._centerline_layer(resolved_fit_id, bbox, limit + 1)
+            rows = self._centerline_layer(resolved_fit_id, bbox, limit + 1, offset)
             features = [self._centerline_feature(row) for row in rows[:limit]]
             metadata = {"fit_id": resolved_fit_id, "detect_id": resolved_detect_id}
         else:
             raise MapNotFoundError(f"unknown map layer: {layer_id}")
+        has_more = len(rows) > limit
         return create_map_feature_collection(
             features,
             layer=layer_id,
             count=len(features),
-            truncated=len(rows) > limit,
+            truncated=has_more,
+            has_more=has_more,
+            next_cursor=offset + len(features) if has_more else None,
             bbox=list(bbox) if bbox is not None else None,
             **metadata,
         )
@@ -164,6 +168,10 @@ class PostgresMapStore:
             from ..replay.select_intersection_members import replay_intersection
 
             return replay_intersection(self, request)
+        if request.intersection_ids is not None:
+            from ..replay.select_intersection_members import replay_intersections
+
+            return replay_intersections(self, request)
         detect = (
             self._resolve_detect(str(request.detect_id))
             if request.detect_id is not None
@@ -473,20 +481,137 @@ class PostgresMapStore:
         context: _DetectContext,
         bbox: BBox | None,
         limit: int,
+        offset: int = 0,
     ) -> list[Any]:
+        if bbox is not None:
+            return self._resolved_point_layer_in_bbox(context, bbox, limit, offset)
+
         base = self._resolved_base_sql(context.refine)
-        bbox_clause, bbox_params = _bbox_clause("resolved.geom", bbox)
         return self._fetchall(
             base
             + " SELECT subtrack_index, vehicle_id, resolved_point_id, source_row_key, "
             "point_kind, crossing_id, intersection_id, crossing_type, "
             "ST_AsGeoJSON(geom)::jsonb FROM resolved WHERE detect_id = %s"
-            + bbox_clause
-            + " ORDER BY subtrack_index, sequence_in_subtrack LIMIT %s",
-            (context.detect_id, context.detect_id, *bbox_params, limit),
+            + " ORDER BY subtrack_index, sequence_in_subtrack, resolved_point_id LIMIT %s OFFSET %s",
+            (context.detect_id, context.detect_id, limit, offset),
         )
 
-    def _intersection_layer(self, detect_id: str, bbox: BBox | None, limit: int) -> list[Any]:
+    def _resolved_point_layer_in_bbox(
+        self,
+        context: _DetectContext,
+        bbox: BBox,
+        limit: int,
+        offset: int,
+    ) -> list[Any]:
+        """Read only resolved points whose persisted source geometry intersects bbox.
+
+        Kept points get their geometry from the Refine source table, while injected
+        points and crossings have their own stored geometry. Spatial candidate CTEs
+        use those source geometries' GiST indexes before looking up resolved IDs.
+        Vehicle IDs are then aggregated only for subtracks represented in the bbox.
+        """
+        sql = f"""
+            WITH tile AS (
+                SELECT ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS geom
+            ), spatial_points AS MATERIALIZED (
+                SELECT point.id AS resolved_point_id, point.subtrack_index
+                  FROM {context.refine.quoted_source_table} AS source
+                  JOIN kept_trajectory_points AS kept
+                    ON source.id = kept.source_row_key::{context.refine.source_key_sql_type}
+                  JOIN resolved_subtrack_points AS point
+                    ON point.detect_id = %s AND point.kept_point_id = kept.id
+                  CROSS JOIN tile
+                 WHERE kept.refine_id = %s
+                   AND source.geom && tile.geom
+                   AND ST_Intersects(source.geom, tile.geom)
+                UNION ALL
+                SELECT point.id AS resolved_point_id, point.subtrack_index
+                  FROM injected_points AS injected
+                  JOIN resolved_subtrack_points AS point
+                    ON point.detect_id = %s AND point.injected_point_id = injected.id
+                  CROSS JOIN tile
+                 WHERE injected.refine_id = %s
+                   AND injected.geom && tile.geom
+                   AND ST_Intersects(injected.geom, tile.geom)
+                UNION ALL
+                SELECT point.id AS resolved_point_id, point.subtrack_index
+                  FROM candidate_entry_exit_points AS crossing
+                  JOIN resolved_subtrack_points AS point
+                    ON point.detect_id = %s AND point.crossing_point_id = crossing.id
+                  CROSS JOIN tile
+                 WHERE crossing.detect_id = %s
+                   AND crossing.geom && tile.geom
+                   AND ST_Intersects(crossing.geom, tile.geom)
+            ), candidate_subtracks AS MATERIALIZED (
+                SELECT DISTINCT subtrack_index FROM spatial_points
+            ), subtrack_vehicle AS (
+                SELECT member.subtrack_index,
+                       MIN(COALESCE(kept.vehicle_id, injected.vehicle_id)) AS vehicle_id
+                  FROM candidate_subtracks AS selected
+                  JOIN resolved_subtrack_points AS member
+                    ON member.detect_id = %s
+                   AND member.subtrack_index = selected.subtrack_index
+                  LEFT JOIN kept_trajectory_points AS kept
+                    ON kept.id = member.kept_point_id
+                  LEFT JOIN injected_points AS injected
+                    ON injected.id = member.injected_point_id
+                 GROUP BY member.subtrack_index
+            ), resolved AS (
+                SELECT point.detect_id, point.subtrack_index,
+                       point.sequence_in_subtrack, vehicle.vehicle_id,
+                       point.id AS resolved_point_id, kept.source_row_key,
+                       COALESCE(source.lon, injected.lon, crossing.crossing_lon) AS lon,
+                       COALESCE(source.lat, injected.lat, crossing.crossing_lat) AS lat,
+                       COALESCE(source.geom, injected.geom, crossing.geom) AS geom,
+                       CASE WHEN point.kept_point_id IS NOT NULL THEN 'kept'
+                            WHEN point.injected_point_id IS NOT NULL THEN 'injected'
+                            ELSE 'crossing' END AS point_kind,
+                       crossing.id AS crossing_id,
+                       intersection.id AS intersection_id,
+                       crossing.crossing_type
+                  FROM spatial_points AS selected
+                  JOIN resolved_subtrack_points AS point
+                    ON point.id = selected.resolved_point_id AND point.detect_id = %s
+                  JOIN subtrack_vehicle AS vehicle
+                    ON vehicle.subtrack_index = point.subtrack_index
+                  LEFT JOIN kept_trajectory_points AS kept
+                    ON kept.id = point.kept_point_id
+                  LEFT JOIN {context.refine.quoted_source_table} AS source
+                    ON source.id = kept.source_row_key::{context.refine.source_key_sql_type}
+                  LEFT JOIN injected_points AS injected
+                    ON injected.id = point.injected_point_id
+                  LEFT JOIN candidate_entry_exit_points AS crossing
+                    ON crossing.id = point.crossing_point_id
+                   AND crossing.detect_id = point.detect_id
+                  LEFT JOIN intersections AS intersection
+                    ON intersection.detect_id = crossing.detect_id
+                   AND intersection.candidate_intersection_id = crossing.candidate_intersection_id
+            )
+            SELECT subtrack_index, vehicle_id, resolved_point_id, source_row_key,
+                   point_kind, crossing_id, intersection_id, crossing_type,
+                   ST_AsGeoJSON(geom)::jsonb
+              FROM resolved
+             ORDER BY subtrack_index, sequence_in_subtrack, resolved_point_id
+             LIMIT %s OFFSET %s
+        """
+        return self._fetchall(
+            sql,
+            (
+                *bbox,
+                context.detect_id,
+                context.refine.refine_id,
+                context.detect_id,
+                context.refine.refine_id,
+                context.detect_id,
+                context.detect_id,
+                context.detect_id,
+                context.detect_id,
+                limit,
+                offset,
+            ),
+        )
+
+    def _intersection_layer(self, detect_id: str, bbox: BBox | None, limit: int, offset: int = 0) -> list[Any]:
         bbox_clause, bbox_params = _bbox_clause("intersection.geom", bbox)
         return self._fetchall(
             "SELECT intersection.id, candidate.centroid_lon, candidate.centroid_lat, "
@@ -499,11 +624,11 @@ class PostgresMapStore:
             "AND candidate.detect_id = intersection.detect_id "
             "WHERE intersection.detect_id = %s"
             + bbox_clause
-            + " ORDER BY intersection.id LIMIT %s",
-            (detect_id, *bbox_params, limit),
+            + " ORDER BY intersection.id LIMIT %s OFFSET %s",
+            (detect_id, *bbox_params, limit, offset),
         )
 
-    def _entry_exit_layer(self, detect_id: str, bbox: BBox | None, limit: int) -> list[Any]:
+    def _entry_exit_layer(self, detect_id: str, bbox: BBox | None, limit: int, offset: int = 0) -> list[Any]:
         bbox_clause, bbox_params = _bbox_clause("crossing.geom", bbox)
         return self._fetchall(
             "SELECT crossing.id, intersection.id, resolved.id, resolved.subtrack_index, "
@@ -517,11 +642,11 @@ class PostgresMapStore:
             "resolved.crossing_point_id = crossing.id "
             "WHERE crossing.detect_id = %s"
             + bbox_clause
-            + " ORDER BY resolved.subtrack_index, resolved.sequence_in_subtrack LIMIT %s",
-            (detect_id, *bbox_params, limit),
+            + " ORDER BY resolved.subtrack_index, resolved.sequence_in_subtrack, crossing.id LIMIT %s OFFSET %s",
+            (detect_id, *bbox_params, limit, offset),
         )
 
-    def _centerline_layer(self, fit_id: str, bbox: BBox | None, limit: int) -> list[Any]:
+    def _centerline_layer(self, fit_id: str, bbox: BBox | None, limit: int, offset: int = 0) -> list[Any]:
         bbox_clause, bbox_params = _bbox_clause("centerline.geom", bbox)
         return self._fetchall(
             "SELECT centerline.id, centerline.detect_id::text, centerline.variant, "
@@ -530,8 +655,8 @@ class PostgresMapStore:
             "centerline.reverse_clip_count, ST_AsGeoJSON(centerline.geom)::jsonb "
             "FROM centerlines AS centerline WHERE centerline.fit_id = %s"
             + bbox_clause
-            + " ORDER BY centerline.id LIMIT %s",
-            (fit_id, *bbox_params, limit),
+            + " ORDER BY centerline.id LIMIT %s OFFSET %s",
+            (fit_id, *bbox_params, limit, offset),
         )
 
     def _select_resolved_tracks(
@@ -840,8 +965,9 @@ def _bbox_clause(column: str, bbox: BBox | None) -> tuple[str, tuple[Any, ...]]:
     if bbox is None:
         return "", ()
     return (
-        f" AND {column} && ST_MakeEnvelope(%s, %s, %s, %s, 4326)",
-        tuple(bbox),
+        f" AND {column} && ST_MakeEnvelope(%s, %s, %s, %s, 4326)"
+        f" AND ST_Intersects({column}, ST_MakeEnvelope(%s, %s, %s, %s, 4326))",
+        (*bbox, *bbox),
     )
 
 def _quoted_identifier(value: str) -> str:

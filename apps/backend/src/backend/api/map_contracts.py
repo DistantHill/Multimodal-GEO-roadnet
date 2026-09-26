@@ -39,6 +39,7 @@ def parse_bbox(value: str | None) -> BBox | None:
 
 class ReplayRequest(BaseModel):
     intersection_id: int | None = Field(default=None, ge=1)
+    intersection_ids: list[int] | None = Field(default=None, min_length=1)
     database_name: str | None = Field(default=None, min_length=1, max_length=63)
     detect_id: UUID | None = None
     source_row_keys: list[str] | None = None
@@ -46,6 +47,17 @@ class ReplayRequest(BaseModel):
     bbox: BBox | None = None
     max_vehicles: int | None = Field(default=None, ge=1)
     max_points: int | None = Field(default=None, ge=2)
+
+    @field_validator("intersection_ids")
+    @classmethod
+    def validate_intersection_ids(cls, value: list[int] | None) -> list[int] | None:
+        if value is None:
+            return None
+        if any(item <= 0 for item in value):
+            raise ValueError("intersection_ids must contain positive integers")
+        if len(set(value)) != len(value):
+            raise ValueError("intersection_ids must contain distinct values")
+        return value
 
     @field_validator("source_row_keys")
     @classmethod
@@ -82,16 +94,19 @@ class ReplayRequest(BaseModel):
     @model_validator(mode="after")
     def validate_selection(self) -> "ReplayRequest":
         if self.bbox is not None:
-            raise ValueError("Replay 不支持 bbox，请发送选中要素的 resolved_point_ids 或 intersection_id")
+            raise ValueError(
+                "Replay 不支持 bbox，请发送 resolved_point_ids、intersection_id 或 intersection_ids"
+            )
         selections = (
             self.intersection_id,
+            self.intersection_ids,
             self.source_row_keys,
             self.resolved_point_ids,
             self.bbox,
         )
         if sum(value is not None for value in selections) != 1:
             raise ValueError(
-                "provide exactly one of source_row_keys, resolved_point_ids, or intersection_id"
+                "provide exactly one of source_row_keys, resolved_point_ids, intersection_id, or intersection_ids"
             )
         if self.resolved_point_ids is not None and self.detect_id is None:
             raise ValueError("resolved_point_ids requires detect_id")
@@ -125,6 +140,7 @@ class FeatureCollection(BaseModel):
 def resolve_replay_limits(request: ReplayRequest, config: "MapConfig") -> ReplayRequest:
     """Return a request with configured defaults after enforcing its resource budget."""
     for name, values in (
+        ("intersection_ids", request.intersection_ids),
         ("source_row_keys", request.source_row_keys),
         ("resolved_point_ids", request.resolved_point_ids),
     ):

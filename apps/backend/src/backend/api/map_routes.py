@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Annotated, Any, Protocol
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -44,7 +44,7 @@ class MapStore(Protocol):
     def layer_catalog(self) -> dict[str, Any]: ...
     def run_catalog(self) -> dict[str, Any]: ...
     def validate_layer_context(self, refine_id: str, detect_id: str | None, fit_id: str | None) -> None: ...
-    def read_layer(self, layer_id: str, *, bbox: BBox | None, detect_id: str | None, fit_id: str | None, limit: int) -> dict[str, Any]: ...
+    def read_layer(self, layer_id: str, *, bbox: BBox | None, detect_id: str | None, fit_id: str | None, limit: int, offset: int) -> dict[str, Any]: ...
     def replay(self, request: ReplayRequest) -> dict[str, Any]: ...
     def clip(self, request: ClipRequest) -> dict[str, Any]: ...
 
@@ -93,14 +93,25 @@ def get_map_config(request: Request) -> MapConfig:
 
 
 @router.get("/layers/{layer_id}", response_model=FeatureCollection)
-def read_layer(layer_id: str, bbox: str | None = Query(default=None, description="minLon,minLat,maxLon,maxLat"), detect_id: UUID | None = None, fit_id: UUID | None = None, refine_id: UUID | None = None, limit: int | None = Query(default=None, ge=1), store: MapStore = Depends(get_map_store), map_config: MapConfig = Depends(get_map_config)) -> dict[str, Any]:
+def read_layer(layer_id: str, bbox: str | None = Query(default=None, description="Tile AABB in EPSG:4326: minLon,minLat,maxLon,maxLat"), detect_id: UUID | None = None, fit_id: UUID | None = None, refine_id: UUID | None = None, limit: int | None = Query(default=None, ge=1), offset: Annotated[int, Query(ge=0)] = 0, view_bbox: Annotated[str | None, Query(description="Current view AABB in EPSG:4326")] = None, tile_key: Annotated[str | None, Query(max_length=100, pattern=r"^\d{1,2}/\d+/\d+$")] = None, store: MapStore = Depends(get_map_store), map_config: MapConfig = Depends(get_map_config)) -> dict[str, Any]:
     try:
         resolved_limit = map_config.layer_limit_default if limit is None else limit
         if resolved_limit > map_config.layer_limit_max:
             raise ValueError(f"limit must not exceed configured maximum {map_config.layer_limit_max}")
         if refine_id is not None:
             store.validate_layer_context(str(refine_id), str(detect_id) if detect_id else None, str(fit_id) if fit_id else None)
-        return store.read_layer(layer_id, bbox=parse_bbox(bbox), detect_id=str(detect_id) if detect_id else None, fit_id=str(fit_id) if fit_id else None, limit=resolved_limit)
+        parsed_bbox = parse_bbox(bbox)
+        parsed_view_bbox = parse_bbox(view_bbox)
+        if (tile_key is not None or parsed_view_bbox is not None) and parsed_bbox is None:
+            raise ValueError("tile requests require an explicit bbox")
+        result = store.read_layer(layer_id, bbox=parsed_bbox, detect_id=str(detect_id) if detect_id else None, fit_id=str(fit_id) if fit_id else None, limit=resolved_limit, offset=offset)
+        if tile_key is not None or parsed_view_bbox is not None:
+            result.setdefault("metadata", {}).update(
+                tile_key=tile_key,
+                view_bbox=list(parsed_view_bbox) if parsed_view_bbox is not None else None,
+                scope="tile",
+            )
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except MapSchemaMismatchError as exc:

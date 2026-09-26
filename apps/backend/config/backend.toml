@@ -21,7 +21,8 @@ host = "qdrant"
 port = 6333
 
 [map]
-# Default and maximum number of features returned by a layer request.
+# Default and maximum number of features returned per layer page.
+# Clients request subsequent pages with the returned next_cursor until has_more is false.
 layer_limit_default = 1000
 layer_limit_max = 5000
 # Tables below this planner estimate receive an exact COUNT(*) in the catalog.

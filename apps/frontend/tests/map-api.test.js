@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
+import { planViewTiles } from '../src/map-tiles.js';
 
 import {
   listMapLayers,
@@ -11,6 +12,31 @@ import {
 } from '../src/map-api.js';
 
 const originalFetch = globalThis.fetch;
+
+test('Web Mercator half-world northing converts to the known latitude limit', () => {
+  const halfWorld = 20_037_508.342789244;
+  const north = planViewTiles([0, halfWorld - 1, 1, halfWorld], 4);
+  const south = planViewTiles([0, -halfWorld, 1, -halfWorld + 1], 4);
+  assert.ok(Math.abs(north.viewBbox4326[3] - 85.0511287798066) < 1e-10);
+  assert.ok(Math.abs(south.viewBbox4326[1] + 85.0511287798066) < 1e-10);
+  assert.equal(north.tiles.length, 0);
+});
+
+test('sample XYZ tile and current view AABB use the correct Mercator latitude', () => {
+  const halfWorld = 20_037_508.342789244;
+  const width = (halfWorld * 2) / (2 ** 14);
+  const west = 13178 * width - halfWorld;
+  const north = halfWorld - 6493 * width;
+  const extent = [west, north - width, west + width, north];
+  const expected = [109.5556640625, 34.92197103616376, 109.57763671875, 34.93998515156042];
+  const plan = planViewTiles(extent, 14);
+  const tile = plan.tiles.find((item) => item.key === '14/13178/6493');
+  assert.ok(tile);
+  for (let index = 0; index < 4; index += 1) {
+    assert.ok(Math.abs(tile.bbox4326[index] - expected[index]) < 1e-9);
+    assert.ok(Math.abs(plan.viewBbox4326[index] - expected[index]) < 1e-9);
+  }
+});
 
 test('Replay exposes database resource exhaustion message', async () => {
   const message = 'PostgreSQL 共享内存空间不足（SQLSTATE 53100）';
@@ -65,7 +91,7 @@ test('layer catalog keeps the backend default context', async () => {
   assert.equal(catalog.metadata.detect_id, 41);
 });
 
-test('layer request defaults to the backend-safe 5000 feature limit', async () => {
+test('layer request uses the configured backend page size by default', async () => {
   let requestedUrl;
   globalThis.fetch = async (url) => {
     requestedUrl = new URL(url, 'http://frontend.test');
@@ -75,7 +101,7 @@ test('layer request defaults to the backend-safe 5000 feature limit', async () =
   await loadMapLayer('trajectory points', { detectId: 8, fitId: 3 });
 
   assert.equal(requestedUrl.pathname, '/api/v1/map/layers/trajectory%20points');
-  assert.equal(requestedUrl.searchParams.get('limit'), '5000');
+  assert.equal(requestedUrl.searchParams.has('limit'), false);
   assert.equal(requestedUrl.searchParams.get('detect_id'), '8');
   assert.equal(requestedUrl.searchParams.get('fit_id'), '3');
 });
@@ -190,10 +216,30 @@ test('layers preserve entry-exit and centerline feature collections unchanged', 
 
   assert.deepEqual(entryResult, {
     featureCollection: { type: 'FeatureCollection', features: [entryExit] },
-    metadata: { detect_id: 'detect-1', count: 1, context: {} },
+    metadata: {
+      detect_id: 'detect-1',
+      count: 1,
+      context: { detect_id: 'detect-1' },
+      refine_id: undefined,
+      fit_id: undefined,
+      has_more: false,
+      truncated: false,
+      next_cursor: null,
+      loaded_page_count: 1,
+    },
   });
   assert.deepEqual(centerlineResult, {
     featureCollection: { type: 'FeatureCollection', features: [centerline] },
-    metadata: { detect_id: 'detect-1', fit_id: 'fit-1', count: 1, context: {} },
+    metadata: {
+      detect_id: 'detect-1',
+      fit_id: 'fit-1',
+      count: 1,
+      context: { detect_id: 'detect-1', fit_id: 'fit-1' },
+      refine_id: undefined,
+      has_more: false,
+      truncated: false,
+      next_cursor: null,
+      loaded_page_count: 1,
+    },
   });
 });

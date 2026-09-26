@@ -148,26 +148,110 @@ export async function listMapLayers({ signal, databaseName } = {}) {
 
 export async function loadMapLayer(
   layerId,
-  { bbox, detectId, fitId, refineId, databaseName, limit = 5_000, signal } = {},
+  { bbox, viewBbox, tileKey, detectId, fitId, refineId, databaseName, limit, maxFeatures, onPage, signal } = {},
 ) {
-  const query = buildQuery({
-    database_name: databaseName,
-    refine_id: refineId,
-    bbox,
-    detect_id: detectId,
-    fit_id: fitId,
-    limit,
-  });
-  const payload = await requestJson(`/map/layers/${encodeURIComponent(layerId)}${query}`, { signal });
+  const features = [];
+  const seenFeatureIds = new Set();
+  let pageOffset = 0;
+  let loadedPageCount = 0;
+  let resolvedDetectId = detectId;
+  let resolvedFitId = fitId;
+  let resolvedRefineId = refineId;
+  let metadata = {};
+
+  while (true) {
+    const query = buildQuery({
+      database_name: databaseName,
+      refine_id: resolvedRefineId,
+      bbox,
+      view_bbox: viewBbox,
+      tile_key: tileKey,
+      detect_id: resolvedDetectId,
+      fit_id: resolvedFitId,
+      limit,
+      offset: pageOffset,
+    });
+    const requestedContext = {
+      detect_id: resolvedDetectId,
+      fit_id: resolvedFitId,
+      refine_id: resolvedRefineId,
+    };
+    const payload = await requestJson(`/map/layers/${encodeURIComponent(layerId)}${query}`, { signal });
+    const page = normalizeFeatureCollection(payload);
+    const pageMetadata = normalizeMetadata(payload);
+    for (const [key, requestedId] of Object.entries(requestedContext)) {
+      const returnedId = firstDefined(pageMetadata[key], pageMetadata.context?.[key]);
+      if (requestedId !== undefined && requestedId !== null
+        && returnedId !== undefined && returnedId !== null
+        && String(returnedId) !== String(requestedId)) {
+        throw new MapApiError(`地图图层 ${layerId} 分页期间的 ${key} 上下文发生变化。`);
+      }
+    }
+    for (const feature of page.features) {
+      if (feature.id === undefined || feature.id === null) continue;
+      const featureId = String(feature.id);
+      if (seenFeatureIds.has(featureId)) {
+        throw new MapApiError(`地图图层 ${layerId} 分页返回了重复要素 ID ${featureId}。`);
+      }
+      seenFeatureIds.add(featureId);
+    }
+    if (maxFeatures !== undefined && features.length + page.features.length > maxFeatures) {
+      throw new MapApiError(`当前区域超过 ${maxFeatures.toLocaleString('zh-CN')} 个要素的内存上限；请放大地图后重试。`);
+    }
+    // Reserve shared in-flight capacity before retaining this page or requesting another.
+    if (signal?.aborted) {
+      const error = new Error('地图区域请求已取消。');
+      error.name = 'AbortError';
+      throw error;
+    }
+    onPage?.(page.features.length);
+    features.push(...page.features);
+    loadedPageCount += 1;
+
+    resolvedDetectId = firstDefined(resolvedDetectId, pageMetadata.detect_id, pageMetadata.context?.detect_id);
+    resolvedFitId = firstDefined(resolvedFitId, pageMetadata.fit_id, pageMetadata.context?.fit_id);
+    resolvedRefineId = firstDefined(resolvedRefineId, pageMetadata.refine_id, pageMetadata.context?.refine_id);
+    metadata = pageMetadata;
+
+    const hasMore = firstDefined(pageMetadata.has_more, pageMetadata.truncated, false);
+    if (typeof hasMore !== 'boolean') {
+      throw new MapApiError(`地图图层 ${layerId} 返回了无效的分页状态。`);
+    }
+    if (!hasMore) break;
+
+    const nextCursor = pageMetadata.next_cursor;
+    if (!Number.isSafeInteger(nextCursor)
+      || nextCursor !== pageOffset + page.features.length
+      || page.features.length === 0) {
+      throw new MapApiError(`地图图层 ${layerId} 声明仍有后续页，但没有有效的分页游标。`);
+    }
+    pageOffset = nextCursor;
+  }
 
   return {
-    featureCollection: normalizeFeatureCollection(payload),
-    metadata: normalizeMetadata(payload),
+    featureCollection: { type: 'FeatureCollection', features },
+    metadata: {
+      ...metadata,
+      detect_id: resolvedDetectId ?? metadata.detect_id,
+      fit_id: resolvedFitId ?? metadata.fit_id,
+      refine_id: resolvedRefineId ?? metadata.refine_id,
+      context: {
+        ...(metadata.context || {}),
+        ...(resolvedDetectId === undefined ? {} : { detect_id: resolvedDetectId }),
+        ...(resolvedFitId === undefined ? {} : { fit_id: resolvedFitId }),
+        ...(resolvedRefineId === undefined ? {} : { refine_id: resolvedRefineId }),
+      },
+      count: features.length,
+      has_more: false,
+      truncated: false,
+      next_cursor: null,
+      loaded_page_count: loadedPageCount,
+    },
   };
 }
 
 export async function requestReplay(
-  { detectId, sourceRowKeys, resolvedPointIds, intersectionId, bbox, maxVehicles, maxPoints, databaseName },
+  { detectId, sourceRowKeys, resolvedPointIds, intersectionId, intersectionIds, bbox, maxVehicles, maxPoints, databaseName },
   { signal } = {},
 ) {
   const body = {};
@@ -177,16 +261,27 @@ export async function requestReplay(
   if (resolvedPointIds?.length) body.resolved_point_ids = resolvedPointIds;
   if (bbox !== undefined) throw new MapApiError('Replay 不支持 bbox，请选择准确的点或交叉口 ID。');
   if (intersectionId !== undefined) body.intersection_id = intersectionId;
+  if (intersectionIds !== undefined) {
+    if (!Array.isArray(intersectionIds) || intersectionIds.length === 0
+      || new Set(intersectionIds.map(Number)).size !== intersectionIds.length
+      || intersectionIds.some((id) => !Number.isSafeInteger(Number(id)) || Number(id) < 1)) {
+      throw new MapApiError('Replay 必须选择一个以上具有有效且互不重复 intersection_id 的交叉口。');
+    }
+    body.intersection_ids = intersectionIds.map(Number);
+  }
   if (maxVehicles !== undefined) body.max_vehicles = maxVehicles;
   if (maxPoints !== undefined) body.max_points = maxPoints;
 
-  const selections = [body.source_row_keys, body.resolved_point_ids, body.intersection_id]
+  const selections = [body.source_row_keys, body.resolved_point_ids, body.intersection_id, body.intersection_ids]
     .filter((value) => value !== undefined);
   if (selections.length !== 1) {
-    throw new MapApiError('Replay 需要且只能提供来源键、resolved point ID 或 intersection ID。');
+    throw new MapApiError('Replay 需要且只能提供来源键、resolved point ID、单个交叉口 ID 或交叉口 ID 列表。');
   }
   if (body.resolved_point_ids && !body.detect_id) {
     throw new MapApiError('resolved point ID Replay 缺少 detect_id 上下文。');
+  }
+  if (body.intersection_ids && !body.detect_id) {
+    throw new MapApiError('交叉口 Replay 缺少 detect_id 上下文。');
   }
 
   const payload = await requestJson('/map/replay', { method: 'POST', body, signal });

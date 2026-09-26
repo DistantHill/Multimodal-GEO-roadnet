@@ -97,3 +97,100 @@ def replay_intersection(store: "PostgresMapStore", request: "ReplayRequest") -> 
                                intersection_id=request.intersection_id, detect_id=detect_id,
                                candidate_intersection_id=candidate_id,
                                returned_point_count=len(features), truncated=False)
+
+
+def replay_intersections(store: "PostgresMapStore", request: "ReplayRequest") -> dict[str, Any]:
+    """Replay selected intersections and merge shared points without truncation."""
+    intersection_ids = request.intersection_ids
+    if intersection_ids is None:
+        raise MapDataError("Replay 需要至少一个 intersection_id。")
+
+    merged: dict[Any, dict[str, Any]] = {}
+    event_keys: dict[Any, set[tuple[Any, Any, Any]]] = defaultdict(set)
+    candidate_ids: set[int] = set()
+    intersection_sources: list[dict[str, int | None]] = []
+    detect_id: str | None = None
+
+    for intersection_id in intersection_ids:
+        single_request = request.model_copy(
+            update={"intersection_id": intersection_id, "intersection_ids": None}
+        )
+        result = replay_intersection(store, single_request)
+        result_detect_id = result["metadata"]["detect_id"]
+        if detect_id is None:
+            detect_id = result_detect_id
+        elif result_detect_id != detect_id:
+            raise MapDataError("所选交叉口必须属于同一个 Detect Run。")
+
+        candidate_id = result["metadata"].get("candidate_intersection_id")
+        if candidate_id is not None:
+            candidate_id = int(candidate_id)
+            candidate_ids.add(candidate_id)
+        intersection_sources.append(
+            {
+                "intersection_id": intersection_id,
+                "candidate_intersection_id": candidate_id,
+            }
+        )
+
+        for feature in result["features"]:
+            properties = feature["properties"]
+            feature_id = feature.get("id", properties.get("resolved_point_id"))
+            if feature_id is None:
+                raise MapDataError("交叉口回放点缺少稳定 ID，无法合并。")
+
+            candidate_id = properties.get("candidate_intersection_id")
+            if candidate_id is not None:
+                candidate_ids.add(int(candidate_id))
+
+            current = merged.get(feature_id)
+            if current is None:
+                current = {**feature, "properties": dict(properties)}
+                current["properties"]["intersection_ids"] = []
+                current["properties"]["candidate_intersection_ids"] = []
+                current["properties"]["events"] = []
+                merged[feature_id] = current
+                if len(merged) > request.max_points:
+                    raise MapDataError(
+                        "所选交叉口合并后的构成点超过 max_points 上限，请提高上限后重试；未返回部分结果。"
+                    )
+
+            merged_properties = current["properties"]
+            if intersection_id not in merged_properties["intersection_ids"]:
+                merged_properties["intersection_ids"].append(intersection_id)
+            if candidate_id is not None and candidate_id not in merged_properties[
+                "candidate_intersection_ids"
+            ]:
+                merged_properties["candidate_intersection_ids"].append(candidate_id)
+            for event in properties.get("events") or []:
+                source_event = {
+                    **event,
+                    "intersection_id": intersection_id,
+                    "candidate_intersection_id": candidate_id,
+                }
+                event_key = (
+                    intersection_id,
+                    source_event.get("kind"),
+                    source_event.get("id"),
+                )
+                if event_key not in event_keys[feature_id]:
+                    event_keys[feature_id].add(event_key)
+                    merged_properties["events"].append(source_event)
+
+            if len(merged_properties["intersection_ids"]) > 1:
+                merged_properties["intersection_id"] = None
+            if len(merged_properties["candidate_intersection_ids"]) > 1:
+                merged_properties["candidate_intersection_id"] = None
+
+    features = list(merged.values())
+    return create_map_feature_collection(
+        features,
+        operation="replay",
+        selection="intersection_ids",
+        intersection_ids=intersection_ids,
+        detect_id=detect_id,
+        candidate_intersection_ids=sorted(candidate_ids),
+        intersection_sources=intersection_sources,
+        returned_point_count=len(features),
+        truncated=False,
+    )

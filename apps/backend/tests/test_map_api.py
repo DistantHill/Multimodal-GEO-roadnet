@@ -102,6 +102,7 @@ def test_layer_query_parses_bbox_context_and_limit() -> None:
         "detect_id": str(detect_id),
         "fit_id": None,
         "limit": 25,
+        "offset": 0,
     }]
     assert result["metadata"]["crs"] == "EPSG:4326"
 
