@@ -13,6 +13,7 @@ from track.v2.replay import (
     ReplayService,
     ReplayTarget,
     _replay_fit_endpoint,
+    _stringify_source_row_key,
 )
 
 
@@ -146,3 +147,9 @@ def test_cli_scopes_external_and_internal_ids_explicitly() -> None:
     assert _parse_target(
         kind="resolved_point", id="42", detect_id="detect"
     ) == ReplayTarget("resolved_point", 42, detect_id="detect")
+
+
+def test_replay_source_key_json_remains_a_string() -> None:
+    assert _stringify_source_row_key({"source_row_key": 9223372036854775807}) == {
+        "source_row_key": "9223372036854775807",
+    }

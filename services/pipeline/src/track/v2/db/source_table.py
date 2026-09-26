@@ -27,9 +27,6 @@ _KEY_TYPES = {
     "int2": "smallint",
     "int4": "integer",
     "int8": "bigint",
-    "uuid": "uuid",
-    "text": "text",
-    "varchar": "varchar",
 }
 
 
@@ -87,7 +84,7 @@ def validate_source_table(conn: Any, source_table: str) -> SourceTableContract:
         if key_type not in _KEY_TYPES:
             raise ValueError(
                 f"source table id type {key_type!r} is unsupported; expected "
-                "an integer family, UUID, TEXT, or VARCHAR"
+                "smallint, integer, or bigint"
             )
         if not key_not_null:
             raise ValueError("source table id must be NOT NULL")
@@ -253,7 +250,7 @@ def calculate_source_fingerprint(
             UNION
             SELECT source_row_key FROM excluded_points WHERE refine_id = %s
         )
-        SELECT referenced.source_row_key,
+        SELECT referenced.source_row_key::text,
                source.id IS NOT NULL,
                source.vehicle_id,
                source.timestamp,
@@ -264,8 +261,8 @@ def calculate_source_fingerprint(
                {extra_sql}
           FROM referenced
           LEFT JOIN {contract.quoted_table} AS source
-            ON source.id = referenced.source_row_key::{contract.key_sql_type}
-         ORDER BY referenced.source_row_key
+            ON source.id = referenced.source_row_key
+         ORDER BY referenced.source_row_key::text
     """
     digest = hashlib.sha256()
     row_count = 0

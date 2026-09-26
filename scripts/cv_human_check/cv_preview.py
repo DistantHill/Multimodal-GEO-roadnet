@@ -13,7 +13,8 @@ import uuid
 
 import numpy as np
 
-from track.v2.config import connect, default_postgres_config
+from track.v2.cli._startup import load_startup_config
+from track.v2.config import connect
 from .preview import fit_profile, split_tiles, write_report
 from track.v2.db.queries import fetch_detect_row, fetch_intersections
 from track.v2.db.source_table import validate_source_table, verify_refine_source_fingerprint
@@ -73,7 +74,7 @@ def main() -> int:
         parser.error("runtime output must be outside the repository")
     if output.exists():
         parser.error("output directory already exists; choose a new path")
-    config = default_postgres_config()
+    config = load_startup_config().postgres
     if args.database:
         config = replace(config, database=args.database)
     print("Reading original trajectory points in a read-only snapshot...", flush=True)

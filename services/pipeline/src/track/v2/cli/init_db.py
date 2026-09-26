@@ -1,6 +1,6 @@
-"""Create track.v2 schema v7 or migrate an existing v3/v4/v5/v6 schema in place.
+"""Create track.v2 schema v8 or migrate an existing v3/v4/v5/v6/v7 schema in place.
 
-Schema v3 supports ``--migrate-refine``; v4/v5/v6 support ``--migrate-artifacts``.
+Schema v3 supports ``--migrate-refine``; v4 through v7 support ``--migrate-artifacts``.
 An existing v1/v2
 database must be recreated with ``--reset`` so an old column can never retain
 an ambiguous meaning behind a new API.
@@ -17,7 +17,7 @@ from ..logger import init_logger, shutdown_logger
 
 
 SCHEMA_COMPONENT = "track.v2"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 DDL_STATEMENTS: list[tuple[str, str]] = [
@@ -112,7 +112,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         """
         CREATE TABLE IF NOT EXISTS excluded_points (
             refine_id        UUID NOT NULL REFERENCES refine_runs(id) ON DELETE CASCADE,
-            source_row_key  TEXT NOT NULL,
+            source_row_key  BIGINT NOT NULL,
             reason          TEXT NOT NULL,
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             PRIMARY KEY (refine_id, source_row_key)
@@ -126,7 +126,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             id                      BIGSERIAL PRIMARY KEY,
             refine_id                UUID NOT NULL
                                     REFERENCES refine_runs(id) ON DELETE CASCADE,
-            source_row_key          TEXT NOT NULL,
+            source_row_key          BIGINT NOT NULL,
             vehicle_id              TEXT NOT NULL,
             subtrack_index          INTEGER NOT NULL CHECK (subtrack_index >= 1),
             sequence_in_subtrack    INTEGER NOT NULL
@@ -2011,14 +2011,14 @@ def _existing_pipeline_tables(cur: Any) -> list[str]:
     return [str(row[0]) for row in cur.fetchall()]
 
 
-def _require_empty_or_v7(cur: Any) -> None:
+def _require_empty_or_current(cur: Any) -> None:
     version = _schema_version(cur)
     if version == SCHEMA_VERSION:
         return
     if version is not None:
         raise RuntimeError(
             f"database schema is v{version}; track.v2 requires v{SCHEMA_VERSION}. "
-            "For v3 use init-db --migrate-refine; for v4, v5, or v6 use "
+            "For v3 use init-db --migrate-refine; for v4 through v7 use "
             "init-db --migrate-artifacts; older schemas require --reset."
         )
     existing = _existing_pipeline_tables(cur)
@@ -2027,7 +2027,7 @@ def _require_empty_or_v7(cur: Any) -> None:
         suffix = " ..." if len(existing) > 8 else ""
         raise RuntimeError(
             "unversioned/legacy pipeline tables exist "
-            f"({preview}{suffix}); schema v7 has no legacy in-place migration. "
+            f"({preview}{suffix}); schema v8 has no legacy in-place migration. "
             "Run init_db --reset."
         )
 
@@ -2079,7 +2079,7 @@ def create_tables(
     migrate_refine_names: bool = False,
     migrate_artifacts: bool = False,
 ) -> int:
-    """Create schema v7, optionally migrating v3/v4/v5/v6 in one transaction."""
+    """Create schema v8, optionally migrating v3/v4/v5/v6/v7 in one transaction."""
     with pg_connect(config) as conn:
         with conn.cursor() as cur:
             installed_before = _schema_version(cur)
@@ -2096,17 +2096,24 @@ def create_tables(
                 from ..db.detect_completion_migration import migrate_completion_v7
 
                 migrate_completion_v7(cur)
+                from ..db.source_row_key_migration import migrate_source_row_key_v8
+
+                migrate_source_row_key_v8(cur)
             elif migrate_artifacts and installed_before != SCHEMA_VERSION:
                 from ..db.artifact_migration import migrate_artifacts_v5
                 from ..db.completion_migration import migrate_completion_v6
                 from ..db.detect_completion_migration import migrate_completion_v7
+                from ..db.source_row_key_migration import migrate_source_row_key_v8
 
                 if _schema_version(cur) == 4:
                     migrate_artifacts_v5(cur)
                 if _schema_version(cur) == 5:
                     migrate_completion_v6(cur)
-                migrate_completion_v7(cur)
-            _require_empty_or_v7(cur)
+                if _schema_version(cur) == 6:
+                    migrate_completion_v7(cur)
+                if _schema_version(cur) == 7:
+                    migrate_source_row_key_v8(cur)
+            _require_empty_or_current(cur)
 
             print("\n── 创建数据表 / Creating Tables ──")
             for name, ddl in DDL_STATEMENTS:
@@ -2153,7 +2160,7 @@ def create_tables(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Initialize the destructive track.v2 PostgreSQL schema v7."
+        description="Initialize the destructive track.v2 PostgreSQL schema v8."
     )
     parser.add_argument(
         "--ask-password",
@@ -2164,15 +2171,15 @@ def main() -> int:
     migration.add_argument(
         "--reset",
         action="store_true",
-        help="Destructively drop all known Pipeline tables before creating v7.",
+        help="Destructively drop all known Pipeline tables before creating v8.",
     )
     migration.add_argument(
         "--migrate-refine", action="store_true",
-        help="Preserve v3 data, rename Clean objects, then migrate through v7.",
+        help="Preserve v3 data, rename Clean objects, then migrate through v8.",
     )
     migration.add_argument(
         "--migrate-artifacts", action="store_true",
-        help="Preserve v4/v5/v6 data and migrate through schema v7.",
+        help="Preserve v4/v5/v6/v7 data and migrate through schema v8.",
     )
     args = parser.parse_args()
 

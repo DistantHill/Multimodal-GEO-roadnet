@@ -64,6 +64,9 @@ def test_queries_are_owner_scoped_stable_and_preserve_clip_relations():
     assert "COALESCE(k.vehicle_id, ip.vehicle_id, sk.vehicle_id, sip.vehicle_id)" in queries[
         "resolved_points"
     ]
+    assert "k.source_row_key::text AS source_row_key" in queries["resolved_points"]
+    assert "s.id=k.source_row_key" in queries["resolved_points"]
+    assert "k.source_row_key::bigint" not in queries["resolved_points"]
     assert "r.crossing_point_id=c.id" in queries["entry_exit_points"]
     assert detect_parquet_export._relation(queries["resolved_points"], "resolved_points").endswith(
         "ORDER BY subtrack_index, sequence_in_subtrack, resolved_point_id"

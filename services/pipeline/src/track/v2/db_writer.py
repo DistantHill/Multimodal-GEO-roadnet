@@ -281,7 +281,7 @@ def insert_excluded_points(
     batch_size: int = _BATCH,
 ) -> int:
     rows = [
-        (refine_id, item.point_ref.source_row_key, item.reason)
+        (refine_id, int(item.point_ref.source_row_key), item.reason)
         for item in excluded.items
     ]
     with conn.cursor() as cur:
@@ -309,7 +309,7 @@ def insert_kept_trajectory_points(
                 continue
             rows.append((
                 refine_id,
-                point.point_ref.source_row_key,
+                int(point.point_ref.source_row_key),
                 point.vehicle_id,
                 subtrack.subtrack_index,
                 sequence,

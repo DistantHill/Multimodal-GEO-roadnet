@@ -78,6 +78,9 @@ def test_postgres_query_is_run_scoped_safe_and_computes_interleaved_sequence():
 
     assert sql.count(f"'{run_id}'::uuid") == 2
     assert 'JOIN "odd"."schema" s' in sql
+    assert 'ON s.id = k.source_row_key' in sql
+    assert 'k.source_row_key::text AS source_row_key' in sql
+    assert 'k.source_row_key::bigint' not in sql
     assert 'FROM "run""schema".kept_trajectory_points k' in sql
     assert 'FROM "run""schema".injected_points i' in sql
     projected = "ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), 32650)"

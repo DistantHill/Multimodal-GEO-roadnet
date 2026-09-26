@@ -765,7 +765,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
 
         self.assertIn("FROM ktp AS ktp", conn.cursor_instance.query)
         self.assertIn('JOIN "custom_points" AS tp', conn.cursor_instance.query)
-        self.assertIn("ON tp.id = ktp.source_row_key::bigint", conn.cursor_instance.query)
+        self.assertIn("ON tp.id = ktp.source_row_key", conn.cursor_instance.query)
         self.assertIn("ktp.refine_id = %s", conn.cursor_instance.query)
         self.assertNotIn("is_active", conn.cursor_instance.query)
         self.assertIn(

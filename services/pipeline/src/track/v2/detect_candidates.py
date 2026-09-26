@@ -24,6 +24,7 @@ from .cross_candidate_relation import CrossCandidateRelation
 
 if TYPE_CHECKING:
     from .detect import IntersectConfig
+    from .refine_parquet import RefineDatasetReader
 
 
 def extract_turn_candidates(
@@ -170,7 +171,7 @@ def extract_cross_track_candidates(
 
 @observed_operation("列式轨迹交点候选提取")
 def extract_columnar_cross_track_candidates(
-    reader: Any,
+    reader: RefineDatasetReader,
     source_table: str,
     transformer: CoordinateTransformer,
     cfg: Any,

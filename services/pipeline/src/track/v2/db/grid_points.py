@@ -75,7 +75,7 @@ def fetch_points_in_grid(
                  candidate.refined_sequence, candidate.source_id
           FROM (
             (SELECT k.sequence_in_subtrack AS anchor, 0 AS kind,
-                   k.id AS point_id, k.source_row_key,
+                   k.id AS point_id, k.source_row_key::text AS source_row_key,
                    ST_X(ST_Transform(src.geom, {int(spatial_context.processing_srid)})) AS x,
                    ST_Y(ST_Transform(src.geom, {int(spatial_context.processing_srid)})) AS y,
                    src.heading, src.timestamp, src.speed, src.lon, src.lat,
@@ -89,7 +89,7 @@ def fetch_points_in_grid(
                    '{source.source_table}'::text AS source_id
             FROM kept_trajectory_points k
             JOIN {source.quoted_table} src
-              ON src.id = k.source_row_key::{source.key_sql_type}
+              ON src.id = k.source_row_key
             WHERE k.refine_id = %s AND k.subtrack_index = h.subtrack_index
               AND ROW(k.sequence_in_subtrack, 0, k.id)
                   {comparator} ROW(h.anchor, h.kind, h.point_id)
@@ -120,11 +120,11 @@ def fetch_points_in_grid(
         """
 
     # Parentheses keep each branch's ORDER BY / LIMIT local to its index probe.
-    query = f"""
+    hits_cte = f"""
     WITH hits AS (
       SELECT k.vehicle_id, k.subtrack_index,
              k.sequence_in_subtrack AS anchor, 0 AS kind, k.id AS point_id,
-             k.source_row_key, ST_X({projected}) AS x,
+             k.source_row_key::text AS source_row_key, ST_X({projected}) AS x,
              ST_Y({projected}) AS y, s.heading, s.timestamp, s.speed,
              s.lon, s.lat, NULL::text AS generated_reason,
              k.sequence_in_subtrack + (
@@ -136,7 +136,7 @@ def fetch_points_in_grid(
              '{source.source_table}'::text AS source_id
       FROM {source.quoted_table} s
       JOIN kept_trajectory_points k
-        ON s.id = k.source_row_key::{source.key_sql_type} AND k.refine_id = %s
+        ON s.id = k.source_row_key AND k.refine_id = %s
       WHERE s.geom && {envelope}
         AND ST_X({projected}) >= %s AND ST_Y({projected}) >= %s
         AND ST_X({projected}) <= %s AND ST_Y({projected}) <= %s
@@ -155,6 +155,13 @@ def fetch_points_in_grid(
       WHERE i.refine_id = %s AND i.geom && {envelope}
         AND i.x >= %s AND i.y >= %s AND i.x <= %s AND i.y <= %s
     )
+    """
+    # A server-side cursor is planned for a small initial fetch. For this
+    # query that can choose a nested loop which rescans the entire Refine kept
+    # set for every spatial hit. Build hits with a regular statement first;
+    # the cursor then streams only the neighbour lookups.
+    hits_table = f"cross_track_hits_{uuid.uuid4().hex}"
+    query = f"""
     SELECT h.vehicle_id, h.subtrack_index, h.anchor, h.kind, h.point_id,
            h.source_row_key, h.x, h.y, h.heading, h.timestamp, h.speed,
            h.lon, h.lat, h.generated_reason, h.refined_sequence, h.source_id,
@@ -166,17 +173,17 @@ def fetch_points_in_grid(
            nxt.x, nxt.y, nxt.heading, nxt.timestamp, nxt.speed,
            nxt.lon, nxt.lat, nxt.generated_reason, nxt.refined_sequence,
            nxt.source_id
-    FROM hits h
+    FROM {hits_table} h
     {neighbour('prev')}
     {neighbour('nxt')}
     ORDER BY h.vehicle_id, h.subtrack_index, h.anchor, h.kind, h.point_id
     """
     bounds = (lon_min, lat_min, lon_max, lat_max)
     xy = (x_min, y_min, x_max, y_max)
-    params = (
+    hit_params = (
         refine_id, *bounds, *xy, refine_id, *bounds, *xy,
-        refine_id, refine_id, refine_id, refine_id,
     )
+    neighbour_params = (refine_id,) * 4
     names = (
         "vehicle_id", "subtrack_index", "anchor_sequence", "point_kind",
         "point_id", "source_row_key", "x", "y", "heading", "timestamp",
@@ -191,8 +198,14 @@ def fetch_points_in_grid(
         "next_timestamp", "next_speed", "next_lon", "next_lat",
         "next_generated_reason", "next_refined_sequence_in_subtrack", "next_source_id",
     )
+    with conn.cursor() as cur:
+        cur.execute(
+            f"CREATE TEMP TABLE {hits_table} ON COMMIT DROP AS "
+            + hits_cte + " SELECT * FROM hits",
+            hit_params,
+        )
     with conn.cursor(name=f"cross_track_grid_{uuid.uuid4().hex}") as cur:
-        cur.execute(query, params)
+        cur.execute(query, neighbour_params)
         while rows := cur.fetchmany(batch_size):
             yield {name: tuple(row[index] for row in rows)
                    for index, name in enumerate(names)}

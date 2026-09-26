@@ -98,10 +98,10 @@ SELECT r.detect_id, r.id AS resolved_point_id, r.subtrack_index,
  CASE WHEN r.kept_point_id IS NOT NULL THEN 'kept'
       WHEN r.injected_point_id IS NOT NULL THEN 'injected' ELSE 'crossing' END AS point_kind,
  COALESCE(r.kept_point_id, r.injected_point_id) AS refined_point_id,
- k.source_row_key, c.id AS crossing_id, i.id AS intersection_id, c.crossing_type
+ k.source_row_key::text AS source_row_key, c.id AS crossing_id, i.id AS intersection_id, c.crossing_type
 FROM {base} r JOIN {detects} d ON d.id=r.detect_id
 LEFT JOIN {kept} k ON k.id=r.kept_point_id AND k.refine_id=d.refine_id
-LEFT JOIN {source} s ON s.id=k.source_row_key::{key_type}
+LEFT JOIN {source} s ON s.id=k.source_row_key
 LEFT JOIN {injected} ip ON ip.id=r.injected_point_id AND ip.refine_id=d.refine_id
 LEFT JOIN {crossing} c ON c.id=r.crossing_point_id AND c.detect_id=r.detect_id
 LEFT JOIN {base} sr ON sr.id=c.segment_start_point_id AND sr.detect_id=r.detect_id

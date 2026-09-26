@@ -378,6 +378,27 @@ PostgreSQL 连接；Q74 确认 `todo/running/done/failed`、失败最多重试 2
   清理范围扩大到原始源数据或其他项目。
 - Q62 已完成最终设计确认，Q63 已授权分阶段实施；26M 性能验收尚未进行。
 
+### 9.3 网格查询性能与整数行键访谈（2026-09-25）
+
+用户要求在 roadnet_test.public.day01 建立 EPSG:32649 的投影表达式索引，
+用 `ST_Intersects(ST_Transform(s.geom, 32649), ST_MakeEnvelope(..., 32649))`
+与现有临时命中表加服务端游标的两段式查询，对指定八个网格的扫描次数和耗时
+进行比较。用户另要求将 `kept_trajectory_points` 与 `excluded_points` 的
+`source_row_key` 改为 BIGINT。
+
+代码事实（2026-09-25 核查）：当前 schema v7 的两列均为 TEXT；来源表契约
+允许 smallint、integer、bigint、UUID 和文本主键，查询按来源主键类型转换
+`source_row_key`。现有 v7 库不会因修改 CREATE TABLE IF NOT EXISTS 自动迁移。
+已通过运行中的 Compose Pipeline 容器只读连接 roadnet_test：当前为 schema v7，
+两列均为 TEXT；本轮性能对比尚未运行。
+
+Q80 已确认两张表都改 BIGINT，并将来源限制为整数主键。Q81 指定方案 1
+以 UTM 索引直接筛选 day01，再关联保留点表，一条查询输出；方案 2 保持先建
+hits 临时表再读取的两段式流程。Q82 回答旧数据可以删除；Q83 确认两方案输出完全一致。Q84 指定清理保留点
+及后续产物，保留 roadnet_test.day01 与 roadnet.trajectory_points；Q86 已确认两个数据库的派生数据都清理；Q87 已确认数据库派生数据及对应 Parquet 目录均清理；Q88 已确认先对比、再清理和改类型。Q89 已确认完整执行范围并授权实施；性能对比、清理和类型改造尚待实际执行与验收。本轮访谈尚未完成；
+没有执行数据库变更。
+新决定只覆盖本轮明确范围，不改写 Q79 的历史结论。
+
 ## 10. 确认记录
 
 用户已在 Q62 以“确认”明确确认当时第 1–9 节为完整共享设计。设计确认日期为
@@ -1790,3 +1811,194 @@ Q74 对该类失败的重试解释；其余可恢复失败仍按 Q74。
 
 最终检查：Q19–Q79 连续且唯一，均已回答；本次局部设计已确认、逐函数实施
 已授权、实现与验收尚未完成；QA 附录仍位于文末。
+
+### 第 21 轮 — UTM 索引、比较口径与整数行键（2026-09-25）
+
+发问时前提：Q79 已确认此前网格方案；本轮要求新增数据库索引、对比查询，
+并将两张结果表的来源行键改为 BIGINT。
+
+#### Q80 — 两张表的行键类型
+
+> `source_row_key` 目前支持整数、UUID 和文本来源表。你要把通用 schema 的
+> `kept_trajectory_points` 与 `excluded_points` 都收窄为 BIGINT，并同步迁移
+> 现有列及相关查询吗？选择：A. 保留 TEXT，本次只做索引对比；
+> B. 两张表改 BIGINT，来源限整数主键；C. 仅 roadnet_test 改 BIGINT，
+> 通用 schema 保留 TEXT。
+>
+> 推荐 A：先保留 TEXT，把类型改造与本次索引性能对比分开；若明确只支持整数
+> 来源，则按 BIGINT 全链路改造。
+>
+> 用户回答：两张表改 BIGINT，来源限整数主键
+
+正文关联：第 9.3 节。当前解释：选择 B；通用 schema、现有数据库迁移和相关
+读写查询均进入设计范围，不把仅改新建表 DDL 当作现有库迁移。
+
+#### Q81 — 性能比较范围
+
+> UTM 方案是直接执行完整的网格加邻点查询，还是只替换当前两段式方案中
+> 生成临时 hits 表的空间筛选？选择：A. 完整查询对比，分阶段记录；
+> B. 只比较网格 hits 筛选；C. 完整查询和 hits 筛选都比较。
+>
+> 推荐 A：比较完整端到端耗时，并分别记录两段式的建表与游标阶段、
+> 每个计划节点的 Actual Loops、缓冲区读写和超时。
+>
+> 用户回答：UTM方案就是一段直出结果，不走临时hits表了，申明下，方案1、用utm索引  WHERE ST_Intersects(
+>       ST_Transform(s.geom, 32649),
+>       ST_MakeEnvelope(xmin, ymin, xmax, ymax, 32649)
+>   )直接筛出day01源表里的点，接着去匹配kept_trajectory_points；方案2、先hits临时表，在从临时表里去读
+
+正文关联：第 9.3 节。当前解释：方案 1 一条查询直出；方案 2 保持两段式。
+
+#### Q82 — v7 旧数据的迁移失败策略
+
+> 把两张表的 `source_row_key` 原地转为 BIGINT 前，应检查所有值及关联来源表。
+> 若发现非整数或超出 BIGINT 范围的值，选择：A. 预检失败即停止，不删数据；
+> B. 清理不兼容行后继续迁移；C. 仅改新库 DDL，旧库暂不迁移。
+>
+> 推荐 A：停止并报告具体数量，不自动删数据。
+>
+> 用户回答：数据全删了，我都不需要
+
+正文关联：第 9.3 节。当前解释：允许删除数据，但未明确限于两张目标表、
+关联 Run，还是整个 roadnet_test；删除范围由 Q84 确定。
+
+本轮检查：Q80–Q82 已回答；Q82 的删除范围待澄清；未进行最终设计确认或数据库实施。
+
+#### Q83 — 两种方案的输出一致性
+
+> 现有两段式查询除网格命中点外，还为每个点查询前驱和后继。
+> 方案 1 在关联 kept_trajectory_points 后，是否也要查询相同的前驱、
+> 后继和注入点，并保持相同排序？选择：A. 两方案输出完全一致；
+> B. 只比较源表与 kept 匹配的 hits；C. 分别报告 hits 和完整输出两层结果。
+>
+> 推荐 A：保持输出完全一致，才能比较整条查询的扫描次数和耗时。
+>
+> 用户回答：建议：两方案输出完全一致
+
+正文关联：第 9.3 节。当前解释：选择 A；比较前须核对行数和稳定身份。
+
+#### Q84 — 旧数据删除范围
+
+> 你说“数据全删了”，是指旧结果数据已经被你清空，还是要我现在执行删除？
+> 这次对比仍需要 day01 和同一 Refine Run 的 kept_trajectory_points 数据。
+> 选择：A. 已清空；先核实，不再删除；B. 清空两张结果表，再重建基准数据；
+> C. 清空整个 roadnet_test，再重建基准数据。
+>
+> 推荐 A：先核实现状；若仍有旧数据，再按指定范围清理，并确保基准数据可用。
+>
+> 用户回答：清除kept_points和后续产物，保留roadnet_test.day01(注意一下，roadnet_test.trajectory里有某个测试用的几个点，是之前agent自己放进去的，你找到对应的test_*,至于后续怎么改，之后再说)和roadnet.trajectory_points
+
+正文关联：第 9.3 节。当前解释：清理保留点与下游产物；保留两处指定
+源表。roadnet_test.trajectory_points 中 8 个 smoke 测试点的处置以后再定；
+清理范围和数据库由 Q86 继续澄清。
+
+#### Q85 — 数据库执行入口
+
+> 本轮要对 roadnet_test 真正建索引并运行 EXPLAIN ANALYZE。当前执行环境没有
+> 可用的 Pipeline Python 虚拟环境，也无法访问 Docker socket，暂时连不上
+> 数据库。请提供可用的执行入口，无需在聊天中发送密码。
+> 选择：A. 提供可用容器或主机命令；B. 数据库稍后开放，先完成代码和脚本；
+> C. 只准备脚本，用户自行执行数据库操作。
+>
+> 推荐 A：提供可用执行入口，完成真实数据库对比。
+>
+> 用户回答：提供可用容器或主机命令，但是这你直接从docker compose dev里找就好了呗，还要我提供吗？
+
+正文关联：第 9.3 节。当前解释：已从 Compose 开发栈找到运行中的 Pipeline
+容器，并成功只读连接 roadnet_test；不再要求用户提供连接入口。真实性能指标尚未测得。
+
+本轮检查：Q80–Q83 已回答；Q84–Q85 待回答；没有执行数据库变更。
+
+#### Q86 — 清理数据库范围
+
+> 本次索引和对比的目标是 roadnet_test；你同时要求保留
+> roadnet.trajectory_points。选择：A. 只清理 roadnet_test 派生数据；
+> B. 两个数据库的派生数据都清理；C. 只清理指定 Refine Run 的派生数据。
+>
+> 推荐 A：只清理 roadnet_test 的 Refine 及后续 Run 数据，保留该库的
+> day01 与 trajectory_points；roadnet 完全不动。
+>
+> 用户回答：两个数据库的派生数据都清理
+
+正文关联：第 9.3 节。当前解释：roadnet_test 与 roadnet 的派生数据都进入清理范围；
+保留 roadnet_test.day01、roadnet_test.trajectory_points 和 roadnet.trajectory_points。
+
+#### Q87 — Parquet 文件范围
+
+> “后续产物”是否包括已登记的 Refine/Detect Parquet 文件？
+> 选择：A. 清理数据库派生数据及对应 Parquet；B. 只清理数据库派生数据；
+> C. 连同所有 Pipeline 运行文件一起清理。
+>
+> 推荐 A：清理对应 Run 的数据库记录和专属 Parquet 目录，保留 day01、
+> 两库 trajectory_points、日志和未登记的其他文件；清理前列出实际目录。
+>
+> 用户回答：建议：清理数据库派生数据及对应 Parquet
+
+正文关联：第 9.3 节。当前解释：选择 A；只清理两库登记的 Refine/Detect
+产物专属目录及派生数据库记录，保留源表、日志和未登记文件。
+
+#### Q88 — 比较与清理的顺序
+
+> 清理会移除性能对比所需的 kept 点。选择：A. 先用现有 roadnet_test
+> Refine Run 完成两方案同数据对比，保存计划和报告，再清理两库派生数据并
+> 改行键类型；B. 先清理改类型，重跑 Refine 后对比；C. 只准备对比脚本，
+> 先清理和改类型。
+>
+> 推荐 A：先对比，再清理和改类型，避免为本次对比额外重跑 Refine。
+>
+> 用户回答：待回答
+
+正文关联：第 9.3 节。当前解释：待回答。
+
+本轮检查：Q80–Q87 已回答；Q88 待回答；尚未修改数据库。
+
+### 第 22 轮 — 本次数据库对比与清理的共享理解（2026-09-25）
+
+发问时前提：Q80–Q88 已回答。两个数据库和九个已登记的 Parquet 目录已只读盘点；
+roadnet_test 的八个 smoke 点尚未找到对应 test_* 文件，保持原状。
+
+#### Q89 — 完整执行范围确认
+
+> 是否确认按以下顺序执行：
+> 1. 仅在 roadnet_test.public.day01 建立 EPSG:32649 的 ST_Transform
+>    表达式 GiST 索引。
+> 2. 对原定八个网格（包含重复目标），比较一条 SQL 直出与当前 hits 临时表加
+>    游标两段式；两方案返回完全相同的命中点、前后邻点、注入点和排序。
+>    保存完整 EXPLAIN、扫描循环/行数、分阶段及总耗时，并核对结果一致性。
+> 3. 对比完成后，清理 roadnet_test 和 roadnet 的 Refine 及下游数据库数据和
+>    已登记的专属 Refine/Detect Parquet 目录；保留
+>    roadnet_test.day01、两个数据库的 trajectory_points、日志与未登记文件。
+>    roadnet_test.trajectory_points 的八个 smoke 点暂不更改。
+> 4. 将 kept_trajectory_points 和 excluded_points 的 source_row_key 改为
+>    BIGINT，通用来源表契约限整数主键；同步 schema 版本、SQL、读写及测试。
+>    不把只改 CREATE TABLE IF NOT EXISTS 当作现有数据库迁移。
+> 选择：A. 确认；B. 请指出需要更正的条目。
+>
+> 推荐 A：按此范围实施；若性能对比未取得可核对的结果，先保留基准数据并报告，
+> 不先行清理。
+
+> 用户回答：建议：确认，按此范围实施
+
+正文关联：第 9.3、10 节。当前解释：确认并授权按 Q89 的四步顺序实施；
+若性能对比未取得可核对的结果，先保留基准数据。
+
+本轮检查：Q80–Q89 已回答；设计已确认并授权实施，尚待实际执行与验收；
+QA 附录仍位于文末。
+
+### Q89 实施与验收结果（2026-09-25）
+
+Q89 四步已完成：八个网格的一段直出与两段式查询均返回完全相同的有序结果；
+八个直出 EXPLAIN 计划都实际使用 UTM GiST 索引。派生数据库数据和九个登记的
+Refine/Detect Parquet 目录已清理，三个保护源表行数保持不变。两个数据库已从
+schema v7 迁移到 v8，kept_trajectory_points.source_row_key 与
+excluded_points.source_row_key 均为 BIGINT。
+
+性能计划、耗时、行数与循环、清理清单、迁移状态和测试结果记录在本机
+`services/pipeline/generated/cross-track-explain/` 下的 `q89-results.md`、
+`grid_compare_summary.json` 和 `cleanup_manifest.json`。该 `generated/` 路径由
+`.gitignore` 忽略；这些生成证据只保存在本地，不纳入 Git。
+
+迁移预检保留旧字符串身份：只接受规范十进制行键，并拒绝仍引用 UUID、TEXT
+等非整数 id 来源表的保留 Refine Runs。验证结果为 Pipeline smoke 1,141 passed、
+1 skipped；make test 中 Backend 83 passed、Pipeline 1,075 passed、67 skipped，
+迁移 PostgreSQL 集成测试 8 passed。

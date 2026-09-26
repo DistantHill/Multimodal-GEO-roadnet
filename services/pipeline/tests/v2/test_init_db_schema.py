@@ -8,7 +8,7 @@ from track.v2.cli.init_db import (
     POST_DDL_STATEMENTS,
     SCHEMA_COMPONENT,
     SCHEMA_VERSION,
-    _require_empty_or_v7,
+    _require_empty_or_current,
 )
 
 
@@ -16,9 +16,9 @@ def _ddl(table: str) -> str:
     return dict(DDL_STATEMENTS)[table]
 
 
-def test_schema_v7_is_an_explicit_destructive_contract() -> None:
+def test_schema_v8_is_an_explicit_destructive_contract() -> None:
     assert SCHEMA_COMPONENT == "track.v2"
-    assert SCHEMA_VERSION == 7
+    assert SCHEMA_VERSION == 8
     assert "pipeline_schema_versions" in dict(DDL_STATEMENTS)
 
 
@@ -32,8 +32,9 @@ def test_refine_tables_store_only_v3_source_membership() -> None:
     assert "source_fingerprint" in refine
     assert "source_kind" not in refine
     assert "target_table" not in refine
-    assert "source_row_key          TEXT NOT NULL" in kept
+    assert "source_row_key          BIGINT NOT NULL" in kept
     assert "trajectory_point_id" not in kept
+    assert "source_row_key  BIGINT NOT NULL" in excluded
     assert "PRIMARY KEY (refine_id, source_row_key)" in excluded
     assert "after_sequence_in_subtrack" in injected
     assert "from_source" not in injected
@@ -281,14 +282,14 @@ class _VersionCursor:
 
 def test_unversioned_legacy_schema_is_refused_without_reset() -> None:
     with pytest.raises(RuntimeError, match="no legacy in-place migration"):
-        _require_empty_or_v7(_VersionCursor(None, ["refine_runs"]))
+        _require_empty_or_current(_VersionCursor(None, ["refine_runs"]))
 
 
-def test_existing_v7_schema_is_accepted() -> None:
-    _require_empty_or_v7(_VersionCursor(7, ["refine_runs"]))
+def test_existing_v8_schema_is_accepted() -> None:
+    _require_empty_or_current(_VersionCursor(8, ["refine_runs"]))
 
 
-@pytest.mark.parametrize("version", [4, 5, 6])
-def test_existing_v4_v5_or_v6_schema_requires_artifact_migration(version: int) -> None:
+@pytest.mark.parametrize("version", [4, 5, 6, 7])
+def test_existing_v4_through_v7_schema_requires_artifact_migration(version: int) -> None:
     with pytest.raises(RuntimeError, match="--migrate-artifacts"):
-        _require_empty_or_v7(_VersionCursor(version, ["refine_runs"]))
+        _require_empty_or_current(_VersionCursor(version, ["refine_runs"]))

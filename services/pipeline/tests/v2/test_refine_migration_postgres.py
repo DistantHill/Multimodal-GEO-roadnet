@@ -67,7 +67,7 @@ def test_migration_preserves_data_and_completed_artifact_guards(legacy_connectio
         migrate_refine(cur)  # Repeat migration is a no-op.
     assert conn.execute("SELECT version FROM pipeline_schema_versions").fetchone() == (4,)
     assert conn.execute("SELECT id, status FROM refine_runs").fetchone() == (run_id, "completed")
-    assert conn.execute("SELECT refine_id, source_row_key FROM excluded_points").fetchone() == (run_id, "7")
+    assert conn.execute("SELECT refine_id, source_row_key FROM excluded_points").fetchone() == (run_id, 7)
     assert conn.execute("SELECT to_regclass('clean_runs')").fetchone() == (None,)
     assert conn.execute(
         "SELECT to_regprocedure('guard_refine_artifact_mutation()') IS NOT NULL"

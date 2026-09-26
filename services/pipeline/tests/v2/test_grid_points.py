@@ -64,11 +64,17 @@ def test_fetch_points_in_grid_uses_closed_xy_and_bounded_column_batches(monkeypa
     assert batches[0]["next_refined_sequence_in_subtrack"] == (1,)
     assert batches[0]["next_source_id"] == ("trajectory_points",)
     assert batches[1]["prev_point_id"] == (11,)
-    assert data.query.count("%s") == len(data.params)
-    assert "ST_X(ST_Transform(s.geom, 32650)) >= %s" in data.query
-    assert "i.x <= %s" in data.query
-    assert data.params[1:5] == (110.0, 20.0, 111.0, 21.0)
-    assert "s.id = k.source_row_key::bigint" in data.query
+    # Q89 uses a regular statement to materialize the grid hits, then a
+    # server-side cursor only for the bounded neighbour lookups.
+    assert metadata.query.startswith("CREATE TEMP TABLE cross_track_hits_")
+    assert "ON COMMIT DROP AS" in metadata.query
+    assert metadata.query.count("%s") == len(metadata.params)
+    assert "ST_X(ST_Transform(s.geom, 32650)) >= %s" in metadata.query
+    assert "i.x <= %s" in metadata.query
+    assert metadata.params[1:5] == (110.0, 20.0, 111.0, 21.0)
+    assert "s.id = k.source_row_key" in metadata.query
+    assert data.query.count("%s") == len(data.params) == 4
+    assert "FROM cross_track_hits_" in data.query
 
 
 def test_fetch_points_in_grid_rejects_negative_or_out_of_range_index():
@@ -124,7 +130,7 @@ def test_fetch_points_in_grid_postgis_closed_boundary_neighbours_and_batches():
                 CREATE INDEX source_points_geom_idx ON source_points USING gist (geom);
                 CREATE TABLE kept_trajectory_points (
                     id bigint PRIMARY KEY, refine_id uuid NOT NULL,
-                    source_row_key text NOT NULL, vehicle_id text NOT NULL,
+                    source_row_key bigint NOT NULL, vehicle_id text NOT NULL,
                     subtrack_index integer NOT NULL,
                     sequence_in_subtrack integer NOT NULL
                 );

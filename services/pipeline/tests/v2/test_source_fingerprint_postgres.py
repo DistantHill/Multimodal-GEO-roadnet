@@ -49,20 +49,20 @@ def fingerprint_connection() -> Iterator[Any]:
                 ) ON COMMIT DROP;
                 CREATE TEMP TABLE kept_trajectory_points (
                     refine_id text NOT NULL,
-                    source_row_key text COLLATE "C" NOT NULL
+                    source_row_key bigint NOT NULL
                 ) ON COMMIT DROP;
                 CREATE TEMP TABLE excluded_points (
                     refine_id text NOT NULL,
-                    source_row_key text COLLATE "C" NOT NULL
+                    source_row_key bigint NOT NULL
                 ) ON COMMIT DROP;
                 INSERT INTO pg_temp.fingerprint_source VALUES
                     (2, '车辆甲', 2, 121.5, 31, NULL, 0, '{"z":1,"a":"中文"}'),
                     (10, 'truck', 10, 120, 30, 90, 2, NULL),
                     (99, 'unreferenced', 99, 100, 20, 0, 1, '{}');
                 INSERT INTO pg_temp.kept_trajectory_points VALUES
-                    ('refine-1', '2'), ('refine-1', '2'), ('other-refine', '99');
+                    ('refine-1', 2), ('refine-1', 2), ('other-refine', 99);
                 INSERT INTO pg_temp.excluded_points VALUES
-                    ('refine-1', '2'), ('refine-1', '10')
+                    ('refine-1', 2), ('refine-1', 10)
             """)
             conn.execute("SET LOCAL cursor_tuple_fraction=0.37; SET LOCAL statement_timeout='5s'")
             yield conn
@@ -143,12 +143,12 @@ def test_postgres_missing_reference_closes_cursor_without_aborting_transaction(
         calculate_source_fingerprint(conn, "refine-1", _CONTRACT, fetch_size=1)
     _assert_caller_transaction_is_intact(conn)
     assert conn.execute(
-        "SELECT count(*) FROM pg_temp.excluded_points WHERE source_row_key = '404'"
+        "SELECT count(*) FROM pg_temp.excluded_points WHERE source_row_key = 404"
     ).fetchone() == (1,)
 
     # Recovery is the caller's choice; a Python validation error must not leave
     # PostgreSQL INERROR or silently roll back earlier work in this transaction.
-    conn.execute("DELETE FROM pg_temp.excluded_points WHERE source_row_key = '404'")
+    conn.execute("DELETE FROM pg_temp.excluded_points WHERE source_row_key = 404")
     recovered = calculate_source_fingerprint(conn, "refine-1", _CONTRACT, fetch_size=2)
     assert recovered == _expected_fingerprint()
     _assert_caller_transaction_is_intact(conn)

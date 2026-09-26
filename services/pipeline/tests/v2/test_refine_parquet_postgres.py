@@ -197,8 +197,8 @@ def test_real_refine_export_publish_register_and_complete(refine_database, tmp_p
                  public.ST_SetSRID(public.ST_MakePoint(s.lon, s.lat),4326),32650)),
                public.ST_Y(public.ST_Transform(
                  public.ST_SetSRID(public.ST_MakePoint(s.lon, s.lat),4326),32650)),
-               s.heading, s.speed, k.source_row_key
-          FROM kept_trajectory_points k JOIN source_points s ON s.id = k.source_row_key::bigint
+               s.heading, s.speed, k.source_row_key::text
+          FROM kept_trajectory_points k JOIN source_points s ON s.id = k.source_row_key
          WHERE k.refine_id = %s ORDER BY k.sequence_in_subtrack
     """, (run_id,)).fetchall()
     kept_names = [column.name for column in REFINE_PARQUET_V1["kept_points"]]

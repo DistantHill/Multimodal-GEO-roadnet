@@ -1,11 +1,46 @@
+from contextlib import nullcontext
+from dataclasses import replace
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from scripts.cv_human_check import cv_preview
 from scripts.cv_human_check.preview import (
     METHODS, count_quantile, fit_profile, normalize, raster_tile, split_tiles, write_report,
 )
+from track.v2.config import PostgresConfig
+
+
+@pytest.mark.parametrize("database, expected", [(None, "configured"), ("requested", "requested")])
+def test_main_loads_pipeline_config_and_optionally_overrides_database(
+        monkeypatch, tmp_path, database, expected):
+    postgres = PostgresConfig(
+        host="postgres", port=5432, database="configured", user="roadnet", password="secret",
+        connect_timeout=10, sslmode=None, keepalives=True, keepalives_idle=30,
+        keepalives_interval=10, keepalives_count=3, tcp_user_timeout=30_000,
+    )
+    connected = []
+    connection = SimpleNamespace(execute=lambda _statement: None)
+    argv = ["cv-preview", "--detect-id", "00000000-0000-0000-0000-000000000001",
+            "--output", str(tmp_path / "out")]
+    if database:
+        argv.extend(("--database", database))
+
+    monkeypatch.setattr(cv_preview, "load_startup_config",
+                        lambda: SimpleNamespace(postgres=postgres))
+    monkeypatch.setattr(cv_preview, "connect",
+                        lambda config: connected.append(config) or nullcontext(connection))
+    monkeypatch.setattr(cv_preview, "fetch_detect_row",
+                        lambda conn, value: (_ for _ in ()).throw(RuntimeError("stop after connect")))
+    monkeypatch.setattr("sys.argv", argv)
+
+    with pytest.raises(RuntimeError, match="stop after connect"):
+        cv_preview.main()
+
+    assert len(connected) == 1
+    assert connected[0] == replace(postgres, database=expected)
 
 
 def test_weighted_quantiles_match_expanded_pixel_population():

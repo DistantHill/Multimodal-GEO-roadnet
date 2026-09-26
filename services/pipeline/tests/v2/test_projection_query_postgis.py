@@ -50,7 +50,7 @@ def test_postgis_prefilter_matches_exact_oracle_and_returns_run_xy() -> None:
                 CREATE INDEX ON projection_raw USING gist (geom);
                 CREATE TEMP TABLE kept_trajectory_points (
                     id bigint PRIMARY KEY, refine_id text NOT NULL, vehicle_id text NOT NULL,
-                    source_row_key text NOT NULL, subtrack_index integer NOT NULL,
+                    source_row_key bigint NOT NULL, subtrack_index integer NOT NULL,
                     sequence_in_subtrack integer NOT NULL
                 ) ON COMMIT DROP;
                 CREATE TEMP TABLE injected_points (

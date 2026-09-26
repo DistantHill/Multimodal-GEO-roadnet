@@ -69,8 +69,8 @@ WITH target_detect AS (SELECT %s::uuid AS detect_id), member_evidence AS (
 
 TABLES = (
     TableSpec("refine.kept_points", ("refine",), """
-      SELECT source_row_key, vehicle_id, subtrack_index, sequence_in_subtrack
-      FROM kept_trajectory_points WHERE refine_id=%s ORDER BY source_row_key
+      SELECT source_row_key::text, vehicle_id, subtrack_index, sequence_in_subtrack
+      FROM kept_trajectory_points WHERE refine_id=%s ORDER BY source_row_key::text
     """, (("vehicle_id", "exact"), ("subtrack_index", "exact"), ("sequence", "exact"))),
     TableSpec("refine.injected_points", ("refine",), """
       SELECT jsonb_build_array(vehicle_id,subtrack_index,after_sequence_in_subtrack,generated_reason)::text,
@@ -80,12 +80,12 @@ TABLES = (
     """, (("timestamp", "float"), ("lon", "degree"), ("lat", "degree"),
            ("x", "metre"), ("y", "metre"), ("heading", "float"), ("speed", "float"))),
     TableSpec("refine.excluded_points", ("refine",), """
-      SELECT source_row_key,reason FROM excluded_points WHERE refine_id=%s ORDER BY source_row_key
+      SELECT source_row_key::text,reason FROM excluded_points WHERE refine_id=%s ORDER BY source_row_key::text
     """, (("reason", "exact"),)),
     TableSpec("detect.resolved_points", ("detect", "detect"), _SEMANTIC_KEYS + """
       SELECT jsonb_build_array(r.subtrack_index,r.sequence_in_subtrack)::text,
              r.refined_sequence_in_subtrack,
-             CASE WHEN k.id IS NOT NULL THEN jsonb_build_array('kept',k.source_row_key)::text
+             CASE WHEN k.id IS NOT NULL THEN jsonb_build_array('kept',k.source_row_key::text)::text
                   WHEN n.id IS NOT NULL THEN jsonb_build_array('injected',n.vehicle_id,n.subtrack_index,
                                                                n.after_sequence_in_subtrack,n.generated_reason)::text
                   ELSE jsonb_build_array('crossing',COALESCE(q.business_key,'__UNCOMPARABLE_CROSSING__'))::text

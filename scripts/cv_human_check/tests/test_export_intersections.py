@@ -1,11 +1,50 @@
+from contextlib import nullcontext
 import json
+from types import SimpleNamespace
+import uuid
 
 import numpy as np
 from PIL import Image
 import pytest
 
+from scripts.cv_human_check import export_intersections
 from scripts.cv_human_check.export_intersections import crop_grid, rasterize, unique_pixels, write_dataset
 from scripts.cv_human_check.preview import normalize
+from track.v2.config import PostgresConfig
+
+
+def test_main_loads_pipeline_config_and_overrides_database(monkeypatch, tmp_path):
+    postgres = PostgresConfig(
+        host="postgres", port=5432, database="configured", user="roadnet", password="secret",
+        connect_timeout=10, sslmode=None, keepalives=True, keepalives_idle=30,
+        keepalives_interval=10, keepalives_count=3, tcp_user_timeout=30_000,
+    )
+    connected = []
+    connection = SimpleNamespace(execute=lambda _statement: None)
+    detect_id = uuid.uuid4()
+
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(export_intersections, "load_startup_config",
+                        lambda: SimpleNamespace(postgres=postgres))
+    monkeypatch.setattr(export_intersections, "connect",
+                        lambda config: connected.append(config) or nullcontext(connection))
+    monkeypatch.setattr(export_intersections, "fetch_detect_row",
+                        lambda conn, value: (_ for _ in ()).throw(RuntimeError("stop after connect")))
+    monkeypatch.setattr(
+        "sys.argv",
+        ["export_intersections", "--database", "requested", "--detect-id", str(detect_id),
+         "--bbox", "116", "39", "117", "40", "--output", str(tmp_path / "export")],
+    )
+
+    with pytest.raises(RuntimeError, match="stop after connect"):
+        export_intersections.main()
+
+    assert len(connected) == 1
+    assert connected[0] == PostgresConfig(
+        host="postgres", port=5432, database="requested", user="roadnet", password="secret",
+        connect_timeout=10, sslmode=None, keepalives=True, keepalives_idle=30,
+        keepalives_interval=10, keepalives_count=3, tcp_user_timeout=30_000,
+    )
 
 
 def test_circle_crop_preserves_full_extent_on_negative_global_grid():

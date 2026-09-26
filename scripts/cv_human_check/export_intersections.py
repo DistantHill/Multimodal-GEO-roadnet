@@ -15,7 +15,8 @@ import uuid
 import numpy as np
 from PIL import Image
 
-from track.v2.config import connect, default_postgres_config
+from track.v2.cli._startup import load_startup_config
+from track.v2.config import connect
 from track.v2.db.queries import fetch_detect_row, fetch_intersections
 from track.v2.db.source_table import validate_source_table, verify_refine_source_fingerprint
 from track.v2.projection import CoordinateTransformer
@@ -188,7 +189,8 @@ def main() -> int:
         parser.error("output must be a new directory under DATA_ROOT, outside the repository")
     if output.exists():
         parser.error("output exists; choose a new directory")
-    with connect(replace(default_postgres_config(), database=args.database)) as conn:
+    pipeline_config = load_startup_config()
+    with connect(replace(pipeline_config.postgres, database=args.database)) as conn:
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         conn.execute("SET LOCAL statement_timeout = '180s'")
         run = fetch_detect_row(conn, str(args.detect_id))

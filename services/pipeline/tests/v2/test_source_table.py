@@ -20,6 +20,10 @@ from track.v2.db.source_table import (
 )
 
 
+def test_source_table_ids_are_limited_to_integer_types() -> None:
+    assert set(source_table._KEY_TYPES) == {"int2", "int4", "int8"}
+
+
 def test_source_table_name_is_schema_qualified_and_safely_quoted() -> None:
     assert quote_table_name("public.day01") == '"public"."day01"'
     assert quote_table_name("trajectory_points") == '"trajectory_points"'
@@ -188,8 +192,8 @@ def test_fingerprint_preserves_v1_digest_with_bounded_named_cursor(fetch_size: i
     assert "SELECT source_row_key FROM kept_trajectory_points WHERE refine_id = %s UNION" in query
     assert "SELECT source_row_key FROM excluded_points WHERE refine_id = %s" in query
     assert 'LEFT JOIN "public"."day01" AS source' in query
-    assert "source.id = referenced.source_row_key::bigint" in query
-    assert query.endswith("ORDER BY referenced.source_row_key")
+    assert "source.id = referenced.source_row_key" in query
+    assert query.endswith("ORDER BY referenced.source_row_key::text")
 
 
 def test_fingerprint_defaults_to_bounded_fetch_and_unique_cursor_names() -> None:

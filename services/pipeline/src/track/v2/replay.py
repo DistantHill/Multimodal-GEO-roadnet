@@ -132,6 +132,13 @@ def replay_centerline_inputs(
     )
 
 
+def _stringify_source_row_key(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Keep persisted BIGINT source identities aligned with PointRef/API strings."""
+    if row is not None and row.get("source_row_key") is not None:
+        row["source_row_key"] = str(row["source_row_key"])
+    return row
+
+
 def _replay_fit_endpoint(point: Any, *, expected_type: int) -> ReplayFitEndpoint:
     if (
         point.crossing_id is None
@@ -311,17 +318,21 @@ class PostgresReplayStore:
             if target.kind == "source_point":
                 return self._get_source_point(refine_id, str(target.id))
             if target.kind == "excluded_point":
-                return self._get_json_row(
+                row = self._get_json_row(
                     "excluded_points",
-                    "refine_id = %s AND source_row_key = %s",
+                    "refine_id = %s AND source_row_key = %s::bigint",
                     (refine_id, str(target.id)),
                 )
+                return _stringify_source_row_key(row)
             table = _ENTITY_TABLES[target.kind]
-            return self._get_json_row(
+            row = self._get_json_row(
                 table,
                 "id = %s AND refine_id = %s",
                 (int(target.id), refine_id),
             )
+            if target.kind == "kept_trajectory_point":
+                return _stringify_source_row_key(row)
+            return row
         if target.kind in DETECT_REPLAY_KINDS:
             detect_id = self._require_detect_target(target)
             table = _ENTITY_TABLES[target.kind]

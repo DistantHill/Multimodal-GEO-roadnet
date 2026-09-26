@@ -786,10 +786,10 @@ WITH points AS (
         s.timestamp, s.lon, s.lat,
         ST_X(ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), {srid})) AS x,
         ST_Y(ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), {srid})) AS y,
-        s.heading, s.speed, k.source_row_key, NULL::text AS generated_reason,
+        s.heading, s.speed, k.source_row_key::text AS source_row_key, NULL::text AS generated_reason,
         NULL::integer AS after_sequence_in_subtrack
  FROM {result_schema}.kept_trajectory_points k JOIN {contract.quoted_table} s
-   ON s.id = k.source_row_key::{contract.key_sql_type}
+   ON s.id = k.source_row_key
  WHERE k.refine_id = {run}::uuid
  UNION ALL
  SELECT i.refine_id, i.id, i.vehicle_id, i.subtrack_index,
