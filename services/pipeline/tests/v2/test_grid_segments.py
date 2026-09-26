@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from track.v2.grid_cross_track_candidates import GridSegmentBudgetError, build_grid_segments
+from track.v2.candidates.grid_segments import GridSegmentBudgetError, build_grid_segments
 
 
 def _point(point_id, sequence, x, *, kind=0):

@@ -18,11 +18,11 @@ import argparse
 import time
 
 from ..config import connect as pg_connect
-from ..logger import init_logger, shutdown_logger
+from ..telemetry.console_logging import init_logger, shutdown_logger
 from ..models import CsvSource
-from .. import get_database
-from ..db_writer import insert_trajectory_points
-from ._startup import load_startup_config
+from ..trajectories.read_source import get_database
+from ..db.insert_trajectory_points import insert_trajectory_points
+from ._load_config import load_startup_config
 
 
 # ── Import logic ─────────────────────────────────────────────────────

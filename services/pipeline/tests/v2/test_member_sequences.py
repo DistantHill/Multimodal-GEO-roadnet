@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from track.v2.member_sequences import (
+from track.v2.intersections.member_sequences import (
     ConcatSequence, PointRefSequence, ReadOnlySequence, SliceSequence,
     iter_member_identities, reference_source_ids, summarize_events,
 )

@@ -339,7 +339,10 @@ Q78 规定后续项目用语：Pipeline 冒烟测试使用
 代码事实（2026-09-24 核查）：当前 Detect 大表从 Refine Parquet 读取，
 `RefineDatasetReader.__enter__` 将保留点和注入点合成 `refine_points` 视图；
 Refine 导出 Parquet 时从 PostgreSQL 保留点归属表关联源点，并合并注入点。
-见 `services/pipeline/src/track/v2/refine_parquet.py:73-109,778-807`。
+见 `services/pipeline/src/track/v2/trajectories/results/read_parquet.py` 的
+`RefineDatasetReader.__enter__` 和
+`services/pipeline/src/track/v2/trajectories/results/export_to_parquet.py` 的
+`export_refine_parquet()`。
 现有 PostgreSQL GiST 索引覆盖源轨迹点和注入点，保留点归属表本身没有几何列；
 见 `services/pipeline/src/track/v2/cli/init_db.py:125-167,555-582`。
 

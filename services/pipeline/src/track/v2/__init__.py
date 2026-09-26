@@ -19,11 +19,11 @@ from importlib import import_module as _import_module
 # before its spawned process initializer can configure native thread counts.
 # Public stage functions and model classes retain their original identities.
 _MODULE_EXPORTS = {
-    "refine": ("refine_vehicle",),
-    "clip": ("extract_clips", "extract_clips_for_detect"),
-    "fitting": ("fit_centerlines", "fit_centerline_variants"),
-    "detect": ("IntersectConfig", "IntersectResult", "detect_intersections"),
-    "network": ("build_network",),
+    "trajectories.refine_trajectories": ("refine_vehicle",),
+    "clips.extract_clips": ("extract_clips", "extract_clips_for_detect"),
+    "centerlines.fit_centerlines": ("fit_centerlines", "fit_centerline_variants"),
+    "intersections.detect_intersections": ("IntersectConfig", "IntersectResult", "detect_intersections"),
+    "road_network.build_road_network": ("build_network",),
     "models": (
         "Centerline", "CenterlineFitBundle", "RefineConfig", "ClipConfig",
         "ClipEndpoint", "ClipInput", "ClipIntersection", "ClipPoint", "ClipReport",
@@ -32,13 +32,13 @@ _MODULE_EXPORTS = {
         "NetworkReport", "NetworkResult", "PointRef", "PostgresSource", "ProjectionConfig",
         "ResolvedTrackPoint", "SpatialContext", "TrackClip", "TrajectoryPoint",
     ),
-    "parser": ("get_database",),
+    "trajectories.read_source": ("get_database",),
     "projection": (
         "ProjectionError", "QueryWindow", "QueryWindowRequest", "build_query_window",
         "create_spatial_context",
     ),
-    "replay": ("ReplayService", "ReplayTarget", "replay_centerline_inputs"),
-    "pipeline": ("PipelineInput", "PipelineResult"),
+    "validation.replay_lineage": ("ReplayService", "ReplayTarget", "replay_centerline_inputs"),
+    "orchestration.run_pipeline": ("PipelineInput", "PipelineResult"),
 }
 _EXPORT_MODULE = {
     name: module for module, names in _MODULE_EXPORTS.items() for name in names

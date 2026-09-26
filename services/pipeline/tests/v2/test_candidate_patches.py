@@ -8,17 +8,17 @@ from unittest.mock import patch
 
 import pytest
 
-from track.v2.detect_candidates import extract_cross_track_candidates, extract_turn_candidates
-from track.v2.candidate_patches import (
+from track.v2.candidates.collect_candidates import extract_cross_track_candidates, extract_turn_candidates
+from track.v2.candidates.build_patches import (
     build_cross_track_index,
     iter_cross_track_patches,
     iter_track_patches,
 )
-from track.v2.cross_track import _prepare_segments, extract_cross_track_candidates_reference
-from track.v2.detect import IntersectConfig
+from track.v2.candidates.detect_cross_track_pairs import _prepare_segments, extract_cross_track_candidates_reference
+from track.v2.intersections.detect_intersections import IntersectConfig
 from track.v2.models import PointRef, RefinedPointRef, SpatialContext, TrajectoryPoint
 from track.v2.projection import CoordinateTransformer
-from track.v2.turn_events import detect_turn_patch
+from track.v2.candidates.detect_turn_events import detect_turn_patch
 
 
 _CONTEXT = SpatialContext(

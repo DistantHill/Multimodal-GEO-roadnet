@@ -1,6 +1,6 @@
 from unittest.mock import MagicMock, patch
 
-from track.v2.detect import _run_columnar_db_detect
+from track.v2.intersections.detect_intersections import _run_columnar_db_detect
 
 from .config_factory import intersect_run_config
 from .test_detect import _TEST_SPATIAL_CONTEXT
@@ -21,10 +21,10 @@ def test_db_detect_uses_grid_task_and_keeps_turn_reader():
     connector = lambda: object()
     main_conn = object()
     with (
-        patch("track.v2.detect.run_grid_cross_track_task", return_value=[]) as grid_task,
-        patch("track.v2.detect.extract_columnar_cross_track_candidates") as old_pairs,
-        patch("track.v2.detect._cluster_pipeline", return_value=([], [])),
-        patch("track.v2.detect._build_topologies_from_tracks", return_value=([], [], [])),
+        patch("track.v2.intersections.detect_intersections.run_grid_cross_track_task", return_value=[]) as grid_task,
+        patch("track.v2.intersections.detect_intersections.extract_columnar_cross_track_candidates") as old_pairs,
+        patch("track.v2.intersections.detect_intersections._cluster_pipeline", return_value=([], [])),
+        patch("track.v2.intersections.detect_intersections._build_topologies_from_tracks", return_value=([], [], [])),
     ):
         result = _run_columnar_db_detect(
             cfg, _TEST_SPATIAL_CONTEXT, reader,

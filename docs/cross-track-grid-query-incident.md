@@ -75,7 +75,7 @@
 
 ### 4. 游标修复
 
-`src/track/v2/db/grid_points.py`现在把原查询拆成同一事务中的两步：
+`src/track/v2/db/fetch_refine_points_in_grid.py`（原 `db/grid_points.py`）现在把原查询拆成同一事务中的两步：
 
 ```text
 普通 SQL：CREATE TEMP TABLE cross_track_hits_<uuid> ON COMMIT DROP AS
@@ -111,7 +111,7 @@
 
 ### 6. 事故相关文件
 
-- 实现：`src/track/v2/db/grid_points.py`
+- 实现：`src/track/v2/db/fetch_refine_points_in_grid.py`（由 `db/grid_points.py` 迁移）
 - 热点列表和游标计划脚本：`scripts/explain_grid_queries.py`
 - 原始源点计数：`generated/cross-track-point-counts/points_counts.json`
 - 原始普通 SQL 计划：`generated/cross-track-explain/plain_plan_3_6.json`

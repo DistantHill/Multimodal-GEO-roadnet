@@ -3,8 +3,8 @@
 状态：已实施。用户授权按纯结构重构一次完成并以单个提交交付。
 
 本文遵循[项目术语与写作规范](terminology.md)，说明如何把当前集中在
-`track.v2.pipeline.run_pipeline()` 中的阶段实现提取为独立阶段运行器，使
-`pipeline.py` 只保留数据处理流水线（Pipeline）的顺序编排、阶段选择和最终结果汇总。
+`track.v2.orchestration.run_pipeline.run_pipeline()` 中的阶段实现提取为独立阶段运行器，使
+`orchestration/run_pipeline.py` 只保留数据处理流水线（Pipeline）的顺序编排、阶段选择和最终结果汇总。
 
 ## 1. 背景
 
@@ -20,8 +20,8 @@
 - 执行路网构建阶段（Network）；
 - 汇总全部统计字段并发送阶段事件。
 
-算法实现已经分别位于 `refine.py`、`detect.py`、`clip.py`、`fitting.py` 和
-`network.py`，但阶段生命周期仍内联在 `pipeline.py`。这使 Pipeline 编排器同时依赖
+算法实现已经分别位于 `trajectories/refine_trajectories.py`、`intersections/detect_intersections.py`、
+`intersections/extract_topology.py`、`clips/extract_clips.py`、`centerlines/fit_centerlines.py` 和 `road_network/build_road_network.py`，但阶段生命周期仍内联在 `orchestration/run_pipeline.py`。这使 Pipeline 编排器同时依赖
 算法、数据库、文件发布、阶段进度和失败恢复细节，增加了审查、测试和后续修改的耦合。
 
 ## 2. 范围说明
@@ -59,7 +59,7 @@
 
 ### 3.1 目标
 
-1. `pipeline.py` 只负责：
+1. `orchestration/run_pipeline.py` 只负责：
    - 输入校验；
    - PostgreSQL 连接和数据库结构版本校验；
    - 新建或复用 Refine 的选择；
@@ -90,35 +90,35 @@
 
 ```text
 services/pipeline/src/track/v2/
-├── pipeline.py
-├── stage_types.py                # 阶段引用、结果及 Clip 资源所有权
-├── stage_support.py              # 仅包含真正通用的事件和计时辅助函数
-├── refine_stage.py
-├── detect_stage.py
-├── clip_stage.py
-├── fitting_stage.py
-├── network_stage.py
+├── orchestration/run_pipeline.py
+├── stages/types.py                # 阶段引用、结果及 Clip 资源所有权
+├── stages/support.py              # 仅包含真正通用的事件和计时辅助函数
+├── stages/refine.py
+├── stages/detect.py
+├── stages/clip.py
+├── stages/fitting.py
+├── stages/network.py
 │
-├── refine.py                     # Refine 算法
-├── detect.py                     # Detect 算法
-├── clip.py                       # Clip 算法
-├── fitting.py                    # Fitting 算法
-├── network.py                    # Network 算法
-├── pipeline_events.py
+├── trajectories/refine_trajectories.py # Refine 算法
+├── intersections/detect_intersections.py # Detect 交叉口检测
+├── clips/extract_clips.py       # Clip 算法
+├── centerlines/fit_centerlines.py # Fitting 中心线算法
+├── road_network/build_road_network.py # Network 算法
+├── orchestration/events.py
 └── db/
     └── pipeline_store.py
 ```
 
 `services/pipeline/generated/refine_stage.py` 只作为审查样板，位于被 Git 忽略的目录，
 不得成为正式运行时导入路径。实施时应根据当前接口修正后迁入
-`services/pipeline/src/track/v2/refine_stage.py`。
+`services/pipeline/src/track/v2/stages/refine.py`。
 
 ## 5. 阶段间数据模型
 
-以下阶段引用、结果及 `ClipStageResult` 统一定义于 `stage_types.py`。该模块只依赖
-现有模型、制品描述符及持久化结果类型，不导入 `pipeline.py` 或任何阶段运行器。
-`PipelineInput`、`PipelineResult` 留在 `pipeline.py`，阶段运行器不依赖这两个编排类型，
-避免循环导入。`stage_support.py` 不承担类型容器职责。
+以下阶段引用、结果及 `ClipStageResult` 统一定义于 `stages/types.py`。该模块只依赖
+现有模型、制品描述符及持久化结果类型，不导入 `orchestration/run_pipeline.py` 或任何阶段运行器。
+`PipelineInput`、`PipelineResult` 留在 `orchestration/run_pipeline.py`，阶段运行器不依赖这两个编排类型，
+避免循环导入。`stages/support.py` 不承担类型容器职责。
 
 ### 5.1 持久化阶段引用
 
@@ -194,7 +194,7 @@ Clip 的结果包含延迟读取资源，单独采用可关闭对象，见 8.3�
 
 ## 6. 公共阶段辅助边界
 
-建议新增 `stage_support.py`，第一版只容纳以下无状态辅助函数：
+建议新增 `stages/support.py`，第一版只容纳以下无状态辅助函数：
 
 ```python
 def emit_message(emit: EventSink, message: str) -> None: ...
@@ -216,7 +216,7 @@ def log_stage_finish(stage: str, started_at: float, **run_ids: object) -> float:
 ## 7. 目标 Pipeline 编排
 
 目标代码形态如下，参数与第 8 节的阶段签名保持一致。新建与复用选择直接保留在
-`pipeline.py`；新建分支也在此由 `config.projection` 创建 `SpatialContext`，复用分支
+`orchestration/run_pipeline.py`；新建分支也在此由 `config.projection` 创建 `SpatialContext`，复用分支
 始终采用历史 Run 的空间上下文，不使用本次投影配置覆盖它。
 
 ```python
@@ -736,8 +736,8 @@ Fitting 的 `compute_elapsed_s`、`persist_elapsed_s` 仍服务于现有 `fit_co
 
 ### C1：建立阶段类型和公共辅助函数
 
-- 在 `stage_types.py` 新增阶段引用和结果数据类，避免反向导入 Pipeline；
-- 新增最小 `stage_support.py`；
+- 在 `stages/types.py` 新增阶段引用和结果数据类，避免反向导入 Pipeline；
+- 新增最小 `stages/support.py`；
 - 不改变 `run_pipeline()` 行为；
 - 同步调整 `test_pipeline_events.py` 的报告辅助函数导入并保留格式断言；
 - 添加类型和事件辅助函数单元测试。
@@ -795,7 +795,7 @@ Fitting 的 `compute_elapsed_s`、`persist_elapsed_s` 仍服务于现有 `fit_co
 - 运行 Pipeline 测试；
 - 运行真实 PostgreSQL 与 Parquet 集成测试；
 - 运行 `make test`；
-- 更新与 `pipeline.py` 旧行号或旧职责描述相关的技术文档。
+- 更新与 `orchestration/run_pipeline.py` 旧行号或旧职责描述相关的技术文档。
 
 ## 14. 测试计划
 
@@ -848,11 +848,11 @@ Detect 须覆盖结果行提交后、Parquet 导出前关闭暂存关系，计�
 | --- | --- |
 | `test_run_pipeline_lifecycle.py` | 将阶段故障注入和事务断言迁至对应阶段测试；保留新建/复用、顺序、上下文及完整统计映射的编排断言 |
 | `test_pipeline_config_wiring.py` | 分阶段更新算法、读取器和发布函数的 patch 位置；保留至少一条真实阶段运行器串联、底层依赖替换的非默认配置接线测试 |
-| `test_pipeline_events.py` | 报告辅助函数改从 `stage_support.py` 导入；保留整数格式、事件适配器和 CLI 报告行为测试 |
+| `test_pipeline_events.py` | 报告辅助函数改从 `stages/support.py` 导入；保留整数格式、事件适配器和 CLI 报告行为测试 |
 | `test_turn_event_wiring.py` | Detect 暂存释放、提交和取消用例改用阶段测试 fixture；算法内部关系测试保留原归属，移除对旧生命周期测试 fixture 的依赖 |
 | `test_pipeline_api.py` | 保留公开导出、冻结数据类、CLI 调用签名与失败时 reporter 关闭测试 |
 
-不得为了迁移后继续 patch 旧符号而在 `pipeline.py` 保留无用兼容导入。完整统计测试必须
+不得为了迁移后继续 patch 旧符号而在 `orchestration/run_pipeline.py` 保留无用兼容导入。完整统计测试必须
 比较第 10 节的键集合和值，验证复用时仅省略三个 Refine 键，不能只检查 Run ID。
 
 ### 14.3 集成测试
@@ -876,7 +876,7 @@ Detect 须覆盖结果行提交后、Parquet 导出前关闭暂存关系，计�
    - `fit_centerline_variants()`；
    - `build_network()`；
    - `export_refine_parquet()`；
-   - `export_detect_parquet()`；
+   - `export_detect_results_to_parquet()`；
    - `create_staging()`、`publish()` 或 `abandon_staging()`。
 2. `run_pipeline()` 不包含阶段私有 `try/except`、批量刷新循环或来源指纹逻辑。
 3. 五个阶段分别具有独立运行器和强类型结果。
@@ -902,7 +902,7 @@ Detect 须覆盖结果行提交后、Parquet 导出前关闭暂存关系，计�
 | Detect 只在最终清理时关闭结果 | 导出时叠加计算暂存与导出资源 | 结果行提交后立即释放，测试断言发生于导出前 |
 | 阶段结果携带大型对象过久 | 增加内存占用 | 引用与结果分离，Detect 内部关闭 `IntersectResult` |
 | 传入完整 `PipelineConfig` | 阶段间重新耦合 | 只传阶段所需配置分组 |
-| 测试继续 patch `pipeline.py` 内部符号 | 重构后测试脆弱 | 阶段行为测试迁入对应模块，Pipeline 测试只 patch 阶段入口 |
+| 测试继续 patch `orchestration/run_pipeline.py` 内部符号 | 重构后测试脆弱 | 阶段行为测试迁入对应模块，Pipeline 测试只 patch 阶段入口 |
 | 配置接线测试全部改为 mock 阶段 | 实际参数遗漏无法检出 | 保留真实阶段运行器串联的非默认配置接线测试 |
 | 生成目录样板被当作正式源码 | 文件不进入 Git 或部署镜像 | 正式实现迁入 `src/track/v2`，删除或保留样板但禁止导入 |
 
@@ -929,10 +929,10 @@ docs: update pipeline stage ownership
 1. Parser 继续作为 Refine 的读取部分，不增设第六阶段；
 2. Pipeline 保留新建/复用选择与空间上下文创建；阶段运行器不依赖 `PipelineInput`；
 3. 使用 `refine_ref` 与可选 `refine_result`，复用时延续三个计算计数键省略的现状；
-4. 阶段运行器仅接收所需配置分组，类型集中在 `stage_types.py`；
+4. 阶段运行器仅接收所需配置分组，类型集中在 `stages/types.py`；
 5. Clip 明确返回前异常保护与返回后上下文所有权，Detect 明确导出前释放结果；
 6. Detect 最后提取，全部相关生命周期、配置接线及取消测试随阶段同步迁移；
-7. `stage_support.py` 严格限制为无状态事件与计时辅助函数；
+7. `stages/support.py` 严格限制为无状态事件与计时辅助函数；
 8. 公共统计、CLI 消息、计时边界和异常捕获范围保持现状。
 
 更改复用时排除/注入零消息的措辞、增加历史真实计数查询或统一各阶段取消收敛行为，均不在

@@ -9,7 +9,7 @@ import pytest
 from .config_factory import pipeline_config
 from track.v2.config import PostgresConfig, load_pipeline_config
 from track.v2.errors import ConfigError
-from track.v2.detect import IntersectConfig
+from track.v2.intersections.detect_intersections import IntersectConfig
 from track.v2.models import (ClipConfig, FieldConfig, FieldSpec, FittingConfig, NetworkConfig,
                              ProjectionConfig, RefineConfig, RuntimeConfig)
 

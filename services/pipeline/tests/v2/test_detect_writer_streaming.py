@@ -8,7 +8,7 @@ import os
 
 import pytest
 
-from track.v2 import db_writer as writer
+from track.v2.db import write_detect_results as writer
 from track.v2.models import RefinedPointRef, HotspotCluster
 from .writer_relation_helpers import run_resolved_sequence
 from v2.test_db_writer import _build_resolved_rows, _crossing
@@ -190,7 +190,7 @@ def test_refine_vehicle_check_crosses_fetch_batch_boundary():
 
 def test_short_copy_batches_keep_cumulative_heartbeat(monkeypatch, tmp_path):
     from threading import Event
-    from track.v2.heartbeat import operation_heartbeat
+    from track.v2.telemetry.heartbeat import operation_heartbeat
 
     ticks = {1: Event(), 2: Event()}
     messages = []
@@ -222,8 +222,8 @@ def test_short_copy_batches_keep_cumulative_heartbeat(monkeypatch, tmp_path):
 
     monkeypatch.setattr(writer, '_iter_refine_member_batches', batches)
     monkeypatch.setattr(writer, '_reserve_ids', lambda *args: (copies[0] + 1,))
-    monkeypatch.setattr('track.v2.heartbeat.time.monotonic', lambda: clock[0])
-    monkeypatch.setattr('track.v2.heartbeat.log_info', lambda message: None)
+    monkeypatch.setattr('track.v2.telemetry.heartbeat.time.monotonic', lambda: clock[0])
+    monkeypatch.setattr('track.v2.telemetry.heartbeat.log_info', lambda message: None)
     with operation_heartbeat('外层写入', emit=emit, interval=.01):
         count, _ = run_resolved_sequence(
             SimpleNamespace(cursor=lambda: nullcontext(Cursor())), 'd', 'r',
@@ -237,7 +237,7 @@ def test_short_copy_batches_keep_cumulative_heartbeat(monkeypatch, tmp_path):
 
 def test_standalone_copy_still_has_its_own_heartbeat(monkeypatch):
     from threading import Event
-    from track.v2.heartbeat import operation_heartbeat
+    from track.v2.telemetry.heartbeat import operation_heartbeat
 
     tick = Event()
 
@@ -250,7 +250,7 @@ def test_standalone_copy_still_has_its_own_heartbeat(monkeypatch):
             assert tick.wait(2), 'standalone COPY lost its heartbeat'
 
     cursor = SimpleNamespace(copy=lambda sql: nullcontext(Copy()))
-    monkeypatch.setattr('track.v2.heartbeat.log_info', lambda message: None)
+    monkeypatch.setattr('track.v2.telemetry.heartbeat.log_info', lambda message: None)
     with operation_heartbeat('外层', emit=emit, interval=.01):
         writer._copy_insert(cursor, 'one_copy', ['id'], [(1,)])
     assert tick.is_set()

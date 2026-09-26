@@ -7,9 +7,9 @@ from dataclasses import FrozenInstanceError, is_dataclass
 from unittest.mock import MagicMock, patch
 
 import track.v2 as v2
-from track.v2.cli.run import run_pipeline as cli_run_pipeline
+from track.v2.cli.run_pipeline import run_pipeline as cli_run_pipeline
 from track.v2.config import PostgresConfig
-from track.v2.pipeline import PipelineInput, PipelineResult
+from track.v2.orchestration.run_pipeline import PipelineInput, PipelineResult
 
 
 class PipelineApiTest(unittest.TestCase):
@@ -33,8 +33,8 @@ class PipelineApiTest(unittest.TestCase):
         pipeline_result = PipelineResult(stats={"detect_id": "detect-1"})
         reporter = MagicMock()
         with (
-            patch("track.v2.cli.run.PipelineReporter", return_value=reporter),
-            patch("track.v2.cli.run._run_pipeline", return_value=pipeline_result) as run,
+            patch("track.v2.cli.run_pipeline.PipelineReporter", return_value=reporter),
+            patch("track.v2.cli.run_pipeline._run_pipeline", return_value=pipeline_result) as run,
         ):
             stats = cli_run_pipeline(
                 self.config,
@@ -52,9 +52,9 @@ class PipelineApiTest(unittest.TestCase):
     def test_cli_adapter_closes_reporter_when_core_fails(self) -> None:
         reporter = MagicMock()
         with (
-            patch("track.v2.cli.run.PipelineReporter", return_value=reporter),
+            patch("track.v2.cli.run_pipeline.PipelineReporter", return_value=reporter),
             patch(
-                "track.v2.cli.run._run_pipeline",
+                "track.v2.cli.run_pipeline._run_pipeline",
                 side_effect=RuntimeError("core failed"),
             ) as run,
             self.assertRaisesRegex(RuntimeError, "core failed"),

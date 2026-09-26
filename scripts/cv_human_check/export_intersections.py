@@ -15,9 +15,9 @@ import uuid
 import numpy as np
 from PIL import Image
 
-from track.v2.cli._startup import load_startup_config
+from track.v2.cli._load_config import load_startup_config
 from track.v2.config import connect
-from track.v2.db.queries import fetch_detect_row, fetch_intersections
+from track.v2.intersections.query_results import fetch_detect_row, fetch_intersections
 from track.v2.db.source_table import validate_source_table, verify_refine_source_fingerprint
 from track.v2.projection import CoordinateTransformer
 

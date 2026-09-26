@@ -10,9 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from track.v2 import turn_event_relation
+from track.v2.candidates import turn_event_relation
 from track.v2.models import PointRef, RefinedPointRef, RuntimeConfig, TrackModel, TurnEvent
-from track.v2.turn_event_relation import TurnCoordinate, TurnEventRelation
+from track.v2.candidates.turn_event_relation import TurnCoordinate, TurnEventRelation
 
 
 def _event(index: int, *, source_ids: tuple[str, ...] = ()) -> TurnEvent:

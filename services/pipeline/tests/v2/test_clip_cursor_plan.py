@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 import pytest
 
-from track.v2.db.queries import fetch_resolved_clip_tracks
-from track.v2.db.cursors import declare_full_scan_cursor
+from track.v2.intersections.query_results import fetch_resolved_clip_tracks
+from track.v2.db.plan_full_scan_cursor import declare_full_scan_cursor
 from .test_clip_fitting_streaming import Connection
 
 
@@ -108,8 +108,8 @@ def test_intersection_lookup_preserves_missing_candidates_and_point_order():
             (4, 1, 3, "v", 1., 2., None, None, None)]
     conn = Connection(rows)
     with (
-        patch("track.v2.db.queries.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s")),
-        patch("track.v2.db.queries.validate_source_table", return_value=SimpleNamespace(quoted_table='"s"', key_sql_type="bigint")),
+        patch("track.v2.intersections.query_results.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s")),
+        patch("track.v2.intersections.query_results.validate_source_table", return_value=SimpleNamespace(quoted_table='"s"', key_sql_type="bigint")),
     ):
         tracks = list(fetch_resolved_clip_tracks(conn, "d", batch_size=2000))
     assert [point.resolved_point_id for point in tracks[0].points] == [1, 2, 3, 4]

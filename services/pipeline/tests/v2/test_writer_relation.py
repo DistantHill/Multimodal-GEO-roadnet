@@ -10,10 +10,10 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from track.v2 import writer_relation
+from track.v2.intersections.relations import source_associations as writer_relation
 from track.v2.models import RefinedPointRef, RuntimeConfig
-from track.v2.writer_relation import WriterRelation
-from track.v2 import db_writer
+from track.v2.intersections.relations.source_associations import WriterRelation
+from track.v2.db import write_detect_results as db_writer
 
 
 def _relation(tmp_path: Path, *, batch_size: int = 2) -> WriterRelation:

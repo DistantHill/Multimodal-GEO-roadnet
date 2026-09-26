@@ -5,11 +5,18 @@ Detect 先提取转向事件（turn events）和跨轨迹候选（cross-track ca
 
 | 位置 | 职责 |
 | --- | --- |
-| `services/pipeline/src/track/v2/candidate_patches.py` | 完整轨迹分块；空间网格构建、容量检查、线段对分块、规范归属去重及长线段回退调度 |
-| `services/pipeline/src/track/v2/turn_events.py` | `detect_turn_patch` 计算一个轨迹任务块中的转向事件 |
-| `services/pipeline/src/track/v2/cross_track.py` | 准备有效线段；`detect_cross_track_patch` 对指定线段对执行精确求交并保留来源追溯信息 |
-| `services/pipeline/src/track/v2/detect_candidates.py` | 调用检测内核、汇总候选、统一编号、报告进度和心跳 |
-| `services/pipeline/src/track/v2/detect.py` | 连接读取、候选提取、全局聚类和拓扑验证阶段 |
+| `services/pipeline/src/track/v2/candidates/build_patches.py` | 完整轨迹分块；空间网格构建、容量检查、线段对分块、规范归属去重及长线段回退调度 |
+| `services/pipeline/src/track/v2/candidates/detect_turn_events.py` | `detect_turn_patch` 计算一个轨迹任务块中的转向事件 |
+| `services/pipeline/src/track/v2/candidates/detect_cross_track_pairs.py` | 准备有效线段；`detect_cross_track_patch` 对指定线段对执行精确求交并保留来源追溯信息 |
+| `services/pipeline/src/track/v2/candidates/dbscan_index.py` | 紧凑存储 DBSCAN 候选索引及活动网格链接 |
+| `services/pipeline/src/track/v2/candidates/cross_track_relation.py` | 保存并流式读取跨轨迹候选及其聚类成员关系 |
+| `services/pipeline/src/track/v2/candidates/turn_event_relation.py` | 保存并流式读取转向事件候选 |
+| `services/pipeline/src/track/v2/candidates/collect_candidates.py` | 调用检测内核、汇总候选、统一编号、报告进度和心跳 |
+| `services/pipeline/src/track/v2/candidates/grid.py` | 根据 Refine 范围划分闭合 XY 网格 |
+| `services/pipeline/src/track/v2/candidates/grid_segments.py` | 从网格读取批次构建有界线段列 |
+| `services/pipeline/src/track/v2/candidates/detect_grid_crossings.py` | 检测网格内跨轨迹交点并调度候选结果 |
+| `services/pipeline/src/track/v2/intersections/detect_intersections.py` | 连接读取、候选提取与全局聚类阶段 |
+| `services/pipeline/src/track/v2/intersections/extract_topology.py` | 按检测簇提取轨迹进出观察并构建交叉口拓扑 |
 
 转向路径由 `iter_track_patches` 按 `stream_batch_size` 输出完整轨迹任务块，
 包含最后不足一个完整批次的任务块。内存入口与数据库入口复用相同调度与汇总逻辑。

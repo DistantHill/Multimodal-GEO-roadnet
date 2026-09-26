@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from track.v2 import fit_centerline_variants
-from track.v2.db_writer import insert_centerline_bundle
+from track.v2.db.write_fitting_results import insert_centerline_bundle
 from track.v2.models import (
     ClipEndpoint,
     ClipPoint,

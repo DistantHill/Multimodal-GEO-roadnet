@@ -3,9 +3,9 @@ from unittest.mock import patch
 
 import pytest
 
-from track.v2.heartbeat import heartbeat_progress, observed_operation, operation_heartbeat
-from track.v2.logger import LiveStatus
-from track.v2.pipeline_events import EventProgressAdapter, PipelineEventKind
+from track.v2.telemetry.heartbeat import heartbeat_progress, observed_operation, operation_heartbeat
+from track.v2.telemetry.console_logging import LiveStatus
+from track.v2.orchestration.events import EventProgressAdapter, PipelineEventKind
 
 
 def test_blocking_operation_emits_repeated_heartbeat_and_stops_on_error():
@@ -17,7 +17,7 @@ def test_blocking_operation_emits_repeated_heartbeat_and_stops_on_error():
         if len(messages) >= 3:
             tick.set()
 
-    with patch('track.v2.heartbeat.log_info'), pytest.raises(RuntimeError, match='query failed'):
+    with patch('track.v2.telemetry.heartbeat.log_info'), pytest.raises(RuntimeError, match='query failed'):
         with operation_heartbeat('提交', emit=emit, interval=.01):
             assert tick.wait(2), 'no heartbeat while caller is blocked'
             raise RuntimeError('query failed')
@@ -34,7 +34,7 @@ def test_nested_operation_reuses_observer_and_reports_batch_counts():
         if '批量查询' in message and '10/100 行' in message:
             tick.set()
 
-    with patch('track.v2.heartbeat.log_info'):
+    with patch('track.v2.telemetry.heartbeat.log_info'):
         with operation_heartbeat('写入', emit=emit, interval=.01):
             with operation_heartbeat('批量查询'):
                 heartbeat_progress(10, total=100)
@@ -83,7 +83,7 @@ def test_optional_progress_detail_reports_hits_and_default_call_remains_compatib
         messages.append(message)
         tick.set()
 
-    with patch('track.v2.heartbeat.log_info'):
+    with patch('track.v2.telemetry.heartbeat.log_info'):
         with operation_heartbeat('跨轨迹', emit=emit, interval=.01):
             heartbeat_progress(1234, unit='线段对', detail='候选命中 56')
             tick.clear()

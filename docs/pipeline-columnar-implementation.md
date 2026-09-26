@@ -844,7 +844,7 @@ Polars 对该逐 pair 标量筛选不会减少搬运，Python 仅解码宽筛保
 用 NumPy 列字典注册 DuckDB 临时关系，再以 `INSERT SELECT` 写入事件和来源 ID。成功提交
 后才推进 relation 计数；失败批整体回滚，先前已提交批保持可读，不存在隐藏延迟缓冲区。
 
-正式 `detect.py` 直接把 `iter_turn_candidates` 的 iterator 以 `stream_batch_size` 喂给批写
+正式 `intersections/detect_intersections.py` 直接把 `iter_turn_candidates` 的 iterator 以 `stream_batch_size` 喂给批写
 API，避免为写入重新构建全量事件列表。nullable BIGINT 使用 Python `int`/`None` 的 object
 数组，避免经过浮点数丢失大于 `2^53` 的身份；浮点列显式使用 `float64`，NaN 即使被注册
 层表示为空值也会被既有 `seal` 校验拒绝。可空的 `g_star_z` 是例外：scanner 若把 NaN
@@ -963,7 +963,7 @@ directed 正反两行均保留且交换方向不等价。Semantic diff 定向真
 
 #### C12e5b — Network 受控参数化重放
 
-新增独立 Network replay 验收模块，以当前 `network.py` 文件字节的固定 SHA-256 锚定受控
+新增独立 Network replay 验收模块，以当前 `road_network/build_road_network.py` 文件字节的固定 SHA-256 锚定受控
 算法版本；运行时哈希不符即 fail closed。`NetworkConfig` 必须仍且仅含
 `include_isolated_nodes: bool=True`，并穷举 false/true 两种配置；新增配置字段或类型、默认值
 变化不会被静默遗漏。该证据的 kind 为 `controlled_replay`，明确标记
@@ -974,7 +974,7 @@ directed 正反两行均保留且交换方向不等价。Semantic diff 定向真
 combined centerline 小表，再由两种配置复用；稳定 intersection identity 由目标 detect 的
 既有 semantic key CTE 单独窄读一次。该路径不读取 trajectory points、clip manifests，也不
 构造全量点对象。最小 Fit adapter 只提供生产 `build_network` 实际消费的 centerlines 与
-detect ID，不伪造 FitReport；生产 Network 算法文件保持不变。
+detect ID，不伪造 FitReport；生产 Network 算法逻辑保持不变。迁移到 `road_network/build_road_network.py` 时，为解析新包层级仅将模型导入改为父包相对路径；现行哈希锚点随之更新到新文件摘要 `7946329a8869879c1c931929829090bb7c8f68a559af03e4cf827338011a9b9f`，原文件摘要 `4986ebfd9cc1f481f488b86f22c59384c363aded58b391f240f47ab6d220fbef` 仍保留在历史验证记录。
 
 规范结果按两种配置分别生成 nodes、edges、issues、report 共八张表。节点以稳定
 intersection identity 为键；无向边按稳定端点 pair 排序，反向时同步反转 points 并交换

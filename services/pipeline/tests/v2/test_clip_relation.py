@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from track.v2 import clip_relation
-from track.v2.clip_relation import ClipRelation
+from track.v2.clips import clip_input as clip_relation
+from track.v2.clips.clip_input import ClipRelation
 from track.v2.models import ClipEndpoint, ClipPoint, RuntimeConfig, TrackClip
 
 

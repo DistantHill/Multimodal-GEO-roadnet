@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from track.v2.grid_cross_track_candidates import iter_grid_candidates
+from track.v2.candidates.detect_grid_crossings import iter_grid_candidates
 from track.v2.models import PointRef, RefinedPointRef
 
 

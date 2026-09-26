@@ -12,8 +12,8 @@ from track.v2.config import PostgresConfig
 from track.v2.config.pipeline_config_loader import PipelineConfig
 from track.v2.db.pipeline_store import RefineBatchResult, DetectPersistenceResult
 from track.v2.db.source_table import SourceTableContract
-from track.v2.db_writer import RefineRunRecord
-from track.v2.detect import IntersectConfig, IntersectResult
+from track.v2.db.write_refine_results import RefineRunRecord
+from track.v2.intersections.detect_intersections import IntersectConfig, IntersectResult
 from track.v2.models import (
     RefineConfig,
     ClipConfig,
@@ -23,8 +23,8 @@ from track.v2.models import (
     ProjectionConfig,
     RuntimeConfig,
 )
-from track.v2.pipeline import PipelineInput, run_pipeline
-from track.v2.pipeline_events import PipelineEvent, PipelineEventKind
+from track.v2.orchestration.run_pipeline import PipelineInput, run_pipeline
+from track.v2.orchestration.events import PipelineEvent, PipelineEventKind
 from track.v2.projection import create_spatial_context
 
 
@@ -254,11 +254,11 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.store = _RecordingStore(self.conn, self.events)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        self.stack.enter_context(patch("track.v2.pipeline.pg_connect", return_value=self.conn))
+        self.stack.enter_context(patch("track.v2.orchestration.run_pipeline.pg_connect", return_value=self.conn))
         self.stack.enter_context(
-            patch("track.v2.pipeline.PostgresPipelineStore", return_value=self.store)
+            patch("track.v2.orchestration.run_pipeline.PostgresPipelineStore", return_value=self.store)
         )
-        self.stack.enter_context(patch("track.v2.pipeline.require_current_schema"))
+        self.stack.enter_context(patch("track.v2.orchestration.run_pipeline.require_current_schema"))
         source_contract = SourceTableContract(
             source_table="raw_points",
             quoted_table='"raw_points"',
@@ -266,15 +266,15 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             has_extra=True,
         )
         self.stack.enter_context(patch(
-            "track.v2.refine_stage.validate_source_table",
+            "track.v2.stages.refine.validate_source_table",
             return_value=source_contract,
         ))
         self.stack.enter_context(patch(
-            "track.v2.detect_stage.validate_source_table",
+            "track.v2.stages.detect.validate_source_table",
             return_value=source_contract,
         ))
         self.fingerprint = {"version": 1, "row_count": 0, "sha256": "0"}
-        for module in ("refine_stage", "detect_stage"):
+        for module in ("stages.refine", "stages.detect"):
             self.stack.enter_context(patch(
                 f"track.v2.{module}.calculate_source_fingerprint",
                 side_effect=lambda *_args: self.events.append("fingerprint") or self.fingerprint,
@@ -286,13 +286,13 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             id="detect-artifact", relative_path=f"detect/{DETECT_ID}",
         )
         self.stack.enter_context(patch(
-            "track.v2.detect_stage.find_refine_artifact",
+            "track.v2.stages.detect.find_refine_artifact",
             side_effect=lambda *_args: SimpleNamespace(
                 descriptor=self.descriptor, state="present",
             ),
         ))
-        self.stack.enter_context(patch("track.v2.detect_stage.RefineDatasetReader", _Reader))
-        for module in ("refine_stage", "detect_stage"):
+        self.stack.enter_context(patch("track.v2.stages.detect.RefineDatasetReader", _Reader))
+        for module in ("stages.refine", "stages.detect"):
             self.stack.enter_context(patch(
                 f"track.v2.{module}.create_staging",
                 side_effect=lambda _root, stage, *_args: self.events.append(
@@ -300,14 +300,14 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 ) or (self.refine_staging if stage == "refine" else self.detect_staging),
             ))
         self.stack.enter_context(patch(
-            "track.v2.refine_stage.export_refine_parquet",
+            "track.v2.stages.refine.export_refine_parquet",
             side_effect=lambda *args, **kwargs: self.events.append("export_refine") or self.descriptor,
         ))
         self.export_detect = self.stack.enter_context(patch(
-            "track.v2.detect_stage.export_detect_parquet",
+            "track.v2.stages.detect.export_detect_results_to_parquet",
             side_effect=lambda *args, **kwargs: self.events.append("export_detect") or self.detect_descriptor,
         ))
-        for module in ("refine_stage", "detect_stage"):
+        for module in ("stages.refine", "stages.detect"):
             self.stack.enter_context(patch(
                 f"track.v2.{module}.publish",
                 side_effect=lambda handle: self.events.append(f"publish:{handle.stage}"),
@@ -315,20 +315,20 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.abandon = MagicMock(
             side_effect=lambda handle: self.events.append(f"abandon:{handle.stage}"),
         )
-        for module in ("refine_stage", "detect_stage"):
+        for module in ("stages.refine", "stages.detect"):
             self.stack.enter_context(patch(
                 f"track.v2.{module}.abandon_staging", new=self.abandon,
             ))
         self.detect = self.stack.enter_context(
-            patch("track.v2.detect_stage.detect_intersections", return_value=_empty_intersect_result())
+            patch("track.v2.stages.detect.detect_intersections", return_value=_empty_intersect_result())
         )
         self.handle = _EmptyHandle()
         self.stack.enter_context(
-            patch("track.v2.refine_stage.get_database", return_value=self.handle)
+            patch("track.v2.stages.refine.get_database", return_value=self.handle)
         )
-        self.stack.enter_context(patch("track.v2.refine_stage.StreamVehicleSource", _EmptyStream))
+        self.stack.enter_context(patch("track.v2.stages.refine.StreamVehicleSource", _EmptyStream))
         self.stack.enter_context(
-            patch("track.v2.fitting_stage.fit_centerline_variants", return_value=self.store.fit_bundle)
+            patch("track.v2.stages.fitting.fit_centerline_variants", return_value=self.store.fit_bundle)
         )
         network_result = MagicMock()
         self.network_report = {
@@ -340,10 +340,10 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         }
         network_result.report.as_dict.return_value = self.network_report
         self.stack.enter_context(patch(
-            "track.v2.network_stage.build_network", return_value=network_result,
+            "track.v2.stages.network.build_network", return_value=network_result,
         ))
         self.log_info = MagicMock()
-        for module in ("stage_support", "detect_stage", "fitting_stage"):
+        for module in ("stages.support", "stages.detect", "stages.fitting"):
             self.stack.enter_context(patch(
                 f"track.v2.{module}.log_info", new=self.log_info,
             ))
@@ -514,7 +514,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         changed = {"version": 1, "row_count": 1, "sha256": "changed"}
         with (
             patch(
-                "track.v2.detect_stage.calculate_source_fingerprint",
+                "track.v2.stages.detect.calculate_source_fingerprint",
                 side_effect=(self.fingerprint, changed),
             ),
             self.assertRaisesRegex(RuntimeError, "Detect source changed"),
@@ -547,7 +547,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 raise RuntimeError("detect publish failed")
 
         with (
-            patch("track.v2.detect_stage.publish", side_effect=fail_detect_publish),
+            patch("track.v2.stages.detect.publish", side_effect=fail_detect_publish),
             self.assertRaisesRegex(RuntimeError, "detect publish failed"),
         ):
             run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
@@ -567,7 +567,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 raise RuntimeError("artifact deleted")
 
         with (
-            patch("track.v2.detect_stage.RefineDatasetReader", _FailingReader),
+            patch("track.v2.stages.detect.RefineDatasetReader", _FailingReader),
             self.assertRaisesRegex(RuntimeError, "artifact deleted"),
         ):
             run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
@@ -578,7 +578,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
 
     def test_missing_artifact_marks_detect_failed(self) -> None:
         with (
-            patch("track.v2.detect_stage.find_refine_artifact", side_effect=RuntimeError("missing")),
+            patch("track.v2.stages.detect.find_refine_artifact", side_effect=RuntimeError("missing")),
             self.assertRaisesRegex(RuntimeError, "missing"),
         ):
             run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
@@ -635,7 +635,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                 raise RuntimeError("stream failed")
 
         with (
-            patch("track.v2.refine_stage.StreamVehicleSource", _FailingStream),
+            patch("track.v2.stages.refine.StreamVehicleSource", _FailingStream),
             self.assertRaisesRegex(RuntimeError, "stream failed"),
         ):
             run_pipeline(
@@ -655,7 +655,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             {"version": 1, "row_count": 1, "sha256": "1"},
         ))
         with (
-            patch("track.v2.refine_stage.calculate_source_fingerprint", side_effect=fingerprints),
+            patch("track.v2.stages.refine.calculate_source_fingerprint", side_effect=fingerprints),
             self.assertRaisesRegex(RuntimeError, "source changed"),
         ):
             run_pipeline(PipelineInput(source_table="raw_points"), self.config)
@@ -667,7 +667,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
     def test_refine_export_failure_abandons_staging_and_preserves_error(self) -> None:
         with (
             patch(
-                "track.v2.refine_stage.export_refine_parquet",
+                "track.v2.stages.refine.export_refine_parquet",
                 side_effect=RuntimeError("export failed"),
             ),
             self.assertRaisesRegex(RuntimeError, "export failed"),
@@ -706,9 +706,9 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             subtracks=[],
         )
         with (
-            patch("track.v2.refine_stage.StreamVehicleSource", _OneTrackStream),
-            patch("track.v2.refine_stage.CoordinateTransformer", return_value=transformer),
-            patch("track.v2.refine_stage.refine_vehicle", return_value=refine_result),
+            patch("track.v2.stages.refine.StreamVehicleSource", _OneTrackStream),
+            patch("track.v2.stages.refine.CoordinateTransformer", return_value=transformer),
+            patch("track.v2.stages.refine.refine_vehicle", return_value=refine_result),
             self.assertRaisesRegex(ValueError, "outside projection bounds"),
         ):
             run_pipeline(
@@ -760,7 +760,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
     def test_detect_compute_failure_closes_snapshot_and_marks_detect_failed(self) -> None:
         with (
             patch(
-                "track.v2.detect_stage.detect_intersections",
+                "track.v2.stages.detect.detect_intersections",
                 side_effect=RuntimeError("detect compute failed"),
             ),
             self.assertRaisesRegex(RuntimeError, "detect compute failed"),

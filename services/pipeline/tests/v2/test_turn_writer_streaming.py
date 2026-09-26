@@ -9,10 +9,10 @@ import os
 
 import pytest
 
-from track.v2 import db_writer as writer
+from track.v2.db import write_detect_results as writer
 from track.v2.models import RefinedPointRef, TurnEvent
 from track.v2.models import RuntimeConfig
-from track.v2.writer_relation import WriterRelation
+from track.v2.intersections.relations.source_associations import WriterRelation
 from .writer_relation_helpers import prepared_turn_relation
 
 
@@ -189,7 +189,7 @@ def test_postgres_turn_batches_keep_id_order_and_rollback_prior_batches(tmp_path
 
 
 def test_turn_relation_survives_sparse_mapping_scan_and_batched_write(monkeypatch, tmp_path):
-    from track.v2.turn_event_relation import TurnEventRelation
+    from track.v2.candidates.turn_event_relation import TurnEventRelation
 
     next_id = [200]
     copied = []

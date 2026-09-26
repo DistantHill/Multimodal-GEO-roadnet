@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, pipeline_config, postgres_config, projection_config, refine_config, runtime_config)
 
 import json
 import math
@@ -16,16 +16,18 @@ from uuid import UUID, uuid4
 import duckdb
 import pytest
 
-from track.v2.artifact_parquet import validate_published
-from track.v2.artifact_publication import abandon_staging, create_staging, publish
+from track.v2.artifacts.parquet_manifest import validate_published
+from track.v2.artifacts.publish_dataset import abandon_staging, create_staging, publish
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
 from track.v2.config import PostgresConfig
 from track.v2.db.pipeline_store import PostgresPipelineStore
-from track.v2.db.queries import _stream_vehicle_tracks_from_db
+from track.v2.trajectories.query_refine_points import _stream_vehicle_tracks_from_db
 from track.v2.db.source_table import calculate_source_fingerprint, validate_source_table
 from track.v2.models import RuntimeConfig
 from track.v2.projection import spatial_context_from_values
-from track.v2.refine_parquet import REFINE_PARQUET_V1, RefineDatasetReader, export_refine_parquet
+from track.v2.trajectories.results.export_to_parquet import export_refine_parquet
+from track.v2.trajectories.results.parquet_schema import REFINE_PARQUET_V1
+from track.v2.trajectories.results.read_parquet import RefineDatasetReader
 
 
 pytestmark = pytest.mark.skipif(
@@ -145,6 +147,8 @@ def _export(conn, config, root: Path, run_id: UUID, fingerprint: dict[str, objec
     handle = create_staging(root.resolve(), "refine", run_id, uuid4())
     descriptor = export_refine_parquet(
         conn, config, handle, runtime_config(duckdb_threads=1), fingerprint,
+        data_root=root.resolve(),
+        postgres_extension_path=pipeline_config().paths.duckdb_postgres_extension_path,
     )
     return handle, descriptor
 

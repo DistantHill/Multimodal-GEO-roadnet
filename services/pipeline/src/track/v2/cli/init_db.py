@@ -12,8 +12,8 @@ import argparse
 from typing import Any
 
 from ..config import PostgresConfig, connect as pg_connect
-from ._startup import load_startup_config
-from ..logger import init_logger, shutdown_logger
+from ._load_config import load_startup_config
+from ..telemetry.console_logging import init_logger, shutdown_logger
 
 
 SCHEMA_COMPONENT = "track.v2"
@@ -2084,26 +2084,26 @@ def create_tables(
         with conn.cursor() as cur:
             installed_before = _schema_version(cur)
             if migrate_refine_names and installed_before != SCHEMA_VERSION:
-                from ..db.refine_migration import migrate_refine
+                from ..db.migrations.refine_v4 import migrate_refine
 
                 migrate_refine(cur)
-                from ..db.artifact_migration import migrate_artifacts_v5
+                from ..db.migrations.artifacts_v5 import migrate_artifacts_v5
 
                 migrate_artifacts_v5(cur)
-                from ..db.completion_migration import migrate_completion_v6
+                from ..db.migrations.refine_completion_v6 import migrate_completion_v6
 
                 migrate_completion_v6(cur)
-                from ..db.detect_completion_migration import migrate_completion_v7
+                from ..db.migrations.detect_completion_v7 import migrate_completion_v7
 
                 migrate_completion_v7(cur)
-                from ..db.source_row_key_migration import migrate_source_row_key_v8
+                from ..db.migrate_source_row_key import migrate_source_row_key_v8
 
                 migrate_source_row_key_v8(cur)
             elif migrate_artifacts and installed_before != SCHEMA_VERSION:
-                from ..db.artifact_migration import migrate_artifacts_v5
-                from ..db.completion_migration import migrate_completion_v6
-                from ..db.detect_completion_migration import migrate_completion_v7
-                from ..db.source_row_key_migration import migrate_source_row_key_v8
+                from ..db.migrations.artifacts_v5 import migrate_artifacts_v5
+                from ..db.migrations.refine_completion_v6 import migrate_completion_v6
+                from ..db.migrations.detect_completion_v7 import migrate_completion_v7
+                from ..db.migrate_source_row_key import migrate_source_row_key_v8
 
                 if _schema_version(cur) == 4:
                     migrate_artifacts_v5(cur)

@@ -5,44 +5,16 @@ from .config_factory import intersect_run_config
 import pytest
 from unittest.mock import patch
 
-from track.v2.cross_track import (
+from track.v2.candidates.detect_cross_track_pairs import (
     extract_cross_track_candidates_reference,
 )
-from track.v2.detect_candidates import (
+from track.v2.candidates.collect_candidates import (
     extract_cross_track_candidates,
 )
-from track.v2.db.queries import SpatialWindow
-from track.v2.detect import IntersectConfig
-from track.v2.manual_thin_benchmark.manual_bench_cross_track_inner import (
-    _compare_records,
-    _run_stage,
-)
+from track.v2.projection import SpatialWindow
+from track.v2.intersections.detect_intersections import IntersectConfig, _extract_cross_track_windows
 from track.v2.models import RefinedPointRef, PointRef, SpatialContext, TrajectoryPoint
 from track.v2.projection import CoordinateTransformer
-
-
-def test_same_crs_comparison_accepts_tiny_absolute_roundoff_and_reports_it() -> None:
-    left = [{"id": "a|b", "members": ["a", "b"], "x": 500000.0, "lon": 116.0}]
-    right = [{"id": "a|b", "members": ["a", "b"], "x": 500000.0 + 5e-7, "lon": 116.0 + 5e-10}]
-
-    differences = _compare_records(left, right)
-
-    assert differences["x"] == pytest.approx(5e-7, rel=0, abs=1e-10)
-    assert differences["lon"] == pytest.approx(5e-10, rel=0, abs=1e-13)
-
-
-@pytest.mark.parametrize(
-    "right,match",
-    [
-        ([{"id": "a|b", "members": ["b", "a"], "x": 1.0}], "identity/member/order"),
-        ([{"id": "a|b", "members": ["a", "b"], "x": float("nan")}], "non-finite"),
-        ([{"id": "a|b", "members": ["a", "b"], "x": 1.00001}], "tolerance"),
-    ],
-)
-def test_same_crs_comparison_fails_closed(right: object, match: str) -> None:
-    left = [{"id": "a|b", "members": ["a", "b"], "x": 1.0}]
-    with pytest.raises(ValueError, match=match):
-        _compare_records(left, right)
 
 
 def test_complete_stage_reference_matches_db_subtrack_keys_and_vehicle_identity() -> None:
@@ -75,14 +47,26 @@ def test_complete_stage_reference_matches_db_subtrack_keys_and_vehicle_identity(
     cfg = intersect_run_config(use_turn_events=False, cross_track_grid_cell_m=100.0)
     window = SpatialWindow(499000.0, 4319000.0, 501000.0, 4321000.0)
     results = []
-    with patch("track.v2.detect._query_active_points_in_window", return_value=points):
+    with patch("track.v2.intersections.detect_intersections._query_active_points_in_window", return_value=points):
         for extractor in (extract_cross_track_candidates_reference, extract_cross_track_candidates):
-            candidates, _wall, _telemetry = _run_stage(
+            candidates = _extract_cross_track_windows(
                 object(), cfg,
                 (window.x_min, window.y_min, window.x_max, window.y_max),
-                context, transformer, extractor, windows_override=[window],
+                context, transformer, candidate_extractor=extractor,
+                windows_override=[window],
             )
-            results.append([candidate.as_dict() for candidate in candidates])
+            results.append(candidates)
 
-    _compare_records(results[0], results[1])
-    assert [candidate["vehicle_id"] for candidate in results[1]] == ["A|B", "A|B"]
+    reference, optimized = results
+    assert [candidate.vehicle_id for candidate in reference] == ["A|B", "A|B"]
+    assert [candidate.vehicle_id for candidate in optimized] == ["A|B", "A|B"]
+    for expected, actual in zip(reference, optimized, strict=True):
+        assert actual.from_segment_start == expected.from_segment_start
+        assert actual.to_segment_start == expected.to_segment_start
+        assert actual.timestamp == expected.timestamp
+        assert actual.heading == expected.heading
+        assert actual.speed == expected.speed
+        assert actual.x == pytest.approx(expected.x, rel=0, abs=1e-6)
+        assert actual.y == pytest.approx(expected.y, rel=0, abs=1e-6)
+        assert actual.lon == pytest.approx(expected.lon, rel=0, abs=1e-9)
+        assert actual.lat == pytest.approx(expected.lat, rel=0, abs=1e-9)

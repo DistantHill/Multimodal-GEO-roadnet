@@ -9,16 +9,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from track.v2.detect_candidates import extract_turn_candidates
-from track.v2.candidate_patches import iter_track_patches
+from track.v2.candidates.collect_candidates import extract_turn_candidates
+from track.v2.candidates.build_patches import iter_track_patches
 from track.v2.models import RuntimeConfig
-from track.v2.turn_event_relation import TurnEventRelation
-from track.v2.detect import (
+from track.v2.candidates.turn_event_relation import TurnEventRelation
+from track.v2.intersections.detect_intersections import (
     IntersectConfig, _IntersectRunConfig, _GStarCoordinate,
     _cluster_pipeline, _compute_getis_ord_g_star,
     _detect_intersections_db, _select_hotspot_events,
 )
-from track.v2.pipeline import PipelineInput, run_pipeline
+from track.v2.orchestration.run_pipeline import PipelineInput, run_pipeline
 from .test_candidate_patches import _turn_tracks, _CONTEXT, _TRANSFORMER
 from . import test_run_pipeline_lifecycle as lifecycle
 from .test_run_pipeline_lifecycle import REFINE_ID, _empty_intersect_result
@@ -100,7 +100,7 @@ def test_compact_gstar_matches_full_event_scores_and_hotspots(tmp_path, radius, 
         for event in events:
             spool.append(event)
         spool.seal()
-        with patch("track.v2.detect._compute_getis_ord_g_star", side_effect=compact_compute):
+        with patch("track.v2.intersections.detect_intersections._compute_getis_ord_g_star", side_effect=compact_compute):
             actual = _select_hotspot_events(spool, cfg)
             assert [value.as_dict() for value in actual] == [
                 value.as_dict() for value in expected_hotspots
@@ -139,9 +139,9 @@ def test_db_result_survives_columnar_run_and_cross_holds_no_full_turns(tmp_path,
     })()
 
     with (
-        patch("track.v2.detect.TurnEventRelation", OwnedSequence),
-        patch("track.v2.detect.run_grid_cross_track_task", side_effect=cross),
-        patch("track.v2.detect._build_topologies_from_tracks", side_effect=lambda clusters, *_a, **_kw: ([], clusters, [])),
+        patch("track.v2.intersections.detect_intersections.TurnEventRelation", OwnedSequence),
+        patch("track.v2.intersections.detect_intersections.run_grid_cross_track_task", side_effect=cross),
+        patch("track.v2.intersections.detect_intersections._build_topologies_from_tracks", side_effect=lambda clusters, *_a, **_kw: ([], clusters, [])),
     ):
         result = _detect_intersections_db(
             object(), _run_config(cfg), _CONTEXT,
@@ -173,8 +173,8 @@ def test_columnar_detect_feeds_turn_relation_through_bounded_extend(tmp_path):
     })()
     cfg = intersect_config(stream_batch_size=7, use_cross_track_candidates=False)
     with (
-        patch("track.v2.detect.TurnEventRelation", ObservedRelation),
-        patch("track.v2.detect._build_topologies_from_tracks", return_value=([], [], [])),
+        patch("track.v2.intersections.detect_intersections.TurnEventRelation", ObservedRelation),
+        patch("track.v2.intersections.detect_intersections._build_topologies_from_tracks", return_value=([], [], [])),
     ):
         result = _detect_intersections_db(
             object(), _run_config(cfg), _CONTEXT,
@@ -194,7 +194,7 @@ def test_detect_internal_failure_closes_output_relation(tmp_path, monkeypatch, f
         event_store.append(_event(0, 0., 0.))
         raise failure
 
-    with patch("track.v2.detect._run_columnar_db_detect", side_effect=fail):
+    with patch("track.v2.intersections.detect_intersections._run_columnar_db_detect", side_effect=fail):
         with pytest.raises(type(failure)):
             _detect_intersections_db(
                 object(), _run_config(intersect_config()), _CONTEXT,
@@ -218,7 +218,7 @@ def test_pipeline_closes_turn_storage_after_commit_or_failure(tmp_path, failure)
 
     try:
         with (
-            patch("track.v2.detect_stage.detect_intersections", return_value=result),
+            patch("track.v2.stages.detect.detect_intersections", return_value=result),
             patch.object(fixture.store, "load_clip", side_effect=check_clip),
         ):
             if failure is None:
@@ -278,7 +278,7 @@ def test_hotspot_output_iteration_closes_on_error(tmp_path, failure):
     with ObservedSequence(runtime_config(), tmp_path) as relation:
         relation.append(_event(0, 0., 0.))
         relation.seal()
-        with patch("track.v2.detect.replace", side_effect=failure):
+        with patch("track.v2.intersections.detect_intersections.replace", side_effect=failure):
             with pytest.raises(type(failure)):
                 _select_hotspot_events(relation, intersect_config(g_star_min_z=-100.))
         assert relation.active_readers == 0
@@ -309,7 +309,7 @@ def test_turn_relation_closes_after_result_rows_commit_before_artifact_completio
 
     try:
         with (
-            patch("track.v2.detect_stage.detect_intersections", return_value=result),
+            patch("track.v2.stages.detect.detect_intersections", return_value=result),
             patch.object(fixture.store, "commit", side_effect=commit),
         ):
             if failure is None:
@@ -344,7 +344,7 @@ def test_keyboard_interrupt_after_detect_commit_keeps_completed_status(tmp_path)
             raise KeyboardInterrupt()
 
     try:
-        with patch("track.v2.detect_stage.detect_intersections", return_value=result):
+        with patch("track.v2.stages.detect.detect_intersections", return_value=result):
             with pytest.raises(KeyboardInterrupt):
                 run_pipeline(PipelineInput(refine_id=REFINE_ID), fixture.config, emit=emit)
         assert "finish_detect:completed" in fixture.events
@@ -360,7 +360,7 @@ def test_keyboard_interrupt_during_detect_compute_marks_header_failed():
     fixture = lifecycle.RunPipelineLifecycleTest()
     fixture.setUp()
     try:
-        with patch("track.v2.detect_stage.detect_intersections", side_effect=KeyboardInterrupt()):
+        with patch("track.v2.stages.detect.detect_intersections", side_effect=KeyboardInterrupt()):
             with pytest.raises(KeyboardInterrupt):
                 run_pipeline(PipelineInput(refine_id=REFINE_ID), fixture.config)
         assert "finish_detect:completed" not in fixture.events

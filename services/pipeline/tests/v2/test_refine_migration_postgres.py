@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
-from track.v2.db.refine_migration import migrate_refine
+from track.v2.db.migrations.refine_v4 import migrate_refine
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("ROADNET_TEST_DSN"), reason="ROADNET_TEST_DSN is not set",

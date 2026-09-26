@@ -26,15 +26,15 @@ from track.v2.models import (
     TrajectoryPoint,
     TrackModel,
 )
-from track.v2.field_config import build_field_mapping, load_field_config
-from track.v2.parser import (
+from track.v2.config.field_mapping import build_field_mapping, load_field_config
+from track.v2.trajectories.read_source import (
     CsvSource,
     PostgresSource,
     detect_encoding,
-    _parse_timestamp,
     get_database,
 )
-from track.v2.parser import PostgresTrajectorySourceHandle
+from track.v2.trajectories.read_source import PostgresTrajectorySourceHandle
+from track.v2.trajectories.parse_rows import _parse_timestamp
 from .config_factory import pipeline_config
 
 

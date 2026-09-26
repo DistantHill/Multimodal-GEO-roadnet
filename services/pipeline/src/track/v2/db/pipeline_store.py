@@ -13,26 +13,30 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
-from ..heartbeat import validation_notices
-from ..clip import extract_clips_for_detect
+from ..telemetry.heartbeat import validation_notices
+from ..clips.extract_clips import extract_clips_for_detect
 from .artifact_registry import ArtifactDescriptor, insert_present
-from .queries import fetch_detect_row
-from ..db_writer import (
+from ..intersections.query_results import fetch_detect_row
+from .write_refine_results import (
     RefineRunRecord,
     create_refine_run,
-    create_detect_run,
-    create_fit_run,
     fetch_refine_run,
     finish_refine_run,
-    finish_detect_run,
-    finish_fit_run,
-    insert_centerline_bundle,
     insert_excluded_points,
     insert_injected_points,
     insert_kept_trajectory_points,
+)
+from .write_detect_results import (
+    create_detect_run,
+    finish_detect_run,
     persist_detect_result,
 )
-from ..detect import IntersectResult
+from .write_fitting_results import (
+    create_fit_run,
+    finish_fit_run,
+    insert_centerline_bundle,
+)
+from ..intersections.detect_intersections import IntersectResult
 from ..models import (
     CenterlineFitBundle,
     ClipConfig,

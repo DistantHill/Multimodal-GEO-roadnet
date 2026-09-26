@@ -172,7 +172,7 @@ P04–P09 仍需细分任务卡和小提交，不能按整行任务一次性提�
    新恢复入口必须先固定规范列投影/映射或拒绝冲突，不能直接把新摘要用于任意 `SELECT *`。
 2. `clean_vehicle` 仍接收完整车辆列表，并按完整分段数决定车辆子轨迹命名；解析器还会跳过
    无效行。分组规划必须保持这些语义，不按原始行数机械切割。
-3. 现有 `pipeline.py` 从 1 累加全局 `subtrack_index`，写入层按偏移重编号；并行落库不能按
+3. 现有 `orchestration/run_pipeline.py` 从 1 累加全局 `subtrack_index`，写入层按偏移重编号；并行落库不能按
    计算完成顺序分配。必须持久规划稳定编号/映射，并核对外键、引用字段和恢复身份。
 
 上述条件明确了下一批范围，不是已完成 Clean 业务恢复。空间父子拆分与归并、超大组外存
@@ -192,7 +192,7 @@ P04–P09 仍需细分任务卡和小提交，不能按整行任务一次性提�
 | 错误响应 | HTTP 错误 `detail` 可含 `error/message/sqlstate` | 显示 `detail.message` 等错误内容 | 不吞掉资源错误，不暴露 SQL/凭证 |
 
 来源：`apps/backend/src/backend/map_api.py` 的 `run_catalog`、`read_layer`、各
-`_..._feature` 与 `_feature_collection`；`map_schemas.py` 的请求模型；
+`_..._feature` 与 `_feature_collection`；`backend.api.map_contracts` 的请求模型；
 `apps/frontend/src/map-api.js` 的请求/标准化函数；`main.js` 的 `syncRuns`、
 `decorateFeature`、`refreshRuns`。本批不改变这些公开字段；迁移后仍需重新联调。
 

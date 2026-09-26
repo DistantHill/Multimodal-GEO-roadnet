@@ -24,26 +24,33 @@ from track.v2._geometry import (
     _to_lonlat,
     _to_xy,
 )
-from track.v2._perf import PerfTracker
-from track.v2.cross_track import (
+from track.v2.intersections.performance_timing import PerfTracker
+from track.v2.candidates.detect_cross_track_pairs import (
     extract_cross_track_candidates_legacy as _extract_orthogonal_cross_track_candidates_legacy,
     _prepare_segments as _prepare_cross_track_segments,
 )
-from track.v2.candidate_patches import (
+from track.v2.candidates.build_patches import (
     build_cross_track_index,
     _iter_cross_vehicle_pair_batches,
     _iter_pair_batches as _iter_cross_track_pair_batches,
 )
-from track.v2.detect_candidates import (
+from track.v2.candidates.collect_candidates import (
     extract_cross_track_candidates as _extract_orthogonal_cross_track_candidates,
 )
-from track.v2 import _cross_track_legacy as cross_track_legacy_module
+from track.v2.diagnostics import reference_cross_track_candidates as cross_track_legacy_module
 from track.v2.exceptions import V2Error
-from track.v2.detect import (
+from track.v2.projection import SpatialWindow
+from track.v2.intersections.extract_topology import (
+    _cluster_angles_greedy,
+    _extract_entry_exit_observations_batch,
+    _build_topology_point_index,
+    _build_topologies_from_tracks,
+    _nearest_angle_id,
+    _topology_point_windows,
+)
+from track.v2.intersections.detect_intersections import (
     IntersectConfig,
     IntersectResult,
-    SpatialWindow,
-    _cluster_angles_greedy,
     _cluster_dbscan,
     _cluster_pipeline,
     _cluster_orthogonal_cross_track_candidates,
@@ -52,7 +59,6 @@ from track.v2.detect import (
     _detect_turn_events,
     _detect_intersections_db,
     _run_columnar_db_detect,
-    _extract_entry_exit_observations_batch,
     _extract_cross_track_windows,
     extract_columnar_cross_track_candidates,
     _getis_local_counts_grid,
@@ -60,13 +66,9 @@ from track.v2.detect import (
     _group_cluster_items,
     _group_by_vehicle,
     _build_dbscan_grid,
-    _build_topology_point_index,
-    _build_topologies_from_tracks,
     _merge_clusters,
-    _nearest_angle_id,
     _project_tracks,
     _run_dbscan,
-    _topology_point_windows,
     _query_active_points_in_window,
     _select_hotspot_events,
     detect_intersections,
@@ -86,15 +88,15 @@ from track.v2.models import (
     TurnEvent,
 )
 from track.v2.db.source_table import SourceTableContract
-from track.v2.db.queries import _stream_vehicle_tracks_from_db
-from track.v2.parser import CsvSource, get_database
+from track.v2.trajectories.query_refine_points import _stream_vehicle_tracks_from_db
+from track.v2.trajectories.read_source import CsvSource, get_database
 from track.v2.projection import (
     CoordinateTransformer,
     ProjectionError,
     QueryWindowRequest,
     build_query_window,
 )
-from track.v2.refine_parquet import TopologyTrackSelection
+from track.v2.trajectories.results.read_parquet import TopologyTrackSelection
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -525,7 +527,7 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
         tracks = {"A": self._track("A", [(116, 39), (116.001, 39)], 90),
                   "B": self._track("B", [(117, 40), (117.001, 40)], 90)}
         telemetry = {}
-        with patch("track.v2._cross_track_legacy._iter_bounded_segment_intersections") as kernel:
+        with patch("track.v2.diagnostics.reference_cross_track_candidates._iter_bounded_segment_intersections") as kernel:
             candidates, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
                 tracks, 116, 39, intersect_config(), telemetry=telemetry,
             )
@@ -541,7 +543,7 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
                   "B": self._track("B", [(115.999, 39), (116, 39)], 90)}
         telemetry = {}
         with patch(
-            "track.v2._cross_track_legacy._iter_bounded_segment_intersections",
+            "track.v2.diagnostics.reference_cross_track_candidates._iter_bounded_segment_intersections",
             wraps=_iter_bounded_segment_intersections,
         ) as kernel:
             candidates, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
@@ -569,7 +571,7 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
         oracle, oracle_pairs, oracle_total = self._historical_oracle(tracks)
         telemetry: dict[str, int] = {}
         with patch(
-            "track.v2._cross_track_legacy._iter_bounded_segment_intersections",
+            "track.v2.diagnostics.reference_cross_track_candidates._iter_bounded_segment_intersections",
             wraps=_iter_bounded_segment_intersections,
         ) as kernel:
             actual, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
@@ -607,7 +609,7 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
         oracle, oracle_pairs, oracle_total = self._historical_oracle(tracks)
         telemetry: dict[str, int] = {}
         with patch(
-            "track.v2._cross_track_legacy._iter_bounded_segment_intersections",
+            "track.v2.diagnostics.reference_cross_track_candidates._iter_bounded_segment_intersections",
             wraps=_iter_bounded_segment_intersections,
         ) as kernel:
             actual, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
@@ -637,10 +639,10 @@ class VehicleAabbPrefilterTest(unittest.TestCase):
         }
         telemetry: dict[str, int] = {}
         with patch(
-            "track.v2._cross_track_legacy._emit_progress",
+            "track.v2.diagnostics.reference_cross_track_candidates._emit_progress",
             wraps=cross_track_legacy_module._emit_progress,
         ) as progress, patch(
-            "track.v2._cross_track_legacy._iter_bounded_segment_intersections",
+            "track.v2.diagnostics.reference_cross_track_candidates._iter_bounded_segment_intersections",
         ) as kernel:
             candidates, pairs, total = _extract_orthogonal_cross_track_candidates_legacy(
                 tracks, 116.0, 39.0, intersect_config(), telemetry=telemetry,
@@ -677,7 +679,13 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
             has_extra=True,
         )
         patcher = patch(
-            "track.v2.db.queries.validate_source_table",
+            "track.v2.candidates.query_source_windows.validate_source_table",
+            return_value=source_contract,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch(
+            "track.v2.trajectories.query_refine_points.validate_source_table",
             return_value=source_contract,
         )
         patcher.start()
@@ -872,7 +880,7 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
         telemetry: dict[str, int | float] = {}
 
         with patch(
-            "track.v2.db.queries.time.perf_counter",
+            "track.v2.candidates.query_source_windows.time.perf_counter",
             side_effect=(10.0, 12.5, 20.0, 20.75),
         ):
             points = _query_active_points_in_window(
@@ -888,60 +896,6 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
         self.assertEqual(telemetry["materialization_seconds"], 0.75)
 
 
-class PerfWindowsGateContractTest(unittest.TestCase):
-    """The frozen performance gate is immutable and formal-real checks fail closed."""
-
-    def test_manifest_writer_is_write_once(self):
-        from track.v2.manual_thin_benchmark.perf_windows_gate import _write_manifest_once
-
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "gate_manifest.json"
-            output.write_text("frozen\n", encoding="utf-8")
-
-            with self.assertRaises(FileExistsError):
-                _write_manifest_once(output, {"replacement": True})
-
-            self.assertEqual(output.read_text(encoding="utf-8"), "frozen\n")
-
-    def test_real_gate_rejects_drifted_incomplete_database(self):
-        from track.v2.manual_thin_benchmark.manual_bench_windows import _validate_real_gate
-
-        frozen = {
-            "available": True,
-            "database": "track_test",
-            "table": "trajectory_points",
-            "row_count": 1_000_000,
-            "extent": [108.8, 34.6, 110.9, 35.899982],
-            "stable_id_checksum": "frozen-checksum",
-        }
-        observed = {
-            "available": True,
-            "read_only": True,
-            "database": "track_test",
-            "table": "trajectory_points",
-            "row_count": 200_000,
-            "extent": [108.8, 34.600008, 110.899942, 35.899963],
-            "columns": ["id", "vehicle_id", "timestamp", "lon", "lat"],
-            "source_row_key_checksum": None,
-            "full_table_sha256": None,
-        }
-
-        validation = _validate_real_gate(frozen, observed)
-
-        self.assertFalse(validation["formal_valid"])
-        self.assertEqual(
-            set(validation["error_codes"]),
-            {
-                "frozen_schema_sha256_missing",
-                "frozen_full_table_sha256_missing",
-                "row_count_mismatch",
-                "extent_mismatch",
-                "source_row_key_missing",
-                "source_row_key_checksum_mismatch",
-            },
-        )
-
-
 class CrossTrackWindowProgressTest(unittest.TestCase):
     """Method 3 reports window-level progress even for small windows."""
 
@@ -950,7 +904,7 @@ class CrossTrackWindowProgressTest(unittest.TestCase):
             spatial_window_size=(1_000.0, 1_000.0),
             spatial_window_overlap=0.0,
         )
-        with patch("track.v2.detect._query_active_points_in_window", return_value=[]), \
+        with patch("track.v2.intersections.detect_intersections._query_active_points_in_window", return_value=[]), \
              patch("builtins.print") as print_mock:
             _extract_cross_track_windows(
                 object(), cfg,
@@ -975,7 +929,7 @@ class CrossTrackWindowProgressTest(unittest.TestCase):
             spatial_window_overlap=0.15,
             cross_track_dbscan_min_samples=1,
         )
-        with patch("track.v2.detect._query_active_points_in_window", return_value=points), \
+        with patch("track.v2.intersections.detect_intersections._query_active_points_in_window", return_value=points), \
               patch("builtins.print"):
             centre_x, centre_y = _TEST_TRANSFORMER.forward(origin_lon, origin_lat)
             candidates = _extract_cross_track_windows(
@@ -1093,7 +1047,7 @@ class ProjectionContextContractTest(unittest.TestCase):
             refine_id="refine-1", source_fingerprint_json='{"version":1}',
         ))
         with (
-            patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
+            patch("track.v2.intersections.detect_intersections.fetch_refine_run_row", return_value=refine),
             self.assertRaisesRegex(V2Error, "runtime and data_root"),
         ):
             detect_intersections(
@@ -1109,7 +1063,7 @@ class ProjectionContextContractTest(unittest.TestCase):
             spatial_context=_TEST_SPATIAL_CONTEXT, source_fingerprint={"version": 1},
         )
         with (
-            patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
+            patch("track.v2.intersections.detect_intersections.fetch_refine_run_row", return_value=refine),
             patch("track.v2.db.source_table.verify_refine_source_fingerprint") as fingerprint,
             self.assertRaisesRegex(V2Error, "RefineDatasetReader"),
         ):
@@ -1133,8 +1087,8 @@ class ProjectionContextContractTest(unittest.TestCase):
             source_fingerprint_json='{"version":2}',
         ))
         with (
-            patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
-            patch("track.v2.detect._detect_intersections_db") as compute,
+            patch("track.v2.intersections.detect_intersections.fetch_refine_run_row", return_value=refine),
+            patch("track.v2.intersections.detect_intersections._detect_intersections_db") as compute,
             self.assertRaisesRegex(V2Error, "fingerprint"),
         ):
             detect_intersections(
@@ -1160,8 +1114,8 @@ class ProjectionContextContractTest(unittest.TestCase):
         reader = MagicMock()
         reader.iter_cross_track_pair_batches.return_value = iter(())
         with (
-            patch("track.v2.detect_candidates._prepare_segments") as prepare,
-            patch("track.v2.detect_candidates.build_cross_track_index") as build_index,
+            patch("track.v2.candidates.collect_candidates._prepare_segments") as prepare,
+            patch("track.v2.candidates.collect_candidates.build_cross_track_index") as build_index,
         ):
             actual = extract_columnar_cross_track_candidates(
                 reader,
@@ -1180,9 +1134,9 @@ class ProjectionContextContractTest(unittest.TestCase):
         reader.iter_turn_candidates.return_value = iter(())
         reader.track_count.return_value = 0
         with (
-            patch("track.v2.detect.run_grid_cross_track_task") as columnar,
-            patch("track.v2.detect._cluster_pipeline", return_value=([], [])),
-            patch("track.v2.detect._build_topologies_from_tracks", return_value=([], [], [])),
+            patch("track.v2.intersections.detect_intersections.run_grid_cross_track_task") as columnar,
+            patch("track.v2.intersections.detect_intersections._cluster_pipeline", return_value=([], [])),
+            patch("track.v2.intersections.detect_intersections._build_topologies_from_tracks", return_value=([], [], [])),
         ):
             _run_columnar_db_detect(
                 cfg,
@@ -1201,7 +1155,7 @@ class ProjectionContextContractTest(unittest.TestCase):
             4326, 32649,
             {"coordinate_semantics_version": 2, "enforce_area_of_use": True, "max_scale_error": .01},
         )
-        with patch("track.v2.detect.fetch_refine_run_row", return_value=refine):
+        with patch("track.v2.intersections.detect_intersections.fetch_refine_run_row", return_value=refine):
             with self.assertRaisesRegex(V2Error, "does not match"):
                 detect_intersections(
                     conn=object(), config=intersect_config(),
@@ -1226,7 +1180,7 @@ class ProjectionContextContractTest(unittest.TestCase):
             )
             with (
                 self.subTest(status=status, fingerprint=fingerprint),
-                patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
+                patch("track.v2.intersections.detect_intersections.fetch_refine_run_row", return_value=refine),
             ):
                 with self.assertRaisesRegex(V2Error, "completed immutable-source"):
                     detect_intersections(
@@ -1246,7 +1200,7 @@ class ProjectionContextContractTest(unittest.TestCase):
         ):
             with (
                 self.subTest(override=override),
-                patch("track.v2.detect.fetch_refine_run_row", return_value=refine),
+                patch("track.v2.intersections.detect_intersections.fetch_refine_run_row", return_value=refine),
             ):
                 with self.assertRaisesRegex(V2Error, "does not belong|must use"):
                     detect_intersections(
@@ -1564,7 +1518,7 @@ class GetisOrdGStarTest(unittest.TestCase):
         ]
         # If the threshold/fallback regresses, this mock makes the test fail:
         # successful computation proves the actual grid path was exercised.
-        with patch("track.v2.detect._getis_local_counts_scan", side_effect=AssertionError("scan fallback used")):
+        with patch("track.v2.intersections.detect_intersections._getis_local_counts_scan", side_effect=AssertionError("scan fallback used")):
             actual_counts = _getis_local_counts_grid(events, radius)
             actual_z = _compute_getis_ord_g_star(events, radius)
             actual_selected = [
@@ -1627,7 +1581,7 @@ class GetisOrdGStarTest(unittest.TestCase):
         """Huge finite quotient ULPs cannot create an unbounded cell range."""
         events = self._large_events([(1e308, float(index * 3)) for index in range(257)])
         expected_counts = _getis_local_counts_scan(events, 1.0)
-        with patch("track.v2.detect._getis_local_counts_scan", wraps=_getis_local_counts_scan) as fallback:
+        with patch("track.v2.intersections.detect_intersections._getis_local_counts_scan", wraps=_getis_local_counts_scan) as fallback:
             actual_counts = _getis_local_counts_grid(events, 1.0)
         self.assertEqual(actual_counts, expected_counts)
         fallback.assert_called_once()
@@ -1833,7 +1787,7 @@ class DBSCANTest(unittest.TestCase):
         xs = [-1e-300, 1.0, math.nextafter(1.0, math.inf)] + [1000.0 + i * 10.0 for i in range(254)]
         ys = [0.0] * len(xs)
         expected = self._historical_scan_oracle(xs, ys, 1.0, 1)
-        with patch("track.v2.detect._neighbors_indices", side_effect=AssertionError("full scan fallback forbidden")):
+        with patch("track.v2.intersections.detect_intersections._neighbors_indices", side_effect=AssertionError("full scan fallback forbidden")):
             actual = _run_dbscan(xs, ys, eps_m=1.0, min_samples=1)
         self.assertEqual(actual, expected)
 
@@ -1857,7 +1811,7 @@ class DBSCANTest(unittest.TestCase):
 
     def test_dense_grid_enqueues_each_point_at_most_once(self):
         """Dense clusters do not re-materialise N neighbours for every core."""
-        from track.v2.detect import _take_grid_frontier_neighbors
+        from track.v2.intersections.detect_intersections import _take_grid_frontier_neighbors
 
         taken = 0
 
@@ -1869,7 +1823,7 @@ class DBSCANTest(unittest.TestCase):
 
         count = 2_000
         with patch(
-            "track.v2.detect._take_grid_frontier_neighbors",
+            "track.v2.intersections.detect_intersections._take_grid_frontier_neighbors",
             side_effect=observe,
         ):
             labels = _run_dbscan(
@@ -1926,7 +1880,7 @@ class DBSCANTest(unittest.TestCase):
             value = _build_dbscan_grid(*args)
             build_results.append(value)
             return value
-        with patch("track.v2.detect._build_dbscan_grid", side_effect=observe_build) as build_grid:
+        with patch("track.v2.intersections.detect_intersections._build_dbscan_grid", side_effect=observe_build) as build_grid:
             actual = _run_dbscan(xs, ys, eps_m=1.0, min_samples=1)
         build_grid.assert_called_once_with(xs, ys, 1.0)
         self.assertEqual(build_results, [None])
@@ -2255,7 +2209,7 @@ class TopologyExtractionTest(unittest.TestCase):
         ]})["v1"]
 
         with patch(
-            "track.v2.detect._extract_entry_exit_observations_batch",
+            "track.v2.intersections.extract_topology._extract_entry_exit_observations_batch",
             return_value=([], []),
         ) as extract:
             topologies, annotated, observations = _build_topologies_from_tracks(
@@ -2360,7 +2314,7 @@ class TopologyExtractionTest(unittest.TestCase):
         reader = MagicMock()
         reader.iter_topology_tracks.return_value = selections()
         with patch(
-            "track.v2.detect._extract_entry_exit_observations_batch",
+            "track.v2.intersections.extract_topology._extract_entry_exit_observations_batch",
             side_effect=KeyboardInterrupt,
         ), self.assertRaises(KeyboardInterrupt):
             _build_topologies_from_tracks(
@@ -2564,7 +2518,7 @@ class TopologyExtractionTest(unittest.TestCase):
         reader.track_count.return_value = 1
         with (
             patch(
-                "track.v2.detect.fetch_refine_run_row",
+                "track.v2.intersections.detect_intersections.fetch_refine_run_row",
                 return_value=SimpleNamespace(
                     refine_id="refine-1",
                     source_table="trajectory_points",
@@ -2574,15 +2528,15 @@ class TopologyExtractionTest(unittest.TestCase):
                 ),
             ),
             patch(
-                "track.v2.detect.run_grid_cross_track_task",
+                "track.v2.intersections.detect_intersections.run_grid_cross_track_task",
                 return_value=[],
             ),
             patch(
-                "track.v2.detect._cluster_pipeline",
+                "track.v2.intersections.detect_intersections._cluster_pipeline",
                 return_value=([], [cluster]),
             ),
             patch(
-                "track.v2.detect._build_topologies_from_tracks",
+                "track.v2.intersections.detect_intersections._build_topologies_from_tracks",
                 return_value=([topology], [cluster], []),
             ) as build_topologies,
         ):

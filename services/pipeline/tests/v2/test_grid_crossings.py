@@ -3,8 +3,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from track.v2.candidate_patches import CrossTrackCapacityError
-from track.v2.grid_cross_track_candidates import iter_grid_crossings
+from track.v2.candidates.build_patches import CrossTrackCapacityError
+from track.v2.candidates.detect_grid_crossings import iter_grid_crossings
 
 
 def _segments():

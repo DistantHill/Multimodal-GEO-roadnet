@@ -10,9 +10,9 @@ from uuid import UUID, uuid4
 import pytest
 
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
-from track.v2.db.artifact_migration import migrate_artifacts_v5
-from track.v2.db.completion_migration import migrate_completion_v6
-from track.v2.db.detect_completion_migration import migrate_completion_v7
+from track.v2.db.migrations.artifacts_v5 import migrate_artifacts_v5
+from track.v2.db.migrations.refine_completion_v6 import migrate_completion_v6
+from track.v2.db.migrations.detect_completion_v7 import migrate_completion_v7
 from track.v2.db.artifact_registry import (
     ArtifactDescriptor,
     append_deleted,

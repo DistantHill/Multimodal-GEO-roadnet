@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from track.v2.config import PipelineConfig, PostgresConfig, load_pipeline_config
-from track.v2.detect import DetectRuntimeContext, _IntersectRunConfig
+from track.v2.intersections.detect_intersections import DetectRuntimeContext, _IntersectRunConfig
 
 
 @lru_cache(maxsize=1)

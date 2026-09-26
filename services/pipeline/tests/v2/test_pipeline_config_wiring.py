@@ -10,8 +10,8 @@ from unittest.mock import MagicMock, patch
 from track.v2.config import PostgresConfig
 from track.v2.config.pipeline_config_loader import PipelineConfig
 from track.v2.db.pipeline_store import DetectPersistenceResult
-from track.v2.db_writer import RefineRunRecord
-from track.v2.detect import IntersectConfig, IntersectResult
+from track.v2.db.write_refine_results import RefineRunRecord
+from track.v2.intersections.detect_intersections import IntersectConfig, IntersectResult
 from track.v2.models import (
     RefineConfig,
     ClipConfig,
@@ -21,7 +21,7 @@ from track.v2.models import (
     ProjectionConfig,
     RuntimeConfig,
 )
-from track.v2.pipeline import PipelineInput, run_pipeline
+from track.v2.orchestration.run_pipeline import PipelineInput, run_pipeline
 from track.v2.projection import create_spatial_context
 
 
@@ -166,25 +166,25 @@ class PipelineConfigWiringTest(unittest.TestCase):
         reader.__enter__.return_value = reader
 
         with (
-            patch("track.v2.pipeline.pg_connect", return_value=_Connection()),
-            patch("track.v2.pipeline.PostgresPipelineStore", return_value=store),
-            patch("track.v2.pipeline.require_current_schema"),
-            patch("track.v2.detect_stage.validate_source_table", return_value=MagicMock()),
+            patch("track.v2.orchestration.run_pipeline.pg_connect", return_value=_Connection()),
+            patch("track.v2.orchestration.run_pipeline.PostgresPipelineStore", return_value=store),
+            patch("track.v2.orchestration.run_pipeline.require_current_schema"),
+            patch("track.v2.stages.detect.validate_source_table", return_value=MagicMock()),
             patch(
-                "track.v2.detect_stage.calculate_source_fingerprint",
+                "track.v2.stages.detect.calculate_source_fingerprint",
                 return_value={"version": 1, "row_count": 0, "sha256": "0"},
             ),
-            patch("track.v2.detect_stage.find_refine_artifact", return_value=MagicMock()),
-            patch("track.v2.detect_stage.RefineDatasetReader", return_value=reader),
-            patch("track.v2.detect_stage.detect_intersections", return_value=intersections) as detect,
-            patch("track.v2.detect_stage.create_staging", return_value=MagicMock(stage="detect")),
-            patch("track.v2.detect_stage.export_detect_parquet", return_value=MagicMock()),
-            patch("track.v2.detect_stage.publish"),
+            patch("track.v2.stages.detect.find_refine_artifact", return_value=MagicMock()),
+            patch("track.v2.stages.detect.RefineDatasetReader", return_value=reader),
+            patch("track.v2.stages.detect.detect_intersections", return_value=intersections) as detect,
+            patch("track.v2.stages.detect.create_staging", return_value=MagicMock(stage="detect")),
+            patch("track.v2.stages.detect.export_detect_results_to_parquet", return_value=MagicMock()),
+            patch("track.v2.stages.detect.publish"),
             patch(
-                "track.v2.fitting_stage.fit_centerline_variants",
+                "track.v2.stages.fitting.fit_centerline_variants",
                 return_value=store.fit_bundle,
             ) as fit,
-            patch("track.v2.network_stage.build_network", return_value=MagicMock()) as network,
+            patch("track.v2.stages.network.build_network", return_value=MagicMock()) as network,
         ):
             run_pipeline(PipelineInput(refine_id=REFINE_ID), configured_pipeline)
 

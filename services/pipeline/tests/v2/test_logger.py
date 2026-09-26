@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from track.v2.logger import _resolve_log_path
+from track.v2.telemetry.console_logging import _resolve_log_path
 
 
 class LoggerPathTest(unittest.TestCase):
@@ -15,8 +15,8 @@ class LoggerPathTest(unittest.TestCase):
 
     def test_log_directory_keeps_timestamped_filename(self) -> None:
         with (
-            patch("track.v2.logger.datetime") as mocked_datetime,
-            patch("track.v2.logger.os.getpid", return_value=4242),
+            patch("track.v2.telemetry.console_logging.datetime") as mocked_datetime,
+            patch("track.v2.telemetry.console_logging.os.getpid", return_value=4242),
         ):
             mocked_datetime.now.return_value = datetime(2026, 8, 31, 9, 8, 7, 654321)
             path = _resolve_log_path("/data/logs")
@@ -28,8 +28,8 @@ class LoggerPathTest(unittest.TestCase):
 
     def test_same_timestamp_uses_pid_to_separate_processes(self) -> None:
         with (
-            patch("track.v2.logger.datetime") as mocked_datetime,
-            patch("track.v2.logger.os.getpid", side_effect=[101, 202]),
+            patch("track.v2.telemetry.console_logging.datetime") as mocked_datetime,
+            patch("track.v2.telemetry.console_logging.os.getpid", side_effect=[101, 202]),
         ):
             mocked_datetime.now.return_value = datetime(2026, 8, 31, 9, 8, 7, 654321)
             first = _resolve_log_path("/data/logs")

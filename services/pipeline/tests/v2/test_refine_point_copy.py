@@ -1,7 +1,7 @@
 from dataclasses import dataclass, replace
 
 from track.v2.models import PointRef, TrajectoryPoint
-from track.v2.refine import _projected_point
+from track.v2.trajectories.refine_trajectories import _projected_point
 
 
 def test_projection_copy_matches_replace_without_rebuilding_identity():

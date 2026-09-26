@@ -9,15 +9,15 @@ import pytest
 
 
 @pytest.mark.parametrize("module", [
-    "track.v2", "track.v2.resource_budget", "track.v2.db.source_table",
+    "track.v2", "track.v2.telemetry.snapshot_run_environment", "track.v2.db.source_table",
 ])
 def test_lightweight_import_does_not_initialize_numerical_libraries(module):
     result = subprocess.run(
         [sys.executable, "-c", (
             "import importlib,json,sys; "
             f"importlib.import_module({module!r}); "
-            "print(json.dumps([n for n in ('numpy','pyproj','track.v2.fitting',"
-            "'track.v2.pipeline') if n in sys.modules]))"
+            "print(json.dumps([n for n in ('numpy','pyproj','track.v2.centerlines.fit_centerlines',"
+            "'track.v2.orchestration.run_pipeline') if n in sys.modules]))"
         )],
         text=True, capture_output=True, check=True, timeout=20,
     )
@@ -28,11 +28,11 @@ def test_every_existing_public_export_preserves_identity():
     import track.v2 as v2
 
     expected = {
-        "refine": "refine_vehicle",
-        "clip": "extract_clips extract_clips_for_detect",
-        "fitting": "fit_centerlines fit_centerline_variants",
-        "detect": "IntersectConfig IntersectResult detect_intersections",
-        "network": "build_network",
+        "trajectories.refine_trajectories": "refine_vehicle",
+        "clips.extract_clips": "extract_clips extract_clips_for_detect",
+        "centerlines.fit_centerlines": "fit_centerlines fit_centerline_variants",
+        "intersections.detect_intersections": "IntersectConfig IntersectResult detect_intersections",
+        "road_network.build_road_network": "build_network",
         "models": (
             "Centerline CenterlineFitBundle RefineConfig ClipConfig ClipEndpoint "
             "ClipInput ClipIntersection ClipPoint ClipReport ClipResult ClipTrack "
@@ -41,12 +41,12 @@ def test_every_existing_public_export_preserves_identity():
             "PointRef PostgresSource ProjectionConfig ResolvedTrackPoint SpatialContext "
             "TrackClip TrajectoryPoint"
         ),
-        "parser": "get_database",
+        "trajectories.read_source": "get_database",
         "projection": (
             "ProjectionError QueryWindow QueryWindowRequest build_query_window create_spatial_context"
         ),
-        "replay": "ReplayService ReplayTarget replay_centerline_inputs",
-        "pipeline": "PipelineInput PipelineResult",
+        "validation.replay_lineage": "ReplayService ReplayTarget replay_centerline_inputs",
+        "orchestration.run_pipeline": "PipelineInput PipelineResult",
     }
     names = {name for values in expected.values() for name in values.split()}
     assert set(v2.__all__) == names

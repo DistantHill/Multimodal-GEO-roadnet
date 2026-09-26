@@ -1,6 +1,6 @@
 import pytest
 
-from track.v2.grid_cross_track_candidates import create_grid
+from track.v2.candidates.grid import create_grid
 
 
 def test_create_grid_tiles_extent_with_shared_closed_edges():

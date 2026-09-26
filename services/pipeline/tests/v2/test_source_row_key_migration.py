@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from track.v2.db.source_row_key_migration import migrate_source_row_key_v8
+from track.v2.db.migrate_source_row_key import migrate_source_row_key_v8
 
 
 pytestmark = pytest.mark.skipif(

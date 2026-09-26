@@ -3,9 +3,9 @@ from .config_factory import (clip_config, fitting_config, intersect_config, netw
 from contextlib import contextmanager
 from types import SimpleNamespace as NS
 
-from track.v2 import db_writer as writer
+from track.v2.db import write_detect_results as writer
 from track.v2.models import RefinedPointRef, RuntimeConfig
-from track.v2.writer_relation import WriterRelation
+from track.v2.intersections.relations.source_associations import WriterRelation
 
 
 def run_resolved_sequence(

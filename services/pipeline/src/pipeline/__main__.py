@@ -6,7 +6,7 @@ import sys
 import tempfile
 import time
 from track.v2.config import PipelineConfig
-from track.v2.cli._startup import load_startup_config
+from track.v2.cli._load_config import load_startup_config
 
 
 def check_config(config: PipelineConfig) -> int:
@@ -55,20 +55,26 @@ def serve(config: PipelineConfig) -> int:
 
 
 def main() -> int:
-    delegated_commands = {
-        "artifacts", "delete-run", "import-trajectories", "init-db", "replay",
-        "run", "semantic-diff", "rasterize",
+    delegated_modules = {
+        "artifacts": "reconcile_artifacts",
+        "delete-run": "delete_run",
+        "import-trajectories": "import_trajectories",
+        "init-db": "init_db",
+        "replay": "replay_run",
+        "run": "run_pipeline",
+        "semantic-diff": "compare_run_lineages",
+        "rasterize": "rasterize",
     }
-    if len(sys.argv) > 1 and sys.argv[1] in delegated_commands:
+    if len(sys.argv) > 1 and sys.argv[1] in delegated_modules:
         command, forwarded = sys.argv[1], sys.argv[2:]
         if command == "init-db":
             from track.v2.cli.init_db import main as delegated_main
         elif command == "artifacts":
-            from track.v2.cli.artifacts import main as delegated_main
+            from track.v2.cli.reconcile_artifacts import main as delegated_main
         elif command == "run":
-            from track.v2.cli.run import main as delegated_main
+            from track.v2.cli.run_pipeline import main as delegated_main
         elif command == "semantic-diff":
-            from track.v2.cli.semantic_diff import main as delegated_main
+            from track.v2.cli.compare_run_lineages import main as delegated_main
         elif command == "delete-run":
             from track.v2.cli.delete_run import main as delegated_main
         elif command == "import-trajectories":
@@ -76,9 +82,9 @@ def main() -> int:
         elif command == "rasterize":
             from track.v2.cli.rasterize import main as delegated_main
         else:
-            from track.v2.cli.replay import main as delegated_main
+            from track.v2.cli.replay_run import main as delegated_main
 
-        sys.argv = [f"track.v2.cli.{command.replace('-', '_')}", *forwarded]
+        sys.argv = [f"track.v2.cli.{delegated_modules[command]}", *forwarded]
         return delegated_main()
 
     parser = argparse.ArgumentParser(description="Roadnet pipeline runtime")

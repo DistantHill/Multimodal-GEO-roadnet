@@ -10,12 +10,13 @@ from uuid import uuid4
 import duckdb
 import pytest
 
-from track.v2 import artifact_publication, detect_parquet_export
+from track.v2.artifacts import publish_dataset as publish_dataset
+from track.v2.intersections.results import export_to_parquet as detect_parquet_export
 from track.v2.models import RuntimeConfig
 
 
 def _handle(tmp_path: Path):
-    return artifact_publication.create_staging(
+    return publish_dataset.create_staging(
         tmp_path.resolve(), "detect", uuid4(), uuid4(),
     )
 

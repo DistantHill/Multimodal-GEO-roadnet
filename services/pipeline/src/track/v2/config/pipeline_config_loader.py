@@ -11,9 +11,9 @@ from pathlib import Path
 from types import UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
-from ..detect import IntersectConfig
+from ..intersections.detect_intersections import IntersectConfig
 from ..errors import ConfigError
-from ..field_config import load_field_config
+from .field_mapping import load_field_config
 from ..models import (ClipConfig, FieldConfig, FittingConfig, NetworkConfig,
                       ProjectionConfig, RefineConfig, RuntimeConfig)
 from ..raster.models import RasterConfig

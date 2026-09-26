@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import pytest
 
-from track.v2.artifact_reconcile import apply_reconcile_plan, build_reconcile_plan
+from track.v2.artifacts.reconcile_datasets import apply_reconcile_plan, build_reconcile_plan
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
 
 

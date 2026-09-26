@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
+from .config_factory import (clip_config, fitting_config, intersect_config, network_config, pipeline_config, postgres_config, projection_config, refine_config, runtime_config)
 
 import os
 import json
@@ -14,17 +14,16 @@ import duckdb
 import pytest
 from unittest.mock import patch
 
-from track.v2.artifact_parquet import build_descriptor, validate_published
-from track.v2.artifact_publication import create_staging, publish
+from track.v2.artifacts.parquet_manifest import build_descriptor, validate_published
+from track.v2.artifacts.publish_dataset import create_staging, publish
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
 from track.v2.config import PostgresConfig
-from track.v2.db.queries import fetch_intersections, fetch_resolved_clip_tracks
-from track.v2.db.queries import fetch_detect_row
+from track.v2.intersections.query_results import fetch_intersections, fetch_resolved_clip_tracks, fetch_detect_row
 from track.v2.db.artifact_registry import find_detect_artifact
 from track.v2.db.pipeline_store import PostgresPipelineStore
-from track.v2.detect_parquet_export import export_detect_parquet
-from track.v2.detect_parquet_reader import DetectDatasetReader
-from track.v2.clip import extract_clips, extract_clips_for_detect
+from track.v2.intersections.results.export_to_parquet import export_detect_results_to_parquet
+from track.v2.intersections.results.read_parquet import DetectDatasetReader
+from track.v2.clips.extract_clips import extract_clips, extract_clips_for_detect
 from track.v2.models import ClipConfig, ClipInput, RuntimeConfig
 
 
@@ -125,8 +124,10 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
     conn.commit()
 
     handle = create_staging(tmp_path.resolve(), "detect", detect_id, uuid4())
-    descriptor = export_detect_parquet(
+    descriptor = export_detect_results_to_parquet(
         conn, config, handle, runtime_config(duckdb_threads=1), {"version": 1},
+        data_root=tmp_path.resolve(),
+        postgres_extension_path=pipeline_config().paths.duckdb_postgres_extension_path,
     )
     assert conn.execute(
         "SELECT status FROM detect_runs WHERE id=%s", (detect_id,),
@@ -147,7 +148,7 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
     ).fetchone() == ("completed",)
 
     expected_intersections = fetch_intersections(conn, str(detect_id))
-    expected_tracks = list(fetch_resolved_clip_tracks(conn, str(detect_id)))
+    expected_tracks = list(fetch_resolved_clip_tracks(conn, str(detect_id), batch_size=1024))
     with DetectDatasetReader(
         tmp_path, registered.descriptor, registered.state,
         runtime_config(duckdb_threads=1),
@@ -159,19 +160,20 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
         fetch_detect_row(conn, str(detect_id)).spatial_context, str(detect_id),
     )
     for include_boundaries in (True, False):
-        clip_config = clip_config(include_boundary_clips=include_boundaries)
-        expected_clip = extract_clips(oracle_input, config=clip_config)
+        selected_clip_config = clip_config(include_boundary_clips=include_boundaries)
+        expected_clip = extract_clips(oracle_input, config=selected_clip_config)
         with (
             patch("track.v2.db.source_table.verify_refine_source_fingerprint",
                   side_effect=AssertionError("legacy source fingerprint called")),
-            patch("track.v2.db.queries.fetch_intersections",
+            patch("track.v2.intersections.query_results.fetch_intersections",
                   side_effect=AssertionError("legacy intersection reader called")),
-            patch("track.v2.db.queries.fetch_resolved_clip_tracks",
+            patch("track.v2.intersections.query_results.fetch_resolved_clip_tracks",
                   side_effect=AssertionError("legacy track reader called")),
         ):
             actual_clip = extract_clips_for_detect(
                 conn, str(detect_id), publication_root=tmp_path, data_root=tmp_path,
-                runtime=runtime_config(duckdb_threads=1), config=clip_config,
+                runtime=runtime_config(duckdb_threads=1), config=selected_clip_config,
+                verify_sha256=True,
             )
         try:
             assert actual_clip.as_dict() == expected_clip.as_dict()

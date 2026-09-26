@@ -8,8 +8,8 @@ from uuid import uuid4
 
 import pytest
 
-from track.v2.validation import network_replay
-from track.v2.validation.network_replay import NetworkReplayError, replay_network
+from track.v2.validation import replay_network_from_fitting
+from track.v2.validation.replay_network_from_fitting import NetworkReplayError, replay_network
 
 
 class _Result:
@@ -143,7 +143,7 @@ def test_replay_fails_closed_on_unreliable_contract(mutation, identities, match)
 
 def test_anchor_mismatch_fails_before_database_reads() -> None:
     conn = _Connection()
-    with patch.object(network_replay, "_network_hash", return_value="changed"):
+    with patch.object(replay_network_from_fitting, "_network_hash", return_value="changed"):
         with pytest.raises(NetworkReplayError, match="anchor mismatch"):
             _replay(conn)
     assert conn.queries == []
@@ -151,8 +151,8 @@ def test_anchor_mismatch_fails_before_database_reads() -> None:
 
 def test_new_network_config_field_fails_before_database_reads() -> None:
     conn = _Connection()
-    existing = network_replay.fields(network_replay.NetworkConfig)
-    with patch.object(network_replay, "fields", return_value=existing + existing):
+    existing = replay_network_from_fitting.fields(replay_network_from_fitting.NetworkConfig)
+    with patch.object(replay_network_from_fitting, "fields", return_value=existing + existing):
         with pytest.raises(NetworkReplayError, match="domain changed"):
             _replay(conn)
     assert conn.queries == []

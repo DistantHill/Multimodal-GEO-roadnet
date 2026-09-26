@@ -6,7 +6,7 @@ from uuid import uuid4
 
 import pytest
 
-from track.v2 import grid_cross_track_candidates
+from track.v2.candidates import detect_grid_crossings
 from track.v2.models import CrossTrackCandidate, PointRef, RefinedPointRef
 
 
@@ -38,11 +38,11 @@ def test_grid_scheduler_retries_then_deduplicates_and_writes_on_main_thread(monk
     main_thread = get_ident()
     opened = []
     attempts = Counter()
-    grids = grid_cross_track_candidates.create_grid((0.0, 0.0, 10.0, 1.0), 5.0)
-    monkeypatch.setattr(grid_cross_track_candidates, "create_grid", lambda *_args: grids)
+    grids = detect_grid_crossings.create_grid((0.0, 0.0, 10.0, 1.0), 5.0)
+    monkeypatch.setattr(detect_grid_crossings, "create_grid", lambda *_args: grids)
     logs = []
-    monkeypatch.setattr(grid_cross_track_candidates, "log_info", logs.append)
-    real_wait = grid_cross_track_candidates.wait
+    monkeypatch.setattr(detect_grid_crossings, "log_info", logs.append)
+    real_wait = detect_grid_crossings.wait
     wait_calls = 0
     def delayed_wait(futures, **kwargs):
         nonlocal wait_calls
@@ -50,10 +50,10 @@ def test_grid_scheduler_retries_then_deduplicates_and_writes_on_main_thread(monk
         if wait_calls == 1:
             return set(), set(futures)
         return real_wait(futures, **kwargs)
-    monkeypatch.setattr(grid_cross_track_candidates, "wait", delayed_wait)
+    monkeypatch.setattr(detect_grid_crossings, "wait", delayed_wait)
     ticks = iter((0.0,))
     monkeypatch.setattr(
-        grid_cross_track_candidates, "time",
+        detect_grid_crossings, "time",
         SimpleNamespace(monotonic=lambda: next(ticks, 3.1)),
     )
     def connect_worker():
@@ -67,13 +67,13 @@ def test_grid_scheduler_retries_then_deduplicates_and_writes_on_main_thread(monk
             raise RuntimeError("transient read error")
         return [grid_index]
 
-    monkeypatch.setattr(grid_cross_track_candidates, "fetch_points_in_grid", fetch)
-    monkeypatch.setattr(grid_cross_track_candidates, "build_grid_segments", lambda batches, **_kw:
+    monkeypatch.setattr(detect_grid_crossings, "fetch_points_in_grid", fetch)
+    monkeypatch.setattr(detect_grid_crossings, "build_grid_segments", lambda batches, **_kw:
                         {"grid": batches[0], "segment_identity": (1, 2)})
-    monkeypatch.setattr(grid_cross_track_candidates, "iter_grid_crossings", lambda segments, *_a, **_kw:
+    monkeypatch.setattr(detect_grid_crossings, "iter_grid_crossings", lambda segments, *_a, **_kw:
                         [segments["grid"]])
     pair = (("a", 1, 0, 1, 0, 2), ("b", 2, 0, 2, 0, 3))
-    monkeypatch.setattr(grid_cross_track_candidates, "iter_grid_candidates", lambda *_args:
+    monkeypatch.setattr(detect_grid_crossings, "iter_grid_candidates", lambda *_args:
                         [(pair, _candidate())])
     updates = []
     status = SimpleNamespace(update=lambda **kwargs: updates.append(kwargs))
@@ -83,7 +83,7 @@ def test_grid_scheduler_retries_then_deduplicates_and_writes_on_main_thread(monk
         store.items.extend(items)
     store.extend = extend
     store.seal = lambda: setattr(store, "sealed", True)
-    result = grid_cross_track_candidates.run_grid_cross_track_task(
+    result = detect_grid_crossings.run_grid_cross_track_task(
         uuid4(), (0.0, 0.0, 10.0, 1.0), None, None, None,
         connect_worker=connect_worker,
         grid_cell_size_m=5.0, max_segments=10, max_segment_bytes=100_000,
@@ -107,14 +107,14 @@ def test_grid_scheduler_retries_then_deduplicates_and_writes_on_main_thread(monk
 
 
 def test_grid_scheduler_does_not_retry_budget_error(monkeypatch):
-    monkeypatch.setattr(grid_cross_track_candidates, "log_info", lambda _message: None)
+    monkeypatch.setattr(detect_grid_crossings, "log_info", lambda _message: None)
     attempts = []
     def over_budget(_conn, grid_index, *_args):
         attempts.append(grid_index)
-        raise grid_cross_track_candidates.GridSegmentBudgetError("grid budget exceeded")
-    monkeypatch.setattr(grid_cross_track_candidates, "fetch_points_in_grid", over_budget)
-    with pytest.raises(grid_cross_track_candidates.GridSegmentBudgetError):
-        grid_cross_track_candidates.run_grid_cross_track_task(
+        raise detect_grid_crossings.GridSegmentBudgetError("grid budget exceeded")
+    monkeypatch.setattr(detect_grid_crossings, "fetch_points_in_grid", over_budget)
+    with pytest.raises(detect_grid_crossings.GridSegmentBudgetError):
+        detect_grid_crossings.run_grid_cross_track_task(
             uuid4(), (0.0, 0.0, 1.0, 1.0), None, None, None,
             connect_worker=_WorkerConnection,
             grid_cell_size_m=5.0, max_segments=1, max_segment_bytes=1,
@@ -125,21 +125,21 @@ def test_grid_scheduler_does_not_retry_budget_error(monkeypatch):
 
 
 def test_grid_scheduler_caps_worker_candidate_results_without_retry(monkeypatch):
-    monkeypatch.setattr(grid_cross_track_candidates, "log_info", lambda _message: None)
+    monkeypatch.setattr(detect_grid_crossings, "log_info", lambda _message: None)
     attempts = []
     def fetch(_conn, grid_index, *_args):
         attempts.append(grid_index)
         return [grid_index]
-    monkeypatch.setattr(grid_cross_track_candidates, "fetch_points_in_grid", fetch)
-    monkeypatch.setattr(grid_cross_track_candidates, "build_grid_segments", lambda _batches, **_kw:
+    monkeypatch.setattr(detect_grid_crossings, "fetch_points_in_grid", fetch)
+    monkeypatch.setattr(detect_grid_crossings, "build_grid_segments", lambda _batches, **_kw:
                         {"segment_identity": (1, 2)})
-    monkeypatch.setattr(grid_cross_track_candidates, "iter_grid_crossings", lambda *_args, **_kw:
+    monkeypatch.setattr(detect_grid_crossings, "iter_grid_crossings", lambda *_args, **_kw:
                         [object()])
     pair = (("a", 1, 0, 1, 0, 2), ("b", 2, 0, 2, 0, 3))
-    monkeypatch.setattr(grid_cross_track_candidates, "iter_grid_candidates", lambda *_args:
+    monkeypatch.setattr(detect_grid_crossings, "iter_grid_candidates", lambda *_args:
                         [(pair, _candidate())])
-    with pytest.raises(grid_cross_track_candidates.GridSegmentBudgetError, match="candidate result"):
-        grid_cross_track_candidates.run_grid_cross_track_task(
+    with pytest.raises(detect_grid_crossings.GridSegmentBudgetError, match="candidate result"):
+        detect_grid_crossings.run_grid_cross_track_task(
             uuid4(), (0.0, 0.0, 1.0, 1.0), None, None, None,
             connect_worker=_WorkerConnection,
             grid_cell_size_m=5.0, max_segments=2, max_segment_bytes=100_000,

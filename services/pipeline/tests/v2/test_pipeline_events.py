@@ -3,14 +3,14 @@ from __future__ import annotations
 import unittest
 from dataclasses import FrozenInstanceError
 
-from track.v2.cli.pipeline_reporter import PipelineReporter
-from track.v2.pipeline_events import (
+from track.v2.cli.report_pipeline_events import PipelineReporter
+from track.v2.orchestration.events import (
     EventProgressAdapter,
     EventSink,
     PipelineEvent,
     PipelineEventKind,
 )
-from track.v2.stage_support import emit_report
+from track.v2.stages.support import emit_report
 
 
 class FakeLiveStatus:

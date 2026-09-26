@@ -1,8 +1,8 @@
 """Database infrastructure layer for track.v2 pipeline stages.
 
-ZH: 基建层——存放各 pipeline stage 的数据库查询，与业务逻辑分离。
-    上层 (clip.py, detect.py, replay.py) 只做组装，不写 SQL。
-EN: Infrastructure layer — database queries for each pipeline stage,
-    separated from business logic. Upper layers (clip.py, detect.py,
-    replay.py) only orchestrate; they never write SQL.
+ZH: 基建层——存放 Pipeline 阶段可复用的数据库查询与 schema 契约。
+    Clip、Detect 和 validation.replay_lineage 等上层按职责组织数据访问。
+EN: Infrastructure layer — reusable database queries and schema contracts
+    for Pipeline stages. Clip, Detect, and validation.replay_lineage organize
+    data access at their respective boundaries.
 """

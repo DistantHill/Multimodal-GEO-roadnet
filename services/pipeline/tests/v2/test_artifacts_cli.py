@@ -7,8 +7,8 @@ from uuid import uuid4
 
 import pytest
 
-from track.v2.artifact_reconcile import ApplyResult, ReconcileAction, ReconcilePlan
-from track.v2.cli import artifacts
+from track.v2.artifacts.reconcile_datasets import ApplyResult, ReconcileAction, ReconcilePlan
+from track.v2.cli import reconcile_artifacts
 
 
 NOW = datetime(2026, 9, 20, tzinfo=timezone.utc)
@@ -51,9 +51,9 @@ def action(kind="registered_present", *, eligible=True, protected=False):
 def setup(monkeypatch, plan, *, apply_error=None):
     conn = Connection()
     calls = {"build": [], "apply": []}
-    monkeypatch.setattr(artifacts, "pg_connect", lambda _config: conn)
+    monkeypatch.setattr(reconcile_artifacts, "pg_connect", lambda _config: conn)
     monkeypatch.setattr(
-        artifacts, "load_startup_config",
+        reconcile_artifacts, "load_startup_config",
         lambda **_kwargs: SimpleNamespace(
             postgres=object(),
             paths=SimpleNamespace(parquet_directory=Path("/tmp/parquet")),
@@ -61,7 +61,7 @@ def setup(monkeypatch, plan, *, apply_error=None):
         ),
     )
     monkeypatch.setattr(
-        artifacts, "build_reconcile_plan",
+        reconcile_artifacts, "build_reconcile_plan",
         lambda cur, root, now, days: calls["build"].append((cur, root, now, days)) or plan,
     )
 
@@ -71,7 +71,7 @@ def setup(monkeypatch, plan, *, apply_error=None):
             raise apply_error
         return ApplyResult(("refine/removed",), (), (), 1)
 
-    monkeypatch.setattr(artifacts, "apply_reconcile_plan", apply)
+    monkeypatch.setattr(reconcile_artifacts, "apply_reconcile_plan", apply)
     return conn, calls
 
 
@@ -79,7 +79,7 @@ def test_default_is_dry_run_with_no_apply_or_commit(monkeypatch, tmp_path, capsy
     plan = ReconcilePlan(NOW, 7, (action(),))
     conn, calls = setup(monkeypatch, plan)
     monkeypatch.setattr(
-        artifacts, "load_startup_config",
+        reconcile_artifacts, "load_startup_config",
         lambda **_kwargs: SimpleNamespace(
             postgres=object(),
             paths=SimpleNamespace(parquet_directory=tmp_path / "parquet"),
@@ -87,7 +87,7 @@ def test_default_is_dry_run_with_no_apply_or_commit(monkeypatch, tmp_path, capsy
         ),
     )
 
-    assert artifacts.main(["reconcile"]) == 0
+    assert reconcile_artifacts.main(["reconcile"]) == 0
 
     assert calls["build"][0][1] == tmp_path / "parquet"
     assert calls["build"][0][3] == 7
@@ -100,17 +100,17 @@ def test_apply_uses_config_and_commits(monkeypatch, tmp_path, capsys):
     conn, calls = setup(monkeypatch, plan)
 
     monkeypatch.setattr(
-        artifacts, "load_startup_config",
+        reconcile_artifacts, "load_startup_config",
         lambda **_kwargs: SimpleNamespace(
             postgres=object(),
             paths=SimpleNamespace(parquet_directory=tmp_path),
             runtime=SimpleNamespace(artifact_gc_grace_days=0),
         ),
     )
-    assert artifacts.main(["reconcile", "--apply"]) == 0
+    assert reconcile_artifacts.main(["reconcile", "--apply"]) == 0
 
     assert calls["build"][0][3] == 0 and calls["apply"][0][1] == tmp_path
-    assert calls["apply"][0][3] == artifacts._APPLY_REASON
+    assert calls["apply"][0][3] == reconcile_artifacts._APPLY_REASON
     assert conn.commits == 1 and conn.rollbacks == 0
     output = capsys.readouterr().out
     assert '"mode":"apply"' in output and '"appended_events":1' in output
@@ -120,7 +120,7 @@ def test_apply_empty_plan_is_successful_noop(monkeypatch, tmp_path):
     plan = ReconcilePlan(NOW, 7, ())
     conn, calls = setup(monkeypatch, plan)
 
-    assert artifacts.main(["reconcile", "--apply"]) == 0
+    assert reconcile_artifacts.main(["reconcile", "--apply"]) == 0
 
     assert len(calls["apply"]) == 1 and conn.commits == 1 and conn.rollbacks == 0
 
@@ -130,13 +130,13 @@ def test_startup_config_supplies_grace_period(monkeypatch, tmp_path):
     conn, calls = setup(monkeypatch, plan)
     seen = []
     monkeypatch.setattr(
-        artifacts, "load_startup_config",
+        reconcile_artifacts, "load_startup_config",
         lambda **kwargs: seen.append(kwargs) or SimpleNamespace(
             postgres=object(), paths=SimpleNamespace(parquet_directory=tmp_path),
             runtime=SimpleNamespace(artifact_gc_grace_days=12),
         ),
     )
-    assert artifacts.main(["reconcile"]) == 0
+    assert reconcile_artifacts.main(["reconcile"]) == 0
 
     assert seen == [{"ask_password": False}] and calls["build"][0][3] == 12
     assert conn.commits == 0
@@ -147,7 +147,7 @@ def test_apply_refuses_entire_plan_on_critical_item(monkeypatch, tmp_path, kind,
     plan = ReconcilePlan(NOW, 7, (action(), action(kind, eligible=False, protected=True)))
     conn, calls = setup(monkeypatch, plan)
 
-    assert artifacts.main(["reconcile", "--apply"]) == 2
+    assert reconcile_artifacts.main(["reconcile", "--apply"]) == 2
 
     assert not calls["apply"] and conn.commits == 0 and conn.rollbacks == 1
     assert "critical items" in capsys.readouterr().err
@@ -158,7 +158,7 @@ def test_error_rolls_back_without_printing_password(monkeypatch, tmp_path, capsy
     plan = ReconcilePlan(NOW, 7, (action(),))
     conn, _calls = setup(monkeypatch, plan, apply_error=RuntimeError("apply failed"))
     monkeypatch.setattr(
-        artifacts, "load_startup_config",
+        reconcile_artifacts, "load_startup_config",
         lambda **_kwargs: SimpleNamespace(
             postgres=SimpleNamespace(password=secret),
             paths=SimpleNamespace(parquet_directory=tmp_path),
@@ -166,7 +166,7 @@ def test_error_rolls_back_without_printing_password(monkeypatch, tmp_path, capsy
         ),
     )
 
-    assert artifacts.main([
+    assert reconcile_artifacts.main([
         "reconcile", "--apply", "--ask-password",
     ]) == 2
 
@@ -177,4 +177,4 @@ def test_error_rolls_back_without_printing_password(monkeypatch, tmp_path, capsy
 
 def test_negative_grace_days_is_rejected():
     with pytest.raises(SystemExit):
-        artifacts.main(["reconcile", "--grace-days", "-1"])
+        reconcile_artifacts.main(["reconcile", "--grace-days", "-1"])

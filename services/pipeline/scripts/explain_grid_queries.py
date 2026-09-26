@@ -15,9 +15,9 @@ from uuid import UUID
 import psycopg
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from track.v2.cli._startup import load_startup_config
+from track.v2.cli._load_config import load_startup_config
 from track.v2.db.source_table import validate_source_table
-from track.v2.grid_cross_track_candidates import create_grid
+from track.v2.candidates.grid import create_grid
 from track.v2.models import SpatialContext
 from track.v2.projection import CoordinateTransformer
 

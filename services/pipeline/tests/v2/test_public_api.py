@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import track.v2 as v2
-from track.v2.refine import refine as _refine
+from track.v2.trajectories.refine_trajectories import refine as _refine
 from track.v2.errors import DataSourceCorrupted
 
 
@@ -21,7 +21,7 @@ def _get_database(source, **kwargs):
     config = pipeline_config()
     field_path = kwargs.pop("field_config", None)
     if field_path is not None:
-        from track.v2.field_config import load_field_config
+        from track.v2.config.field_mapping import load_field_config
         kwargs["field_config"] = load_field_config(field_path)
     else:
         kwargs["field_config"] = config.parser.fields
@@ -42,7 +42,12 @@ def _make_csv(tmpdir: str, content: str) -> Path:
 
 class PublicApiTest(unittest.TestCase):
     def test_track_v2_exports_parser_and_refine_entrypoints(self) -> None:
-        self.assertIs(v2.get_database, __import__("track.v2.parser", fromlist=["get_database"]).get_database)
+        self.assertIs(
+            v2.get_database,
+            __import__(
+                "track.v2.trajectories.read_source", fromlist=["get_database"],
+            ).get_database,
+        )
         self.assertTrue(callable(refine))
         self.assertTrue(hasattr(v2, "CsvSource"))
         self.assertTrue(hasattr(v2, "TrajectoryPoint"))

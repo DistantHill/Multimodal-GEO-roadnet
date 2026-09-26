@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from track.v2.cli.replay import _target_from_args
-from track.v2.replay import (
+from track.v2.cli.replay_run import _target_from_args
+from track.v2.validation.replay_lineage import (
     REFINE_REPLAY_KINDS,
     DETECT_REPLAY_KINDS,
     PostgresReplayStore,

@@ -204,7 +204,7 @@ Python 对象的 `bytes_per_row` 不只是数据类浅尺寸，还包括：
 
 当前生产 PG CLI 的主要工作集：
 
-- [`PostgresTrajectorySourceHandle.iter_points`](../services/pipeline/src/track/v2/parser.py)
+- [`PostgresTrajectorySourceHandle.iter_points`](../services/pipeline/src/track/v2/trajectories/read_source.py)
   使用命名游标，读取批量为 10,000；
 - 当前 PG 源数据查询仍可能是 `SELECT *`；10,000 只限制行数，不限制超宽
   JSON/`extra` 等字段的读取字节数；

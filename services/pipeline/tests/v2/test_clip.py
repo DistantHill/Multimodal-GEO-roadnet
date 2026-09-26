@@ -16,7 +16,7 @@ from track.v2 import (
     extract_clips as _extract_clips,
     extract_clips_for_detect as _extract_clips_for_detect,
 )
-from track.v2 import clip as clip_module
+from track.v2.clips import extract_clips as clip_module
 from track.v2.models import ResolvedTrackPoint, RuntimeConfig, SpatialContext
 from track.v2.projection import CoordinateTransformer
 
@@ -266,11 +266,11 @@ class DetectClipLoadTest(unittest.TestCase):
         reader.iter_tracks.return_value = iter(tracks)
         conn = MagicMock()
         with (
-            patch("track.v2.clip.fetch_detect_row", return_value=run),
-            patch("track.v2.clip.find_detect_artifact", return_value=SimpleNamespace(
+            patch("track.v2.clips.extract_clips.fetch_detect_row", return_value=run),
+            patch("track.v2.clips.extract_clips.find_detect_artifact", return_value=SimpleNamespace(
                 descriptor="descriptor", state="present",
             )),
-            patch("track.v2.clip.DetectDatasetReader", return_value=reader) as factory,
+            patch("track.v2.clips.extract_clips.DetectDatasetReader", return_value=reader) as factory,
         ):
             result = extract_clips_for_detect(
                 conn, "detect-1", publication_root="/parquet", data_root="/tmp",
@@ -291,12 +291,12 @@ class DetectClipLoadTest(unittest.TestCase):
         conn = MagicMock()
         spool = MagicMock()
         with (
-            patch("track.v2.clip.fetch_detect_row", return_value=run),
-            patch("track.v2.clip.find_detect_artifact", return_value=SimpleNamespace(
+            patch("track.v2.clips.extract_clips.fetch_detect_row", return_value=run),
+            patch("track.v2.clips.extract_clips.find_detect_artifact", return_value=SimpleNamespace(
                 descriptor="descriptor", state="deleted",
             )),
-            patch("track.v2.clip.DetectDatasetReader", side_effect=ValueError("deleted")),
-            patch("track.v2.clip.ClipRelation", return_value=spool),
+            patch("track.v2.clips.extract_clips.DetectDatasetReader", side_effect=ValueError("deleted")),
+            patch("track.v2.clips.extract_clips.ClipRelation", return_value=spool),
         ):
             with self.assertRaisesRegex(ValueError, "deleted"):
                 extract_clips_for_detect(
@@ -313,12 +313,12 @@ class DetectClipLoadTest(unittest.TestCase):
         reader.iter_tracks.side_effect = ValueError("broken relation")
         spool = MagicMock()
         with (
-            patch("track.v2.clip.fetch_detect_row", return_value=run),
-            patch("track.v2.clip.find_detect_artifact", return_value=SimpleNamespace(
+            patch("track.v2.clips.extract_clips.fetch_detect_row", return_value=run),
+            patch("track.v2.clips.extract_clips.find_detect_artifact", return_value=SimpleNamespace(
                 descriptor="descriptor", state="present",
             )),
-            patch("track.v2.clip.DetectDatasetReader", return_value=reader),
-            patch("track.v2.clip.ClipRelation", return_value=spool),
+            patch("track.v2.clips.extract_clips.DetectDatasetReader", return_value=reader),
+            patch("track.v2.clips.extract_clips.ClipRelation", return_value=spool),
         ):
             with self.assertRaisesRegex(ValueError, "broken relation"):
                 extract_clips_for_detect(
@@ -331,8 +331,8 @@ class DetectClipLoadTest(unittest.TestCase):
     def test_incomplete_detect_is_rejected_before_child_queries(self) -> None:
         run = SimpleNamespace(status="running", refine_id="refine-1")
         with (
-            patch("track.v2.clip.fetch_detect_row", return_value=run),
-            patch("track.v2.clip.find_detect_artifact") as fetch,
+            patch("track.v2.clips.extract_clips.fetch_detect_row", return_value=run),
+            patch("track.v2.clips.extract_clips.find_detect_artifact") as fetch,
         ):
             with self.assertRaisesRegex(ValueError, "is not completed"):
                 extract_clips_for_detect(

@@ -1,7 +1,6 @@
 """Shared geometry helpers for v2 pipeline stages.
 
-Private module — all functions are underscore-prefixed. Imported by
-refine.py and detect.py to avoid duplication.
+Private module — all functions are underscore-prefixed. Imported by refinement and intersection detection to avoid duplication.
 
 Provides:
   - Coordinate conversion (lon/lat <-> local meter x/y)

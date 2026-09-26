@@ -5,11 +5,8 @@ from typing import Any
 
 import pytest
 
-from track.v2.db_writer import (
-    _RefineMember,
-    _refine_key,
-    finish_refine_run,
-)
+from track.v2.db.write_detect_results import _RefineMember, _refine_key
+from track.v2.db.write_refine_results import finish_refine_run
 from track.v2.models import RefinedPointRef, CrossingPoint, HotspotCluster, PointRef
 
 

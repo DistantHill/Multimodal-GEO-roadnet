@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from track.v2.artifact_reconcile import ReconcileError, build_reconcile_plan
+from track.v2.artifacts.reconcile_datasets import ReconcileError, build_reconcile_plan
 
 
 NOW = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)

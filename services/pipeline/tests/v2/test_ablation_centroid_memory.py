@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from track.v2.detect import (
+from track.v2.intersections.detect_intersections import (
     IntersectConfig,
     _annotate_source_ablation,
     _build_candidate_clusters,
@@ -95,7 +95,7 @@ def test_full_reclustered_objects_are_released_before_next_source():
         refs.extend((weakref.ref(rebuilt), weakref.ref(event), weakref.ref(point_ref)))
         return [rebuilt]
 
-    with patch("track.v2.detect._build_candidate_clusters", side_effect=build):
+    with patch("track.v2.intersections.detect_intersections._build_candidate_clusters", side_effect=build):
         actual = _annotate_source_ablation([base], [], [], intersect_config(), _TEST_TRANSFORMER)
     gc.collect()
     assert all(reference() is None for reference in refs)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from track.v2.db.completion_migration import migrate_completion_v6
+from track.v2.db.migrations.refine_completion_v6 import migrate_completion_v6
 
 
 class _Cursor:

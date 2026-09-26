@@ -13,11 +13,11 @@ import weakref
 
 import pytest
 
-from track.v2 import detect
-from track.v2.cross_candidate_relation import ClusterMemberSequence, CrossCandidateRelation
-from track.v2.member_sequences import ConcatSequence
-from track.v2.db_writer import _insert_tracks_cross, _refine_key
-from track.v2.writer_relation import WriterRelation
+import track.v2.intersections.detect_intersections as detect
+from track.v2.candidates.cross_track_relation import ClusterMemberSequence, CrossCandidateRelation
+from track.v2.intersections.member_sequences import ConcatSequence
+from track.v2.db.write_detect_results import _insert_tracks_cross, _refine_key
+from track.v2.intersections.relations.source_associations import WriterRelation
 from track.v2.models import RefinedPointRef, RuntimeConfig
 from track.v2.models import HotspotCluster, PointRef
 from .test_ablation_centroid_memory import _crossing, _event
@@ -284,7 +284,7 @@ def test_sorted_relation_to_result_writes_same_rows(tmp_path):
                     relation.add_mapping(RefinedPointRef(kind, point_id, subtrack, 0), rid)
                 relation.resolve_sources()
                 relation.prepare_annotations(output.clusters, ids, output.hotspot_events)
-                with patch("track.v2.db_writer._copy_insert", side_effect=capture):
+                with patch("track.v2.db.write_detect_results._copy_insert", side_effect=capture):
                     _insert_tracks_cross(Connection(), "run", relation, batch_size=3)
             rows.append(copied)
         membership = {index: value for kind, index, value in eager_membership_rows(eager_clusters, ids) if kind == "cross"}

@@ -9,8 +9,8 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from track.v2.refine import refine_vehicle as _refine_vehicle
-from track.v2.refine import (
+from track.v2.trajectories.refine_trajectories import refine_vehicle as _refine_vehicle
+from track.v2.trajectories.refine_trajectories import (
     RefineConfig,
     RefineResult,
     refine as _refine,
@@ -25,7 +25,8 @@ from track.v2.models import (
     SpatialContext,
     TrajectoryPoint,
 )
-from track.v2.parser import CsvSource, get_database as _get_database
+from track.v2.models import CsvSource
+from track.v2.trajectories.read_source import get_database as _get_database
 
 
 # ── Helpers ──────────────────────────────────────────────────────────

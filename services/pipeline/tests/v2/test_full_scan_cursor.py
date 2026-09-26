@@ -6,7 +6,7 @@ from uuid import uuid4
 
 import pytest
 
-from track.v2.db.cursors import declare_full_scan_cursor
+from track.v2.db.plan_full_scan_cursor import declare_full_scan_cursor
 
 
 @pytest.mark.skipif(not os.getenv('ROADNET_TEST_DSN'), reason='ROADNET_TEST_DSN is not set')

@@ -9,13 +9,13 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from track.v2.raster.aggregation import (
+from track.v2.raster.aggregate_point_counts import (
     accumulate_raw_counts, allocate_counts, validate_count_conservation,
 )
 from track.v2.raster.grid import build_grid_spec, cell_center, explicit_grid_spec, point_to_cell
 from track.v2.raster.models import GridSpec, RasterConfig
-from track.v2.raster.normalization import fit_q95_profile, render_sqrt_uint8
-from track.v2.raster.tiling import iter_tile_windows, write_tiles
+from track.v2.raster.render_counts_to_uint8 import fit_q95_profile, render_sqrt_uint8
+from track.v2.raster.write_rgb_tiles import iter_tile_windows, write_tiles
 
 
 def test_six_points_global_q95_and_batch_order():
@@ -144,7 +144,7 @@ def test_geotiff_window_io_and_repeated_rgb(tmp_path, monkeypatch):
 def test_point_source_uses_detect_union_and_binds_refine_twice(monkeypatch):
     from track.v2.db.source_table import SourceTableContract
     from track.v2.models import SpatialContext
-    from track.v2.raster import point_source
+    from track.v2.raster import read_refine_points
 
     class Cursor:
         def __enter__(self):
@@ -167,11 +167,11 @@ def test_point_source_uses_detect_union_and_binds_refine_twice(monkeypatch):
             assert name.startswith("raster_points_")
             return self.read_cursor
 
-    monkeypatch.setattr(point_source, "validate_source_table", lambda *_: SourceTableContract(
+    monkeypatch.setattr(read_refine_points, "validate_source_table", lambda *_: SourceTableContract(
         "trajectory_points", '"trajectory_points"', "bigint", True))
     conn = Connection()
     context = SpatialContext(4326, 32649, {"coordinate_semantics_version": 2})
-    assert list(point_source.iter_refined_points(
+    assert list(read_refine_points.iter_refined_points(
         conn, refine_id="refine-A", source_table="trajectory_points",
         spatial_context=context, batch_size=10)) == []
     assert "UNION ALL" in conn.read_cursor.query
@@ -182,43 +182,43 @@ def test_point_source_uses_detect_union_and_binds_refine_twice(monkeypatch):
 
 def test_point_source_accepts_completed_refine_run(monkeypatch):
     from track.v2.models import SpatialContext
-    from track.v2.raster import point_source
+    from track.v2.raster import read_refine_points
 
     context = SpatialContext(4326, 32649, {"coordinate_semantics_version": 2})
     fingerprint = {"algorithm": "sha256", "digest": "sample"}
-    monkeypatch.setattr(point_source, "fetch_refine_run_row", lambda *_: SimpleNamespace(
+    monkeypatch.setattr(read_refine_points, "fetch_refine_run_row", lambda *_: SimpleNamespace(
         status="completed", source_table="trajectory_points",
         spatial_context=context, source_fingerprint=fingerprint))
 
-    assert point_source.load_refine_spatial_context(object(), "refine-A") == (
+    assert read_refine_points.load_refine_spatial_context(object(), "refine-A") == (
         "trajectory_points", context, fingerprint)
 
 
 def test_point_source_rejects_unfinished_refine_run(monkeypatch):
-    from track.v2.raster import point_source
+    from track.v2.raster import read_refine_points
 
-    monkeypatch.setattr(point_source, "fetch_refine_run_row", lambda *_: SimpleNamespace(
+    monkeypatch.setattr(read_refine_points, "fetch_refine_run_row", lambda *_: SimpleNamespace(
         status="running"))
 
     with pytest.raises(ValueError, match="must be completed: running"):
-        point_source.load_refine_spatial_context(object(), "refine-A")
+        read_refine_points.load_refine_spatial_context(object(), "refine-A")
 
 
 def test_runner_writes_verified_geotiffs_and_publishes_complete(tmp_path, monkeypatch):
     import rasterio
 
     from track.v2.models import SpatialContext
-    from track.v2.raster import runner
+    from track.v2.raster import run_rasterization
     from track.v2.raster.models import RasterRunRequest
 
     context = SpatialContext(4326, 32649, {"coordinate_semantics_version": 2})
     fingerprint = {"algorithm": "sha256", "digest": "sample"}
-    monkeypatch.setattr(runner, "load_refine_spatial_context",
+    monkeypatch.setattr(run_rasterization, "load_refine_spatial_context",
                         lambda *_: ("trajectory_points", context, fingerprint))
     points = [(0.5, 1.5)] * 4 + [(1.5, 1.5), (2.5, 1.5)]
-    monkeypatch.setattr(runner, "iter_refined_points",
+    monkeypatch.setattr(run_rasterization, "iter_refined_points",
                         lambda *_args, **_kwargs: iter((points[:2], points[2:])))
-    result = runner.run_rasterization(object(), RasterRunRequest("refine-A", tmp_path),
+    result = run_rasterization.run_rasterization(object(), RasterRunRequest("refine-A", tmp_path),
                                       RasterConfig(tile_size_px=4, overlap_px=1,
                                                    block_size_px=2,
                                                    materialize_rgb_geotiff=True))
@@ -262,13 +262,13 @@ def test_runner_writes_verified_geotiffs_and_publishes_complete(tmp_path, monkey
 def test_failed_run_has_no_published_directory(tmp_path, monkeypatch):
     import json
 
-    from track.v2.raster import runner
+    from track.v2.raster import run_rasterization
     from track.v2.raster.models import RasterRunRequest
 
-    monkeypatch.setattr(runner, "load_refine_spatial_context",
+    monkeypatch.setattr(run_rasterization, "load_refine_spatial_context",
                         lambda *_: (_ for _ in ()).throw(ValueError("bad run")))
     with pytest.raises(ValueError, match="bad run"):
-        runner.run_rasterization(object(), RasterRunRequest("refine-A", tmp_path),
+        run_rasterization.run_rasterization(object(), RasterRunRequest("refine-A", tmp_path),
                                  RasterConfig())
     assert not list((tmp_path / "raster").iterdir()) or all(
         path.name == "failed" for path in (tmp_path / "raster").iterdir())

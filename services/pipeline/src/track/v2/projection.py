@@ -30,6 +30,16 @@ class QueryWindowRequest:
     height_m: float
 
 
+@dataclass
+class SpatialWindow:
+    """A processing-CRS rectangle shared by spatial readers and algorithms."""
+
+    x_min: float
+    y_min: float
+    x_max: float
+    y_max: float
+
+
 @dataclass(frozen=True, slots=True)
 class QueryWindow:
     """A validated rectangle in one standard WGS84 / UTM query CRS.

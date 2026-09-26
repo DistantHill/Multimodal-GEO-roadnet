@@ -7,7 +7,7 @@
 
 | 原标识 | 当前标识 |
 | --- | --- |
-| `track.v2.cleaner.clean` / `clean_vehicle` | `track.v2.refine.refine` / `refine_vehicle` |
+| `track.v2.cleaner.clean` / `clean_vehicle` | `track.v2.trajectories.refine_trajectories.refine` / `refine_vehicle` |
 | `CleanerConfig` / `CleanerResult` | `RefineConfig` / `RefineResult` |
 | `[cleaner]` | `[refine]` |
 | `runtime.cleaner_flush_point_threshold` | `runtime.refine_flush_point_threshold` |
@@ -15,15 +15,16 @@
 | `cleaned_sequence_in_subtrack` | `refined_sequence_in_subtrack` |
 | `--clean-id` | `--refine-id` |
 | 前端 `cleanId` / API `clean_id` | `refineId` / `refine_id` |
-| `track.v2.intersect2` | `track.v2.detect` |
-| `track.v2.parser0` / `track.v2.sources` | `track.v2.parser` |
+| `track.v2.intersect2` | `track.v2.intersections.detect_intersections` |
+| `track.v2.parser0` / `track.v2.sources` | `track.v2.trajectories.read_source` / `parse_rows` |
 
-正式 Python 入口使用 `from track.v2.refine import refine`。包级增量入口为
-`from track.v2 import refine_vehicle`；`track.v2.refine` 是模块。
+正式 Python 入口使用 `from track.v2.trajectories.refine_trajectories import refine`。
+包级增量入口仍为 `from track.v2 import refine_vehicle`，由 `track.v2` 延迟导出。
 `cleaner`、`cleaner1`、`clean1`、`refine1`、`parser0`、`intersect2`、`detect2`
-薄壳已删除，不再提供旧导入路径或包级 `clean` 别名。解析实现由 `sources.py`
-移至 `parser.py`，正式 Pipeline、测试和基准脚本直接调用 `parser`、`refine`、`detect`。
-旧基准命令薄壳也已删除，使用 `manual_bench_read_refine` 和 `manual_bench_schema_v4`。
+薄壳已删除，不再提供旧导入路径或包级 `clean` 别名。Parser 来源读取与行解析
+分别位于 `trajectories.read_source` 和 `trajectories.parse_rows`；正式 Pipeline 和测试
+直接调用这些模块及 `trajectories.refine_trajectories`。
+旧基准命令薄壳和 `manual_*` 临时调试脚本已于 2026-09-25 从仓库移除；下方计时数字是历史记录，当前 checkout 不再提供对应的可执行基准入口。
 旧配置节、旧 CLI 参数与旧 API 字段需要调用方同步修改。
 
 数据库结构（schema）版本升至 v4。先停止使用目标库的 Pipeline 和 Backend，
@@ -65,17 +66,8 @@ Refine 保留点复用原有 `PointRef`，投影坐标和子轨迹编号更新�
 最终脚本复测为 105.6 ms → 55.9 ms（1.89 倍），Parser 构造器占比分别为
 12.1% 和 19.6%；记录这些波动，避免将单次计时作为固定性能承诺。
 
-可复现对象测量：
-
-```sh
-PYTHONPATH=services/pipeline/src services/pipeline/.venv/bin/python \
-  -m track.v2.manual_thin_benchmark.manual_bench_point_objects
-```
-
-数据库读取与精炼的只读基准为 `manual_bench_read_refine`；需使用原测试数据库
-连接配置，并设置符合数据区域的 `TRACK_BENCH_PROCESSING_SRID`、
-`TRACK_BENCH_SOURCE_TABLE` 和 `TRACK_BENCH_MAX_VEHICLES`。该脚本现直接调用
-生产 `refine_vehicle`，包含投影和点复制，并复用同一坐标转换器。
+上述对象构建计时与数据库读取/精炼基准的原入口已移除；这些结果保留为历史记录，
+不构成当前可复现命令或当前版本性能保证。
 
 后续依据真实样本计时再选择优化：分别测量读取与解析、Refine 计算、批量写入、
 来源指纹；若计算占主导，再评估按完整车辆分组的有界进程池及序列化成本；

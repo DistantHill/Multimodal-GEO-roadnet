@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
-from track.v2.parser import _configure_postgres_session
+from track.v2.trajectories.read_source import _configure_postgres_session
 
 pytestmark = pytest.mark.skipif(not os.getenv('ROADNET_TEST_DSN'), reason='ROADNET_TEST_DSN is not set')
 
@@ -36,7 +36,7 @@ def seed_detect(conn, *, tracks=1, offset=0, long_subtrack=False):
     conn.execute("INSERT INTO refine_runs(id, source_table, status) VALUES (%s, 'public.fixture', 'running')", (refine,))
     conn.execute("""
         INSERT INTO kept_trajectory_points(id, refine_id, source_row_key, vehicle_id, subtrack_index, sequence_in_subtrack)
-        SELECT %s + n, %s, n::text, ((n-1)/2)::text, (n-1)/2+1, (n-1)%%2
+        SELECT %s + n, %s, n::bigint, ((n-1)/2)::text, (n-1)/2+1, (n-1)%%2
         FROM generate_series(1, %s) n
     """, (offset, refine, tracks * 2))
     if long_subtrack:
@@ -198,7 +198,7 @@ def test_invalid_fit_is_rejected_and_planner_setting_restored(connection, mutati
 def test_notice_updates_heartbeat_during_blocking_sql_and_detaches(connection):
     from threading import Event
     from unittest.mock import patch
-    from track.v2.heartbeat import operation_heartbeat, validation_notices
+    from track.v2.telemetry.heartbeat import operation_heartbeat, validation_notices
 
     tick = Event()
     messages = []
@@ -208,7 +208,7 @@ def test_notice_updates_heartbeat_during_blocking_sql_and_detaches(connection):
         if '校验端点' in message:
             tick.set()
 
-    with patch('track.v2.heartbeat.log_info'):
+    with patch('track.v2.telemetry.heartbeat.log_info'):
         with operation_heartbeat('提交', emit=emit, interval=.01), validation_notices(connection):
             connection.execute("DO $$ BEGIN RAISE NOTICE 'track_v2 validation: 校验端点'; PERFORM pg_sleep(0.15); END $$")
             assert tick.is_set(), 'heartbeat did not receive the current SQL check during execution'

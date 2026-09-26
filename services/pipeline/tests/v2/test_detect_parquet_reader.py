@@ -11,11 +11,11 @@ from uuid import UUID, uuid4
 import duckdb
 import pytest
 
-from track.v2 import artifact_publication
-from track.v2.artifact_parquet import build_descriptor
+from track.v2.artifacts import publish_dataset as publish_dataset
+from track.v2.artifacts.parquet_manifest import build_descriptor
 from track.v2.db.artifact_registry import ArtifactDescriptor, canonical_json
-from track.v2.detect_parquet_export import DETECT_PARQUET_V1, DetectParquetError
-from track.v2.detect_parquet_reader import DetectDatasetReader
+from track.v2.intersections.results.export_to_parquet import DETECT_PARQUET_V1, DetectParquetError
+from track.v2.intersections.results.read_parquet import DetectDatasetReader
 from track.v2.models import RuntimeConfig
 
 
@@ -54,7 +54,7 @@ def _sql(table: str, owner: UUID, *, empty: bool = False) -> str:
 
 
 def _published(tmp_path: Path, *, empty: bool = False):
-    handle = artifact_publication.create_staging(tmp_path.resolve(), "detect", uuid4(), uuid4())
+    handle = publish_dataset.create_staging(tmp_path.resolve(), "detect", uuid4(), uuid4())
     with duckdb.connect() as connection:
         for table in DETECT_PARQUET_V1:
             output = handle.path / table / "part.parquet"
@@ -65,7 +65,7 @@ def _published(tmp_path: Path, *, empty: bool = False):
         handle, {table: [f"{table}/part.parquet"] for table in DETECT_PARQUET_V1},
         {"version": 1},
     )
-    artifact_publication.publish(handle)
+    publish_dataset.publish(handle)
     return descriptor
 
 

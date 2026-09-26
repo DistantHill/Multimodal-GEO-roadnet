@@ -10,11 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from track.v2 import cross_candidate_relation
-from track.v2.cross_candidate_relation import (
+from track.v2.candidates import cross_track_relation as cross_candidate_relation
+from track.v2.candidates.cross_track_relation import (
     ClusterMemberSequence, CrossCandidateCoordinate, CrossCandidateRelation,
 )
-from track.v2.member_sequences import SliceSequence
+from track.v2.intersections.member_sequences import SliceSequence
 from track.v2.models import CrossTrackCandidate, PointRef, RefinedPointRef, RuntimeConfig
 
 

@@ -7,8 +7,8 @@ import uuid
 
 from ..config import connect as pg_connect
 from ..delete_run import DeleteRunService
-from ..logger import init_logger, shutdown_logger
-from ._startup import load_startup_config
+from ..telemetry.console_logging import init_logger, shutdown_logger
+from ._load_config import load_startup_config
 
 
 def _uuid_arg(value: str) -> str:

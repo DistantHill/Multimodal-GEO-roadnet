@@ -7,7 +7,7 @@ from pipeline.__main__ import check_config, main
 from track.v2.config import load_pipeline_config
 
 
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "config/pipeline.toml"
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "config/pipeline-roadnet-test.toml"
 
 
 def pipeline_config():
@@ -65,15 +65,15 @@ def test_check_config_rejects_files_as_runtime_directories(tmp_path) -> None:
 
 def test_run_subcommand_forwards_help_to_original_cli(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", ["pipeline", "run", "--help"])
-    with patch("track.v2.cli.run.main", return_value=0) as delegated:
+    with patch("track.v2.cli.run_pipeline.main", return_value=0) as delegated:
         assert main() == 0
     delegated.assert_called_once_with()
-    assert __import__("sys").argv == ["track.v2.cli.run", "--help"]
+    assert __import__("sys").argv == ["track.v2.cli.run_pipeline", "--help"]
 
 
 def test_artifacts_subcommand_forwards_to_artifact_cli(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", ["pipeline", "artifacts", "reconcile"])
-    with patch("track.v2.cli.artifacts.main", return_value=0) as delegated:
+    with patch("track.v2.cli.reconcile_artifacts.main", return_value=0) as delegated:
         assert main() == 0
     delegated.assert_called_once_with()
-    assert __import__("sys").argv == ["track.v2.cli.artifacts", "reconcile"]
+    assert __import__("sys").argv == ["track.v2.cli.reconcile_artifacts", "reconcile"]

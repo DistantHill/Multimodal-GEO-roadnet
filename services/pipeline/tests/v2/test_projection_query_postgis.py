@@ -8,7 +8,7 @@ from dataclasses import replace
 
 import pytest
 
-from track.v2.db.queries import _query_active_points_in_window
+from track.v2.candidates.query_source_windows import _query_active_points_in_window
 from track.v2.models import SpatialContext
 from track.v2.projection import CoordinateTransformer, QueryWindowRequest, build_query_window
 

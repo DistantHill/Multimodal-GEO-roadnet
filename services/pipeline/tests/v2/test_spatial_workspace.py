@@ -10,10 +10,10 @@ from unittest.mock import patch
 import pytest
 
 from track.v2._geometry import _to_lonlat
-from track.v2.candidate_patches import CrossTrackCapacityError
-from track.v2.detect_candidates import extract_cross_track_candidates
-from track.v2.db.queries import SpatialWindowIterator
-from track.v2.detect import (
+from track.v2.candidates.build_patches import CrossTrackCapacityError
+from track.v2.candidates.collect_candidates import extract_cross_track_candidates
+from track.v2.candidates.query_source_windows import SpatialWindowIterator
+from track.v2.intersections.detect_intersections import (
     IntersectConfig,
     _cross_track_candidate_key,
     _extract_cross_track_memory_windows,
@@ -105,7 +105,7 @@ def test_capacity_guard_runs_before_grid_allocation() -> None:
     cfg = intersect_config(cross_track_max_grid_cells_per_segment=1)
 
     with patch(
-        "track.v2.candidate_patches._build_grid",
+        "track.v2.candidates.build_patches._build_grid",
         side_effect=AssertionError("grid must not be allocated"),
     ):
         with pytest.raises(CrossTrackCapacityError, match="overflow fallback"):
@@ -138,7 +138,7 @@ def test_memory_windows_match_legacy_window_queries() -> None:
             and window.y_min <= point.y <= window.y_max
         ]
 
-    with patch("track.v2.detect._query_active_points_in_window", side_effect=query):
+    with patch("track.v2.intersections.detect_intersections._query_active_points_in_window", side_effect=query):
         legacy = _extract_cross_track_windows(
             object(),
             cfg,

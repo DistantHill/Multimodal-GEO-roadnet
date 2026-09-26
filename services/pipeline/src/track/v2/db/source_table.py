@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 
-from ..heartbeat import observed_operation, heartbeat_progress
+from ..telemetry.heartbeat import observed_operation, heartbeat_progress
 
 _REQUIRED_COLUMNS = {
     "id",

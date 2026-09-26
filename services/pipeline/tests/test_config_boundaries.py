@@ -21,7 +21,7 @@ PRODUCTION_ROOTS = [PIPELINE_ROOT / "src"]
 if REPOSITORY_ROOT != PIPELINE_ROOT:
     PRODUCTION_ROOTS.append(REPOSITORY_ROOT / "apps/backend/src")
 APPROVED_ENVIRONMENT_READERS = {
-    PIPELINE_ROOT / "src/track/v2/cli/_startup.py",
+    PIPELINE_ROOT / "src/track/v2/cli/_load_config.py",
 }
 if REPOSITORY_ROOT != PIPELINE_ROOT:
     APPROVED_ENVIRONMENT_READERS.add(REPOSITORY_ROOT / "apps/backend/src/backend/config.py")
@@ -77,7 +77,6 @@ def _production_files() -> list[Path]:
         path
         for root in PRODUCTION_ROOTS
         for path in root.rglob("*.py")
-        if "manual_thin_benchmark" not in path.parts
     ]
 
 

@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 import pytest
 
-from track.v2 import detect
-from track.v2.dbscan_storage import ActiveGridLinks, index_typecode
+import track.v2.intersections.detect_intersections as detect
+from track.v2.candidates.dbscan_index import ActiveGridLinks, index_typecode
 
 
 def invoke(function, xs, ys, eps, minimum):

@@ -12,10 +12,10 @@ import pytest
 from uuid import uuid4
 
 from track.v2.cli.init_db import DDL_STATEMENTS, INDEX_STATEMENTS, POST_DDL_STATEMENTS
-from track.v2.validation import semantic_diff
-from track.v2.cli import semantic_diff as semantic_diff_cli
-from track.v2.validation.network_replay import ReplayResult
-from track.v2.validation.semantic_diff import (
+from track.v2.validation import compare_run_lineages as semantic_diff
+from track.v2.cli import compare_run_lineages as semantic_diff_cli
+from track.v2.validation.replay_network_from_fitting import ReplayResult
+from track.v2.validation.compare_run_lineages import (
     TABLES, canonical_endpoint_pair, compare_rows, compare_runs,
 )
 from .config_factory import pipeline_config, runtime_config

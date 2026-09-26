@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from track.v2.db.artifact_migration import migrate_artifacts_v5
+from track.v2.db.migrations.artifacts_v5 import migrate_artifacts_v5
 
 
 class _Cursor:

@@ -83,15 +83,11 @@ python -m pipeline run \
   --processing-srid 32650 \
   --stats-json /tmp/roadnet-v3-run.json
 
-python -m track.v2.manual_thin_benchmark.manual_bench_schema_v3 \
-  --database roadnet \
-  --detect-id <completed-detect-uuid> \
-  --pipeline-stats /tmp/roadnet-v3-run.json \
-  --output /tmp/roadnet-v3-benchmark.json
-```
-
-Pass a prior report with `--baseline`. The tool intentionally has no arbitrary
-percentage threshold. It fails only when a comparable timing or bytes-per-row
-metric is greater than 10×, or when the behavior document differs. Host load,
-cache state, source fingerprint, and dataset must still be held constant for a
-valid comparison.
+The `manual_bench_schema_v3` entry point was removed from the repository on
+2026-09-25 with the temporary manual-debug scripts. The benchmark figures and
+acceptance rules below are historical evidence; this checkout no longer provides
+a command to reproduce them. Historical reports could be compared with a prior
+report using the then-supported `--baseline` option; the tool had no arbitrary
+percentage threshold and failed on comparable timing or bytes-per-row changes
+greater than 10×, or a changed behavior document. Host load, cache state, source
+fingerprint, and dataset still had to be held constant for a valid comparison.

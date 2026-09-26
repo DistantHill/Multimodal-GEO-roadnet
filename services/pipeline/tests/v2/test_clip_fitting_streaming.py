@@ -10,9 +10,9 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from track.v2.clip import extract_clips as _extract_clips, extract_clips_for_detect as _extract_clips_for_detect
-from track.v2.db.queries import fetch_resolved_clip_tracks
-from track.v2.fitting import (
+from track.v2.clips.extract_clips import extract_clips as _extract_clips, extract_clips_for_detect as _extract_clips_for_detect
+from track.v2.intersections.query_results import fetch_resolved_clip_tracks
+from track.v2.centerlines.fit_centerlines import (
     _OrientedClip, _fit_pair_stream, _orient_clip, _resample_at_progress,
     _resample_at_spacing, _xy_polyline_length, fit_centerline_variants as _fit_centerline_variants,
 )
@@ -51,11 +51,11 @@ def test_streamed_clip_result_matches_memory_and_serializes(tmp_path):
     reader.iter_tracks.return_value = iter(tracks)
     conn = MagicMock()
     with (
-        patch("track.v2.clip.fetch_detect_row", return_value=run),
-        patch("track.v2.clip.find_detect_artifact", return_value=SimpleNamespace(
+        patch("track.v2.clips.extract_clips.fetch_detect_row", return_value=run),
+        patch("track.v2.clips.extract_clips.find_detect_artifact", return_value=SimpleNamespace(
             descriptor="descriptor", state="present",
         )),
-        patch("track.v2.clip.DetectDatasetReader", return_value=reader),
+        patch("track.v2.clips.extract_clips.DetectDatasetReader", return_value=reader),
     ):
         actual = extract_clips_for_detect(
             conn, "detect", publication_root="/parquet", data_root=tmp_path,
@@ -80,7 +80,7 @@ def test_streamed_pair_is_exact_reference_median(count, tmp_path):
     actual = _fit_pair_stream((1, 2), lambda: iter(oriented), count, cfg, _TRANSFORMER)
     assert actual == expected
     result = _clip_result(*clips)
-    from track.v2.clip_relation import ClipRelation
+    from track.v2.clips.clip_input import ClipRelation
     with ClipRelation(runtime_config(), tmp_path) as sequence:
         for clip in clips:
             sequence.append(clip)
@@ -89,7 +89,7 @@ def test_streamed_pair_is_exact_reference_median(count, tmp_path):
 
 
 def test_pair_sampling_rejects_changed_count_and_uses_multiple_blocks(monkeypatch):
-    import track.v2.fitting as fitting
+    import track.v2.centerlines.fit_centerlines as fitting
     clips = [_clip(str(i), 1, 2, [(0, i), (40, i + 1), (200, i)]) for i in range(3)]
     oriented = [_orient_clip(clip, _TRANSFORMER)[0] for clip in clips]
     calls = 0
@@ -109,8 +109,8 @@ def test_pair_sampling_rejects_changed_count_and_uses_multiple_blocks(monkeypatc
 
 
 def test_clip_and_fitting_do_not_use_legacy_spill_implementations():
-    import track.v2.clip as clip_module
-    import track.v2.fitting as fitting_module
+    import track.v2.clips.extract_clips as clip_module
+    import track.v2.centerlines.fit_centerlines as fitting_module
     assert "DiskSequence" not in inspect.getsource(clip_module)
     fitting_source = inspect.getsource(fitting_module)
     for forbidden in ("DiskSequence", "TemporaryDirectory", "np.memmap", "import mmap"):
@@ -194,8 +194,8 @@ def test_resolved_reader_streams_subtracks_inherits_leading_crossing_vehicle_and
             (4, 2, 1, "w", 1., 2., None, None, None)]
     conn = Connection(rows)
     with (
-        patch("track.v2.db.queries.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s")),
-        patch("track.v2.db.queries.validate_source_table", return_value=SimpleNamespace(quoted_table='"s"', key_sql_type="bigint")),
+        patch("track.v2.intersections.query_results.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s")),
+        patch("track.v2.intersections.query_results.validate_source_table", return_value=SimpleNamespace(quoted_table='"s"', key_sql_type="bigint")),
     ):
         stream = _reader(conn)
         first = next(stream)
@@ -212,8 +212,8 @@ def test_resolved_reader_rejects_mixed_vehicles_instead_of_dropping_track():
     conn = Connection([(1, 1, 0, "v", 1., 2., None, None, None),
                        (2, 1, 1, "w", 1., 2., None, None, None)])
     with (
-        patch("track.v2.db.queries.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s")),
-        patch("track.v2.db.queries.validate_source_table", return_value=SimpleNamespace(quoted_table='"s"', key_sql_type="bigint")),
+        patch("track.v2.intersections.query_results.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s")),
+        patch("track.v2.intersections.query_results.validate_source_table", return_value=SimpleNamespace(quoted_table='"s"', key_sql_type="bigint")),
         pytest.raises(ValueError, match="multiple vehicles"),
     ):
         list(_reader(conn))
@@ -258,7 +258,7 @@ def _reference_fit_pair(
 
 
 def test_fitting_heartbeat_counts_have_separate_scopes_and_units():
-    from track.v2 import heartbeat
+    from track.v2.telemetry import heartbeat
 
     clips = _clip_result(
         _clip("forward", 1, 2, [(0, 0), (100, 10), (200, 0)]),
@@ -272,7 +272,7 @@ def test_fitting_heartbeat_counts_have_separate_scopes_and_units():
         original(completed, total=total, unit=unit)
         statuses.append(heartbeat._current.get().status)
 
-    with patch("track.v2.fitting.heartbeat_progress", side_effect=capture):
+    with patch("track.v2.centerlines.fit_centerlines.heartbeat_progress", side_effect=capture):
         fit_centerline_variants(clips)
 
     scopes = {}
@@ -291,7 +291,7 @@ def test_fitting_heartbeat_counts_have_separate_scopes_and_units():
 
 
 def test_pair_sampling_does_not_overwrite_outer_heartbeat_counts():
-    from track.v2 import heartbeat
+    from track.v2.telemetry import heartbeat
 
     clip = _clip("single", 1, 2, [(0, 0), (100, 10), (200, 0)])
     oriented = _orient_clip(clip, _TRANSFORMER)[0]

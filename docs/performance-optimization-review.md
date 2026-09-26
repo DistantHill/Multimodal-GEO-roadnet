@@ -22,13 +22,14 @@ as 20M capacity evidence.
 
 ## Terminology
 
-- **Current runtime** means the production path under `track.v2.pipeline` and
+- **Current runtime** means the production path under `track.v2.orchestration.run_pipeline` and
   `track.v2.intersect2`.
 - **Legacy run registry** means only an early database that still contains the
   single `pipeline_runs` table. Current lineage is
   `clean_runs → detect_runs → fit_runs`.
 - **Historical implementation** is qualified by the concrete component being
-  discussed. `_cross_track_legacy.py` is a frozen comparison oracle and is not
+  discussed. `track.v2.diagnostics.reference_cross_track_candidates` is a
+  frozen comparison oracle and is not
   selected by the production Pipeline. By contrast, `_run_dbscan_scan` remains
   the current small/non-indexable-input path, and the in-memory point-window
   implementation remains the current capacity fallback.
@@ -74,9 +75,10 @@ predicate for each cluster, and materializes only the current query window.
 Duplicate-timestamp tracks retain stream order instead of acquiring a new
 adjacency from the spatial sort.
 
-Implementation: [`intersect2.py`](../services/pipeline/src/track/v2/detect.py),
-[`cross_track.py`](../services/pipeline/src/track/v2/cross_track.py), and
-[`queries.py`](../services/pipeline/src/track/v2/db/queries.py).
+Implementation: [`detect_intersections.py`](../services/pipeline/src/track/v2/intersections/detect_intersections.py),
+[`extract_topology.py`](../services/pipeline/src/track/v2/intersections/extract_topology.py),
+[`detect_cross_track_pairs.py`](../services/pipeline/src/track/v2/candidates/detect_cross_track_pairs.py), and
+[`query_source_windows.py`](../services/pipeline/src/track/v2/candidates/query_source_windows.py).
 
 ### Persistence and Run lifecycle
 
@@ -112,8 +114,9 @@ transaction back, then records the Detect Run as `failed` separately. Telemetry
 now separates `detect_compute`, `detect_persist`, and the resolved-sequence part
 of persistence. Fitting continues to separate `fit_compute` and `fit_persist`.
 
-Implementation: [`db_writer.py`](../services/pipeline/src/track/v2/db_writer.py)
-and [`pipeline.py`](../services/pipeline/src/track/v2/pipeline.py).
+Implementation: [`write_detect_results.py`](../services/pipeline/src/track/v2/db/write_detect_results.py),
+[`insert_batches.py`](../services/pipeline/src/track/v2/db/insert_batches.py), and
+[`orchestration/run_pipeline.py`](../services/pipeline/src/track/v2/orchestration/run_pipeline.py).
 
 ### Resolved sequence and Clip
 
@@ -131,8 +134,8 @@ boundaries are explicit `boundary_start`/`boundary_end`; an entirely outside
 track with no crossing is `full_track`, while an entirely inside track emits
 nothing. Fitting accepts only `between_intersection`.
 
-Implementation: [`clip.py`](../services/pipeline/src/track/v2/clip.py) and
-[`queries.py`](../services/pipeline/src/track/v2/db/queries.py).
+Implementation: [`clips/extract_clips.py`](../services/pipeline/src/track/v2/clips/extract_clips.py) and
+[`intersections/query_results.py`](../services/pipeline/src/track/v2/intersections/query_results.py).
 
 ### Source tables and schema version
 
@@ -147,7 +150,8 @@ upgrade path: v1/v2 or unversioned tables require an explicitly confirmed
 not match. Pipeline itself accepts only `source_table` (or a completed
 `clean_id`); CSV remains a separate parser/importer facility.
 
-Implementation: [`sources.py`](../services/pipeline/src/track/v2/parser.py) and
+Implementation: [`read_source.py`](../services/pipeline/src/track/v2/trajectories/read_source.py),
+[`parse_rows.py`](../services/pipeline/src/track/v2/trajectories/parse_rows.py), and
 [`init_db.py`](../services/pipeline/src/track/v2/cli/init_db.py).
 
 The schema-v3 cutover audit and repeatable A65 commands are recorded in

@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from track.v2.resource_budget import (
+from track.v2.telemetry.snapshot_run_environment import (
     SnapshotProbe,
     collect_run_environment,
 )

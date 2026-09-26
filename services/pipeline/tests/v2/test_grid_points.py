@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 
-from track.v2.db import grid_points
+from track.v2.db import fetch_refine_points_in_grid as point_reader
 from track.v2.models import SpatialContext
 from track.v2.projection import CoordinateTransformer
 
@@ -46,13 +46,13 @@ def test_fetch_points_in_grid_uses_closed_xy_and_bounded_column_batches(monkeypa
         + point(0, 0, 11, "8", 0.0, 0) + missing,
     ])
     conn = SimpleNamespace(cursor=lambda **kwargs: data if kwargs else metadata)
-    monkeypatch.setattr(grid_points, "validate_source_table", lambda *_args:
+    monkeypatch.setattr(point_reader, "validate_source_table", lambda *_args:
         SimpleNamespace(source_table="trajectory_points",
                         quoted_table='"trajectory_points"', key_sql_type="bigint"))
-    monkeypatch.setattr(grid_points, "CoordinateTransformer", lambda *_args:
+    monkeypatch.setattr(point_reader, "CoordinateTransformer", lambda *_args:
         SimpleNamespace(inverse_bounds=lambda _bounds: (110.0, 20.0, 111.0, 21.0)))
 
-    batches = list(grid_points.fetch_points_in_grid(
+    batches = list(point_reader.fetch_points_in_grid(
         conn, (0, 0), [[(0.0, 0.0, 1.0, 1.0)]], uuid4(),
         SimpleNamespace(processing_srid=32650), batch_size=1,
     ))
@@ -64,8 +64,6 @@ def test_fetch_points_in_grid_uses_closed_xy_and_bounded_column_batches(monkeypa
     assert batches[0]["next_refined_sequence_in_subtrack"] == (1,)
     assert batches[0]["next_source_id"] == ("trajectory_points",)
     assert batches[1]["prev_point_id"] == (11,)
-    # Q89 uses a regular statement to materialize the grid hits, then a
-    # server-side cursor only for the bounded neighbour lookups.
     assert metadata.query.startswith("CREATE TEMP TABLE cross_track_hits_")
     assert "ON COMMIT DROP AS" in metadata.query
     assert metadata.query.count("%s") == len(metadata.params)
@@ -80,7 +78,7 @@ def test_fetch_points_in_grid_uses_closed_xy_and_bounded_column_batches(monkeypa
 def test_fetch_points_in_grid_rejects_negative_or_out_of_range_index():
     for index in ((-1, 0), (0, -1), (1, 0), (0, 1)):
         try:
-            list(grid_points.fetch_points_in_grid(
+            list(point_reader.fetch_points_in_grid(
                 None, index, [[(0.0, 0.0, 1.0, 1.0)]], uuid4(), None,
             ))
         except IndexError:
@@ -201,10 +199,10 @@ def test_fetch_points_in_grid_postgis_closed_boundary_neighbours_and_batches():
                 [(boundary_x - 1.0, boundary_y - 1.0,
                   boundary_x, boundary_y + 1.0)],
             ]
-            batches = list(grid_points.fetch_points_in_grid(
+            batches = list(point_reader.fetch_points_in_grid(
                 conn, (0, 0), grids, refine_id, context, batch_size=1,
             ))
-            left_batches = list(grid_points.fetch_points_in_grid(
+            left_batches = list(point_reader.fetch_points_in_grid(
                 conn, (1, 0), grids, refine_id, context, batch_size=1,
             ))
             assert [batch["point_id"][0] for batch in batches] == [101, 301]

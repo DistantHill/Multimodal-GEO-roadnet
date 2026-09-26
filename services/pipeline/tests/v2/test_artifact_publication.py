@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 
-from track.v2 import artifact_publication as publication
+from track.v2.artifacts import publish_dataset as publication
 
 
 def staging(tmp_path: Path) -> publication.StagingDataset:
