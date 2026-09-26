@@ -2,10 +2,10 @@
 
 术语遵循[项目术语与写作规范](terminology.md)，不在本文复制通用术语表。
 
-状态：Detect 网格提取局部变更已实施并通过小样本冒烟；26M 性能验收未执行
+状态：Q99 全链路列批实施已完成主要功能，独立审查与最终功能验收收尾中；本次 1M 冒烟及 26M 性能验收尚未执行
 创建日期：2026-09-19
-更新日期：2026-09-24
-访谈进度：Q19–Q79 均已回答；Detect 网格提取变更已确认并完成逐函数实施
+更新日期：2026-09-26
+访谈进度：Q19–Q89 的历史问答与实施记录保留；点对象重构已确认；Q99 已选择 A，实施已授权、进行中；权威 XY 为 (N,2)/float64，验收未通过（尚待执行验证）
 
 > 本文是当前活跃设计。旧的[2,000 万行内存预算与验收标准 Spec](pipeline-20m-memory-budget-spec.md)
 > 保留容量审计、旧进程池/磁盘暂存方案及历史实施证据，但已被本文取代。
@@ -239,6 +239,276 @@ Q76 对 2026-09-24 的新跨轨迹算法作局部更正：保留外部接口字�
 
 这是 Q79 已确认的设计摘要，并非已实现接口。
 
+### 5.6 点对象与模型粒度重构审计（2026-09-26，已确认、实施已授权）
+
+本次复用当前列式架构 Spec，补充内存数据表示重构，不新建同主题 Spec。
+用户已提出：Segment 是最小计算单位；SubTrack 直接存整条轨迹的向量，
+不由 Segment 对象组成；删除 TrajectoryPoint、DerivedPoint 等逐点类，
+并审计本节模型文件的全部类。该方向已明确，完整方案已由 Q99 确认并授权实施；本记录不表示运行代码已完成修改。
+原有已确认方案与实施记录继续保留，本节不是对历史性能验收的追认。
+
+#### 5.6.1 当前生产数据流与分配证据
+
+审计范围覆盖 Parser、Refine、Detect、Clip、Fitting、Network、持久化、Pipeline 回放与
+Backend 交叉口回放。模型文件顶层共 60 个 class，包含基类、Protocol 和 Enum。
+以下是静态调用与代码结构事实，不是性能基准：
+
+- Parser 的 PostgreSQL 快速路径已避免逐行 dict，但仍逐行构建 PointRef、
+  TrajectoryPoint 和空 extra 字典。证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/parse_rows.py:33](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/parse_rows.py:33)  和 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/parse_rows.py:135](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/parse_rows.py:135) 。
+- Refine 在投影后为每个保留点再次构建 TrajectoryPoint；kept、derived、
+  subtracks.points 是引用同批点的多组列表，没有复制全部几何，但重复保存引用。
+  正式阶段未消费增量结果的 kept/derived 列表。证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/refine_trajectories.py:45](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/refine_trajectories.py:45) 、
+   [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/refine_trajectories.py:103](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/refine_trajectories.py:103)  和 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/stages/refine.py:221](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/stages/refine.py:221) 。
+- DerivedPoint 与 TrajectoryPoint 的字段完全相同，没有新增行为；注入点写出依据
+  generated_reason 区分，不依赖 DerivedPoint 类型检查。证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/models.py:150](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/models.py:150)  和 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/db/write_refine_results.py:171](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/db/write_refine_results.py:171) 。
+- 正式 Detect 转向候选走 SQL，网格跨轨迹计算消费列批和 NumPy 数组；不能将旧
+  detect_turn_patch 的 Point 列表路径误判为正式转向主路径。网格构段仍先建逐线段
+  字典/元组再转列数组；命中交点后仍包装点引用与候选对象。证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/detect_intersections.py:1170](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/detect_intersections.py:1170) 、
+   [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/grid_segments.py:35](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/grid_segments.py:35)  和 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/detect_grid_crossings.py:148](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/detect_grid_crossings.py:148) 。
+- Detect 拓扑按窗口选择完整子轨迹，逐行构建 TrajectoryPoint、PointRef、
+  RefinedPointRef；不同窗口可再次解码同一子轨迹。几何计算又将点列表转换为坐标
+  元组列表、起止端点列表与 NumPy 数组。证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/results/read_parquet.py:208](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/results/read_parquet.py:208)  和 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/extract_topology.py:546](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/extract_topology.py:546) 。
+- Clip 读取时逐点创建 ResolvedTrackPoint，片段内点再创建 ClipPoint，临时关系
+  每次读取再次创建 ClipPoint；Fitting 定向过程随后又形成坐标列表、投影元组和
+  np.asarray 输入。三种中心线方向各有准备/配对/长度/采样读取。证据：
+   [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/results/read_parquet.py:87](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/results/read_parquet.py:87) 、
+   [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/clips/extract_clips.py:222](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/clips/extract_clips.py:222) 、
+   [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/clips/clip_input.py:253](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/clips/clip_input.py:253)  和 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/centerlines/fit_centerlines.py:225](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/centerlines/fit_centerlines.py:225) 。
+- Detect 写出仍为每个 Refine 成员构建 _RefineMember 和 RefinedPointRef。
+  Backend 交叉口回放也直接创建 PointRef/TrajectoryPoint，必须同步迁移。
+  证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/db/write_detect_results.py:248](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/db/write_detect_results.py:248)  和 [/data/workspace/Multimodal-GEO-roadnet/apps/backend/src/backend/replay/select_intersection_members.py:15](/data/workspace/Multimodal-GEO-roadnet/apps/backend/src/backend/replay/select_intersection_members.py:15) 。
+- TrackModel 没有 __slots__；声明 slots=True 的后代仍继承实例字典。
+  结构及隔离加载验证已确认机制，但宿主 Python 为 3.10，隔离加载使用内存中的
+  StrEnum 替身；不得将该验证的对象大小当成生产 Python 3.11 性能结果。
+  证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/models.py:29](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/models.py:29) 。
+- 全仓库未找到 InOutIntersectionPoint 的构造调用或 inout_points 的赋值；
+  仍有默认空字段和 replay_inout_points 消费接口。实际观测生产者是
+  EntryExitObservation。证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/models.py:616](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/models.py:616)  和 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/extract_topology.py:398](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/extract_topology.py:398) 。
+- NetworkEdge 已共享 Centerline.points，没有重新构建几何；仅合并这两类不能
+  解释为节省几何分配。证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/road_network/build_road_network.py:67](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/road_network/build_road_network.py:67) 。
+
+#### 5.6.2 全部 60 类的审计建议
+
+下表审计建议已纳入 Q99 确认范围；实际状态按 2026-09-26 当前工作树核对。功能整合和性能验收另记，类定义落地不代表已完成全部验收。“保留”不要求继续集中放在一个文件。
+配置由加载器动态构造，不能用显式构造次数为零判断无用。
+
+| 类 | 粒度、重复关系及建议 | 实际落地状态 |
+| --- | --- | --- |
+| TrackModel | 保留生产使用的 as_dict 能力；候选方案为无实例字典的基类或独立序列化函数。 | 保留 as_dict；__slots__=()，移除 from_dict/format_print。 |
+| _DictModel | 仅 from_dict 包装使用，调用仅在测试；与 from_dict/format_print 一起作为清理候选。 | 已删除，关联语义迁入阶段数组/端点元信息。 |
+| PointRef | 删除逐点实例；source 元数据在容器共享，来源行键、派生锚点等存列。 | 已删除，关联语义迁入阶段数组/端点元信息。 |
+| RefinedPointRef | 删除逐点实例；点类型、点 ID、子轨迹与顺序存列，保留身份语义。 | 已删除，关联语义迁入阶段数组/端点元信息。 |
+| TrajectoryPoint | 删除，改子轨迹/读取批次列式载荷。 | 已删除，关联语义迁入阶段数组/端点元信息。 |
+| DerivedPoint | 与 TrajectoryPoint 字段完全重复；删除，以 kind/reason 列区分。 | 已删除，关联语义迁入阶段数组/端点元信息。 |
+| FieldSpec | 每字段配置定义，保留；不在逐点规模构建。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| FieldMapping | 每来源映射且有 specs_by_canonical 缓存，保留；与配置定义职责不同。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| FieldConfig | 字段定义及解析质量阈值，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| SourceInfo | 每数据源元数据，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| ParseIssue | 保留错误语义与受限采样；point_ref 改标量身份，不为正常点构建。 | 保留受限错误样本；point_ref 为标量身份。 |
+| ReadReport | 来源级计数与错误样本，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| RefineReport | 阶段计数，保留；样本点引用改标量。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| ExcludedPoint | 删除逐排除点包装，改来源行键/原因列。 | 已删除，关联语义迁入阶段数组/端点元信息。 |
+| ExcludedIndex | 替换或合入列式排除结果容器；过滤/计数直接消费列。 | 已删除，排除结果为 ExcludedBatch 来源键/原因/几何列。 |
+| RefineConfig | 阶段配置，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| ProjectionConfig | 投影政策，保留；与具体运行上下文不重复。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| SpatialContext | 运行共享 CRS 上下文，保留；另审 projection_config 字典是否必要重复。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| RuntimeConfig | 跨阶段 I/O 与执行参数、校验，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| TrajectorySourceHandle | Protocol 本身不逐点分配；改读取批次/整轨接口。 | 保留 Protocol；iter_vehicle_batches 返回整车 SourceBatch。 |
+| GeneratedReason | 共享 Enum 常量，保留，非逐点对象热点。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| RefineResult | 与增量结果统一数组数据契约；按 Q92 迁移仓库内调用，清理无剩余调用的重复入口。 | 已改数组子轨迹与排除批次；eager/stream 共用数据契约。 |
+| RefinementSubtrack | 保留每子轨迹容器，改整轨数组，不含 Point/Segment 实例列表。 | 已改 ndarray；运动、身份、kind、after_sequence 列，原车名保留。 |
+| RefineIncrementalResult | 简化为子轨迹、排除列与统计，去重复 kept/derived 列表。 | 已简化为 subtracks、ExcludedBatch、统计；无 kept/derived 点列表。 |
+| CsvSource | 每源输入描述，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| PostgresSource | 每源查询与连接描述，保留；与 CsvSource 不构成无意义重复。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| TurnEvent | Q90 已选择逐事件载荷改批量列，保留转向事件语义。 | 已删除，转向载荷为 TurnBatch。 |
+| CrossTrackCandidate | Q90 已选择候选列/关系接口，消除嵌套点引用对象。 | 已删除，候选载荷为 CrossCandidateBatch 与关系批次。 |
+| HotspotCluster | 保留聚类级容器，成员以索引/关系关联，去逐点引用包装。 | 保留聚类语义；MemberBatch 引用事件 namespace/index/order，无重复事件载荷。 |
+| EntryExitObservation | 与两个穿越点关联的一次观测，非 CrossingPoint 同义类；Q90 已选择列式化。 | 已删除，观测载荷为 ObservationBatch。 |
+| CrossingPoint | 删除逐穿越点包装，保留线段身份、fraction、进出、交叉口关联等列。 | 已删除，穿越载荷为 CrossingBatch。 |
+| InOutIntersectionPoint | 无构造生产者；删除候选，连带空字段与残留回放接口清理。 | 已删除，关联语义迁入阶段数组/端点元信息。 |
+| IntersectionTopology | 每聚类拓扑摘要、分支与转移计数，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| IntersectReport | 阶段统计，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| ClipIntersection | 每交叉口圆定义，保留；不是轨迹点规模的分配。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| ResolvedTrackPoint | 删除逐点包装，改已解析子轨迹列。 | 已删除，关联语义迁入阶段数组/端点元信息。 |
+| ClipTrack | 与统一子轨迹表示复用数组与身份规则；避免独立的一套点包装。 | 已改 resolved ID、XY/lonlat、穿越关联与独立有效性列。 |
+| ClipInput | 阶段输入与上下文容器，保留或简化接口。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| ClipEndpoint | 随 Q92 迁移为片段端点索引与元信息，删除点包装；来源依据见第 5.6.4 节。 | 已删除，关联语义迁入阶段数组/端点元信息。 |
+| ClipPoint | 删除，片段内几何及 resolved IDs 存数组/切片。 | 已删除，关联语义迁入阶段数组/端点元信息。 |
+| TrackClip | 每片段容器有独立类型和端点语义，保留；几何改数组。 | 保留片段语义；端点元信息及内点 ID 列，几何 ndarray/slice。 |
+| ClipReport | 阶段计数，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| ClipResult | 输出、报告、上下文与关系生命周期，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| ClipConfig | 单字段阶段配置；可结构合并，但无逐点性能证据。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| FittingConfig | 阶段配置，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| Centerline | 每路对结果，保留；几何可统一数组表示。 | 保留中心线语义；readonly float64(N,2) 几何。 |
+| FitIssue | 拒绝片段/路对的原因，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| FitReport | 阶段计数，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| FitResult | 阶段输出容器，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| CenterlineFitBundle | 三种不同方向拟合结果，保留；不是同一结果的重复包装。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| NetworkConfig | 单字段配置，可结构合并，但非逐点性能重点。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| NetworkNode | 比交叉口圆增加网络 degree，保留网络语义。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| NetworkEdge | 与 Centerline 有部分字段相同但已有几何共享；保留或公共几何接口，非优先合并。 | 保留网络 degree/方向等语义；共享中心线 ndarray 几何。 |
+| NetworkIssue | 与 FitIssue 有部分重叠，可公共错误结构；目前低频且字段约束不同。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| NetworkReport | 阶段计数，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| NetworkResult | 阶段输出容器，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| ReplayFitEndpoint | 随 Q92 与 ClipEndpoint 一起迁移为端点元信息；保留 resolved ID、边界可空语义及回放字段。 | 已删除，关联语义迁入阶段数组/端点元信息。 |
+| ReplayFitClip | 保留回放容器，内部点改数组；方向和输入顺序不同于普通 TrackClip。 | 保留回放语义；完整 ID/几何列，JSON 边界恢复原字段。 |
+| CenterlineInputReplay | 每中心线回放元数据，保留。 | 保留原业务/配置/报告/资源职责，非逐记录载荷。 |
+| ReplayRefineResult | 保留 original/excluded/injected/active 分组语义，按 Q92 迁移数组与索引，清理无剩余调用的重复入口。 | 保留分组语义；原始 SourceBatch、排除索引、active 子轨迹数组，边界序列化。 |
+
+
+#### 5.6.3 数组方案草案与设计树
+
+建议：每条 SubTrack 持有 XY、lon/lat、heading、timestamp、speed 及所需身份列；
+共享 vehicle/source/CRS 元数据放容器。Segment i 由相邻成员 i、i+1 定义，
+不创建 Point、也不由 Segment 实例列表组成 SubTrack。跨网格的局部线段可存
+独立线段列批，不要求为了局部求交加载整条子轨迹。
+
+Q99 已确认 XY 权威内部布局为 (N,2) / float64；新构建数组默认 C 连续，
+基本切片允许非连续 strides，下游只读。接口需要 (2,N) 时优先转置 view，
+必要算法工作区仍可分配，不承诺全链零复制。
+保留点、注入点、穿越点的种类、来源行键、Refine 点 ID、resolved ID、
+顺序与锚点有不同含义，不合成一个通用 id 列。仅为实际消费者配置必要列，
+不将所有阶段可选字段堆入统一大容器。
+
+设计树：
+
+1. 已明确的根方向：删除逐点类；整轨数组；Segment 为最小几何计算单位。
+2. 已明确范围：Q90 同时列式化逐点和逐事件载荷，允许拆成多个 commit；Q92 迁移旧对象与仓库内调用，不留旧 Point API 兼容层。
+3. Q91 保持算法规则；不做容差检查，不比较历史派生结果，以最新生成数据为准。Q95 后续更正明确取消 vehicle_id 的 _segNN 后缀，subtrack_index 是唯一子轨迹分区依据。
+4. Q93 选择少量阶段容器；Q94 明确构建可写、交付下游只读；Q95 保留 Refine 整车读取；Q96 保存 XY 和 lon/lat。
+5. Q97 已选择同 Run 内仅按 subtrack_index 排除同轨；同原始 vehicle_id 的不同子轨迹允许求交。事件批次、成员关系、身份与锚点列和回放契约见第 5.6.4–5.6.6 节。
+6. 数据契约与验证范围已整理；分 commit 依赖顺序见第 8.1 节，性能目标沿用本 Spec 既有基线。
+7. Q98 更正及布局审计完成；Q99 已选择 A，确认完整修订设计并授权指定子代理分 commit 实施。
+
+Q91 已明确只将 trajectory_points 与 day01 源表作为必须保留的数据，其他历史派生数据
+允许抛弃，以最新产生的数据为准；因此不要求兼容旧派生数据的 ID、布局或历史结果。
+旧派生数据可抛弃不等于删除点的来源追溯字段；新生成结果仍需满足当前算法的身份关联、
+顺序、锚点与回放功能。Q92 的前后端响应字段、命令行功能与回放能力继续保留。
+派生表/Parquet 的新布局按实际字段需求决定，本轮尚未执行任何数据清理。
+性能测量尚未执行，不宣称对象数量减少的倍数、内存下降比例或全链路加速比例。
+
+#### 5.6.4 Q90–Q97 后的数据约束与契约（2026-09-26）
+
+已确认决定：
+
+- Q90：逐点与逐事件同时列式化，可以按模块分 commit。
+- Q91：保持算法规则；取消本次容差检查/旧结果比较；保留 trajectory_points、
+  day01 源表；历史派生数据可以抛弃，以最新生成数据为准。
+- Q92：旧对象和仓库内调用方直接迁移，不保留旧 Point API 兼容层，保留既有功能。
+- Q93：采用少量阶段容器，按阶段所需字段直接持有列数组，共享坐标与切片约定。
+- Q94：构建期间可写，交给下游后只读。用户明确的是写读边界；共享连续切片与批量
+  构建结果仍为符合该边界的实现建议，不解释为用户要求每处都零复制。
+- Q95：本轮保留 Refine 整车读取，内部子轨迹数组化；vehicle_id 保留源值，
+  不再添加 _segNN，subtrack_index 是所属 Run 内唯一权威子轨迹分区键。
+  此更正取代前轮关于保持后缀命名的建议，是 Q91 保持算法规则的明确局部例外。
+- Q96：Clip→Fitting 临时关系同时保存 XY 与 lon/lat，后续计算复用 XY，
+  使用该 Run 的 SpatialContext，不重复逐点投影。
+- Q97：同 Run 内跨轨迹配对只要求 subtrack_index 不同，允许同原始 vehicle_id
+  的不同子轨迹求交；grid、Parquet 与内存路径统一按子轨迹身份排除同轨。
+
+根据现有代码及上述决定，可直接落实而无需重复提问的约束：
+
+- Q99 确认坐标为 (N,2) / float64，新构建数组默认 C 连续，下游只读；
+  非连续切片可用，需要 (2,N) 时优先转置 view。小型 NumPy 实验已确认转置、相邻切片及同 dtype 的 asarray 共享内存；
+  已检查的求交/Fitting 内核未要求 C 连续。未在完整生产环境执行内核基准，
+  不宣称所有算法都不分配临时数组。证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/_geometry.py:122](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/_geometry.py:122)  和 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/centerlines/fit_centerlines.py:293](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/centerlines/fit_centerlines.py:293) 。
+- 来源行键、Refine 类型/ID、resolved ID 分别表达不同关联，改列后仍保留语义，
+  无须保留历史 ID 数值。正式 subtrack_index 按 Run 递增分配，不必另加重复的
+  字符串子轨迹 ID。证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/db/pipeline_store.py:276](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/db/pipeline_store.py:276) 。
+- 来源整数主键没有正值约束，因此不能拿 0/-1 代替缺失来源键，使用有效性标记；
+  现有同车辆同时间源行按 id::text 排序，数值化存储不能顺手改成数值排序。
+  证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/db/source_table.py:83](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/db/source_table.py:83)  和 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/db/source_table.py:138](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/db/source_table.py:138) 。
+- Clip 端点来自 resolved 序列的穿越点或自然首尾点，内点是连续区间；
+  可把端点的索引、kind、crossing/intersection 关联作为片段元数据，
+  删除 ClipEndpoint/ReplayFitEndpoint 的点包装，回放输出在边界映射原字段。
+  证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/clips/extract_clips.py:214](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/clips/extract_clips.py:214) 。
+- 投影工具的 forward_many 当前仍创建输入列表、经纬度列表和输出元组列表，
+  也需要改数组接口，否则只换模型仍保留这条转换链。
+  证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/projection.py:288](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/projection.py:288) 。
+
+身份与生命周期的实施约束：
+
+- 同一 Run 内分组、相邻点构段、时间窗口、子轨迹内顺序与片段读取统一使用
+  subtrack_index；vehicle_id 仅保存源车辆归属，不再作为子轨迹分区的替代值。
+  跨 Run 访问仍由所属 Run 隔离，不把 subtrack_index 当成跨所有 Run 的全局主键。
+- 不按车辆名后缀恢复子轨迹，不把同车不同子轨迹连成跨时间间隔的线段；旧后缀
+  派生数据无需兼容，按 Q91 可重建。相关测试应使用同 vehicle_id、不同
+  subtrack_index 的用例，验证分组、邻点、写出与回放。
+- 下游获得只读数组；过滤、注入用批量索引和一次输出分配完成。连续片段可共用
+  只读切片，沿用逐条子轨迹写出及释放，避免长期保留父数组。
+- Q96 每个片段成员新增 16 B 的 XY 数值载荷，实际临时存储增长及性能收益待测。
+  当前重复投影证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/centerlines/fit_centerlines.py:214](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/centerlines/fit_centerlines.py:214) 。
+
+#### 5.6.5 少量阶段容器的模型实现草案
+
+依据 Q90–Q96 与现有字段用途，采用以下少量阶段容器；具体名称随模块职责调整，
+不新增通用模型框架，不保留逐点实例链。
+
+- SourceBatch：整车 source_id、原 vehicle_id、lonlat 数组（与坐标布局一致为 (N,2)）、timestamp/heading/speed、来源行键与必要 extra 列。
+- RefinementSubtrack：Run、vehicle_id、subtrack_index、XY/lonlat、运动列，以及 kind、来源键、Refine ID、生成原因与锚点列。
+- resolved 子轨迹：Detect/Run、vehicle_id、subtrack_index、XY/lonlat、resolved ID、crossing 关联及可空关联的有效性列。
+- TrackClip：subtrack_index、片段序号、类型、距离、连续内点范围与端点元信息；临时成员关系列式保存 XY、lon/lat 与关联 ID。
+- Turn/Cross/Crossing/Observation：各自的事件批次列；HotspotCluster 保存成员索引或关系与摘要。成员键为 kind + calculation_index，member_order 独立；crossing 键为 cluster index + crossing index。
+- Segment 是最小几何计算单位；完整轨迹使用相邻点索引，网格局部 SegmentBatch 可持有显式端点列，SubTrack 不保存 Segment 实例链。
+
+模型文件外的 TurnCoordinate、CrossCandidateCoordinate、_RefineMember 等逐项包装
+同步列式化；低频配置、报告与资源所有者保留独立对象。构建可写、下游只读，
+连续切片可共享数组，不承诺每处零复制。Q97 已选仅按 subtrack_index 排除同轨。
+
+#### 5.6.6 全部模型及文件外包装的最终清理建议
+
+第 5.6.2 节保留全部 60 类逐项审计记录；以下清理建议已按 Q98 第 6 项采纳，完整设计已由 Q99 确认，
+不表示已执行删除。
+
+- 删除 PointRef、RefinedPointRef、TrajectoryPoint、DerivedPoint、ExcludedPoint、
+  ResolvedTrackPoint、ClipPoint、CrossingPoint 的逐点包装；ClipEndpoint 与
+  ReplayFitEndpoint 改端点索引/元信息，删除包装类。事件类改批次列，保留各事件语义。
+- 删除无生产构造者的 InOutIntersectionPoint 及空字段/残留接口；删除仅测试使用的
+  _DictModel 与无生产用途的 from_dict/format_print。生产 as_dict 功能保留为边界序列化函数。
+- ExcludedIndex 合入排除列结果；RefineResult、RefineIncrementalResult 与
+  ReplayRefineResult 共享子轨迹/排除/统计数据契约，去重复 kept/derived 列表及无调用入口，
+  保留回放 original/excluded/injected/active 分组功能。
+- 文件外 TurnCoordinate、CrossCandidateCoordinate、_RefineMember 等逐项包装
+  同步改列/关系；ClipTrack 复用子轨迹数组与身份，ClipInput 保留必要阶段输入职责。
+- 保留低频配置、来源描述、报告、问题样本、运行上下文及资源生命周期容器；
+  不为性能目标合并职责不同的 FieldSpec/FieldMapping 或 CsvSource/PostgresSource。
+- 保留 Centerline、NetworkNode/Edge 及结果语义，继续共享几何数组；
+  保留不同方向拟合 bundle、拓扑摘要与回放容器，不建立逐点链。
+
+其余单字段配置、错误结构与序列化函数的局部形式由实施者按实际调用选择，
+无需新增设计问题；不能由此扩大为通用框架。完整范围见 Q98。
+
+#### 5.6.7 主要几何内核布局审计（2026-09-26）
+
+本轮按正式生产内核族核查，不以函数数或未经测量的运行时占比计票。
+审计推荐权威 XY 布局为 float64 (N,2)，已由 Q99 明确采纳，取代此前暂定 (2,N)。
+
+| 生产内核族 | 当前输入/主要运算 | 布局证据 |
+| --- | --- | --- |
+| Refine 与投影 | 整车状态机、点对象标量；forward_many 物化经纬度列表和输出元组列表 | 无二维 ndarray 布局偏好。 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/refine_trajectories.py:52](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/refine_trajectories.py:52)  [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/projection.py:286](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/projection.py:286)  |
+| Detect 转向、G*、DBSCAN | 正式转向 iter_turn_candidates 使用 SQL 列/窗口；G*/DBSCAN 为 x/y 标量或独立一维列。Point→元组列表属于旧 eager detect_turn_patch | 均不计作 (2,N) 矩阵证据。 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/detect_turn_events.py:35](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/detect_turn_events.py:35)  [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/detect_intersections.py:1730](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/detect_intersections.py:1730)  |
+| Detect 正式网格跨轨迹求交 | 独立输入列 column_stack 成 (N,2) starts/ends，配对索引 gather 后批量求交 | 天然 (N,2)，有界 segment/pair 批次。 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/detect_grid_crossings.py:65](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/detect_grid_crossings.py:65)  [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/_geometry.py:306](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/_geometry.py:306)  |
+| Detect Topology 圆求交 | 完整 subtrack 元组列表转 (N,2)，显式 shape 校验、按行广播/einsum | 天然 (N,2)。 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/extract_topology.py:555](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/extract_topology.py:555)  [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/_geometry.py:436](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/_geometry.py:436)  |
+| Clip | 完整 track 状态机、内点元组、重投影后相邻 hypot | 无 ndarray 布局偏好；tuple 与重投影物化为当前边界。 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/clips/extract_clips.py:222](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/clips/extract_clips.py:222)  [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/clips/extract_clips.py:380](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/clips/extract_clips.py:380)  |
+| Fitting | (N,2) 折线；diff(axis=0)/norm(axis=1)、分列 interp；sampled(K,B,2) 沿 axis=0 median | 天然 (N,2)，按路对/采样块反复消费。 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/centerlines/fit_centerlines.py:225](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/centerlines/fit_centerlines.py:225)  [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/centerlines/fit_centerlines.py:293](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/centerlines/fit_centerlines.py:293)  |
+
+真正消费二维 XY ndarray 的生产内核族为上述跨轨迹求交、圆求交、Fitting：
+3/3 使用 (N,2)，0/3 使用 (2,N)。这是接口族统计，不是性能测量或运行时百分比。
+旧 eager/参考求交及非当前正式入口的 DuckDB pair 路径也为 (N,2)，仅作佐证，
+不重复计入生产分母。DB/Parquet 的独立列不决定二维矩阵 shape。
+
+shape 与内存顺序分别约定：推荐新构建的权威数组默认 C 连续；交付下游只读，
+基本切片允许非连续 strides，不为所有视图强制 C 连续。需要 (2,N) 的接口优先转置
+view。C 连续 (N,2) 的 x/y 视图步幅为 16 B；C 连续 (2,N) 转置为 (N,2) 后是
+F 连续视图。现有 NumPy 基础运算/einsum/diff/norm 未发现 C 连续强制要求，
+但不能据此保证 pyproj 等生产版本内部零复制。
+
+已确认分配包括 column_stack、元组列表转 asarray、整数/布尔高级索引与采样/stack
+工作区；转置免复制不代表全链路免复制，选择 (N,2) 也不取消必要算法分配。
+宿主 NumPy 1.21.5 的小 shape/strides 实验观察到转置共享内存、高级索引不共享；
+该版本不满足生产 NumPy >=2，未测生产速度、峰值内存、容差或旧输出。
+Q99 已确认最终布局并单独明确实施授权；审计本身不构成性能验收。
+
 ## 6. 约束与非功能要求
 
 ### 6.1 资源边界
@@ -272,7 +542,22 @@ DuckDB PostgreSQL 扩展。扩展在镜像构建期安装，运行时禁止联�
 
 ## 7. 验收标准
 
+2026-09-26 的点对象重构已确认、实施已授权：性能与资源目标沿用本 Spec 既有基线。
+结构验收要求生产数据流不再构建逐点/逐事件实例链，阶段容器以数组与索引交接；
+功能验收覆盖点顺序、来源/派生身份、锚点、可空关联、端点与回放字段，
+以及同车不同子轨迹允许求交、同子轨迹排除的 grid/Parquet/内存独立用例。
+生产环境测量对象构建、耗时与内存，不以审计推算代替实测。
+本次代码审计不构成性能验收；宿主隔离加载的 slots 机制验证不替代生产环境测量。
+
 ### 7.1 语义
+
+2026-09-26 更正（Q91，适用于本次全部逐点/逐事件重构；Q95 明确更正车辆/子轨迹身份）：保持当前算法规则，
+不设置或执行新旧结果容差检查，不以历史派生数据或旧算法输出作为验收基线；
+trajectory_points 与 day01 源表必须保留，其他历史派生数据可抛弃，使用最新生成结果。
+Q97 明确同 Run 的跨轨迹配对仅要求 subtrack_index 不同，同 vehicle_id 不构成排除条件；
+grid、Parquet、内存路径统一执行该规则。以下历史差分和容差条款不适用于本次重构。
+独立功能用例、顺序/身份/锚点完整性、
+回放字段及运行完成性仍需验证；这些检查不要求与旧输出逐项对应。
 
 下列严格差分标准属于 Q19–Q63 原列式迁移基线。本次 Detect 网格跨轨迹算法按
 Q76 不与历史中间结果或当前旧算法输出比较，也不设置二者的数量/位置容差。
@@ -325,6 +610,36 @@ Q78 规定后续项目用语：Pipeline 冒烟测试使用
 本次 Detect 网格跨轨迹路径先按第 7.1 节新增的独立功能验收运行冒烟测试；
 不要求与旧输出做差分。
 本次实施按用户先前要求一次讨论和修改一个函数，逐步验证，不批量改造其他函数。
+
+### 8.1 点对象重构实施顺序（2026-09-26，已授权）
+
+主要几何内核布局审计与完整确认已完成；先定义整轨/批次列与身份语义，
+随后迁移 Parser/Refine 及其写出；
+随后迁移 Detect 拓扑、穿越和候选关系边界，再迁移 Clip/Fitting 交接、
+Pipeline 与 Backend 回放；最后清除无剩余调用的旧类和接口。
+Q90 已确认逐事件一并列式化并允许分 commit 提交；Q91 保持算法规则、取消本次
+新旧结果容差/历史派生对比；Q92 迁移旧对象接口与调用方，不保留兼容层。
+Q93–Q96 已确认阶段容器、构建可写/下游只读、Refine 整车读取、保存 XY/lonlat；
+子轨迹身份迁移同步取消 vehicle_id 后缀，并以 subtrack_index 分区；按 Q97，
+grid/Parquet/内存求交路径统一仅排除同 subtrack_index，允许同车不同子轨迹求交。
+验证应覆盖独立功能用例、顺序/锚点/边界和回放字段，并在相同生产环境测量
+对象构建、时间与内存；性能目标沿用本 Spec 既有基线，不新增旧输出容差。
+实施阶段仍需运行项目要求的 make test，实际 Pipeline 冒烟/全量运行分别注明
+指定配置。Q99 已授权按此计划分 commit 实施；本次文档收尾不编辑代码或提交，
+由执行负责人统一集成与提交。
+
+实施清单初始状态（授权已生效；状态不等于验收结果）：
+
+| 项目 | 状态 |
+| --- | --- |
+| 阶段模型、数组与身份契约 | 已实施；结构入口及身份/只读独立审查已闭环 |
+| Parser/Refine 及写出 | 已实施；真实 PG 与规则回归通过 |
+| Detect 事件、拓扑与候选关系 | 已实施；最终诊断/只读交付审查收尾中 |
+| Clip/Fitting 双坐标与端点关系 | 已实施；真实 PG 下游验证通过 |
+| Pipeline/Backend 回放与边界调用迁移 | 已实施；Backend 84 项通过 |
+| 旧类、无生产者接口与重复结果清理 | 已实施；生产残留扫描无匹配 |
+| 功能、make test、指定冒烟/全量及性能验证 | 完整 make 已通过；正式 1M 正在运行，26M 待执行 |
+| 审查、分 commit 集成与提交 | 独立交叉审查已闭环；b12b960、10f27a6 已提交 |
 
 ## 9. 风险与待决事项
 
@@ -402,6 +717,32 @@ hits 临时表再读取的两段式流程。Q82 回答旧数据可以删除；Q8
 没有执行数据库变更。
 新决定只覆盖本轮明确范围，不改写 Q79 的历史结论。
 
+### 9.4 点对象与模型粒度重构访谈（2026-09-26）
+
+用户已明确 SubTrack 整轨数组、Segment 最小几何计算单位与删除逐点类的方向；
+要求审计模型文件全部类并共同讨论重构方案。审计结论与全部 60 类建议见第 5.6 节。
+Q90–Q92 已回答：逐点与逐事件一起列式化、允许分 commit；算法规则保持，
+不做容差检查，保留 trajectory_points/day01、允许抛弃历史派生数据，以新结果为准；
+旧对象与调用方直接迁移。Q93–Q96 已回答：阶段容器、构建可写/下游只读、Refine
+整车读取以及 Clip 临时关系保存 XY/lonlat；Q95 进一步更正为取消 vehicle_id 后缀、
+subtrack_index 唯一分区。核查已确认正式网格路径按 vehicle_id 建立 rank，
+配对排除相同 rank：取消后缀会使同车不同子轨迹从原本可配对变为被排除。
+证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/detect_grid_crossings.py:89](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/detect_grid_crossings.py:89)  和 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/build_patches.py:229](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/build_patches.py:229)  及 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/build_patches.py:264](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/build_patches.py:264) 。
+Q97 已选 A：同 Run 内只要求 subtrack_index 不同，允许同车不同子轨迹求交，
+不允许同子轨迹内部参与跨轨迹配对。所有路径同步迁移该身份判断。
+约束、模型草案与最终清理建议见第 5.6.4–5.6.6 节。Q98 第 2–8 项已采纳，
+第 1 项已完成布局审计；Q99 已选择 A，确认权威 (N,2) / float64，
+完整设计已确认并授权实施，当前进入实施阶段，尚待验收。
+
+协作方式按第 24 轮后续补充：主代理协调、访谈和汇总，详细仓库调查、编码和审查
+交给 gpt-6-sol low 子代理，必要时由其调用 gpt-6-luna high 并行。
+所有子代理默认要求 Fast；模型及推理强度仍为 sol low、按需 luna high。
+本工具会话无法显式启用或验证 Fast：spawn_agent 及其他可用工具无 Fast/service_tier 控制，
+也无自动继承证据；
+不声称已成功启用，不将 low 推理强度当作 Fast。
+协作补充本身不替代设计确认或实施授权；两者现已由 Q99 明确授予。
+本次未修改运行代码，未运行 Pipeline 数据任务，未删除数据或发布制品。
+
 ## 10. 确认记录
 
 用户已在 Q62 以“确认”明确确认当时第 1–9 节为完整共享设计。设计确认日期为
@@ -418,6 +759,11 @@ hits 临时表再读取的两段式流程。Q82 回答旧数据可以删除；Q8
 用户在 Q79 回答“确认并让subagent(gpt6 sol low)实施”，确认 Detect 网格跨轨迹
 局部设计，并授权 `gpt-6-sol`、`low` 子代理逐函数实施。沿用先前“一次讨论和
 修改一个函数”的协作范围；该授权不表示已完成实现或验收。
+
+本次点对象重构 Q90–Q97 已回答，Q98 两条局部更正及布局审计已完成。
+用户在 Q99 明确选择 A，确认权威 (N,2) / float64 的完整修订设计，并要求开始按计划
+实施，授权 gpt-6-sol low 分 commit 实施和审查、必要时派 gpt-6-luna high。
+设计确认及实施授权均已生效；功能与性能验证、提交仍待执行，不构成验收通过。
 
 ## 附录：完整 QA 记录
 
@@ -1996,12 +2342,355 @@ Refine/Detect Parquet 目录已清理，三个保护源表行数保持不变。�
 schema v7 迁移到 v8，kept_trajectory_points.source_row_key 与
 excluded_points.source_row_key 均为 BIGINT。
 
-性能计划、耗时、行数与循环、清理清单、迁移状态和测试结果记录在本机
-`services/pipeline/generated/cross-track-explain/` 下的 `q89-results.md`、
-`grid_compare_summary.json` 和 `cleanup_manifest.json`。该 `generated/` 路径由
-`.gitignore` 忽略；这些生成证据只保存在本地，不纳入 Git。
+性能计划、耗时、行数与循环、清理清单、迁移状态和测试结果见
+ [Q89 实施报告](../services/pipeline/generated/cross-track-explain/q89-results.md) ；
+机器可读的完整计划与汇总见
+ [网格查询汇总](../services/pipeline/generated/cross-track-explain/grid_compare_summary.json) ，
+九个清理路径见
+ [清理清单](../services/pipeline/generated/cross-track-explain/cleanup_manifest.json) 。
 
 迁移预检保留旧字符串身份：只接受规范十进制行键，并拒绝仍引用 UUID、TEXT
 等非整数 id 来源表的保留 Refine Runs。验证结果为 Pipeline smoke 1,141 passed、
 1 skipped；make test 中 Backend 83 passed、Pipeline 1,075 passed、67 skipped，
 迁移 PostgreSQL 集成测试 8 passed。
+
+### 第 23 轮 — 点对象与模型粒度重构（2026-09-26）
+
+发问时前提：复用列式架构 Spec；第 5.6 节已完成全部 60 类及正式数据流审计。
+本轮只讨论方案，运行代码未改，未开展性能基准。
+
+#### 本轮需求原文与先前补充
+
+用户最初提出：
+
+> 我要修改底层class，尽可能去除掉class points ->class segment -> class subtrack ->class ...
+> 以后计算的最小对象是segment，而且不要用segment组成subtrack，subtrack直接用向量存一整条subtrack，比如
+> subtrack :
+> points[[x1,x2,...],[y1,y2...]],id:str,hedings[heading1,heading2,...],....
+> 这样可以减少python对象的构建吧
+
+本轮调用访谈并补充：
+
+> [$grill-me](/home/reid/.codex/skills/skills/grill-me/SKILL.md) 对，大方向没错，你详细检查下代码，和我一起讨论个方案，refactor，去掉trajectoryPoint class，derivedPoint class等point class
+> 并且同步检查一下，models.py里所有class是否有重复？能合并的？没必要的？粒度太小导致性能浪费的？
+
+解释范围：认可整轨数组和线段计算方向，明确要求逐点类删除方案及全部模型审计。
+属于设计讨论授权，未确认完整新方案，不继承 Q79 指定模型实施局部函数的授权范围。
+
+#### Q90 — 逐事件对象是否一并列式化
+
+> 你已明确删除逐点类。本轮是否同时把 TurnEvent、CrossTrackCandidate、EntryExitObservation 等逐事件载荷改为列数组？A. 同时列式化逐点和逐事件载荷，保留子轨迹、批次、片段、交叉口等容器；B. 本轮只删除逐点类，逐事件类留待下一轮重构。CrossingPoint 的穿越身份与属性无论选哪项都必须保留为数据，不能随类删除。
+
+> 推荐 A：正式数据流中事件临时关系仍会逐条解码为对象，CrossTrackCandidate 转成聚类事件时还会构建 TurnEvent；只改轨迹点会留下这部分包装和重复读取。不是把不同事件的业务含义合并。
+
+> 用户回答：90：同时列式化，但是commit可以分开提交
+
+正文关联：第 5.6、7、8、9.4 节。
+回答来源（合并原文摘录）：第 23 轮合并回答，第 1 行。
+当前解释：选择同时列式化逐点与逐事件载荷；允许分多个 commit 提交。
+本条没有确认完整方案或触发立即实施。
+
+#### Q91 — 本轮是否保持算法语义
+
+> 这次是纯数据表示与执行方式重构，还是也允许改变算法规则？A. 保持当前算法规则、点顺序、身份、去重及边界行为，只改变存储和计算方式；B. 同时调整算法规则，逐项另定预期结果。
+
+> 推荐 A：先验证数组路径与当前同源输入的参考结果，再评估性能。浮点运算顺序可能因向量化改变，具体容差与必须精确一致的字段在下一轮明确；不以历史数据库产物代替当前参考算法。
+
+> 用户回答：91：先保持算法规则，注意不要检查容差，唯一需要尊重保留的是trajectory\_points和day01这两个table，其他的历史派生直接可抛弃，已最新产生数据为准
+
+正文关联：第 5.6、7、8、9.4 节。
+回答来源（合并原文摘录）：第 23 轮合并回答，第 2 行。
+当前解释：保持算法规则，但明确撤销本次新旧结果容差检查及历史派生基线要求；
+保留 trajectory_points/day01 源表，历史派生可抛弃，以新生成结果为准。
+新结果仍需满足功能、身份关联、顺序和锚点规则；本轮没有执行任何删除。
+
+#### Q92 — 旧 Python 点对象接口的兼容边界
+
+> 删除点类会改变 Pipeline 的公开 Python 导出和函数签名；Backend 交叉口回放也实际调用了这些类。A. 允许直接迁移所有仓库内调用方，不保留旧 Point 构造/API 兼容层；仅由旧点接口支撑的重复入口在确认无剩余调用后删除；B. 保留现有功能入口与函数名，统一改成数组输入输出，但不保留点类。两项均保留现有前后端字段、命令行功能和回放能力。
+
+> 推荐 A：这与彻底删除逐点对象的目标一致，也允许清除仅服务旧对象链的包装；实际使用中的导入、回放和命令行入口必须迁移，不能仅因使用旧类就删除功能。
+
+> 用户回答：92：按推荐，旧对象也迁移
+
+正文关联：第 5.6、7、8、9.4 节。
+回答来源（合并原文摘录）：第 23 轮合并回答，第 3 行。
+当前解释：采纳 A，迁移旧对象及仓库内全部调用方，不保留旧 Point API 兼容层；
+无剩余调用的重复入口可清理，前后端字段、命令行功能及回放能力仍需保留。
+
+本轮检查：Q90–Q92 连续且唯一，全部已回答；正文记录已明确方向和审计事实，
+未决项与实施状态明确；QA 附录保留在文末。
+
+### 第 23 轮合并回答 — 对应 Q90–Q92
+
+接收日期：2026-09-26。
+用户回答原文：
+
+> 90：同时列式化，但是commit可以分开提交
+> 91：先保持算法规则，注意不要检查容差，唯一需要尊重保留的是trajectory\_points和day01这两个table，其他的历史派生直接可抛弃，已最新产生数据为准
+> 92：按推荐，旧对象也迁移
+
+解释范围：Q90 同时列式化且可分 commit；Q91 保持算法规则，同时以用户更正取代
+原推荐中的新旧结果/容差对比，保护两类源表并允许抛弃历史派生；Q92 直接迁移旧对象
+及调用方。没有将局部回答解释为完整设计确认或立即删除数据/实施代码的指令。
+正文同步：顶部访谈进度、第 5.6、7.1、8.1、9.4 节及各题当前解释。
+
+### 第 24 轮 — 数组容器与生命周期（2026-09-26）
+
+发问时前提：Q90–Q92 已回答；同时列式化逐点/逐事件，保持算法规则，
+不做容差/旧结果比较，保护 trajectory_points/day01，旧对象直接迁移。
+(2,N) 布局、身份字段和 Clip 端点来源已按代码核实，不重复询问已明确语义。
+
+#### Q93 — 统一模型还是少量阶段容器
+
+> 数组化后，模型边界选哪种？A. 保留少量阶段容器：Refine 子轨迹、resolved 子轨迹、各类事件批次，共用坐标和切片约定；B. 所有阶段使用一个通用 SubTrack/列容器，通过可选字段和类型标记区分。两项都直接持有数组，不恢复 Point/Segment 对象链。
+
+> 推荐 A：Refine 需要时间、方向、速度和来源身份；Clip 消费的 resolved 序列主要需要坐标、resolved ID 与穿越关联。按实际用途配置列，构建频率是每条子轨迹或每批事件，而不是每个点。
+
+> 用户回答：93：A
+
+正文关联：第 5.6.4、8.1、9.4 节。
+回答来源（合并原文摘录）：第 24 轮合并回答，第 1 行。
+当前解释：采用少量阶段容器，直接持有各阶段必需数组，共享坐标与切片约定。
+
+#### Q94 — 数组共享与修改规则
+
+> 数组在算法之间如何传递？A. 构建期间可写，交给下游后只读；连续片段共用切片，Refine 删除/注入时批量生成新数组，写出后释放父子轨迹；B. 每次交给下游都复制成独立数组，避免共享存储。
+
+> 推荐 A：与现有阶段输出不可修改的约定一致，也能消除 Clip 的逐内点复制。只读切片会保留父数组，所以沿用当前逐条子轨迹写临时关系并释放的流程，不累积跨轨迹切片。
+
+> 用户回答：94：构建期间可写，交给下游后只读； &#x20;
+
+正文关联：第 5.6.4、8.1、9.4 节。
+回答来源（合并原文摘录）：第 24 轮合并回答，第 2 行。
+当前解释：明确构建期间可写、交付下游只读；共享连续切片与批量构建是符合此边界
+的实现建议，不扩大成用户要求每处零复制或强制复制。
+
+#### Q95 — 本轮是否改变 Refine 的读取粒度
+
+> 当前 Refine 先读完整车辆，再按时间间隔拆子轨迹；Detect/Clip 已按子轨迹读取。本轮选：A. Refine 先改为整车列批和子轨迹数组，保留当前读取粒度；B. 同时把 Refine 改为逐子轨迹读取，额外改造分组查询或预扫描。
+
+> 推荐 A：先完成全链路对象迁移。当前是否给 vehicle_id 加 _segNN 后缀取决于整车拆分总数，B 必须额外取得这个信息，并保持解析后的时间间隔规则；不能把删除 Point 类等同于已经实现单子轨迹驻留。
+
+> 用户回答：95：A, PS:以后不再给vehicle\_id加segNN，subtrack唯一权威partition是subtrack\_index
+
+正文关联：第 5.6.4、8.1、9.4 节。
+回答来源（合并原文摘录）：第 24 轮合并回答，第 3 行。
+当前解释：保留整车读取，并明确更正原推荐中的命名保留规则：vehicle_id 保留原值，
+不追加 _segNN；subtrack_index 是 Run 内唯一权威子轨迹分区键。此更正覆盖 Q91
+“保持算法规则”中有关旧后缀命名的部分。跨轨迹配对规则现已由 Q97 明确为仅按 subtrack_index 排除同轨。
+
+#### Q96 — 是否在 Clip 临时关系保存投影坐标
+
+> Clip 计算长度时已投影坐标，Fitting 多次读取又重复投影。本轮选：A. Clip→Fitting 临时关系同时保存 XY 和 lon/lat，Fitting 直接使用 XY；B. 临时关系只保存 lon/lat，Fitting 仍在读取时投影。
+
+> 推荐 A：每个片段成员增加 16 B 的 float64 XY 数值载荷，可省去后续重复投影；实际临时存储增长还包含数据库开销，收益需要测量。沿用该 Run 的 SpatialContext，可独立提交。
+
+> 用户回答：96：A,保存XY和lon/lat，后续方便计算
+
+正文关联：第 5.6.4、8.1、9.4 节。
+回答来源（合并原文摘录）：第 24 轮合并回答，第 4 行。
+当前解释：临时关系同时保存 XY 与 lon/lat，后续计算复用 XY。
+
+本轮检查：Q90–Q92 的合并原文及逐题摘录已保存，正文已同步；
+Q93–Q96 连续且唯一，全部已回答。完整设计尚未确认，未实施运行代码；
+QA 附录仍位于文末。
+
+### 第 24 轮合并回答 — 对应 Q93–Q96
+
+接收日期：2026-09-26。
+用户回答原文：
+
+> 93：A
+> 94：构建期间可写，交给下游后只读； &#x20;
+> 95：A, PS:以后不再给vehicle\_id加segNN，subtrack唯一权威partition是subtrack\_index
+> 96：A,保存XY和lon/lat，后续方便计算
+
+解释范围：阶段容器、构建可写/下游只读、保留整车读取、缓存 XY 已明确。
+Q95 另明确更正车辆命名与子轨迹分区，以该更正为准，不再保留旧后缀建议。
+未确认完整设计，未执行代码实施或派生数据清理。
+正文同步：顶部进度、第 5.6.3、5.6.4、7.1、8.1、9.4 节及 Q93–Q96 当前解释。
+
+### 第 24 轮后续补充 — 主代理与子代理职责（2026-09-26）
+
+关联原记录：第 24 轮 Q93–Q96 合并回答后收到的独立消息。
+用户补充原文：
+
+> astra，你是我的助理，而不是执行者，详细的repo detect、coding和review都交给subagent(gpt-6-sol-low)，并且允许subagent唤起(gpt-6-luna-high)进行必要的并行任务
+
+当前解释：主代理协调、访谈、汇总；详细调查、编码和审查由 gpt-6-sol low 承担，
+必要时可派 gpt-6-luna high 并行。本条未授权立即代码实施，未回答配对规则，
+也未确认完整设计。正文同步：第 9.4 节。
+
+### 第 25 轮 — 取消车辆名后缀后的跨轨迹配对（2026-09-26）
+
+发问时前提：Q90–Q96 已回答；Q95 要求保留原 vehicle_id，subtrack_index 为 Run 内
+唯一权威子轨迹分区。按 vehicle_id 排除同 rank 的配对受取消后缀影响，需明确规则。
+
+#### Q97 — 同车不同子轨迹是否参与跨轨迹求交
+
+> 取消 _segNN 后，同一辆车的不同子轨迹能否参与跨轨迹求交？A. 只要求 subtrack_index 不同，允许同车不同子轨迹求交；B. 还要求原始 vehicle_id 不同，同车所有子轨迹相互排除。两项都不允许同一子轨迹内部参与该跨轨迹配对。
+
+> 推荐 A：与 subtrack 唯一 partition 一致，并延续旧后缀实际区分子轨迹后的参与范围。
+
+> 用户回答：Q97 只要求subturack\_index不同
+
+正文关联：第 5.6.5、7.1、8.1、9.4 节。
+当前解释：原文 subturack_index 的拼写解释为 subtrack_index；已选择 A。
+同 Run 内仅要求 subtrack_index 不同，允许同原始 vehicle_id 的不同子轨迹参与，
+不允许同子轨迹内部配对。
+
+本轮检查：Q90–Q97 已回答，编号连续且唯一；第 24 轮后续补充原文独立
+保存，未冒充 Q97 回答。正文与当前决定一致，完整设计尚未确认；未修改运行代码、
+未运行数据任务、未删除数据；QA 附录仍位于文末。
+
+### 第 25 轮发问前后续补充 — 子代理默认 Fast（2026-09-26）
+
+关联原记录：第 24 轮主代理与子代理职责补充；本条不是 Q97 回答。
+用户补充原文：
+
+> 补充，所有subagent默认fast模式
+
+当前解释：所有子代理默认要求 Fast，模型与推理强度不变（sol low、按需 luna high）。
+本工具会话无法显式启用或验证 Fast：spawn_agent 及其他可用工具无 Fast/service_tier 控制，
+也无自动继承证据；
+不能记录为已成功启用，也不能把 low 推理强度当作 Fast。
+正文同步：第 9.4 节；发问时 Q97 待回答，现已由后续回答收敛；完整设计尚未确认。
+
+### Q97 回答收录 — 跨轨迹配对决定（2026-09-26）
+
+用户回答完整原文：
+
+> Q97 只要求subturack\_index不同
+
+当前解释：保留原文拼写；解释为 subtrack_index，选择 A。正文同步：顶部进度、
+第 5.6、7、7.1、8.1、9.4 节及 Q97 逐题记录。独立技术决策已收敛，待 Q98 最终设计确认。
+
+### 第 26 轮 — 点对象重构完整设计确认（2026-09-26）
+
+发问时前提：Q90–Q97 已回答，独立技术决策已收敛；以下题目明确区分设计确认与实施授权；未回答前不启动实施，不表示验收通过。
+
+#### Q98 — 本次重构完整设计确认
+
+> 完整共享设计：
+> 1. 全链路逐点与逐事件同时列式化，覆盖 models.py 全部 60 类及文件外逐项包装；采用少量阶段容器，NumPy 坐标为 (2,N) float64，运动、来源键、kind、Refine/resolved ID、顺序、锚点与有效性按消费者所需存列。
+> 2. SubTrack 持有整轨数组，不含 Point/Segment 实例链；Segment 为最小几何计算单位，用相邻点索引或网格局部端点列批表示。删除点/引用/端点包装、无生产者 InOutIntersectionPoint、仅测试 _DictModel 等；简化 Refine 重复结果/索引，保留低频配置、报告、资源容器和 Centerline/Network 几何共享。
+> 3. 构建期间可写，交付下游只读；连续范围可共享视图但不保证每处零复制。Refine 保留整车读取，内部子轨迹数组化。
+> 4. vehicle_id 保留原值，不追加 _segNN；subtrack_index 为 Run 内唯一权威 partition。grid/Parquet/内存路径统一排除同 subtrack_index，同原始 vehicle_id 的不同子轨迹允许求交，禁止同子轨迹内部跨轨迹配对。
+> 5. Clip 内点使用连续范围，端点使用索引与 kind/crossing/intersection 元信息；Clip→Fitting 临时关系列式保存 XY、lon/lat 和关联 ID。事件成员使用 kind + calculation_index，member_order 独立；crossing 使用 cluster index + crossing index。
+> 6. 直接迁移旧类及全部仓库调用方，包括 Pipeline/Backend 回放与前后端边界，不保留 Point API 兼容层；保留既有外部响应字段、命令行、方向/输入顺序、边界可空及回放功能。
+> 7. 仅 trajectory_points、day01 源表必须保留；旧派生可抛弃，以新数据为准。不作容差检查或旧输出比较；除已确认的车辆/子轨迹身份与配对更正，其余算法规则保持。源追溯、身份关联、顺序与锚点仍需正确。
+> 8. 可分 commit：先容器/身份契约，再 Parser/Refine 与写出，随后 Detect 事件/拓扑/候选关系，再 Clip/Fitting 和回放，最后清理旧类。实施需 make test、独立功能/身份/边界/回放验证；Pipeline 冒烟配置为 services/pipeline/config/pipeline-roadnet-test.toml ，全量配置为 services/pipeline/config/pipeline.toml ，记录实际配置。性能与资源标准沿用本 Spec 既有基线，在生产环境测量；代码审计不表示通过验收。
+> 9. 主代理仅协调、访谈、汇总；gpt-6-sol low 执行详细调查、coding、review，必要时可调用 gpt-6-luna high 并行。所有子代理默认要求 Fast，但本工具会话无法显式启用或验证，不把 low 推理强度当作 Fast。
+>
+> 是否确认上述为本次重构完整设计，并选择实施范围？A. 确认完整设计，并授权指定子代理按方案分 commit 实施；B. 仅确认设计，暂不实施；C. 指出需要更正的条目。A 同时授予设计确认和实施授权，B 仅确认设计；两者均不构成验收通过。
+
+> 推荐 A：完整设计已收敛，可进入实施；选 B 也完成设计确认，但不启动实施。
+
+> 用户回答：待回答
+
+正文关联：第 5.6、7、8.1、9.4、10 节。
+当前解释：后续两条原文构成 C 类局部更正；实际用户回复的第 2–8 项已采纳，
+第 1 项 shape 暂定并要求主要几何内核审计。原问题和推荐作为历史保留。
+用户未明确选择 A，当前仅授权布局审计与 Spec 修订，未获立即编码实施授权。
+
+本轮检查：Q19–Q98 连续且唯一；Q90–Q97 已回答，Q98 待回答；历史 QA 保留，
+配对规则已同步，协作补充独立记录；QA 附录仍位于文末。未运行数据任务或删除数据。
+
+### Q98 后续更正（一）— 暂定布局与第 2–3 项采纳（2026-09-26）
+
+关联原记录：第 26 轮 Q98；这是独立收到的第一条消息，原问题与推荐不覆盖。
+用户完整原文：
+
+> **SubTrack 采用列式 ndarray 存储；XY 的权威内部布局暂定&#x20;****`(2,N)`****&#x20;/&#x20;****`float64`****。Segment 由相邻索引&#x20;****`i → i+1`****&#x20;定义，不创建逐 Segment Python 对象。算法如需要&#x20;****`(N,2)`****，优先通过转置 view 提供，不复制数据。**
+> 至于最终到底选 `(2,N)` 还是 `(N,2)`，我反而建议在正式实施前让 repo 审计重点检查一次：**Refine / Detect / Clip / Fitting 当前所有主要几何 kernel 到底哪种 shape 用得更多**。如果绝大多数现有 NumPy/几何接口天然吃 `(N,2)`，为了 `(2,N)` 不断 `.T` 虽然通常不复制，但也未必值得把 `(2,N)` 定成整个 Pipeline 的规范。
+>
+> 2、采用
+> 3、采用
+
+当前解释：列式 ndarray 与 float64 保持，(2,N) 只是暂定布局；正式实施前需审计
+四阶段主要几何内核的实际 shape 需求，最终契约及适配规则待审计结果。实际用户面前
+的第 2 项为 Segment 相邻索引/局部列批，不建对象链；第 3 项为构建可写、下游只读及
+Refine 整车读取，两项已采纳。本条没有明确选择实施授权。
+正文同步：顶部进度、第 5.6.3–5.6.5、8.1、9.4、10 节；不改写 Q98 原题历史。
+
+### Q98 后续更正（二）— 第 4–8 项采纳与修订要求（2026-09-26）
+
+关联原记录：第 26 轮 Q98；这是随后独立收到的第二条消息，不并入第一条。
+用户完整原文：
+
+> 4、采用
+> 5、采用
+> 6、采用
+> 7、采用
+> 8、采用
+> Q98 按照我说的小范围修改一下
+
+当前解释：按实际用户面前的八项汇总对应：第 4 项为原 vehicle_id、Run 内唯一
+subtrack_index 分区及不同子轨迹求交；第 5 项为 Clip 端点索引元信息和 XY/lonlat/ID；
+第 6 项为删除逐点/引用/端点/无生产者包装、简化 Refine 结果，保留配置/报告/资源与
+共享几何；第 7 项为全部调用与回放迁移、无 Point 兼容层、保留外部字段功能；
+第 8 项为保护源表、旧派生可弃、不作容差/旧输出对比、分 commit、指定 sol low
+实施审查（可派 luna high）、功能与配置性能验证。上述均已采纳。
+Spec 原 Q98 将这些内容分为九项，因此按语义对应，不机械按原题数字错配。
+整体属于 C 类局部更正，未明确选择 A 实施授权；只开展布局审计与 Spec 修订。
+正文同步：第 5.6.6、8.1、9.4、10 节及 Q98 当前解释。
+
+本次检查：两条用户原文独立保存，HTML 转义、拼写和标点保留；Q98 原题和原推荐
+未覆盖。正文布局仅暂定，待本轮审计结论；修订后的确认题尚未发问，未开始编码。
+
+### Q98 更正后的审计结果 — 布局建议（2026-09-26）
+
+只读审计已完成，详细矩阵和限制见第 5.6.7 节。生产二维 XY ndarray 的三个内核族
+均天然使用 (N,2)；其余标量/独立一维列没有二维布局偏好。因此推荐将暂定 (2,N)
+改为权威 (N,2) / float64，而非宣称用户已采纳。新构建数组默认 C 连续，基本切片
+可非连续，下游只读；需要另一 shape 时优先转置 view。未测性能，不宣称全链零复制。
+正文同步：顶部进度、第 5.6.4、5.6.7、9.4、10 节；Q98 原题及两条更正继续保留。
+
+### 第 27 轮 — 布局小范围修订与实施范围确认（2026-09-26）
+
+发问时前提：Q98 第 2–8 项已采纳；第 1 项布局暂定并要求审计。
+审计推荐 (N,2)，不能替代用户决定；没有开始运行代码实施。
+
+#### Q99 — 确认布局修订并选择实施范围
+
+> 主要几何内核审计已完成：生产批量 XY ndarray 的跨轨迹求交、Topology 圆求交、Fitting 三个内核族均天然使用 (N,2)；Refine、Clip、转向/G*/DBSCAN 的标量或独立列不计作二维布局偏好。推荐将权威 XY 从暂定 (2,N) 调整为 (N,2) / float64：新构建数组默认 C 连续，下游只读，基本切片允许非连续 strides；接口需要 (2,N) 时优先转置 view，必要算法工作区仍可分配，不承诺全链零复制。其余已采纳的第 2–8 项保持不变，包括 Segment 相邻索引/局部列批、Refine 整车读取、子轨迹分区与求交规则、Clip 双坐标与端点元信息、模型清理、调用/回放迁移、源表保护和验证标准，以及指定子代理分 commit 的协作方式。
+>
+> 是否确认这次小范围修订，并选择实施范围？A. 确认修订后的完整设计，并授权 gpt-6-sol low 按方案分 commit 实施和审查，必要时可派 gpt-6-luna high 并行；B. 仅确认修订设计，暂不实施；C. 指出需要更正的条目。A 同时授予设计确认和实施授权，B 仅确认设计；均不构成验收通过。Fast 仍为默认要求，当前工具无法显式启用或验证。
+
+> 推荐 A：生产内核接口支持 (N,2) 作为规范，其他决定已采纳，可进入实施；选 B 也完成设计确认，但不启动实施。
+
+> 用户回答：Q99 A 确认修订
+> 开始按计划实施
+
+正文关联：第 5.6.7、8.1、9.4、10 节。
+当前解释：用户明确选择 A，设计已确认且实施已授权；权威布局为 (N,2) / float64。
+按计划开始指定子代理的分 commit 实施，尚未通过验收。
+
+本轮检查：Q19–Q99 连续唯一；Q98 原题、推荐及两条更正保留；Q99 已回答并选择 A。
+审计推荐与用户决定、shape 与内存顺序、已确认分配与未测性能明确区分。
+只更新 Spec，未修改运行代码、未运行数据任务、未删除数据。
+
+### Q99 完整回答 — 设计确认及实施授权（2026-09-26）
+
+用户完整原文：
+
+> Q99 A 确认修订
+> 开始按计划实施
+
+当前解释：完整修订设计已确认，立即开始按计划实施的授权已明确。
+正文同步：顶部进度、第 5.6、7、8.1、9.4、10 节。实施清单初始全部待做；
+设计确认、实施授权与验收结果分开记录。本次仅完成 Spec 收尾，没有编辑代码或提交。
+
+
+### Q99 实施记录（2026-09-26，持续更新）
+
+- 已提交 `b12b960 refactor: introduce stage columns and refine vehicle arrays`。该逻辑提交包含模型、Parser、整车 Refine、投影及 Refine 持久化入口；完整工作树验证依赖后续 Detect、Clip、Fitting、回放迁移，不能把工作树通过结果理解为该提交独立完整验收。
+- 已完成生产逐点/逐事件类删除及调用迁移；现有权威 XY、lonlat 为 float64 `(N,2)`，来源整数身份与有效性 mask 独立，保留 `id::text` 同时间排序。Refine 采用整车列批、预分配注入工作区及 Run 内统一 subtrack_index；Detect 的配对与拓扑使用同一 partition 身份，Clip/Fitting 复用 XY。
+- 独立审查已覆盖来源 0/-1、注入锚点、CSV 原来源 hash/extra、只读交付、批次身份 dtype/列长/数组类型及 JSON 回放字段；发现的问题在原业务规则下修复，不采用新旧产物差分或输出容差作为验收。
+- 初始 Pipeline 测试库存为 1082 项（实施前基线与初始修改快照核对）。原 Detect 99 个测试函数逐项映射并恢复明确预期覆盖；删除逐点模型构造接口的测试改为相应列批结构或边界行为测试。完整映射正在最终审查，尚不标记全部验收完成。
+- 首轮不忽略任何文件、真实 PostgreSQL 环境的 `make test`：Backend 84 passed；Pipeline/CV 1154 collected，1153 passed、1 failed、零 skipped。唯一失败是 PostGIS 测试残留逐点访问，已改为来源 key/mask 与权威 XY 列断言；其所在真实 PG 受影响组 25 passed。共享非数组列结构入口修复后，列批/Refine/Clip 回放/Detect 边界受影响组 50 passed。
+- 本次正式冒烟使用 `services/pipeline/config/pipeline-roadnet-test.toml`，全量使用 `services/pipeline/config/pipeline.toml`；尚未执行时不记录运行成功、耗时或内存达标。最终实测将固定代码 revision，记录新容器 Pipeline cgroup 峰值、完整 CLI 耗时，并单独报告 PostgreSQL 临时文件及磁盘变化，保护源表只读。
+
+- 最终完整 `make test`（无忽略文件，真实 PG）：Backend 84 passed；Pipeline/CV 1181 passed、零 skipped，75.81 秒，8 项既有 Rasterio 弃用提醒。最后完整 patch 的资源释放修复在套件收集后补入，另外执行 25 项受影响测试通过，并经独立弱引用测试 1 passed 确认；两次结果分别归因。
+- 已固定 runtime 提交 `10f27a6 refactor: complete columnar pipeline and replay contracts`（93 个文件，完整可导入运行的模型 API 迁移同时覆盖 Backend）。测试覆盖映射见 [Q99 Detect 测试覆盖迁移映射](validation/columnar-detect-test-mapping.md)。外部既有 Makefile、README、Dockerfile、CI 修改未纳入本任务提交。
+- 1M 正式冒烟已启动：源 `public.day01`，配置 `pipeline-roadnet-test.toml`，Refine ID `0b31582d-0f2f-4a55-b08e-34dc50e8573e`，runtime revision `10f27a6`。结果尚未完成，不表示冒烟或性能验收通过。
