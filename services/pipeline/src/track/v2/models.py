@@ -1,9 +1,4 @@
-"""Unified base class for all v2 output models.
-
-All output models inherit from TrackModel, which provides as_dict() and
-format_print(). Parser and Refine models (TrajectoryPoint, PointRef,
-FieldSpec, ReadReport, etc.) are defined here per the v2 PRD §3.
-"""
+"""Stage column batches and low-frequency configuration/output containers."""
 
 from __future__ import annotations
 
@@ -12,12 +7,12 @@ from enum import StrEnum
 import json
 import math
 import re
-import sys
-from dataclasses import dataclass, field, fields, is_dataclass
+import numpy as np
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import date, datetime
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal, Protocol, TextIO
+from typing import Any, Callable, Iterator, Literal, Protocol
 
 
 ColumnSelector = Callable[[list[str]], dict[str, str]]
@@ -27,49 +22,11 @@ ColumnSelector = Callable[[list[str]], dict[str, str]]
 
 
 class TrackModel:
-    """Base class for all v2 output models.
-
-    Every v2 output is a frozen dataclass inheriting from TrackModel.
-    Subclasses get:
-      - as_dict()       → recursive JSON-safe dict
-      - format_print()  → pretty-print key: value pairs
-    """
+    """Boundary serialization for low-frequency output containers."""
+    __slots__ = ()
 
     def as_dict(self) -> dict[str, Any]:
-        """Recursive, JSON-safe dictionary representation."""
-        return _to_output_value(self)  # type: ignore[return-value]
-
-    def format_print(
-        self,
-        *,
-        title: str | None = None,
-        file: TextIO | None = None,
-    ) -> None:
-        """Pretty-print as ``title:`` followed by ``  key: value`` lines."""
-        out = file if file is not None else sys.stdout
-        if title is not None:
-            print(title, file=out)
-        for key, value in self.as_dict().items():
-            print(f"  {key}: {_format_scalar(value)}", file=out)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> TrackModel:
-        """Wrap a plain dict as a lightweight TrackModel for ad-hoc printing.
-
-        Use when you have a one-off key-value mapping and want
-        ``.format_print()`` without defining a full dataclass.
-        """
-        return _DictModel(data)
-
-
-class _DictModel(TrackModel):
-    """Internal: TrackModel wrapper around a plain dict."""
-
-    def __init__(self, data: dict[str, Any]) -> None:
-        self._data = dict(data)
-
-    def as_dict(self) -> dict[str, Any]:
-        return _to_output_value(self._data)  # type: ignore[return-value]
+        return _to_output_value(self)
 
 
 # ── JSON-safe conversion helper ─────────────────────────────────────
@@ -81,6 +38,78 @@ def _json_key(value: object) -> str:
 
 def _to_output_value(value: object) -> object:
     """Recursively convert common Python types to JSON-safe values."""
+    if isinstance(value, ReplayRefineResult):
+        original = value.original
+        def source_point(i: int) -> dict[str, Any]:
+            return {"point_ref": {"source_id": original.source_id,
+                                  "source_row_key": str(original.source_row_key[i]),
+                                  "stable": bool(original.source_stable[i]),
+                                  "from_ref": None, "to_ref": None, "generated_reason": "",
+                                  "source_row_hash": str(original.source_row_hash[i])},
+                    "vehicle_id": original.vehicle_id, "timestamp": float(original.timestamp[i]),
+                    "lon": float(original.lonlat[i, 0]), "lat": float(original.lonlat[i, 1]),
+                    "heading": float(original.heading[i]), "speed": float(original.speed[i]),
+                    "extra": {name: _to_output_value(column[i]) for name, column in original.extra.items()},
+                    "x": None, "y": None, "refined_point_ref": None}
+        keys = {str(key): i for i, key in enumerate(original.source_row_key)}
+        active, injected = [], []
+        for track in value.active:
+            kept_keys = track.source_row_key[track.kind == "p"]
+            for i in range(len(track)):
+                derived = track.kind[i] == "i"
+                anchor = int(track.after_sequence[i])
+                left = str(kept_keys[anchor]) if derived and 0 <= anchor < len(kept_keys) else None
+                right = str(kept_keys[anchor + 1]) if derived and 0 <= anchor + 1 < len(kept_keys) else None
+                key = (f"{left}->{right}:orthogonal_heading" if derived else str(track.source_row_key[i]))
+                point = {"point_ref": {"source_id": track.source_id, "source_row_key": key,
+                                       "stable": not derived, "from_ref": left, "to_ref": right,
+                                       "generated_reason": str(track.generated_reason[i]), "source_row_hash": ""},
+                         "vehicle_id": track.vehicle_id, "timestamp": float(track.timestamp[i]),
+                         "lon": float(track.lonlat[i, 0]), "lat": float(track.lonlat[i, 1]),
+                         "heading": float(track.heading[i]), "speed": float(track.speed[i]),
+                         "extra": {}, "x": float(track.xy[i, 0]), "y": float(track.xy[i, 1]),
+                         "refined_point_ref": None}
+                if not derived and key in keys:
+                    source_output = source_point(keys[key])
+                    point["point_ref"] = source_output["point_ref"]
+                    point["extra"] = source_output["extra"]
+                active.append(point)
+                if derived and left in keys and right in keys:
+                    injected.append([point, source_point(keys[left]), source_point(keys[right])])
+        return {"vehicle_id": value.vehicle_id,
+                "original": [source_point(i) for i in range(len(original))],
+                "excluded": [[source_point(int(i)), str(reason)] for i, reason in
+                             zip(value.excluded_indices, value.excluded_reasons)],
+                "injected": injected, "active": active or [source_point(i) for i in range(len(original))]}
+    if isinstance(value, ReplayFitClip):
+        def endpoint(index: int, prefix: str) -> dict[str, Any]:
+            return {"resolved_point_id": int(value.resolved_point_ids[index]),
+                    "crossing_id": getattr(value, prefix + "_crossing_id"),
+                    "intersection_id": getattr(value, prefix + "_intersection_id"),
+                    "kind": getattr(value, prefix + "_kind"),
+                    "lon": float(value.lonlat[index, 0]), "lat": float(value.lonlat[index, 1])}
+        return {"input_ordinal": value.input_ordinal,
+                "original_from_intersection_id": value.original_from_intersection_id,
+                "original_to_intersection_id": value.original_to_intersection_id,
+                "reverse_to_centerline_direction": value.reverse_to_centerline_direction,
+                "start": endpoint(0, "start"), "end": endpoint(-1, "end"),
+                "interior_points": [{"resolved_point_id": int(value.resolved_point_ids[i]),
+                                     "lon": float(value.lonlat[i, 0]), "lat": float(value.lonlat[i, 1])}
+                                    for i in range(1, len(value.lonlat) - 1)]}
+    if isinstance(value, TrackClip):
+        def endpoint(index: int, prefix: str) -> dict[str, Any]:
+            return {"kind": getattr(value, prefix + "_kind"),
+                    "intersection_id": getattr(value, prefix + "_intersection_id"),
+                    "crossing_id": getattr(value, prefix + "_crossing_id"),
+                    "lon": float(value.lonlat[index, 0]), "lat": float(value.lonlat[index, 1])}
+        result = {name: _to_output_value(getattr(value, name)) for name in
+                  ("clip_id", "vehicle_id", "trip_id", "clip_type", "distance_m", "point_count",
+                   "subtrack_index", "clip_ordinal_in_track")}
+        result.update(start=endpoint(0, "start"), end=endpoint(-1, "end"),
+                      points=[{"resolved_point_id": int(value.resolved_point_ids[i]),
+                               "lon": float(value.lonlat[i + 1, 0]), "lat": float(value.lonlat[i + 1, 1])}
+                              for i in range(len(value.resolved_point_ids))])
+        return result
     if is_dataclass(value) and not isinstance(value, type):
         return {f.name: _to_output_value(getattr(value, f.name)) for f in fields(value)}
     if isinstance(value, dict):
@@ -103,12 +132,6 @@ def _to_output_value(value: object) -> object:
     as_dict = getattr(value, "as_dict", None)
     if callable(as_dict):
         return _to_output_value(as_dict())
-    return str(value)
-
-
-def _format_scalar(value: object) -> str:
-    if isinstance(value, int) and not isinstance(value, bool):
-        return f"{value:,}"
     return str(value)
 
 
@@ -248,7 +271,7 @@ class ParseIssue(TrackModel):
     PRD §3.4
     """
 
-    point_ref: PointRef | None
+    point_ref: str | None
     row_number: int | None
     level: str
     reason: str
@@ -284,7 +307,7 @@ class RefineReport(TrackModel):
     excluded_count: int
     injected_count: int
     excluded_reasons: dict[str, int]
-    sample_excluded: list[tuple[PointRef, str]]
+    sample_excluded: list[tuple[str, str]]
 
 
 @dataclass(frozen=True)
@@ -431,7 +454,7 @@ class TrajectorySourceHandle(Protocol):
     @property
     def field_mapping(self) -> FieldMapping: ...
 
-    def iter_points(self) -> Iterator[TrajectoryPoint]: ...
+    def iter_vehicle_batches(self) -> Iterator[SourceBatch]: ...
 
     def close(self) -> None: ...
 
@@ -444,32 +467,122 @@ class GeneratedReason(StrEnum):
     INTER_SEGMENT_ORTHOGONAL = "inter_segment_orthogonal"
 
     
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RefineResult(TrackModel):
-    active: TrajectorySourceHandle
-    excluded: ExcludedIndex
+    subtracks: list[RefinementSubtrack]
+    excluded: list[ExcludedBatch]
     report: RefineReport
     spatial_context: SpatialContext
-    kept_subtracks: list[list[TrajectoryPoint]] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
+def validate_column_lengths(instance: object, size: int) -> None:
+    for model_field in fields(instance):
+        value = getattr(instance, model_field.name)
+        if isinstance(value, np.ndarray) and (value.ndim == 0 or len(value) != size):
+            raise ValueError(f"{model_field.name} has inconsistent length")
+        if model_field.name.endswith("_valid") and isinstance(value, np.ndarray) and value.dtype != np.bool_:
+            raise ValueError(f"{model_field.name} must be a boolean mask")
+
+
+def readonly_columns(instance: object) -> None:
+    """Publish array columns without copying views or enforcing contiguity."""
+    for model_field in fields(instance):
+        value = getattr(instance, model_field.name)
+        if isinstance(value, np.ndarray):
+            value.flags.writeable = False
+        elif isinstance(value, dict):
+            for column in value.values():
+                if isinstance(column, np.ndarray):
+                    column.flags.writeable = False
+
+
+@dataclass(frozen=True, slots=True)
+class SourceBatch(TrackModel):
+    """One complete source vehicle, with independent identity columns."""
+    source_id: str
+    vehicle_id: str
+    lonlat: np.ndarray
+    timestamp: np.ndarray
+    heading: np.ndarray
+    speed: np.ndarray
+    source_row_key: np.ndarray
+    source_stable: np.ndarray
+    source_row_hash: np.ndarray
+    extra: dict[str, np.ndarray] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.lonlat.shape != (len(self.timestamp), 2) or self.lonlat.dtype != np.float64:
+            raise ValueError("lonlat must be float64 (N,2)")
+        validate_column_lengths(self, len(self.timestamp))
+        if self.source_row_key.dtype != np.int64 or self.source_stable.dtype != np.bool_:
+            raise ValueError("source keys must be int64 and stable flags boolean")
+        if any(len(column) != len(self.timestamp) for column in self.extra.values()):
+            raise ValueError("extra columns have inconsistent lengths")
+        readonly_columns(self)
+
+    def __len__(self) -> int:
+        return len(self.timestamp)
+
+
+@dataclass(frozen=True, slots=True)
+class ExcludedBatch(TrackModel):
+    source_id: str
+    source_row_key: np.ndarray
+    reason: np.ndarray
+    lonlat: np.ndarray
+
+    def __post_init__(self) -> None:
+        readonly_columns(self)
+
+    def __len__(self) -> int:
+        return len(self.source_row_key)
+
+    def reason_counts(self) -> dict[str, int]:
+        values, counts = np.unique(self.reason, return_counts=True)
+        return {str(value): int(count) for value, count in zip(values, counts)}
+
+
+@dataclass(frozen=True, slots=True)
 class RefinementSubtrack(TrackModel):
-    """One Refine subtrack with kept and derived points in deterministic order."""
-
+    """Complete ordered p/i columns; segment i joins rows i and i+1."""
     vehicle_id: str
     subtrack_index: int
-    points: list[TrajectoryPoint | DerivedPoint] = field(default_factory=list)
+    source_id: str
+    xy: np.ndarray
+    lonlat: np.ndarray
+    timestamp: np.ndarray
+    heading: np.ndarray
+    speed: np.ndarray
+    kind: np.ndarray
+    source_row_key: np.ndarray
+    source_row_key_valid: np.ndarray
+    refine_point_id: np.ndarray
+    refine_point_id_valid: np.ndarray
+    generated_reason: np.ndarray
+    after_sequence: np.ndarray
 
-@dataclass(frozen=True)
+    def __post_init__(self) -> None:
+        size = len(self.timestamp)
+        for name in ("xy", "lonlat"):
+            value = getattr(self, name)
+            if value.shape != (size, 2) or value.dtype != np.float64:
+                raise ValueError(f"{name} must be float64 (N,2)")
+        validate_column_lengths(self, len(self.timestamp))
+        for name in ("source_row_key", "refine_point_id", "after_sequence"):
+            if getattr(self, name).dtype != np.int64:
+                raise ValueError(f"{name} must be int64")
+        readonly_columns(self)
+
+    def __len__(self) -> int:
+        return len(self.timestamp)
+
+
+@dataclass(frozen=True, slots=True)
 class RefineIncrementalResult(TrackModel):
-    """Refine result for one incremental run. """
-    kept: list[TrajectoryPoint]
-    excluded: list[ExcludedPoint]
-    derived: list[DerivedPoint]
+    excluded: ExcludedBatch
     spatial_context: SpatialContext
     derived_counts: dict[GeneratedReason, int] = field(default_factory=dict)
-    subtracks: list[RefinementSubtrack] = field(default_factory=list) 
+    subtracks: list[RefinementSubtrack] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -561,17 +674,15 @@ class HotspotCluster(TrackModel):
     centroid_lat: float
     radius_m: float
     cluster_ref: str = ""        # stable ref → "cluster_{source}_{id}"
-    events: Sequence[TurnEvent] = ()
+    members: MemberBatch | None = None
     source: str = "turn"
     algorithm_sources: tuple[str, ...] = ()
     source_ids: tuple[str, ...] = ()
     source_counts: dict[str, int] = field(default_factory=dict)
     source_ratios: dict[str, float] = field(default_factory=dict)
-    source_point_refs: dict[str, Sequence[PointRef]] = field(default_factory=dict)
     critical_sources: tuple[str, ...] = ()
     # ── topology intermediate products ──
-    crossing_points: tuple[CrossingPoint, ...] = ()
-    inout_points: tuple[InOutIntersectionPoint, ...] = ()
+    crossing_points: CrossingBatch | None = None
 
 @dataclass(frozen=True)
 class EntryExitObservation(TrackModel):
@@ -691,13 +802,26 @@ class ResolvedTrackPoint(TrackModel):
 
 @dataclass(frozen=True, slots=True)
 class ClipTrack(TrackModel):
-    """One time-ordered trip presented to the Clip module."""
-
     vehicle_id: str
     trip_id: str
-    points: tuple[ResolvedTrackPoint, ...]
+    xy: np.ndarray
+    lonlat: np.ndarray
+    resolved_point_ids: np.ndarray
+    crossing_ids: np.ndarray
+    intersection_ids: np.ndarray
+    crossing_types: np.ndarray
+    crossing_valid: np.ndarray
+    intersection_valid: np.ndarray
     subtrack_index: int = 1
 
+
+    def __post_init__(self) -> None:
+        validate_column_lengths(self, len(self.lonlat))
+        if self.xy.shape != self.lonlat.shape or self.lonlat.shape != (len(self.lonlat), 2):
+            raise ValueError("clip geometry must have shape (N,2)")
+        if self.xy.dtype != np.float64 or self.lonlat.dtype != np.float64:
+            raise ValueError("clip geometry must be float64")
+        readonly_columns(self)
 
 @dataclass(frozen=True, slots=True)
 class ClipInput(TrackModel):
@@ -731,24 +855,31 @@ class ClipPoint(TrackModel):
 
 @dataclass(frozen=True, slots=True)
 class TrackClip(TrackModel):
-    """One trajectory fragment outside verified intersection circles.
-
-    ``points`` contains only resolved points strictly between the endpoints.
-    ``point_count`` includes both explicit endpoints.
-    """
-
     clip_id: str
     vehicle_id: str
     trip_id: str
     clip_type: str
-    start: ClipEndpoint
-    end: ClipEndpoint
-    points: tuple[ClipPoint, ...]
+    xy: np.ndarray
+    lonlat: np.ndarray
+    resolved_point_ids: np.ndarray
+    start_index: int
+    end_index: int
+    interior_start: int
+    interior_end: int
+    start_kind: str
+    end_kind: str
+    start_intersection_id: int | None
+    end_intersection_id: int | None
+    start_crossing_id: int | None
+    end_crossing_id: int | None
     distance_m: float
     point_count: int
     subtrack_index: int = 1
     clip_ordinal_in_track: int = 0
 
+
+    def __post_init__(self) -> None:
+        readonly_columns(self)
 
 @dataclass(frozen=True, slots=True)
 class ClipReport(TrackModel):
@@ -810,6 +941,12 @@ class Centerline(TrackModel):
     @property
     def source_clip_count(self) -> int:
         return self.forward_clip_count + self.reverse_clip_count
+
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.points, np.ndarray) or self.points.dtype != np.float64 or self.points.ndim != 2 or self.points.shape[1] != 2:
+            raise ValueError("points must be a float64 (N,2) array")
+        readonly_columns(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -879,6 +1016,12 @@ class NetworkEdge(TrackModel):
     reverse_clip_count: int
 
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.points, np.ndarray) or self.points.dtype != np.float64 or self.points.ndim != 2 or self.points.shape[1] != 2:
+            raise ValueError("points must be a float64 (N,2) array")
+        readonly_columns(self)
+
+
 @dataclass(frozen=True, slots=True)
 class NetworkIssue(TrackModel):
     from_intersection_id: int
@@ -923,10 +1066,17 @@ class ReplayFitClip(TrackModel):
     original_from_intersection_id: int
     original_to_intersection_id: int
     reverse_to_centerline_direction: bool
-    start: ReplayFitEndpoint
-    interior_points: tuple[ClipPoint, ...]
-    end: ReplayFitEndpoint
+    lonlat: np.ndarray
+    resolved_point_ids: np.ndarray
+    start_crossing_id: int
+    end_crossing_id: int
+    start_intersection_id: int
+    end_intersection_id: int
+    start_kind: str
+    end_kind: str
 
+    def __post_init__(self) -> None:
+        readonly_columns(self)
 
 @dataclass(frozen=True, slots=True)
 class CenterlineInputReplay(TrackModel):
@@ -945,13 +1095,190 @@ class CenterlineInputReplay(TrackModel):
 # ── Replay output models ────────────────────────────────────────────
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ReplayRefineResult(TrackModel):
-    """Replay output for one vehicle's refine stage."""
-
     vehicle_id: str
-    original: list[TrajectoryPoint]     # 原始点（时间序）
-    excluded: list[tuple[TrajectoryPoint, str]]   # 被排除 + 原因
-    injected: list[tuple[TrajectoryPoint, TrajectoryPoint, TrajectoryPoint]]
-    #              ↑ injected_pt,      from_original_pt,  to_original_pt
-    active: list[TrajectoryPoint]       # 精炼后
+    original: SourceBatch
+    excluded_indices: np.ndarray
+    excluded_reasons: np.ndarray
+    active: list[RefinementSubtrack]
+
+    def __post_init__(self) -> None:
+        readonly_columns(self)
+
+
+@dataclass(frozen=True, slots=True)
+class TurnBatch(TrackModel):
+    calculation_index: np.ndarray
+    vehicle_id: np.ndarray
+    subtrack_index: np.ndarray
+    point_index: np.ndarray
+    xy: np.ndarray
+    lonlat: np.ndarray
+    timestamp: np.ndarray
+    entry_bearing: np.ndarray
+    exit_bearing: np.ndarray
+    turn_deg: np.ndarray
+    score: np.ndarray
+    source_id: np.ndarray
+    source_row_key: np.ndarray
+    source_row_key_valid: np.ndarray
+    point_kind: np.ndarray
+    refine_point_id: np.ndarray
+    refine_point_id_valid: np.ndarray
+    generated_reason: np.ndarray
+    g_star_z: np.ndarray
+    g_star_z_valid: np.ndarray
+
+    def __post_init__(self) -> None:
+        size = len(self.vehicle_id) if hasattr(self, "vehicle_id") else len(self.calculation_index)
+        for model_field in fields(self):
+            column = getattr(self, model_field.name)
+            if isinstance(column, np.ndarray) and len(column) != size:
+                raise ValueError(f"{model_field.name} has inconsistent length")
+        readonly_columns(self)
+
+    def __len__(self) -> int:
+        return len(self.vehicle_id) if hasattr(self, "vehicle_id") else len(self.calculation_index)
+
+    def take(self, indices: np.ndarray):
+        return replace(self, **{model_field.name: getattr(self, model_field.name)[indices]
+                                for model_field in fields(self)
+                                if isinstance(getattr(self, model_field.name), np.ndarray)})
+
+
+@dataclass(frozen=True, slots=True)
+class CrossCandidateBatch(TrackModel):
+    calculation_index: np.ndarray
+    xy: np.ndarray
+    lonlat: np.ndarray
+    timestamp: np.ndarray
+    heading: np.ndarray
+    speed: np.ndarray
+    from_vehicle_id: np.ndarray
+    to_vehicle_id: np.ndarray
+    from_subtrack_index: np.ndarray
+    to_subtrack_index: np.ndarray
+    from_point_index: np.ndarray
+    to_point_index: np.ndarray
+    from_point_kind: np.ndarray
+    to_point_kind: np.ndarray
+    from_refine_point_id: np.ndarray
+    to_refine_point_id: np.ndarray
+    from_refine_point_id_valid: np.ndarray
+    to_refine_point_id_valid: np.ndarray
+    from_source_id: np.ndarray
+    to_source_id: np.ndarray
+    from_source_row_key: np.ndarray
+    to_source_row_key: np.ndarray
+    from_source_row_key_valid: np.ndarray
+    to_source_row_key_valid: np.ndarray
+    from_generated_reason: np.ndarray
+    to_generated_reason: np.ndarray
+
+    def __post_init__(self) -> None:
+        size = len(self.vehicle_id) if hasattr(self, "vehicle_id") else len(self.calculation_index)
+        for model_field in fields(self):
+            column = getattr(self, model_field.name)
+            if isinstance(column, np.ndarray) and len(column) != size:
+                raise ValueError(f"{model_field.name} has inconsistent length")
+        readonly_columns(self)
+
+    def __len__(self) -> int:
+        return len(self.vehicle_id) if hasattr(self, "vehicle_id") else len(self.calculation_index)
+
+    def take(self, indices: np.ndarray):
+        return replace(self, **{model_field.name: getattr(self, model_field.name)[indices]
+                                for model_field in fields(self)
+                                if isinstance(getattr(self, model_field.name), np.ndarray)})
+
+
+@dataclass(frozen=True, slots=True)
+class CrossingBatch(TrackModel):
+    cluster_ref: str
+    calculation_index: np.ndarray
+    vehicle_id: np.ndarray
+    subtrack_index: np.ndarray
+    point_index: np.ndarray
+    point_kind: np.ndarray
+    refine_point_id: np.ndarray
+    refine_point_id_valid: np.ndarray
+    source_id: np.ndarray
+    source_row_key: np.ndarray
+    source_row_key_valid: np.ndarray
+    generated_reason: np.ndarray
+    xy: np.ndarray
+    lonlat: np.ndarray
+    is_entry: np.ndarray
+    branch_angle_deg: np.ndarray
+    segment_fraction: np.ndarray
+
+    def __post_init__(self) -> None:
+        size = len(self.vehicle_id) if hasattr(self, "vehicle_id") else len(self.calculation_index)
+        for model_field in fields(self):
+            column = getattr(self, model_field.name)
+            if isinstance(column, np.ndarray) and len(column) != size:
+                raise ValueError(f"{model_field.name} has inconsistent length")
+        readonly_columns(self)
+
+    def __len__(self) -> int:
+        return len(self.vehicle_id) if hasattr(self, "vehicle_id") else len(self.calculation_index)
+
+    def take(self, indices: np.ndarray):
+        return replace(self, **{model_field.name: getattr(self, model_field.name)[indices]
+                                for model_field in fields(self)
+                                if isinstance(getattr(self, model_field.name), np.ndarray)})
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationBatch(TrackModel):
+    cluster_calculate_index: int
+    vehicle_id: np.ndarray
+    subtrack_index: np.ndarray
+    entry_branch_angle: np.ndarray
+    exit_branch_angle: np.ndarray
+    entry_bearing: np.ndarray
+    exit_bearing: np.ndarray
+    turn_deg: np.ndarray
+    entry_crossing_calculate_index: np.ndarray
+    entry_crossing_calculate_index_valid: np.ndarray
+    exit_crossing_calculate_index: np.ndarray
+    exit_crossing_calculate_index_valid: np.ndarray
+
+    def __post_init__(self) -> None:
+        size = len(self.vehicle_id) if hasattr(self, "vehicle_id") else len(self.calculation_index)
+        for model_field in fields(self):
+            column = getattr(self, model_field.name)
+            if isinstance(column, np.ndarray) and len(column) != size:
+                raise ValueError(f"{model_field.name} has inconsistent length")
+        readonly_columns(self)
+
+    def __len__(self) -> int:
+        return len(self.vehicle_id) if hasattr(self, "vehicle_id") else len(self.calculation_index)
+
+    def take(self, indices: np.ndarray):
+        return replace(self, **{model_field.name: getattr(self, model_field.name)[indices]
+                                for model_field in fields(self)
+                                if isinstance(getattr(self, model_field.name), np.ndarray)})
+
+
+
+
+@dataclass(frozen=True, slots=True)
+class MemberBatch(TrackModel):
+    kind: np.ndarray
+    calculation_index: np.ndarray
+    member_order: np.ndarray
+    source_id: np.ndarray
+    source_id_valid: np.ndarray
+
+    def __post_init__(self) -> None:
+        if any(len(getattr(self, f.name)) != len(self.kind) for f in fields(self)):
+            raise ValueError("member columns have inconsistent lengths")
+        readonly_columns(self)
+
+    def __len__(self) -> int:
+        return len(self.kind)
+
+    def take(self, indices: np.ndarray):
+        return replace(self, **{f.name: getattr(self, f.name)[indices] for f in fields(self)})

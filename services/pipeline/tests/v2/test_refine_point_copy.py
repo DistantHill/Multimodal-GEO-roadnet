@@ -1,22 +1,14 @@
-from dataclasses import dataclass, replace
-
-from track.v2.models import PointRef, TrajectoryPoint
-from track.v2.trajectories.refine_trajectories import _projected_point
-
-
-def test_projection_copy_matches_replace_without_rebuilding_identity():
-    point = TrajectoryPoint(PointRef("source", "12", True), "v", 1, 116, 39, 90, 10, {"a": 1})
-    result = _projected_point(point, 3, 4, "v_seg01")
-    assert result == replace(point, x=3, y=4, vehicle_id="v_seg01")
-    assert result.point_ref is point.point_ref
-    assert result.extra is point.extra
-    assert point.x is None and point.vehicle_id == "v"
+"""Array publication preserves basic views without point-copy wrappers."""
+import numpy as np
+from track.v2.models import SourceBatch
 
 
-def test_projection_copy_preserves_subclass_fields():
-    @dataclass(frozen=True)
-    class TaggedPoint(TrajectoryPoint):
-        tag: str = "custom"
-
-    point = TaggedPoint(PointRef("source", "12", True), "v", 1, 116, 39, 90, 10)
-    assert _projected_point(point, 3, 4, "v_seg01") == replace(point, x=3, y=4, vehicle_id="v_seg01")
+def test_noncontiguous_geometry_view_is_published_without_copy():
+    owner = np.arange(24, dtype=np.float64).reshape(12, 2)
+    view = owner[::2]
+    batch = SourceBatch("fixture", "v", view, np.arange(6, dtype=np.float64),
+                        np.zeros(6), np.zeros(6), np.arange(6), np.ones(6, dtype=bool), np.full(6, ""))
+    assert np.shares_memory(batch.lonlat, owner)
+    assert not batch.lonlat.flags.c_contiguous
+    assert not batch.lonlat.flags.writeable
+    assert not hasattr(batch, "__dict__")

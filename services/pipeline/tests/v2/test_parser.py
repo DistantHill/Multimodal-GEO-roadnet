@@ -21,10 +21,7 @@ from track.v2.models import (
     FieldMapping,
     FieldSpec,
     ParseIssue,
-    PointRef,
     ReadReport,
-    TrajectoryPoint,
-    TrackModel,
 )
 from track.v2.config.field_mapping import build_field_mapping, load_field_config
 from track.v2.trajectories.read_source import (
@@ -268,14 +265,14 @@ class CsvPointRefTest(unittest.TestCase):
             source = CsvSource(csv_path)
             handle = _get_database(source)
             try:
-                points = list(handle.iter_points())
+                points = list(handle.iter_vehicle_batches())
             finally:
                 handle.close()
             self.assertEqual(len(points), 1)
-            ref = points[0].point_ref
-            self.assertTrue(ref.stable)
-            self.assertEqual(ref.source_row_key, "2")  # row 2 (after header)
-            self.assertEqual(len(ref.source_row_hash), 64)
+            self.assertTrue(points[0].source_stable[0])
+            self.assertEqual(points[0].source_row_key[0], 2)
+            self.assertEqual(len(points[0].source_row_hash[0]), 64)
+            self.assertFalse(points[0].lonlat.flags.writeable)
 
 
 class FakePostgresCursorTest(unittest.TestCase):
@@ -337,16 +334,6 @@ class FakePostgresCursorTest(unittest.TestCase):
         self.assertEqual(count_params, ("public.day01",))
 
 
-class PostgresNoPKTest(unittest.TestCase):
-    """P0-12: Postgres without primary key has stable=False."""
-
-    def test_no_pk_stable_false(self):
-        # Verify the default PointRef for postgres has stable=False when no PK
-        ref = PointRef(source_id="pg://test", source_row_key="42", stable=False)
-        self.assertFalse(ref.stable)
-        self.assertEqual(ref.source_row_key, "42")
-
-
 class TrajectoryOrderErrorTest(unittest.TestCase):
     """P0-13: Order violation raises TrajectoryOrderError with context."""
 
@@ -362,7 +349,7 @@ class TrajectoryOrderErrorTest(unittest.TestCase):
             handle = _get_database(source)
             try:
                 with self.assertRaises(TrajectoryOrderError) as ctx:
-                    list(handle.iter_points())
+                    list(handle.iter_vehicle_batches())
             finally:
                 handle.close()
             self.assertIn("v1", str(ctx.exception))
@@ -383,7 +370,7 @@ class CoreFieldSkipTest(unittest.TestCase):
             source = CsvSource(csv_path)
             handle = _get_database(source)
             try:
-                points = list(handle.iter_points())
+                points = list(handle.iter_vehicle_batches())
                 report = handle.get_report()
             finally:
                 handle.close()
@@ -405,11 +392,11 @@ class HeadingSpeedWarnTest(unittest.TestCase):
             source = CsvSource(csv_path)
             handle = _get_database(source)
             try:
-                points = list(handle.iter_points())
+                points = list(handle.iter_vehicle_batches())
             finally:
                 handle.close()
             self.assertEqual(len(points), 1)
-            self.assertEqual(points[0].speed, 0.0)
+            self.assertEqual(points[0].speed[0], 0.0)
 
 
 class ConsecutiveErrorThresholdTest(unittest.TestCase):
@@ -427,7 +414,7 @@ class ConsecutiveErrorThresholdTest(unittest.TestCase):
             handle = _get_database(source)
             try:
                 with self.assertRaises(DataSourceCorrupted):
-                    list(handle.iter_points())
+                    list(handle.iter_vehicle_batches())
             finally:
                 handle.close()
 
@@ -478,7 +465,7 @@ class ReadReportSerializationTest(unittest.TestCase):
 
             # Consume all points
             try:
-                points = list(handle.iter_points())
+                points = list(handle.iter_vehicle_batches())
                 report = handle.get_report()
             finally:
                 handle.close()
@@ -503,7 +490,7 @@ class ContextManagerTest(unittest.TestCase):
             )
             source = CsvSource(csv_path)
             with _get_database(source) as handle:
-                points = list(handle.iter_points())
+                points = list(handle.iter_vehicle_batches())
                 self.assertEqual(len(points), 1)
             # handle is closed after with block
             self.assertTrue(handle._closed)
@@ -521,8 +508,8 @@ class IterPointsRepeatableTest(unittest.TestCase):
             )
             source = CsvSource(csv_path)
             handle = _get_database(source)
-            p1 = list(handle.iter_points())
-            p2 = list(handle.iter_points())
+            p1 = list(handle.iter_vehicle_batches())
+            p2 = list(handle.iter_vehicle_batches())
             self.assertEqual(len(p1), len(p2))
             self.assertEqual(p1[0].vehicle_id, p2[0].vehicle_id)
             handle.close()
@@ -547,7 +534,7 @@ class ExtraFieldTest(unittest.TestCase):
             source = CsvSource(csv_path)
             handle = _get_database(source)
             try:
-                points = list(handle.iter_points())
+                points = list(handle.iter_vehicle_batches())
             finally:
                 handle.close()
             self.assertEqual(len(points), 1)
@@ -569,78 +556,21 @@ class HeadingNormalizationTest(unittest.TestCase):
             source = CsvSource(csv_path)
             handle = _get_database(source)
             try:
-                points = list(handle.iter_points())
+                points = list(handle.iter_vehicle_batches())
             finally:
                 handle.close()
             self.assertEqual(len(points), 1)
-            self.assertAlmostEqual(points[0].heading % 360, 730 % 360, delta=0.01)
+            self.assertAlmostEqual(points[0].heading[0] % 360, 730 % 360, delta=0.01)
 
 
-class TrackModelFormatPrintTest(unittest.TestCase):
-    """P0 extras: TrackModel.format_print() works."""
-
-    def test_format_print(self):
-        ref = PointRef(source_id="test", source_row_key="1", stable=True)
-        tp = TrajectoryPoint(
-            point_ref=ref,
-            vehicle_id="v1",
-            timestamp=1000.0,
-            lon=116.0,
-            lat=39.0,
-            heading=90.0,
-            speed=10.0,
-        )
-        buf = io.StringIO()
-        tp.format_print(title="Test Point", file=buf)
-        output = buf.getvalue()
-        self.assertIn("Test Point", output)
-        self.assertIn("vehicle_id", output)
-        self.assertIn("v1", output)
-
-    def test_from_dict_ad_hoc(self):
-        """Ad-hoc dict printing via TrackModel.from_dict()."""
-        ad_hoc = TrackModel.from_dict({"ok": True, "count": 42})
-        buf = io.StringIO()
-        ad_hoc.format_print(title="Status", file=buf)
-        output = buf.getvalue()
-        self.assertIn("Status", output)
-        self.assertIn("ok", output)
-        self.assertIn("42", output)
-
-    def test_from_dict_empty(self):
-        """Empty dict → format_print should not crash."""
-        ad_hoc = TrackModel.from_dict({})
-        buf = io.StringIO()
-        ad_hoc.format_print(title="Empty", file=buf)
-        output = buf.getvalue()
-        self.assertIn("Empty", output)
-
-    def test_as_dict_recursive(self):
-        """as_dict() recursively unfolds nested TrackModel (PointRef inside TrajectoryPoint)."""
-        ref = PointRef(source_id="s", source_row_key="5", stable=True,
-                       from_ref=None, to_ref=None, generated_reason="")
-        tp = TrajectoryPoint(point_ref=ref, vehicle_id="v1",
-                             timestamp=1000.0, lon=116.0, lat=39.0,
-                             heading=90.0, speed=10.0)
-        d = tp.as_dict()
-        self.assertIsInstance(d, dict)
-        self.assertIn("point_ref", d)
-        self.assertIsInstance(d["point_ref"], dict)
-        self.assertEqual(d["point_ref"]["source_id"], "s")
-        self.assertIsNone(d["point_ref"]["from_ref"])
-        self.assertEqual(d["vehicle_id"], "v1")
-
-    def test_extra_with_special_types_as_dict(self):
-        """extra dict containing float values serializes correctly."""
-        ref = PointRef(source_id="s", source_row_key="1", stable=True)
-        tp = TrajectoryPoint(point_ref=ref, vehicle_id="v1",
-                             timestamp=1000.0, lon=116.0, lat=39.0,
-                             heading=90.0, speed=10.0,
-                             extra={"altitude": 150.7, "road_id": "R01"})
-        d = tp.as_dict()
-        self.assertEqual(d["extra"]["altitude"], 150.7)
-        self.assertEqual(d["extra"]["road_id"], "R01")
-
-
-if __name__ == "__main__":
-    unittest.main()
+class ArrayOutputSerializationTest(unittest.TestCase):
+    def test_batch_as_dict_retains_identity_and_extra_columns(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _make_csv(td, "points.csv", "vid,lng,lat,included_angle,gps_speed,gps_time_a,altitude\n"
+                             "v1,116,39,90,40,1700000000000,100.5\n")
+            with _get_database(CsvSource(path)) as handle:
+                batch = next(handle.iter_vehicle_batches())
+                output = batch.as_dict()
+            self.assertEqual(output["source_row_key"], [2])
+            self.assertEqual(output["extra"]["altitude"], [100.5])
+            self.assertEqual(output["lonlat"], [[116., 39.]])

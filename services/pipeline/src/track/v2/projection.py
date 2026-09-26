@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import numpy as np
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Iterable
@@ -283,19 +284,29 @@ class CoordinateTransformer:
             raise ProjectionError("heading could not be mapped into processing_srid")
         return dx / length, dy / length
 
-    def forward_many(
-        self,
-        points: Iterable[tuple[float, float]],
-    ) -> list[tuple[float, float]]:
-        values = list(points)
-        if not values:
-            return []
-        lons = [value[0] for value in values]
-        lats = [value[1] for value in values]
-        self.validate_bounds((min(lons), min(lats), max(lons), max(lats)))
-        xs, ys = self._forward.transform(lons, lats)
-        projected = [(float(x), float(y)) for x, y in zip(xs, ys)]
-        if any(not (math.isfinite(x) and math.isfinite(y)) for x, y in projected):
+    def inverse_many(self, points: np.ndarray) -> np.ndarray:
+        values = np.asarray(points, dtype=np.float64)
+        if values.ndim != 2 or values.shape[1] != 2:
+            raise ValueError("coordinates must have shape (N,2)")
+        if not len(values):
+            return np.empty((0, 2), dtype=np.float64)
+        lons, lats = self._inverse.transform(values[:, 0], values[:, 1])
+        result = np.column_stack((lons, lats))
+        if not np.isfinite(result).all():
+            raise ProjectionError("coordinates could not be transformed into source_srid")
+        return result
+
+    def forward_many(self, points: np.ndarray) -> np.ndarray:
+        values = np.asarray(points, dtype=np.float64)
+        if values.ndim != 2 or values.shape[1] != 2:
+            raise ValueError("coordinates must have shape (N,2)")
+        if not len(values):
+            return np.empty((0, 2), dtype=np.float64)
+        self.validate_bounds((float(values[:, 0].min()), float(values[:, 1].min()),
+                              float(values[:, 0].max()), float(values[:, 1].max())))
+        xs, ys = self._forward.transform(values[:, 0], values[:, 1])
+        projected = np.column_stack((xs, ys))
+        if not np.isfinite(projected).all():
             raise ProjectionError("coordinates could not be transformed into processing_srid")
         return projected
 

@@ -7,6 +7,7 @@ import hashlib
 import json
 import uuid
 import warnings
+import numpy as np
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,12 +27,11 @@ from ..models import (
     FieldConfig,
     FieldMapping,
     ParseIssue,
-    PointRef,
     PostgresSource,
     ReadReport,
     RuntimeConfig,
     SourceInfo,
-    TrajectoryPoint,
+    SourceBatch,
 )
 from .parse_rows import (
     _SkipRow,
@@ -153,8 +153,34 @@ class BaseTrajectorySourceHandle:
     def get_report(self) -> ReadReport:
         return self.report
 
-    def iter_points(self) -> Iterator[TrajectoryPoint]:
+    def _iter_values(self) -> Iterator[tuple]:
         raise NotImplementedError
+
+    def iter_vehicle_batches(self) -> Iterator[SourceBatch]:
+        if self._closed:
+            raise RuntimeError("trajectory source handle is closed")
+        columns: list[list] = [[] for _ in range(10)]
+        vehicle_id: str | None = None
+        extra_columns: dict[str, list] = {}
+        source_id = self._source_info.path_or_dsn
+        for values in self._iter_values():
+            if vehicle_id is not None and values[0] != vehicle_id:
+                yield _source_batch(source_id, vehicle_id, columns, extra_columns)
+                columns = [[] for _ in range(10)]
+                extra_columns = {}
+            vehicle_id = values[0]
+            extras = values[6] or {}
+            previous_size = len(columns[0])
+            for name in extras:
+                if name not in extra_columns:
+                    extra_columns[name] = [None] * previous_size
+            for name, column in extra_columns.items():
+                column.append(extras.get(name))
+            for index, (column, value) in enumerate(zip(columns, values)):
+                if index != 6:
+                    column.append(value)
+        if vehicle_id is not None:
+            yield _source_batch(source_id, vehicle_id, columns, extra_columns)
 
     def count_vehicle_ids(self) -> int:
         """ZH: 快速统计 distinct vehicle_id 数量，用于进度条显示。
@@ -231,19 +257,14 @@ class CsvTrajectorySourceHandle(BaseTrajectorySourceHandle):
         mapping = build_field_mapping(config.specs, columns, selector)
         super().__init__(source_info, config, mapping)
 
-    def iter_points(self) -> Iterator[TrajectoryPoint]:
+    def _iter_values(self) -> Iterator[tuple]:
         self._state = self._new_state()
-        previous: TrajectoryPoint | None = None
+        previous: tuple | None = None
         with open_text_auto(self._path, encoding=self._encoding, newline="") as f:
             reader = csv.DictReader(f)
             for row_number, row in enumerate(reader, start=2):
                 self._state.total_rows += 1
-                point_ref = PointRef(
-                    str(self._path.resolve()),
-                    str(row_number),
-                    True,
-                    source_row_hash=source_row_hash(row),
-                )
+                point_ref = str(row_number)
                 try:
                     point, issues = parse_row(row, point_ref, row_number, self._mapping)
                 except _SkipRow as exc:
@@ -253,10 +274,10 @@ class CsvTrajectorySourceHandle(BaseTrajectorySourceHandle):
 
                 for issue in issues:
                     self._state.add_issue(issue)
-                _check_order(previous, point)
-                previous = point
+                _check_order(previous, (*point, point_ref))
+                previous = (*point, point_ref)
                 self._state.mark_loaded()
-                yield point
+                yield (*point, row_number, True, source_row_hash(row))
                 self._state.assert_thresholds()
 
     def count_vehicle_ids(self) -> int:
@@ -307,9 +328,9 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
         super().__init__(source_info, config, mapping)
 
     @observed_operation("读取源数据与逐车精炼")
-    def iter_points(self) -> Iterator[TrajectoryPoint]:
+    def _iter_values(self) -> Iterator[tuple]:
         self._state = self._new_state()
-        previous: TrajectoryPoint | None = None
+        previous: tuple | None = None
         conn = self._connect()
         cur = None
         try:
@@ -360,10 +381,13 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
 
                 for issue in issues:
                     self._state.add_issue(issue)
-                _check_order(previous, point)
-                previous = point
+                source_key = str(row[pk_idx]) if pk_idx is not None and row[pk_idx] is not None else str(ordinal)
+                _check_order(previous, (*point, source_key))
+                previous = (*point, source_key)
                 self._state.mark_loaded()
-                yield point
+                key = row[pk_idx] if pk_idx is not None else None
+                yield (*point, int(key) if key not in (None, "") else ordinal,
+                       key not in (None, ""), "")
                 self._state.assert_thresholds()
             self._state.assert_thresholds()
         finally:
@@ -430,24 +454,6 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
         finally:
             _close_quietly(cur)
             _close_quietly(conn)
-
-    def _point_ref(self, row: dict[str, Any], ordinal: int) -> PointRef:
-        # ZH: PG 模式下 source_row_key 就是 DB 主键，稳定且可复现，
-        #     不需要昂贵的 SHA-256 哈希做 replay 校验——跳过以提速。
-        # EN: In PG mode source_row_key is the DB PK, already stable and
-        #     reproducible — skip the expensive SHA-256 hash to improve throughput.
-        key = self._source.primary_key_field
-        if key in row and row[key] not in (None, ""):
-            return PointRef(
-                self._source_id(),
-                str(row[key]),
-                True,
-            )
-        return PointRef(
-            self._source_id(),
-            str(ordinal),
-            False,
-        )
 
     def _source_id(self) -> str:
         if self._source.source_id is not None:
@@ -516,27 +522,11 @@ def open_text_auto(
     return path.open("r", encoding=encoding, newline=newline, errors=errors)
 
 
-def _check_order(previous: TrajectoryPoint | None, current: TrajectoryPoint) -> None:
-    if previous is None:
-        return
-    if _order_key(current) < _order_key(previous):
-        raise TrajectoryOrderError(
-            vehicle_id=current.vehicle_id,
-            previous_ref=previous.point_ref,
-            current_ref=current.point_ref,
-            previous_timestamp=previous.timestamp,
-            current_timestamp=current.timestamp,
-        )
-
-
-def _order_key(point: TrajectoryPoint) -> tuple[str, float, tuple[int, str]]:
-    return (point.vehicle_id, point.timestamp, _natural_ref_key(point.point_ref.source_row_key))
-
-
-def _natural_ref_key(value: str) -> tuple[int, str]:
-    if value.isdigit():
-        return (int(value), value)
-    return (0, value)
+def _check_order(previous: tuple | None, current: tuple) -> None:
+    if previous is not None and (current[0], current[1]) < (previous[0], previous[1]):
+        raise TrajectoryOrderError(vehicle_id=current[0], previous_ref=previous[7],
+                                   current_ref=current[7], previous_timestamp=previous[1],
+                                   current_timestamp=current[1])
 
 
 def _read_csv_columns(path: Path, encoding: str) -> list[str]:
@@ -646,26 +636,10 @@ class StreamVehicleSource:
     def field_mapping(self) -> FieldMapping:
         return self._handle.field_mapping
 
-    def iter_vehicle_tracks(self) -> Iterator[list[TrajectoryPoint]]:
-        """Yield one vehicle's worth of points at a time.
-
-        Reads points one-by-one from the underlying handle.  When
-        ``vehicle_id`` changes, the previous vehicle's buffered points
-        are yielded and the buffer resets.
-        """
+    def iter_vehicle_tracks(self) -> Iterator[SourceBatch]:
         if self._closed:
             raise RuntimeError("StreamVehicleSource is closed")
-        current_vid: str | None = None
-        current: list[TrajectoryPoint] = []
-        for point in self._handle.iter_points():
-            vid = point.vehicle_id
-            if current_vid is not None and vid != current_vid:
-                yield current
-                current = []
-            current_vid = vid
-            current.append(point)
-        if current:
-            yield current
+        yield from self._handle.iter_vehicle_batches()
 
     def close(self) -> None:
         self._closed = True
@@ -676,3 +650,18 @@ class StreamVehicleSource:
 
     def __exit__(self, *args: object) -> None:
         self.close()
+
+
+def _source_batch(source_id: str, vehicle_id: str, columns: list[list],
+                  extra_columns: dict[str, list]) -> SourceBatch:
+    return SourceBatch(
+        source_id, vehicle_id,
+        np.column_stack((columns[2], columns[3])).astype(np.float64),
+        np.asarray(columns[1], dtype=np.float64),
+        np.asarray(columns[4], dtype=np.float64),
+        np.asarray(columns[5], dtype=np.float64),
+        np.asarray(columns[7], dtype=np.int64),
+        np.asarray(columns[8], dtype=np.bool_),
+        np.asarray(columns[9], dtype=object),
+        {name: np.asarray(values, dtype=object) for name, values in extra_columns.items()},
+    )

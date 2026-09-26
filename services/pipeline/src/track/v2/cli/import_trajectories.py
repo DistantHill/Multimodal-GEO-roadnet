@@ -68,32 +68,15 @@ def main() -> int:
         total_written = 0
 
         with pg_connect(db_config) as conn:
-            batch: list = []
-            for point in handle.iter_points():
-                batch.append(point)
-                if len(batch) >= pc.runtime.import_batch_size:
-                    t0 = time.perf_counter()
-                    tp_id_map = insert_trajectory_points(conn, batch, table=args.table)
-                    written = len(tp_id_map)
-                    total_written += written
-                    total_parsed += len(batch)
-                    elapsed = time.perf_counter() - t0
-                    print(f"  ... 已解析 / parsed: {total_parsed:>12,}  "
-                          f"已写入 / written: {total_written:>12,}  "
-                          f"({elapsed:.1f}s per batch)")
-                    batch.clear()
-
-            # ── Final batch ──
-            if batch:
+            for batch in handle.iter_vehicle_batches():
                 t0 = time.perf_counter()
-                tp_id_map = insert_trajectory_points(conn, batch, table=args.table)
-                written = len(tp_id_map)
-                total_written += written
+                tp_id_map = insert_trajectory_points(conn, batch, table=args.table,
+                                                    batch_size=pc.runtime.import_batch_size)
+                total_written += len(tp_id_map)
                 total_parsed += len(batch)
-                elapsed = time.perf_counter() - t0
                 print(f"  ... 已解析 / parsed: {total_parsed:>12,}  "
                       f"已写入 / written: {total_written:>12,}  "
-                      f"({elapsed:.1f}s final batch)")
+                      f"({time.perf_counter() - t0:.1f}s per vehicle)")
 
             conn.commit()
 

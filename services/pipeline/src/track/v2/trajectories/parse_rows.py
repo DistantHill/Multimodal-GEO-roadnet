@@ -6,7 +6,7 @@ import math
 from datetime import datetime
 from typing import Any
 
-from ..models import FieldMapping, FieldSpec, ParseIssue, PointRef, TrajectoryPoint
+from ..models import FieldMapping, FieldSpec, ParseIssue
 
 
 class _SkipRow(Exception):
@@ -22,7 +22,7 @@ def _parse_row_from_tuple(
     specs: dict[str, FieldSpec],
     source_id: str,
     pk_idx: int | None,
-) -> tuple[TrajectoryPoint, list[ParseIssue]]:
+) -> tuple[tuple, list[ParseIssue]]:
     """ZH: PG 元组快速解析路径——跳过 _row_to_dict dict 分配 + _raw_value 双 dict 查找，
         直接用 tuple[row_idx] 索引。保留 parse_row 全部校验语义。
     EN: Fast-path tuple parser for PG rows — skips per-row dict allocation and
@@ -30,15 +30,15 @@ def _parse_row_from_tuple(
     """
     issues: list[ParseIssue] = []
 
-    # ── PointRef from tuple PK column ──
+    # ── str from tuple PK column ──
     if pk_idx is not None:
         pk_val = row[pk_idx]
         if pk_val not in (None, ""):
-            point_ref = PointRef(source_id, str(pk_val), True)
+            point_ref = str(pk_val)
         else:
-            point_ref = PointRef(source_id, str(ordinal), False)
+            point_ref = str(ordinal)
     else:
-        point_ref = PointRef(source_id, str(ordinal), False)
+        point_ref = str(ordinal)
 
     def _fast_issue(level: str, reason: str) -> ParseIssue:
         return ParseIssue(
@@ -132,25 +132,15 @@ def _parse_row_from_tuple(
         speed = _float_default(spd_spec) if spd_spec else 0.0
         issues.append(_fast_issue("WARN", "speed invalid; using default"))
 
-    point = TrajectoryPoint(
-        point_ref=point_ref,
-        vehicle_id=vehicle_id,
-        timestamp=timestamp,
-        lon=lon,
-        lat=lat,
-        heading=heading,
-        speed=speed,
-        extra={},
-    )
-    return point, issues
+    return (vehicle_id, timestamp, lon, lat, heading, speed, None), issues
 
 
 def parse_row(
     row: dict[str, Any],
-    point_ref: PointRef,
+    point_ref: str,
     row_number: int,
     mapping: FieldMapping,
-) -> tuple[TrajectoryPoint, list[ParseIssue]]:
+) -> tuple[tuple, list[ParseIssue]]:
     specs = mapping.specs_by_canonical
     issues: list[ParseIssue] = []
 
@@ -177,26 +167,15 @@ def parse_row(
         issues.append(_issue(point_ref, row_number, "WARN", "speed invalid; using default", row))
 
     extra = _parse_extra(row, mapping, point_ref, row_number, issues)
-    return (
-        TrajectoryPoint(
-            point_ref=point_ref,
-            vehicle_id=vehicle_id,
-            timestamp=timestamp,
-            lon=lon,
-            lat=lat,
-            heading=heading,
-            speed=speed,
-            extra=extra,
-        ),
-        issues,
-    )
+    return (vehicle_id, timestamp, lon, lat, heading, speed, extra), issues
+
 
 
 def _required_str(
     row: dict[str, Any],
     spec: FieldSpec,
     mapping: FieldMapping,
-    point_ref: PointRef,
+    point_ref: str,
     row_number: int,
 ) -> str:
     raw = _raw_value(row, spec, mapping)
@@ -210,7 +189,7 @@ def _required_timestamp(
     row: dict[str, Any],
     spec: FieldSpec,
     mapping: FieldMapping,
-    point_ref: PointRef,
+    point_ref: str,
     row_number: int,
 ) -> float:
     raw = _raw_value(row, spec, mapping)
@@ -227,7 +206,7 @@ def _required_float(
     row: dict[str, Any],
     spec: FieldSpec,
     mapping: FieldMapping,
-    point_ref: PointRef,
+    point_ref: str,
     row_number: int,
 ) -> float:
     raw = _raw_value(row, spec, mapping)
@@ -244,7 +223,7 @@ def _optional_float(
     row: dict[str, Any],
     spec: FieldSpec | None,
     mapping: FieldMapping,
-    point_ref: PointRef,
+    point_ref: str,
     row_number: int,
     issues: list[ParseIssue],
 ) -> float:
@@ -265,7 +244,7 @@ def _optional_float(
 def _parse_extra(
     row: dict[str, Any],
     mapping: FieldMapping,
-    point_ref: PointRef,
+    point_ref: str,
     row_number: int,
     issues: list[ParseIssue],
 ) -> dict[str, Any]:
@@ -348,7 +327,7 @@ def _float_default(spec: FieldSpec | None) -> float:
 
 
 def _issue(
-    point_ref: PointRef,
+    point_ref: str,
     row_number: int,
     level: str,
     reason: str,

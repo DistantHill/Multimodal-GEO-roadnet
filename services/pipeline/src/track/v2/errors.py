@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from .models import PointRef
 
 
 class V2Error(RuntimeError):
@@ -50,8 +49,8 @@ class TrajectoryOrderError(FatalDataError):
         self,
         *,
         vehicle_id: str,
-        previous_ref: PointRef,
-        current_ref: PointRef,
+        previous_ref: str | None,
+        current_ref: str | None,
         previous_timestamp: float,
         current_timestamp: float,
     ) -> None:
@@ -62,17 +61,17 @@ class TrajectoryOrderError(FatalDataError):
         self.current_timestamp = current_timestamp
         super().__init__(
             f"order violation for vehicle {vehicle_id!r}: "
-            f"previous {previous_ref.source_row_key} at {previous_timestamp}, "
-            f"current {current_ref.source_row_key} at {current_timestamp}"
+            f"previous {previous_ref} at {previous_timestamp}, "
+            f"current {current_ref} at {current_timestamp}"
         )
 
     @property
     def prev_point_ref(self) -> str:
-        return self.previous_ref.source_row_key
+        return self.previous_ref
 
     @property
     def curr_point_ref(self) -> str:
-        return self.current_ref.source_row_key
+        return self.current_ref
 
     @property
     def prev_timestamp(self) -> float:

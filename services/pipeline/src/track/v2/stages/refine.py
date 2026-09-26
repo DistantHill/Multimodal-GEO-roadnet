@@ -16,7 +16,7 @@ from ..db.source_table import (
     validate_source_table,
 )
 from ..models import (
-    ExcludedPoint,
+    ExcludedBatch,
     GeneratedReason,
     PostgresSource,
     RefineConfig,
@@ -191,7 +191,7 @@ def _stream_and_persist(
             f"({time.perf_counter() - count_started:.1f}s)",
         )
         source_count = injected_count = excluded_count = kept_count = vehicle_count = 0
-        pending_excluded: list[ExcludedPoint] = []
+        pending_excluded: list[ExcludedBatch] = []
         pending_subtracks: list[RefinementSubtrack] = []
         pending_point_count = 0
         subtrack_index = 1
@@ -204,10 +204,10 @@ def _stream_and_persist(
         for vehicle_points in stream.iter_vehicle_tracks():
             if vehicle_points:
                 bounds = (
-                    min(point.lon for point in vehicle_points),
-                    min(point.lat for point in vehicle_points),
-                    max(point.lon for point in vehicle_points),
-                    max(point.lat for point in vehicle_points),
+                    float(vehicle_points.lonlat[:, 0].min()),
+                    float(vehicle_points.lonlat[:, 1].min()),
+                    float(vehicle_points.lonlat[:, 0].max()),
+                    float(vehicle_points.lonlat[:, 1].max()),
                 )
                 run_bounds = _extend_bounds(run_bounds, bounds)
             source_count += len(vehicle_points)
@@ -221,14 +221,14 @@ def _stream_and_persist(
             injected_count += result.derived_counts.get(
                 GeneratedReason.HEADING_ORTHOGONAL, 0,
             )
-            pending_excluded.extend(result.excluded)
+            pending_excluded.append(result.excluded)
             excluded_count += len(result.excluded)
             pending_subtracks.extend(result.subtracks)
             pending_point_count += len(result.excluded) + sum(
-                len(subtrack.points) for subtrack in result.subtracks
+                len(subtrack) for subtrack in result.subtracks
             )
             if _should_flush(
-                pending_excluded_count=len(pending_excluded),
+                pending_excluded_count=sum(map(len, pending_excluded)),
                 pending_point_count=pending_point_count,
                 vehicle_count=vehicle_count,
                 runtime=runtime_config,
@@ -314,7 +314,7 @@ def _should_flush(
 
 def _flush(
     *, store: PipelineStore, refine_id: str,
-    pending_excluded: list[ExcludedPoint],
+    pending_excluded: list[ExcludedBatch],
     pending_subtracks: list[RefinementSubtrack], subtrack_index: int,
     batch_size: int, spatial_context: SpatialContext,
 ) -> tuple[int, int]:

@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 import uuid
+import numpy as np
 from dataclasses import dataclass
 from typing import Any
 
 from ..models import (
-    ExcludedIndex, GeneratedReason, RefinedPointRef, RefinementSubtrack,
-    SpatialContext, TrajectoryPoint,
+    ExcludedBatch, GeneratedReason, RefinementSubtrack,
+    SpatialContext,
 )
 from ..projection import CoordinateTransformer, spatial_context_from_values
 from .insert_batches import _BATCH, _chunked_insert, _copy_insert
@@ -102,119 +103,45 @@ def fetch_refine_run(conn: Any, refine_id: str) -> RefineRunRecord:
     )
 
 
-def insert_excluded_points(
-    conn: Any,
-    excluded: ExcludedIndex,
-    *,
-    refine_id: str,
-    batch_size: int = _BATCH,
-) -> int:
-    rows = [
-        (refine_id, int(item.point_ref.source_row_key), item.reason)
-        for item in excluded.items
-    ]
+def insert_excluded_points(conn: Any, excluded: ExcludedBatch, *, refine_id: str,
+                           batch_size: int = _BATCH) -> int:
+    rows = [(refine_id, int(excluded.source_row_key[i]), str(excluded.reason[i]))
+            for i in range(len(excluded))]
     with conn.cursor() as cur:
-        _chunked_insert(
-            cur,
-            "excluded_points",
-            ["refine_id", "source_row_key", "reason"],
-            rows,
-            batch_size=batch_size,
-        )
+        _chunked_insert(cur, "excluded_points", ["refine_id", "source_row_key", "reason"],
+                        rows, batch_size=batch_size)
     return len(rows)
 
 
-def insert_kept_trajectory_points(
-    conn: Any,
-    subtracks: list[RefinementSubtrack],
-    *,
-    refine_id: str,
-) -> int:
-    rows: list[tuple[Any, ...]] = []
-    for subtrack in subtracks:
-        sequence = 0
-        for point in subtrack.points:
-            if point.point_ref.generated_reason:
-                continue
-            rows.append((
-                refine_id,
-                int(point.point_ref.source_row_key),
-                point.vehicle_id,
-                subtrack.subtrack_index,
-                sequence,
-            ))
-            sequence += 1
+def insert_kept_trajectory_points(conn: Any, subtracks: list[RefinementSubtrack], *,
+                                 refine_id: str) -> int:
+    rows = []
+    for track in subtracks:
+        kept = np.flatnonzero(track.kind == "p")
+        rows.extend((refine_id, int(track.source_row_key[i]), track.vehicle_id,
+                     track.subtrack_index, sequence) for sequence, i in enumerate(kept))
     with conn.cursor() as cur:
-        _copy_insert(
-            cur,
-            "kept_trajectory_points",
-            [
-                "refine_id",
-                "source_row_key",
-                "vehicle_id",
-                "subtrack_index",
-                "sequence_in_subtrack",
-            ],
-            rows,
-        )
+        _copy_insert(cur, "kept_trajectory_points", ["refine_id", "source_row_key", "vehicle_id",
+                     "subtrack_index", "sequence_in_subtrack"], rows)
     return len(rows)
 
 
-def insert_injected_points(
-    conn: Any,
-    subtracks: list[RefinementSubtrack],
-    *,
-    refine_id: str,
-    spatial_context: SpatialContext,
-    batch_size: int = _BATCH,
-) -> int:
-    injected: list[tuple[RefinementSubtrack, int, TrajectoryPoint]] = []
-    for subtrack in subtracks:
-        kept_sequence = -1
-        for point in subtrack.points:
-            if point.point_ref.generated_reason != GeneratedReason.HEADING_ORTHOGONAL:
-                kept_sequence += 1
-                continue
-            if kept_sequence < 0:
+def insert_injected_points(conn: Any, subtracks: list[RefinementSubtrack], *, refine_id: str,
+                           spatial_context: SpatialContext, batch_size: int = _BATCH) -> int:
+    rows = []
+    for track in subtracks:
+        for i in np.flatnonzero(track.kind == "i"):
+            if track.after_sequence[i] < 0:
                 raise ValueError("an injected point requires a preceding kept point")
-            injected.append((subtrack, kept_sequence, point))
-    transformer = CoordinateTransformer(spatial_context)
-    xy = transformer.forward_many((point.lon, point.lat) for _, _, point in injected)
-    rows = [(
-        refine_id,
-        point.vehicle_id,
-        subtrack.subtrack_index,
-        anchor,
-        point.timestamp,
-        point.lon,
-        point.lat,
-        x,
-        y,
-        point.heading,
-        point.speed,
-        str(point.point_ref.generated_reason),
-    ) for (subtrack, anchor, point), (x, y) in zip(injected, xy, strict=True)]
+            rows.append((refine_id, track.vehicle_id, track.subtrack_index,
+                         int(track.after_sequence[i]), float(track.timestamp[i]),
+                         float(track.lonlat[i, 0]), float(track.lonlat[i, 1]),
+                         float(track.xy[i, 0]), float(track.xy[i, 1]),
+                         float(track.heading[i]), float(track.speed[i]), str(track.generated_reason[i])))
     with conn.cursor() as cur:
-        _chunked_insert(
-            cur,
-            "injected_points",
-            [
-                "refine_id",
-                "vehicle_id",
-                "subtrack_index",
-                "after_sequence_in_subtrack",
-                "timestamp",
-                "lon",
-                "lat",
-                "x",
-                "y",
-                "heading",
-                "speed",
-                "generated_reason",
-            ],
-            rows,
-            batch_size=batch_size,
-        )
+        _chunked_insert(cur, "injected_points", ["refine_id", "vehicle_id", "subtrack_index",
+                        "after_sequence_in_subtrack", "timestamp", "lon", "lat", "x", "y",
+                        "heading", "speed", "generated_reason"], rows, batch_size=batch_size)
     return len(rows)
 
 
