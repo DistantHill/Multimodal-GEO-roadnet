@@ -66,9 +66,9 @@ def test_queries_are_owner_scoped_stable_and_preserve_clip_relations():
         "resolved_points"
     ]
     assert "k.source_row_key AS source_row_key" in queries["resolved_points"]
-    assert "rf.processing_srid" in queries["resolved_points"]
-    assert "ip.x, c.crossing_x) AS x" in queries["resolved_points"]
-    assert "ip.y, c.crossing_y) AS y" in queries["resolved_points"]
+    assert "ST_Transform" not in queries["resolved_points"]
+    assert "COALESCE(ip.x, c.crossing_x) AS x" in queries["resolved_points"]
+    assert "COALESCE(ip.y, c.crossing_y) AS y" in queries["resolved_points"]
     assert "s.id=k.source_row_key" in queries["resolved_points"]
     assert "k.source_row_key::bigint" not in queries["resolved_points"]
     assert "r.crossing_point_id=c.id" in queries["entry_exit_points"]
@@ -147,3 +147,38 @@ def test_q44_export_is_pure_duckdb_sql_without_python_rows():
     assert ".commit(" not in source
     assert ".rollback(" not in source
     assert "publish(" not in source
+
+
+def test_kept_xy_comes_from_refine_identity_without_reprojection():
+    owner = uuid4()
+    with duckdb.connect() as connection:
+        connection.execute("CREATE TABLE refine_kept_xy(point_id BIGINT,x DOUBLE,y DOUBLE)")
+        connection.execute("INSERT INTO refine_kept_xy VALUES (20,12345.25,-9876.5)")
+        query = _select("resolved_points").replace("?", f"'{owner}'").replace("20::BIGINT AS source_row_key", "42::BIGINT AS source_row_key")
+        row = connection.execute(detect_parquet_export._resolved_xy_relation(query)).fetchnumpy()
+        assert row["x"].tolist() == [12345.25]
+        assert row["y"].tolist() == [-9876.5]
+        assert row["source_row_key"].tolist() == [42]
+        assert row["resolved_point_id"].tolist() == [10]
+        crossing = query.replace("'kept'", "'crossing'").replace("20::BIGINT AS refined_point_id", "NULL::BIGINT AS refined_point_id")
+        row = connection.execute(detect_parquet_export._resolved_xy_relation(crossing)).fetchnumpy()
+        assert row["x"].tolist() == [100.0] and row["y"].tolist() == [200.0]
+
+
+def test_refine_xy_rejects_wrong_owner_before_reading_files(tmp_path):
+    descriptor = Mock(stage="refine", refine_id=uuid4())
+    with duckdb.connect() as connection:
+        with pytest.raises(detect_parquet_export.DetectParquetError, match="owner"):
+            detect_parquet_export._load_refine_xy(connection, tmp_path, descriptor, uuid4())
+
+
+def test_missing_refine_xy_fails_without_source_projection_fallback(tmp_path):
+    handle = _handle(tmp_path)
+    with duckdb.connect() as connection:
+        connection.execute("CREATE TABLE refine_kept_xy(point_id BIGINT,x DOUBLE,y DOUBLE)")
+        query = _select("resolved_points").replace("?", f"'{handle.run_id}'")
+        with pytest.raises(detect_parquet_export.DetectParquetError, match="null required"):
+            detect_parquet_export._copy(
+                connection, detect_parquet_export._resolved_xy_relation(query),
+                handle.path / "resolved_points/part.parquet", "resolved_points", runtime_config(),
+            )

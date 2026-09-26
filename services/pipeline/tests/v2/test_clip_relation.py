@@ -203,3 +203,21 @@ def test_q44_relation_uses_only_duckdb_columnar_storage():
     assert "unnest" in append_source and "executemany" not in append_source
     for forbidden in ("sqlite", "pickle", "temporarydirectory", "memmap"):
         assert forbidden not in source
+
+
+def test_wide_json_columns_preserve_large_int64_and_xy(tmp_path):
+    from dataclasses import replace
+    size = 4096
+    xy = np.column_stack((np.linspace(1.0, 3.0, size+2), np.linspace(2.0, 4.0, size+2)))
+    xy[1] = [-0.0, -0.0]
+    clip = replace(_clip("wide"), xy=xy.copy(), lonlat=xy.copy(),
+                   resolved_point_ids=np.arange(size,dtype=np.int64)+2**53,
+                   end_index=size+1, interior_end=size+1, point_count=size+2)
+    with _relation(tmp_path, batch_size=1024) as relation:
+        relation.append(clip)
+        relation.seal()
+        result = next(iter(relation))
+        np.testing.assert_array_equal(result.resolved_point_ids, clip.resolved_point_ids)
+        np.testing.assert_array_equal(result.xy, clip.xy)
+        np.testing.assert_array_equal(result.lonlat, clip.lonlat)
+        assert np.signbit(result.xy[1]).all()

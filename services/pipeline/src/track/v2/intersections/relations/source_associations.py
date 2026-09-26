@@ -182,6 +182,14 @@ class WriterRelation:
 
     def _register_batch(self, columns: dict[str, np.ndarray]) -> str:
         relation = f"writer_batch_{uuid4().hex}"
+        # DuckDB's object-string scanner is expensive even for bounded batches.
+        # Pure text columns can use its typed string scanner; nullable/mixed
+        # object columns retain their original NULL and scalar semantics.
+        columns = {
+            name: values.astype(np.str_) if values.dtype.kind == "O"
+            and all(isinstance(value, str) for value in values) else values
+            for name, values in columns.items()
+        }
         self._require_open().register(relation, columns)
         return relation
 

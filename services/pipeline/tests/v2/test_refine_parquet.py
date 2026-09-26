@@ -82,11 +82,12 @@ def test_postgres_query_is_run_scoped_safe_and_computes_interleaved_sequence():
     assert 'JOIN "odd"."schema" s' in sql
     assert 'FROM "run""schema".kept_trajectory_points k' in sql
     assert 'ON s.id = k.source_row_key' in sql
-    assert 'k.source_row_key::text AS source_row_key' in sql
+    assert 'k.source_row_key AS source_row_key' in sql
     assert 'k.source_row_key::bigint' not in sql
     assert 'FROM "run""schema".injected_points i' in sql
     projected = "ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), 32650)"
-    assert sql.count(projected) == 2
+    assert projected not in sql
+    assert "k.x AS x" in sql and "k.y AS y" in sql
     assert "ST_Transform(s.geom" not in sql
     assert "PARTITION BY subtrack_index" in sql
     assert "ORDER BY anchor_sequence, point_kind, point_id" in sql
@@ -129,7 +130,7 @@ def test_copy_writes_real_typed_files_including_empty_injected(tmp_path):
     )
     with duckdb.connect() as connection:
         refine_export._copy_table(
-            connection, f"SELECT {common}, 'source-7'::VARCHAR AS source_row_key",
+            connection, f"SELECT {common}, 7::BIGINT AS source_row_key",
             handle.path / "kept_points/part-00000.parquet", "kept_points", runtime_config(),
         )
         refine_export._copy_table(

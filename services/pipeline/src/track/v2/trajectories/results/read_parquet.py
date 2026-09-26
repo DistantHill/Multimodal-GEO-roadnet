@@ -98,7 +98,7 @@ class RefineDatasetReader:
                 FROM kept_points
                 UNION ALL BY NAME
                 SELECT *, 'injected'::VARCHAR AS point_kind,
-                       NULL::VARCHAR AS source_row_key
+                       NULL::BIGINT AS source_row_key
                 FROM injected_points
             """)
         except BaseException:
@@ -447,7 +447,7 @@ class RefineDatasetReader:
              OR lat NOT BETWEEN -90 AND 90 OR point_kind IS NULL
              OR point_kind NOT IN ('kept', 'injected')
              OR (point_kind = 'kept' AND
-                 (source_row_key IS NULL OR source_row_key = '' OR generated_reason IS NOT NULL
+                 (source_row_key IS NULL OR generated_reason IS NOT NULL
                   OR after_sequence_in_subtrack IS NOT NULL))
              OR (point_kind = 'injected' AND
                  (source_row_key IS NOT NULL OR generated_reason IS NULL

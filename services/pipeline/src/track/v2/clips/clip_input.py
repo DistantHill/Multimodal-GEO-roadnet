@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
+import json
 import numpy as np
 from pathlib import Path
 from uuid import uuid4
@@ -103,13 +104,13 @@ class ClipRelation(Sequence[TrackClip]):
             for lo in range(0, len(clip.resolved_point_ids), self._batch_size):
                 hi = min(lo+self._batch_size, len(clip.resolved_point_ids))
                 connection.execute(
-                    "INSERT INTO clip_points SELECT ?, unnest(?::BIGINT[]), "
-                    "unnest(?::BIGINT[]), unnest(?::DOUBLE[]), unnest(?::DOUBLE[]), "
-                    "unnest(?::DOUBLE[]), unnest(?::DOUBLE[])",
-                    (ordinal, np.arange(lo, hi, dtype=np.int64).tolist(),
-                     clip.resolved_point_ids[lo:hi].tolist(),
-                     clip.lonlat[lo+1:hi+1,0].tolist(), clip.lonlat[lo+1:hi+1,1].tolist(),
-                     clip.xy[lo+1:hi+1,0].tolist(), clip.xy[lo+1:hi+1,1].tolist()),
+                    "INSERT INTO clip_points SELECT ?, unnest(from_json(?, '[\"BIGINT\"]')), "
+                    "unnest(from_json(?, '[\"BIGINT\"]')), unnest(from_json(?, '[\"DOUBLE\"]')), unnest(from_json(?, '[\"DOUBLE\"]')), "
+                    "unnest(from_json(?, '[\"DOUBLE\"]')), unnest(from_json(?, '[\"DOUBLE\"]'))",
+                    (ordinal, json.dumps(np.arange(lo, hi, dtype=np.int64).tolist(), separators=(",", ":")),
+                     json.dumps(clip.resolved_point_ids[lo:hi].tolist(), separators=(",", ":")),
+                     json.dumps(clip.lonlat[lo+1:hi+1,0].tolist(), separators=(",", ":")), json.dumps(clip.lonlat[lo+1:hi+1,1].tolist(), separators=(",", ":")),
+                     json.dumps(clip.xy[lo+1:hi+1,0].tolist(), separators=(",", ":")), json.dumps(clip.xy[lo+1:hi+1,1].tolist(), separators=(",", ":"))),
                 )
             connection.execute("COMMIT")
         except Exception:

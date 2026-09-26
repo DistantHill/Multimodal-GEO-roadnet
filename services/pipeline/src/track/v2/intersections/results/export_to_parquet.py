@@ -9,7 +9,7 @@ from uuid import UUID
 
 import duckdb
 
-from track.v2.artifacts.parquet_manifest import build_descriptor
+from track.v2.artifacts.parquet_manifest import build_descriptor, validate_published
 from track.v2.artifacts.publish_dataset import StagingDataset, _validate_handle
 from track.v2.config import PostgresConfig
 from track.v2.db.artifact_registry import ArtifactDescriptor
@@ -65,10 +65,10 @@ def _quote(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
-def _metadata(conn: Any, detect_id: UUID) -> tuple[str, str]:
+def _metadata(conn: Any, detect_id: UUID) -> tuple[str, str, UUID]:
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT r.source_table, current_schema(), d.status "
+            "SELECT r.source_table, current_schema(), d.status, r.id "
             "FROM detect_runs d JOIN refine_runs r ON r.id=d.refine_id WHERE d.id=%s",
             (detect_id,),
         )
@@ -79,7 +79,7 @@ def _metadata(conn: Any, detect_id: UUID) -> tuple[str, str]:
         raise DetectParquetError("Detect Run must remain running during staging export")
     if not isinstance(row[1], str):
         raise DetectParquetError("current PostgreSQL schema is unavailable")
-    return str(row[0]), _quote(row[1])
+    return str(row[0]), _quote(row[1]), row[3]
 
 
 def _queries(detect_id: UUID, schema: str, source: str, key_type: str) -> dict[str, str]:
@@ -91,21 +91,19 @@ def _queries(detect_id: UUID, schema: str, source: str, key_type: str) -> dict[s
     intersections = f"{schema}.intersections"
     candidates = f"{schema}.candidate_intersections"
     detects = f"{schema}.detect_runs"
-    refines = f"{schema}.refine_runs"
     resolved = f"""
 SELECT r.detect_id, r.id AS resolved_point_id, r.subtrack_index,
  r.sequence_in_subtrack, r.refined_sequence_in_subtrack,
  COALESCE(k.vehicle_id, ip.vehicle_id, sk.vehicle_id, sip.vehicle_id) AS vehicle_id,
  COALESCE(s.lon, ip.lon, c.crossing_lon) AS lon,
  COALESCE(s.lat, ip.lat, c.crossing_lat) AS lat,
- COALESCE(ST_X(ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), rf.processing_srid)), ip.x, c.crossing_x) AS x,
- COALESCE(ST_Y(ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), rf.processing_srid)), ip.y, c.crossing_y) AS y,
+ COALESCE(ip.x, c.crossing_x) AS x,
+ COALESCE(ip.y, c.crossing_y) AS y,
  CASE WHEN r.kept_point_id IS NOT NULL THEN 'kept'
       WHEN r.injected_point_id IS NOT NULL THEN 'injected' ELSE 'crossing' END AS point_kind,
  COALESCE(r.kept_point_id, r.injected_point_id) AS refined_point_id,
  k.source_row_key AS source_row_key, c.id AS crossing_id, i.id AS intersection_id, c.crossing_type
 FROM {base} r JOIN {detects} d ON d.id=r.detect_id
-JOIN {refines} rf ON rf.id=d.refine_id
 LEFT JOIN {kept} k ON k.id=r.kept_point_id AND k.refine_id=d.refine_id
 LEFT JOIN {source} s ON s.id=k.source_row_key
 LEFT JOIN {injected} ip ON ip.id=r.injected_point_id AND ip.refine_id=d.refine_id
@@ -139,19 +137,48 @@ WHERE c.detect_id={run}
     }
 
 
+def _resolved_xy_relation(relation: str) -> str:
+    # Refine kept XY is authoritative; injected and crossing XY stays persisted.
+    columns = []
+    for column in DETECT_PARQUET_V1["resolved_points"]:
+        value = (f"CASE WHEN p.point_kind='kept' THEN k.{column.name} ELSE p.{column.name} END"
+                 if column.name in {"x", "y"} else f"p.{column.name}")
+        columns.append(f"{value}::{column.duckdb_type} AS {column.name}")
+    return ("SELECT " + ", ".join(columns) + f" FROM ({relation}) p "
+            "LEFT JOIN refine_kept_xy k ON p.point_kind='kept' AND p.refined_point_id=k.point_id")
+
+
 def _relation(query: str, table: str) -> str:
-    projection = ", ".join(
-        f"{column.name}::{column.duckdb_type} AS {column.name}"
-        for column in DETECT_PARQUET_V1[table]
-    )
+    postgres = f"SELECT * FROM postgres_query('authoritative_pg', {quote_sql_literal(query)})"
+    if table == "resolved_points":
+        relation = _resolved_xy_relation(postgres)
+    else:
+        projection = ", ".join(
+            f"{column.name}::{column.duckdb_type} AS {column.name}"
+            for column in DETECT_PARQUET_V1[table]
+        )
+        relation = f"SELECT {projection} FROM ({postgres})"
     order = {
         "resolved_points": "subtrack_index, sequence_in_subtrack, resolved_point_id",
         "intersections": "intersection_id",
         "entry_exit_points": "intersection_id, crossing_id",
     }[table]
-    return (
-        f"SELECT {projection} FROM postgres_query('authoritative_pg', {quote_sql_literal(query)}) "
-        f"ORDER BY {order}"
+    return f"{relation} ORDER BY {order}"
+
+
+def _load_refine_xy(connection, root: Path, descriptor: ArtifactDescriptor, refine_id: UUID) -> None:
+    from track.v2.trajectories.results.parquet_schema import _validate_schema as validate_refine_schema
+    if descriptor.stage != "refine" or descriptor.refine_id != refine_id:
+        raise DetectParquetError("Refine XY artifact owner differs from Detect lineage")
+    validate_published(root, descriptor, "present")
+    validate_refine_schema(descriptor)
+    manifest = json.loads(descriptor.manifest_json)
+    table = next(table for table in manifest["tables"] if table["name"] == "kept_points")
+    final = root / descriptor.relative_path
+    files = ", ".join(quote_sql_literal(str(final / file["relative_path"])) for file in table["files"])
+    connection.execute(
+        "CREATE TEMP VIEW refine_kept_xy AS SELECT point_id, x, y "
+        f"FROM read_parquet([{files}]) WHERE refine_id={quote_sql_literal(str(refine_id))}::UUID"
     )
 
 
@@ -254,7 +281,8 @@ def _validate_schema(descriptor: ArtifactDescriptor) -> None:
 def export_detect_results_to_parquet(conn: Any, postgres: PostgresConfig, handle: StagingDataset,
                           runtime: RuntimeConfig,
                           source_fingerprint: dict[str, object], *, data_root: Path,
-                          postgres_extension_path: Path) -> ArtifactDescriptor:
+                          postgres_extension_path: Path, refine_descriptor: ArtifactDescriptor,
+                          parquet_directory: Path) -> ArtifactDescriptor:
     """Write and inspect staging only; never publish, finish, or control transactions.
 
     Detect result rows must already be committed and visible to postgres_scanner,
@@ -264,7 +292,7 @@ def export_detect_results_to_parquet(conn: Any, postgres: PostgresConfig, handle
     _validate_handle(handle)
     if handle.stage != "detect":
         raise DetectParquetError("staging dataset must belong to the detect stage")
-    source_table, schema = _metadata(conn, handle.run_id)
+    source_table, schema, refine_id = _metadata(conn, handle.run_id)
     contract = validate_source_table(conn, source_table)
     queries = _queries(handle.run_id, schema, contract.quoted_table, contract.key_sql_type)
     outputs = {name: handle.path / name / "part-00000.parquet" for name in DETECT_PARQUET_V1}
@@ -273,6 +301,7 @@ def export_detect_results_to_parquet(conn: Any, postgres: PostgresConfig, handle
         data_root / "duckdb" / str(handle.run_id),
         postgres_extension_path,
     ) as connection:
+        _load_refine_xy(connection, parquet_directory, refine_descriptor, refine_id)
         connection.execute(
             f"ATTACH {quote_sql_literal(postgres.dsn())} AS authoritative_pg (TYPE postgres, READ_ONLY)"
         )

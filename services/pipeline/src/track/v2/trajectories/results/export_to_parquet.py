@@ -61,9 +61,9 @@ WITH points AS (
  SELECT k.refine_id, k.id AS point_id, k.vehicle_id, k.subtrack_index,
         k.sequence_in_subtrack AS anchor_sequence, 0 AS point_kind,
         s.timestamp, s.lon, s.lat,
-        ST_X(ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), {srid})) AS x,
-        ST_Y(ST_Transform(ST_SetSRID(ST_MakePoint(s.lon, s.lat), 4326), {srid})) AS y,
-        s.heading, s.speed, k.source_row_key::text AS source_row_key, NULL::text AS generated_reason,
+        k.x AS x,
+        k.y AS y,
+        s.heading, s.speed, k.source_row_key AS source_row_key, NULL::text AS generated_reason,
         NULL::integer AS after_sequence_in_subtrack
  FROM {result_schema}.kept_trajectory_points k JOIN {contract.quoted_table} s
    ON s.id = k.source_row_key
@@ -71,7 +71,7 @@ WITH points AS (
  UNION ALL
  SELECT i.refine_id, i.id, i.vehicle_id, i.subtrack_index,
         i.after_sequence_in_subtrack, 1, i.timestamp, i.lon, i.lat, i.x, i.y,
-        i.heading, i.speed, NULL::text, i.generated_reason,
+        i.heading, i.speed, NULL::bigint, i.generated_reason,
         i.after_sequence_in_subtrack
  FROM {result_schema}.injected_points i WHERE i.refine_id = {run}::uuid
 ), sequenced AS (

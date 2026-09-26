@@ -76,7 +76,7 @@ def fetch_points_in_grid(
                  candidate.refined_sequence, candidate.source_id
           FROM (
             (SELECT k.sequence_in_subtrack AS anchor, 0 AS kind,
-                   k.id AS point_id, k.source_row_key::text AS source_row_key,
+                   k.id AS point_id, k.source_row_key AS source_row_key,
                    ST_X(ST_Transform(src.geom, {int(spatial_context.processing_srid)})) AS x,
                    ST_Y(ST_Transform(src.geom, {int(spatial_context.processing_srid)})) AS y,
                    src.heading, src.timestamp, src.speed, src.lon, src.lat,
@@ -97,7 +97,7 @@ def fetch_points_in_grid(
             ORDER BY k.sequence_in_subtrack {order}, k.id {order}
             LIMIT 1)
             UNION ALL
-            (SELECT i.after_sequence_in_subtrack, 1, i.id, NULL::text,
+            (SELECT i.after_sequence_in_subtrack, 1, i.id, NULL::bigint,
                  i.x, i.y, i.heading, i.timestamp, i.speed, i.lon, i.lat,
                  i.generated_reason,
                  i.after_sequence_in_subtrack + (
@@ -125,7 +125,7 @@ def fetch_points_in_grid(
     WITH hits AS (
       SELECT k.vehicle_id, k.subtrack_index,
              k.sequence_in_subtrack AS anchor, 0 AS kind, k.id AS point_id,
-             k.source_row_key::text AS source_row_key, ST_X({projected}) AS x,
+             k.source_row_key AS source_row_key, ST_X({projected}) AS x,
              ST_Y({projected}) AS y, s.heading, s.timestamp, s.speed,
              s.lon, s.lat, NULL::text AS generated_reason,
              k.sequence_in_subtrack + (
@@ -143,7 +143,7 @@ def fetch_points_in_grid(
         AND ST_X({projected}) <= %s AND ST_Y({projected}) <= %s
       UNION ALL
       SELECT i.vehicle_id, i.subtrack_index, i.after_sequence_in_subtrack,
-             1, i.id, NULL::text, i.x, i.y, i.heading,
+             1, i.id, NULL::bigint, i.x, i.y, i.heading,
              i.timestamp, i.speed, i.lon, i.lat, i.generated_reason,
              i.after_sequence_in_subtrack + (
                SELECT COUNT(*) FROM injected_points rank_i

@@ -23,6 +23,7 @@ from track.v2.intersections.query_results import fetch_intersections, fetch_reso
 from track.v2.db.artifact_registry import find_detect_artifact
 from track.v2.db.pipeline_store import PostgresPipelineStore
 from track.v2.intersections.results.export_to_parquet import export_detect_results_to_parquet
+from track.v2.trajectories.results.export_to_parquet import export_refine_parquet
 from track.v2.intersections.results.read_parquet import DetectDatasetReader
 from track.v2.clips.extract_clips import extract_clips, extract_clips_for_detect
 from track.v2.models import ClipConfig, ClipInput, RuntimeConfig
@@ -89,8 +90,8 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
     conn.execute("INSERT INTO detect_runs(id,refine_id,status) VALUES (%s,%s,'running')",
                  (detect_id, refine_id))
     kept = conn.execute("INSERT INTO kept_trajectory_points"
-                        "(refine_id,source_row_key,vehicle_id,subtrack_index,sequence_in_subtrack) "
-                        "VALUES (%s,'1','v',1,0),(%s,'2','v',1,1) RETURNING id",
+                        "(refine_id,source_row_key,vehicle_id,subtrack_index,sequence_in_subtrack,x,y) "
+                        "VALUES (%s,'1','v',1,0,1000.25,2000.5),(%s,'2','v',1,1,1001.25,2001.5) RETURNING id",
                         (refine_id, refine_id)).fetchall()
     candidate = conn.execute("INSERT INTO candidate_intersections"
                              "(detect_id,centroid_x,centroid_y,centroid_lon,centroid_lat,radius_m) "
@@ -116,6 +117,13 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
         "VALUES (%s,%s,90,90,%s,%s)",
         (detect_id, intersection, crossings[0][0], crossings[1][0]))
     conn.commit()
+    refine_handle = create_staging(tmp_path.resolve(), "refine", refine_id, uuid4())
+    refine_descriptor = export_refine_parquet(
+        conn, config, refine_handle, runtime_config(duckdb_threads=1), {"version": 1},
+        data_root=tmp_path.resolve(),
+        postgres_extension_path=pipeline_config().paths.duckdb_postgres_extension_path,
+    )
+    publish(refine_handle)
     conn.execute("ALTER TABLE refine_runs DISABLE TRIGGER USER")
     conn.execute(
         "UPDATE refine_runs SET status='completed', source_fingerprint=%s::jsonb WHERE id=%s",
@@ -129,6 +137,7 @@ def test_export_matches_clip_readers_with_crossings_between_points(database, tmp
         conn, config, handle, runtime_config(duckdb_threads=1), {"version": 1},
         data_root=tmp_path.resolve(),
         postgres_extension_path=pipeline_config().paths.duckdb_postgres_extension_path,
+        refine_descriptor=refine_descriptor, parquet_directory=tmp_path.resolve(),
     )
     assert conn.execute(
         "SELECT status FROM detect_runs WHERE id=%s", (detect_id,),

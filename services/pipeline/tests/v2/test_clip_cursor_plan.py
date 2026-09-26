@@ -142,3 +142,32 @@ def test_postgres_declare_restores_settings_on_success_error_and_early_close():
         # An error rolled back only the declaration savepoint, not the caller's transaction.
         assert conn.execute("SELECT 123").fetchone() == (123,)
         conn.rollback()
+
+
+@pytest.mark.parametrize('batch_size', [1, 2])
+def test_replay_uses_persisted_xy_releases_prior_chunks_and_closes_early(batch_size):
+    import weakref
+    import numpy as np
+    import track.v2.intersections.query_results as module
+    rows = [(1,37,0,'same',120.,30.,None,None,None,123.25,-456.5),
+            (2,37,1,'same',120.1,30.1,None,None,None,124.25,-455.5),
+            (3,212,0,'same',121.,31.,None,None,None,9.,10.)]
+    conn = Connection(rows)
+    references = []
+    original = np.fromiter
+    def capture(*args, **kwargs):
+        column = original(*args, **kwargs)
+        references.append(weakref.ref(column))
+        return column
+    with patch.object(module,'fetch_detect_row',return_value=SimpleNamespace(status='completed',source_table='s',spatial_context=_CONTEXT)), \
+         patch.object(module,'validate_source_table',return_value=SimpleNamespace(quoted_table='"s"',key_sql_type='bigint')), \
+         patch.object(module.np,'fromiter',side_effect=capture):
+        iterator = fetch_resolved_clip_tracks(conn,'d',batch_size=batch_size)
+        track = next(iterator)
+        np.testing.assert_array_equal(track.xy, [[123.25,-456.5],[124.25,-455.5]])
+        assert track.subtrack_index == 37
+        assert not track.xy.flags.writeable
+        assert all(reference() is None for reference in references[:11])
+        iterator.close()
+    assert conn.value.closed
+    assert conn.fraction == '0.37'

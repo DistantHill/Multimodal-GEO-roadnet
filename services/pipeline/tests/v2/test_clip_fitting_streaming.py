@@ -197,7 +197,7 @@ def test_resolved_reader_streams_subtracks_inherits_leading_crossing_vehicle_and
         patch("track.v2.intersections.query_results.fetch_detect_row", return_value=SimpleNamespace(status="completed", source_table="s", spatial_context=_CONTEXT)),
         patch("track.v2.intersections.query_results.validate_source_table", return_value=SimpleNamespace(quoted_table='"s"', key_sql_type="bigint")),
     ):
-        stream = _reader(conn)
+        stream = fetch_resolved_clip_tracks(conn, "d", batch_size=1)
         first = next(stream)
         assert conn.fraction == "0.37"
         assert first.vehicle_id == "v"

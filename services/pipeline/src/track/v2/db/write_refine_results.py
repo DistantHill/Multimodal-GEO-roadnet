@@ -119,10 +119,11 @@ def insert_kept_trajectory_points(conn: Any, subtracks: list[RefinementSubtrack]
     for track in subtracks:
         kept = np.flatnonzero(track.kind == "p")
         rows.extend((refine_id, int(track.source_row_key[i]), track.vehicle_id,
-                     track.subtrack_index, sequence) for sequence, i in enumerate(kept))
+                     track.subtrack_index, sequence, float(track.xy[i,0]), float(track.xy[i,1]))
+                    for sequence, i in enumerate(kept))
     with conn.cursor() as cur:
         _copy_insert(cur, "kept_trajectory_points", ["refine_id", "source_row_key", "vehicle_id",
-                     "subtrack_index", "sequence_in_subtrack"], rows)
+                     "subtrack_index", "sequence_in_subtrack", "x", "y"], rows)
     return len(rows)
 
 

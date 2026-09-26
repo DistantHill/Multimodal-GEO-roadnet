@@ -538,3 +538,22 @@ def test_final_row_states_identity_empty_and_close(tmp_path):
         relation.validate_cross_pairs("detect")
     with pytest.raises(RuntimeError, match="closed"):
         next(relation.iter_validated_cross_rows())
+
+
+def test_typed_text_scanner_preserves_wide_strings_null_nan_and_large_ids(tmp_path):
+    size = 4096
+    with _relation(tmp_path) as relation:
+        ids = np.arange(size,dtype=np.int64)+2**53
+        texts = np.asarray(["p" if i%2 else "injected-with-long-text中文🚗" for i in range(size)],dtype=object)
+        nullable = np.ma.array(np.full(size,np.nan),mask=np.arange(size)%2==1)
+        columns = {"id":ids,"kind":texts,**relation._float_columns({"value":nullable})}
+        name = relation._register_batch(columns)
+        try:
+            rows = relation._connection.execute(f"SELECT id,kind FROM {name}").fetchmany(size)
+            np.testing.assert_array_equal(np.fromiter((row[0] for row in rows),dtype=np.int64),ids)
+            assert [row[1] for row in rows] == texts.tolist()
+            value = relation._float_sql(("value",))
+            assert relation._connection.execute(f"SELECT count(*) FROM (SELECT {value} AS v FROM {name}) WHERE v IS NULL").fetchone()[0] == size//2
+            assert relation._connection.execute(f"SELECT count(*) FROM (SELECT {value} AS v FROM {name}) WHERE isnan(v)").fetchone()[0] == size//2
+        finally:
+            relation._connection.unregister(name)

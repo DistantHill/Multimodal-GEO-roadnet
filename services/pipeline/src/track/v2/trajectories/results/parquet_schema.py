@@ -20,7 +20,7 @@ _COMMON = (
     ParquetColumn("speed", "DOUBLE"),
 )
 REFINE_PARQUET_V1 = {
-    "kept_points": (*_COMMON, ParquetColumn("source_row_key", "VARCHAR")),
+    "kept_points": (*_COMMON, ParquetColumn("source_row_key", "BIGINT")),
     "injected_points": (
         *_COMMON, ParquetColumn("generated_reason", "VARCHAR"),
         ParquetColumn("after_sequence_in_subtrack", "INTEGER"),

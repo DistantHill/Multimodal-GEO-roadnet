@@ -154,6 +154,8 @@ def run_detect_stage(
             fingerprint,
             data_root=paths_config.data_root,
             postgres_extension_path=paths_config.duckdb_postgres_extension_path,
+            refine_descriptor=registered.descriptor,
+            parquet_directory=paths_config.parquet_directory,
         )
         store.rollback()
         confirmed_fingerprint = calculate_source_fingerprint(

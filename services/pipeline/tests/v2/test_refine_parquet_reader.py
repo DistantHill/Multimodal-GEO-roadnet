@@ -53,7 +53,7 @@ def _published(tmp_path: Path):
                         common.format(point=7, vehicle="v1", subtrack=5, sequence=0),
                         common.format(point=8, vehicle="v2", subtrack=6, sequence=0)]
                 sql = " UNION ALL ".join(
-                    f"SELECT {row}, point_id::VARCHAR source_row_key"
+                    f"SELECT {row}, point_id::BIGINT source_row_key"
                     for row in rows
                 )
             else:
@@ -72,7 +72,7 @@ def _published(tmp_path: Path):
     return descriptor
 
 
-def _published_tracks(tmp_path: Path, tracks):
+def _published_tracks(tmp_path: Path, tracks, *, source_keys=None):
     """Publish real Parquet rows used to differential-test the SQL operator."""
     handle = publish_dataset.create_staging(
         tmp_path.resolve(), "refine", uuid4(), uuid4(),
@@ -89,13 +89,13 @@ def _published_tracks(tmp_path: Path, tracks):
                              sequence, timestamp,
                              120 + x / 1e6 if x is not None else 120,
                              30 + y / 1e6 if y is not None else 30,
-                             x, y, heading, 4.0, str(point_id)))
+                             x, y, heading, 4.0, point_id if source_keys is None else source_keys[point_id-1]))
         connection.execute("""
             CREATE TABLE input_points(
               refine_id UUID, point_id BIGINT, vehicle_id VARCHAR,
               subtrack_index INTEGER, refined_sequence_in_subtrack BIGINT,
               timestamp DOUBLE, lon DOUBLE, lat DOUBLE, x DOUBLE, y DOUBLE,
-              heading DOUBLE, speed DOUBLE, source_row_key VARCHAR)
+              heading DOUBLE, speed DOUBLE, source_row_key BIGINT)
         """)
         connection.executemany(
             "INSERT INTO input_points VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows,
@@ -953,3 +953,16 @@ def test_published_track_does_not_retain_consumed_driver_column_chunks(monkeypat
     assert all(reference() is None for reference in references[0])
     assert not track.xy.flags.writeable
     tracks.close()
+
+
+def test_native_parquet_source_keys_preserve_zero_negative_and_large_identity(tmp_path):
+    keys = [0, -1, 2**53+1]
+    descriptor = _published_tracks(tmp_path, [("same",37,[(0,0,0,0),(1,1,0,0),(2,2,0,0)])], source_keys=keys)
+    with refine_reader.RefineDatasetReader(tmp_path, descriptor, "present", runtime_config(), data_root=tmp_path) as reader:
+        track = next(reader.iter_tracks("source", batch_size=1))
+        assert track.source_row_key.dtype == np.int64
+        assert track.source_row_key.tolist() == keys
+        assert track.source_row_key_valid.tolist() == [True]*3
+        batches = list(reader.iter_cross_track_segments("source", intersect_config(), batch_size=1))
+        assert [int(batch["source_row_key"][0]) for batch in batches] == keys[:2]
+        assert all(batch["source_row_key_valid"][0] for batch in batches)

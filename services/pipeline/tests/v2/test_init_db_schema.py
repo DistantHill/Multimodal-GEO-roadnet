@@ -16,9 +16,9 @@ def _ddl(table: str) -> str:
     return dict(DDL_STATEMENTS)[table]
 
 
-def test_schema_v8_is_an_explicit_destructive_contract() -> None:
+def test_schema_v9_is_an_explicit_contract() -> None:
     assert SCHEMA_COMPONENT == "track.v2"
-    assert SCHEMA_VERSION == 8
+    assert SCHEMA_VERSION == 9
     assert "pipeline_schema_versions" in dict(DDL_STATEMENTS)
 
 
@@ -287,8 +287,8 @@ def test_unversioned_legacy_schema_is_refused_without_reset() -> None:
         _require_empty_or_current(_VersionCursor(None, ["refine_runs"]))
 
 
-def test_existing_v8_schema_is_accepted() -> None:
-    _require_empty_or_current(_VersionCursor(8, ["refine_runs"]))
+def test_existing_v9_schema_is_accepted() -> None:
+    _require_empty_or_current(_VersionCursor(9, ["refine_runs"]))
 
 
 @pytest.mark.parametrize("version", [4, 5, 6, 7])

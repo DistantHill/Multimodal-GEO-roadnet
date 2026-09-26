@@ -500,7 +500,7 @@ def detect_encoding(
 
     guessed, confidence = _guess_with_chardet(raw)
     if guessed is not None and confidence >= min_confidence:
-        encoding = _canonical_encoding(guessed)
+        encoding = _canonical_encoding(guessed, default_encoding=default_encoding)
         if _can_decode(raw, encoding):
             return encoding
 
@@ -542,13 +542,13 @@ def _can_decode(raw: bytes, encoding: str) -> bool:
     return True
 
 
-def _canonical_encoding(encoding: str) -> str:
+def _canonical_encoding(encoding: str, *, default_encoding: str) -> str:
     normalized = encoding.strip().lower().replace("_", "-")
     aliases = {
-        "ascii": DEFAULT_TEXT_ENCODING,
-        "utf8": DEFAULT_TEXT_ENCODING,
-        "utf-8": DEFAULT_TEXT_ENCODING,
-        "utf-8-sig": DEFAULT_TEXT_ENCODING,
+        "ascii": default_encoding,
+        "utf8": default_encoding,
+        "utf-8": default_encoding,
+        "utf-8-sig": default_encoding,
         "gb2312": "gb18030",
         "gbk": "gb18030",
         "gb18030": "gb18030",

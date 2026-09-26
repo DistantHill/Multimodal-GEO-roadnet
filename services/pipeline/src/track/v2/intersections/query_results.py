@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from itertools import islice
 import math
 import numpy as np
 import uuid
@@ -112,8 +113,8 @@ def fetch_resolved_clip_tracks(
                crossing.id AS crossing_id,
                crossing.candidate_intersection_id,
                crossing.crossing_type,
-               COALESCE(ST_X(ST_Transform(ST_SetSRID(ST_MakePoint(source.lon, source.lat), 4326), {run.spatial_context.processing_srid})), injected.x, crossing.crossing_x) AS x,
-               COALESCE(ST_Y(ST_Transform(ST_SetSRID(ST_MakePoint(source.lon, source.lat), 4326), {run.spatial_context.processing_srid})), injected.y, crossing.crossing_y) AS y
+               COALESCE(kept.x, injected.x, crossing.crossing_x) AS x,
+               COALESCE(kept.y, injected.y, crossing.crossing_y) AS y
           FROM resolved_subtrack_points AS resolved
           LEFT JOIN kept_trajectory_points AS kept
             ON kept.id = resolved.kept_point_id
@@ -127,53 +128,81 @@ def fetch_resolved_clip_tracks(
          WHERE resolved.detect_id = %s
          ORDER BY resolved.subtrack_index, resolved.sequence_in_subtrack
     """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     current_subtrack: int | None = None
     current_vehicle = ""
-    points: list[tuple[object, ...]] = []
+    chunks: list[tuple[np.ndarray, ...]] = []
 
     def build_track() -> ClipTrack:
-        lonlat = np.asarray([(row[4], row[5]) for row in points], dtype=np.float64)
-        valid = np.asarray([row[6] is not None for row in points], dtype=np.bool_)
+        columns = tuple(np.concatenate([chunk[index] for chunk in chunks])
+                        for index in range(10))
         return ClipTrack(
             vehicle_id=current_vehicle, trip_id=f"{current_vehicle}:subtrack-{current_subtrack:04d}",
-            xy=np.asarray([(row[9],row[10]) for row in points], dtype=np.float64), lonlat=lonlat,
-            resolved_point_ids=np.asarray([row[0] for row in points], dtype=np.int64),
-            crossing_ids=np.asarray([row[6] if row[6] is not None else 0 for row in points], dtype=np.int64),
-            intersection_ids=np.asarray([intersection_ids.get(row[7], 0) for row in points], dtype=np.int64),
-            crossing_types=np.asarray([row[8] if row[8] is not None else 0 for row in points], dtype=np.int8),
-            crossing_valid=valid, intersection_valid=np.asarray([row[7] in intersection_ids for row in points], dtype=np.bool_), subtrack_index=current_subtrack,
+            xy=np.column_stack((columns[7], columns[8])),
+            lonlat=np.column_stack((columns[1], columns[2])),
+            resolved_point_ids=columns[0], crossing_ids=columns[3],
+            intersection_ids=columns[4], crossing_types=columns[5],
+            crossing_valid=columns[6], intersection_valid=columns[9],
+            subtrack_index=current_subtrack,
         )
+
     with conn.cursor(name=f"clip_tracks_{uuid.uuid4().hex}") as cur:
         cur.itersize = batch_size
         declare_full_scan_cursor(conn, cur, query, (detect_id,))
-        for row_count, row in enumerate(cur, 1):
-            if row_count % 10_000 == 0:
-                heartbeat_progress(row_count)
-            if row[4] is None or row[5] is None or (row[3] is None and row[6] is None):
+        rows_iterator = iter(cur)
+        row_count = 0
+        while rows := list(islice(rows_iterator, batch_size)):
+            if any(row[4] is None or row[5] is None or row[9] is None or row[10] is None
+                   or (row[3] is None and row[6] is None) for row in rows):
                 raise ValueError(f"Detect Run {detect_id} has missing resolved point data")
-            subtrack_index = int(row[1])
-            vehicle_id = None if row[3] is None else str(row[3])
-            if current_subtrack is not None and subtrack_index != current_subtrack:
-                if not current_vehicle:
-                    raise ValueError(f"subtrack {current_subtrack} has no source vehicle")
-                yield build_track()
-                points = []
-                current_vehicle = ""
-            elif (
-                current_subtrack is not None
-                and vehicle_id is not None
-                and current_vehicle
-                and current_vehicle != vehicle_id
-            ):
-                raise ValueError(f"subtrack {subtrack_index} contains multiple vehicles")
-            current_subtrack = subtrack_index
-            if vehicle_id is not None:
-                current_vehicle = vehicle_id
-            points.append(row)
+            ids = np.fromiter((int(row[1]) for row in rows), dtype=np.int64, count=len(rows))
+            owners = np.asarray([row[3] for row in rows], dtype=object)
+            columns = (
+                np.fromiter((int(row[0]) for row in rows), dtype=np.int64, count=len(rows)),
+                np.fromiter((float(row[4]) for row in rows), dtype=np.float64, count=len(rows)),
+                np.fromiter((float(row[5]) for row in rows), dtype=np.float64, count=len(rows)),
+                np.fromiter((0 if row[6] is None else int(row[6]) for row in rows), dtype=np.int64, count=len(rows)),
+                np.fromiter((intersection_ids.get(row[7], 0) for row in rows), dtype=np.int64, count=len(rows)),
+                np.fromiter((0 if row[8] is None else int(row[8]) for row in rows), dtype=np.int8, count=len(rows)),
+                np.fromiter((row[6] is not None for row in rows), dtype=bool, count=len(rows)),
+                np.fromiter((float(row[9]) for row in rows), dtype=np.float64, count=len(rows)),
+                np.fromiter((float(row[10]) for row in rows), dtype=np.float64, count=len(rows)),
+                np.fromiter((row[7] in intersection_ids for row in rows), dtype=bool, count=len(rows)),
+            )
+            previous_count = row_count
+            row_count += len(rows)
+            del rows
+            for count in range((previous_count // 10_000 + 1) * 10_000, row_count + 1, 10_000):
+                heartbeat_progress(count)
+            boundaries = np.r_[0, np.flatnonzero(ids[1:] != ids[:-1]) + 1, len(ids)]
+            for start, stop in zip(boundaries[:-1], boundaries[1:]):
+                subtrack_index = int(ids[start])
+                if current_subtrack is not None and subtrack_index != current_subtrack:
+                    if not current_vehicle:
+                        raise ValueError(f"subtrack {current_subtrack} has no source vehicle")
+                    track = build_track()
+                    chunks = []
+                    yield track
+                    del track
+                    current_vehicle = ""
+                current_subtrack = subtrack_index
+                vehicle_ids = {str(owner) for owner in owners[start:stop] if owner is not None}
+                if current_vehicle:
+                    vehicle_ids.add(current_vehicle)
+                if len(vehicle_ids) > 1:
+                    raise ValueError(f"subtrack {subtrack_index} contains multiple vehicles")
+                if vehicle_ids:
+                    current_vehicle = vehicle_ids.pop()
+                chunks.append(tuple(column[start:stop] for column in columns))
+            del columns, owners, ids
         if current_subtrack is not None:
             if not current_vehicle:
                 raise ValueError(f"subtrack {current_subtrack} has no source vehicle")
-            yield build_track()
+            track = build_track()
+            chunks = []
+            yield track
+            del track
 
 def _decode_json_object(value: object) -> dict[str, object]:
     """Decode PostgreSQL JSONB values returned as dicts or JSON strings."""

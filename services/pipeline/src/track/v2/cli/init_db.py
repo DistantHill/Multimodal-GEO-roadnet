@@ -1,6 +1,6 @@
-"""Create track.v2 schema v8 or migrate an existing v3/v4/v5/v6/v7 schema in place.
+"""Create track.v2 schema v9 or migrate an existing v3/v4/v5/v6/v7/v8 schema in place.
 
-Schema v3 supports ``--migrate-refine``; v4 through v7 support ``--migrate-artifacts``.
+Schema v9 persists Refine XY. Schema v3 supports ``--migrate-refine``; v4 through v8 support ``--migrate-artifacts``.
 An existing v1/v2
 database must be recreated with ``--reset`` so an old column can never retain
 an ambiguous meaning behind a new API.
@@ -17,7 +17,7 @@ from ..telemetry.console_logging import init_logger, shutdown_logger
 
 
 SCHEMA_COMPONENT = "track.v2"
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 DDL_STATEMENTS: list[tuple[str, str]] = [
@@ -131,6 +131,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             subtrack_index          INTEGER NOT NULL CHECK (subtrack_index >= 1),
             sequence_in_subtrack    INTEGER NOT NULL
                                     CHECK (sequence_in_subtrack >= 0),
+            x                       DOUBLE PRECISION,
+            y                       DOUBLE PRECISION,
             created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             CONSTRAINT kept_points_source_member_key
                 UNIQUE (refine_id, source_row_key),
@@ -2001,7 +2003,7 @@ def _require_empty_or_current(cur: Any) -> None:
     if version is not None:
         raise RuntimeError(
             f"database schema is v{version}; track.v2 requires v{SCHEMA_VERSION}. "
-            "For v3 use init-db --migrate-refine; for v4 through v7 use "
+            "For v3 use init-db --migrate-refine; for v4 through v8 use "
             "init-db --migrate-artifacts; older schemas require --reset."
         )
     existing = _existing_pipeline_tables(cur)
@@ -2062,7 +2064,7 @@ def create_tables(
     migrate_refine_names: bool = False,
     migrate_artifacts: bool = False,
 ) -> int:
-    """Create schema v8, optionally migrating v3/v4/v5/v6/v7 in one transaction."""
+    """Create schema v9, optionally migrating v3/v4/v5/v6/v7/v8 in one transaction."""
     with pg_connect(config) as conn:
         with conn.cursor() as cur:
             installed_before = _schema_version(cur)
@@ -2082,6 +2084,9 @@ def create_tables(
                 from ..db.migrate_source_row_key import migrate_source_row_key_v8
 
                 migrate_source_row_key_v8(cur)
+                from ..db.migrations.kept_xy_v9 import migrate_kept_xy_v9
+
+                migrate_kept_xy_v9(cur)
             elif migrate_artifacts and installed_before != SCHEMA_VERSION:
                 from ..db.migrations.artifacts_v5 import migrate_artifacts_v5
                 from ..db.migrations.refine_completion_v6 import migrate_completion_v6
@@ -2096,6 +2101,10 @@ def create_tables(
                     migrate_completion_v7(cur)
                 if _schema_version(cur) == 7:
                     migrate_source_row_key_v8(cur)
+                if _schema_version(cur) == 8:
+                    from ..db.migrations.kept_xy_v9 import migrate_kept_xy_v9
+
+                    migrate_kept_xy_v9(cur)
             _require_empty_or_current(cur)
 
             print("\n── 创建数据表 / Creating Tables ──")
@@ -2158,11 +2167,11 @@ def main() -> int:
     )
     migration.add_argument(
         "--migrate-refine", action="store_true",
-        help="Preserve v3 data, rename Clean objects, then migrate through v8.",
+        help="Preserve v3 data, rename Clean objects, then migrate through v9.",
     )
     migration.add_argument(
         "--migrate-artifacts", action="store_true",
-        help="Preserve v4/v5/v6/v7 data and migrate through schema v8.",
+        help="Preserve v4/v5/v6/v7/v8 data and migrate through schema v9.",
     )
     args = parser.parse_args()
 

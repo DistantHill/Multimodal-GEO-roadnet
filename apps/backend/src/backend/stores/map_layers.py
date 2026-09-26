@@ -690,7 +690,7 @@ class PostgresMapStore:
                 "SELECT kept.vehicle_id, point.subtrack_index, kept.source_row_key"
                 " FROM kept_trajectory_points kept JOIN resolved_subtrack_points point"
                 " ON point.kept_point_id = kept.id AND point.detect_id = %s"
-                " WHERE kept.refine_id = %s AND kept.source_row_key = ANY(%s::text[])"
+                " WHERE kept.refine_id = %s AND kept.source_row_key = ANY(%s::bigint[])"
                 " ORDER BY kept.vehicle_id, point.subtrack_index",
                 (context.detect_id, context.refine.refine_id, source_row_keys),
             )
@@ -709,7 +709,7 @@ class PostgresMapStore:
             rows = self._fetchall(
                 "SELECT DISTINCT kept.vehicle_id, kept.subtrack_index, kept.source_row_key "
                 "FROM kept_trajectory_points AS kept WHERE kept.refine_id = %s "
-                "AND kept.source_row_key = ANY(%s::text[]) "
+                "AND kept.source_row_key = ANY(%s::bigint[]) "
                 "ORDER BY kept.vehicle_id, kept.subtrack_index",
                 (refine.refine_id, source_row_keys),
             )

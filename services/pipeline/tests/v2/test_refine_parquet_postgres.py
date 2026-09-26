@@ -123,8 +123,8 @@ def _seed(
     )
     conn.execute(
         "INSERT INTO kept_trajectory_points"
-        "(refine_id, source_row_key, vehicle_id, subtrack_index, sequence_in_subtrack) "
-        "VALUES (%s, '10', 'vehicle-a', 1, 0), (%s, '20', 'vehicle-a', 1, 1)",
+        "(refine_id, source_row_key, vehicle_id, subtrack_index, sequence_in_subtrack, x, y) "
+        "VALUES (%s, '10', 'vehicle-a', 1, 0, 123.25, -456.5), (%s, '20', 'vehicle-a', 1, 1, 124.25, -455.5)",
         (run_id, run_id),
     )
     conn.execute("""
@@ -197,11 +197,8 @@ def test_real_refine_export_publish_register_and_complete(refine_database, tmp_p
         SELECT k.refine_id, k.id, k.vehicle_id, k.subtrack_index,
                (k.sequence_in_subtrack + k.sequence_in_subtrack)::bigint,
                s.timestamp, s.lon, s.lat,
-               public.ST_X(public.ST_Transform(
-                 public.ST_SetSRID(public.ST_MakePoint(s.lon, s.lat),4326),32650)),
-               public.ST_Y(public.ST_Transform(
-                 public.ST_SetSRID(public.ST_MakePoint(s.lon, s.lat),4326),32650)),
-               s.heading, s.speed, k.source_row_key::text
+               k.x, k.y,
+               s.heading, s.speed, k.source_row_key
           FROM kept_trajectory_points k JOIN source_points s ON s.id = k.source_row_key
          WHERE k.refine_id = %s ORDER BY k.sequence_in_subtrack
     """, (run_id,)).fetchall()
