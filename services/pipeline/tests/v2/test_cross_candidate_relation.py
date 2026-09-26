@@ -187,7 +187,7 @@ def test_runtime_limits_bounded_fetch_and_columnar_implementation(tmp_path):
         assert settings['temp_directory']==str(relation._temp_directory)
     assert 'fetchmany' in inspect.getsource(CrossCandidateRelation.iter_batches)
     assert 'fetchmany' in inspect.getsource(CrossCandidateRelation.iter_coordinate_batches)
-    assert 'register' in inspect.getsource(CrossCandidateRelation.append_batch)
+    assert 'unnest' in inspect.getsource(CrossCandidateRelation.append_batch)
     for forbidden in ('sqlite','pickle','struct','temporarydirectory'): assert forbidden not in inspect.getsource(cross_candidate_relation).lower()
 
 
@@ -252,3 +252,28 @@ def test_source_summary_reads_both_sources_without_business_payloads(tmp_path):
         assert np.concatenate([part[0] for part in parts]).tolist()==[0,1]
         assert np.concatenate([part[1] for part in parts]).tolist()==['source','source']
         assert np.concatenate([part[2] for part in parts]).tolist()==['other','other']
+
+
+def test_typed_cross_driver_keeps_nan_and_sql_null_distinct(tmp_path):
+    batch = replace(_candidate([0, 1, 2, 3]),
+        heading=np.ma.array([np.nan, np.nan, np.inf, -np.inf], mask=[False, True, False, False]))
+    with _relation(tmp_path, batch_size=2) as relation:
+        relation.append_batch(batch)
+        values = [row[0] for row in relation._connection.execute("SELECT heading FROM events ORDER BY ordinal").fetchall()]
+        assert np.isnan(values[0]) and values[1] is None
+        assert values[2:] == [np.inf, -np.inf]
+        with pytest.raises(ValueError):
+            relation.seal()
+
+
+def test_typed_json_column_boundary_keeps_signed_zero_and_int64_extrema(tmp_path):
+    batch = replace(_candidate([0, 1], optional=True), heading=np.array([-0.0, 0.0]),
+        from_source_row_key=np.array([-(2**63), 2**63-1], dtype=np.int64),
+        from_source_row_key_valid=np.array([True, True]), from_source_id=np.array(["中文🚗", "another"], dtype=object))
+    with _relation(tmp_path, batch_size=2) as relation:
+        relation.append_batch(batch)
+        relation.seal()
+        actual = next(relation.iter_batches())
+        assert np.signbit(actual.heading).tolist() == [True, False]
+        np.testing.assert_array_equal(actual.from_source_row_key, batch.from_source_row_key)
+        np.testing.assert_array_equal(actual.from_source_id, batch.from_source_id)

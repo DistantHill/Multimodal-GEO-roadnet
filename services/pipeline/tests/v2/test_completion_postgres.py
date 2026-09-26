@@ -31,7 +31,7 @@ def connection():
             conn.rollback()
 
 
-def seed_detect(conn, *, tracks=1, offset=0, long_subtrack=False):
+def seed_detect(conn, *, tracks=1, offset=0, long_subtrack=False, same_vehicle=False):
     refine, detect = uuid4(), uuid4()
     conn.execute("INSERT INTO refine_runs(id, source_table, status) VALUES (%s, 'public.fixture', 'running')", (refine,))
     conn.execute("""
@@ -42,6 +42,8 @@ def seed_detect(conn, *, tracks=1, offset=0, long_subtrack=False):
     if long_subtrack:
         conn.execute("""UPDATE kept_trajectory_points SET vehicle_id='one', subtrack_index=1,
             sequence_in_subtrack=id-%s-1 WHERE refine_id=%s""", (offset, refine))
+    if same_vehicle:
+        conn.execute("UPDATE kept_trajectory_points SET vehicle_id='original' WHERE refine_id=%s", (refine,))
     artifact = uuid4()
     conn.execute("""
         INSERT INTO pipeline_artifacts(
@@ -215,3 +217,18 @@ def test_notice_updates_heartbeat_during_blocking_sql_and_detaches(connection):
     count = len(messages)
     connection.execute("DO $$ BEGIN RAISE NOTICE 'track_v2 validation: 已退出'; END $$")
     assert len(messages) == count
+
+
+@pytest.mark.parametrize("same_subtrack", [False, True], ids=["same-vehicle-distinct-partitions", "same-partition"])
+def test_cross_completion_uses_run_partition_identity(connection, same_subtrack):
+    conn = connection
+    detect = seed_detect(conn, tracks=2, same_vehicle=True, long_subtrack=same_subtrack)
+    conn.execute("""INSERT INTO tracks_cross(detect_id,candidate_intersection_id,
+        from_segment_start_point_id,to_segment_start_point_id,x,y,lon,lat)
+        VALUES (%s,1,1,3,0,0,0,0)""", (detect,))
+    if same_subtrack:
+        with pytest.raises(Exception, match="different subtracks"):
+            complete(conn, detect)
+    else:
+        complete(conn, detect)
+        assert conn.execute("SELECT status FROM detect_runs WHERE id=%s", (detect,)).fetchone()[0] == "completed"

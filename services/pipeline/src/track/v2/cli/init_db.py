@@ -1254,9 +1254,9 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                 RAISE EXCEPTION '%', violation;
             END IF;
 
-            RAISE NOTICE 'track_v2 validation: Detect：校验跨轨迹车辆归属';
+            RAISE NOTICE 'track_v2 validation: Detect：校验跨轨迹分区归属';
 
-            SELECT 'track cross segments must belong to different vehicles/subtracks'
+            SELECT 'track cross segments must belong to different subtracks'
               INTO violation
               FROM tracks_cross AS track_cross
               JOIN resolved_subtrack_points AS from_point
@@ -1265,26 +1265,9 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
               JOIN resolved_subtrack_points AS to_point
                 ON to_point.id = track_cross.to_segment_start_point_id
                AND to_point.detect_id = track_cross.detect_id
-              LEFT JOIN kept_trajectory_points AS from_kept
-                ON from_kept.id = from_point.kept_point_id
-               AND from_kept.refine_id = NEW.refine_id
-              LEFT JOIN injected_points AS from_injected
-                ON from_injected.id = from_point.injected_point_id
-               AND from_injected.refine_id = NEW.refine_id
-              LEFT JOIN kept_trajectory_points AS to_kept
-                ON to_kept.id = to_point.kept_point_id
-               AND to_kept.refine_id = NEW.refine_id
-              LEFT JOIN injected_points AS to_injected
-                ON to_injected.id = to_point.injected_point_id
-               AND to_injected.refine_id = NEW.refine_id
              WHERE track_cross.detect_id = NEW.id
-               AND (
-                   from_point.subtrack_index IS NOT DISTINCT FROM
-                       to_point.subtrack_index
-                   OR COALESCE(from_kept.vehicle_id, from_injected.vehicle_id)
-                      IS NOT DISTINCT FROM
-                      COALESCE(to_kept.vehicle_id, to_injected.vehicle_id)
-               )
+               AND from_point.subtrack_index IS NOT DISTINCT FROM
+                   to_point.subtrack_index
              LIMIT 1;
             IF violation IS NOT NULL THEN
                 RAISE EXCEPTION '%', violation;

@@ -92,26 +92,63 @@ class DetectDatasetReader:
             raise DetectParquetError("batch_size is invalid")
         connection = self._require_open()
         cursor = connection.cursor()
+        current = None
+        vehicle = ""
+        chunks = []
+        names = ("resolved_point_id", "subtrack_index", "vehicle_id", "lon", "lat", "x", "y", "crossing_id", "intersection_id", "crossing_type")
+
+        def publish():
+            columns = {name: np.concatenate([chunk[name] for chunk in chunks]) for name in chunks[0]}
+            return ClipTrack(
+                vehicle_id=vehicle, trip_id=f"{vehicle}:subtrack-{current:04d}", subtrack_index=int(current),
+                xy=np.column_stack((columns["x"], columns["y"])),
+                lonlat=np.column_stack((columns["lon"], columns["lat"])),
+                resolved_point_ids=columns["resolved_point_id"], crossing_ids=columns["crossing_id"],
+                intersection_ids=columns["intersection_id"], crossing_types=columns["crossing_type"],
+                crossing_valid=columns["crossing_valid"], intersection_valid=columns["intersection_valid"],
+            )
+
         try:
-            cursor.execute("SELECT subtrack_index, min(vehicle_id), count(*) FROM resolved_points GROUP BY subtrack_index ORDER BY subtrack_index")
-            while tracks := cursor.fetchmany(batch_size):
-                for subtrack, vehicle, count in tracks:
-                    columns = connection.execute(
-                        "SELECT resolved_point_id,lon,lat,x,y,crossing_id,intersection_id,crossing_type FROM resolved_points WHERE subtrack_index=? ORDER BY sequence_in_subtrack,resolved_point_id", (subtrack,),
-                    ).fetchnumpy()
-                    valid = ~np.ma.getmaskarray(columns["crossing_id"])
-                    def integers(name: str, dtype: object = np.int64) -> np.ndarray:
-                        return np.asarray(np.ma.filled(columns[name], 0), dtype=dtype)
-                    yield ClipTrack(
-                        vehicle_id=str(vehicle), trip_id=f"{vehicle}:subtrack-{subtrack:04d}",
-                        subtrack_index=int(subtrack),
-                        xy=np.column_stack((columns["x"],columns["y"])),
-                        lonlat=np.column_stack((columns["lon"],columns["lat"])),
-                        resolved_point_ids=integers("resolved_point_id"),
-                        crossing_ids=integers("crossing_id"), intersection_ids=integers("intersection_id"),
-                        crossing_types=integers("crossing_type", np.int8), crossing_valid=valid,
-                        intersection_valid=~np.ma.getmaskarray(columns["intersection_id"]),
-                    )
+            cursor.execute("SELECT " + ",".join(names) + " FROM resolved_points ORDER BY subtrack_index,sequence_in_subtrack,resolved_point_id")
+            while rows := cursor.fetchmany(batch_size):
+                # Discard the bounded DB row buffer after transposing. Only typed
+                # column chunks survive across fetch boundaries, never track rows.
+                raw = tuple(zip(*rows))
+                del rows
+                partition = np.asarray(raw[1], dtype=np.int64)
+                vehicles = np.asarray(raw[2], dtype=object)
+                columns = {}
+                for index, name in enumerate(names):
+                    if name in {"subtrack_index", "vehicle_id"}:
+                        continue
+                    if name in {"crossing_id", "intersection_id", "crossing_type"}:
+                        values = np.asarray(raw[index], dtype=object)
+                        valid = values != None
+                        columns[name] = np.where(valid, values, 0).astype(np.int8 if name == "crossing_type" else np.int64)
+                        if name != "crossing_type":
+                            columns["crossing_valid" if name == "crossing_id" else "intersection_valid"] = valid
+                    else:
+                        columns[name] = np.asarray(raw[index], dtype=np.int64 if name == "resolved_point_id" else np.float64)
+                del raw
+                boundaries = np.r_[0, np.flatnonzero(partition[1:] != partition[:-1]) + 1, len(partition)]
+                for start, stop in zip(boundaries[:-1], boundaries[1:]):
+                    subtrack = int(partition[start])
+                    if current is not None and subtrack != current:
+                        track = publish()
+                        chunks = []
+                        yield track
+                        del track
+                    current = subtrack
+                    next_vehicle = str(vehicles[start])
+                    if (vehicle and chunks and vehicle != next_vehicle) or np.any(vehicles[start:stop] != next_vehicle):
+                        raise DetectParquetError(f"subtrack {subtrack} contains multiple vehicles")
+                    vehicle = next_vehicle
+                    chunks.append({name: values[start:stop] for name, values in columns.items()})
+            if chunks:
+                track = publish()
+                chunks = []
+                yield track
+                del track
         finally:
             cursor.close()
 

@@ -427,8 +427,8 @@ def test_batch_api_uses_bounded_fetchmany_not_fetchall() -> None:
 
 @pytest.mark.parametrize("window", [1, 2])
 def test_duckdb_turn_candidates_match_python_oracle_across_batches(tmp_path, window) -> None:
-    # DuckDB is selected because ordering, fixed windows and threshold filtering
-    # are columnar and spillable; this operator needs no Polars/Python fallback.
+    # DuckDB orders complete subtracks; the NumPy turn kernel consumes their
+    # columns and is checked against these explicit known turn expectations.
     tracks = [
         ("a", 1, [(0, -40, 0, 359), (10, -20, 0, 1), (20, 0, 0, 90),
                    (30, 0, 20, 91), (40, 0, 40, 89)]),
@@ -619,7 +619,7 @@ def test_columnar_cross_track_exact_kernel_matches_q49_oracle(tmp_path, batch_si
     # the permitted fallback. No threads, processes, or Dask are involved.
     descriptor = _published_tracks(tmp_path, [
         ("a", 10, [(0, -10, 0, 0), (2, 10, 0, 0)]),
-        ("a", 11, [(3, -10, 3, 0), (4, 10, 3, 0)]),  # same vehicle excluded
+        ("a", 11, [(3, -10, 3, 0), (4, 10, 3, 0)]),  # same vehicle, distinct subtrack participates
         ("b", 20, [(1, 0, -10, 90), (5, 0, 10, 90)]),
         ("c", 30, [(6, -10, 5, 0), (7, 10, 5, 0)]),  # parallel
         ("d", 40, [(8, -8, -8, 45), (9, 8, 8, 45)]),  # angle boundary
@@ -877,3 +877,79 @@ def test_reader_closes_connection_when_view_creation_fails(tmp_path, monkeypatch
     assert reader._connection is None
     temp_root = tmp_path / "duckdb" / "refine-readers"
     assert temp_root.is_dir() and list(temp_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+def test_complete_tracks_use_column_chunks_across_driver_boundaries(tmp_path, monkeypatch, batch_size):
+    descriptor = _published(tmp_path)
+    original = refine_reader._subtrack_from_point_columns
+    calls = []
+    def decode(columns, source):
+        assert all(isinstance(value, np.ndarray) and value.ndim == 1 for value in columns.values())
+        calls.append(len(columns["point_id"]))
+        return original(columns, source)
+    monkeypatch.setattr(refine_reader, "_subtrack_from_point_columns", decode)
+    with refine_reader.RefineDatasetReader(tmp_path, descriptor, "present", runtime_config(), data_root=tmp_path) as reader:
+        tracks = list(reader.iter_tracks("source", batch_size=batch_size))
+        assert [track.subtrack_index for track in tracks] == [4, 5, 6]
+        assert calls == [3, 1, 1]
+        assert tracks[0].kind.tolist() == ["p", "i", "p"]
+        assert all(not track.xy.flags.writeable and not track.source_row_key.flags.writeable for track in tracks)
+        windows = [SpatialWindow(0, 0, 30, 40)]
+        selections = list(reader.iter_topology_tracks("source", windows, batch_size=batch_size))
+        assert [item.points.subtrack_index for item in selections] == [4]
+        assert not selections[0].points.xy.flags.writeable
+
+
+def test_turn_producer_releases_consumed_track_before_next_build(monkeypatch):
+    import gc
+    import weakref
+    from track.v2.trajectories.subtrack_columns import refinement_subtrack_from_columns
+    references = []
+    def tracks(*args, **kwargs):
+        for index in range(2):
+            if references:
+                gc.collect()
+                assert references[-1]() is None
+            track = refinement_subtrack_from_columns(
+                vehicle_id="v", subtrack_index=index, source_id="source",
+                xy=np.array([[0., 0.], [10., 0.], [10., 10.]]),
+                lonlat=np.zeros((3, 2)), timestamp=np.arange(3, dtype=float),
+                heading=np.array([0., 90., 90.]), speed=np.ones(3)*4,
+                kind=np.array(["p"]*3), source_row_key=np.arange(3, dtype=np.int64),
+                refine_point_id=np.arange(3, dtype=np.int64), generated_reason=np.array([""]*3),
+                after_sequence=np.full(3, -1, dtype=np.int64),
+            )
+            references.append(weakref.ref(track.xy))
+            yield track
+            del track
+    reader = object.__new__(refine_reader.RefineDatasetReader)
+    monkeypatch.setattr(reader, "iter_tracks", tracks)
+    list(reader.iter_turn_candidates("source", intersect_config()))
+    gc.collect()
+    assert all(reference() is None for reference in references)
+
+
+def test_published_track_does_not_retain_consumed_driver_column_chunks(monkeypatch):
+    import gc
+    import weakref
+    owner = uuid4()
+    first = _adapter_row(owner)
+    second = list(_adapter_row(owner, vehicle="v2"))
+    second[3] = 2
+    reader, result = _adapter_reader([], owner)
+    result.fetchmany.side_effect = [[first], [tuple(second)], []]
+    original = refine_reader._point_columns_from_driver_batch
+    references = []
+    def columns(*args, **kwargs):
+        batch = original(*args, **kwargs)
+        references.append([weakref.ref(value) for value in batch.values()])
+        return batch
+    monkeypatch.setattr(refine_reader, "_point_columns_from_driver_batch", columns)
+    tracks = reader.iter_tracks("source", batch_size=1)
+    track = next(tracks)
+    gc.collect()
+    assert len(references) == 2
+    assert all(reference() is None for reference in references[0])
+    assert not track.xy.flags.writeable
+    tracks.close()

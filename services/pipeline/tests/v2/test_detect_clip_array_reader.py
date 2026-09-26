@@ -3,11 +3,13 @@ from types import SimpleNamespace
 
 import duckdb
 import numpy as np
+import pytest
 
 from track.v2.intersections.results.read_parquet import DetectDatasetReader
 
 
-def test_reader_batch_one_preserves_xy_order_nullable_events_and_source_vehicle():
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 20])
+def test_reader_batch_one_preserves_xy_order_nullable_events_and_source_vehicle(batch_size, monkeypatch):
     reader = object.__new__(DetectDatasetReader)
     reader._runtime = SimpleNamespace(parquet_read_batch_size=1)
     reader._connection = duckdb.connect()
@@ -25,7 +27,33 @@ def test_reader_batch_one_preserves_xy_order_nullable_events_and_source_vehicle(
                 (2,7,1,'original',2,3,20,30,0,0,1),
                 (4,8,0,'original',4,5,40,50,NULL,NULL,NULL)
         """)
-        tracks = tuple(reader.iter_tracks(batch_size=1))
+        queries = []
+        closed = []
+        connection = reader._connection
+        class Cursor:
+            def __init__(self): self.inner = connection.cursor()
+            def execute(self, query): queries.append(query); self.inner.execute(query)
+            def fetchmany(self, size): return self.inner.fetchmany(size)
+            def close(self): self.inner.close(); closed.append(True)
+        class Connection:
+            def cursor(self): return Cursor()
+            def close(self): connection.close()
+        reader._connection = Connection()
+        import weakref
+        original = np.concatenate
+        chunk_references = []
+        def concatenate(values, *args, **kwargs):
+            if isinstance(values, list) and len(values) == 3:
+                chunk_references.extend(weakref.ref(value) for value in values)
+            return original(values, *args, **kwargs)
+        monkeypatch.setattr(np, "concatenate", concatenate)
+        iterator = reader.iter_tracks(batch_size=batch_size)
+        first = next(iterator)
+        if batch_size == 1:
+            assert chunk_references and all(reference() is None for reference in chunk_references)
+        tracks = (first, *iterator)
+        assert len(queries) == 1 and "ORDER BY subtrack_index" in queries[0]
+        assert closed == [True]
         assert [track.subtrack_index for track in tracks] == [7, 8]
         assert [track.vehicle_id for track in tracks] == ["original", "original"]
         np.testing.assert_array_equal(tracks[0].resolved_point_ids, [1, 2, 3])

@@ -127,7 +127,9 @@ def test_post_ddl_validates_semantics_once_when_runs_complete() -> None:
     assert "Detect parent Refine Run" in detect
     assert "complete intersection" in detect
     assert "contains multiple vehicles" in detect
-    assert "different vehicles/subtracks" in detect
+    assert "different subtracks" in detect
+    assert "from_point.subtrack_index IS NOT DISTINCT FROM" in detect
+    assert "COALESCE(from_kept.vehicle_id, from_injected.vehicle_id)" not in detect
     assert "refined p/i resolved point" in detect
     assert "entry/exit crossing types must be 1/0" in detect
     assert "entry crossing must precede exit crossing" in detect

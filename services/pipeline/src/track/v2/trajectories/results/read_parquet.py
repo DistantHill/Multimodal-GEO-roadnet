@@ -190,18 +190,12 @@ class RefineDatasetReader:
           ORDER BY vehicle_id, subtrack_index, refined_sequence_in_subtrack,
                    point_kind, point_id
         """)
-        current_key: int | None = None
-        track_rows: list[tuple[Any, ...]] = []
-        while rows := result.fetchmany(batch_size):
-            for row in rows:
-                key = int(row[3])
-                if current_key is not None and key != current_key:
-                    yield self._decode_track(track_rows, source_table)
-                    track_rows = []
-                current_key = key
-                track_rows.append(row)
-        if track_rows:
-            yield self._decode_track(track_rows, source_table)
+        for _, columns in _iter_refine_column_groups(result, batch_size, self._descriptor.refine_id, topology=False):
+            track = _subtrack_from_point_columns(columns, source_table)
+            columns.clear()
+            del columns
+            yield track
+            del track
 
     def iter_topology_tracks(
         self, source_table: str, windows: Iterable[SpatialWindow], *,
@@ -275,22 +269,12 @@ class RefineDatasetReader:
                        CAST(p.subtrack_index AS VARCHAR),
                        p.refined_sequence_in_subtrack, p.point_kind, p.point_id
             """)
-            current: tuple[int, str, int] | None = None
-            points: list[tuple[Any, ...]] = []
-            for rows in iter(lambda: result.fetchmany(batch_size), []):
-                for row in rows:
-                    key = (int(row[17]), str(row[2]), int(row[3]))
-                    if current is not None and key != current:
-                        yield TopologyTrackSelection(
-                            canonical[current[0]][1], str(current[2]), self._decode_track(points, source_table),
-                        )
-                        points = []
-                    current = key
-                    points.append(row[:17])
-            if current is not None:
-                yield TopologyTrackSelection(
-                    canonical[current[0]][1], str(current[2]), self._decode_track(points, source_table),
-                )
+            for key, columns in _iter_refine_column_groups(result, batch_size, self._descriptor.refine_id, topology=True):
+                track = _subtrack_from_point_columns(columns, source_table)
+                columns.clear()
+                del columns
+                yield TopologyTrackSelection(canonical[key[0]][1], str(key[1]), track)
+                del track
         finally:
             if self._connection is not None:
                 connection.execute(f"DROP TABLE IF EXISTS {table}")
@@ -309,6 +293,7 @@ class RefineDatasetReader:
             for track in tracks:
                 batch=turns_from_subtrack(track,cfg,first_index=offset)
                 offset+=len(batch)
+                del track
                 if len(batch): yield batch
         finally:
             tracks.close()
@@ -529,46 +514,102 @@ class RefineDatasetReader:
             raise RefineParquetError("dataset reader is not open")
         return self._connection
 
-    def _decode_track(self, rows: list[tuple[Any, ...]], source_table: str) -> RefinementSubtrack:
-        """Materialize one validated subtrack as arrays, never Point wrappers."""
-        size = len(rows)
-        def floats(position: int) -> np.ndarray:
-            return np.fromiter((float(row[position]) for row in rows), dtype=np.float64, count=size)
-        def integers(position: int) -> np.ndarray:
-            return np.fromiter((int(row[position]) for row in rows), dtype=np.int64, count=size)
-        if not size:
-            raise RefineParquetError("cannot decode an empty subtrack")
-        if any(row[0] != self._descriptor.refine_id for row in rows):
-            raise RefineParquetError("row owner differs from descriptor owner")
-        if rows[0][4] != 0:
-            raise RefineParquetError("subtrack sequence does not start at zero")
-        if not np.array_equal(integers(4), np.arange(size, dtype=np.int64)):
-            raise RefineParquetError("subtrack sequence is not contiguous from zero")
-        if len({(row[2], row[3]) for row in rows}) != 1:
-            raise RefineParquetError("subtrack contains conflicting identity")
-        if any(len(row) != 17 or row[12] not in {"kept", "injected"} or not isinstance(row[2], str) or not row[2] for row in rows):
-            raise RefineParquetError("row identity is invalid")
-        if any(row[16] != 1 for row in rows):
-            raise RefineParquetError("subtrack contains multiple vehicles")
-        numeric = np.column_stack([floats(index) for index in range(5, 12)])
-        if not np.isfinite(numeric).all():
-            raise RefineParquetError("point contains non-finite numeric fields")
-        if np.any(np.abs(numeric[:,1]) > 180) or np.any(np.abs(numeric[:,2]) > 90):
-            raise RefineParquetError("point longitude/latitude is outside EPSG:4326")
-        for row in rows:
-            if row[12] == "kept":
-                if row[13] is None or row[14] is not None or row[15] is not None:
-                    raise RefineParquetError("kept point identity fields are invalid")
-            elif row[13] is not None or not isinstance(row[14], str) or not row[14] or isinstance(row[15], bool) or not isinstance(row[15], int):
-                raise RefineParquetError("injected point identity fields are invalid")
-        kept = np.fromiter((row[12] == "kept" for row in rows), dtype=np.bool_, count=size)
-        return refinement_subtrack_from_columns(
-            vehicle_id=str(rows[0][2]), subtrack_index=int(rows[0][3]), source_id=source_table,
-            xy=np.column_stack((floats(8), floats(9))),
-            lonlat=np.column_stack((floats(6), floats(7))), timestamp=floats(5),
-            heading=floats(10), speed=floats(11), kind=np.where(kept, "p", "i"),
-            source_row_key=np.asarray([int(row[13]) if row[13] is not None else 0 for row in rows], dtype=np.int64),
-            refine_point_id=integers(1),
-            generated_reason=np.asarray([row[14] or "" for row in rows]),
-            after_sequence=np.asarray([-1 if row[15] is None else int(row[15]) for row in rows], dtype=np.int64),
-        )
+
+
+def _point_columns_from_driver_batch(rows, owner, *, topology):
+    size = len(rows)
+    width = 18 if topology else 17
+    if any(len(row) != width or row[0] != owner for row in rows):
+        raise RefineParquetError("row owner differs from descriptor owner")
+    def numeric(position, dtype):
+        try:
+            return np.fromiter((row[position] for row in rows), dtype=dtype, count=size)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RefineParquetError("point numeric fields are invalid") from exc
+    def text(position):
+        return np.asarray([row[position] for row in rows], dtype=object)
+    for row in rows:
+        if row[12] == "injected" and (row[13] is not None or not isinstance(row[14], str) or not row[14] or isinstance(row[15], bool) or not isinstance(row[15], int)):
+            raise RefineParquetError("injected point identity fields are invalid")
+    source_valid = np.fromiter((row[13] is not None for row in rows), dtype=np.bool_, count=size)
+    reason_valid = np.fromiter((row[14] is not None for row in rows), dtype=np.bool_, count=size)
+    anchor_valid = np.fromiter((row[15] is not None for row in rows), dtype=np.bool_, count=size)
+    return {
+        "point_id": numeric(1,np.int64), "vehicle_id":text(2), "subtrack_index":numeric(3,np.int64),
+        "sequence":numeric(4,np.int64), "timestamp":numeric(5,np.float64),
+        "lon":numeric(6,np.float64), "lat":numeric(7,np.float64),
+        "x":numeric(8,np.float64), "y":numeric(9,np.float64),
+        "heading":numeric(10,np.float64), "speed":numeric(11,np.float64), "kind":text(12),
+        "source_row_key":np.fromiter((int(row[13]) if row[13] is not None else 0 for row in rows),dtype=np.int64,count=size),
+        "source_row_key_valid":source_valid,
+        "generated_reason":np.asarray([row[14] if row[14] is not None else "" for row in rows],dtype=object),
+        "generated_reason_valid":reason_valid,
+        "after_sequence":np.fromiter((row[15] if row[15] is not None else -1 for row in rows),dtype=np.int64,count=size),
+        "after_sequence_valid":anchor_valid, "vehicles":numeric(16,np.int64),
+        "window_order":numeric(17,np.int64) if topology else np.zeros(size,dtype=np.int64),
+    }
+
+
+def _iter_refine_column_groups(result, batch_size, owner, *, topology):
+    current = None
+    pieces = None
+    while rows := result.fetchmany(batch_size):
+        columns = _point_columns_from_driver_batch(rows,owner,topology=topology)
+        del rows
+        keys = np.column_stack((columns["window_order"],columns["subtrack_index"]))
+        cuts = np.r_[0,np.flatnonzero(np.any(keys[1:] != keys[:-1],axis=1))+1,len(keys)]
+        for start,stop in zip(cuts[:-1],cuts[1:]):
+            key = (int(keys[start,0]),int(keys[start,1]))
+            if current is not None and key != current:
+                complete = {name:np.concatenate(chunks) for name,chunks in pieces.items()}
+                pieces = None
+                yield current, complete
+                del complete
+            if pieces is None:
+                pieces = {name:[] for name in columns}
+            current = key
+            for name,values in columns.items():
+                pieces[name].append(values[start:stop])
+            del name, values
+    if current is not None:
+        complete = {name:np.concatenate(chunks) for name,chunks in pieces.items()}
+        pieces = None
+        del columns, keys
+        yield current, complete
+
+
+def _subtrack_from_point_columns(columns, source_table):
+    size = len(columns["point_id"])
+    if not size or any(values.ndim != 1 or len(values) != size for values in columns.values()):
+        raise RefineParquetError("point columns differ in length")
+    if columns["sequence"][0] != 0:
+        raise RefineParquetError("subtrack sequence does not start at zero")
+    if not np.array_equal(columns["sequence"],np.arange(size,dtype=np.int64)):
+        raise RefineParquetError("subtrack sequence is not contiguous from zero")
+    if any(not isinstance(value,str) or not value for value in columns["vehicle_id"]):
+        raise RefineParquetError("row identity is invalid")
+    if len(np.unique(columns["subtrack_index"])) != 1 or len(np.unique(columns["vehicle_id"])) != 1:
+        raise RefineParquetError("subtrack contains conflicting identity")
+    vehicle = columns["vehicle_id"][0]
+    if not isinstance(vehicle,str) or not vehicle or np.any(~np.isin(columns["kind"],["kept","injected"])):
+        raise RefineParquetError("row identity is invalid")
+    if np.any(columns["vehicles"] != 1):
+        raise RefineParquetError("subtrack contains multiple vehicles")
+    xy = np.column_stack((columns["x"],columns["y"]))
+    lonlat = np.column_stack((columns["lon"],columns["lat"]))
+    if (not np.isfinite(xy).all() or not np.isfinite(lonlat).all()
+            or any(not np.isfinite(columns[name]).all() for name in ("timestamp","heading","speed"))):
+        raise RefineParquetError("point contains non-finite numeric fields")
+    if np.any(np.abs(lonlat[:,0])>180) or np.any(np.abs(lonlat[:,1])>90):
+        raise RefineParquetError("point longitude/latitude is outside EPSG:4326")
+    kept = columns["kind"] == "kept"
+    if np.any(kept & (~columns["source_row_key_valid"] | columns["generated_reason_valid"] | columns["after_sequence_valid"])):
+        raise RefineParquetError("kept point identity fields are invalid")
+    if np.any(~kept & (columns["source_row_key_valid"] | ~columns["generated_reason_valid"] | (columns["generated_reason"] == "") | ~columns["after_sequence_valid"])):
+        raise RefineParquetError("injected point identity fields are invalid")
+    return refinement_subtrack_from_columns(
+        vehicle_id=vehicle,subtrack_index=int(columns["subtrack_index"][0]),source_id=source_table,
+        xy=xy,lonlat=lonlat,timestamp=columns["timestamp"],heading=columns["heading"],speed=columns["speed"],
+        kind=np.where(kept,"p","i"),source_row_key=columns["source_row_key"],refine_point_id=columns["point_id"],
+        after_sequence=columns["after_sequence"],generated_reason=columns["generated_reason"],
+    )

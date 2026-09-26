@@ -5,6 +5,7 @@ from dataclasses import fields
 from pathlib import Path
 from uuid import uuid4
 import shutil
+import json
 import duckdb
 import numpy as np
 from ..models import RuntimeConfig, TurnBatch
@@ -80,15 +81,35 @@ class TurnEventRelation:
                         columns[item.name + "_0"] = values[:,0]
                         columns[item.name + "_1"] = values[:,1]
                     else:
-                        columns[item.name] = values.astype(object) if values.dtype.kind in "US" else values
+                        columns[item.name] = values
                 columns["ordinal"] = np.arange(self._count, self._count + stop - start, dtype=np.int64)
-                view = "incoming_" + uuid4().hex
-                connection.register(view, columns)
-                try:
-                    connection.execute(f"INSERT INTO events BY NAME SELECT * FROM {view}")
-                    self._count += stop-start
-                finally:
-                    connection.unregister(view)
+                expressions, parameters = [], []
+                def parameter(values, sql_type):
+                    # One scalar string per typed column avoids the driver's
+                    # expensive per-value adaptation of nested Python lists.
+                    parameters.extend((json.dumps(values.tolist(), ensure_ascii=False, separators=(",", ":")), json.dumps([sql_type])))
+                    return "unnest(from_json(?, ?))"
+                for name, values in columns.items():
+                    # Bounded serialization buffers, never per-event rows. NaN
+                    # and SQL NULL remain independent of business validity masks.
+                    nulls = np.ma.getmaskarray(values)
+                    data = np.asarray(np.ma.getdata(values))
+                    sql_type = {"b": "BOOLEAN", "i": "BIGINT", "f": "DOUBLE"}.get(data.dtype.kind, "VARCHAR")
+                    if data.dtype.kind == "f":
+                        nan = np.isnan(data) & ~nulls
+                        safe = np.where(nulls | nan, 0.0, data)
+                        null_sql = parameter(nulls, "BOOLEAN")
+                        nan_sql = parameter(nan, "BOOLEAN")
+                        data_sql = parameter(safe, "DOUBLE")
+                        expressions.append(f"CASE WHEN {null_sql} THEN NULL WHEN {nan_sql} THEN 'NaN'::DOUBLE ELSE {data_sql} END AS {name}")
+                    elif np.any(nulls):
+                        null_sql = parameter(nulls, "BOOLEAN")
+                        data_sql = parameter(data, sql_type)
+                        expressions.append(f"CASE WHEN {null_sql} THEN NULL ELSE {data_sql} END AS {name}")
+                    else:
+                        expressions.append(parameter(data, sql_type) + " AS " + name)
+                connection.execute("INSERT INTO events BY NAME SELECT " + ", ".join(expressions), parameters)
+                self._count += stop-start
             connection.execute("COMMIT")
         except BaseException:
             connection.execute("ROLLBACK")

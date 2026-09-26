@@ -216,7 +216,7 @@ def test_runtime_limits_and_columnar_implementation(tmp_path):
         assert settings['autoload_known_extensions']==settings['autoinstall_known_extensions']=='false'
         assert settings['temp_directory']==str(relation._temp_directory)
     assert 'fetchmany' in inspect.getsource(TurnEventRelation.iter_batches)
-    assert 'register' in inspect.getsource(TurnEventRelation.append_batch)
+    assert 'unnest' in inspect.getsource(TurnEventRelation.append_batch)
     for forbidden in ('sqlite','pickle','struct','temporarydirectory'): assert forbidden not in inspect.getsource(turn_event_relation).lower()
 
 
@@ -243,3 +243,19 @@ def test_selector_rejects_lossy_or_noncolumn_identity(tmp_path,indices):
         relation.append_batch(_event([0]));relation.seal()
         with pytest.raises(ValueError,match="one-dimensional int64"):list(relation.iter_batches(indices=indices))
         assert concatenate(relation.iter_batches()).calculation_index.tolist()==[0]
+
+
+def test_typed_driver_boundary_preserves_nan_null_inf_unicode_and_int64(tmp_path):
+    expected = _event([0, 1, 2, 3],
+        timestamp=np.ma.array([np.nan, np.nan, np.inf, -np.inf], mask=[False, True, False, False]),
+        source_row_key=np.array([-(2**63), 2**63-1, 0, -1], dtype=np.int64),
+        source_id=np.array(["中文🚗", "", "source", "source"], dtype=object))
+    with _relation(tmp_path, batch_size=2) as relation:
+        relation.append_batch(expected)
+        rows = relation._connection.execute("SELECT timestamp,source_row_key,source_id FROM events ORDER BY ordinal").fetchall()
+        assert np.isnan(rows[0][0]) and rows[1][0] is None
+        assert rows[2][0] == np.inf and rows[3][0] == -np.inf
+        assert [row[1] for row in rows] == [-(2**63), 2**63-1, 0, -1]
+        assert [row[2] for row in rows] == ["中文🚗", "", "source", "source"]
+        with pytest.raises(ValueError):
+            relation.seal()

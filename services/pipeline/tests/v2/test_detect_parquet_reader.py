@@ -215,20 +215,15 @@ def test_q44_reader_uses_duckdb_and_bounded_python_models_only():
     reader = object.__new__(DetectDatasetReader)
     owner = uuid4()
     reader._descriptor = Mock(detect_id=owner)
-    result = Mock()
     cursor = Mock()
-    cursor.fetchmany.side_effect = [[(2,"v",1)], []]
-    result.fetchnumpy.return_value = {
-        "resolved_point_id":np.array([1],dtype=np.int64),
-        "lon":np.array([120.]),"lat":np.array([30.]),"x":np.array([1.]),"y":np.array([2.]),
-        "crossing_id":np.ma.array([0],mask=[True]),
-        "intersection_id":np.ma.array([0],mask=[True]),
-        "crossing_type":np.ma.array([0],mask=[True]),
-    }
+    cursor.fetchmany.side_effect = [[(1,2,"v",120.,30.,1.,2.,None,None,None)], []]
     connection = Mock()
     connection.cursor.return_value = cursor
-    connection.execute.return_value = result
     reader._connection = connection
-    assert next(reader.iter_tracks(batch_size=1)).trip_id == "v:subtrack-0002"
-    assert not result.fetchall.called
-    result.fetchnumpy.assert_called_once()
+    iterator = reader.iter_tracks(batch_size=1)
+    assert next(iterator).trip_id == "v:subtrack-0002"
+    assert not cursor.fetchall.called
+    cursor.execute.assert_called_once()
+    assert all(call.args == (1,) for call in cursor.fetchmany.call_args_list)
+    iterator.close()
+    cursor.close.assert_called_once()
