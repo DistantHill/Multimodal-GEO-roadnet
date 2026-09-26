@@ -9,7 +9,8 @@ services:
         pipeline_source: ../../services/pipeline
     environment:
       BACKEND_CONFIG_PATH: ${BACKEND_CONFIG_PATH:-/app/config/backend.toml}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      # 此密码从 .env 文件读取，无需手动输入。
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?环境文件中缺少 POSTGRES_PASSWORD 或其值为空}
     command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
     expose:
       - "8000"
@@ -23,7 +24,8 @@ services:
       dockerfile: Dockerfile
     environment:
       PIPELINE_CONFIG_PATH: ${PIPELINE_CONFIG_PATH:-/app/config/pipeline.toml}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      # 此密码从 .env 文件读取，无需手动输入。
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?环境文件中缺少 POSTGRES_PASSWORD 或其值为空}
     volumes:
       - ${DATA_ROOT:?DATA_ROOT must point to an external runtime data directory}:/data
       - ${PARQUET_ROOT:-${DATA_ROOT}/parquet}:/data/parquet

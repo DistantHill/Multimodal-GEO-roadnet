@@ -9,7 +9,8 @@ services:
         pipeline_source: ../../services/pipeline
     environment:
       BACKEND_CONFIG_PATH: ${BACKEND_CONFIG_PATH:-/app/config/backend.toml}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      # 此密码从 .env 文件读取，无需手动输入。
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?环境文件中缺少 POSTGRES_PASSWORD 或其值为空}
     volumes:
       - ../../apps/backend:/app
       - ../../services/pipeline/src:/opt/pipeline/src:ro
@@ -26,7 +27,8 @@ services:
       dockerfile: Dockerfile
     environment:
       PIPELINE_CONFIG_PATH: ${PIPELINE_CONFIG_PATH:-/app/config/pipeline.toml}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-asdf}
+      # 此密码从 .env 文件读取，无需手动输入。
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?环境文件中缺少 POSTGRES_PASSWORD 或其值为空}
     volumes:
       - ../../services/pipeline:/app
       - ../../scripts/cv_human_check:/app/scripts/cv_human_check:ro
