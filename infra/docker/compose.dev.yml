@@ -26,7 +26,7 @@ services:
       dockerfile: Dockerfile
     environment:
       PIPELINE_CONFIG_PATH: ${PIPELINE_CONFIG_PATH:-/app/config/pipeline.toml}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-asdf}
     volumes:
       - ../../services/pipeline:/app
       - ../../scripts/cv_human_check:/app/scripts/cv_human_check:ro

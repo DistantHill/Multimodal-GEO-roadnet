@@ -40,3 +40,4 @@ def insert_trajectory_points(
         (point.point_ref.source_id, point.point_ref.source_row_key): int(row[0])
         for point, row in zip(points, returned, strict=True)
     }
+

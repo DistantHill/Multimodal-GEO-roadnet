@@ -60,3 +60,6 @@ exports/
 .devcontainer/
 *.swp
 *.swo
+
+
+services/pipeline/config

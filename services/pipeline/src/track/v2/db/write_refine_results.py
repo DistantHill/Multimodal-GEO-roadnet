@@ -226,3 +226,4 @@ def _json_object(value: Any, label: str) -> dict[str, Any]:
         if isinstance(decoded, dict):
             return decoded
     raise ValueError(f"{label} must be a JSON object")
+
