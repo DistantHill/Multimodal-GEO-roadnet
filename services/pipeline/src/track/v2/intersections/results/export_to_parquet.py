@@ -145,7 +145,7 @@ def _resolved_xy_relation(relation: str) -> str:
                  if column.name in {"x", "y"} else f"p.{column.name}")
         columns.append(f"{value}::{column.duckdb_type} AS {column.name}")
     return ("SELECT " + ", ".join(columns) + f" FROM ({relation}) p "
-            "LEFT JOIN refine_kept_xy k ON p.point_kind='kept' AND p.refined_point_id=k.point_id")
+            "LEFT JOIN refine_kept_xy k ON CASE WHEN p.point_kind='kept' THEN p.refined_point_id ELSE NULL END=k.point_id")
 
 
 def _relation(query: str, table: str) -> str:

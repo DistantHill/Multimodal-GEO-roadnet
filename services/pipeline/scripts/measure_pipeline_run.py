@@ -39,6 +39,8 @@ def main() -> int:
     parser.add_argument('--source-table', required=True)
     parser.add_argument('--record', required=True, type=Path)
     parser.add_argument('--revision', required=True)
+    parser.add_argument('--pipeline-arg', action='append', default=[],
+                        help='Additional explicit Pipeline CLI argument (repeatable).')
     args = parser.parse_args()
     config_path = Path(os.environ['PIPELINE_CONFIG_PATH'])
     config = tomllib.loads(config_path.read_text())['postgres']
@@ -56,11 +58,12 @@ def main() -> int:
         stats_path.parent.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
         return_code = subprocess.call([sys.executable, '-m', 'pipeline', 'run',
-                                       '--source-table', args.source_table, '--stats-json', str(stats_path)])
+                                       '--source-table', args.source_table, '--stats-json', str(stats_path),
+                                       *args.pipeline_arg])
         elapsed = time.monotonic() - started
         database_after = database_snapshot(connection, args.source_table)
     record = {'revision': args.revision, 'config': str(config_path), 'source_table': args.source_table,
-              'return_code': return_code, 'elapsed_seconds': elapsed,
+              'return_code': return_code, 'elapsed_seconds': elapsed, 'pipeline_args': args.pipeline_arg,
               'stats_path': str(stats_path),
               'pipeline_stats': json.loads(stats_path.read_text()) if stats_path.exists() else None,
               'requested_memory_max_bytes': 2_000_000_000,

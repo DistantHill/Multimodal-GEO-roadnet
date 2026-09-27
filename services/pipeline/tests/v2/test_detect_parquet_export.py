@@ -160,7 +160,8 @@ def test_kept_xy_comes_from_refine_identity_without_reprojection():
         assert row["y"].tolist() == [-9876.5]
         assert row["source_row_key"].tolist() == [42]
         assert row["resolved_point_id"].tolist() == [10]
-        crossing = query.replace("'kept'", "'crossing'").replace("20::BIGINT AS refined_point_id", "NULL::BIGINT AS refined_point_id")
+        # Non-kept IDs may collide with Refine IDs: only kept rows join XY.
+        crossing = query.replace("'kept'", "'crossing'")
         row = connection.execute(detect_parquet_export._resolved_xy_relation(crossing)).fetchnumpy()
         assert row["x"].tolist() == [100.0] and row["y"].tolist() == [200.0]
 
@@ -182,3 +183,12 @@ def test_missing_refine_xy_fails_without_source_projection_fallback(tmp_path):
                 connection, detect_parquet_export._resolved_xy_relation(query),
                 handle.path / "resolved_points/part.parquet", "resolved_points", runtime_config(),
             )
+
+
+def test_kept_xy_join_uses_hashable_identity_key():
+    with duckdb.connect() as connection:
+        connection.execute("CREATE TABLE refine_kept_xy(point_id BIGINT,x DOUBLE,y DOUBLE)")
+        connection.execute("CREATE TABLE resolved_stub AS " + _select("resolved_points").replace("?", "'00000000-0000-0000-0000-000000000001'") + " LIMIT 0")
+        plan = connection.execute("EXPLAIN " + detect_parquet_export._resolved_xy_relation("SELECT * FROM resolved_stub")).fetchone()[1]
+        assert "HASH_JOIN" in plan
+        assert "BLOCKWISE_NL_JOIN" not in plan
