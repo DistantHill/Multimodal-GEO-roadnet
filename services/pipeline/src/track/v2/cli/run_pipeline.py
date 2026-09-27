@@ -17,6 +17,11 @@ from ..telemetry.console_logging import init_logger, shutdown_logger
 from ..orchestration.run_pipeline import PipelineInput, PipelineResult, run_pipeline as _run_pipeline
 from ._load_config import load_startup_config
 from .report_pipeline_events import PipelineReporter
+from .refine_selection import (
+    format_refine_history,
+    get_refine_selection,
+    latest_completed_refine,
+)
 
 
 def run_pipeline(
@@ -45,6 +50,29 @@ def _uuid_arg(value: str) -> uuid.UUID:
         raise argparse.ArgumentTypeError("expected a UUID") from exc
 
 
+def _bool_arg(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
+def _ask_reuse(selection: object) -> bool:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise RuntimeError(
+            "发现已完成 Refine，但当前没有交互终端；请显式传 --refine-resume-last true 自动复用，或 false 新建"
+        )
+    while True:
+        answer = input("是否复用此 Refine？[Y/n] ").strip().lower()
+        if answer in ("", "y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("请输入 y/yes 或 n/no，也可直接回车复用。")
+
+
 def main() -> int:
     # Force stdout/stderr to UTF-8 so CJK text survives pipe environments.
     sys.stdout.reconfigure(encoding="utf-8")
@@ -57,6 +85,13 @@ def main() -> int:
     source_group.add_argument(
         "--source-table", metavar="TABLE",
         help="从 PostgreSQL 表读取输入轨迹点 / Read input trajectory points from a PostgreSQL table."
+    )
+    parser.add_argument(
+        "--refine-resume-last",
+        type=_bool_arg,
+        default=None,
+        metavar="true|false",
+        help="有历史 Refine 时自动复用 (true) 或新建 (false)；省略时交互选择。",
     )
     source_group.add_argument(
         "--refine-id", metavar="UUID", type=_uuid_arg,
@@ -75,11 +110,57 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.refine_resume_last is not None and args.source_table is None:
+        parser.error("--refine-resume-last 只能与 --source-table 配合使用")
+
     config = load_startup_config(ask_password=args.ask_password)
     db_config = config.postgres
 
+    selected_refine_id = str(args.refine_id) if args.refine_id else None
+    selected_history = None
+    if args.source_table is not None and args.refine_resume_last is not False:
+        try:
+            selected_history = latest_completed_refine(db_config, args.source_table)
+        except Exception as exc:
+            print(f"[FAIL] 查询来源 {args.source_table} 的已完成 Refine 失败: {exc}", file=sys.stderr)
+            return 2
+        if selected_history is None:
+            print(f"未找到来源表 {args.source_table} 的已完成 Refine；将新建 Refine。")
+        else:
+            print("找到可复用的历史 Refine：")
+            print(format_refine_history(selected_history))
+            if args.refine_resume_last is True:
+                selected_refine_id = selected_history.id
+            else:
+                try:
+                    if _ask_reuse(selected_history):
+                        selected_refine_id = selected_history.id
+                        print(f"已选择复用 Refine Run {selected_refine_id}。")
+                    else:
+                        print("已选择新建 Refine。")
+                except (RuntimeError, EOFError, KeyboardInterrupt) as exc:
+                    if isinstance(exc, KeyboardInterrupt):
+                        print("\n已取消。", file=sys.stderr)
+                        return 130
+                    if isinstance(exc, EOFError):
+                        print(
+                            "交互输入遇到 EOF，已退出；请显式传 --refine-resume-last true 自动复用，或 false 新建。",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(str(exc), file=sys.stderr)
+                    return 2
+    elif selected_refine_id is not None:
+        try:
+            selected_history = get_refine_selection(db_config, selected_refine_id)
+            print("显式指定的历史 Refine：")
+            print(format_refine_history(selected_history))
+        except Exception as exc:
+            print(f"[FAIL] Refine Run {selected_refine_id}: {exc}", file=sys.stderr)
+            return 2
+
     source_label = (
-        f"refine:{args.refine_id}" if args.refine_id
+        f"refine:{selected_refine_id}" if selected_refine_id
         else f"postgresql://{db_config.database}/{args.source_table}"
     )
     log_path = init_logger(config.logging.directory)
@@ -90,8 +171,8 @@ def main() -> int:
     try:
         stats = run_pipeline(
             config,
-            source_table=args.source_table,
-            refine_id=str(args.refine_id) if args.refine_id else None,
+            source_table=args.source_table if selected_refine_id is None else None,
+            refine_id=selected_refine_id,
         )
         _print_write_summary(stats)
         if args.stats_json is not None:
@@ -103,10 +184,12 @@ def main() -> int:
             print(f"  stats_json: {args.stats_json}")
         return 0
     except RuntimeError as exc:
-        print(str(exc))
+        prefix = f"Refine Run {selected_refine_id}: " if selected_refine_id else ""
+        print(prefix + str(exc))
         return 2
     except Exception as exc:
-        print(f"[FAIL] 流水线失败 / Pipeline failed: {exc}")
+        prefix = f"Refine Run {selected_refine_id}: " if selected_refine_id else ""
+        print(f"[FAIL] {prefix}流水线失败 / Pipeline failed: {exc}")
         import traceback
         traceback.print_exc()
         return 1

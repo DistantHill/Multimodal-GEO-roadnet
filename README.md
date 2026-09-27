@@ -144,8 +144,37 @@ docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm pipeline
 `public.day01` 这类 schema-qualified 名称，并必须提供唯一非空的 `id` 以及
 `vehicle_id/timestamp/lon/lat/heading/speed/geom`；`extra` 可选。Pipeline 不再把
 CSV 当作运行入口，需要时先用独立 importer 导入 PostgreSQL。`--refine-id UUID`
-只复用已完成且来源指纹仍一致的 Refine Run，并始终创建新的 Detect Run；Detect
+只复用已完成 Refine Run，并沿用既有产物及来源指纹校验；候选发现不额外扫描当前来源数据。每次始终创建新的 Detect Run；Detect
 完成后再创建 Fit Run。Pipeline 是独立批处理进程，不经由 Backend 请求启动。
+
+`make test` 运行 pytest 测试套件。`pipeline-smoke-test` 则执行真实流水线，
+使用 `pipeline-roadnet-test.toml` 冒烟测试配置，连接 `roadnet_test` 并提交运行结果。
+可指定来源表，按需设置 `REFINE_RESUME_LAST`；省略 Bool 时由终端询问，`true` 自动复用最新已完成结果，`false` 新建 Refine：
+
+```sh
+make pipeline-smoke-test SOURCE_TABLE=public.day01
+make pipeline-smoke-test SOURCE_TABLE=public.day01 REFINE_RESUME_LAST=true
+```
+
+也可直接复用指定批次：
+
+```sh
+make pipeline-smoke-test REFINE_ID=00000000-0000-0000-0000-000000000000
+```
+
+`pipeline-full-test` 使用 `pipeline.toml` 全量测试配置，连接 `roadnet` 并提交运行结果，
+支持同样的 `SOURCE_TABLE`、`REFINE_ID` 与 `REFINE_RESUME_LAST` 选择方式：
+
+```sh
+make pipeline-full-test SOURCE_TABLE=public.day01
+make pipeline-full-test SOURCE_TABLE=public.day01 REFINE_RESUME_LAST=false
+```
+
+这两个命令执行 Refine、Detect、Clip、Fitting 和 Network，不会在结束时清理业务结果。
+`--rm` 只移除本次临时容器；PostgreSQL 记录、挂载目录中的 Parquet 和日志仍保留。
+当前 Network 阶段在内存中组装路网；持久化内容以各阶段已有的数据库和制品写入逻辑为准。
+
+CLI 也支持 `--refine-resume-last true|false`。显式 `--refine-id` 与来源表二选一，且不能与该 Bool 同时使用。省略 Bool 时，有候选且终端可交互则默认复用；非交互环境请显式传 `true` 或 `false`。复用时输出历史 Refine 数据类别、历史 Parser/Refine 生成参数和投影上下文；后续 Detect、Clip、Fitting、Network 使用当前启动配置。
 
 当前 Run lineage 为 `refine_runs → detect_runs → fit_runs`。Detect 的完整
 `resolved_subtrack_points` 序列与所有 Detect 子产物在一个最终事务中落盘；失败

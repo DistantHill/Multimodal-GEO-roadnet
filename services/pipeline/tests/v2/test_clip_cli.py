@@ -18,6 +18,11 @@ class RunCliRefineReuseTest(unittest.TestCase):
         with (
             patch("sys.argv", ["track.v2.cli.run_pipeline", "--refine-id", refine_id]),
             patch("track.v2.cli.run_pipeline.load_startup_config", return_value=self.config),
+            patch(
+                "track.v2.cli.run_pipeline.get_refine_selection",
+                return_value=object(),
+            ),
+            patch("track.v2.cli.run_pipeline.format_refine_history", return_value="HISTORY"),
             patch("track.v2.cli.run_pipeline.init_logger"),
             patch("track.v2.cli.run_pipeline.shutdown_logger"),
             patch("track.v2.cli.run_pipeline.run_pipeline", return_value={}) as run_pipeline,
