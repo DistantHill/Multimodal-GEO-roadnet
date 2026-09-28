@@ -23,7 +23,7 @@ RUN detected_arch="$(dpkg --print-architecture)" \
     && mv /tmp/postgres_scanner.duckdb_extension \
         /opt/duckdb/extensions/v1.5.5/linux_amd64/postgres_scanner.duckdb_extension
 
-FROM python:3.12-slim
+FROM python:3.12-slim AS runtime
 
 # Rasterio's bundled GDAL links against libexpat on the slim runtime image.
 USER root
@@ -65,3 +65,19 @@ COPY scripts ./scripts
 RUN pip install --no-cache-dir --progress-bar off --no-deps --no-build-isolation .
 
 CMD ["python", "-m", "pipeline", "serve"]
+
+# Development Compose selects this target with profiling tools.
+FROM runtime AS development
+RUN pip install --no-cache-dir py-spy scalene
+
+# The debug Compose overlay selects this non-root target.
+FROM development AS debug
+RUN groupadd --gid 1000 vscode-debug \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash vscode-debug \
+    && mkdir -p /data/parquet /data/logs \
+    && chown vscode-debug:vscode-debug /data /data/parquet /data/logs
+ENV PATH="/home/vscode-debug/.local/bin:${PATH}"
+USER vscode-debug
+
+# Default builds retain the runtime image without profiling tools.
+FROM runtime AS production

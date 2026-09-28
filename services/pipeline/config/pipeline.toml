@@ -112,7 +112,7 @@ artifact_gc_grace_days = 7 # 产物 GC 宽限期；天，>=1；执行语义。
 verify_artifact_sha256 = false # 读取产物时校验 SHA-256；布尔；执行语义。
 
 [raster]
-resolution_m = 1.0 # 栅格分辨率；米，>0；算法语义。
+resolution_m = 10.0 # 栅格分辨率；米，>0；算法语义。
 count_mode = "raw" # 计数方式；本轮仅 raw；算法语义。
 point_kernel = "none" # 点核；本轮仅 none；算法语义。
 clip_quantile = 0.95 # 全局非零单元分位数；本轮固定 0.95；算法语义。

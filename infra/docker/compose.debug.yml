@@ -1,0 +1,9 @@
+# Overlay on compose.dev.yml to use the debug build targets.
+services:
+  backend:
+    build:
+      target: debug
+
+  pipeline:
+    build:
+      target: debug

@@ -19,6 +19,7 @@ class ComposePathsTest(unittest.TestCase):
         for key in (
             "DATA_ROOT", "PARQUET_ROOT", "PIPELINE_LOG_DIR", "PIPELINE_LOG_PATH",
             "MODEL_ROOT", "TRACK_LOG_DIR", "TRACK_LOG_PATH", "PIPELINE_CONFIG_PATH",
+            "PROFILE_OUTPUT_DIR",
         ):
             environment.pop(key, None)
         environment.update({
@@ -43,6 +44,9 @@ class ComposePathsTest(unittest.TestCase):
         }
         environment.pop("PIPELINE_CONFIG_PATH", None)
         environment.pop("BACKEND_CONFIG_PATH", None)
+        environment.pop("PROFILE_OUTPUT_DIR", None)
+        environment.pop("PIPELINE_LOG_DIR", None)
+        environment.pop("PARQUET_ROOT", None)
         result = subprocess.run(
             ["docker", "compose", "--env-file", os.devnull, "-f",
              str(ROOT / "infra/docker" / f"compose.{mode}.yml"),
@@ -95,6 +99,22 @@ class ComposePathsTest(unittest.TestCase):
             self.resolve_pipeline("dev", {}),
             "/data/tmp/road-network", "/data/tmp/road-network/parquet", "/data/tmp/road-network/logs",
         )
+
+    def test_profile_directory_override_uses_same_pipeline_container_path(self):
+        self.assert_paths(
+            self.resolve_pipeline("dev", {
+                "DATA_ROOT": "/host/runtime", "PIPELINE_LOG_DIR": "/host/logs",
+                "PROFILE_OUTPUT_DIR": "/host/profile reports",
+            }),
+            "/host/runtime", "/host/runtime/parquet", "/host/profile reports",
+        )
+
+    def test_development_build_targets_and_backend_report_mount(self):
+        config = self.resolve_config("dev")
+        for name in ("backend", "pipeline"):
+            self.assertEqual(config["services"][name]["build"]["target"], "development")
+        mounts = {entry["target"]: entry for entry in config["services"]["backend"]["volumes"]}
+        self.assertEqual(mounts["/data/logs"]["source"], "/host/runtime/logs")
 
     def test_databases_are_external_services(self):
         for mode in ("dev", "prod"):
