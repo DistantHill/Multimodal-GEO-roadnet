@@ -8,6 +8,7 @@ from collections import deque
 from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
+from queue import Empty, Queue
 from threading import Lock, local
 from typing import Any, Callable
 
@@ -22,7 +23,9 @@ from .build_patches import (
 )
 from .detect_cross_track_pairs import (intersect_cross_track_patch, build_cross_track_patch_candidates, concatenate_cross_batches)
 from .grid import create_grid
-from .grid_segments import GridSegmentBudgetError, build_grid_segments
+from .grid_segments import GridSegmentBudgetError, GridSegmentRelation, open_grid_segments
+from .build_patches import _iter_cross_subtrack_pair_batches, _iter_pair_batches
+from .temp_quota import is_temp_quota_exhausted
 
 
 def iter_grid_crossings(
@@ -126,6 +129,52 @@ def iter_grid_candidates(segments, crossing_batches, transformer):
         a, b = batch["segment_index_a"], batch["segment_index_b"]
         yield build_cross_track_patch_candidates(columns, a, b, batch["x"], batch["y"], np.arange(len(a)), transformer)
 
+
+def iter_spilled_grid_candidates(relation: GridSegmentRelation, cfg, transformer, *, block_size: int = 4096):
+    """Compare every distinct block pair without retaining the whole grid."""
+    if block_size < 1:
+        raise ValueError("segment block size must be positive")
+    pair_size = int(cfg.cross_track_pair_batch_size)
+    threshold = float(cfg.cross_track_straightness_deg)
+    total = relation.count
+    for first in range(0, total, block_size):
+        left = relation.block(first, block_size)
+        for second in range(first, total, block_size):
+            right = left if first == second else relation.block(second, block_size)
+            if first == second:
+                segments = left
+                pairs = _iter_cross_subtrack_pair_batches(
+                    np.arange(len(left["subtrack_index"]), dtype=np.int64),
+                    left["subtrack_index"], pair_size,
+                )
+            else:
+                segments = {name: np.concatenate((left[name], right[name])) for name in left}
+                base = len(left["subtrack_index"])
+                pairs = _iter_pair_batches(
+                    np.arange(base, dtype=np.int64),
+                    np.arange(base, len(segments["subtrack_index"]), dtype=np.int64),
+                    pair_size,
+                )
+            headings = np.asarray(segments["heading"], dtype=np.float64)
+            end_heading = np.asarray(segments["end_heading"], dtype=np.float64)
+            straight = np.abs((end_heading - headings + 180.0) % 360.0 - 180.0) <= threshold
+            starts = np.column_stack((segments["x_start"], segments["y_start"]))
+            ends = np.column_stack((segments["x_end"], segments["y_end"]))
+            if not (np.isfinite(starts[straight]).all() and np.isfinite(ends[straight]).all()
+                    and np.isfinite(headings[straight]).all()):
+                raise ValueError("segment coordinates and headings must be finite")
+            for a, b in pairs:
+                keep = straight[a] & straight[b]
+                keep &= segments["subtrack_index"][a] != segments["subtrack_index"][b]
+                if not np.any(keep):
+                    continue
+                a, b = a[keep], b[keep]
+                xs, ys, hit = intersect_cross_track_patch(starts, ends, headings, a, b, cfg)
+                if not len(hit):
+                    continue
+                batch = {"x": xs, "y": ys, "segment_index_a": a[hit], "segment_index_b": b[hit]}
+                yield from iter_grid_candidates(segments, (batch,), transformer)
+
 def run_grid_cross_track_task(
     refine_id: Any,
     extent: tuple[float, float, float, float] | None,
@@ -141,6 +190,8 @@ def run_grid_cross_track_task(
     max_overflow_pair_space: int,
     max_candidates: int,
     max_result_bytes: int,
+    runtime: Any,
+    data_root: Any,
     thread_count: int = 4,
     candidate_store: Any = None,
     live_status: Any = None,
@@ -177,86 +228,133 @@ def run_grid_cross_track_task(
     thread_state = local()
     opened_connections = []
     connection_lock = Lock()
-    budget_lock = Lock()
-    result_count = result_bytes = done_count = segment_count = 0
-    attempts = {}
-    batches = []
-    seen_pairs = np.empty((0, 4), dtype=np.int64)
+    result_count = done_count = segment_count = 0
+    attempts: dict[tuple[int, int], int] = {}
+    active: dict[Any, tuple[tuple[int, int], int]] = {}
+    grid_order = {(col, row): ordinal for ordinal, (col, row) in enumerate(pending)}
+    events: Queue[tuple[str, tuple[int, int], int, Any]] = Queue(maxsize=2)
+    from threading import Event
+    canceled = Event()
+    staged = candidate_store is not None and hasattr(candidate_store, "append_staged")
+    legacy_batches = []
+    attempt_counts: dict[tuple[tuple[int, int], int], int] = {}
 
-    def worker(grid_index):
-        nonlocal result_count, result_bytes
+    def enqueue(kind, cell, attempt, payload):
+        while not canceled.is_set():
+            try:
+                events.put((kind, cell, attempt, payload), timeout=0.1)
+                return
+            except Exception as error:
+                from queue import Full
+                if not isinstance(error, Full):
+                    raise
+
+    def worker(cell, attempt):
         conn = getattr(thread_state, "connection", None)
         if conn is None or conn.closed:
             conn = connect_worker()
             thread_state.connection = conn
             with connection_lock:
                 opened_connections.append(conn)
-        found = []
-        reserved_count = reserved_bytes = 0
-        try:
-            with conn.transaction():
-                segments = build_grid_segments(fetch_points_in_grid(conn, grid_index, grids, refine_id, spatial_context), max_segments=max_segments, max_bytes=max_segment_bytes)
-                crossings = iter_grid_crossings(segments, cfg, max_grid_memberships=max_grid_memberships, max_overflow_pair_space=max_overflow_pair_space)
-                for batch in iter_grid_candidates(segments, crossings, transformer):
-                    # Array buffers plus object-string slots; no candidate object graph.
-                    cost = sum(getattr(batch, name).nbytes for name in batch.__dataclass_fields__)
-                    cost += 256 * len(batch)
-                    with budget_lock:
-                        if result_count + len(batch) > max_candidates or result_bytes + cost > max_result_bytes:
-                            raise GridSegmentBudgetError("cross-track candidate result budget exceeded")
-                        result_count += len(batch); result_bytes += cost
-                    reserved_count += len(batch); reserved_bytes += cost
-                    found.append(batch)
-            return found, len(segments["subtrack_index"])
-        except Exception:
-            with budget_lock:
-                result_count -= reserved_count; result_bytes -= reserved_bytes
-            raise
+        local_index = 0
+        with conn.transaction():
+            with open_grid_segments(
+                fetch_points_in_grid(conn, cell, grids, refine_id, spatial_context),
+                max_segments=max_segments, max_bytes=max_segment_bytes,
+                runtime=runtime, data_root=data_root, owner=f"grid-segments-{grid_order[cell]}",
+            ) as segments:
+                if isinstance(segments, GridSegmentRelation):
+                    batches = iter_spilled_grid_candidates(segments, cfg, transformer)
+                    count = segments.count
+                else:
+                    crossings = iter_grid_crossings(
+                        segments, cfg, max_grid_memberships=max_grid_memberships,
+                        max_overflow_pair_space=max_overflow_pair_space,
+                    )
+                    batches = iter_grid_candidates(segments, crossings, transformer)
+                    count = len(segments["subtrack_index"])
+                for batch in batches:
+                    if canceled.is_set():
+                        return count
+                    enqueue("batch", cell, attempt, (local_index, batch))
+                    local_index += len(batch)
+        return count
 
-    active = {}
+    def process_event(event):
+        nonlocal result_count
+        kind, cell, attempt, payload = event
+        if attempt != attempts.get(cell, 0):
+            return
+        if kind == "batch":
+            local_index, batch = payload
+            if staged:
+                candidate_store.append_staged(grid_order[cell], local_index, batch)
+            else:
+                legacy_batches.append((cell, attempt, batch))
+            result_count += len(batch)
+            attempt_counts[(cell, attempt)] = attempt_counts.get((cell, attempt), 0) + len(batch)
+
     try:
         with ThreadPoolExecutor(max_workers=thread_count) as pool:
-            while pending or active:
+            while pending or active or not events.empty():
                 while pending and len(active) < thread_count:
                     cell = pending.popleft()
+                    attempt = attempts.get(cell, 0)
                     grids[cell[0]][cell[1]].status = "running"
-                    active[pool.submit(worker, cell)] = cell
-                finished, _ = wait(active, timeout=3.0, return_when=FIRST_COMPLETED)
+                    active[pool.submit(worker, cell, attempt)] = (cell, attempt)
+                try:
+                    process_event(events.get(timeout=0.1))
+                    while True:
+                        process_event(events.get_nowait())
+                except Empty:
+                    pass
                 now = time.monotonic()
                 if now - last_log_at >= 3.0:
                     log_info(f"跨轨迹网格：{done_count}/{total} 完成，{len(active)} 运行中，耗时 {now-started:.1f}s")
                     last_log_at = now
+                finished = [future for future in active if future.done()]
+                # A completed worker has already put all its batches into the FIFO.
+                # Drain before finish_grid or discard_grid, even after a failure.
+                if finished:
+                    while True:
+                        try:
+                            process_event(events.get_nowait())
+                        except Empty:
+                            break
                 for future in finished:
-                    cell = active.pop(future)
+                    cell, attempt = active.pop(future)
                     try:
-                        found, count = future.result()
+                        count = future.result()
                     except Exception as exc:
-                        if isinstance(exc, (GridSegmentBudgetError, CrossTrackCapacityError, MemoryError, ValueError, TypeError)) or attempts.get(cell, 0) >= 2:
+                        result_count -= attempt_counts.pop((cell, attempt), 0)
+                        if staged:
+                            candidate_store.discard_grid(grid_order[cell])
+                        if (is_temp_quota_exhausted(exc)
+                                or isinstance(exc, (GridSegmentBudgetError, CrossTrackCapacityError, MemoryError, ValueError, TypeError))
+                                or attempts.get(cell, 0) >= 2):
                             raise
-                        attempts[cell] = attempts.get(cell, 0) + 1
+                        attempts[cell] = attempt + 1
                         pending.appendleft(cell)
                         continue
-                    for batch in found:
-                        identities=np.column_stack((batch.from_subtrack_index,batch.to_subtrack_index,batch.from_point_index,batch.to_point_index))
-                        all_identities = np.concatenate((seen_pairs, identities))
-                        _, first = np.unique(all_identities, axis=0, return_index=True)
-                        first.sort()
-                        keep = first[first >= len(seen_pairs)] - len(seen_pairs)
-                        seen_pairs = all_identities[first]
-                        duplicates=len(batch)-len(keep)
-                        if duplicates:
-                            cost=sum(getattr(batch,name).nbytes for name in batch.__dataclass_fields__)+256*len(batch)
-                            with budget_lock:
-                                result_count-=duplicates; result_bytes-=cost*duplicates//max(1,len(batch))
-                        if len(keep): batches.append(batch.take(np.asarray(keep,dtype=np.int64)))
+                    if staged:
+                        candidate_store.finish_grid(grid_order[cell])
                     grids[cell[0]][cell[1]].status = "done"
-                    segment_count += count; done_count += 1
+                    segment_count += count
+                    done_count += 1
                 if live_status is not None:
                     live_status.update(detail=f"跨轨迹网格：{done_count}/{total} 完成，{segment_count} 线段，{result_count} 候选", elapsed=time.monotonic()-started, stage="Detect: 跨轨迹网格")
     finally:
+        canceled.set()
         for conn in opened_connections:
             conn.close()
-    combined = concatenate_cross_batches(batches)
+
+    if staged:
+        candidate_store.finalize_staged()
+        return candidate_store
+    combined = concatenate_cross_batches([
+        batch for cell, attempt, batch in legacy_batches
+        if attempt == attempts.get(cell, 0)
+    ])
     if len(combined):
         identity = np.column_stack((combined.from_subtrack_index, combined.to_subtrack_index, combined.from_point_index, combined.to_point_index))
         _, unique = np.unique(identity, axis=0, return_index=True)

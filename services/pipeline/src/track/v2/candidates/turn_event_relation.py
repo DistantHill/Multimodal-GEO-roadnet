@@ -8,6 +8,7 @@ import shutil
 import json
 import duckdb
 import numpy as np
+from .temp_quota import TempQuota
 from ..models import RuntimeConfig, TurnBatch
 from .detect_turn_events import empty_turn_batch
 
@@ -34,6 +35,7 @@ class TurnEventRelation:
                 "memory_limit":runtime.duckdb_memory_limit, "threads":str(runtime.duckdb_threads),
                 "temp_directory":str(self._temp_directory), "max_temp_directory_size":runtime.duckdb_max_temp_directory_size,
             })
+            self._quota = TempQuota(self._connection, runtime.duckdb_max_temp_directory_size, identity)
             self._create_schema()
         except BaseException:
             self.close(); raise
@@ -50,7 +52,6 @@ class TurnEventRelation:
                 sql_type = {"b": "BOOLEAN", "i": "BIGINT", "f": "DOUBLE"}.get(values.dtype.kind, "VARCHAR")
                 definitions.append(name + " " + sql_type)
         self._connection.execute("CREATE TABLE events (" + ", ".join(definitions) + ")")
-        self._connection.execute("CREATE UNIQUE INDEX event_identity ON events(calculation_index)")
 
     def __len__(self):
         self._require_open()
@@ -66,6 +67,9 @@ class TurnEventRelation:
             raise RuntimeError("event relation is sealed")
         if not isinstance(batch, TurnBatch):
             raise TypeError("expected TurnBatch")
+        self._quota.run("append_batch", lambda: self._append_transaction(batch))
+
+    def _append_transaction(self, batch):
         connection = self._require_open()
         if np.any(batch.g_star_z_valid & ~np.isfinite(batch.g_star_z)):
             raise ValueError("g_star_z must be finite when valid")
@@ -123,25 +127,29 @@ class TurnEventRelation:
     append_many = extend
 
     def seal(self):
-        connection = self._require_open()
+        self._require_open()
         try:
-            if self._count:
-                names = [row[1] for row in connection.execute("PRAGMA table_info('events')").fetchall()]
-                guards = [name + " IS NULL" for name in names if name != "g_star_z"]
-                guards.append("g_star_z_valid AND g_star_z IS NULL")
-                guards.extend(['calculation_index != ordinal', 'NOT isfinite(xy_0) OR NOT isfinite(xy_1)', 'NOT isfinite(lonlat_0) OR NOT isfinite(lonlat_1) OR abs(lonlat_0)>180 OR abs(lonlat_1)>90', "vehicle_id = '' OR source_id = ''", 'refine_point_id_valid AND refine_point_id < 0', 'NOT isfinite(turn_deg) OR turn_deg >= 180 OR turn_deg < -180 OR NOT isfinite(score) OR score != abs(turn_deg)', 'g_star_z_valid AND NOT isfinite(g_star_z)'])
-                guards.extend(['NOT isfinite(timestamp)', 'NOT isfinite(entry_bearing)', 'NOT isfinite(exit_bearing)', "refine_point_id_valid AND point_kind NOT IN ('p','i','kept','injected')", 'refine_point_id_valid AND (subtrack_index < 0 OR point_index < 0)'])
-                invalid_sql = " OR ".join("(" + guard + ")" for guard in guards)
-                count, unique_count, first_ordinal, last_ordinal, ordinal_count, invalid = connection.execute(
-                    "SELECT count(*), count(DISTINCT calculation_index), min(ordinal), max(ordinal), count(DISTINCT ordinal), count(*) FILTER (WHERE "
-                    + invalid_sql + ") FROM events"
-                ).fetchone()
-                if count != self._count or unique_count != count or first_ordinal != 0 or last_ordinal != count - 1 or ordinal_count != count or invalid:
-                    raise ValueError("event relation has invalid identity, ordinal, geometry or provenance")
+            self._quota.run("seal", self._validate_before_seal)
             self._sealed = True
         except BaseException:
             self.close()
             raise
+
+    def _validate_before_seal(self):
+        connection = self._require_open()
+        if self._count:
+            names = [row[1] for row in connection.execute("PRAGMA table_info('events')").fetchall()]
+            guards = [name + " IS NULL" for name in names if name != "g_star_z"]
+            guards.append("g_star_z_valid AND g_star_z IS NULL")
+            guards.extend(['calculation_index != ordinal', 'NOT isfinite(xy_0) OR NOT isfinite(xy_1)', 'NOT isfinite(lonlat_0) OR NOT isfinite(lonlat_1) OR abs(lonlat_0)>180 OR abs(lonlat_1)>90', "vehicle_id = '' OR source_id = ''", 'refine_point_id_valid AND refine_point_id < 0', 'NOT isfinite(turn_deg) OR turn_deg >= 180 OR turn_deg < -180 OR NOT isfinite(score) OR score != abs(turn_deg)', 'g_star_z_valid AND NOT isfinite(g_star_z)'])
+            guards.extend(['NOT isfinite(timestamp)', 'NOT isfinite(entry_bearing)', 'NOT isfinite(exit_bearing)', "refine_point_id_valid AND point_kind NOT IN ('p','i','kept','injected')", 'refine_point_id_valid AND (subtrack_index < 0 OR point_index < 0)'])
+            invalid_sql = " OR ".join("(" + guard + ")" for guard in guards)
+            count, unique_count, first_ordinal, last_ordinal, ordinal_count, invalid = connection.execute(
+                "SELECT count(*), count(DISTINCT calculation_index), min(ordinal), max(ordinal), count(DISTINCT ordinal), count(*) FILTER (WHERE "
+                + invalid_sql + ") FROM events"
+            ).fetchone()
+            if count != self._count or unique_count != count or first_ordinal != 0 or last_ordinal != count - 1 or ordinal_count != count or invalid:
+                raise ValueError("event relation has invalid identity, ordinal, geometry or provenance")
 
     def iter_batches(self, *, indices: np.ndarray | None = None) -> Iterator[TurnBatch]:
         connection = self._require_open()
@@ -179,18 +187,19 @@ class TurnEventRelation:
                 cursor.unregister(selected)
             cursor.close()
 
-    def iter_coordinate_batches(self):
+    def iter_coordinate_batches(self, *, include_source: bool = True):
         connection = self._require_open()
         if not self._sealed:
             raise RuntimeError("event relation must be sealed")
         if not self._count: return
         cursor=connection.cursor()
         try:
-            cursor.execute("SELECT xy_0,xy_1,calculation_index,source_id FROM events ORDER BY ordinal")
+            cursor.execute("SELECT xy_0,xy_1,calculation_index" + (",source_id" if include_source else "") + " FROM events ORDER BY ordinal")
             while rows := cursor.fetchmany(self._batch_size):
                 columns = (np.asarray([[row[0],row[1]] for row in rows],dtype=np.float64),
-                           np.asarray([row[2] for row in rows],dtype=np.int64),
-                           np.asarray([row[3] for row in rows],dtype=object))
+                           np.asarray([row[2] for row in rows],dtype=np.int64))
+                if include_source:
+                    columns += (np.asarray([row[3] for row in rows],dtype=object),)
                 for column in columns:
                     column.flags.writeable = False
                 yield columns

@@ -187,7 +187,7 @@ def test_runtime_limits_bounded_fetch_and_columnar_implementation(tmp_path):
         assert settings['temp_directory']==str(relation._temp_directory)
     assert 'fetchmany' in inspect.getsource(CrossCandidateRelation.iter_batches)
     assert 'fetchmany' in inspect.getsource(CrossCandidateRelation.iter_coordinate_batches)
-    assert 'unnest' in inspect.getsource(CrossCandidateRelation.append_batch)
+    assert 'unnest' in inspect.getsource(CrossCandidateRelation._insert_columns)
     for forbidden in ('sqlite','pickle','struct','temporarydirectory'): assert forbidden not in inspect.getsource(cross_candidate_relation).lower()
 
 
@@ -277,3 +277,76 @@ def test_typed_json_column_boundary_keeps_signed_zero_and_int64_extrema(tmp_path
         assert np.signbit(actual.heading).tolist() == [True, False]
         np.testing.assert_array_equal(actual.from_source_row_key, batch.from_source_row_key)
         np.testing.assert_array_equal(actual.from_source_id, batch.from_source_id)
+
+
+def test_staged_grid_results_deduplicate_before_stable_ids(tmp_path):
+    from dataclasses import replace
+    first = _candidate([90], optional=True)
+    duplicate = replace(first, xy=np.asarray([[9.0, 8.0]]),
+                        from_point_index=np.asarray([0], dtype=np.int64),
+                        to_point_index=np.asarray([0], dtype=np.int64))
+    first = replace(first, from_point_index=np.asarray([0], dtype=np.int64),
+                    to_point_index=np.asarray([0], dtype=np.int64))
+    second = replace(_candidate([91], optional=True),
+                     from_point_index=np.asarray([1], dtype=np.int64),
+                     to_point_index=np.asarray([1], dtype=np.int64))
+    with _relation(tmp_path) as relation:
+        relation.append_staged(1, 0, duplicate)
+        relation.append_staged(0, 0, first)
+        relation.append_staged(0, 1, second)
+        with pytest.raises(RuntimeError, match="unfinished"):
+            relation.finalize_staged()
+        relation.finish_grid(0)
+        relation.finish_grid(1)
+        relation.finalize_staged()
+        actual = concatenate(relation.iter_batches())
+        assert actual.calculation_index.tolist() == [0, 1]
+        assert actual.from_point_index.tolist() == [0, 1]
+        np.testing.assert_array_equal(actual.xy[0], first.xy[0])
+        assert concatenate(relation.iter_batches(indices=np.asarray([1],dtype=np.int64))).from_point_index.tolist() == [1]
+
+
+def test_discarded_grid_attempt_cannot_publish(tmp_path):
+    first = _candidate([10], optional=True)
+    second = _candidate([20], optional=True)
+    with _relation(tmp_path) as relation:
+        relation.append_staged(2, 0, first)
+        relation.discard_grid(2)
+        relation.append_staged(2, 0, second)
+        relation.finish_grid(2)
+        relation.finalize_staged()
+        actual = concatenate(relation.iter_batches())
+        assert len(actual) == 1 and actual.xy.tolist() == second.xy.tolist()
+
+
+def test_duplicate_calculation_index_rejected_at_seal_without_art(tmp_path):
+    with _relation(tmp_path) as relation:
+        relation.append_batch(_candidate([0, 0]))
+        with pytest.raises(ValueError, match="invalid identity"):
+            relation.seal()
+        with pytest.raises(RuntimeError, match="closed"):
+            len(relation)
+
+
+def test_quota_failure_mid_append_replays_one_business_batch_atomically(tmp_path, monkeypatch):
+    import duckdb
+    relation = _relation(tmp_path, batch_size=1)
+    relation._quota.limits = ("256MB", "512MB")
+    original = relation._insert_columns
+    calls = 0
+    def fail_after_first_slice(table, columns):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise duckdb.OutOfMemoryException(
+                "failed to offload data block of size 256.0 KiB (0 bytes/0 bytes used).")
+        return original(table, columns)
+    monkeypatch.setattr(relation, "_insert_columns", fail_after_first_slice)
+    with relation:
+        relation.append_batch(_candidate([0, 1]))
+        relation.seal()
+        actual = concatenate(relation.iter_batches())
+        assert actual.calculation_index.tolist() == [0, 1]
+        assert relation._connection.execute("SELECT count(*) FROM events").fetchone()[0] == 2
+        assert calls == 4
+        assert relation._quota.current == "512MB"

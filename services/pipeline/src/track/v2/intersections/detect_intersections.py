@@ -150,17 +150,34 @@ def _batches(events):
             if close: close()
 
 
-def _coordinates(events):
+def _coordinates(events, *, include_sources: bool = True):
     if isinstance(events,(TurnBatch,CrossCandidateBatch)):
-        return events.xy,events.calculation_index,events.source_id if isinstance(events,TurnBatch) else events.from_source_id
-    pieces=list(events.iter_coordinate_batches())
-    if not pieces: return np.empty((0,2)),np.empty(0,dtype=np.int64),np.empty(0,dtype=object)
-    return tuple(np.concatenate([piece[i] for piece in pieces]) for i in range(3))
+        source = (events.source_id if isinstance(events,TurnBatch) else events.from_source_id) if include_sources else None
+        return events.xy,events.calculation_index,source
+    size = len(events)
+    xy = np.empty((size, 2), dtype=np.float64)
+    indices = np.empty(size, dtype=np.int64)
+    sources = np.empty(size, dtype=object) if include_sources else None
+    cursor = 0
+    batches = events.iter_coordinate_batches(include_source=include_sources)
+    try:
+        for columns in batches:
+            stop = cursor + len(columns[1])
+            xy[cursor:stop] = columns[0]
+            indices[cursor:stop] = columns[1]
+            if include_sources:
+                sources[cursor:stop] = columns[2]
+            cursor = stop
+    finally:
+        batches.close()
+    if cursor != size:
+        raise ValueError("event relation coordinate count changed during scan")
+    return xy, indices, sources
 
 
 def _compute_getis_ord_g_star(events, radius_m, **_kwargs):
     started = time.monotonic()
-    xy,indices,_=_coordinates(events)
+    xy,indices,_=_coordinates(events,include_sources=False)
     n=len(xy)
     counts=np.zeros(n,dtype=np.float64)
     radius_sq=radius_m*radius_m
@@ -362,12 +379,12 @@ def _detect_intersections_db(conn,cfg,spatial_context,*,runtime,data_root,refine
         return _empty_intersect_result(spatial_context)
     event_store=TurnEventRelation(runtime,data_root); candidate_store=CrossCandidateRelation(runtime,data_root)
     try:
-        return _run_columnar_db_detect(cfg,spatial_context,refine_reader,event_store=event_store,candidate_store=candidate_store,conn=conn,refine_id=cfg.refine_id,connect_worker=connect_worker)
+        return _run_columnar_db_detect(cfg,spatial_context,refine_reader,event_store=event_store,candidate_store=candidate_store,conn=conn,refine_id=cfg.refine_id,connect_worker=connect_worker,runtime=runtime,data_root=data_root)
     except BaseException:
         event_store.close(); candidate_store.close(); raise
 
 
-def _run_columnar_db_detect(cfg,spatial_context,refine_reader,*,event_store=None,candidate_store=None,conn=None,refine_id=None,connect_worker=None):
+def _run_columnar_db_detect(cfg,spatial_context,refine_reader,*,runtime,data_root,event_store=None,candidate_store=None,conn=None,refine_id=None,connect_worker=None):
     transformer=CoordinateTransformer(spatial_context)
     if refine_reader.extent() is None: return _empty_intersect_result(spatial_context)
     batches=refine_reader.iter_turn_candidates(cfg.source_table or cfg.db_table,cfg,batch_size=cfg.stream_batch_size) if cfg.use_turn_events else ()
@@ -376,7 +393,7 @@ def _run_columnar_db_detect(cfg,spatial_context,refine_reader,*,event_store=None
     crosses=empty_cross_batch()
     if cfg.use_cross_track_candidates:
         if conn is None or refine_id is None or connect_worker is None: raise V2Error("formal DB cross-track requires connection, refine_id, and worker connector")
-        crosses=run_grid_cross_track_task(refine_id,refine_reader.extent(),spatial_context,transformer,cfg,connect_worker=connect_worker,grid_cell_size_m=cfg.cross_track_task_grid_m,thread_count=cfg.cross_track_task_threads,max_segments=200_000,max_segment_bytes=268_435_456,max_grid_memberships=2_000_000,max_overflow_pair_space=20_000_000,max_candidates=500_000,max_result_bytes=536_870_912,candidate_store=candidate_store,live_status=cfg.live_status)
+        crosses=run_grid_cross_track_task(refine_id,refine_reader.extent(),spatial_context,transformer,cfg,connect_worker=connect_worker,grid_cell_size_m=cfg.cross_track_task_grid_m,thread_count=cfg.cross_track_task_threads,max_segments=200_000,max_segment_bytes=268_435_456,max_grid_memberships=2_000_000,max_overflow_pair_space=20_000_000,max_candidates=500_000,max_result_bytes=536_870_912,candidate_store=candidate_store,live_status=cfg.live_status,runtime=runtime,data_root=data_root)
     hotspot,clusters=_cluster_pipeline(turns,crosses,transformer,cfg)
     topologies,clusters,observations=_build_topologies_from_tracks(clusters,{},cfg,transformer,refine_reader=refine_reader)
     return IntersectResult(turns,hotspot,clusters,topologies,_build_intersect_report(clusters,topologies,turns,hotspot,crosses,track_count=refine_reader.track_count()),spatial_context,observations,crosses)

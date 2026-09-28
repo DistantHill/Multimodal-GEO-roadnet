@@ -161,10 +161,10 @@ def test_hotspot_coordinate_iteration_closes_on_error(tmp_path, failure):
     class ObservedSequence(TurnEventRelation):
         active_coordinates = 0
 
-        def iter_coordinate_batches(self):
+        def iter_coordinate_batches(self, *, include_source=True):
             self.active_coordinates += 1
             try:
-                yield next(super().iter_coordinate_batches())
+                yield next(super().iter_coordinate_batches(include_source=include_source))
                 raise failure
             finally:
                 self.active_coordinates -= 1

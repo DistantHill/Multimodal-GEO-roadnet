@@ -216,7 +216,7 @@ def test_runtime_limits_and_columnar_implementation(tmp_path):
         assert settings['autoload_known_extensions']==settings['autoinstall_known_extensions']=='false'
         assert settings['temp_directory']==str(relation._temp_directory)
     assert 'fetchmany' in inspect.getsource(TurnEventRelation.iter_batches)
-    assert 'unnest' in inspect.getsource(TurnEventRelation.append_batch)
+    assert 'unnest' in inspect.getsource(TurnEventRelation._append_transaction)
     for forbidden in ('sqlite','pickle','struct','temporarydirectory'): assert forbidden not in inspect.getsource(turn_event_relation).lower()
 
 
@@ -259,3 +259,12 @@ def test_typed_driver_boundary_preserves_nan_null_inf_unicode_and_int64(tmp_path
         assert [row[2] for row in rows] == ["中文🚗", "", "source", "source"]
         with pytest.raises(ValueError):
             relation.seal()
+
+
+def test_duplicate_calculation_index_rejected_at_seal_without_art(tmp_path):
+    with _relation(tmp_path) as relation:
+        relation.append_batch(_event([0, 0]))
+        with pytest.raises(ValueError, match="invalid identity"):
+            relation.seal()
+        with pytest.raises(RuntimeError, match="closed"):
+            len(relation)

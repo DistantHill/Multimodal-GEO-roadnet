@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from track.v2.candidates.grid_segments import GridSegmentBudgetError, build_grid_segments
+from track.v2.candidates.grid_segments import GridSegmentBudgetError, GridSegmentRelation, build_grid_segments, open_grid_segments
 
 
 def _point(point_id, sequence, x, *, kind=0):
@@ -72,3 +72,95 @@ def test_build_grid_segments_rejects_nonadjacent_neighbours():
             [_batch(_row("a", third, prev=first))],
             max_segments=2, max_bytes=100_000,
         )
+
+
+def test_spilled_grid_switches_before_large_concat_and_keeps_cross_batch_segments(tmp_path):
+    from types import SimpleNamespace
+    first = _point(10, 0, 0.0)
+    middle = _point(11, 1, 1.0)
+    last = _point(12, 2, 2.0)
+    batches = iter((_batch(_row("a", first, next_=middle)),
+                    _batch(_row("a", middle, prev=first, next_=last))))
+    runtime = SimpleNamespace(duckdb_memory_limit="16MB", duckdb_threads=1,
+                              duckdb_max_temp_directory_size="64MB")
+    with open_grid_segments(batches, max_segments=1, max_bytes=100_000,
+                            runtime=runtime, data_root=tmp_path) as result:
+        assert isinstance(result, GridSegmentRelation)
+        assert result.count == 2
+        first_block = result.block(0, 1)
+        second_block = result.block(1, 1)
+        assert first_block["start_point_id"].tolist() == [10]
+        assert second_block["start_point_id"].tolist() == [11]
+        assert not first_block["start_point_id"].flags.writeable
+    assert not list((tmp_path / "duckdb").iterdir())
+
+
+def test_spilled_grid_compares_distinct_blocks_with_exact_kernel(tmp_path):
+    from types import SimpleNamespace
+    from track.v2.candidates.detect_grid_crossings import iter_spilled_grid_candidates
+    from .config_factory import intersect_config
+    from .detect_columns_helpers import TRANSFORMER
+
+    horizontal_a = _point(10, 0, -10.0)
+    horizontal_b = _point(11, 1, 10.0)
+    vertical_a = _point(20, 0, 0.0)
+    vertical_b = _point(21, 1, 0.0)
+    vertical_a["y"] = -10.0
+    vertical_b["y"] = 10.0
+    vertical_a["heading"] = vertical_b["heading"] = 0.0
+    batches = (_batch(_row("same-car", horizontal_a, next_=horizontal_b, subtrack=1)),
+               _batch(_row("same-car", vertical_a, next_=vertical_b, subtrack=2)))
+    runtime = SimpleNamespace(duckdb_memory_limit="16MB", duckdb_threads=1,
+                              duckdb_max_temp_directory_size="64MB")
+    with open_grid_segments(batches, max_segments=1, max_bytes=100_000,
+                            runtime=runtime, data_root=tmp_path) as relation:
+        assert isinstance(relation, GridSegmentRelation)
+        found = list(iter_spilled_grid_candidates(relation, intersect_config(), TRANSFORMER,
+                                                  block_size=1))
+    assert sum(map(len, found)) == 1
+    assert found[0].from_subtrack_index.tolist() == [1]
+    assert found[0].to_subtrack_index.tolist() == [2]
+
+
+def test_spilled_grid_owner_cleans_directory_when_schema_creation_fails(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from track.v2.candidates import grid_segments
+    connection = SimpleNamespace(closed=False)
+    connection.execute = lambda _sql: (_ for _ in ()).throw(RuntimeError("schema failure"))
+    connection.close = lambda: setattr(connection, "closed", True)
+    monkeypatch.setattr(grid_segments.duckdb, "connect", lambda *_a, **_kw: connection)
+    runtime = SimpleNamespace(duckdb_memory_limit="16MB", duckdb_threads=1,
+                              duckdb_max_temp_directory_size="64MB")
+    with pytest.raises(RuntimeError, match="schema failure"):
+        GridSegmentRelation(runtime, tmp_path)
+    assert connection.closed
+    assert not list((tmp_path / "duckdb").iterdir())
+
+
+def test_grid_owner_native_temp_spill_and_quota_retry(tmp_path):
+    from types import SimpleNamespace
+    from track.v2.candidates.temp_quota import TempQuota
+    runtime = SimpleNamespace(duckdb_memory_limit="16MB", duckdb_threads=1,
+                              duckdb_max_temp_directory_size="64MB")
+    owner = GridSegmentRelation(runtime, tmp_path)
+    events = []
+    try:
+        owner._quota = TempQuota(owner._connection, "0B", "grid-test",
+                                 limits=("0B", "64MB"), emit=events.append)
+        owner._connection.execute(
+            "CREATE TEMP TABLE stress_source AS SELECT i, md5(i::VARCHAR) AS value "
+            "FROM range(120000) t(i)"
+        )
+        owner._connection.execute("SET max_temp_directory_size='0B'")
+        owner._quota.run("test_native_sort", lambda: owner._connection.execute(
+            "CREATE TEMP TABLE sorted_stress AS "
+            "SELECT * FROM stress_source ORDER BY value DESC"
+        ))
+        assert owner._connection.execute("SELECT count(*) FROM sorted_stress").fetchone() == (120000,)
+        assert owner._connection.execute(
+            "SELECT coalesce(sum(size), 0) FROM duckdb_temporary_files()"
+        ).fetchone()[0] > 0
+        assert len(events) == 1 and "old=0B new=64MB" in events[0]
+    finally:
+        owner.close()
+    assert not list((tmp_path / "duckdb").iterdir())

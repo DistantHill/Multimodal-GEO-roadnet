@@ -175,6 +175,8 @@ class ProjectionContextContractTest(unittest.TestCase):
                 cfg,
                 _TEST_SPATIAL_CONTEXT,
                 reader,
+                runtime=runtime_config(),
+                data_root=Path(tempfile.mkdtemp()),
             )
         columnar.assert_not_called()
         reader.iter_cross_track_pair_batches.assert_not_called()
