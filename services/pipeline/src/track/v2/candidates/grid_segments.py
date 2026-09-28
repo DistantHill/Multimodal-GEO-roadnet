@@ -218,9 +218,14 @@ def open_grid_segments(point_batches, *, max_segments: int, max_bytes: int, runt
             result = {name: value[unique] for name, value in combined.items()}
         if relation is not None:
             relation.finish()
-            yield relation
+            delivered = relation
         else:
-            yield _finish_memory(result)
+            delivered = _finish_memory(result)
+        # The contextmanager frame stays alive while the worker consumes a grid.
+        # Drop the final cursor batch, pieces, concat/unique workspaces and the
+        # unsorted result before handing the completed columns to that worker.
+        batch = pieces = combined = unique = _ = result = None
+        yield delivered
     finally:
         close = getattr(iterator, "close", None)
         if close:

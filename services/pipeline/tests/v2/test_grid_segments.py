@@ -137,6 +137,63 @@ def test_spilled_grid_owner_cleans_directory_when_schema_creation_fails(tmp_path
     assert not list((tmp_path / "duckdb").iterdir())
 
 
+@pytest.mark.parametrize("spill", [False, True])
+def test_open_grid_releases_build_workspaces_before_worker_consumes(tmp_path, monkeypatch, spill):
+    import gc
+    import weakref
+    from types import SimpleNamespace
+    from track.v2.candidates import grid_segments
+
+    refs = []
+    original_pieces = grid_segments._pieces
+    original_finish = grid_segments._finish_memory
+
+    def tracked_pieces(batch):
+        pieces = original_pieces(batch)
+        refs.extend(weakref.ref(value) for piece in pieces for value in piece.values())
+        return pieces
+
+    def tracked_finish(result):
+        refs.extend(weakref.ref(value) for value in result.values())
+        return original_finish(result)
+
+    monkeypatch.setattr(grid_segments, "_pieces", tracked_pieces)
+    monkeypatch.setattr(grid_segments, "_finish_memory", tracked_finish)
+
+    class Batch(dict):
+        pass
+
+    class SingleBatch:
+        used = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.used:
+                raise StopIteration
+            self.used = True
+            batch = Batch(_batch(_row("car", _point(10, 0, 0.0),
+                                      next_=_point(11, 1, 1.0))))
+            refs.append(weakref.ref(batch))
+            return batch
+
+    runtime = SimpleNamespace(duckdb_memory_limit="16MB", duckdb_threads=1,
+                              duckdb_max_temp_directory_size="64MB")
+    with open_grid_segments(SingleBatch(), max_segments=0 if spill else 10,
+                            max_bytes=100_000, runtime=runtime,
+                            data_root=tmp_path) as delivered:
+        assert isinstance(delivered, GridSegmentRelation) if spill else len(delivered["subtrack_index"]) == 1
+        gc.collect()
+        # DuckDB may retain registered NumPy columns while its connection is
+        # alive; the last cursor batch must not be retained by the generator.
+        assert refs and refs[0]() is None
+        if not spill:
+            assert all(ref() is None for ref in refs)
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+
+
 def test_grid_owner_native_temp_spill_and_quota_retry(tmp_path):
     from types import SimpleNamespace
     from track.v2.candidates.temp_quota import TempQuota
