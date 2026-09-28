@@ -66,7 +66,7 @@ def build_cross_track_index(
     max_overflow_pair_space: int | None = None,
     telemetry: dict[str, int | float] | None = None,
 ) -> CrossTrackIndex:
-    """Check capacity before allocating grid memberships, then build the index."""
+    """Bound grid memberships; stream overflow work regardless of total pairs."""
     starts = np.asarray(starts, dtype=np.float64)
     ends = np.asarray(ends, dtype=np.float64)
     subtrack_indices = np.asarray(subtrack_indices, dtype=np.int64)
@@ -95,19 +95,24 @@ def build_cross_track_index(
             max_grid_memberships is not None
             and indexed_memberships > max_grid_memberships
         ):
-            raise CrossTrackCapacityError(
-                "global cross-track grid requires "
-                f"{indexed_memberships:,} memberships; "
-                f"budget is {max_grid_memberships:,}"
-            )
-        if (
-            max_overflow_pair_space is not None
-            and overflow_pair_space > max_overflow_pair_space
-        ):
-            raise CrossTrackCapacityError(
-                "global cross-track overflow fallback spans "
-                f"{overflow_pair_space:,} segment pairs; "
-                f"budget is {max_overflow_pair_space:,}"
+            # Avoid allocating the oversized membership graph. Every finite
+            # segment participates in the same exact, bounded overflow stream.
+            overflow_ids = np.flatnonzero(finite).tolist()
+            if telemetry is not None:
+                telemetry["grid_membership_fallback"] = 1
+                telemetry["overflow_segments"] = len(overflow_ids)
+                telemetry["overflow_pair_space_estimate"] = len(overflow_ids) ** 2
+                telemetry["overflow_pair_budget_exceeded"] = int(
+                    max_overflow_pair_space is not None
+                    and len(overflow_ids) ** 2 > max_overflow_pair_space
+                )
+            return CrossTrackIndex(spans, finite, representable, subtrack_indices, {}, overflow_ids)
+        # This is total work, not retained memory. The overflow iterator emits
+        # bounded patches, so a large estimate must not reject a valid grid.
+        if telemetry is not None:
+            telemetry["overflow_pair_budget_exceeded"] = int(
+                max_overflow_pair_space is not None
+                and overflow_pair_space > max_overflow_pair_space
             )
     grid, overflow_ids = _build_grid(spans, finite, representable, max_cells)
     return CrossTrackIndex(

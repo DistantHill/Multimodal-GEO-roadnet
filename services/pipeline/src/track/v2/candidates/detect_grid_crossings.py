@@ -35,8 +35,8 @@ def iter_grid_crossings(
     """Yield bounded exact cross-vehicle hits from one grid's segment columns.
 
     Straightness follows the existing Detect heading rule. The current
-    spatial bucket index creates bounded pair batches; its capacity error is
-    propagated unchanged so the caller can fail without retrying. Each yield
+    spatial bucket index creates bounded pair batches; oversized membership
+    graphs use the exact overflow stream instead of rejecting total work. Each yield
     contains at most ``cfg.cross_track_pair_batch_size`` exact hits and retains
     original segment column indices plus stable identities for later grid merge.
     """

@@ -15,11 +15,14 @@ def _crossing_tracks():
             2: subtrack([[-300, 0], [300, 0]], subtrack_index=2, vehicle_id="B", headings=[90, 90])}
 
 
-def test_capacity_guard_runs_before_grid_allocation():
-    with patch("track.v2.candidates.build_patches._build_grid", side_effect=AssertionError("grid must not be allocated")):
-        with pytest.raises(CrossTrackCapacityError, match="overflow fallback"):
-            extract_cross_track_candidates(_crossing_tracks(), TRANSFORMER,
-                intersect_config(cross_track_max_grid_cells_per_segment=1), max_overflow_pair_space=1)
+def test_large_overflow_work_is_completed_in_bounded_patches():
+    candidates, eligible, scheduled = extract_cross_track_candidates(
+        _crossing_tracks(), TRANSFORMER,
+        intersect_config(cross_track_max_grid_cells_per_segment=1, cross_track_pair_batch_size=1),
+        max_overflow_pair_space=1)
+    assert eligible == scheduled == 1
+    assert len(candidates) == 1
+    np.testing.assert_array_equal(candidates.xy, [[0, 0]])
 
 
 def test_memory_workspace_emits_one_crossing_with_run_partition_identity():

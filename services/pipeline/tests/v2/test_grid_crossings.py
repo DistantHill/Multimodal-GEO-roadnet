@@ -69,12 +69,15 @@ def test_iter_grid_crossings_batches_only_cross_vehicle_exact_hits():
     assert {int(batch["segment_index_b"][0]) for batch in batches} == {2, 5}
 
 
-def test_iter_grid_crossings_preserves_bucket_capacity_error():
-    with pytest.raises(CrossTrackCapacityError):
-        list(iter_grid_crossings(
-            _segments(), _cfg(), max_grid_memberships=0,
-            max_overflow_pair_space=0,
-        ))
+@pytest.mark.parametrize("batch_size", [1, 2, 10])
+def test_membership_fallback_completes_known_crossings(batch_size):
+    cfg=_cfg()
+    cfg.cross_track_pair_batch_size=batch_size
+    batches=list(iter_grid_crossings(_segments(),cfg,max_grid_memberships=0,max_overflow_pair_space=0))
+    assert all(len(batch['x'])<=batch_size for batch in batches)
+    assert sorted((float(x),float(y)) for batch in batches for x,y in zip(batch['x'],batch['y']))==[(1.,0.),(1.5,0.)]
+    pairs=[(int(a),int(b)) for batch in batches for a,b in zip(batch['segment_index_a'],batch['segment_index_b'])]
+    assert sorted(pairs)==[(0,2),(0,5)]
 
 
 def test_same_vehicle_different_subtracks_are_exact_crossing_participants():

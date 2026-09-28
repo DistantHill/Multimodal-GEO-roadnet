@@ -38,14 +38,15 @@ def test_grid_and_overflow_keep_known_same_vehicle_crossing(batch_size,cell_m):
     assert batch.from_subtrack_index.tolist()==[1] and batch.to_subtrack_index.tolist()==[2]
 
 
-def test_index_holds_only_numeric_segment_spans_and_capacity_fails_before_grid():
+def test_index_holds_numeric_spans_and_membership_fallback_avoids_grid():
     starts=np.asarray([[-20.,0],[0,-20.]])
     ends=-starts
     index=build_cross_track_index(starts,ends,np.asarray([1,2],dtype=np.int64),cell_m=10,max_cells=100)
     assert index.spans.shape==(2,4) and index.spans.dtype==np.int64
     assert sum(len(a) for a,b in iter_cross_track_patches(index,1))==1
-    with pytest.raises(CrossTrackCapacityError,match="memberships"):
-        build_cross_track_index(starts,ends,np.asarray([1,2],dtype=np.int64),cell_m=10,max_cells=100,max_grid_memberships=0)
+    fallback=build_cross_track_index(starts,ends,np.asarray([1,2],dtype=np.int64),cell_m=10,max_cells=100,max_grid_memberships=0)
+    assert fallback.grid=={}
+    assert [(a.tolist(),b.tolist()) for a,b in iter_cross_track_patches(fallback,1)]==[([0],[1])]
 
 
 def test_nonfinite_segment_is_excluded_from_exact_pairing():
@@ -71,3 +72,18 @@ def test_consumed_complete_patch_is_released_before_next_subtrack_build():
     assert len(result)==2
     gc.collect()
     assert all(reference() is None for reference in references)
+
+
+def test_overflow_work_limit_does_not_drop_pairs_or_expand_batches():
+    starts=np.asarray([[0.,0.],[0.,1.],[0.,2.],[0.,3.]])
+    ends=starts+np.asarray([1000.,1000.])
+    telemetry={}
+    index=build_cross_track_index(starts,ends,np.asarray([1,1,2,3],dtype=np.int64),
+        cell_m=1,max_cells=1,max_grid_memberships=0,max_overflow_pair_space=1,telemetry=telemetry)
+    pairs=[]
+    for a,b in iter_cross_track_patches(index,2):
+        assert len(a)==len(b)<=2
+        pairs.extend(zip(a.tolist(),b.tolist()))
+    assert pairs==[(0,2),(0,3),(1,2),(1,3),(2,3)]
+    assert telemetry['overflow_pair_space_estimate']==16
+    assert telemetry['overflow_pair_budget_exceeded']==1
