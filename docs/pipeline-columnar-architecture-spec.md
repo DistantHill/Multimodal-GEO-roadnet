@@ -3193,6 +3193,17 @@ cgroup 分开记录。完整指标：
 不等于此次 26M 已完成所有 grid。OOM 内存生命周期正在据实际代码定位，
 不得把任何单点发现未经复验写作唯一根因。
 
+后续提交 `edf842a` 仅修正 `open_grid_segments` contextmanager 在交给 worker
+消费 grid 时仍强持有最后一批输入、拼接/去重工作数组和排序前结果的生命周期；
+未改几何规则、grid 预算、worker 数或 DuckDB 内存配置。fast/TEMP 两条路径
+的弱引用生命周期回归通过；生产镜像针对性 grid/config 组 `26 passed`。
+一组无数据库的同输入 120,000 segment 局部 RSS 探针，旧版交付时
+187,199,488 B、修正版 178,737,152 B；各测一次，仅证局部强引用下降，
+不能外推全链峰值或宣称这就是 26M OOM 的唯一原因。修复后的
+`make test` 仍由同一 Backend 外部夹具失败阻断（`108 passed, 1 failed`）；
+随后按 Makefile 的 Pipeline/CV 命令、真实 PostgreSQL 环境完整运行，
+`1275 passed`、零失败。修复后的 fresh 26M 全链功能与资源仍**未验收**。
+
 本计划不改变既有 2GB 硬 cap、数据保护、前后端 JSON/CLI/回放契约。用户已
 确认上述最终方案并授权恢复实施；功能与性能达标仍以实际检查/运行结果为准。
 
