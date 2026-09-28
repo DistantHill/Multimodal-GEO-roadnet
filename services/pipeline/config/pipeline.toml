@@ -101,6 +101,7 @@ refine_flush_point_threshold = 100000 # Refine 点刷新阈值；>=1；执行语
 progress_interval = 500 # 进度计数间隔；>=1；执行语义。
 progress_time_threshold_s = 2.0 # 进度时间间隔；秒，>0；执行语义。
 duckdb_memory_limit = "1GB" # DuckDB 内存限制；容量字符串；执行语义。
+duckdb_event_memory_limit = "4GB" # Detect Turn/Cross 事件关系各自的 DuckDB 内存上限；其余实例沿用 duckdb_memory_limit。
 duckdb_threads = 4 # DuckDB 线程；1..4；执行语义。
 duckdb_max_temp_directory_size = "50GB" # DuckDB 临时盘上限；容量字符串；执行语义。
 polars_threads = 4 # Polars 线程；>=1；执行语义。

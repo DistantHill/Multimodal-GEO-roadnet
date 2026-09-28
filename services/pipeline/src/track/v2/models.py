@@ -324,6 +324,7 @@ class RuntimeConfig(TrackModel):
     progress_interval: int
     progress_time_threshold_s: float
     duckdb_memory_limit: str
+    duckdb_event_memory_limit: str
     duckdb_threads: int
     duckdb_max_temp_directory_size: str
     polars_threads: int
@@ -346,7 +347,7 @@ class RuntimeConfig(TrackModel):
                 maximum = f" and <= {upper}" if upper is not None else ""
                 raise ValueError(f"{name} must be >= {lower}{maximum}")
 
-        for name in ("duckdb_memory_limit", "duckdb_max_temp_directory_size"):
+        for name in ("duckdb_memory_limit", "duckdb_event_memory_limit", "duckdb_max_temp_directory_size"):
             value = getattr(self, name)
             if not isinstance(value, str):
                 raise ValueError(f"{name} must be a capacity string")

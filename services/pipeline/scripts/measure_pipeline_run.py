@@ -1,6 +1,6 @@
 """Measure one fresh container's Pipeline Run without resetting shared counters.
 
-Launch this in a new container with memory.max=2,000,000,000 and swap disabled.
+Launch this in a new container with memory.max=4,000,000,000 and swap disabled.
 The subprocess inherits the container cgroup; the final sample is taken before
 container teardown. Source row counts and PostgreSQL counters are read-only.
 """
@@ -48,8 +48,8 @@ def main() -> int:
     swap_limit = read_cgroup('memory.swap.max')
     # cgroup v2 rounds Docker's byte limit down to an OS page boundary.
     effective_limit = int(memory_limit) if memory_limit != 'max' else 0
-    if not 0 <= 2_000_000_000 - effective_limit < os.sysconf('SC_PAGE_SIZE') or swap_limit != '0':
-        raise SystemExit('measurement requires memory.max=2000000000 and memory.swap.max=0')
+    if not 0 <= 4_000_000_000 - effective_limit < os.sysconf('SC_PAGE_SIZE') or swap_limit != '0':
+        raise SystemExit('measurement requires memory.max=4000000000 and memory.swap.max=0')
     events_before = read_cgroup('memory.events')
     with psycopg.connect(host=config['host'], port=config['port'], dbname=config['database'],
                         user=config['user'], password=os.environ['POSTGRES_PASSWORD']) as connection:
@@ -66,7 +66,7 @@ def main() -> int:
               'return_code': return_code, 'elapsed_seconds': elapsed, 'pipeline_args': args.pipeline_arg,
               'stats_path': str(stats_path),
               'pipeline_stats': json.loads(stats_path.read_text()) if stats_path.exists() else None,
-              'requested_memory_max_bytes': 2_000_000_000,
+              'requested_memory_max_bytes': 4_000_000_000,
               'memory_max_bytes': effective_limit, 'memory_swap_max_bytes': int(swap_limit),
               'memory_peak_bytes': int(read_cgroup('memory.peak')),
               'memory_events_before': events_before, 'memory_events_after': read_cgroup('memory.events'),

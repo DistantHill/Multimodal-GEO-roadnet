@@ -161,7 +161,10 @@ def _collect_section(name: str, cls: type[Any], raw: Any, base_dir: Path,
     if cls is PostgresConfig:
         fields.pop("password")
     errors.extend(f"{name}.{key}: unknown key" for key in sorted(set(raw) - set(fields)))
-    errors.extend(f"{name}.{key}: missing required key" for key in sorted(set(fields) - set(raw)))
+    missing = set(fields) - set(raw)
+    if cls is RuntimeConfig:
+        missing.discard("duckdb_event_memory_limit")
+    errors.extend(f"{name}.{key}: missing required key" for key in sorted(missing))
     hints = get_type_hints(cls)
     result = {}
     for key in sorted(set(raw) & set(fields)):
@@ -170,6 +173,8 @@ def _collect_section(name: str, cls: type[Any], raw: Any, base_dir: Path,
             errors.append(f"{name}.{key}: expected {annotation!s}")
         else:
             result[key] = _convert(raw[key], annotation, base_dir)
+    if cls is RuntimeConfig and "duckdb_event_memory_limit" not in raw and "duckdb_memory_limit" in result:
+        result["duckdb_event_memory_limit"] = result["duckdb_memory_limit"]
     return result
 
 

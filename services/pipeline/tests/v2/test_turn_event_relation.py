@@ -220,6 +220,13 @@ def test_runtime_limits_and_columnar_implementation(tmp_path):
     for forbidden in ('sqlite','pickle','struct','temporarydirectory'): assert forbidden not in inspect.getsource(turn_event_relation).lower()
 
 
+def test_dedicated_event_memory_limit(tmp_path):
+    runtime = runtime_config(duckdb_memory_limit='64MB', duckdb_event_memory_limit='128MB', duckdb_threads=1)
+    with TurnEventRelation(runtime, tmp_path) as relation:
+        value = relation._connection.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+        assert value == '122.0 MiB'
+
+
 @pytest.mark.parametrize("kind",["p","i","kept","injected"])
 def test_valid_refined_kinds_and_numeric_zero_negative_source_keys(tmp_path,kind):
     expected=_event([0,1],point_kind=np.full(2,kind),source_row_key=np.asarray([0,-1],dtype=np.int64),

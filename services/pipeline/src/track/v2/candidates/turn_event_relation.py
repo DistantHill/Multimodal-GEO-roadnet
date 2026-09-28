@@ -32,7 +32,7 @@ class TurnEventRelation:
         try:
             self._connection = duckdb.connect(":memory:", config={
                 "autoload_known_extensions":"false", "autoinstall_known_extensions":"false",
-                "memory_limit":runtime.duckdb_memory_limit, "threads":str(runtime.duckdb_threads),
+                "memory_limit":runtime.duckdb_event_memory_limit, "threads":str(runtime.duckdb_threads),
                 "temp_directory":str(self._temp_directory), "max_temp_directory_size":runtime.duckdb_max_temp_directory_size,
             })
             self._quota = TempQuota(self._connection, runtime.duckdb_max_temp_directory_size, identity)

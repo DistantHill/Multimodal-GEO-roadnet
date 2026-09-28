@@ -37,9 +37,22 @@ def test_checked_in_complete_config_loads() -> None:
     config = pipeline_config()
     assert config.projection.processing_srid == 32649
     assert config.runtime.duckdb_threads == 4
+    assert config.runtime.duckdb_memory_limit == "1GB"
+    assert config.runtime.duckdb_event_memory_limit == "4GB"
     assert config.detect.cross_track_task_grid_m == 5000.0
     assert config.detect.cross_track_task_threads == 4
     assert len(config.parser.fields.specs) == 9
+
+
+def test_smoke_config_and_optional_event_limit(tmp_path: Path) -> None:
+    smoke = load_pipeline_config(CONFIG_PATH.with_name("pipeline-roadnet-test.toml"), postgres_password="secret")
+    assert smoke.runtime.duckdb_memory_limit == "1GB"
+    assert smoke.runtime.duckdb_event_memory_limit == "4GB"
+    legacy = _write(tmp_path, lambda text: "\n".join(
+        line for line in text.splitlines() if not line.startswith("duckdb_event_memory_limit =")
+    ))
+    loaded = load_pipeline_config(legacy, postgres_password="secret")
+    assert loaded.runtime.duckdb_event_memory_limit == loaded.runtime.duckdb_memory_limit == "1GB"
 
 
 @pytest.mark.parametrize("value", ["0.0", "-1.0", "inf", "nan"])

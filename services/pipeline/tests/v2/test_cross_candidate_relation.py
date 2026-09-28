@@ -191,6 +191,13 @@ def test_runtime_limits_bounded_fetch_and_columnar_implementation(tmp_path):
     for forbidden in ('sqlite','pickle','struct','temporarydirectory'): assert forbidden not in inspect.getsource(cross_candidate_relation).lower()
 
 
+def test_dedicated_event_memory_limit(tmp_path):
+    runtime = runtime_config(duckdb_memory_limit='64MB', duckdb_event_memory_limit='128MB', duckdb_threads=1)
+    with CrossCandidateRelation(runtime, tmp_path) as relation:
+        value = relation._connection.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+        assert value == '122.0 MiB'
+
+
 def test_member_pass_has_independent_expected_views_and_ignores_noise(tmp_path):
     labels=np.asarray([4,-1,2,4,2],dtype=np.int64)
     with _relation(tmp_path) as relation:
