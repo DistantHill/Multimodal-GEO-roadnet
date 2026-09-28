@@ -28,6 +28,31 @@ MAP_CONFIG = MapConfig(layer_limit_default=1_000, layer_limit_max=5_000,
                        clip_feature_limit=1_000)
 
 
+@pytest.mark.parametrize("override", [
+    {"centerline_ids": []}, {"centerline_ids": [0]}, {"centerline_ids": [-1]},
+    {"centerline_ids": [1, 1]}, {"fit_id": None}, {"detect_id": None},
+    {"source_row_keys": ["1"]}, {"intersection_id": 1}, {"resolved_point_ids": [1]},
+])
+def test_centerline_replay_validates_selection_and_context(override) -> None:
+    with pytest.raises(ValidationError):
+        ReplayRequest(**{
+            "centerline_ids": [81],
+            "fit_id": "12345678-1234-5678-1234-567812345679",
+            "detect_id": "12345678-1234-5678-1234-567812345678",
+            **override,
+        })
+
+
+def test_centerline_replay_selection_limit_is_enforced() -> None:
+    from backend.api.map_contracts import resolve_replay_limits
+
+    request = ReplayRequest(centerline_ids=list(range(1, 1002)),
+                            fit_id="12345678-1234-5678-1234-567812345679",
+                            detect_id="12345678-1234-5678-1234-567812345678")
+    with pytest.raises(ValueError, match="centerline_ids"):
+        resolve_replay_limits(request, MAP_CONFIG)
+
+
 def feature_collection(**metadata: Any) -> dict[str, Any]:
     return {
         "type": "FeatureCollection",

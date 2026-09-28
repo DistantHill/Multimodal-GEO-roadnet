@@ -13,6 +13,36 @@ import {
 
 const originalFetch = globalThis.fetch;
 
+test('centerline replay sends exact selection and linked Run context', async () => {
+  let body;
+  globalThis.fetch = async (_url, options) => {
+    body = JSON.parse(options.body);
+    return jsonResponse({ type: 'FeatureCollection', features: [], metadata: {
+      returned_point_count: 3, returned_clip_count: 2, source_fingerprint_verified: false,
+    } });
+  };
+  const result = await requestReplay({
+    centerlineIds: ['81', 82], fitId: 'fit', detectId: 'detect', refineId: 'refine', databaseName: 'test',
+  });
+  assert.deepEqual(body, {
+    centerline_ids: [81, 82], fit_id: 'fit', detect_id: 'detect', refine_id: 'refine', database_name: 'test',
+  });
+  assert.equal(result.metadata.returned_point_count, 3);
+  assert.equal(result.metadata.returned_clip_count, 2);
+  assert.equal(result.metadata.source_fingerprint_verified, false);
+});
+
+test('centerline replay rejects invalid, mixed and context-free selections before fetch', async () => {
+  globalThis.fetch = async () => assert.fail('invalid selection must not reach Backend');
+  const context = { fitId: 'fit', detectId: 'detect', centerlineIds: [81] };
+  for (const centerlineIds of [[], [0], [-1], [1.5], [Number.MAX_SAFE_INTEGER + 1], [81, '81'], Array.from({ length: 1001 }, (_, i) => i + 1)]) {
+    await assert.rejects(requestReplay({ ...context, centerlineIds }), MapApiError);
+  }
+  for (const override of [{ fitId: undefined }, { detectId: undefined }, { sourceRowKeys: ['1'] }, { intersectionIds: [1] }, { resolvedPointIds: [1] }]) {
+    await assert.rejects(requestReplay({ ...context, ...override }), MapApiError);
+  }
+});
+
 test('Web Mercator half-world northing converts to the known latitude limit', () => {
   const halfWorld = 20_037_508.342789244;
   const north = planViewTiles([0, halfWorld - 1, 1, halfWorld], 4);

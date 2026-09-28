@@ -476,6 +476,12 @@ function decorateFeature(feature, descriptor, metadata) {
     role === 'intersection' ? properties.id : undefined,
     role === 'intersection' ? feature.getId() : undefined,
   );
+  const centerlineId = descriptor.id === 'centerlines'
+    ? firstValue(properties.centerline_id, properties.centerlineId, feature.getId())
+    : undefined;
+  const refineId = descriptor.id === 'centerlines'
+    ? firstValue(properties.refine_id, properties.refineId, metadata.refine_id, metadata.context?.refine_id)
+    : undefined;
 
   feature.set('_layerId', descriptor.id, true);
   feature.set('_layerName', descriptor.name, true);
@@ -485,6 +491,10 @@ function decorateFeature(feature, descriptor, metadata) {
   feature.set('_sourceRowKey', sourceRowKey, true);
   feature.set('_resolvedPointId', resolvedPointId, true);
   feature.set('_intersectionId', intersectionId, true);
+  if (descriptor.id === 'centerlines') {
+    feature.set('_centerlineId', centerlineId, true);
+    feature.set('_refineId', refineId, true);
+  }
 }
 
 function createLayerRecord(descriptor) {
@@ -846,6 +856,34 @@ function formatBbox(bbox) {
 
 function updateActionState() {
   const features = selectedFeatures.getFeatures().getArray();
+  const centerlines = features.filter((feature) => feature.get('_layerId') === 'centerlines');
+  const centerlineOnly = features.length > 0 && centerlines.length === features.length;
+  const centerlineIds = centerlines.map((feature) => feature.get('_centerlineId')).filter(isPresent);
+  const centerlineFitIds = unique(centerlines.map((feature) => feature.get('_fitId')).filter(isPresent));
+  const centerlineDetectIds = unique(centerlines.map((feature) => feature.get('_detectId')).filter(isPresent));
+  const centerlineRefineIds = unique(centerlines.map((feature) => {
+    const featureRefineId = feature.get('_refineId');
+    if (isPresent(featureRefineId)) return featureRefineId;
+    return state.runs.detect.find((run) => String(run.id) === String(feature.get('_detectId')))?.refine_id;
+  }).filter(isPresent));
+  const currentDetectRun = state.runs.detect.find((run) => String(run.id) === String(state.context.detectId));
+  const currentFitRun = state.runs.fit.find((run) => String(run.id) === String(state.context.fitId));
+  const centerlineIdsValid = centerlineIds.length === centerlines.length
+    && unique(centerlineIds).length === centerlines.length
+    && centerlineIds.every(isPositiveSafeIntegerId);
+  const centerlineContextCurrent = centerlineOnly
+    && Boolean(state.refineId && state.context.detectId && state.context.fitId)
+    && centerlineFitIds.length === 1
+    && String(centerlineFitIds[0]) === String(state.context.fitId)
+    && centerlineDetectIds.length === 1
+    && String(centerlineDetectIds[0]) === String(state.context.detectId)
+    && centerlineRefineIds.length === 1
+    && String(centerlineRefineIds[0]) === String(state.refineId)
+    && String(currentDetectRun?.refine_id) === String(state.refineId)
+    && String(currentFitRun?.detect_id) === String(state.context.detectId);
+  const centerlineReady = centerlineContextCurrent
+    && centerlineIdsValid
+    && centerlineIds.length <= 1_000;
   const allResolved = features.length > 0 && features.every(
     (feature) => isPresent(feature.get('_resolvedPointId')),
   );
@@ -869,10 +907,11 @@ function updateActionState() {
   const detectIds = unique(
     intersections.map((feature) => firstValue(feature.get('_detectId'), state.context.detectId)).filter(isPresent),
   );
-  const intersectionReady = features.length > 0 && intersections.length === features.length
+  const intersectionReady = centerlines.length === 0 && features.length > 0 && intersections.length === features.length
     && unique(intersectionIds).length === features.length && detectIds.length === 1;
   const replayReady = !state.busy && (
-    intersectionReady || (
+    centerlineReady || intersectionReady || (
+      centerlines.length === 0 &&
       intersections.length === 0 &&
       replayKeys.length > 0 &&
       replayKeys.length <= 1_000 &&
@@ -883,6 +922,16 @@ function updateActionState() {
   dom.replayAction.disabled = !replayReady;
   if (state.busy) {
     dom.replayHint.textContent = '正在处理请求…';
+  } else if (centerlines.length) {
+    dom.replayHint.textContent = !centerlineOnly
+      ? 'Replay 不支持混选中心线、交叉口与轨迹点'
+      : !centerlineIdsValid
+      ? '所选中心线必须具有有效且互不重复的 centerline_id'
+      : centerlineIds.length > 1_000
+      ? `中心线选择上限为 1000 · 当前 ${centerlineIds.length}`
+      : !centerlineContextCurrent
+      ? '所选中心线必须属于当前 Fit、Detect 与 Refine Run'
+      : `回放 ${centerlineIds.length} 条中心线 · Fit ${centerlineFitIds[0]}`;
   } else if (intersectionReady) {
     dom.replayHint.textContent = `回放 ${intersectionIds.length} 个交叉口构成点`;
   } else if (intersections.length) {
@@ -901,7 +950,7 @@ function updateActionState() {
     dom.replayHint.textContent =
       '所选要素缺少统一的 source_row_key 或 resolved_point_id';
   } else {
-    dom.replayHint.textContent = '选择已加载的点或一个以上交叉口';
+    dom.replayHint.textContent = '选择已加载的点、交叉口或中心线';
   }
 
   const clipReady =
@@ -924,6 +973,11 @@ function isPresent(value) {
   return value !== undefined && value !== null && value !== '';
 }
 
+function isPositiveSafeIntegerId(value) {
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric > 0;
+}
+
 function unique(values) {
   const seen = new Set();
   return values.filter((value) => {
@@ -937,6 +991,18 @@ function unique(values) {
 async function runReplay() {
   if (dom.replayAction.disabled) return;
   const features = selectedFeatures.getFeatures().getArray();
+  const centerlineFeatures = features.filter((feature) => feature.get('_layerId') === 'centerlines');
+  if (centerlineFeatures.length) {
+    await runAnalysis('Replay', (signal) => requestReplay({
+      databaseName: state.databaseName,
+      detectId: state.context.detectId,
+      fitId: state.context.fitId,
+      refineId: state.refineId,
+      centerlineIds: unique(centerlineFeatures.map((feature) => feature.get('_centerlineId')).filter(isPresent))
+        .map(Number),
+    }, { signal }));
+    return;
+  }
   const intersectionIds = features.length > 0 && features.every(
     (feature) => feature.get('_layerRole') === 'intersection',
   ) ? features.map((feature) => feature.get('_intersectionId')) : undefined;
@@ -1019,7 +1085,21 @@ function drawResult(name, featureCollection, metadata = {}) {
   state.lastResult = { name, featureCount: features.length, metadata };
   dom.resultCard.hidden = false;
   dom.resultTitle.textContent = `tmp · ${name}`;
-  dom.resultDetail.textContent = `${features.length.toLocaleString('zh-CN')} 个要素`;
+  const hasCenterlineCounts = Number.isSafeInteger(metadata.returned_point_count)
+    && metadata.returned_point_count >= 0
+    && Number.isSafeInteger(metadata.returned_clip_count)
+    && metadata.returned_clip_count >= 0;
+  const resultSummary = hasCenterlineCounts
+    ? `${metadata.returned_point_count.toLocaleString('zh-CN')} 个唯一构成点 · ${metadata.returned_clip_count.toLocaleString('zh-CN')} 个来源片段 · ${features.length.toLocaleString('zh-CN')} 个几何要素`
+    : `${features.length.toLocaleString('zh-CN')} 个要素`;
+  const sourceSemanticsNote = metadata.selection === 'centerline_ids'
+    && metadata.source_fingerprint_verified !== true
+    ? '当前源值投影；未验证历史来源指纹'
+    : '';
+  const resultDescription = sourceSemanticsNote
+    ? `${resultSummary} · ${sourceSemanticsNote}`
+    : resultSummary;
+  dom.resultDetail.textContent = resultDescription;
   renderLayerTree();
   updateFeatureTotal();
 
@@ -1031,11 +1111,11 @@ function drawResult(name, featureCollection, metadata = {}) {
     if (!isEmptyExtent(extent)) {
       view.fit(extent, { duration: 420, maxZoom: 18, padding: [70, 70, 70, 70] });
     }
-    setStatus(`${name} 完成 · ${features.length.toLocaleString('zh-CN')} 个要素已绘制到 tmp`);
-    showToast(`${name} 完成，结果已绘制到 tmp 图层。`, 'success');
+    setStatus(`${name} 完成 · ${resultDescription} 已绘制到 tmp`);
+    showToast(`${name} 完成 · ${resultDescription} 已绘制到 tmp 图层。`, 'success');
   } else {
-    setStatus(`${name} 完成 · 返回结果为空`);
-    showToast(`${name} 已完成，但没有返回可绘制要素。`, 'warning');
+    setStatus(`${name} 完成 · 返回结果为空${sourceSemanticsNote ? ` · ${sourceSemanticsNote}` : ''}`);
+    showToast(`${name} 已完成，但没有返回可绘制要素。${sourceSemanticsNote ? ` ${sourceSemanticsNote}。` : ''}`, 'warning');
   }
 }
 

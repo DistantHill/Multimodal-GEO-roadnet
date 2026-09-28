@@ -124,10 +124,13 @@ def test_centerline_fields_keep_pair_direction_and_metre_units() -> None:
     geometry = {"type": "LineString", "coordinates": [[120.1, 30.2], [120.2, 30.3]]}
     result = PostgresMapStore._centerline_feature(
         (81, DETECT_ID, "directed", 11, 12, 123.5, 8, 3, geometry),
+        fit_id="12345678-1234-5678-1234-567812345679",
     )
     assert result["id"] == 81
     assert result["geometry"] == geometry
     assert result["properties"] == {
+        "centerline_id": 81,
+        "fit_id": "12345678-1234-5678-1234-567812345679",
         "detect_id": DETECT_ID,
         "variant": "directed",
         "from_intersection_id": 11,

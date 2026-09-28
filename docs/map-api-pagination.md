@@ -1,4 +1,4 @@
-# 地图视口瓦片加载、分页与交叉口回放
+# 地图视口瓦片加载、分页与回放
 
 ## 视口区域加载
 
@@ -82,3 +82,36 @@ Backend 对所选交叉口分别执行既有交叉口 Replay，再按 resolved p
 `selection=intersection_ids`、所选 `intersection_ids`、所属 `detect_id`、候选交叉口 ID、
 `intersection_sources`（交叉口 ID 与候选交叉口 ID 的对应关系列表；无构成点时也保留映射）、
 `returned_point_count` 和 `truncated=false`。
+
+## 中心线 Replay
+
+`POST /api/v1/map/replay` 支持 `centerline_ids`，与点及交叉口选择互斥。
+请求必须指定 `fit_id`、`detect_id`，可指定 `refine_id`；Backend 验证完整运行及其
+归属，未知中心线、跨运行选择、缺失或不完整的中心线清单（centerline manifests）均失败。
+Web UI 只允许回放属于当前 Fit、Detect、Refine Run 的中心线。
+
+查询从选中中心线的清单定位穿越点（crossing points），再读取同子轨迹起终序列闭区间
+内的解析点；不使用邻近点、视口包围盒或完整 Detect 轨迹代替清单成员。
+返回去重的 Point 及每条清单对应的来源片段 LineString，而不是将中心线顶点冒充轨迹点。
+点按 `resolved_point_id` 合并，`centerline_ids`、`clip_sources` 保留全部归属。
+片段 ID 为 `centerline:{id}:clip:{ordinal}`，方向反转时保留持久化起终点及方向标记。
+
+`vehicle_id` 表示持久化 Refine 车辆身份，成员必须与同子轨迹锚点一致；
+`source_vehicle_id` 单独表示保留点当前源行的原始车辆字段，允许原样返回空值。
+缺失源行或坐标仍使请求失败。旧 Run 的持久化身份
+可能带有分段后缀，不能要求它与原始字段相等，也不通过剥后缀猜测映射。
+车辆预算统计持久化身份，metadata 以
+`vehicle_identity_semantics=persisted_refine_vehicle_id` 明示这一口径。
+
+`max_points` 仅统计唯一解析点，`max_vehicles` 统计车辆数；来源片段数量受
+`map.clip_feature_limit` 限制，片段与点的归属引用总量另受 `map.replay_max_points_max`
+限制。共享点不会重复消耗唯一点预算，但会计入归属引用上限。选择数量受
+`map.replay_selection_ids_max` 限制。任何超限或缺失成员均使整个请求失败，不返回部分结果。
+响应分别报告 `returned_point_count`、`returned_clip_count`、`membership_reference_count`
+与 `membership_reference_limit`，`truncated=false`；几何要素数量为点数与片段数之和。
+
+本分支仅确认持久化成员身份与运行关联，坐标及属性读取当前源数据行，未运行整 Refine
+来源指纹校验。因此明确返回 `source_fingerprint_verified=false` 和
+`value_semantics=persisted_clip_members_with_current_source_values`，界面同时提示
+“当前源值投影；未验证历史来源指纹”。不能将结果解释为已认证的历史拟合输入值还原。
+已有 Clip 和 Pipeline 来源指纹检查保持不变。

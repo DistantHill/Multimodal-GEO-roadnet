@@ -251,7 +251,7 @@ export async function loadMapLayer(
 }
 
 export async function requestReplay(
-  { detectId, sourceRowKeys, resolvedPointIds, intersectionId, intersectionIds, bbox, maxVehicles, maxPoints, databaseName },
+  { detectId, fitId, refineId, sourceRowKeys, resolvedPointIds, intersectionId, intersectionIds, centerlineIds, bbox, maxVehicles, maxPoints, databaseName },
   { signal } = {},
 ) {
   const body = {};
@@ -259,7 +259,7 @@ export async function requestReplay(
   if (detectId !== undefined && detectId !== null) body.detect_id = detectId;
   if (sourceRowKeys?.length) body.source_row_keys = sourceRowKeys.map(String);
   if (resolvedPointIds?.length) body.resolved_point_ids = resolvedPointIds;
-  if (bbox !== undefined) throw new MapApiError('Replay 不支持 bbox，请选择准确的点或交叉口 ID。');
+  if (bbox !== undefined) throw new MapApiError('Replay 不支持 bbox，请选择准确的点、交叉口或中心线 ID。');
   if (intersectionId !== undefined) body.intersection_id = intersectionId;
   if (intersectionIds !== undefined) {
     if (!Array.isArray(intersectionIds) || intersectionIds.length === 0
@@ -269,13 +269,29 @@ export async function requestReplay(
     }
     body.intersection_ids = intersectionIds.map(Number);
   }
+  if (centerlineIds !== undefined) {
+    if (!Array.isArray(centerlineIds) || centerlineIds.length === 0 || centerlineIds.length > 1_000
+      || new Set(centerlineIds.map(Number)).size !== centerlineIds.length
+      || centerlineIds.some((id) => !Number.isSafeInteger(Number(id)) || Number(id) < 1)) {
+      throw new MapApiError('Replay 必须选择 1 到 1000 条具有有效且互不重复 centerline_id 的中心线。');
+    }
+    if (fitId === undefined || fitId === null || fitId === '') {
+      throw new MapApiError('中心线 Replay 缺少 fit_id 上下文。');
+    }
+    if (detectId === undefined || detectId === null || detectId === '') {
+      throw new MapApiError('中心线 Replay 缺少 detect_id 上下文。');
+    }
+    body.centerline_ids = centerlineIds.map(Number);
+    body.fit_id = fitId;
+    if (refineId !== undefined && refineId !== null && refineId !== '') body.refine_id = refineId;
+  }
   if (maxVehicles !== undefined) body.max_vehicles = maxVehicles;
   if (maxPoints !== undefined) body.max_points = maxPoints;
 
-  const selections = [body.source_row_keys, body.resolved_point_ids, body.intersection_id, body.intersection_ids]
+  const selections = [body.source_row_keys, body.resolved_point_ids, body.intersection_id, body.intersection_ids, body.centerline_ids]
     .filter((value) => value !== undefined);
   if (selections.length !== 1) {
-    throw new MapApiError('Replay 需要且只能提供来源键、resolved point ID、单个交叉口 ID 或交叉口 ID 列表。');
+    throw new MapApiError('Replay 需要且只能提供来源键、resolved point ID、交叉口 ID 或中心线 ID。');
   }
   if (body.resolved_point_ids && !body.detect_id) {
     throw new MapApiError('resolved point ID Replay 缺少 detect_id 上下文。');

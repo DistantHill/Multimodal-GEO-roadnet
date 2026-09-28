@@ -143,7 +143,7 @@ class PostgresMapStore:
                     f"completed Fit Run {resolved_fit_id} does not belong to Detect Run {detect_id}"
                 )
             rows = self._centerline_layer(resolved_fit_id, bbox, limit + 1, offset)
-            features = [self._centerline_feature(row) for row in rows[:limit]]
+            features = [self._centerline_feature(row, resolved_fit_id) for row in rows[:limit]]
             metadata = {"fit_id": resolved_fit_id, "detect_id": resolved_detect_id}
         else:
             raise MapNotFoundError(f"unknown map layer: {layer_id}")
@@ -164,6 +164,10 @@ class PostgresMapStore:
         if request.database_name is not None:
             return self._query_database("replay", request)
         self._validate_database(request.database_name)
+        if request.centerline_ids is not None:
+            from ..replay.select_centerline_members import replay_centerlines
+
+            return replay_centerlines(self, request, _require_config().map)
         if request.intersection_id is not None:
             from ..replay.select_intersection_members import replay_intersection
 
@@ -926,10 +930,12 @@ class PostgresMapStore:
         )
 
     @staticmethod
-    def _centerline_feature(row: Any) -> dict[str, Any]:
+    def _centerline_feature(row: Any, fit_id: str | None = None) -> dict[str, Any]:
         return create_map_feature(
             int(row[0]),
             _geometry(row[8]),
+            centerline_id=int(row[0]),
+            fit_id=fit_id,
             detect_id=str(row[1]),
             variant=str(row[2]),
             from_intersection_id=int(row[3]),

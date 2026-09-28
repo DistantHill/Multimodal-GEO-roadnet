@@ -40,8 +40,11 @@ def parse_bbox(value: str | None) -> BBox | None:
 class ReplayRequest(BaseModel):
     intersection_id: int | None = Field(default=None, ge=1)
     intersection_ids: list[int] | None = Field(default=None, min_length=1)
+    centerline_ids: list[int] | None = Field(default=None, min_length=1)
     database_name: str | None = Field(default=None, min_length=1, max_length=63)
     detect_id: UUID | None = None
+    fit_id: UUID | None = None
+    refine_id: UUID | None = None
     source_row_keys: list[str] | None = None
     resolved_point_ids: list[int] | None = None
     bbox: BBox | None = None
@@ -57,6 +60,17 @@ class ReplayRequest(BaseModel):
             raise ValueError("intersection_ids must contain positive integers")
         if len(set(value)) != len(value):
             raise ValueError("intersection_ids must contain distinct values")
+        return value
+
+    @field_validator("centerline_ids")
+    @classmethod
+    def validate_centerline_ids(cls, value: list[int] | None) -> list[int] | None:
+        if value is None:
+            return None
+        if any(item <= 0 for item in value):
+            raise ValueError("centerline_ids must contain positive integers")
+        if len(set(value)) != len(value):
+            raise ValueError("centerline_ids must contain distinct values")
         return value
 
     @field_validator("source_row_keys")
@@ -95,21 +109,24 @@ class ReplayRequest(BaseModel):
     def validate_selection(self) -> "ReplayRequest":
         if self.bbox is not None:
             raise ValueError(
-                "Replay 不支持 bbox，请发送 resolved_point_ids、intersection_id 或 intersection_ids"
+                "Replay 不支持 bbox，请发送点 ID、交叉口 ID 或 centerline_ids"
             )
         selections = (
             self.intersection_id,
             self.intersection_ids,
+            self.centerline_ids,
             self.source_row_keys,
             self.resolved_point_ids,
             self.bbox,
         )
         if sum(value is not None for value in selections) != 1:
             raise ValueError(
-                "provide exactly one of source_row_keys, resolved_point_ids, intersection_id, or intersection_ids"
+                "provide exactly one of source_row_keys, resolved_point_ids, intersection_id, intersection_ids, or centerline_ids"
             )
         if self.resolved_point_ids is not None and self.detect_id is None:
             raise ValueError("resolved_point_ids requires detect_id")
+        if self.centerline_ids is not None and (self.fit_id is None or self.detect_id is None):
+            raise ValueError("centerline_ids requires fit_id and detect_id")
         return self
 
 
@@ -141,6 +158,7 @@ def resolve_replay_limits(request: ReplayRequest, config: "MapConfig") -> Replay
     """Return a request with configured defaults after enforcing its resource budget."""
     for name, values in (
         ("intersection_ids", request.intersection_ids),
+        ("centerline_ids", request.centerline_ids),
         ("source_row_keys", request.source_row_keys),
         ("resolved_point_ids", request.resolved_point_ids),
     ):
