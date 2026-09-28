@@ -2,10 +2,10 @@
 
 术语遵循[项目术语与写作规范](terminology.md)，不在本文复制通用术语表。
 
-状态：Q99 全链路列批实施已完成主要功能，独立审查与最终功能验收收尾中；本次 1M 冒烟及 26M 性能验收尚未执行
+状态：Q99 列批重构已实施并通过功能测试；26M 性能验收未通过；Q100–Q107 与后续审核方案已确认，历史实施授权保留；本轮性能优化 Q108–Q110 为未回答的讨论草稿，无新增实施授权
 创建日期：2026-09-19
-更新日期：2026-09-26
-访谈进度：Q19–Q89 的历史问答与实施记录保留；点对象重构已确认；Q99 已选择 A，实施已授权、进行中；权威 XY 为 (N,2)/float64，验收未通过（尚待执行验证）
+更新日期：2026-09-28
+访谈进度：历史 QA 保留；Q99 已实施；Q100–Q107 及审核1/3/4和索引2已确认。Q108–Q110 待回答，当前仅调查与讨论。原5文件预算变更已在历史提交 `3c777b6`。
 
 > 本文是当前活跃设计。旧的[2,000 万行内存预算与验收标准 Spec](pipeline-20m-memory-budget-spec.md)
 > 保留容量审计、旧进程池/磁盘暂存方案及历史实施证据，但已被本文取代。
@@ -583,8 +583,24 @@ Q78 已选择独立功能验收：用少量基于权威源数据的已知交叉�
 - Pipeline 父控制组 memory.peak < 2,000,000,000 B；
 - PostgreSQL 内存、临时文件和磁盘单独报告；
 - 从 Refine 开始至 Network 完成的墙钟时间 < 3,600 秒；
-- 对原 Q19–Q63 列式迁移范围，输出通过 7.1 的语义差分；Q76 的新 Detect 网格
-  跨轨迹路径不适用旧输出差分，按本变更独立功能验收。
+- Q99 本次全链路重构按 7.1 的更正规则执行独立功能、身份/顺序/锚点和回放验证，
+  不执行旧输出差分或容差检查。
+
+### 7.3 本轮 grid 预算策略（Q100–Q107 已确认，计划待最终确认）
+
+用户要求本修改先计划并 grilling，随后回答“全部采用推荐”：Q100=A，配对工作量、
+membership 索引、整 grid 输入、候选及全 Run 去重累计四层均纳入完整处理方案，
+超预算切换处理策略而非预算直接失败；Q101=A，超过 1 小时继续完成，但明确记录
+性能目标未达标。该决策覆盖 Q77 旧 grid failfast 约束；它不是恢复实施授权。
+初稿时已写 WIP 保留但未提交；当前 5 文件变更已在 HEAD `3c777b6`。Q102 要求保留普通快路径，超预算使用 DuckDB 原生外存，
+禁止项目显式 save/spool/COPY 落盘流程；Q103 要求沿用 50GB 初始额度，自动上调
+生效额度并记录日志。每个独立 DuckDB 实例初始 50GB，倍增至 100GB、200GB 封顶，
+不设置 Run 合计配额；Q106 仅对 DuckDB 临时额度耗尽执行受限重试。用户已确认
+这些语义，但尚未确认本节下方完整实施计划或授权恢复实施。
+既有 2 GB Pipeline 控制组硬上限、swap 0、规则与精确完整性保持；不跳过 grid 或
+配对，普通 grid 路径保留。1 小时仍是性能目标，不因继续运行而放宽。
+当前生产仍存在整 grid 输入及全 Run 候选/去重预算拒绝，尚未完成四层方案；
+不声称整个 worker 全程已有界或所有 grid 都能完成。
 
 ## 8. 实施与验证计划
 
@@ -638,7 +654,7 @@ grid/Parquet/内存求交路径统一仅排除同 subtrack_index，允许同车�
 | Clip/Fitting 双坐标与端点关系 | 已实施；真实 PG 下游验证通过 |
 | Pipeline/Backend 回放与边界调用迁移 | 已实施；Backend 84 项通过 |
 | 旧类、无生产者接口与重复结果清理 | 已实施；生产残留扫描无匹配 |
-| 功能、make test、指定冒烟/全量及性能验证 | 完整 make 已通过；正式 1M 正在运行，26M 待执行 |
+| 功能、make test、指定冒烟/全量及性能验证 | 完整 make 已通过；首次 1M 诊断运行失败，修复后重跑待执行，26M 未执行 |
 | 审查、分 commit 集成与提交 | 独立交叉审查已闭环；b12b960、10f27a6 已提交 |
 
 ## 9. 风险与待决事项
@@ -675,8 +691,8 @@ PostgreSQL 连接；Q74 确认 `todo/running/done/failed`、失败最多重试 2
 全局顺序与连续编号。用户特别要求最小实现：不建立 Dask 或通用线程池、任务框架，
 仅为本跨轨迹任务编写局部调度逻辑。Q76 更正：开发阶段不拿历史中间数据或旧
 算法结果作为权威基线，不设置新旧结果容差；只把 `trajectory_points`、`day01`
-等源数据表视为权威来源。Q77 确认单格内存超预算立即返回错误，不重试该格，
-与 Q74 的其他可恢复失败最多重试 2 次区分。Q78 采用少量权威源数据构造的
+等源数据表视为权威来源。Q77 的单格内存超预算立即返回错误是历史决定，
+现由 Q100=A 覆盖：四层预算超限切换处理策略，保持完整处理；具体方案待讨论。Q78 采用少量权威源数据构造的
 几何用例及 Pipeline 冒烟测试，不与旧算法输出比较；测试配置对应关系见第 8 节。
 新方案的性能与聚类质量尚未验证；本次设计确认与逐函数实施授权来自 Q79，
 不由原 Q62/Q63 自动推定。
@@ -2055,8 +2071,9 @@ Q76 后续更正意味着不要求候选集合、坐标或编号逐项对应旧�
 > 用户回答：q77 如果内存超预算，明确返回error并不再重跑
 
 正文关联：第 3.2、6、7、9.1 节。
-当前解释：单格内存超预算应明确返回错误，不自动重试该格或自动重跑 Detect；
-Q74 的最多两次重试仅适用于其他可恢复失败。
+历史解释：单格内存超预算明确返回错误，不自动重试该格或自动重跑 Detect。
+当前更正：Q100=A 已覆盖此预算 failfast 决定，四层均需完整处理策略；
+普通可恢复错误的 Q74 重试规则不因本题自动改变。
 
 ### 第 18 轮合并回答 — 对应 Q76–Q77
 
@@ -2694,3 +2711,593 @@ Spec 原 Q98 将这些内容分为九项，因此按语义对应，不机械按�
 - 最终完整 `make test`（无忽略文件，真实 PG）：Backend 84 passed；Pipeline/CV 1181 passed、零 skipped，75.81 秒，8 项既有 Rasterio 弃用提醒。最后完整 patch 的资源释放修复在套件收集后补入，另外执行 25 项受影响测试通过，并经独立弱引用测试 1 passed 确认；两次结果分别归因。
 - 已固定 runtime 提交 `10f27a6 refactor: complete columnar pipeline and replay contracts`（93 个文件，完整可导入运行的模型 API 迁移同时覆盖 Backend）。测试覆盖映射见 [Q99 Detect 测试覆盖迁移映射](validation/columnar-detect-test-mapping.md)。外部既有 Makefile、README、Dockerfile、CI 修改未纳入本任务提交。
 - 1M 正式冒烟已启动：源 `public.day01`，配置 `pipeline-roadnet-test.toml`，Refine ID `0b31582d-0f2f-4a55-b08e-34dc50e8573e`，runtime revision `10f27a6`。结果尚未完成，不表示冒烟或性能验收通过。
+
+
+#### 首次 1M 诊断运行结果（runtime `10f27a6`）
+
+- 配置 `pipeline-roadnet-test.toml`；源 `public.day01`，只读源 count 前后均为 1,000,000。Refine `0b31582d-0f2f-4a55-b08e-34dc50e8573e`，Detect `a886bd50-c318-4397-91b7-941bac629f21`。
+- CLI 完整耗时 921.782 秒，返回码 1。Detect 计算与写出后，最终事务被旧数据库 completion guard 的同 vehicle 排除规则拒绝；未进入 Clip/Fitting/Network，不属于功能或性能验收成功。
+- Fresh Pipeline cgroup memory.peak 1,999,998,976 字节（请求 2,000,000,000 字节，内核按页向下取整），swap 0；memory.max 压力事件 274，OOM 与 oom_kill 均 0。该计量包括 wrapper、Pipeline 子进程与该容器计入的缓存，不等同主进程 RSS。共享 PostgreSQL 的历史 cgroup peak 另采样，不作为本 Run 独占峰值。
+- 共享 PG 数据库计数 delta：temp_bytes 2,703,799,187 字节，database_size 644,202,496 字节；临时文件计数 8,288→13,101。这些数据库累计计数可能包括同库并发活动，不声称严格独占归因。
+- 现有日志：Refine 读取精炼 47.7 秒、1,598 车辆，kept 614,879、excluded 385,121、injected 999；cross-grid 1,131 个任务；turn 56,178，hotspot 10,105，cross 58,655，candidate crossing 83,947，clusters 393，complete intersections 292（事务完成前计算结果）。
+- 本次作为诊断运行进行了隔离 helper 容器的三次短时只读 py-spy stack dump，未向被测容器安装包或修改源码。前两次定位到 CrossCandidateRelation 的 ndarray object→DuckDB register/INSERT 与 importlib 探测，第三次定位到 topology CrossingBatch 构造；因此本次数字不作为修复后新 revision 的最终性能验收。
+- 实证收尾项：RefineReader/topology Reader 仍保留整轨 tuple 中间图，改为有序有界驱动批次立即列化与列 chunks；DetectDatasetReader 去掉新引入的每轨查询；Turn/Cross 参数列写入保留独立 NULL/NaN mask，避免 object 扫描。数据库派生校验只排同 Run subtrack，允许同原车不同 partition；保护源表不改。
+
+- 首次失败后的派生数据库 guard 修复：只保留同 Detect Run 的 `subtrack_index` 相同即拒绝，删除原 vehicle 相同 OR 及四个无必要来源表 JOIN。真实 PostgreSQL completion/schema/migration 受影响组 45 passed，新增同原车不同 partition 提交通过、同 partition 拒绝；独立审查确认 endpoint 的 Detect/Run 外键与 owner、连续 segment 校验保留。
+- 已向 `roadnet_test` 与 `roadnet` 仅执行该函数的 `CREATE OR REPLACE FUNCTION validate_detect_run_completion()`，没有 reset、没有对源表 DML。新建库与重复 `init-db` 使用相同正式 DDL；物理表 schema version 8 不变。
+
+- 首次诊断后的读取结构修复：RefineReader 与 topology Reader 一条有序 SQL 读取、bounded driver batch 立即列化，只保留跨 batch 的各列 chunks；不再保留整轨 row tuple 图。原 32 函数 43 cases 加跨 batch/readonly/释放证据共 48 passed。DetectReader 恢复单条有序读取，消除重构新引入的按每轨查询；两个 reader 经独立交叉审查无开放 finding。
+- DuckDB 关系 I/O 独立微基准（4096 行宽 Cross 全字段、batch 1024、两轮）：原 register 26.195852/24.143485 秒；直接 typed nested-list 参数 32.502882/36.168193 秒，因此未选择该更慢路径；最终 bounded typed-column scalar JSON 参数 `from_json`/`unnest` 0.125571/0.118719 秒。微基准只代表传输边界，不等同全链路性能。
+- 最终正式关系写入仍以 ndarray 为 Pipeline 内存模型；每个有界写入批次暂时序列化每列，不构造或保留逐事件 row。所有用户值与列 schema 用驱动参数传递，SQL 标识符来自固定 dataclass 字段。NULL 与有效 NaN 使用独立 mask 恢复，不与业务 valid mask 混用；BIGINT 极值/0/-1、Unicode/空串/NULL、正负 Inf、IEEE signed zero 实证保真，事务失败无前缀写入与计数回滚保留。真实 PostgreSQL 11 个受影响测试文件 259 passed、零 skipped，独立审查闭环，无新增依赖。
+
+- 集中修复后的完整 `make test`（无忽略文件、真实 PG）：Backend 84 passed；Pipeline/CV 1195 passed、零 skipped，71.88 秒，8 项既有 Rasterio 提醒。固定 runtime 修复提交 `e85bc83 fix: stream columns and validate Run partition identity`；新 1M 正式验收已启动，未进行 helper stack 采样干预，Refine ID `b3c526aa-a054-4ff1-bc63-533c9be33162`，完成前不标记成功。
+
+- `e85bc83` 的 1M 运行因只读审查确认尚有重复 XY 投影及必要身份/CSV 边界修复，主动有序终止，属于诊断运行，不是验收成功。只中断本任务 Pipeline 子进程并取消已定位的 Detect COPY 会话，未停止共享服务；计量 wrapper 完整记录 1240.209719 秒、返回 -2、Pipeline 控制组峰值 1,999,998,976 字节、max 631、OOM/OOM kill 均 0，`public.day01` 前后均 1,000,000 行。运行未完成 Detect Parquet 导出，尚未进入 Clip/Network，最终 stats 为空；记录 `columnar-e85bc83-smoke.json`、日志 `columnar-e85bc83-smoke.log`。
+- 后续集中收口包含 Refine Parquet 原生 BIGINT 来源 key、Backend 外部字符串 key 对 BIGINT 的参数绑定、实际 CSV 导入入口与非 UTF 编码猜测、Clip 已证实的列参数驱动成本，以及 Detect 导出复用 Refine 权威 XY。独立 PG 回放遗留模块 `query_replay_inputs.py` 的两个函数全仓库无调用或导入，删除该未使用 API，实际 CLI/Backend 回放保留；外部 JSON 的字符串 key、同时间 `id::text` 排序及 v1 指纹文本编码保持。
+- 主动终止的 Detect Run `e91895d3-3b14-47bf-ae83-4890ce00ef44` 已仅按正式结束语义标记 failed，避免清理中断留下 running 状态；未删除已记录的诊断派生证据。
+- 集中来源身份审计：Refine Parquet schema/export/Reader 与 PG grid 内部 key 统一 BIGINT，注入来源 key 用 NULL 与独立 Refine ID 表达；Backend 外部字符串 key 参数绑定为 BIGINT[]。保留的文本转换仅用于外部 JSON 回放字段、可选 lineage 诊断 JSON 与 v1 来源指纹/同时间排序。实际 CSV 导入恢复 bounded COPY 写入数返回，不建立逐点 ID 映射；编码猜测使用明确 runtime 默认值。真实 CSV Parser→CLI→私有临时 PG 表验证多车辆、extra 与关闭，受影响 Parser/回放/模型组 53 passed；Backend 真实临时 PG key 0/-1 与原 Map 组 16 passed。
+- 最后权威 XY 链收口：schema v9 新增 kept 派生 x/y，新 Refine writer 写入算法 track.xy，Refine export 直接读取；v8→v9 仅新增 nullable 派生列，历史数据不 backfill、不重新投影 fallback。两库 `roadnet_test`/`roadnet` 已通过 `init-db --migrate-artifacts` 升级。真实 PG 升级/写出/非投影 XY 导出 25 passed；PG Clip replay reader 同样复用 kept.x/y，并以有界 driver 数组列 chunks 代替整轨 row tuple 图，权威 XY、跨批次释放与早关闭组 13 passed，最终 streaming 组 20 passed。
+- 固定集中 runtime 提交 `fbc2c41 fix: preserve native identity and reuse authoritative coordinates`（34 个本任务文件，仅增量 stage Backend 来源键两处 SQL）。最终 Pipeline/CV 完整套件 1210 passed、零 skipped，76.55 秒、8 项既有 Rasterio 提醒。原 `make test` 的 Backend 阶段 84 passed、1 failed：外部并发 centerline 回放新增字段与原 `test_streaming_api_fields` 预期未同步，本任务未修改或提交该外部实现/测试；执行 make 同等 Pipeline/CV 命令完成上述全绿。本任务 Backend 真实 PG/Map 精确组 16 passed。
+- 最新 1M 冒烟已按固定 `fbc2c41` 启动，源 `public.day01`、配置 `pipeline-roadnet-test.toml`，Refine ID `49e953ef-4046-490f-8ad9-b7165d86c065`，尚未完成时不记录成功。状态清单与计量路径已落盘，Pipeline 新控制组与共享 PG 分开计量；26M 全量验收待实际运行。
+
+#### 恢复后验证与全量计量（2026-09-27）
+
+- `fbc2c41` 的受控 1M 诊断在 Detect 导出阶段主动终止，耗时 1069.416285 秒、返回 2；源 `public.day01` 前后均 1,000,000。Pipeline cgroup peak 为 1,999,998,976 字节，max 496、OOM/oom_kill 0、swap 0。不是完成验收。独立 DuckDB EXPLAIN 确认 kept 条件与 ID 等值并列的 LEFT JOIN 使用 BLOCKWISE_NL_JOIN；等价地把 kept 条件折入 nullable 左键后使用 HASH_JOIN LEFT。
+- 用户另行完成的 1M 日志 `20260926_234453_620938_pid-1_log.txt` 五阶段均 completed，总耗时 1905.410 秒；Refine `eb80a2f6-7105-48b5-bb01-accbbc344356`、Detect `de0cfdd1-1586-4be9-9c2a-e3069a80e31d`、Fit `867af27e-ab31-4c20-9ee2-4536f9f7a238`，Network 292 nodes/556 edges。复用该功能通过证据，不重复整套 1M；它发生在 JOIN 修正前且日志没有 revision/config 路径或 cgroup/swap/OOM 指标，不作为修正后性能或内存验收。
+- 最小修复提交 `6e5b2cd fix: hash join authoritative kept coordinates`：仅改 kept 身份 JOIN 的等价表达式，保留非 kept 同 ID 不关联及缺失权威 XY 拒绝。真实 PG 导出精准组 13 passed，追加计划回归所在组 12 passed；独立私有 mixed-kind 256 行 old/new 全字段精确一致，计划从 BLOCKWISE_NL_JOIN 变为 HASH_JOIN，微量 probe 不外推全量收益。
+- 恢复后执行 `make test`：Backend 84 passed/1 外部 centerline 字段 fixture failed；没有修改外部契约。随后执行相同完整 Pipeline/CV 命令，1239 passed、零 skipped、72.44 秒、8 项既有 Rasterio 提醒。计划回归在该套件收集后新增，另行精准验证通过，分别归因。
+- 26M 全量已启动：源 `public.trajectory_points` 精确 26,000,000 行，配置 `pipeline.toml`，显式 `--refine-resume-last false` 确保 fresh Refine；任务提交 `6e5b2cd` 加工作区用户 reuse 等既有 dirty，不能称纯 commit checkout。测量 wrapper 记录额外 CLI 参数，dirty 摘要独立保存；Pipeline fresh cgroup 请求 2,000,000,000 字节、有效 1,999,998,976、swap 0，PG 共享服务单列。实际结束前不标记 26M 时间/内存验收通过。
+
+
+### grid 预算修订规划轮（2026-09-27）
+
+用户最新要求（根协调器转述）：本修改先计划，并与用户 grill。完整逐字用户消息
+未传给本文维护者，故不伪造引文。当前仅事实查证与文档维护；不继续生产修改、提交
+或重启 26M。该轮记录时，5 文件 WIP 尚未提交：取消总 overflow 配对工作量拒绝，
+membership 超限复用全 finite overflow 流，及对应测试；35 focused cases 已正常收尾通过，
+不构成新方案批准。`6e5b2cd` 的 26M 诊断已安全终止，316.391142 秒、返回 -2，
+peak 141,770,752 B、max/OOM 0、swap 0；源前后均 26,000,000 行，不属于完整验收。
+
+#### Q100 — “尽量完成每 grid”的覆盖范围
+
+> A：覆盖配对工作量、membership 索引、整 grid 输入、候选及去重累计四层；超限切换处理策略，而不是因预算直接失败。（推荐）
+>
+> B：仅覆盖已复现的配对工作量与 membership 两层，其他层保留硬拒绝。
+
+推荐 A；分块或落盘的具体策略依本题答案在下一轮讨论，当前不预先批准实现。
+
+> 用户回答：全部采用推荐
+
+正文关联：第 7.3 节。当前解释：采纳 A，四层均纳入完整处理方案；具体策略及实施授权仍待后续。
+
+#### Q101 — 超过 1 小时的运行策略
+
+> A：继续完成，并明确记录性能目标未达标。（推荐）
+>
+> B：1 小时时终止，并标记失败。
+
+推荐 A；两项均保留既有 2 GB/swap 0 和精确完整规则，不将超过 1 小时写为性能通过。
+
+> 用户回答：全部采用推荐
+
+正文关联：第 7.2、7.3 节。当前解释：采纳 A，超过 1 小时继续完成，性能目标未达标须明确记录。
+
+
+### 本轮合并回答 — 对应 Q100–Q101（2026-09-27）
+
+> 用户回答原文：全部采用推荐
+
+采纳 Q100=A、Q101=A；仅确认上述设计选择，不推定恢复实施授权。
+
+### 候选结果与全 Run 去重的只读规划事实（2026-09-27）
+
+以下为建议，不是已确认实施方案。当前 `CrossCandidateRelation` 具有原生字段 schema、
+有界 typed-column JSON 参数写入、事务失败计数回滚、sealed 批量读取、临时目录与 close
+清理；可以复用业务批次接口，不需要逐事件对象或通用关系框架。当前连接为 `:memory:`，
+scheduler 的 worker `found`、全 Run `batches` 与 `seen_pairs` 仍累计，最后 concat/unique/sort；
+仅提前 append 到现有关系并不能证明整个结果路径严格有界。
+
+最低改动建议：worker 使用独立磁盘候选关系并分批写入；主关系在受限 DuckDB 运算中按
+`from_subtrack_index/to_subtrack_index/from_point_index/to_point_index` 去重和排序，最终连续编号。
+重复代表需使用确定的网格顺序与局部顺序，不使用线程完成先后；最终身份顺序保持既有规则。
+每 worker 只拥有自己的连接，主线程合并，异常或 early close 关闭 cursor/连接并删除本任务
+临时目录，成功关系由阶段所有者消费后关闭。资源失败不发布部分 Run，不能跳过配对。
+
+现有配置可复用：`relation_batch_size=1024`、DuckDB memory_limit/threads、
+`duckdb_max_temp_directory_size="50GB"`，及 data_root 下任务独立 duckdb 临时目录。
+该 50GB 是 DuckDB 临时文件上限，不自动等同新增磁盘数据库文件或多个 worker 的全 Run
+总空间上限；具体容量计量与磁盘空间耗尽时的行为仍需下一轮决策。已定 Q100 四层覆盖、
+Q101 超时继续、2GB/swap0、精确完整、不 skip 与普通路径保留，不重复询问。
+
+### 下一轮 — 大 grid 兜底与引擎临时外存预算（2026-09-27）
+
+发问时前提：Q100=A 四层均需完整处理，Q101=A 超过 1 小时继续并记录性能目标未达标；
+2 GB/swap 0、全部 grid 完成、精确配对、不 skip、稳定身份与普通路径保持。
+本轮只讨论路线及外存容量；当时 WIP 实施暂停，未授权继续。
+
+#### Q102 — 大 grid 的兜底路线
+
+> A：保留普通 grid 快路径；超预算数据交 DuckDB 列式关系，按有界块完整遍历块对并复用原几何 kernel。（推荐）
+>
+> B：先实现自适应空间子网格削减候选，再以块对兜底；需新增长段跨界覆盖与去重规则。
+
+推荐 A：包含所有跨块配对，保持原精确几何规则；最坏工作量可能很大。
+B 增加空间划分及覆盖/去重规则，需要额外验证。用户回答更正显式落盘方向，见下文。
+
+> 用户回答：保留普通快速路径，超预算用duckdb，不要显式调用保存，而是利用duckdb原生的外存特性
+
+正文关联：第 7.3 节。当前解释：普通快路径保留，超预算采用引擎原生外存，
+禁止项目显式 save/spool/COPY 落盘流程；具体支持与资源控制待核查。
+
+#### Q103 — 引擎临时外存预算
+
+> A：继续使用现有 50GB 引擎临时外存上限；耗尽明确失败，不自动扩容。（推荐）
+>
+> B：提高该配置，由用户指定额度。
+
+推荐 A。当前 `duckdb_max_temp_directory_size="50GB"` 仅为引擎 temp 限制，
+不覆盖所有 worker 累计或磁盘数据库数据文件，不能称为 Run 级硬 quota。
+新增文件及 Run 实际总磁盘峰值需要计量记录，但本轮不引入项目全局配额框架。
+目录与恢复粒度沿已有决定，不在本题重复选择。此前草案提出的单 Run 所有工作文件
+50GB 硬上限未经验证，已在发问前撤回，不作为用户待选项或已确认约束。
+
+> 用户回答：沿用上限，自动扩容并log内写入扩容事件
+
+正文关联：第 7.3 节。当前解释：50GB 是初始额度；应用自动上调引擎生效
+max_temp_directory_size 并记录事件，不声称 DuckDB 原生自动提升该配置。
+这里不是物理扩磁盘或修改 Docker 挂载；最终边界、增长规则与重试粒度待讨论。
+
+
+### 本轮回答原文 — 对应 Q102–Q103（2026-09-27）
+
+> Q102：保留普通快速路径，超预算用duckdb，不要显式调用保存，而是利用duckdb原生的外存特性
+>
+> Q103：沿用上限，自动扩容并log内写入扩容事件
+
+此回答确认原生外存方向及自动上调要求，不构成恢复编码、提交或重跑授权。
+此前“worker 磁盘关系显式保存”建议不是现行决定，须按 Q102 修订；50GB 总 Run
+硬配额草案已撤回。只测量实际磁盘占用，不把引擎 temp 限制冒称全 Run 硬 quota。
+
+### 下一轮 — 自动上调的边界与增长规则（待回答）
+
+此前 Spec 未确认对应预留水位、固定最终额度或增长规则。以下只调整 DuckDB 允许的
+临时外存上限，不预先占用磁盘，也不扩大物理磁盘。SQL 失败后的重试粒度另待事实核查，
+不在本轮预设。
+
+#### Q104 — 自动上调的最终边界
+
+> A：不另设固定最终额度，按临时目录所在文件系统可用空间和预留水位约束上调；达到水位明确失败。（推荐）
+>
+> B：配置固定最终上限；达到上限失败。
+
+推荐 A。预留水位数值在选择 A 后再讨论，当前不擅定；选择 B 后需明确最终额度。
+
+> 用户回答：最终边检 200G
+
+正文关联：第 7.3 节及 Q103。当前解释：按语义记录最终边界 200GB，
+不是采纳预留水位建议。配置作用域待下一轮澄清，不能默认为 Run 全局硬 quota。
+
+#### Q105 — 额度增长规则
+
+> A：额度倍增，50→100→200GB，受 Q104 最终边界约束。（推荐）
+>
+> B：每次增加 50GB。
+
+推荐 A。这里提高允许的引擎 temp 上限，不预先申请或占用相应磁盘容量。
+
+> 用户回答：倍增
+
+正文关联：第 7.3 节及 Q103/Q104。当前解释：50→100→200GB，达到最终额度
+不能再自动增长；不预占磁盘，不修改物理磁盘或 Docker 挂载。
+
+#### Q106 — 提高额度后的重试粒度
+
+> A：保留已提交输入或当前有界批次，必要时 ROLLBACK，提高额度后只重放失败 SQL/批次，不重复交付已完成批次。（推荐）
+>
+> B：清理当前 grid 中间结果后整 grid 重算。
+
+推荐 A。DuckDB 不能从 operator 内部断点续算，这里是当前 SQL 或有界批次的重放。
+普通失败 Run 的整阶段重跑约定保持；额度上调是尚未判定 Run 失败的内部可恢复事件，
+不等同自动重跑已失败 Run。Q104/Q105 已回答；Q106 后续确认受限 A，见本题追加回答。
+
+> 用户回答：啥意思，说清楚批次和grid
+> 用户追问：我感觉A更合理，但是保留每个batch批次，会不会过度设计了，如果要实现A需要付出什么代价？需要设计什么机制？
+> 用户最终回答：同意，只处理duckdb额度耗尽的case
+
+正文关联：第 7.3 节及 Q103–Q105。当前解释：在成本说明后确认受限 A：仅 DuckDB 临时外存额度耗尽触发扩容与安全重放；当前有界输入的短暂持有不等于保存历史批次或持久 checkpoint。
+
+
+### 本轮回答原文 — 对应 Q104–Q106（2026-09-27）
+
+> Q104：最终边检 200G
+>
+> Q105：倍增
+>
+> Q106：啥意思，说清楚批次和grid
+
+Q104 按语义记录最终额度 200GB；Q105 为 50→100→200GB。按文件系统剩余空间与
+预留水位设置最终边界的推荐没有被采纳，不保留为用户决定。200GB 的配置作用域仍需
+澄清，不能推定为 Run 全局磁盘硬 quota。Q106 当时仅请求解释，后续回答确认受限 A。
+
+#### Q106 的术语与例子说明（后续确认受限 A）
+
+- grid 是一个地理范围的任务；一个 grid 内可包含许多 segment 配对。
+- pair batch 是有界的候选 segment 配对计算批，区别于数据库输入 fetch 批，
+  也不必与写入事务一一对应。
+- 推荐恢复粒度为失败 SQL 或可重放批次事务：保留已提交输入及完成结果，
+  失败事务 ROLLBACK 后提高额度并重放，不重复交付已完成批次。
+
+例如某 grid 按 100 个可重放计算/写入批次完成，第 61 批失败：A 保留已经完成的
+1–60 批，在扩容后重放失败操作并继续；B 清理该 grid 中间结果，重新计算整个 grid，
+也必须避免重复交付。该例只用于理解，不声称实际失败总发生在 pair batch 边界。
+一次排序/去重 SQL 可能覆盖整个 grid，失败后需要重放该整条 SQL，不保证仅重算
+固定几条 pair，也不能声称从 SQL 内部或 operator 断点继续。
+
+本轮仍在规划：不恢复生产修改、测试、提交或重跑。
+
+
+### Q106 追问：A 的最小恢复代价（2026-09-28，仅规划）
+
+> 用户追问原文：我感觉A更合理，但是保留每个batch批次，会不会过度设计了，如果要实现A需要付出什么代价？需要设计什么机制？
+
+用户已确认受限 A，仅处理 DuckDB 临时外存额度耗尽。A 不要求保存每个批次副本，不新增持久 checkpoint 或
+恢复表。现有 `CrossCandidateRelation.append_batch` 和 `TurnEventRelation.append_batch` 已把
+传入的一个 ndarray 业务批次按配置 `relation_batch_size` 切成有界列，每次建立 JSON 参数，
+在一次 BEGIN/COMMIT 内写入，失败时 ROLLBACK 并将 `_count` 恢复到调用前值。
+列参数当前只活到该次 SQL 调用；调用者在 append 返回前仍持有当前业务批次。
+因此单次 append 的最小重放可以保留当前输入批次到提交成功，失败后回滚，提升额度，
+对同一个输入重调 append；已成功提交的前序 append 无需缓存或重播。
+
+代价是要在明确的资源所有者处识别“引擎临时外存额度不足”且仅对此扩容；
+失败事务必须先回滚、再在连接空闲时调 `max_temp_directory_size` 并记录旧/新额度、
+操作、关系或 grid 身份、失败原因和重试次数。需要保证写入前序批次不会重复交付，
+`_count`、`ordinal`、`calculation_index` 与唯一约束在回滚后同步，且 50→100→200GB
+超过上限仍明确失败。其他 SQL/数据/真实磁盘不足错误原样失败。
+
+不能把这一逻辑当作统一几行 wrapper：`seal` 的聚合校验、去重/排序 SQL 可能处理
+整个关系，失败时需保留已提交输入并重放整条 SQL；scheduler 当前还将 worker 的
+`found`、主线程 `batches` 和 `seen_pairs` 累计在 Python 内存，需要先改变结果所有权与
+确定性去重边界。`append_batch` 事务包含内部多个 1024 行块，若后半块失败，整个
+append 回滚并重放该业务批次，而非只重放最后一个内部块。当前 `:memory:` 关系可用
+DuckDB 原生 temp 外存，temp 路径由关系单独拥有；失败和阶段结束仍必须 close cursor、
+连接并清理目录。额外内存主要是当前有界 ndarray 批次与该次 JSON 参数，外存与重跑
+当前 SQL 的计算量可能增加；没有基于代码证据的统一工时数字。
+
+上述机制/成本解释后，用户确认受限 A；仍未授权恢复实施。
+
+### Q106 受限 A 的读取与交付边界补充（已确认，实施暂停）
+
+这里的受限 A 仅针对 DuckDB 临时外存额度耗尽。现有关系 `append_batch` 的事务、
+`_count` 回滚和调用者在返回前持有的当前业务 batch 可复用；既不保存历史 batch，
+也不新增持久 checkpoint/恢复表。新增机制是识别特定额度错误，事务 ROLLBACK，
+在没有活跃 SQL 的连接上将生效额度按 50→100→200GB 调高并记日志，然后重放当前
+业务 batch 或失败的整条 SQL。一个业务 batch 内可能有多个 1024 行写入子片；
+事务中途失败应重放整个业务 batch，子片不是独立恢复单元。
+
+PostgreSQL 网格输入使用前向 cursor/generator，已经 yield 给下游的数据不能倒带。
+读取中的当前有界输入需持有到相应写入 COMMIT；已提交的输入/结果不重放。
+去重和排序这类可能触发临时外存额度的 SQL 必须在向下游交付前完成；已输出的
+DuckDB result cursor 不能作为任意位置可续传流。利用现有 grid 完成与阶段发布界线，
+不新增任意游标续传、跨进程恢复框架，也不声称 SQL operator 能断点续算。
+
+当前 worker 的 `found`、主线程 `batches`/`seen_pairs` 改为引擎外存，是 Q100
+四层完整处理的共同工作，无论 Q106 选 A 或 B 都需要，不能算成 A 独有成本。
+若某 grid 在完成前已分批提交中间候选，要隔离其未完成结果，确保失败清理或
+确定性幂等去重，不能假定 INSERT 重放天然幂等。受限 A 的专属代价是额度错误分类、
+事务边界与计数状态同步、额度日志和安全重放。
+
+待验证语义：多子片 append 中途额度失败后不重复候选且计数连续；已提交结果不重放；
+到达 200GB 最终额度时明确失败；非额度错误不得误触发扩容或重试。用户已确认
+Q106 受限 A，但未授权恢复实施。
+
+
+### Q106 最终确认原文（2026-09-28）
+
+> 用户回答原文：同意，只处理duckdb额度耗尽的case
+
+当前解释：采纳受限 A，只针对 DuckDB 临时外存额度耗尽，回滚后按 50→100→200GB
+上调生效额度并记日志，再重放当前可重放业务批或整条 SQL。其他 OOM、PostgreSQL、
+I/O、几何或数据错误不因此自动重试。此设计确认不等于恢复编码、测试或提交授权。
+
+### 200GB 配置作用域的只读核查（2026-09-28）
+
+现有 `max_temp_directory_size` 在各 `duckdb.connect` 配置中独立设置，
+不是 Run 全局额度。正式 Detect 同时创建 TurnEventRelation 与 CrossCandidateRelation
+两个独立 DuckDB 连接，各有独立 temp 目录；其他 Refine/Detect 导入导出、关系回读、
+Clip 输入及制品操作也各建连接。当前网格 worker 使用 PostgreSQL 连接，尚无 DuckDB
+每 worker 关系；若 Q100 方案为 worker 建关系，实例数和并发容量将增加。
+
+最小选择是沿引擎原生的每实例 cap：每个发生额度耗尽的实例从 50→100→200GB，
+现有连接生命周期与隔离目录可复用，日志逐实例记录。代价是并发连接的实际 temp
+占用之和可以超过 200GB；测量需另记录 Run 实际总磁盘峰值。若 200GB 意指 Run
+共享总 cap，当前多个独立连接仅分别 SET 200GB 无法达成；实现前可查单 Run
+共享 DuckDB 实例、独立游标等引擎原生策略，或另行协调额度，不能预断唯一方案
+是自研全局 quota 框架。
+
+Q107 后续确认每实例分别设置，不采用 Run 合计额度；本段保留发问前的只读取舍说明。其他未决项若只是
+异常分类、单 SQL 的重试实现、资源清理与测试，按已确认语义由实施者解决，
+不另要求用户决定。当前 5 文件预算变更已进入 HEAD；后续实施仍暂停。
+
+
+### Q107：200GB 的作用域（已回答）
+
+发问时前提：Q100 四层完整处理、Q101 超时继续并标性能未达标、Q102 DuckDB
+原生外存、Q103 初始 50GB 自动上调、Q104 最终 200GB、Q105 倍增、Q106 仅
+DuckDB 额度耗尽的受限 A 均已确认；本题只确认额度语义，不授权实施。
+
+#### Q107 — 200GB 上限约束哪个范围
+
+> A：每个独立 DuckDB 实例各按 50→100→200GB 增长；复用引擎原生 cap，单 Run 实际合计可能超过 200GB。（推荐）
+>
+> B：整个 Run 的全部 DuckDB 工作区合计最多 200GB；需要调整共享实例或统一额度协调，不能只给每个现有实例设置 200GB。
+
+推荐 A，保持当前各关系独立 owner/连接边界。当前代码存在多个独立 DuckDB 实例，
+其 `max_temp_directory_size` 不能自动形成 Run 总额。若用户选 B，须再核可否使用
+单 Run 共享 DuckDB 实例、独立游标等引擎原生策略；不预断必须自研全局 quota。
+block size、SQL、内存切分与重试实现是工程细节，不再作为本题用户语义选择。
+
+> 用户回答：按推荐，每个实例分别设置临时额度，不要合计
+
+当前解释：采纳 A。每个独立 DuckDB 实例从 50GB 增至 100GB、200GB 封顶；
+不设置 Run 合计配额。逐 owner 记录扩容事件，Run 实际总磁盘峰值仍测量报告，
+不将其用作 200GB 总量拒绝。完整实施方案与恢复实施授权仍待最终确认，
+当前 5 文件预算变更已进入 HEAD；后续实施暂停。
+正文关联：第 7.3 节及 200GB 配置作用域的只读核查。
+
+
+### Q107 回答原文（2026-09-28）
+
+> 用户回答原文：按推荐，每个实例分别设置临时额度，不要合计
+
+采纳每实例 DuckDB 原生 temp cap；50→100→200GB 每个实例独立生效，
+不设单 Run 合计拒绝。总磁盘实际占用只作测量与报告，不当作共享硬额度。
+
+## Q100–Q107 现行实施计划（2026-09-28，已获恢复授权）
+
+本节是实施时优先遵循的现行正文，后文 QA 与独立审核保留历史过程。用户已确认
+Q100–Q107、提前切换、不统一内存安排、精确 DBSCAN 减少冗余列/复制、删除两处
+`event_identity` UNIQUE ART，并授权恢复实施。5 文件预算变更已在历史提交
+`3c777b6`，仅覆盖部分预算层；本节和第 7.3/7.2 节共同定义当前目标与验收。
+
+### 行为和资源边界
+
+1. 普通 grid 快路径及原几何 kernel、交叉角/直线规则、同 Run subtrack 身份排除、
+   交点精确计算、规范 pair 方向和稳定最终排序保持。网格状态仍需全部完成才可结束
+   Detect；不跳过困难网格，不以已有派生结果或旧输出容差作为正确性 oracle。
+2. 配对总工作量是计算量，不是驻留内存：超过原 20M 工作量阈值继续使用现有
+   有界 pair patch 流，保留估计与进度记录；membership 索引超驻留预算时不分配
+   oversized 索引，改由全 finite segment 的有界精确配对流处理，保留同轨排除、
+   overflow/overflow 一次性去重及非有限段原处理规则。
+3. 整 grid 输入超驻留预算时，在当前 grid 生命周期内将输入列交 DuckDB TEMP
+   关系，按有界 segment 块读回，完整枚举块对（包含不同块），复用同一几何 kernel；
+   不持有完整 grid 的 Python row/segment 图，不因预算跳过配对。普通小 grid 不额外
+   走关系路径。必须在旧 `grid_segments` concat/unique 超额分配前、同一尚未关闭的
+   PostgreSQL 前向 cursor 中早切；按 segment identity 做完整 grid 有界去重，不能
+   先触发旧 guard 后重开逐轨/逐块全表扫描。
+4. 候选与全 Run 去重超过驻留预算时，候选列批进入 DuckDB TEMP 关系，由引擎
+   对业务 identity 去重、按既有身份规则稳定排序、最后赋连续 calculation_index，
+   不保留 worker `found`、主线程 `batches`/`seen_pairs` 的无界 Python 图。worker
+   的部分 grid 结果在该 grid 完成前不得作为最终结果对外交付；跨 grid 重复代表
+   必须依据确定的 grid 序和局部序，不依赖线程完成先后。worker→主线程以有界
+   批次/背压交接，不堆积 future 的整个 grid 候选。暂存与最终 Cross/Turn 关系均
+   不创建 `event_identity(calculation_index)` UNIQUE ART；暂存先按 pair 身份去重
+   稳定排序，再用 SQL `row_number` 生成最终连续编号，最终关系 `seal` 独立校验
+   非 NULL、唯一、连续与业务有效性，成功后才供下游按编号查询。
+5. DuckDB 使用 `:memory:`/TEMP 表及引擎原生外存。项目不新增显式 save/spool/COPY
+   文件流程、不新建通用任务/配额框架。每个独立实例的初始 temp cap 为 50GB，
+   仅识别 DuckDB 临时额度耗尽后，在连接空闲且必要事务已回滚时提升至 100GB、
+   200GB，200GB 封顶；逐 owner 记录实例/阶段/grid或关系、旧新额度、失败原因、
+   重放操作与次数。增加的是允许额度，不预占磁盘或改变物理磁盘与 Docker 挂载。
+   非额度 OOM、PostgreSQL、I/O、几何及数据错误不自动扩容或重试。实例各自有
+   上限，不设 Run 合计 200GB 拒绝；实际总磁盘峰值另计量。
+6. 额度失败可恢复时，保留调用者当前有界输入直到 COMMIT；ROLLBACK 后同步恢复
+   关系计数与 ordinal，再重放失败的整个业务批次或整条 SQL。单业务批次内 1024
+   行写入子片不单独 checkpoint；已提交批次不重播。排序/去重等 SQL 在对外发布
+   前完成；已向下游 yield 的前向 cursor 与 SQL operator 均不支持任意断点续传。
+   不保存历史 batch 副本，不设持久 checkpoint/恢复表。200GB 用尽仍失败，
+   不发布部分 Run。
+7. 保留现有精确 G*/DBSCAN、空间网格按需邻域及 `eps`/`min_samples`；减少
+   `_coordinates` 中不必要 source 列与 pieces→concat 重复数组，并按实际候选规模
+   核 labels/gridlinks 等线性状态及 2GB 父控制组峰值。不改用 ELKI/近似/抽样。
+   用户拒绝统一内存分配/并发准入，保持当前 worker 默认数与每实例 1GB 配置，
+   不预称 2GB 性能目标已满足。
+
+### 依赖顺序与 review 单元
+
+1. 核对历史提交 `3c777b6` 中已纳入的 5 文件预算变更与当前其他 dirty ownership；
+   复核其有界 overflow 工作量修复与
+   membership fallback，在相同输入的 known geometry、same vehicle 不同 subtrack、
+   同 subtrack 排除、非有限段、跨 patch 唯一性、patch 上限及稳定方向测试后形成
+   第一逻辑提交；若实现与本文语义不符则修订 WIP，不直接视 35 focused passed
+   为最终验收。
+2. 实现单 grid 大输入在 concat 前、同 cursor 早切的 DuckDB TEMP 列关系、
+   全局 segment identity 有界去重与跨块完整配对，维持输入 cursor
+   与 worker/关系 owner 的 close/异常清理。小 grid 快路径和大 grid 精确结果按
+   独立已知几何断言验证，不以历史产物做 oracle；形成第二逻辑提交。
+3. 将 worker 候选与全 Run 去重/排序/连续编号移入 TEMP 关系，移除两处
+   `event_identity` UNIQUE ART，以 `seal` SQL 保持发布前唯一/连续性；删除无界
+   `found`/`batches`/`seen_pairs` 累计；跨 worker 与跨 grid 的确定性代表和部分
+   结果隔离、事务失败回滚/资源清理测试通过后形成第三逻辑提交。
+4. 在每个 DuckDB 资源 owner 处加入仅 temp cap 错误触发的受限扩容及日志，
+   对当前有界业务批或安全整 SQL 做重放。构造多子片中途失败、已提交不重播、
+   200GB 上限、其他异常不误重试、异常 close/临时目录清理测试；形成第四提交。
+   实际代码依赖可使步骤 2/3 与 owner 控制交织，但可 review 提交必须维持可运行。
+5. 减少 `_coordinates`/G* 的重复列与数组副本，保留精确算法；用实际输入规模与
+   2GB 父控制组核结果。geometry 对算法身份/配对覆盖、原生 spill 与额度重放
+   边界做独立只读 review；
+   所有具体 finding 由相应 owner 修复。统一执行 `make test` 及真实 PG 受影响组，
+   说明外部并发 Backend fixture 若仍失败的独立原因，不删除旧测试覆盖。
+6. 固定可运行 runtime revision 与工作区 dirty 摘要，使用
+   `services/pipeline/config/pipeline-roadnet-test.toml` 跑 fresh 1M 全链路功能冒烟；
+   然后用 `services/pipeline/config/pipeline.toml` 对精确 26,000,000 源行做 fresh
+   Refine→Network 全链路计量。保护 `trajectory_points`/`day01` 源表只读 count
+   前后相同；派生可重建。记录 Run IDs、每阶段/子阶段耗时、完整 CLI 墙钟时间、
+   Pipeline 新 cgroup peak/max/OOM/swap、DuckDB 每实例额度事件与临时目录/Run
+   总磁盘峰值、PG temp/disk 单列。Pipeline cgroup peak <2,000,000,000 B、
+   swap 0/OOM 0 且完整耗时 <3600s 才可标性能达标；超过 1 小时仍继续完成，
+   明确写性能目标未达标，不自动终止作业。功能完整与性能目标分别报告。
+
+### 本轮实施与验证状态（2026-09-28）
+
+四层预算路径已按上述现行计划接入：普通 grid 保留原快路径，超额输入在同一
+PostgreSQL 前向流中转入 DuckDB TEMP 列关系，块对仍调用原精确几何 kernel；
+worker 通过有界队列交付候选，主线程暂存、按稳定身份去重和编号，失败 attempt
+在重试前删除。Cross/Turn 的两处 `event_identity` UNIQUE ART 已移除，`seal`
+负责最终编号校验。独立 DuckDB owner 使用 50→100→200GB 的受限 temp 额度
+恢复；G* 坐标读取省去不用的 source 列。实现仍须以真实 1M 与 26M 全链路运行
+检验，当前不将 2GB、1 小时或完整功能验收写为已达标。
+
+验证已完成：真实 PostgreSQL Compose 环境的 Pipeline/CV 完整套件
+`1273 passed`、零失败；受影响组 `57 passed`；grid 路径生产镜像
+`46 passed`，其中含真实 DuckDB 低内存 TEMP spill 与额度重试；关系/额度
+受影响组 `118 passed`。`make test` 的 Backend 部分 `108 passed, 1 failed`，
+失败为现有 `test_store_clip_reads_resolved_crossings_and_returns_between_clip`
+夹具对 source fingerprint 查询返回错误列形状，本轮没有修改 Backend 生产或
+夹具文件；`make test` 因此未整体通过。完整 Pipeline/CV 随后按 Makefile
+同等命令单独运行并通过。新的 fresh 1M 冒烟与 fresh 26M 全量性能/资源
+验收仍待执行，不能用此前成功的 1M 日志替代此次改动的验证。
+
+本计划不改变既有 2GB 硬 cap、数据保护、前后端 JSON/CLI/回放契约。用户已
+确认上述最终方案并授权恢复实施；功能与性能达标仍以实际检查/运行结果为准。
+
+
+### Sol high 独立设计审核（2026-09-28，未闭环）
+
+独立审核结论：当前计划**不能直接实施**。以下是必须补足的设计与证据，
+不是已修复项；Q100–Q107 的用户决策保持有效，不重复询问内部实现细节。
+
+1. `grid_segments` 现先 concat/unique 再检查预算，超限前已经分配；`finally`
+   会关闭 PostgreSQL 前向 cursor。大 grid 兜底必须在超额分配之前将同一 cursor
+   后续有界输入交给 DuckDB TEMP，并在完整 grid 范围按 segment identity 有界去重。
+   不能先触发旧 guard、关闭 cursor 后才试图切换或重读全部源。
+2. `CrossCandidateRelation` 当前对 `calculation_index` 建 UNIQUE ART 索引；
+   DuckDB 原生外存不能据此保证 ART 索引内存有界，而且在暂存阶段预置唯一编号
+   与最终全 Run 去重、稳定编号可能冲突。需明确不依赖 ART 的 staging/最终关系设计，
+   或拿出该索引在 2GB 父控制组下的实测预算证据，才能称候选路径有界。
+3. 候选到聚类的后续内存仍需核查：`_coordinates` 累计全部 pieces 并 concat
+   XY、indices、source，DBSCAN 等阶段也可能全量驻留。计划应涵盖完整
+   候选→聚类峰值及超额时保持精确规则的处理方式，或以测量证据证明既有预算足够；
+   不能预设必须重写全部 DBSCAN，也不能无证据宣称 26M 必然 OOM。
+4. 多个 DuckDB 实例各自 `memory_limit=1GB`，而 Pipeline 父控制组硬上限为 2GB。
+   每实例 200GB temp cap 是磁盘配置，不解决并发驻留内存。需定义并发连接
+   的内存分配/准入和峰值验证方案；这不是 Run 磁盘总 quota 决策。
+
+审核还指出需具体落实 worker→主线程有界批与背压、关系 owner 清理、稳定重复代表；
+限定 DuckDB temp cap 重放不能误改 Q74 的普通可恢复错误重试规则，同时避免
+200GB 封顶后的重复循环与已完成批次再次交付。这些是实现边界，不自动形成
+新的用户语义问题。
+
+当前 Git 核对：HEAD 为 `3c777b6`，工作树 Spec 修改仍未提交；此前 5 文件预算
+WIP 已在 HEAD 中，不能继续标成“未提交”。仓库还存在其他人的 staged/untracked
+文件，不能从当前状态推定该提交的作者或混入本任务后续提交。审核项待修订详细方案
+与再次独立复核；本节不将其标为通过，也不恢复编码、测试或全量运行。
+
+### 对 Sol high 审核的用户反馈及索引事实（2026-09-28，规划中）
+
+本轮根协调器转述的用户原话片段：
+
+> 1：那就早点呗
+>
+> 2：什么索引？用在哪里？
+>
+> 4：不要整理内存安排
+
+当前解释：第 1 点接受在超额 concat/unique 分配之前判断，并在仍打开的同一
+PostgreSQL 前向 cursor 上切换至 DuckDB TEMP；这修订计划，尚非代码已实现或审核闭环。
+第 4 点撤回 Sol high 建议的统一内存分配/全局准入计划，保留既有 worker 数和每实例
+`duckdb_memory_limit` 默认设置，不暗改配置。原 2GB Pipeline 父 cgroup 的计量与验收
+约束未被用户明确取消，继续实际测量，不能事先保证已满足。第 3 点 DBSCAN 的
+代码与资料事实由独立审查者另核，本记录不抢先定论。用户提及 ELKI、近似或调整
+`eps` 的论证并未授权换语言/库、放宽精确规则或改既有阈值。
+
+用户问的不是空间索引。`CrossCandidateRelation._create_schema` 在建立 `events` 后，
+创建 `event_identity ON events(calculation_index)` UNIQUE 索引；`TurnEventRelation` 有
+同名同字段索引。它约束单个关系内“事件编号”唯一，并可能服务按编号选取的查询；
+不按候选两端 segment identity 去重，也不按 XY 做空间搜索。当前 grid 先在 Python
+按双方 subtrack/point index 去重、排序，再赋连续 `calculation_index`，随后才写入
+`CrossCandidateRelation`。因此现有索引不能替代未来 TEMP staging 的业务 pair 去重。
+
+`CrossCandidateRelation.iter_batches(indices=...)` 将外部传入的 int64 calculation
+indices 注册为临时 selected 关系，再 `JOIN events USING(calculation_index)` 并按
+`ordinal` 输出；SQL 不显式要求索引，优化器是否使用该索引需另证。`seal` 还独立检查
+`count(DISTINCT calculation_index)`、首末 ordinal、ordinal distinct 及
+`calculation_index=ordinal`；即使移除 UNIQUE 索引，语义校验仍有代码路径，
+但重复编号在 append 时的即时拒绝会改变。测试覆盖按索引切片读取、篡改后的
+seal 拒绝、资源关闭；不能盲删现有最终关系索引或改公开的 `iter_batches(indices)`
+契约。规划建议仅在**新增 TEMP staging** 中不预置该 UNIQUE ART 索引，
+先完成稳定 pair 去重和最终编号；现有最终关系保持接口和校验，是否无索引或延后
+建索引需在资源实测/行为测试后决定，尚未批准任何代码删除。
+
+高优先级审核项目前仍有未闭环部分：提前切换尚待实现；索引 staging/最终关系的
+内存证据未补；候选→聚类峰值尚待独立事实；用户拒绝统一内存安排后仍需按原 2GB
+父控制组实测。worker→主线程有界背压、稳定代表及额度重试边界仍是详细设计工作。
+本轮只修改计划，不运行生产/测试、不提交，也不宣称已经可以直接实施。
+
+### DBSCAN 与索引审核的事实补充（2026-09-28，仅规划）
+
+独立核查确认，当前 DBSCAN 为项目自研的精确实现，输入是 G* 转向热点与 cross
+候选，不是 26M 原始点；`n>256` 时已有空间网格索引，邻域按需计算，核心点计数
+达到 `min_samples` 即止，没有全 N×N 距离矩阵。成功的 1M 运行对应输入约
+10,105 个转向热点与 58,655 个 cross 候选，DBSCAN 相关两段计时约 0.2/0.8 秒；
+这只说明该次输入，并不能推断 26M 聚类的候选数、峰值或耗时，因为 26M 此前在
+聚类前失败。计划先测真实候选规模，并检查 `_coordinates` 的全量 pieces/concat XY、
+indices 与不必要 source 列，以及 labels/gridlinks 等线性状态的峰值。保留现有精确
+算法、`eps`、`min_samples`，不把用户技术论证误读成改用 ELKI、近似搜索、抽样或
+调整阈值的授权，也不预设要重写 DBSCAN。
+
+`event_identity(calculation_index)` 是最终候选关系的事件编号唯一性约束，
+不是空间索引；segment pair 去重另以两端 subtrack/point 身份 key 执行。新增
+候选 TEMP staging 不应预建该 ART 索引，但仅这么做并未解决最终关系保留索引时的
+驻留峰值。最终关系是否延后建索引、以无索引的 SQL 唯一性校验替代，或用实测证明
+索引在 2GB 父控制组内可承受，仍需给出明确方案与证据，不把索引审核标为闭环。
+
+用户已拒绝 Sol high 的统一内存分配/并发准入建议：实施计划撤回该建议，保持现有
+每实例 memory_limit 与 worker 默认设置。该取舍不等于已证明内存足够；原 2GB
+Pipeline 父 cgroup 指标仍需测量和如实报告。这里没有新增待用户决定的算法选项。
+
+### 用户对四项审核的本轮收敛与索引推荐（2026-09-28，实施仍暂停）
+
+用户经根协调器转述的原话：
+
+> ok，14已经收敛了把，2：你给个推荐方案，3按照推荐完成
+
+当前解释：第 1 点提前切换至同一前向 cursor 的 DuckDB TEMP 路径，已是确认的计划
+修订；第 4 点不做全局内存分配/统一准入、不擅改默认 worker 或每实例内存配置，
+已收敛，但原 2GB Pipeline 父控制组仍需实测，不能宣称已达标。第 3 点采纳此前推荐：
+保留现有精确 G*/DBSCAN、`eps` 与 `min_samples`，先减少 `_coordinates` 中不必要
+source 列和 pieces→concat 重复数组，测实际候选规模、labels/gridlinks 等线性
+状态及父控制组峰值；不换 ELKI/近似/采样，不预设重写整个 DBSCAN。这里“按照推荐
+完成”是方案采纳，不在第 2 点索引方案尚待确认时推定全局恢复实施授权。
+
+第 2 点给用户的最小推荐方案是**整条生产链删除两处 `event_identity` UNIQUE ART**，
+不是只让大数据 staging 无索引、最终关系照旧重建可能占用内存的 ART：
+
+- 新的 cross 候选 TEMP staging 存双方 subtrack/point 身份及确定的 grid/local 顺序，
+  不预分配最终事件编号，不建 `calculation_index` ART，也不使用空间索引代替业务
+  pair 去重。引擎 SQL 先按业务 pair 身份选确定性首次代表，再按既有规范顺序排序，
+  最后 `row_number` 产生连续 `calculation_index`。
+- `CrossCandidateRelation` 与 `TurnEventRelation` 最终关系均删除
+  `CREATE UNIQUE INDEX event_identity ON events(calculation_index)`。保留现有列 schema、
+  按编号 `iter_batches(indices)` 的 selected JOIN、原 JSON/lineage/stable IDs 与
+  `seal` 的 SQL 检查（非 NULL、`count(DISTINCT calculation_index)`、ordinal 首末/唯一、
+  `calculation_index=ordinal`）；只在验证通过后发布关系。索引不是空间索引，也不是
+  grid pair 去重：前者以前约束事件编号，后者本来依赖两端业务身份。
+- 内部错误时点会变：重复 `calculation_index` 从 append 时 ART 即时拒绝，转为
+  seal 时 SQL 拒绝且关闭关系，不保留不必要的内部错误时点兼容层。生产调用者
+  顺序写入并在 seal 后消费；公开查询字段和结果语义不变。现有测试中人为另外
+  创建的 source/vehicle UNIQUE 索引用于注入事务失败，保留该测试；单行篡改、
+  非连续 ID 的 seal 测试保留，并新增真实两行重复编号在 seal 阶段拒绝且无发布。
+
+这是一份待用户确认的推荐，不是已实施的修改。移除 ART 后仍需验证无索引的
+`iter_batches(indices)` 大批量查询、DuckDB SQL 去重/排序的原生外存行为和 2GB
+父控制组峰值；不能仅凭删除索引宣称内存审核闭环。用户其他已确认的 Q100–Q107
+语义保持，仍不修改生产、测试、提交或启动全量作业。
+
+
+### 最终索引方案确认与恢复实施授权（2026-09-28）
+
+> 用户回答原文：ok，可以
+
+当前解释：用户确认两处最终关系及暂存关系不建 `event_identity` UNIQUE ART 的
+最小方案，并结合此前明确实施请求授权恢复 Q100–Q107 方案执行。历史“待确认”
+段落保留原问答状态，不再作为当前禁止实施的指令；实施以“现行实施计划”正文为准。
