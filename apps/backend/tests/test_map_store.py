@@ -427,11 +427,24 @@ def test_clip_rejects_detect_without_fixed_processing_crs() -> None:
         )
 
 
-def test_source_fingerprint_rejects_missing_referenced_row() -> None:
-    connection = ScriptedConnection([[False]], [["missing", False, None, None, None,
-                                                  None, None, None, {}]])
+def test_source_fingerprint_rejects_missing_referenced_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = ScriptedConnection()
+
+    def missing_source_row(*args: Any) -> dict[str, Any]:
+        raise ValueError("Refine Run refine-1 references missing source row")
+
+    monkeypatch.setattr(
+        "backend.stores.map_layers.validate_source_table",
+        lambda conn, table: object(),
+    )
+    monkeypatch.setattr(
+        "backend.stores.map_layers.calculate_source_fingerprint",
+        missing_source_row,
+    )
     store = PostgresMapStore(connection)
-    with pytest.raises(MapDataError, match="missing source row"):
+    with pytest.raises(MapDataError, match="cannot be verified"):
         store._verify_source_fingerprint(_REFINE)
 
 

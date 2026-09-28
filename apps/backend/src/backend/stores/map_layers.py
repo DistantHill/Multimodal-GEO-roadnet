@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from dataclasses import dataclass
 from typing import Any
+
+from track.v2.db.source_table import calculate_source_fingerprint, validate_source_table
 
 from ..api.map_contracts import BBox, ClipRequest, ReplayRequest, resolve_clip_limits, resolve_replay_limits
 from ..database import _require_config, open_read_connection, require_current_schema
@@ -425,56 +426,15 @@ class PostgresMapStore:
         expected = refine.source_fingerprint
         if not expected:
             raise MapDataError(f"Refine Run {refine.refine_id} has no source fingerprint")
-        extra_row = self._fetchone(
-            "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE "
-            "attrelid = %s::regclass AND attname = 'extra' "
-            "AND attnum > 0 AND NOT attisdropped)",
-            (refine.source_table,),
-        )
-        has_extra = bool(extra_row[0])
-        extra_sql = "source.extra" if has_extra else "'{}'::jsonb"
-        sql = f"""
-            WITH referenced(source_row_key) AS (
-                SELECT source_row_key FROM kept_trajectory_points WHERE refine_id = %s
-                UNION
-                SELECT source_row_key FROM excluded_points WHERE refine_id = %s
+        try:
+            contract = validate_source_table(self.connection, refine.source_table)
+            actual = calculate_source_fingerprint(
+                self.connection, refine.refine_id, contract
             )
-            SELECT referenced.source_row_key, source.id IS NOT NULL,
-                   source.vehicle_id, source.timestamp, source.lon, source.lat,
-                   source.heading, source.speed, {extra_sql}
-              FROM referenced
-              LEFT JOIN {refine.quoted_source_table} AS source
-                ON source.id = referenced.source_row_key::{refine.source_key_sql_type}
-             ORDER BY referenced.source_row_key
-        """
-        digest = hashlib.sha256()
-        count = 0
-        for row in self._fetchall(sql, (refine.refine_id, refine.refine_id)):
-            if not bool(row[1]):
-                raise MapDataError(
-                    f"Refine Run {refine.refine_id} references a missing source row"
-                )
-            canonical = {
-                "source_row_key": str(row[0]),
-                "vehicle_id": str(row[2]),
-                "timestamp": row[3],
-                "lon": row[4],
-                "lat": row[5],
-                "heading": row[6],
-                "speed": row[7],
-                "extra": row[8] if isinstance(row[8], dict) else {},
-            }
-            encoded = json.dumps(
-                canonical,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            ).encode("utf-8")
-            digest.update(len(encoded).to_bytes(8, "big"))
-            digest.update(encoded)
-            count += 1
-        actual = {"version": 1, "row_count": count, "sha256": digest.hexdigest()}
+        except ValueError as exc:
+            raise MapDataError(
+                f"source rows for Refine Run {refine.refine_id} cannot be verified; replay is refused"
+            ) from exc
         if actual != expected:
             raise MapDataError(
                 f"source rows for Refine Run {refine.refine_id} changed; replay is refused"
