@@ -25,7 +25,8 @@ def main() -> int:
     parser.add_argument("--refine-id", type=_uuid, required=True)
     parser.add_argument("--bounds", type=float, nargs=4,
                         metavar=("WEST", "SOUTH", "EAST", "NORTH"),
-                        help="Optional explicit processing-CRS grid bounds")
+                        help="Optional processing-CRS bounds, expanded outward to the "
+                             "global pixel grid at the configured resolution")
     parser.add_argument("--ask-password", action="store_true")
     args = parser.parse_args()
     try:

@@ -30,11 +30,25 @@ def explicit_grid_spec(processing_srid: int, resolution_m: float,
     if (not all(math.isfinite(v) for v in bounds) or
             not (west < east and south < north)):
         raise ValueError("explicit raster bounds must have positive finite area")
-    width = (east - west) / resolution_m
-    height = (north - south) / resolution_m
-    if not width.is_integer() or not height.is_integer():
-        raise ValueError("explicit raster bounds must align to resolution_m")
-    return GridSpec(processing_srid, west, north, int(width), int(height), resolution_m)
+    if not math.isfinite(resolution_m) or resolution_m <= 0:
+        raise ValueError("resolution_m must be finite and positive")
+
+    def pixel_index(coordinate: float) -> float:
+        index = coordinate / resolution_m
+        if not math.isfinite(index):
+            raise ValueError("raster pixel indices must be finite")
+        nearest = round(index)
+        return nearest if math.isclose(index, nearest, rel_tol=0, abs_tol=1e-9) else index
+
+    left, bottom = math.floor(pixel_index(west)), math.floor(pixel_index(south))
+    right, top = math.ceil(pixel_index(east)), math.ceil(pixel_index(north))
+    # A positive sub-tolerance box must still produce a nonempty grid.
+    if right <= left:
+        left, right = math.floor(west / resolution_m), math.ceil(east / resolution_m)
+    if top <= bottom:
+        bottom, top = math.floor(south / resolution_m), math.ceil(north / resolution_m)
+    return GridSpec(processing_srid, left * resolution_m, top * resolution_m,
+                    right - left, top - bottom, resolution_m)
 
 
 def point_to_cell(grid: GridSpec, x: float, y: float) -> tuple[int, int] | None:

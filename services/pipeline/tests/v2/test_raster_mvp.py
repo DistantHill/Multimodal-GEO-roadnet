@@ -3,6 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import uuid
+from contextlib import nullcontext
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -47,6 +50,40 @@ def test_grid_boundaries_and_auto_single_point():
     auto = build_grid_spec(32649, 1, (1, 1, 1, 1))
     assert (auto.width_px, auto.height_px) == (1, 1)
     assert point_to_cell(auto, 1, 1) == (0, 0)
+
+
+@pytest.mark.parametrize("resolution,bounds,expected,size", [
+    (10, (332076, 3833719, 350799, 3845148),
+     (332070, 3833710, 350800, 3845150), (1873, 1144)),
+    (10, (20, 30, 40, 50), (20, 30, 40, 50), (2, 2)),
+    (10, (-19, -29, -1, -11), (-20, -30, 0, -10), (2, 2)),
+    (0.1, (0.11, -0.29, 0.39, -0.01), (0.1, -0.3, 0.4, 0), (3, 3)),
+    (1, (1 - 5e-10, 2 - 5e-10, 3 + 5e-10, 4 + 5e-10),
+     (1, 2, 3, 4), (2, 2)),
+    (1, (1 - 2e-9, 2 - 2e-9, 3 + 2e-9, 4 + 2e-9),
+     (0, 1, 4, 5), (4, 4)),
+    (0.1, (0.3, 0.3, 0.6, 0.6), (0.3, 0.3, 0.6, 0.6), (3, 3)),
+    (1, (-1e-10, -1e-10, 1e-10, 1e-10), (-1, -1, 1, 1), (2, 2)),
+])
+def test_explicit_grid_expands_to_global_pixels(resolution, bounds, expected, size):
+    grid = explicit_grid_spec(32649, resolution, bounds)
+    assert (grid.west, grid.south, grid.east, grid.north) == pytest.approx(expected)
+    assert (grid.width_px, grid.height_px) == size
+
+
+@pytest.mark.parametrize("bounds", [
+    (0, 0, 0, 1), (1, 0, 0, 1), (0, 1, 1, 0),
+    (float("nan"), 0, 1, 1), (0, 0, float("inf"), 1),
+])
+def test_explicit_grid_rejects_invalid_bounds(bounds):
+    with pytest.raises(ValueError, match="positive finite area"):
+        explicit_grid_spec(32649, 1, bounds)
+
+
+@pytest.mark.parametrize("resolution", [0, -1, float("nan"), float("inf")])
+def test_explicit_grid_rejects_invalid_resolution(resolution):
+    with pytest.raises(ValueError, match="resolution_m"):
+        explicit_grid_spec(32649, resolution, (0, 0, 1, 1))
 
 
 def test_empty_and_count_overflow_guard(tmp_path):
@@ -257,6 +294,60 @@ def test_runner_writes_verified_geotiffs_and_publishes_complete(tmp_path, monkey
         assert src.count == 3
         np.testing.assert_array_equal(src.read(1), src.read(2))
         np.testing.assert_array_equal(src.read(2), src.read(3))
+
+
+def test_raster_cli_expanded_bounds_smoke(tmp_path, monkeypatch, capsys):
+    import rasterio
+
+    from track.v2.cli import rasterize
+    from track.v2.models import SpatialContext
+    from track.v2.raster import run_rasterization
+
+    config_path = Path(__file__).resolve().parents[2] / "config/pipeline-roadnet-test.toml"
+    monkeypatch.setenv("PIPELINE_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("POSTGRES_PASSWORD", "test-only-not-a-database-credential")
+    load_config = rasterize.load_startup_config
+
+    def load_test_config(**kwargs):
+        config = load_config(**kwargs)
+        assert config.raster.resolution_m == 10
+        return replace(config, paths=replace(config.paths, data_root=tmp_path))
+
+    monkeypatch.setattr(rasterize, "load_startup_config", load_test_config)
+    monkeypatch.setattr(rasterize, "connect", lambda *_: nullcontext(object()))
+    monkeypatch.setattr(rasterize, "require_current_schema", lambda *_: None)
+    context = SpatialContext(4326, 32649, {"coordinate_semantics_version": 2})
+    monkeypatch.setattr(run_rasterization, "load_refine_spatial_context",
+                        lambda *_: ("trajectory_points", context, None))
+    # The second point is outside the requested box, inside the expanded grid.
+    points = [(340000, 3840000), (332071, 3833711), (332069, 3833711)]
+    monkeypatch.setattr(run_rasterization, "iter_refined_points",
+                        lambda *_args, **_kwargs: iter((points,)))
+    monkeypatch.setattr("sys.argv", ["rasterize", "--refine-id", str(uuid.uuid4()),
+                                     "--bounds", "332076", "3833719", "350799", "3845148"])
+
+    assert rasterize.main() == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["input_point_count"] == 3
+    assert result["accepted_point_count"] == 2
+    assert result["excluded_point_count"] == 1
+    output = Path(result["output_directory"])
+    manifest = json.loads((output / "run_manifest.json").read_text())
+    assert manifest["bounds"] == [332076, 3833719, 350799, 3845148]
+    expected = [332070, 3833710, 350800, 3845150]
+    assert manifest["effective_bounds"] == expected
+    grid = result["grid"]
+    assert [grid[key] for key in ("west", "south", "east", "north")] == expected
+    assert (grid["width_px"], grid["height_px"]) == (1873, 1144)
+    metadata = json.loads((output / "grid.json").read_text())
+    assert all(metadata[key] == value for key, value in grid.items())
+    for name in ("raw_count.tif", "gray_uint8.tif"):
+        with rasterio.open(output / name) as src:
+            assert list(src.bounds) == expected
+            assert (src.width, src.height) == (1873, 1144)
+            assert src.res == (10, 10)
+            if name == "raw_count.tif":
+                assert src.read(1).sum() == 2
 
 
 def test_failed_run_has_no_published_directory(tmp_path, monkeypatch):
