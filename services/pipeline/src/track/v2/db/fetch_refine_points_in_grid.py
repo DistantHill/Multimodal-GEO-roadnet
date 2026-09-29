@@ -9,7 +9,6 @@ from typing import Any, Callable
 from uuid import UUID
 
 from ..models import SpatialContext
-from ..projection import CoordinateTransformer
 from .source_table import validate_source_table
 
 
@@ -57,11 +56,9 @@ def fetch_points_in_grid(
     if int(metadata[1]) != int(spatial_context.processing_srid):
         raise ValueError("Refine Run processing CRS differs from spatial_context")
     source = validate_source_table(conn, str(metadata[0]))
-    lon_min, lat_min, lon_max, lat_max = CoordinateTransformer(
-        spatial_context
-    ).inverse_bounds((x_min, y_min, x_max, y_max))
-    envelope = "ST_MakeEnvelope(%s, %s, %s, %s, 4326)"
-    projected = f"ST_Transform(s.geom, {int(spatial_context.processing_srid)})"
+    processing_srid = int(spatial_context.processing_srid)
+    projected = f"ST_Transform(s.geom, {processing_srid})"
+    envelope = f"ST_MakeEnvelope(%s, %s, %s, %s, {processing_srid})"
     # Refine order is (anchor_sequence, point_kind, point_id), with injected
     # points following the kept point at their anchor in the Refine reader.
     def neighbour(direction: str) -> str:
@@ -138,9 +135,7 @@ def fetch_points_in_grid(
       FROM {source.quoted_table} s
       JOIN kept_trajectory_points k
         ON s.id = k.source_row_key AND k.refine_id = %s
-      WHERE s.geom && {envelope}
-        AND ST_X({projected}) >= %s AND ST_Y({projected}) >= %s
-        AND ST_X({projected}) <= %s AND ST_Y({projected}) <= %s
+      WHERE ST_Intersects({projected}, {envelope})
       UNION ALL
       SELECT i.vehicle_id, i.subtrack_index, i.after_sequence_in_subtrack,
              1, i.id, NULL::bigint, i.x, i.y, i.heading,
@@ -153,7 +148,7 @@ def fetch_points_in_grid(
              ) AS refined_sequence,
              'public.injected_points'::text AS source_id
       FROM injected_points i
-      WHERE i.refine_id = %s AND i.geom && {envelope}
+      WHERE i.refine_id = %s
         AND i.x >= %s AND i.y >= %s AND i.x <= %s AND i.y <= %s
     )
     """
@@ -179,10 +174,9 @@ def fetch_points_in_grid(
     {neighbour('nxt')}
     ORDER BY h.vehicle_id, h.subtrack_index, h.anchor, h.kind, h.point_id
     """
-    bounds = (lon_min, lat_min, lon_max, lat_max)
     xy = (x_min, y_min, x_max, y_max)
     hit_params = (
-        refine_id, *bounds, *xy, refine_id, *bounds, *xy,
+        refine_id, *xy, refine_id, *xy,
     )
     neighbour_params = (refine_id,) * 4
     names = (

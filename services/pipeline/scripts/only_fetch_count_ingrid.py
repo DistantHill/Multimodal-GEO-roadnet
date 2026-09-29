@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Count points in selected grid AABBs, only count(*)."""
+"""Count raw source points in selected UTM grids (not Refine kept/injected hits)."""
 
 from __future__ import annotations
 import csv
@@ -16,8 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from track.v2.cli._load_config import load_startup_config
 from track.v2.db.source_table import validate_source_table
 from track.v2.candidates.grid import create_grid
-from track.v2.models import SpatialContext
-from track.v2.projection import CoordinateTransformer
 
 PROCESSING_SRID = 32649
 GRID_SIZE_M = 5000.0
@@ -44,7 +42,6 @@ TARGETS = [
 
 REFINE_ID = "6c14e329-04c7-45d1-87fe-8ab4ff7b767e"
 PROCESSING_SRID = 32649
-SOURCE_SRID = 4326
 GRID_SIZE_M = 5000.0
 STATEMENT_TIMEOUT_MS = 60_000
 
@@ -55,18 +52,6 @@ def main() -> int:
 
     config = load_startup_config()
     grids = create_grid(GRID_EXTENT, GRID_SIZE_M)
-    spatial_context = SpatialContext(
-        source_srid=SOURCE_SRID,
-        processing_srid=PROCESSING_SRID,
-        projection_config={
-            "source_srid": SOURCE_SRID,
-            "processing_srid": PROCESSING_SRID,
-            "enforce_area_of_use": True,
-            "max_scale_error": 0.01,
-            "coordinate_semantics_version": 2,
-        },
-    )
-
     output_dir = Path(__file__).resolve().parents[1] / "generated/cross-track-point-counts"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -88,7 +73,6 @@ def main() -> int:
                     f"got {processing_srid}"
                 )
             source = validate_source_table(conn, str(source_table))
-            transformer = CoordinateTransformer(spatial_context)
             print(f"source_table={source.source_table}")
             print(f"quoted_source_table={source.quoted_table}")
 
@@ -105,23 +89,18 @@ def main() -> int:
                     float(grids[col][row][3]),
                 )
                 xmin, ymin, xmax, ymax = aabb
-                lon_min, lat_min, lon_max, lat_max = transformer.inverse_bounds(aabb)
                 projected = (
                     f"ST_Transform(s.geom, {PROCESSING_SRID})"
                 )
                 sql = f"""
                     SELECT count(*) AS points_count
                     FROM {source.quoted_table} AS s
-                    WHERE s.geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
-                      AND ST_X({projected}) >= %s
-                      AND ST_Y({projected}) >= %s
-                      AND ST_X({projected}) <= %s
-                      AND ST_Y({projected}) <= %s
+                    WHERE ST_Intersects(
+                        {projected},
+                        ST_MakeEnvelope(%s, %s, %s, %s, {PROCESSING_SRID})
+                    )
                 """
-                params = (
-                    lon_min, lat_min, lon_max, lat_max,
-                    xmin, ymin, xmax, ymax,
-                )
+                params = (xmin, ymin, xmax, ymax)
                 execute: Any = cur.execute
                 execute(sql, params)
                 result = cur.fetchone()

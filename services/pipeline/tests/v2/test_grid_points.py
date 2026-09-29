@@ -49,9 +49,6 @@ def test_fetch_points_in_grid_uses_closed_xy_and_bounded_column_batches(monkeypa
     monkeypatch.setattr(point_reader, "validate_source_table", lambda *_args:
         SimpleNamespace(source_table="trajectory_points",
                         quoted_table='"trajectory_points"', key_sql_type="bigint"))
-    monkeypatch.setattr(point_reader, "CoordinateTransformer", lambda *_args:
-        SimpleNamespace(inverse_bounds=lambda _bounds: (110.0, 20.0, 111.0, 21.0)))
-
     batches = list(point_reader.fetch_points_in_grid(
         conn, (0, 0), [[(0.0, 0.0, 1.0, 1.0)]], uuid4(),
         SimpleNamespace(processing_srid=32650), batch_size=1,
@@ -67,9 +64,11 @@ def test_fetch_points_in_grid_uses_closed_xy_and_bounded_column_batches(monkeypa
     assert metadata.query.startswith("CREATE TEMP TABLE cross_track_hits_")
     assert "ON COMMIT DROP AS" in metadata.query
     assert metadata.query.count("%s") == len(metadata.params)
-    assert "ST_X(ST_Transform(s.geom, 32650)) >= %s" in metadata.query
+    assert "ST_Intersects(ST_Transform(s.geom, 32650), ST_MakeEnvelope(%s, %s, %s, %s, 32650))" in metadata.query
     assert "i.x <= %s" in metadata.query
-    assert metadata.params[1:5] == (110.0, 20.0, 111.0, 21.0)
+    assert metadata.params[1:5] == (0.0, 0.0, 1.0, 1.0)
+    assert metadata.params[6:10] == (0.0, 0.0, 1.0, 1.0)
+    assert "i.geom &&" not in metadata.query
     assert "s.id = k.source_row_key" in metadata.query
     assert data.query.count("%s") == len(data.params) == 4
     assert "FROM cross_track_hits_" in data.query
@@ -126,6 +125,8 @@ def test_fetch_points_in_grid_postgis_closed_boundary_neighbours_and_batches():
                     ) STORED
                 );
                 CREATE INDEX source_points_geom_idx ON source_points USING gist (geom);
+                CREATE INDEX source_points_utm_idx ON source_points
+                    USING gist (ST_Transform(geom, 32650));
                 CREATE TABLE kept_trajectory_points (
                     id bigint PRIMARY KEY, refine_id uuid NOT NULL,
                     source_row_key bigint NOT NULL, vehicle_id text NOT NULL,
