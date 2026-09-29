@@ -22,7 +22,7 @@ from ..candidates.build_patches import iter_track_patches
 from ..candidates.detect_grid_crossings import run_grid_cross_track_task
 from ..candidates.dbscan_index import ActiveGridLinks, index_typecode
 from ..telemetry.console_logging import log_info
-from ..telemetry.heartbeat import heartbeat_progress
+from ..telemetry.heartbeat import heartbeat_progress, operation_heartbeat
 from .performance_timing import PerfTracker
 from .progress import report_detect_progress
 from .extract_topology import _build_topologies_from_tracks
@@ -387,9 +387,34 @@ def _detect_intersections_db(conn,cfg,spatial_context,*,runtime,data_root,refine
 def _run_columnar_db_detect(cfg,spatial_context,refine_reader,*,runtime,data_root,event_store=None,candidate_store=None,conn=None,refine_id=None,connect_worker=None):
     transformer=CoordinateTransformer(spatial_context)
     if refine_reader.extent() is None: return _empty_intersect_result(spatial_context)
-    batches=refine_reader.iter_turn_candidates(cfg.source_table or cfg.db_table,cfg,batch_size=cfg.stream_batch_size) if cfg.use_turn_events else ()
-    if event_store is None: turns=concatenate_turn_batches(list(batches))
-    else: event_store.extend(batches); event_store.seal(); turns=event_store
+    turn_started = time.perf_counter()
+    live = cfg.live_status
+    with operation_heartbeat(
+        "Detect：转向事件检测",
+        emit=(lambda message: live.update(detail=message, elapsed=time.perf_counter()-turn_started)) if live is not None else None,
+    ):
+        batches = refine_reader.iter_turn_candidates(
+            cfg.source_table or cfg.db_table, cfg, batch_size=cfg.stream_batch_size,
+        ) if cfg.use_turn_events else ()
+        collected = [] if event_store is None else None
+        turn_count = 0
+        try:
+            for batch in batches:
+                if event_store is None:
+                    collected.append(batch)
+                else:
+                    event_store.append_batch(batch)
+                turn_count += len(batch)
+                heartbeat_progress(turn_count, unit="转向事件")
+        finally:
+            close = getattr(batches, "close", None)
+            if close is not None:
+                close()
+        if event_store is None:
+            turns = concatenate_turn_batches(collected)
+        else:
+            event_store.seal()
+            turns = event_store
     crosses=empty_cross_batch()
     if cfg.use_cross_track_candidates:
         if conn is None or refine_id is None or connect_worker is None: raise V2Error("formal DB cross-track requires connection, refine_id, and worker connector")

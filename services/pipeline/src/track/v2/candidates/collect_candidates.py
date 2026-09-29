@@ -4,12 +4,15 @@ from __future__ import annotations
 import time
 from contextlib import nullcontext
 from dataclasses import replace
+from uuid import UUID
+import duckdb
 import numpy as np
 from ..telemetry.console_logging import log_info
 from ..telemetry.heartbeat import heartbeat_progress, observed_operation, operation_heartbeat
+from ..trajectories.results.read_parquet import RefineDatasetReader
 from .build_patches import build_cross_track_index, iter_cross_track_patches
 from .detect_cross_track_pairs import _prepare_segments, detect_cross_track_patch, concatenate_cross_batches
-from .detect_turn_events import detect_turn_patch, concatenate_turn_batches
+from .detect_turn_events import concatenate_turn_batches
 
 
 def extract_turn_candidates(patches, cfg, *, event_store=None, live_status=None, perf=None):
@@ -17,23 +20,58 @@ def extract_turn_candidates(patches, cfg, *, event_store=None, live_status=None,
     count = track_count = 0
     started = last_progress = time.perf_counter()
     log_info("── 轨迹处理 / Tracks and turn candidates ...")
-    with operation_heartbeat("轨迹读取与转向候选提取"):
-        for patch in patches:
-            if cfg.use_turn_events:
-                batch = detect_turn_patch(patch, cfg, perf=perf)
-                batch = replace(batch, calculation_index=batch.calculation_index + count)
-                count += len(batch)
-                if event_store is None:
-                    batches.append(batch)
-                else:
-                    event_store.append_batch(batch)
-            track_count += len(patch)
-            now = time.perf_counter()
-            if live_status is not None and now - last_progress >= 3.0:
-                live_status.update(detail=f"轨迹处理：{track_count:,} 轨迹，{count:,} 转向事件",
-                                   elapsed=now-started, stage="Detect: 转向候选 / Turn candidates")
-                last_progress = now
-            del patch
+    with duckdb.connect(":memory:") as connection:
+        if cfg.use_turn_events:
+            connection.execute("""
+              CREATE TABLE refine_points (
+                refine_id UUID, point_id BIGINT, vehicle_id VARCHAR,
+                subtrack_index BIGINT, refined_sequence_in_subtrack BIGINT,
+                timestamp DOUBLE, lon DOUBLE, lat DOUBLE, x DOUBLE, y DOUBLE,
+                heading DOUBLE, point_kind VARCHAR, source_row_key BIGINT,
+                generated_reason VARCHAR, refine_point_id_valid BOOLEAN,
+                source_id VARCHAR
+              )
+            """)
+        source_table = None
+        with operation_heartbeat("轨迹读取与转向候选提取"):
+            for patch in patches:
+                if cfg.use_turn_events:
+                    for track in patch.values():
+                        source_table = track.source_id
+                        rows = [
+                            (UUID(int=0), int(track.refine_point_id[index]), track.vehicle_id,
+                             track.subtrack_index, index,
+                             float(track.timestamp[index]), float(track.lonlat[index, 0]),
+                             float(track.lonlat[index, 1]), float(track.xy[index, 0]),
+                             float(track.xy[index, 1]), float(track.heading[index]),
+                             "kept" if track.kind[index] == "p" else "injected",
+                             int(track.source_row_key[index]) if track.source_row_key_valid[index] else None,
+                             str(track.generated_reason[index]),
+                             bool(track.refine_point_id_valid[index]), track.source_id)
+                            for index in range(len(track))
+                        ]
+                        if rows:
+                            connection.executemany("INSERT INTO refine_points VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                        del rows
+                    if patch:
+                        del track
+                track_count += len(patch)
+                now = time.perf_counter()
+                if live_status is not None and now - last_progress >= 3.0:
+                    live_status.update(detail=f"轨迹处理：{track_count:,} 轨迹，{count:,} 转向事件",
+                                       elapsed=now-started, stage="Detect: 转向候选 / Turn candidates")
+                    last_progress = now
+                del patch
+            if cfg.use_turn_events and source_table is not None:
+                for batch in RefineDatasetReader._iter_turn_candidates_sql(
+                    connection, UUID(int=0), source_table, cfg, cfg.stream_batch_size,
+                ):
+                    count += len(batch)
+                    heartbeat_progress(count, unit="转向事件")
+                    if event_store is None:
+                        batches.append(batch)
+                    else:
+                        event_store.append_batch(batch)
     if event_store is not None:
         event_store.seal()
     log_info(f"── 轨迹处理: {track_count:,} 轨迹/tracks → {count:,} 转向事件/turn events ({time.perf_counter()-started:.1f}s)")

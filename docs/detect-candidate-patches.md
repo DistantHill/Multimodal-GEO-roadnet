@@ -6,7 +6,8 @@ Detect 先提取转向事件（turn events）和跨轨迹候选（cross-track ca
 | 位置 | 职责 |
 | --- | --- |
 | `services/pipeline/src/track/v2/candidates/build_patches.py` | 完整轨迹分块；空间网格构建、容量检查、线段对分块、规范归属去重及长线段回退调度 |
-| `services/pipeline/src/track/v2/candidates/detect_turn_events.py` | `detect_turn_patch` 计算一个轨迹任务块中的转向事件 |
+| `services/pipeline/src/track/v2/candidates/detect_turn_events.py` | 构造和拼接转向事件批次 |
+| `services/pipeline/src/track/v2/trajectories/results/read_parquet.py` | 使用 DuckDB 窗口和 SQL 阈值计算转向事件 |
 | `services/pipeline/src/track/v2/candidates/detect_cross_track_pairs.py` | 准备有效线段；`detect_cross_track_patch` 对指定线段对执行精确求交并保留来源追溯信息 |
 | `services/pipeline/src/track/v2/candidates/dbscan_index.py` | 紧凑存储 DBSCAN 候选索引及活动网格链接 |
 | `services/pipeline/src/track/v2/candidates/cross_track_relation.py` | 保存并流式读取跨轨迹候选及其聚类成员关系 |
@@ -18,11 +19,9 @@ Detect 先提取转向事件（turn events）和跨轨迹候选（cross-track ca
 | `services/pipeline/src/track/v2/intersections/detect_intersections.py` | 连接读取、候选提取与全局聚类阶段 |
 | `services/pipeline/src/track/v2/intersections/extract_topology.py` | 按检测簇提取轨迹进出观察并构建交叉口拓扑 |
 
-转向路径由 `iter_track_patches` 按 `stream_batch_size` 输出完整轨迹任务块，
-包含最后不足一个完整批次的任务块。内存入口与数据库入口复用相同调度与汇总逻辑。
-数据库入口 `_load_tracks_and_turn_candidates` 通过 `_iter_prepared_db_tracks`
-完成单次读取、坐标验证与投影，并保留供后续阶段复用的轨迹工作区。
-关闭转向检测时仍完成工作区读取；计算发生异常时关闭底层读取器。
+正式 Detect 从 Refine Parquet 读取点，由 DuckDB 窗口计算转向角并直接应用
+SQL 阈值，输出的事件再组成有界批次。内存轨迹入口将轨迹任务块写入临时
+DuckDB 表，调用同一 SQL 计算路径。关闭转向检测时仍消费输入任务块。
 
 跨轨迹路径先准备线段，再由 `build_cross_track_index` 构建空间网格，
 `iter_cross_track_patches` 输出有界线段对数组，交给检测内核计算。
@@ -33,8 +32,8 @@ Detect 先提取转向事件（turn events）和跨轨迹候选（cross-track ca
 INFO 开始与结束摘要、定时心跳和进度更新由外层候选提取负责，检测内核不打印
 逐任务块日志。心跳覆盖读取、空间网格构建和计算期间，计数在任务块完成后更新。
 
-本次抽离保留现有 NumPy 批量计算方式。轨迹工作区仍保留全部已读取轨迹，
-此变更本身不解决全局轨迹常驻内存问题，也未引入进程池。
+跨轨迹候选仍使用 NumPy 批量计算；转向事件的窗口和阈值计算由 DuckDB 完成。
+内存轨迹入口仍由调用方持有轨迹工作区，也未引入进程池。
 配置字段及持久化结构保持原有格式；性能报告中的 `stream_m1` 阶段改名为
 `load_tracks_and_turn_candidates`，内存入口分别记录 `turn_candidates`
 与 `cross_track_candidates`。

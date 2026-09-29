@@ -8,11 +8,11 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 from .config_factory import intersect_config,intersect_run_config,detect_context,runtime_config
-from .detect_columns_helpers import CONTEXT as _TEST_SPATIAL_CONTEXT,TRANSFORMER as _TEST_TRANSFORMER,subtrack
+from .detect_columns_helpers import CONTEXT as _TEST_SPATIAL_CONTEXT,TRANSFORMER as _TEST_TRANSFORMER,subtrack,sql_turns_from_subtrack
 from track.v2._geometry import _batch_segment_intersections,_iter_bounded_segment_intersections,_paired_segment_intersections
 from track.v2.candidates.build_patches import _iter_pair_batches as _iter_cross_track_pair_batches
 from track.v2.candidates.collect_candidates import extract_cross_track_candidates
-from track.v2.candidates.detect_turn_events import turns_from_subtrack,empty_turn_batch
+from track.v2.candidates.detect_turn_events import empty_turn_batch
 from track.v2.candidates.detect_cross_track_pairs import empty_cross_batch
 from track.v2.intersections.performance_timing import PerfTracker
 from track.v2.intersections.detect_intersections import (_build_dbscan_grid,_run_dbscan,_cluster_pipeline,_compute_getis_ord_g_star,detect_intersections,_detect_intersections_handle,_cluster_dbscan,_merge_clusters)
@@ -174,22 +174,22 @@ class DBSCANTest(unittest.TestCase):
 @pytest.mark.parametrize("headings,expected",[([0,90,90,90],1),([0,0,0,0],0),([0,170,170,170],0)])
 def test_turn_filters_from_heading_window(headings,expected):
     track=subtrack([[0,0],[0,20],[20,20],[40,20]],headings=headings)
-    result=turns_from_subtrack(track,intersect_config(turn_window=1,min_leg_m=1,max_turn_deg=150))
+    result=sql_turns_from_subtrack(track,intersect_config(turn_window=1,min_leg_m=1,max_turn_deg=150))
     assert len(result)==expected
 
 @pytest.mark.parametrize("minimum,maximum,expected",[(90,90,1),(91,150,0),(1,89,0)])
 def test_turn_angle_endpoints_are_inclusive(minimum,maximum,expected):
     track=subtrack([[0,0],[0,20],[20,20]],headings=[0,90,90])
-    assert len(turns_from_subtrack(track,intersect_config(turn_window=1,min_leg_m=1,min_turn_deg=minimum,max_turn_deg=maximum)))==expected
+    assert len(sql_turns_from_subtrack(track,intersect_config(turn_window=1,min_leg_m=1,min_turn_deg=minimum,max_turn_deg=maximum)))==expected
 
 @pytest.mark.parametrize("elapsed,leg,expected",[(1,20,1),(0,20,0),(1,.1,0)])
 def test_turn_movement_filters(elapsed,leg,expected):
     track=subtrack([[0,0],[0,leg],[leg,leg]],headings=[0,90,90])
     track=replace(track,timestamp=np.asarray([0,elapsed,2*elapsed],dtype=np.float64))
-    assert len(turns_from_subtrack(track,intersect_config(turn_window=1,min_leg_m=1)))==expected
+    assert len(sql_turns_from_subtrack(track,intersect_config(turn_window=1,min_leg_m=1)))==expected
 
 def test_getis_star_keeps_noncontiguous_calculation_identity():
-    batch=turns_from_subtrack(subtrack([[0,0],[0,20],[20,20]],headings=[0,90,90]),intersect_config(turn_window=1,min_leg_m=1),first_index=9001)
+    batch=sql_turns_from_subtrack(subtrack([[0,0],[0,20],[20,20]],headings=[0,90,90]),intersect_config(turn_window=1,min_leg_m=1),first_index=9001)
     assert _compute_getis_ord_g_star(batch,5)=={9001:0.0}
 
 @pytest.mark.parametrize("count",[3,300])

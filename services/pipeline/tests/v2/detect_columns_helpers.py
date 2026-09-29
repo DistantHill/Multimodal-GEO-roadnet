@@ -10,3 +10,9 @@ TRANSFORMER=CoordinateTransformer(CONTEXT)
 def subtrack(xy, *, subtrack_index=7, vehicle_id="original_vehicle", headings=None, keys=None):
     xy=np.asarray(xy,dtype=np.float64); size=len(xy)
     return refinement_subtrack_from_columns(vehicle_id=vehicle_id,subtrack_index=subtrack_index,source_id="trajectory_points",xy=xy,lonlat=TRANSFORMER.inverse_many(xy),timestamp=np.arange(size,dtype=np.float64),heading=np.zeros(size,dtype=np.float64) if headings is None else np.asarray(headings,dtype=np.float64),speed=np.full(size,20.,dtype=np.float64),kind=np.full(size,"p"),source_row_key=np.arange(size,dtype=np.int64) if keys is None else np.asarray(keys,dtype=np.int64),refine_point_id=np.arange(size,dtype=np.int64)+100*subtrack_index,after_sequence=np.full(size,-1,dtype=np.int64),generated_reason=np.full(size,""))
+
+
+def sql_turns_from_subtrack(track, cfg, *, first_index=0):
+    from track.v2.candidates.collect_candidates import extract_turn_candidates
+    batch = extract_turn_candidates([{track.subtrack_index: track}], cfg)
+    return replace(batch, calculation_index=batch.calculation_index + first_index)

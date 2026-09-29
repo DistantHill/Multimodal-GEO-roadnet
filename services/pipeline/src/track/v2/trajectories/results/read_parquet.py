@@ -20,7 +20,6 @@ from track.v2.artifacts.parquet_sql import quote_sql_literal
 from track.v2.db.artifact_registry import ArtifactDescriptor
 from track.v2.projection import SpatialWindow
 from track.v2.models import RuntimeConfig, RefinementSubtrack, TurnBatch
-from track.v2._geometry import _angle_delta_deg, _circular_mean_deg
 
 from . import RefineParquetError
 from .parquet_schema import _validate_schema
@@ -92,12 +91,14 @@ class RefineDatasetReader:
                 )
             self._connection.execute("""
                 CREATE TEMP VIEW refine_points AS
-                SELECT *, 'kept'::VARCHAR AS point_kind,
+                SELECT *, 'kept'::VARCHAR AS point_kind, TRUE AS refine_point_id_valid,
+                       NULL::VARCHAR AS source_id,
                        NULL::VARCHAR AS generated_reason,
                        NULL::INTEGER AS after_sequence_in_subtrack
                 FROM kept_points
                 UNION ALL BY NAME
-                SELECT *, 'injected'::VARCHAR AS point_kind,
+                SELECT *, 'injected'::VARCHAR AS point_kind, TRUE AS refine_point_id_valid,
+                       NULL::VARCHAR AS source_id,
                        NULL::BIGINT AS source_row_key
                 FROM injected_points
             """)
@@ -157,9 +158,8 @@ class RefineDatasetReader:
         return extent  # type: ignore[return-value]
 
     def track_count(self) -> int:
-        """Return the exact number of validated vehicle/subtrack identities."""
+        """Count vehicle/subtrack identities in the published Refine dataset."""
         connection = self._require_open()
-        self._validate_source(connection)
         row = connection.execute("""
           SELECT count(*) FROM (
             SELECT DISTINCT vehicle_id, subtrack_index FROM refine_points
@@ -230,7 +230,6 @@ class RefineDatasetReader:
                 canonical[position] = (item[0], item[1] + (input_index,), *item[2:])
         if not canonical:
             return
-        self._validate_source(connection)
         table = f"topology_windows_{uuid4().hex}"
         try:
             connection.execute(f"""
@@ -280,23 +279,91 @@ class RefineDatasetReader:
                 connection.execute(f"DROP TABLE IF EXISTS {table}")
 
     def iter_turn_candidates(self, source_table: str, cfg: Any, *, batch_size: int | None = None):
-        """Yield turn business batches from each complete ordered subtrack."""
-        from ...candidates.detect_turn_events import turns_from_subtrack
+        """Calculate turns in DuckDB and materialize only selected event columns."""
+        connection = self._require_open()
+        if not isinstance(source_table, str) or not source_table.strip():
+            raise RefineParquetError("source_table is required")
+        batch_size = self._runtime.parquet_read_batch_size if batch_size is None else batch_size
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise RefineParquetError("batch_size is invalid")
         if isinstance(cfg.turn_window, bool) or cfg.turn_window < 1:
             raise RefineParquetError("turn_window must be a positive integer")
         thresholds=(cfg.min_turn_deg,cfg.max_turn_deg,cfg.min_leg_m,cfg.min_movement_speed_mps)
         if not all(math.isfinite(value) and value>=0 for value in thresholds) or cfg.min_turn_deg>cfg.max_turn_deg:
             raise RefineParquetError("turn thresholds are invalid")
-        offset=0
-        tracks=self.iter_tracks(source_table,batch_size=batch_size)
-        try:
-            for track in tracks:
-                batch=turns_from_subtrack(track,cfg,first_index=offset)
-                offset+=len(batch)
-                del track
-                if len(batch): yield batch
-        finally:
-            tracks.close()
+        yield from self._iter_turn_candidates_sql(
+            connection, self._descriptor.refine_id, source_table, cfg, batch_size,
+        )
+
+    @staticmethod
+    def _iter_turn_candidates_sql(connection, refine_id, source_table, cfg, batch_size):
+        window = cfg.turn_window
+        last_exit = window - 1
+        result = connection.execute(f"""
+          WITH neighbors AS (
+            SELECT *,
+              row_number() OVER track - 1 AS point_index,
+              lag(x, {window}) OVER track AS in_x,
+              lag(y, {window}) OVER track AS in_y,
+              lead(x, {window}) OVER track AS out_x,
+              lead(y, {window}) OVER track AS out_y,
+              lag(timestamp, {window}) OVER track AS in_time,
+              lead(timestamp, {window}) OVER track AS out_time,
+              sum(sin(radians(heading))) OVER (
+                PARTITION BY vehicle_id, subtrack_index
+                ORDER BY refined_sequence_in_subtrack, point_kind, point_id
+                ROWS BETWEEN {window} PRECEDING AND 1 PRECEDING
+              ) AS entry_sin,
+              sum(cos(radians(heading))) OVER (
+                PARTITION BY vehicle_id, subtrack_index
+                ORDER BY refined_sequence_in_subtrack, point_kind, point_id
+                ROWS BETWEEN {window} PRECEDING AND 1 PRECEDING
+              ) AS entry_cos,
+              sum(sin(radians(heading))) OVER (
+                PARTITION BY vehicle_id, subtrack_index
+                ORDER BY refined_sequence_in_subtrack, point_kind, point_id
+                ROWS BETWEEN CURRENT ROW AND {last_exit} FOLLOWING
+              ) AS exit_sin,
+              sum(cos(radians(heading))) OVER (
+                PARTITION BY vehicle_id, subtrack_index
+                ORDER BY refined_sequence_in_subtrack, point_kind, point_id
+                ROWS BETWEEN CURRENT ROW AND {last_exit} FOLLOWING
+              ) AS exit_cos
+            FROM refine_points
+            WHERE refine_id = ?
+            WINDOW track AS (PARTITION BY vehicle_id, subtrack_index
+                             ORDER BY refined_sequence_in_subtrack, point_kind, point_id)
+          ), legs AS (
+            SELECT *,
+              sqrt(pow(x-in_x, 2) + pow(y-in_y, 2)) AS in_leg,
+              sqrt(pow(out_x-x, 2) + pow(out_y-y, 2)) AS out_leg,
+              out_time-in_time AS elapsed,
+              (degrees(atan2(entry_sin, entry_cos))+360.0) % 360.0 AS entry_bearing,
+              (degrees(atan2(exit_sin, exit_cos))+360.0) % 360.0 AS exit_bearing
+            FROM neighbors
+            WHERE in_x IS NOT NULL AND out_x IS NOT NULL
+              AND entry_sin IS NOT NULL AND exit_sin IS NOT NULL
+          ), angles AS (
+            SELECT *, (exit_bearing-entry_bearing+540.0) % 360.0 - 180.0 AS turn_deg
+            FROM legs
+            WHERE elapsed > 0 AND in_leg >= ? AND out_leg >= ?
+              AND (in_leg+out_leg)/elapsed >= ?
+          ), selected AS (
+            SELECT * FROM angles
+            WHERE abs(turn_deg) BETWEEN ? AND ?
+          )
+          SELECT row_number() OVER (ORDER BY vehicle_id, subtrack_index, point_index)-1,
+                 vehicle_id, subtrack_index, point_index, x, y, lon, lat, timestamp,
+                 entry_bearing, exit_bearing, turn_deg, point_kind, point_id,
+                 source_row_key, generated_reason, refine_point_id_valid,
+                 coalesce(source_id, ?) AS event_source_id
+          FROM selected
+          ORDER BY vehicle_id, subtrack_index, point_index
+        """, [refine_id, cfg.min_leg_m, cfg.min_leg_m,
+               cfg.min_movement_speed_mps, cfg.min_turn_deg, cfg.max_turn_deg,
+               source_table])
+        while rows := result.fetchmany(batch_size):
+            yield _turn_batch_from_sql_rows(rows)
 
     def iter_cross_track_segments(
         self, source_table: str, cfg: Any, *, batch_size: int | None = None,
@@ -514,6 +581,33 @@ class RefineDatasetReader:
             raise RefineParquetError("dataset reader is not open")
         return self._connection
 
+
+
+def _turn_batch_from_sql_rows(rows) -> TurnBatch:
+    size = len(rows)
+    def number(index, dtype):
+        return np.fromiter((row[index] for row in rows), dtype=dtype, count=size)
+    def text(index):
+        return np.asarray([row[index] for row in rows], dtype=object)
+    source_valid = np.fromiter((row[14] is not None for row in rows), dtype=np.bool_, count=size)
+    return TurnBatch(
+        calculation_index=number(0, np.int64), vehicle_id=text(1),
+        subtrack_index=number(2, np.int64), point_index=number(3, np.int64),
+        xy=np.column_stack((number(4, np.float64), number(5, np.float64))),
+        lonlat=np.column_stack((number(6, np.float64), number(7, np.float64))),
+        timestamp=number(8, np.float64), entry_bearing=number(9, np.float64),
+        exit_bearing=number(10, np.float64), turn_deg=number(11, np.float64),
+        score=np.abs(number(11, np.float64)), source_id=text(17),
+        source_row_key=np.fromiter((row[14] if row[14] is not None else 0 for row in rows),
+                                   dtype=np.int64, count=size),
+        source_row_key_valid=source_valid,
+        point_kind=np.asarray(["p" if row[12] == "kept" else "i" for row in rows], dtype=object),
+        refine_point_id=number(13, np.int64),
+        refine_point_id_valid=number(16, np.bool_),
+        generated_reason=np.asarray([row[15] or "" for row in rows], dtype=object),
+        g_star_z=np.zeros(size, dtype=np.float64),
+        g_star_z_valid=np.zeros(size, dtype=np.bool_),
+    )
 
 
 def _point_columns_from_driver_batch(rows, owner, *, topology):

@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 from .config_factory import intersect_config, intersect_run_config, detect_context, runtime_config
-from .detect_columns_helpers import subtrack
+from .detect_columns_helpers import subtrack, sql_turns_from_subtrack
 from track.v2.models import SpatialContext, RefinementSubtrack
 from track.v2.exceptions import V2Error
 from track.v2.projection import CoordinateTransformer, SpatialWindow, QueryWindowRequest, build_query_window
@@ -374,8 +374,7 @@ def test_detect_rejects_unprojected_source_columns_instead_of_legacy_point_graph
 
 @pytest.mark.parametrize('heading,expected_turn',[(45.,45.),(170.,170.),(44.9,None),(170.1,None)])
 def test_turn_thresholds_keep_exact_bounds_and_reject_normalized_outside(heading,expected_turn):
-    from track.v2.candidates.detect_turn_events import turns_from_subtrack
     track=subtrack([[0,0],[10,0],[20,0]],headings=[0,heading,heading])
-    events=turns_from_subtrack(track,intersect_config(turn_window=1,min_turn_deg=45.,max_turn_deg=170.,min_leg_m=1.,min_movement_speed_mps=0.))
+    events=sql_turns_from_subtrack(track,intersect_config(turn_window=1,min_turn_deg=45.,max_turn_deg=170.,min_leg_m=1.,min_movement_speed_mps=0.))
     if expected_turn is None: assert len(events)==0
     else: assert events.turn_deg.tolist()==[expected_turn]

@@ -2,9 +2,8 @@ from dataclasses import replace
 import numpy as np
 import pytest
 from .config_factory import intersect_config,runtime_config
-from .detect_columns_helpers import CONTEXT,TRANSFORMER,subtrack
+from .detect_columns_helpers import CONTEXT,TRANSFORMER,subtrack,sql_turns_from_subtrack
 from track.v2.candidates.collect_candidates import extract_cross_track_candidates
-from track.v2.candidates.detect_turn_events import turns_from_subtrack
 from track.v2.candidates.turn_event_relation import TurnEventRelation
 from track.v2.candidates.cross_track_relation import CrossCandidateRelation
 from track.v2.intersections.detect_intersections import _compute_getis_ord_g_star,_cluster_pipeline,_run_dbscan
@@ -35,7 +34,7 @@ def test_same_subtrack_segments_are_excluded():
 @pytest.mark.parametrize("batch_size",[1,2,10])
 def test_turn_relation_roundtrip_preserves_numeric_keys_masks_and_identity(tmp_path,batch_size):
     track=subtrack([[0,0],[0,20],[20,20],[40,20]],subtrack_index=701,headings=[0,90,90,90],keys=[-1,0,1,2])
-    batch=turns_from_subtrack(track,intersect_config(turn_window=1,min_leg_m=1),first_index=0)
+    batch=sql_turns_from_subtrack(track,intersect_config(turn_window=1,min_leg_m=1),first_index=0)
     assert len(batch)==1
     assert batch.source_row_key.tolist()==[0]
     with TurnEventRelation(runtime_config(),tmp_path.resolve(),batch_size=batch_size) as relation:
@@ -89,7 +88,7 @@ def test_dbscan_core_border_and_noise_columns():
 def test_injected_point_participates_only_when_turn_checks_pass(headings,expected):
     track=subtrack([[0.,0.],[0.,20.],[20.,20.],[40.,20.]],headings=headings)
     track=replace(track,kind=np.asarray(["p","i","p","p"]),source_row_key_valid=np.asarray([True,False,True,True]),generated_reason=np.asarray(["","orthogonal","",""]),after_sequence=np.asarray([-1,0,-1,-1],dtype=np.int64))
-    result=turns_from_subtrack(track,intersect_config(turn_window=1,min_leg_m=1))
+    result=sql_turns_from_subtrack(track,intersect_config(turn_window=1,min_leg_m=1))
     assert len(result)==expected
     if expected:
         assert result.point_kind.tolist()==["i"]

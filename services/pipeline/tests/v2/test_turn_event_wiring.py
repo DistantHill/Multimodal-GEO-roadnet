@@ -13,6 +13,7 @@ from .test_turn_event_relation import concatenate,assert_batch_equal
 from track.v2.candidates.collect_candidates import extract_turn_candidates
 from track.v2.candidates.build_patches import iter_track_patches
 from track.v2.candidates.turn_event_relation import TurnEventRelation
+from track.v2.candidates.detect_turn_events import empty_turn_batch
 from track.v2.candidates.detect_cross_track_pairs import empty_cross_batch
 from track.v2.intersections.detect_intersections import (IntersectConfig,_IntersectRunConfig,_cluster_pipeline,
     _compute_getis_ord_g_star,_select_hotspot_events,_detect_intersections_db)
@@ -98,16 +99,39 @@ def test_db_result_survives_columnar_run_and_cross_holds_no_full_turns(tmp_path,
     result.close(); result.close(); _assert_no_turn_relations(tmp_path)
 
 
-def test_columnar_detect_feeds_turn_relation_through_bounded_extend(tmp_path):
+def test_columnar_detect_feeds_turn_relation_through_bounded_batches(tmp_path):
     calls=[]
     class ObservedRelation(TurnEventRelation):
-        def extend(self,events,*,batch_size=None):
-            calls.append(self._batch_size); return super().extend(events,batch_size=batch_size)
-    reader=type('Reader',(),{'extent':lambda self:(0.,0.,1.,1.),'iter_turn_candidates':lambda self,*a,**kw:iter(()),'track_count':lambda self:0})()
+        def append_batch(self,event):
+            calls.append(self._batch_size); return super().append_batch(event)
+    reader=type('Reader',(),{'extent':lambda self:(0.,0.,1.,1.),'iter_turn_candidates':lambda self,*a,**kw:iter([_events([[0., 0.]])]),'track_count':lambda self:0})()
     cfg=intersect_config(stream_batch_size=7,use_cross_track_candidates=False)
     with patch('track.v2.intersections.detect_intersections.TurnEventRelation',ObservedRelation),patch('track.v2.intersections.detect_intersections._build_topologies_from_tracks',return_value=([],[],[])):
         result=_detect_intersections_db(object(),_run_config(cfg),_CONTEXT,runtime=runtime_config(relation_batch_size=7),data_root=tmp_path,refine_reader=reader)
     assert calls==[7]; result.close()
+
+
+def test_columnar_turn_detection_emits_heartbeat_and_batch_counts(tmp_path):
+    live = MagicMock()
+    batches = [_events([[0., 0.]], start=0), _events([[10., 0.], [20., 0.]], start=1)]
+    reader = type('Reader', (), {
+        'extent': lambda self: (0., 0., 1., 1.),
+        'iter_turn_candidates': lambda self, *args, **kwargs: iter(batches),
+        'track_count': lambda self: 0,
+    })()
+    cfg = replace(_run_config(intersect_config(use_cross_track_candidates=False)), live_status=live)
+    with patch('track.v2.intersections.detect_intersections.heartbeat_progress') as progress, \
+         patch('track.v2.intersections.detect_intersections._cluster_pipeline', return_value=(empty_turn_batch(), [])), \
+         patch('track.v2.intersections.detect_intersections._build_topologies_from_tracks', return_value=([], [], [])):
+        result = _detect_intersections_db(
+            object(), cfg, _CONTEXT, runtime=runtime_config(), data_root=tmp_path,
+            refine_reader=reader,
+        )
+    assert len(result.turn_events) == 3
+    assert '转向事件检测' in live.update.call_args_list[0].kwargs['detail']
+    assert [call.args[0] for call in progress.call_args_list] == [1, 3]
+    assert all(call.kwargs['unit'] == '转向事件' for call in progress.call_args_list)
+    result.close()
 
 
 @pytest.mark.parametrize('failure',[RuntimeError('failed'),KeyboardInterrupt()])

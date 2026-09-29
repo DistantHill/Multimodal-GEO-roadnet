@@ -1,5 +1,5 @@
 """Patch boundaries keep business columns and Run identities intact."""
-from dataclasses import fields
+from dataclasses import fields, replace
 import numpy as np
 import pytest
 from .config_factory import intersect_config
@@ -27,6 +27,14 @@ def test_turn_patch_boundaries_preserve_global_calculation_identity(batch_size):
     assert batch.calculation_index.tolist()==list(range(5))
     assert batch.subtrack_index.tolist()==list(range(1,6))
     assert batch.vehicle_id.tolist()==["original_vehicle"]*5
+
+
+def test_sql_turn_batches_preserve_each_track_source():
+    first = subtrack([[0,0],[0,20],[20,20]],subtrack_index=1,headings=[0,90,90])
+    second = replace(subtrack([[0,0],[0,20],[20,20]],subtrack_index=2,headings=[0,90,90]),
+                     source_id="second-source")
+    turns = extract_turn_candidates([{1:first,2:second}],intersect_config(turn_window=1,min_leg_m=1))
+    assert turns.source_id.tolist()==["trajectory_points","second-source"]
 
 
 @pytest.mark.parametrize("batch_size",[1,2,65536])

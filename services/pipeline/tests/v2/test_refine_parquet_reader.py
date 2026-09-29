@@ -27,7 +27,7 @@ from track.v2.candidates.collect_candidates import (
 )
 from track.v2.models import RuntimeConfig, SpatialContext
 from track.v2.projection import CoordinateTransformer
-from track.v2.candidates.detect_turn_events import detect_turn_patch, concatenate_turn_batches
+from track.v2.candidates.detect_turn_events import concatenate_turn_batches
 
 
 def _published(tmp_path: Path):
@@ -142,7 +142,7 @@ def test_reader_uses_only_manifest_files_and_merges_one_vehicle_subtrack(tmp_pat
         refine_reader.RefineDatasetReader(tmp_path, descriptor, "present", runtime_config())
 
 
-def test_track_count_validates_source_and_counts_subtrack_identities(tmp_path) -> None:
+def test_track_count_counts_subtrack_identities(tmp_path) -> None:
     descriptor = _published(tmp_path)
     with refine_reader.RefineDatasetReader(
         tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
@@ -426,9 +426,8 @@ def test_batch_api_uses_bounded_fetchmany_not_fetchall() -> None:
 
 
 @pytest.mark.parametrize("window", [1, 2])
-def test_duckdb_turn_candidates_match_python_oracle_across_batches(tmp_path, window) -> None:
-    # DuckDB orders complete subtracks; the NumPy turn kernel consumes their
-    # columns and is checked against these explicit known turn expectations.
+def test_duckdb_turn_candidates_match_known_cases_across_batches(tmp_path, window) -> None:
+    # SQL windows calculate turns before the selected events cross into Python.
     tracks = [
         ("a", 1, [(0, -40, 0, 359), (10, -20, 0, 1), (20, 0, 0, 90),
                    (30, 0, 20, 91), (40, 0, 40, 89)]),
@@ -473,7 +472,7 @@ def test_duckdb_turn_thresholds_are_inclusive_and_config_is_strict(tmp_path) -> 
                 list(reader.iter_turn_candidates("source", invalid))
 
 
-def test_duckdb_turn_boundary_fallback_matches_python_oracle(tmp_path) -> None:
+def test_duckdb_turn_threshold_uses_sql_values(tmp_path) -> None:
     below_min = math.nextafter(45.0, -math.inf)
     above_min = math.nextafter(45.0, math.inf)
     below_max = math.nextafter(170.0, -math.inf)
@@ -510,7 +509,22 @@ def test_duckdb_turn_boundary_fallback_matches_python_oracle(tmp_path) -> None:
     assert np.all(np.abs(actual.turn_deg)<=170)
 
 
-def test_duckdb_turn_unstable_resultant_forces_python_oracle(tmp_path) -> None:
+def test_duckdb_turn_threshold_has_no_boundary_tolerance(tmp_path) -> None:
+    descriptor = _published_tracks(tmp_path, [
+        ("below-min", 0, [(0, 0, 0, 0), (10, 10, 0, 45 - 5e-10),
+                          (20, 20, 0, 45 - 5e-10)]),
+        ("above-max", 1, [(0, 0, 10, 0), (10, 10, 10, 170 + 5e-10),
+                           (20, 20, 10, 170 + 5e-10)]),
+    ])
+    cfg = intersect_config(turn_window=1, min_turn_deg=45, max_turn_deg=170,
+                          min_leg_m=1, min_movement_speed_mps=0)
+    with refine_reader.RefineDatasetReader(
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
+    ) as reader:
+        assert list(reader.iter_turn_candidates("source", cfg)) == []
+
+
+def test_duckdb_turn_unstable_resultant_uses_sql_value(tmp_path) -> None:
     descriptor = _published_tracks(tmp_path, [
         ("unstable", 0, [(0, 0, 0, 0), (10, 10, 0, 180), (20, 20, 0, 90),
                           (30, 30, 0, 270), (40, 40, 0, 0)]),
@@ -537,10 +551,9 @@ def test_duckdb_turn_internal_rows_do_not_call_python_exact_helper(tmp_path) -> 
                           min_leg_m=1, min_movement_speed_mps=0)
     with refine_reader.RefineDatasetReader(
         tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
-    ) as reader, patch.object(refine_reader, "_circular_mean_deg") as exact:
+    ) as reader:
         actual = list(reader.iter_turn_candidates("source", cfg, batch_size=1))
     assert len(actual) == 1
-    exact.assert_not_called()
 
 
 def test_duckdb_cross_track_segments_match_q49_oracle(tmp_path) -> None:
@@ -901,33 +914,19 @@ def test_complete_tracks_use_column_chunks_across_driver_boundaries(tmp_path, mo
         assert not selections[0].points.xy.flags.writeable
 
 
-def test_turn_producer_releases_consumed_track_before_next_build(monkeypatch):
-    import gc
-    import weakref
-    from track.v2.trajectories.subtrack_columns import refinement_subtrack_from_columns
-    references = []
-    def tracks(*args, **kwargs):
-        for index in range(2):
-            if references:
-                gc.collect()
-                assert references[-1]() is None
-            track = refinement_subtrack_from_columns(
-                vehicle_id="v", subtrack_index=index, source_id="source",
-                xy=np.array([[0., 0.], [10., 0.], [10., 10.]]),
-                lonlat=np.zeros((3, 2)), timestamp=np.arange(3, dtype=float),
-                heading=np.array([0., 90., 90.]), speed=np.ones(3)*4,
-                kind=np.array(["p"]*3), source_row_key=np.arange(3, dtype=np.int64),
-                refine_point_id=np.arange(3, dtype=np.int64), generated_reason=np.array([""]*3),
-                after_sequence=np.full(3, -1, dtype=np.int64),
-            )
-            references.append(weakref.ref(track.xy))
-            yield track
-            del track
-    reader = object.__new__(refine_reader.RefineDatasetReader)
-    monkeypatch.setattr(reader, "iter_tracks", tracks)
-    list(reader.iter_turn_candidates("source", intersect_config()))
-    gc.collect()
-    assert all(reference() is None for reference in references)
+def test_turn_producer_skips_full_source_validation_and_track_materialization(tmp_path) -> None:
+    descriptor = _published_tracks(tmp_path, [
+        ("v", 0, [(0, 0, 0, 0), (10, 10, 0, 90), (20, 20, 0, 90)]),
+    ])
+    with refine_reader.RefineDatasetReader(
+        tmp_path, descriptor, "present", runtime_config(duckdb_threads=1),
+    ) as reader, patch.object(reader, "_validate_source", side_effect=AssertionError("validated")), \
+         patch.object(reader, "iter_tracks", side_effect=AssertionError("materialized")):
+        turns = list(reader.iter_turn_candidates(
+            "source", intersect_config(turn_window=1, min_leg_m=1, min_movement_speed_mps=0), batch_size=1,
+        ))
+        assert reader.track_count() == 1
+    assert len(turns) == 1
 
 
 def test_published_track_does_not_retain_consumed_driver_column_chunks(monkeypatch):
