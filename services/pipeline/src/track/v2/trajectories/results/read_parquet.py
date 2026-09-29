@@ -413,19 +413,20 @@ class RefineDatasetReader:
             raise RefineParquetError("cross-track angle range is invalid")
         table = f"cross_track_straight_{uuid4().hex}"
         materialize = self._cross_track_segment_relation("""
-          SELECT * FROM straight
+          SELECT *, end_x-x AS dx, end_y-y AS dy,
+                 (degrees(atan2(end_x-x, end_y-y))+360.0) % 360.0 AS bearing
+          FROM straight
         """)
         query = f"""
         WITH paired AS (
           SELECT a.segment_id AS a_id, b.segment_id AS b_id,
-                 a.heading AS a_heading, b.heading AS b_heading,
-                 a.end_x-a.x AS adx, a.end_y-a.y AS ady,
-                 b.end_x-b.x AS bdx, b.end_y-b.y AS bdy,
+                 a.dx AS adx, a.dy AS ady,
+                 b.dx AS bdx, b.dy AS bdy,
                  b.x-a.x AS rx, b.y-a.y AS ry,
-                 abs((((b.heading-a.heading+180.0) % 360.0 + 360.0)
+                 abs((((b.bearing-a.bearing+180.0) % 360.0 + 360.0)
                       % 360.0)-180.0) AS angle,
                  1.4210854715202004e-14
-                   * greatest(1.0, abs(a.heading)+abs(b.heading)+540.0) AS angle_error
+                   * greatest(1.0, abs(a.bearing)+abs(b.bearing)+540.0) AS angle_error
           FROM {table} a JOIN {table} b
             ON a.min_x <= b.max_x AND b.min_x <= a.max_x
            AND a.min_y <= b.max_y AND b.min_y <= a.max_y
@@ -442,8 +443,7 @@ class RefineDatasetReader:
                    abs(adx*ry)+abs(rx*ady)
                  ) AS arithmetic_error
           FROM paired
-          WHERE abs(a_heading) > 1000000.0 OR abs(b_heading) > 1000000.0
-             OR angle BETWEEN ?-angle_error AND ?+angle_error
+          WHERE angle BETWEEN ?-angle_error AND ?+angle_error
         ), conservative_pairs AS (
           SELECT * FROM numeric_pairs
           WHERE NOT isfinite(det) OR NOT isfinite(ta_num) OR NOT isfinite(tb_num)
@@ -452,8 +452,8 @@ class RefineDatasetReader:
                  AND tb_num BETWEEN least(0.0, det)-arithmetic_error
                                 AND greatest(0.0, det)+arithmetic_error)
         )
-          SELECT a.* EXCLUDE (min_x, max_x, min_y, max_y),
-                 b.* EXCLUDE (min_x, max_x, min_y, max_y)
+          SELECT a.* EXCLUDE (min_x, max_x, min_y, max_y, dx, dy, bearing),
+                 b.* EXCLUDE (min_x, max_x, min_y, max_y, dx, dy, bearing)
           FROM conservative_pairs p
           JOIN {table} a ON a.segment_id=p.a_id
           JOIN {table} b ON b.segment_id=p.b_id

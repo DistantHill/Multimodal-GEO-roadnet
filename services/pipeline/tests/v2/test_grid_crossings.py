@@ -116,8 +116,8 @@ def test_filtered_grid_pairs_match_exhaustive_geometry(batch_size, memberships, 
     n = 70
     start = rng.uniform(-8, 8, (n, 2))
     end = rng.uniform(-8, 8, (n, 2))
-    # Coincident minima/endpoints, zero-length segments, angle-bin boundaries,
-    # negative/large headings, same subtrack and same vehicle are intentional.
+    # Coincident minima/endpoints, zero-length segments, same subtrack/vehicle
+    # and source headings unrelated to endpoint geometry are intentional.
     start[:8] = 0
     end[:2] = 0
     headings = np.resize(np.array([-360., -10., 0., 10., 45., 80., 90., 100.,
@@ -143,8 +143,8 @@ def test_filtered_grid_pairs_match_exhaustive_geometry(batch_size, memberships, 
     a, b = a[keep], b[keep]
     swap = partitions[a] > partitions[b]
     a, b = np.where(swap, b, a), np.where(swap, a, b)
-    x, y, hit = _paired_segment_intersections(start[a], end[a], headings[a],
-        start[b], end[b], headings[b], cfg.cross_track_min_angle_deg, cfg.cross_track_max_angle_deg)
+    x, y, hit = _paired_segment_intersections(start[a], end[a],
+        start[b], end[b], cfg.cross_track_min_angle_deg, cfg.cross_track_max_angle_deg)
     expected = {(int(a[i]), int(b[i])): (xx, yy) for i, xx, yy in zip(hit, x, y)}
     timing = CrossTrackTiming()
     batches = list(iter_grid_crossings(segments, cfg, max_grid_memberships=memberships,
@@ -179,3 +179,23 @@ def test_parallel_dense_bucket_is_rejected_before_pair_enumeration():
                                    max_overflow_pair_space=0, timing=timing)) == []
     assert timing.values.get('bbox_query_pairs', 0) == 0
     assert timing.values['pair_count'] == 0
+
+
+@pytest.mark.parametrize("memberships", [0, 100000])
+def test_grid00_segment_86321_rejects_false_heading_crossing(memberships):
+    # Real exported endpoints for segment 86321 and 97139. Field heading
+    # difference is 93 degrees, but endpoint vectors differ by only 1.326 degrees.
+    segments = {key: value[:2].copy() for key, value in _segments().items()}
+    segments.update(
+        x_start=np.array([302106.58528267045, 302063.1643495342]),
+        y_start=np.array([3832912.1438122033, 3832903.1730208807]),
+        x_end=np.array([300959.14955746825, 300203.76082345366]),
+        y_end=np.array([3832666.9790133694, 3832460.668027587]),
+        heading=np.array([0., 267.]), end_heading=np.array([0., 267.]),
+        subtrack_index=np.array([676150, 784587]),
+    )
+    cfg = _cfg()
+    cfg.cross_track_min_angle_deg, cfg.cross_track_max_angle_deg = 80., 100.
+    cfg.cross_track_grid_cell_m = 5000.
+    assert list(iter_grid_crossings(segments, cfg, max_grid_memberships=memberships,
+                                   max_overflow_pair_space=0)) == []

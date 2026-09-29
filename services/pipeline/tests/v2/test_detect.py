@@ -25,9 +25,7 @@ class PairedSegmentIntersectionTest(unittest.TestCase):
         a2 = np.array([[0.0, 1.0], [10.0, 1.0]])
         b1 = np.array([[-1.0, 0.0], [9.0, 2.0]])
         b2 = np.array([[1.0, 0.0], [11.0, 2.0]])
-        ha = np.array([0.0, 0.0])
-        hb = np.array([90.0, 90.0])
-        (xs, ys, hit_indices) = _paired_segment_intersections(a1, a2, ha, b1, b2, hb, 80.0, 100.0)
+        (xs, ys, hit_indices) = _paired_segment_intersections(a1, a2, b1, b2, 80.0, 100.0)
         self.assertEqual(hit_indices.tolist(), [0])
         self.assertEqual(xs.tolist(), [0.0])
         self.assertEqual(ys.tolist(), [0.0])
@@ -47,12 +45,10 @@ class CompactAabbBroadPhaseTest(unittest.TestCase):
     def test_aabb_rejection_skips_exact_pairs_and_keeps_closed_endpoint(self):
         a1 = np.array([[0.0, 0.0], [10.0, 0.0]])
         a2 = np.array([[1.0, 0.0], [11.0, 0.0]])
-        ha = np.array([90.0, 90.0])
         b1 = np.array([[10.0, -1.0], [30.0, -1.0]])
         b2 = np.array([[10.0, 1.0], [30.0, 1.0]])
-        hb = np.array([0.0, 0.0])
         telemetry: dict[str, int] = {}
-        blocks = list(_iter_bounded_segment_intersections(a1, a2, ha, b1, b2, hb, 80.0, 100.0, max_matrix_elements=2, telemetry=telemetry))
+        blocks = list(_iter_bounded_segment_intersections(a1, a2, b1, b2, 80.0, 100.0, max_matrix_elements=2, telemetry=telemetry))
         self.assertEqual(telemetry['broad_pairs'], 1)
         self.assertEqual(telemetry['exact_pairs'], 1)
         self.assertEqual(telemetry['exact_skipped_pairs'], 3)
@@ -68,16 +64,14 @@ class CompactAabbBroadPhaseTest(unittest.TestCase):
         """B wider than the cap never creates an oversized broad/exact block."""
         a1 = np.array([[0.0, 0.0], [0.0, 2.0]])
         a2 = np.array([[7.0, 0.0], [7.0, 2.0]])
-        ha = np.array([90.0, 90.0])
         b1 = np.array([[float(x), -1.0] for x in range(8)])
         b2 = np.array([[float(x), 3.0] for x in range(8)])
-        hb = np.zeros(8)
         cap = 3
         telemetry: dict[str, int] = {}
-        (dense_x, dense_y, dense_hits) = _batch_segment_intersections(a1, a2, ha, b1, b2, hb, 80.0, 100.0)
+        (dense_x, dense_y, dense_hits) = _batch_segment_intersections(a1, a2, b1, b2, 80.0, 100.0)
         bounded_hits: list[int] = []
         bounded_xy: list[tuple[float, float]] = []
-        for (a_offset, cx, cy, flat_idx) in _iter_bounded_segment_intersections(a1, a2, ha, b1, b2, hb, 80.0, 100.0, max_matrix_elements=cap, telemetry=telemetry):
+        for (a_offset, cx, cy, flat_idx) in _iter_bounded_segment_intersections(a1, a2, b1, b2, 80.0, 100.0, max_matrix_elements=cap, telemetry=telemetry):
             bounded_hits.extend((a_offset * len(b1) + flat_idx).tolist())
             bounded_xy.extend(zip(cx.tolist(), cy.tolist()))
         self.assertEqual(bounded_hits, dense_hits.tolist())
@@ -92,11 +86,10 @@ class CompactAabbBroadPhaseTest(unittest.TestCase):
     def test_dense_direct_never_exceeds_smaller_matrix_cap(self):
         a1 = np.array([[0.0, 0.0]])
         a2 = np.array([[2.0, 0.0]])
-        ha = np.array([90.0])
         b1 = np.array([[1.0, -1.0]] * 64)
         b2 = np.array([[1.0, 1.0]] * 64)
         telemetry: dict[str, int] = {}
-        list(_iter_bounded_segment_intersections(a1, a2, ha, b1, b2, np.zeros(64), 80.0, 100.0, max_matrix_elements=32, telemetry=telemetry))
+        list(_iter_bounded_segment_intersections(a1, a2, b1, b2, 80.0, 100.0, max_matrix_elements=32, telemetry=telemetry))
         self.assertNotIn('dense_direct_blocks', telemetry)
         self.assertLessEqual(telemetry['max_broad_block_pairs'], 32)
         self.assertLessEqual(telemetry['max_exact_chunk_pairs'], 32)
@@ -239,7 +232,7 @@ class IntersectConfigStageIdentityTest(unittest.TestCase):
 @pytest.mark.parametrize("pairs,direct",[(1023,True),(1024,True),(1025,False)])
 def test_hybrid_threshold_boundary_preserves_known_hits_order_xy_and_cap(pairs,direct):
     telemetry={}
-    blocks=list(_iter_bounded_segment_intersections(np.array([[0.,0.]]),np.array([[2.,0.]]),np.array([90.]),np.tile([1.,-1.],(pairs,1)),np.tile([1.,1.],(pairs,1)),np.zeros(pairs),80.,100.,max_matrix_elements=262144,telemetry=telemetry))
+    blocks=list(_iter_bounded_segment_intersections(np.array([[0.,0.]]),np.array([[2.,0.]]),np.tile([1.,-1.],(pairs,1)),np.tile([1.,1.],(pairs,1)),80.,100.,max_matrix_elements=262144,telemetry=telemetry))
     assert [int(index) for offset,x,y,indices in blocks for index in offset+indices]==list(range(pairs))
     assert all(np.array_equal(x,np.ones(len(x))) and np.array_equal(y,np.zeros(len(y))) for offset,x,y,indices in blocks)
     if direct:

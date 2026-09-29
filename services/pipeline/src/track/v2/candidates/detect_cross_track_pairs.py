@@ -5,7 +5,7 @@ from dataclasses import fields
 from contextlib import nullcontext
 from typing import Any
 import numpy as np
-from .._geometry import _paired_segment_intersections
+from .._geometry import _paired_segment_intersections, _endpoint_bearings
 from ..models import CrossCandidateBatch
 from ..projection import CoordinateTransformer
 
@@ -34,12 +34,16 @@ def concatenate_cross_batches(batches: list[CrossCandidateBatch]) -> CrossCandid
     return CrossCandidateBatch(**{item.name: np.concatenate([getattr(batch, item.name) for batch in batches]) for item in fields(CrossCandidateBatch)})
 
 
-def intersect_cross_track_patch(starts, ends, headings, segment_ids_a, segment_ids_b, cfg, *, timing=None):
+def intersect_cross_track_patch(starts, ends, bearings, segment_ids_a, segment_ids_b, cfg, *, timing=None):
     with timing.measure("gather_s") if timing else nullcontext():
-        arrays = (starts[segment_ids_a], ends[segment_ids_a], headings[segment_ids_a],
-                  starts[segment_ids_b], ends[segment_ids_b], headings[segment_ids_b])
+        arrays = (starts[segment_ids_a], ends[segment_ids_a],
+                  starts[segment_ids_b], ends[segment_ids_b])
+        bearings_a, bearings_b = bearings[segment_ids_a], bearings[segment_ids_b]
     with timing.measure("kernel_s") if timing else nullcontext():
-        result = _paired_segment_intersections(*arrays, cfg.cross_track_min_angle_deg, cfg.cross_track_max_angle_deg)
+        result = _paired_segment_intersections(
+            *arrays, cfg.cross_track_min_angle_deg, cfg.cross_track_max_angle_deg,
+            bearings_a=bearings_a, bearings_b=bearings_b,
+        )
     if timing:
         timing.values["pair_count"] += len(segment_ids_a)
         timing.values["hit_count"] += len(result[2])
@@ -62,6 +66,7 @@ def build_cross_track_patch_candidates(segments, segment_ids_a, segment_ids_b, x
     return CrossCandidateBatch(**values)
 
 
-def detect_cross_track_patch(segments, starts, ends, headings, segment_ids_a, segment_ids_b, cfg, transformer):
-    xs, ys, hits = intersect_cross_track_patch(starts, ends, headings, segment_ids_a, segment_ids_b, cfg)
+def detect_cross_track_patch(segments, starts, ends, segment_ids_a, segment_ids_b, cfg, transformer):
+    bearings = _endpoint_bearings(starts, ends)
+    xs, ys, hits = intersect_cross_track_patch(starts, ends, bearings, segment_ids_a, segment_ids_b, cfg)
     return build_cross_track_patch_candidates(segments, segment_ids_a, segment_ids_b, xs, ys, hits, transformer)

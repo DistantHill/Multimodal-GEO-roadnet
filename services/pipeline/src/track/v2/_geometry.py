@@ -102,13 +102,21 @@ def _segment_bearings(
 # ── Batch segment-segment intersection (Method 3) ──────────────────────
 
 
+def _endpoint_bearings(starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
+    """Columnar endpoint bearings, clockwise from projected north in [0, 360).
+
+    Zero-length segments have no direction; the exact determinant test rejects
+    them. Keep their placeholder finite so they can pass through bounded bins.
+    """
+    delta = ends - starts
+    return np.degrees(np.arctan2(delta[:, 0], delta[:, 1])) % 360.0
+
+
 def _batch_segment_intersections(
     a1: np.ndarray,
     a2: np.ndarray,
-    ha: np.ndarray,
     b1: np.ndarray,
     b2: np.ndarray,
-    hb: np.ndarray,
     min_angle_deg: float,
     max_angle_deg: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -119,9 +127,7 @@ def _batch_segment_intersections(
 
     Args:
         a1/a2: ``(N, 2)`` segment A start/end coords in meters.
-        ha: ``(N,)`` heading of each segment A (degrees).
         b1/b2: ``(M, 2)`` segment B start/end coords in meters.
-        hb: ``(M,)`` heading of each segment B (degrees).
         min_angle_deg, max_angle_deg: orthogonal angle range.
 
     Returns:
@@ -143,7 +149,9 @@ def _batch_segment_intersections(
         tb = np.where(~parallel, tb_num / det, np.nan)
     # Bounds + angle filter
     valid = (~parallel) & (ta >= 0.0) & (ta <= 1.0) & (tb >= 0.0) & (tb <= 1.0)
-    angle = np.abs((hb[None, :] - ha[:, None] + 180.0) % 360.0 - 180.0)
+    bearings_a = _endpoint_bearings(a1, a2)
+    bearings_b = _endpoint_bearings(b1, b2)
+    angle = np.abs((bearings_b[None, :] - bearings_a[:, None] + 180.0) % 360.0 - 180.0)
     valid &= (min_angle_deg <= angle) & (angle <= max_angle_deg)
     cx = np.where(valid, a1[:, None, 0] + ta * da[:, None, 0], np.nan)
     cy = np.where(valid, a1[:, None, 1] + ta * da[:, None, 1], np.nan)
@@ -154,10 +162,8 @@ def _batch_segment_intersections(
 def _iter_bounded_segment_intersections(
     a1: np.ndarray,
     a2: np.ndarray,
-    ha: np.ndarray,
     b1: np.ndarray,
     b2: np.ndarray,
-    hb: np.ndarray,
     min_angle_deg: float,
     max_angle_deg: float,
     *,
@@ -177,7 +183,7 @@ def _iter_bounded_segment_intersections(
     if pair_elements <= min(dense_direct_threshold, max_matrix_elements):
         exact_started = time.perf_counter() if telemetry is not None else 0.0
         cx, cy, flat_idx = _batch_segment_intersections(
-            a1, a2, ha, b1, b2, hb, min_angle_deg, max_angle_deg,
+            a1, a2, b1, b2, min_angle_deg, max_angle_deg,
         )
         if telemetry is not None:
             telemetry["dense_direct_pairs"] = telemetry.get("dense_direct_pairs", 0) + pair_elements
@@ -193,6 +199,8 @@ def _iter_bounded_segment_intersections(
             yield 0, cx.ravel()[flat_idx], cy.ravel()[flat_idx], flat_idx
         return
 
+    bearings_a = _endpoint_bearings(a1, a2)
+    bearings_b = _endpoint_bearings(b1, b2)
     columns_per_block = min(len(b1), max_matrix_elements)
     rows_per_block = max(1, max_matrix_elements // columns_per_block)
     for a_start in range(0, len(a1), rows_per_block):
@@ -245,7 +253,7 @@ def _iter_bounded_segment_intersections(
                 a_indices = a_start + pair_a
                 exact_started = time.perf_counter() if telemetry is not None else 0.0
                 cx, cy, valid = _compact_segment_intersections(
-                    a1, a2, ha, b1, b2, hb, a_indices, pair_b,
+                    a1, a2, bearings_a, b1, b2, bearings_b, a_indices, pair_b,
                     min_angle_deg, max_angle_deg,
                 )
                 if telemetry is not None:
@@ -265,10 +273,10 @@ def _iter_bounded_segment_intersections(
 def _compact_segment_intersections(
     a1: np.ndarray,
     a2: np.ndarray,
-    ha: np.ndarray,
+    bearings_a: np.ndarray,
     b1: np.ndarray,
     b2: np.ndarray,
-    hb: np.ndarray,
+    bearings_b: np.ndarray,
     a_indices: np.ndarray,
     b_indices: np.ndarray,
     min_angle_deg: float,
@@ -292,7 +300,7 @@ def _compact_segment_intersections(
     with np.errstate(divide="ignore", invalid="ignore"):
         ta = np.where(~parallel, ta_num / det, np.nan)
         tb = np.where(~parallel, tb_num / det, np.nan)
-    angle = np.abs((hb[b_indices] - ha[a_indices] + 180.0) % 360.0 - 180.0)
+    angle = np.abs((bearings_b[b_indices] - bearings_a[a_indices] + 180.0) % 360.0 - 180.0)
     valid = (
         (~parallel)
         & (ta >= 0.0) & (ta <= 1.0)
@@ -305,17 +313,18 @@ def _compact_segment_intersections(
 def _paired_segment_intersections(
     a1: np.ndarray,
     a2: np.ndarray,
-    ha: np.ndarray,
     b1: np.ndarray,
     b2: np.ndarray,
-    hb: np.ndarray,
     min_angle_deg: float,
     max_angle_deg: float,
+    *,
+    bearings_a: np.ndarray | None = None,
+    bearings_b: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Intersect explicitly paired segments without an ``N×M`` broadcast.
 
-    All six array inputs have the same leading dimension. The returned
-    indices address that paired input dimension, letting callers retain their
+    All coordinate and optional bearing arrays have the same leading dimension.
+    The returned indices address that paired input dimension, letting callers retain their
     own segment provenance while this helper keeps only a compact numeric
     working set.
     """
@@ -323,7 +332,12 @@ def _paired_segment_intersections(
         empty_float = np.empty(0, dtype=float)
         return empty_float, empty_float, np.empty(0, dtype=int)
 
-    angle = np.abs((hb - ha + 180.0) % 360.0 - 180.0)
+    # Callers may reuse endpoint bearings precomputed once per segment block.
+    if bearings_a is None:
+        bearings_a = _endpoint_bearings(a1, a2)
+    if bearings_b is None:
+        bearings_b = _endpoint_bearings(b1, b2)
+    angle = np.abs((bearings_b - bearings_a + 180.0) % 360.0 - 180.0)
     a_min_x = np.minimum(a1[:, 0], a2[:, 0])
     a_max_x = np.maximum(a1[:, 0], a2[:, 0])
     a_min_y = np.minimum(a1[:, 1], a2[:, 1])

@@ -18,7 +18,7 @@ def extract_columnar_cross_track_candidates(reader, source_table, transformer, c
     iterator = iter(reader.iter_cross_track_pair_batches(source_table,cfg,batch_size=cfg.cross_track_pair_batch_size))
     try:
         for columns,ids_a,ids_b in iterator:
-            batch = detect_cross_track_patch(columns,columns["starts"],columns["ends"],columns["heading"],ids_a,ids_b,cfg,transformer)
+            batch = detect_cross_track_patch(columns,columns["starts"],columns["ends"],ids_a,ids_b,cfg,transformer)
             batch = replace(batch,calculation_index=batch.calculation_index+count)
             count += len(batch)
             if candidate_store is None:

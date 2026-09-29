@@ -16,6 +16,7 @@ import numpy as np
 
 from ..db.fetch_refine_points_in_grid import fetch_points_in_grid
 from ..models import CrossCandidateBatch
+from .._geometry import _endpoint_bearings
 from ..projection import CoordinateTransformer
 from ..telemetry.console_logging import log_info
 from .build_patches import (
@@ -89,15 +90,15 @@ def iter_grid_crossings(
             np.asarray(segments["x_end"], dtype=np.float64)[retained],
             np.asarray(segments["y_end"], dtype=np.float64)[retained],
         ))
-        headings = heading[retained]
+        bearings = _endpoint_bearings(start, end)
         if not (np.isfinite(start).all() and np.isfinite(end).all()
-                and np.isfinite(headings).all()):
+                and np.isfinite(bearings).all()):
             raise ValueError("segment coordinates and headings must be finite")
         partitions = np.asarray(segments["subtrack_index"], dtype=np.int64)[retained]
         # Pair ordering follows the Run-scoped subtrack identity, independently of vehicle.
         order = np.argsort(partitions, kind="stable")
         retained = retained[order]
-        start, end, headings, partitions = start[order], end[order], headings[order], partitions[order]
+        start, end, bearings, partitions = start[order], end[order], bearings[order], partitions[order]
     with timing.measure("index_s"):
         index = build_cross_track_index(
             start, end, partitions, cell_m=cell_m, max_cells=max_cells,
@@ -105,9 +106,9 @@ def iter_grid_crossings(
             max_overflow_pair_space=max_overflow_pair_space, telemetry=timing.values,
         )
     for ids_a, ids_b in timing.iterate(iter_cross_track_filtered_patches(
-            index, start, end, headings, cfg, telemetry=timing.values), "candidate_s"):
+            index, start, end, bearings, cfg, telemetry=timing.values), "candidate_s"):
         xs, ys, hit_indices = intersect_cross_track_patch(
-            start, end, headings, ids_a, ids_b, cfg, timing=timing,
+            start, end, bearings, ids_a, ids_b, cfg, timing=timing,
         )
         if len(hit_indices) == 0:
             continue
@@ -160,6 +161,10 @@ def iter_spilled_grid_candidates(relation: GridSegmentRelation, cfg, transformer
     for first in range(0, total, block_size):
         with timing.measure("gather_s"):
             left = relation.block(first, block_size)
+            left_bearings = _endpoint_bearings(
+                np.column_stack((left["x_start"], left["y_start"])),
+                np.column_stack((left["x_end"], left["y_end"])),
+            )
             speed_ok = (left["speed"] + left["end_speed"]) / 2.0 >= cfg.cross_track_min_avg_speed
             straight = np.abs((left["end_heading"] - left["heading"] + 180.0) % 360.0 - 180.0) <= threshold
             timing.values["speed_rejected_segments"] += int(np.count_nonzero(~speed_ok))
@@ -171,12 +176,18 @@ def iter_spilled_grid_candidates(relation: GridSegmentRelation, cfg, transformer
             with timing.measure("gather_s"):
                 if first == second:
                     segments = left
+                    bearings = left_bearings
                     pairs = _iter_cross_subtrack_pair_batches(
                         np.arange(len(left["subtrack_index"]), dtype=np.int64),
                         left["subtrack_index"], pair_size,
                     )
                 else:
                     segments = {name: np.concatenate((left[name], right[name])) for name in left}
+                    right_bearings = _endpoint_bearings(
+                        np.column_stack((right["x_start"], right["y_start"])),
+                        np.column_stack((right["x_end"], right["y_end"])),
+                    )
+                    bearings = np.concatenate((left_bearings, right_bearings))
                     base = len(left["subtrack_index"])
                     pairs = _iter_pair_batches(
                         np.arange(base, dtype=np.int64),
@@ -199,7 +210,7 @@ def iter_spilled_grid_candidates(relation: GridSegmentRelation, cfg, transformer
                     if not np.any(keep):
                         continue
                     a, b = a[keep], b[keep]
-                xs, ys, hit = intersect_cross_track_patch(starts, ends, headings, a, b, cfg, timing=timing)
+                xs, ys, hit = intersect_cross_track_patch(starts, ends, bearings, a, b, cfg, timing=timing)
                 if not len(hit):
                     continue
                 batch = {"x": xs, "y": ys, "segment_index_a": a[hit], "segment_index_b": b[hit]}

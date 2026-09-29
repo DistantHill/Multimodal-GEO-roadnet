@@ -111,3 +111,50 @@ def test_cross_track_endpoint_average_speed_is_shared_by_all_routes(tmp_path, sp
             np.testing.assert_array_equal(result.xy, [[0., 0.]])
             assert result.from_subtrack_index.tolist() == [1]
             assert result.to_subtrack_index.tolist() == [2]
+
+
+@pytest.mark.parametrize("angle,heading_b,expected", [
+    (10., 90., 0),  # Field headings look perpendicular; actual segments are not.
+    (79.999, 0., 0), (80., 0., 1), (80.001, 0., 1),
+    (90., 0., 1),  # Equal field headings must not hide a geometric crossing.
+    (99.999, 0., 1), (100., 0., 1), (100.001, 0., 0),
+    (None, 90., 0),  # Zero-length segments have no crossing direction.
+])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_endpoint_angle_is_shared_by_grid_overflow_spill_and_sql(tmp_path, angle, heading_b, expected, reverse):
+    from track.v2.candidates.grid_segments import GridSegmentRelation
+    from track.v2.candidates.detect_grid_crossings import iter_spilled_grid_candidates
+
+    direction = (np.zeros(2) if angle is None else
+                 np.array([np.sin(np.radians(angle)), np.cos(np.radians(angle))]) * 20.)
+    xy = np.array([-direction, direction])
+    if reverse:
+        xy = xy[::-1]
+    tracks = [subtrack([[0., -20.], [0., 20.]], subtrack_index=1, headings=[0., 0.]),
+              subtrack(xy, subtrack_index=2, headings=[heading_b, heading_b])]
+    cfg = intersect_config(cross_track_min_angle_deg=80., cross_track_max_angle_deg=100.,
+                           cross_track_pair_batch_size=1)
+    segments = _grid_columns(tracks)
+    results = []
+    for memberships in (0, 10000):
+        crossings = iter_grid_crossings(segments, cfg, max_grid_memberships=memberships,
+                                        max_overflow_pair_space=0)
+        results.append(concatenate_cross_batches(list(iter_grid_candidates(segments, crossings, TRANSFORMER))))
+    relation = GridSegmentRelation(runtime_config(), tmp_path)
+    try:
+        relation.append(segments)
+        relation.finish()
+        results.append(concatenate_cross_batches(list(iter_spilled_grid_candidates(
+            relation, cfg, TRANSFORMER, block_size=1))))
+    finally:
+        relation.close()
+    published = _published_tracks(tmp_path, [(t.vehicle_id, t.subtrack_index,
+        list(zip(t.timestamp, t.xy[:, 0], t.xy[:, 1], t.heading))) for t in tracks])
+    with RefineDatasetReader(tmp_path, published, "present", runtime_config()) as reader:
+        results.append(extract_columnar_cross_track_candidates(reader, "source", TRANSFORMER, cfg))
+    for result in results:
+        assert len(result) == expected
+        if expected:
+            np.testing.assert_allclose(result.xy, [[0., 0.]], atol=1e-12)
+            # Geometric direction is internal; source metadata remains intact.
+            assert result.heading.tolist() == [0.]

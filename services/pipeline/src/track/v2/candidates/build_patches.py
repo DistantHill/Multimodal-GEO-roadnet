@@ -165,7 +165,7 @@ def _iter_cross_subtrack_pair_batches(
 
 
 def iter_cross_track_filtered_patches(
-    index: CrossTrackIndex, starts: np.ndarray, ends: np.ndarray, headings: np.ndarray,
+    index: CrossTrackIndex, starts: np.ndarray, ends: np.ndarray, bearings: np.ndarray,
     cfg, *, telemetry: dict[str, int | float] | None = None,
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
     """Query interval overlaps inside existing buckets before gathering coordinates.
@@ -173,6 +173,7 @@ def iter_cross_track_filtered_patches(
     For each bucket, sweep the axis with fewer overlapping intervals. Ragged
     interval ranges are decoded in bounded batches, never a bucket Cartesian
     matrix. Minimum shared cell ownership removes multi-cell duplicates.
+    ``bearings`` contains endpoint directions shared with the exact kernel.
     """
     batch_size = int(cfg.cross_track_pair_batch_size)
     if batch_size < 1:
@@ -198,25 +199,21 @@ def iter_cross_track_filtered_patches(
         swap = partitions[a] > partitions[b]
         a, b = np.where(swap, b, a), np.where(swap, a, b)
         # Use exactly the kernel's orientation and modulo arithmetic at boundaries.
-        angle = np.abs((headings[b] - headings[a] + 180.0) % 360.0 - 180.0)
+        angle = np.abs((bearings[b] - bearings[a] + 180.0) % 360.0 - 180.0)
         keep = (cfg.cross_track_min_angle_deg <= angle) & (angle <= cfg.cross_track_max_angle_deg)
         return a[keep], b[keep]
 
-    # Coarse heading buckets are conservative; the exact NumPy angle check
-    # still decides every emitted pair. Huge headings use a wildcard bucket
-    # because reduction of huge floats need not match subtraction then modulo.
-    heading_bin = np.floor((headings % 360.0) / 10.0).astype(np.int64)
-    heading_bin[np.abs(headings) > 1_000_000.0] = 36
+    # Endpoint bearings are precomputed in [0, 360). Coarse direction buckets
+    # are conservative; the exact angle check still decides every emitted pair.
+    bearing_bin = np.floor((bearings % 360.0) / 10.0).astype(np.int64)
 
     def compatible(first, second):
-        if first == 36 or second == 36:
-            return True
         angle = abs(((second - first) * 10.0 + 180.0) % 360.0 - 180.0)
         return (angle + 10.000001 >= cfg.cross_track_min_angle_deg
                 and angle - 10.000001 <= cfg.cross_track_max_angle_deg)
 
     def interval_pairs(left, right, *, same=False):
-        # Disjoint heading groups query each other, never expand same-heading
+        # Disjoint direction groups query each other, never expand same-direction
         # combinations just to reject their angles afterwards.
         best = None
         for axis in (0, 1):
@@ -251,8 +248,8 @@ def iter_cross_track_filtered_patches(
             ids = np.asarray(index.grid[cell], dtype=np.int64)
             if len(ids) < 2:
                 continue
-            bins = np.unique(heading_bin[ids])
-            groups = {int(key): ids[heading_bin[ids] == key] for key in bins}
+            bins = np.unique(bearing_bin[ids])
+            groups = {int(key): ids[bearing_bin[ids] == key] for key in bins}
             for position, first_bin in enumerate(bins):
                 for second_bin in bins[position:]:
                     if not compatible(first_bin, second_bin):
