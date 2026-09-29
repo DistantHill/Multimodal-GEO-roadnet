@@ -62,6 +62,7 @@ def main() -> int:
             source,
             field_config=pc.parser.fields,
             runtime=pc.runtime,
+            hash_csv_rows=False,
         )
 
         # ── Stream insert: 每批 BATCH_SIZE 行边读边写 / batch-insert as we read ──
@@ -69,7 +70,9 @@ def main() -> int:
         total_written = 0
 
         with pg_connect(db_config) as conn:
-            for batch in handle.iter_vehicle_batches():
+            for batch in handle.iter_vehicle_batches(
+                max_batch_size=pc.runtime.import_batch_size,
+            ):
                 t0 = time.perf_counter()
                 written = insert_trajectory_points(conn, batch, table=args.table,
                                                     batch_size=pc.runtime.import_batch_size)
@@ -77,7 +80,7 @@ def main() -> int:
                 total_parsed += len(batch)
                 print(f"  ... 已解析 / parsed: {total_parsed:>12,}  "
                       f"已写入 / written: {total_written:>12,}  "
-                      f"({time.perf_counter() - t0:.1f}s per vehicle)")
+                      f"({time.perf_counter() - t0:.1f}s per batch)")
 
             conn.commit()
 

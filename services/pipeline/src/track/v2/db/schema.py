@@ -26,6 +26,6 @@ def require_current_schema(conn: Any) -> None:
         actual = "missing" if row is None else f"v{int(row[0])}"
         raise RuntimeError(
             f"track.v2 schema mismatch: expected v{SCHEMA_VERSION}, got {actual}; "
-            "for v3 run init-db --migrate-refine; for v4 through v8 run "
-            "init-db --migrate-artifacts; older schemas require --reset"
+            "for v4 through v8 run init-db --migrate-artifacts; "
+            "v3 and older schemas require --reset"
         )

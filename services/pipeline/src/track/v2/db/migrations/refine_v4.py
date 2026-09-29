@@ -41,7 +41,7 @@ def migrate_refine(cur: Any) -> None:
     if row is not None and int(row[0]) == REFINE_SCHEMA_VERSION:
         return
     if row is None or int(row[0]) != 3:
-        raise RuntimeError("--migrate-refine requires an existing schema v3 database")
+        raise RuntimeError("Refine v3 to v4 migration requires an existing schema v3 database")
 
     cur.execute("ALTER TABLE clean_runs RENAME TO refine_runs")
     for table in ("detect_runs", "excluded_points", "kept_trajectory_points", "injected_points"):

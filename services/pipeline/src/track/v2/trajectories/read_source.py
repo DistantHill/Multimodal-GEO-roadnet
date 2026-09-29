@@ -8,7 +8,7 @@ import json
 import uuid
 import warnings
 import numpy as np
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
@@ -53,12 +53,15 @@ def get_database(
     field_config: FieldConfig,
     runtime: RuntimeConfig,
     selector: ColumnSelector | None = None,
+    hash_csv_rows: bool = True,
 ) -> "BaseTrajectorySourceHandle":
     config = field_config
     if runtime.csv_max_field_size > csv.field_size_limit():
         csv.field_size_limit(runtime.csv_max_field_size)
     if isinstance(source, CsvSource):
-        return CsvTrajectorySourceHandle(source, config, selector, runtime)
+        return CsvTrajectorySourceHandle(
+            source, config, selector, runtime, hash_rows=hash_csv_rows,
+        )
     if isinstance(source, PostgresSource):
         return PostgresTrajectorySourceHandle(source, config, selector)
     raise TypeError(f"unsupported source type: {type(source).__name__}")
@@ -156,9 +159,12 @@ class BaseTrajectorySourceHandle:
     def _iter_values(self) -> Iterator[tuple]:
         raise NotImplementedError
 
-    def iter_vehicle_batches(self) -> Iterator[SourceBatch]:
+    def iter_vehicle_batches(self, *, max_batch_size: int | None = None) -> Iterator[SourceBatch]:
+        """Yield whole vehicles by default, or bounded single-vehicle chunks."""
         if self._closed:
             raise RuntimeError("trajectory source handle is closed")
+        if max_batch_size is not None and max_batch_size <= 0:
+            raise ValueError("max_batch_size must be positive")
         columns: list[list] = [[] for _ in range(10)]
         vehicle_id: str | None = None
         extra_columns: dict[str, list] = {}
@@ -179,7 +185,12 @@ class BaseTrajectorySourceHandle:
             for index, (column, value) in enumerate(zip(columns, values)):
                 if index != 6:
                     column.append(value)
-        if vehicle_id is not None:
+            if max_batch_size is not None and len(columns[0]) >= max_batch_size:
+                yield _source_batch(source_id, vehicle_id, columns, extra_columns)
+                columns = [[] for _ in range(10)]
+                extra_columns = {}
+                vehicle_id = None
+        if vehicle_id is not None and columns[0]:
             yield _source_batch(source_id, vehicle_id, columns, extra_columns)
 
     def count_vehicle_ids(self) -> int:
@@ -226,6 +237,41 @@ class BaseTrajectorySourceHandle:
         )
 
 
+class _IndexedCsvRow(Mapping[str | None, Any]):
+    """Expose a CSV row by header name without allocating a dict per record."""
+
+    __slots__ = ("values", "_names", "_indices", "_header_length")
+
+    def __init__(self, header: list[str]) -> None:
+        self.values: list[str] = []
+        self._names = list(dict.fromkeys(header))
+        self._indices = {name: index for index, name in enumerate(header)}
+        self._header_length = len(header)
+
+    def get(self, key: str | None, default: Any = None) -> Any:
+        if key is None and len(self.values) > self._header_length:
+            return self.values[self._header_length:]
+        if key not in self._indices:
+            return default
+        index = self._indices[key]
+        return self.values[index] if index < len(self.values) else None
+
+    def __getitem__(self, key: str | None) -> Any:
+        if key not in self._indices and not (
+            key is None and len(self.values) > self._header_length
+        ):
+            raise KeyError(key)
+        return self.get(key)
+
+    def __iter__(self) -> Iterator[str | None]:
+        yield from self._names
+        if len(self.values) > self._header_length:
+            yield None
+
+    def __len__(self) -> int:
+        return len(self._names) + (len(self.values) > self._header_length)
+
+
 class CsvTrajectorySourceHandle(BaseTrajectorySourceHandle):
     def __init__(
         self,
@@ -233,8 +279,11 @@ class CsvTrajectorySourceHandle(BaseTrajectorySourceHandle):
         config: FieldConfig,
         selector: ColumnSelector | None,
         runtime: RuntimeConfig,
+        *,
+        hash_rows: bool = True,
     ) -> None:
         self._source = source
+        self._hash_rows = hash_rows
         self._path = Path(source.path)
         self._encoding = detect_encoding(
             self._path,
@@ -261,8 +310,14 @@ class CsvTrajectorySourceHandle(BaseTrajectorySourceHandle):
         self._state = self._new_state()
         previous: tuple | None = None
         with open_text_auto(self._path, encoding=self._encoding, newline="") as f:
-            reader = csv.DictReader(f)
-            for row_number, row in enumerate(reader, start=2):
+            reader = csv.reader(f)
+            row = _IndexedCsvRow(next(reader, []))
+            row_number = 1
+            for values in reader:
+                if not values:
+                    continue
+                row_number += 1
+                row.values = values
                 self._state.total_rows += 1
                 point_ref = str(row_number)
                 try:
@@ -277,7 +332,8 @@ class CsvTrajectorySourceHandle(BaseTrajectorySourceHandle):
                 _check_order(previous, (*point, point_ref))
                 previous = (*point, point_ref)
                 self._state.mark_loaded()
-                yield (*point, row_number, True, source_row_hash(row))
+                yield (*point, row_number, True,
+                       source_row_hash(row) if self._hash_rows else "")
                 self._state.assert_thresholds()
 
     def count_vehicle_ids(self) -> int:
@@ -581,11 +637,11 @@ def _configure_postgres_session(conn: Any) -> None:
         _close_quietly(cur)
 
 
-def source_row_hash(row: dict[str, Any]) -> str:
-    """Return a stable identity hash used by the standalone CSV parser.
+def source_row_hash(row: Mapping[str | None, Any]) -> str:
+    """Return a stable identity hash for CSV readers that retain source identity.
 
-    This remains part of ``CsvSource``/importer identity handling; schema-v4
-    database replay validates ``refine_runs.source_fingerprint`` instead.
+    The standalone database importer skips this unused per-row value; database
+    replay validates ``refine_runs.source_fingerprint`` instead.
     """
     normalized = {
         str(key): "" if value is None else str(value)

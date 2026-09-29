@@ -434,7 +434,7 @@ def readonly_columns(instance: object) -> None:
 
 @dataclass(frozen=True, slots=True)
 class SourceBatch(TrackModel):
-    """One complete source vehicle, with independent identity columns."""
+    """One source vehicle or a bounded chunk, with independent identity columns."""
     source_id: str
     vehicle_id: str
     lonlat: np.ndarray

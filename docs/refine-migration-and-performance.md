@@ -27,13 +27,8 @@
 旧基准命令薄壳和 `manual_*` 临时调试脚本已于 2026-09-25 从仓库移除；下方计时数字是历史记录，当前 checkout 不再提供对应的可执行基准入口。
 旧配置节、旧 CLI 参数与旧 API 字段需要调用方同步修改。
 
-数据库结构（schema）版本升至 v4。先停止使用目标库的 Pipeline 和 Backend，
-核对连接目标，使用新代码执行：
-
-```sh
-docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm pipeline \
-  python -m pipeline init-db --migrate-refine
-```
+数据库结构（schema）当时由 v3 升至 v4。以下记录当时的迁移行为；当前 CLI
+已删除 v3 保留数据迁移入口，不再提供对应命令。
 
 迁移在一个事务内改名表、列、索引、约束、触发器及关联函数，并更新版本登记。
 PostgreSQL 不会自动改写 PL/pgSQL 函数正文，因此迁移重新安装权威关系保护函数。

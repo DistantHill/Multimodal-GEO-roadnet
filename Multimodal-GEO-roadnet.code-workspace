@@ -1,0 +1,21 @@
+{
+	"folders": [
+		{
+			"name": "Multimodal-GEO-roadnet",
+			"path": "."
+		}
+	],
+	"settings": {
+		"chat.tools.terminal.autoApprove": {
+			"/^docker compose --env-file \\.env -f infra/docker/compose\\.dev\\.yml run --rm pipeline python -m pytest -q tests/v2/test_detect\\.py tests/v2/test_turn_event_wiring\\.py tests/v2/test_cross_candidate_relation_integration\\.py$/": {
+				"approve": true,
+				"matchCommandLine": true
+			}
+		},
+		"python.testing.pytestArgs": [
+			"services"
+		],
+		"python.testing.unittestEnabled": false,
+		"python.testing.pytestEnabled": true
+	}
+}

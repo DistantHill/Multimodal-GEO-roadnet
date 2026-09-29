@@ -89,7 +89,7 @@ db_stream_batch_size = 2000 # DB 服务端游标读取批大小；>=1；执行�
 relation_batch_size = 1024 # DuckDB 中间关系读写批大小；>=1；执行语义。
 parquet_read_batch_size = 4096 # Parquet 读取批大小；>=1；执行语义。
 validation_batch_size = 2000 # 校验与语义对比读取批大小；>=1；执行语义。
-import_batch_size = 10000 # 导入批大小；>=1；执行语义。
+import_batch_size = 100000 # 导入批大小；>=1；执行语义。
 csv_max_field_size = 10485760 # CSV 最大字段；字节，>=1；执行语义。
 encoding_sample_size = 65536 # 编码探测样本；字节，>=1；执行语义。
 encoding_confidence = 0.5 # 编码置信阈值；0..1；执行语义。

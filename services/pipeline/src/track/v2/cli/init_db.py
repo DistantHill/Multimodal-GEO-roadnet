@@ -1,8 +1,7 @@
-"""Create track.v2 schema v9 or migrate an existing v3/v4/v5/v6/v7/v8 schema in place.
+"""Create track.v2 schema v9 or migrate an existing v4/v5/v6/v7/v8 schema in place.
 
-Schema v9 persists Refine XY. Schema v3 supports ``--migrate-refine``; v4 through v8 support ``--migrate-artifacts``.
-An existing v1/v2
-database must be recreated with ``--reset`` so an old column can never retain
+Schema v9 persists Refine XY. Schemas v4 through v8 support ``--migrate-artifacts``.
+An existing v3 or older database must be recreated with ``--reset`` so an old column can never retain
 an ambiguous meaning behind a new API.
 """
 
@@ -562,6 +561,11 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
         "idx_trajectory_points_geom",
         "CREATE INDEX IF NOT EXISTS idx_trajectory_points_geom "
         "ON trajectory_points USING GIST (geom)",
+    ),
+    (
+        "idx_trajectory_points_geom_utm32649",
+        "CREATE INDEX IF NOT EXISTS idx_trajectory_points_geom_utm32649 "
+        "ON trajectory_points USING GIST (ST_Transform(geom, 32649))",
     ),
     (
         "idx_excluded_points_reason",
@@ -2003,8 +2007,8 @@ def _require_empty_or_current(cur: Any) -> None:
     if version is not None:
         raise RuntimeError(
             f"database schema is v{version}; track.v2 requires v{SCHEMA_VERSION}. "
-            "For v3 use init-db --migrate-refine; for v4 through v8 use "
-            "init-db --migrate-artifacts; older schemas require --reset."
+            "For v4 through v8 use init-db --migrate-artifacts; "
+            "v3 and older schemas require --reset."
         )
     existing = _existing_pipeline_tables(cur)
     if existing:
@@ -2012,8 +2016,8 @@ def _require_empty_or_current(cur: Any) -> None:
         suffix = " ..." if len(existing) > 8 else ""
         raise RuntimeError(
             "unversioned/legacy pipeline tables exist "
-            f"({preview}{suffix}); schema v8 has no legacy in-place migration. "
-            "Run init_db --reset."
+            f"({preview}{suffix}); schema v9 has no unversioned in-place migration. "
+            "Run init-db --reset."
         )
 
 
@@ -2061,33 +2065,13 @@ def reset_tables(config: PostgresConfig) -> int:
 def create_tables(
     config: PostgresConfig,
     *,
-    migrate_refine_names: bool = False,
     migrate_artifacts: bool = False,
 ) -> int:
-    """Create schema v9, optionally migrating v3/v4/v5/v6/v7/v8 in one transaction."""
+    """Create schema v9, optionally migrating v4/v5/v6/v7/v8 in one transaction."""
     with pg_connect(config) as conn:
         with conn.cursor() as cur:
             installed_before = _schema_version(cur)
-            if migrate_refine_names and installed_before != SCHEMA_VERSION:
-                from ..db.migrations.refine_v4 import migrate_refine
-
-                migrate_refine(cur)
-                from ..db.migrations.artifacts_v5 import migrate_artifacts_v5
-
-                migrate_artifacts_v5(cur)
-                from ..db.migrations.refine_completion_v6 import migrate_completion_v6
-
-                migrate_completion_v6(cur)
-                from ..db.migrations.detect_completion_v7 import migrate_completion_v7
-
-                migrate_completion_v7(cur)
-                from ..db.migrate_source_row_key import migrate_source_row_key_v8
-
-                migrate_source_row_key_v8(cur)
-                from ..db.migrations.kept_xy_v9 import migrate_kept_xy_v9
-
-                migrate_kept_xy_v9(cur)
-            elif migrate_artifacts and installed_before != SCHEMA_VERSION:
+            if migrate_artifacts and installed_before != SCHEMA_VERSION:
                 from ..db.migrations.artifacts_v5 import migrate_artifacts_v5
                 from ..db.migrations.refine_completion_v6 import migrate_completion_v6
                 from ..db.migrations.detect_completion_v7 import migrate_completion_v7
@@ -2152,7 +2136,7 @@ def create_tables(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Initialize the destructive track.v2 PostgreSQL schema v8."
+        description="Initialize the track.v2 PostgreSQL schema v9."
     )
     parser.add_argument(
         "--ask-password",
@@ -2163,11 +2147,7 @@ def main() -> int:
     migration.add_argument(
         "--reset",
         action="store_true",
-        help="Destructively drop all known Pipeline tables before creating v8.",
-    )
-    migration.add_argument(
-        "--migrate-refine", action="store_true",
-        help="Preserve v3 data, rename Clean objects, then migrate through v9.",
+        help="Destructively drop all known Pipeline tables before creating v9.",
     )
     migration.add_argument(
         "--migrate-artifacts", action="store_true",
@@ -2185,7 +2165,6 @@ def main() -> int:
             reset_tables(config)
         return create_tables(
             config,
-            migrate_refine_names=args.migrate_refine,
             migrate_artifacts=args.migrate_artifacts,
         )
     except RuntimeError as exc:

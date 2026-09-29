@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
@@ -136,7 +137,7 @@ def _parse_row_from_tuple(
 
 
 def parse_row(
-    row: dict[str, Any],
+    row: Mapping[str | None, Any],
     point_ref: str,
     row_number: int,
     mapping: FieldMapping,
@@ -172,7 +173,7 @@ def parse_row(
 
 
 def _required_str(
-    row: dict[str, Any],
+    row: Mapping[str | None, Any],
     spec: FieldSpec,
     mapping: FieldMapping,
     point_ref: str,
@@ -186,7 +187,7 @@ def _required_str(
 
 
 def _required_timestamp(
-    row: dict[str, Any],
+    row: Mapping[str | None, Any],
     spec: FieldSpec,
     mapping: FieldMapping,
     point_ref: str,
@@ -203,7 +204,7 @@ def _required_timestamp(
 
 
 def _required_float(
-    row: dict[str, Any],
+    row: Mapping[str | None, Any],
     spec: FieldSpec,
     mapping: FieldMapping,
     point_ref: str,
@@ -220,7 +221,7 @@ def _required_float(
 
 
 def _optional_float(
-    row: dict[str, Any],
+    row: Mapping[str | None, Any],
     spec: FieldSpec | None,
     mapping: FieldMapping,
     point_ref: str,
@@ -242,7 +243,7 @@ def _optional_float(
 
 
 def _parse_extra(
-    row: dict[str, Any],
+    row: Mapping[str | None, Any],
     mapping: FieldMapping,
     point_ref: str,
     row_number: int,
@@ -310,7 +311,7 @@ def _timestamp_from_number(value: float) -> float:
     return value
 
 
-def _raw_value(row: dict[str, Any], spec: FieldSpec, mapping: FieldMapping) -> Any:
+def _raw_value(row: Mapping[str | None, Any], spec: FieldSpec, mapping: FieldMapping) -> Any:
     column = mapping.canonical_to_source.get(spec.canonical)
     if column is None:
         return spec.default
@@ -331,7 +332,7 @@ def _issue(
     row_number: int,
     level: str,
     reason: str,
-    row: dict[str, Any],
+    row: Mapping[str | None, Any],
 ) -> ParseIssue:
     return ParseIssue(
         point_ref=point_ref,
