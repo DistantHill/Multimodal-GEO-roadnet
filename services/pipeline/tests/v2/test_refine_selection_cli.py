@@ -109,6 +109,24 @@ def test_latest_candidate_queries_exact_source_and_metadata_only():
     assert "excluded_points" not in sql
 
 
+def test_latest_candidate_without_source_queries_all_completed_runs():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = ROW
+    connection = MagicMock()
+    connection.cursor.return_value.__enter__.return_value = cursor
+    connect_context = MagicMock()
+    connect_context.__enter__.return_value = connection
+    with patch("track.v2.cli.refine_selection.connect", return_value=connect_context):
+        selection = latest_completed_refine(PG, None)
+
+    assert selection is not None
+    assert selection.id == REFINE_ID
+    sql = cursor.execute.call_args.args[0]
+    assert "r.source_table =" not in sql
+    assert "r.status = 'completed'" in sql
+    assert "ORDER BY r.started_at DESC, r.id DESC LIMIT 1" in sql
+
+
 def test_history_prints_historical_parameters_projection_and_current_downstream_scope():
     history = format_refine_history(_selection_from_row(ROW))
     assert REFINE_ID in history
@@ -193,6 +211,34 @@ def test_main_true_candidate_reuses_without_prompt(monkeypatch, capsys):
     assert state.run.call_args.kwargs == {
         "source_table": None, "refine_id": candidate.id,
     }
+
+
+def test_main_true_without_source_reuses_latest_completed_refine(monkeypatch, capsys):
+    candidate = SimpleNamespace(id=REFINE_ID)
+    state = _prepare_main(monkeypatch, capsys, candidates=candidate)
+    monkeypatch.setattr("sys.argv", ["pipeline", "--refine-resume-last", "true"])
+    with patch("track.v2.cli.run_pipeline._ask_reuse") as prompt:
+        assert cli.main() == 0
+    state.latest.assert_called_once_with(PG, None)
+    prompt.assert_not_called()
+    assert state.run.call_args.kwargs == {"source_table": None, "refine_id": REFINE_ID}
+
+
+def test_main_true_without_source_requires_completed_refine(monkeypatch, capsys):
+    state = _prepare_main(monkeypatch, capsys)
+    monkeypatch.setattr("sys.argv", ["pipeline", "--refine-resume-last", "true"])
+    assert cli.main() == 2
+    state.run.assert_not_called()
+    assert "全库没有已完成" in capsys.readouterr().err
+
+
+def test_main_false_without_source_rejects_before_loading_config(monkeypatch, capsys):
+    state = _prepare_main(monkeypatch, capsys)
+    monkeypatch.setattr("sys.argv", ["pipeline", "--refine-resume-last", "false"])
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    state.load.assert_not_called()
 
 
 @pytest.mark.parametrize(("answer", "expected_source", "expected_refine"), [

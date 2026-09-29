@@ -81,7 +81,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run track.v2 through Network."
     )
-    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument(
         "--source-table", metavar="TABLE",
         help="从 PostgreSQL 表读取输入轨迹点 / Read input trajectory points from a PostgreSQL table."
@@ -91,7 +91,7 @@ def main() -> int:
         type=_bool_arg,
         default=None,
         metavar="true|false",
-        help="有历史 Refine 时自动复用 (true) 或新建 (false)；省略时交互选择。",
+        help="有历史 Refine 时自动复用 (true) 或新建 (false)；单独传 true 复用全库最近完成的 Refine。",
     )
     source_group.add_argument(
         "--refine-id", metavar="UUID", type=_uuid_arg,
@@ -110,21 +110,29 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.refine_resume_last is not None and args.source_table is None:
-        parser.error("--refine-resume-last 只能与 --source-table 配合使用")
+    if args.refine_id is not None and args.refine_resume_last is not None:
+        parser.error("--refine-resume-last 不能与 --refine-id 配合使用")
+    if args.source_table is None and args.refine_id is None and args.refine_resume_last is not True:
+        parser.error("请指定 --source-table、--refine-id，或 --refine-resume-last true")
 
     config = load_startup_config(ask_password=args.ask_password)
     db_config = config.postgres
 
     selected_refine_id = str(args.refine_id) if args.refine_id else None
     selected_history = None
-    if args.source_table is not None and args.refine_resume_last is not False:
+    if args.refine_resume_last is True or (
+        args.source_table is not None and args.refine_resume_last is not False
+    ):
         try:
             selected_history = latest_completed_refine(db_config, args.source_table)
         except Exception as exc:
-            print(f"[FAIL] 查询来源 {args.source_table} 的已完成 Refine 失败: {exc}", file=sys.stderr)
+            source_description = args.source_table or "全库"
+            print(f"[FAIL] 查询来源 {source_description} 的已完成 Refine 失败: {exc}", file=sys.stderr)
             return 2
         if selected_history is None:
+            if args.source_table is None:
+                print("[FAIL] 全库没有已完成的 Refine Run。", file=sys.stderr)
+                return 2
             print(f"未找到来源表 {args.source_table} 的已完成 Refine；将新建 Refine。")
         else:
             print("找到可复用的历史 Refine：")

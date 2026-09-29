@@ -30,7 +30,7 @@ class MakePipelineCommandsTest(unittest.TestCase):
     def test_smoke_requires_source(self):
         result = self.dry_run("pipeline-smoke-test", "SOURCE_TABLE=")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("SOURCE_TABLE 或 REFINE_ID", result.stderr)
+        self.assertIn("SOURCE_TABLE 不能为空", result.stderr)
 
     def test_full_runs_pipeline_with_explicit_source_and_full_config(self):
         result = self.dry_run("pipeline-full-test", "SOURCE_TABLE=public.day01")
@@ -43,7 +43,7 @@ class MakePipelineCommandsTest(unittest.TestCase):
     def test_full_requires_source(self):
         result = self.dry_run("pipeline-full-test", "SOURCE_TABLE=")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("SOURCE_TABLE 或 REFINE_ID", result.stderr)
+        self.assertIn("SOURCE_TABLE 不能为空", result.stderr)
 
     def test_smoke_accepts_explicit_refine_id_without_injecting_bool(self):
         result = self.dry_run(
@@ -53,6 +53,22 @@ class MakePipelineCommandsTest(unittest.TestCase):
         self.assertIn("pipeline-roadnet-test.toml", result.stdout)
         self.assertIn("--refine-id \"11111111-1111-1111-1111-111111111111\"", result.stdout)
         self.assertNotIn("--refine-resume-last", result.stdout)
+
+    def test_smoke_passes_resume_last_true(self):
+        result = self.dry_run(
+            "pipeline-smoke-test", "SOURCE_TABLE=public.day01", "REFINE_RESUME_LAST=true"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--refine-resume-last "true"', result.stdout)
+
+    def test_resume_last_true_needs_no_source_or_refine_id(self):
+        for target in ("pipeline-smoke-test", "pipeline-full-test"):
+            with self.subTest(target=target):
+                result = self.dry_run(target, "REFINE_RESUME_LAST=true")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('pipeline run  --refine-resume-last "true"', result.stdout)
+                self.assertNotIn("--source-table", result.stdout)
+                self.assertNotIn("--refine-id", result.stdout)
 
     def test_full_passes_false_as_an_explicit_choice(self):
         result = self.dry_run(
@@ -69,6 +85,7 @@ class MakePipelineCommandsTest(unittest.TestCase):
             (("REFINE_ID=11111111-1111-1111-1111-111111111111", "REFINE_RESUME_LAST=true"), "只能与 SOURCE_TABLE 配合使用"),
             (("SOURCE_TABLE=public.day01", "REFINE_RESUME_LAST=yes"), "只能是 true 或 false"),
             (("SOURCE_TABLE=public.day01", "REFINE_RESUME_LAST=true false"), "必须是单个 true 或 false"),
+            (("REFINE_RESUME_LAST=false",), "请指定 SOURCE_TABLE"),
         ):
             with self.subTest(arguments=arguments):
                 result = self.dry_run("pipeline-full-test", *arguments)

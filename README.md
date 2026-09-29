@@ -154,6 +154,7 @@ CSV 当作运行入口，需要时先用独立 importer 导入 PostgreSQL。`--r
 ```sh
 make pipeline-smoke-test SOURCE_TABLE=public.day01
 make pipeline-smoke-test SOURCE_TABLE=public.day01 REFINE_RESUME_LAST=true
+make pipeline-smoke-test REFINE_RESUME_LAST=true
 ```
 
 也可直接复用指定批次：
@@ -168,13 +169,17 @@ make pipeline-smoke-test REFINE_ID=00000000-0000-0000-0000-000000000000
 ```sh
 make pipeline-full-test SOURCE_TABLE=public.day01
 make pipeline-full-test SOURCE_TABLE=public.day01 REFINE_RESUME_LAST=false
+make pipeline-full-test REFINE_RESUME_LAST=true
 ```
+
+单独传 `REFINE_RESUME_LAST=true` 时，从当前配置连接的数据库中选择最近完成的 Refine Run；
+没有已完成批次则报错。与 `SOURCE_TABLE` 同传时只在该来源表的批次中选择。
 
 这两个命令执行 Refine、Detect、Clip、Fitting 和 Network，不会在结束时清理业务结果。
 `--rm` 只移除本次临时容器；PostgreSQL 记录、挂载目录中的 Parquet 和日志仍保留。
 当前 Network 阶段在内存中组装路网；持久化内容以各阶段已有的数据库和制品写入逻辑为准。
 
-CLI 也支持 `--refine-resume-last true|false`。显式 `--refine-id` 与来源表二选一，且不能与该 Bool 同时使用。省略 Bool 时，有候选且终端可交互则默认复用；非交互环境请显式传 `true` 或 `false`。复用时输出历史 Refine 数据类别、历史 Parser/Refine 生成参数和投影上下文；后续 Detect、Clip、Fitting、Network 使用当前启动配置。
+CLI 也支持 `--refine-resume-last true|false`。显式 `--refine-id` 与来源表二选一，且不能与该 Bool 同时使用。单独传 `--refine-resume-last true` 复用当前数据库最近完成的 Refine。省略 Bool 时，有候选且终端可交互则默认复用；非交互环境请显式传 `true` 或 `false`。复用时输出历史 Refine 数据类别、历史 Parser/Refine 生成参数和投影上下文；后续 Detect、Clip、Fitting、Network 使用当前启动配置。
 
 当前 Run lineage 为 `refine_runs → detect_runs → fit_runs`。Detect 的完整
 `resolved_subtrack_points` 序列与所有 Detect 子产物在一个最终事务中落盘；失败

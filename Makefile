@@ -46,29 +46,29 @@ pipeline-full-test: validate-pipeline-full-selection
 	$(MAKE) --no-print-directory services-up
 	$(COMPOSE_DEV) run --rm -e PIPELINE_CONFIG_PATH=/app/config/pipeline.toml pipeline python -m pipeline run $(PIPELINE_SELECTION_ARGS)
 
-PIPELINE_SELECTION_ARGS = $(if $(strip $(SOURCE_TABLE)),--source-table "$(SOURCE_TABLE)",--refine-id "$(REFINE_ID)") $(if $(filter undefined,$(origin REFINE_RESUME_LAST)),,--refine-resume-last "$(REFINE_RESUME_LAST)")
+PIPELINE_SELECTION_ARGS = $(if $(strip $(SOURCE_TABLE)),--source-table "$(SOURCE_TABLE)",$(if $(strip $(REFINE_ID)),--refine-id "$(REFINE_ID)")) $(if $(filter undefined,$(origin REFINE_RESUME_LAST)),,--refine-resume-last "$(REFINE_RESUME_LAST)")
 
 .PHONY: validate-pipeline-smoke-selection validate-pipeline-full-selection
 validate-pipeline-smoke-selection:
 	$(if $(and $(strip $(SOURCE_TABLE)),$(strip $(REFINE_ID))),$(error SOURCE_TABLE 与 REFINE_ID 只能指定一个))
-	$(if $(strip $(SOURCE_TABLE)),,$(if $(strip $(REFINE_ID)),,$(error 请指定 SOURCE_TABLE 或 REFINE_ID)))
 	$(if $(and $(filter-out undefined,$(origin REFINE_ID)),$(if $(strip $(REFINE_ID)),,true)),$(error REFINE_ID 不能为空))
 	$(if $(and $(filter-out undefined,$(origin SOURCE_TABLE)),$(if $(strip $(SOURCE_TABLE)),,true)),$(error SOURCE_TABLE 不能为空))
 	$(if $(and $(filter-out undefined,$(origin REFINE_RESUME_LAST)),$(if $(strip $(REFINE_RESUME_LAST)),,true)),$(error REFINE_RESUME_LAST 不能为空))
 	$(if $(and $(filter-out undefined,$(origin REFINE_RESUME_LAST)),$(filter-out 1,$(words $(strip $(REFINE_RESUME_LAST))))),$(error REFINE_RESUME_LAST 必须是单个 true 或 false))
 	$(if $(and $(filter-out undefined,$(origin REFINE_RESUME_LAST)),$(filter-out true false,$(REFINE_RESUME_LAST))),$(error REFINE_RESUME_LAST 只能是 true 或 false))
 	$(if $(and $(filter-out undefined,$(origin REFINE_RESUME_LAST)),$(strip $(REFINE_ID))),$(error REFINE_RESUME_LAST 只能与 SOURCE_TABLE 配合使用))
+	$(if $(or $(strip $(SOURCE_TABLE)),$(strip $(REFINE_ID)),$(filter true,$(REFINE_RESUME_LAST))),,$(error 请指定 SOURCE_TABLE、REFINE_ID，或 REFINE_RESUME_LAST=true))
 	@:
 
 validate-pipeline-full-selection:
 	$(if $(and $(strip $(SOURCE_TABLE)),$(strip $(REFINE_ID))),$(error SOURCE_TABLE 与 REFINE_ID 只能指定一个))
-	$(if $(strip $(SOURCE_TABLE)),,$(if $(strip $(REFINE_ID)),,$(error 请指定 SOURCE_TABLE 或 REFINE_ID)))
 	$(if $(and $(filter-out undefined,$(origin REFINE_ID)),$(if $(strip $(REFINE_ID)),,true)),$(error REFINE_ID 不能为空))
 	$(if $(and $(filter-out undefined,$(origin SOURCE_TABLE)),$(if $(strip $(SOURCE_TABLE)),,true)),$(error SOURCE_TABLE 不能为空))
 	$(if $(and $(filter-out undefined,$(origin REFINE_RESUME_LAST)),$(if $(strip $(REFINE_RESUME_LAST)),,true)),$(error REFINE_RESUME_LAST 不能为空))
 	$(if $(and $(filter-out undefined,$(origin REFINE_RESUME_LAST)),$(filter-out 1,$(words $(strip $(REFINE_RESUME_LAST))))),$(error REFINE_RESUME_LAST 必须是单个 true 或 false))
 	$(if $(and $(filter-out undefined,$(origin REFINE_RESUME_LAST)),$(filter-out true false,$(REFINE_RESUME_LAST))),$(error REFINE_RESUME_LAST 只能是 true 或 false))
 	$(if $(and $(filter-out undefined,$(origin REFINE_RESUME_LAST)),$(strip $(REFINE_ID))),$(error REFINE_RESUME_LAST 只能与 SOURCE_TABLE 配合使用))
+	$(if $(or $(strip $(SOURCE_TABLE)),$(strip $(REFINE_ID)),$(filter true,$(REFINE_RESUME_LAST))),,$(error 请指定 SOURCE_TABLE、REFINE_ID，或 REFINE_RESUME_LAST=true))
 	@:
 
 .PHONY: compose-test

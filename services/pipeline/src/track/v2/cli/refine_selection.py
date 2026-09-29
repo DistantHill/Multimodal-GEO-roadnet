@@ -31,17 +31,24 @@ FROM refine_runs AS r
 
 
 def latest_completed_refine(
-    postgres_config: PostgresConfig, source_table: str,
+    postgres_config: PostgresConfig, source_table: str | None,
 ) -> RefineSelection | None:
-    """Return the latest completed record for an exact source_table string."""
+    """Return the latest completed record, optionally limited to one exact source."""
     with connect(postgres_config) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                _SELECTION_SQL
-                + " WHERE r.source_table = %s AND r.status = 'completed' "
-                + "ORDER BY r.started_at DESC, r.id DESC LIMIT 1",
-                (source_table,),
-            )
+            if source_table is None:
+                cur.execute(
+                    _SELECTION_SQL
+                    + " WHERE r.status = 'completed' "
+                    + "ORDER BY r.started_at DESC, r.id DESC LIMIT 1"
+                )
+            else:
+                cur.execute(
+                    _SELECTION_SQL
+                    + " WHERE r.source_table = %s AND r.status = 'completed' "
+                    + "ORDER BY r.started_at DESC, r.id DESC LIMIT 1",
+                    (source_table,),
+                )
             row = cur.fetchone()
     return None if row is None else _selection_from_row(row)
 
