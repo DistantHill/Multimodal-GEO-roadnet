@@ -14,6 +14,10 @@ Example (from the repository root, with the existing local .env):
     python scripts/measure_pipeline_run.py --source-table public.trajectory_points \
     --record /data/logs/full-measurement.json --revision <fixed-revision> \
     --pipeline-arg=--refine-resume-last --pipeline-arg=false
+
+To reuse a completed Refine Run while still counting its protected source,
+pass both --source-table and --refine-id to this measurement wrapper. Only
+--refine-id is passed to the Pipeline CLI; no new Refine is started.
 """
 from __future__ import annotations
 
@@ -40,6 +44,18 @@ def require_uncapped_memory(memory_max: str) -> None:
         raise SystemExit('measurement requires memory.max=max (no container hard memory limit)')
 
 
+def pipeline_selection_args(source_table: str, refine_id: str | None) -> list[str]:
+    return ['--refine-id', refine_id] if refine_id is not None else ['--source-table', source_table]
+
+
+def require_completed_refine_source(connection, refine_id: str, source_table: str) -> None:
+    row = connection.execute(
+        'SELECT source_table, status FROM refine_runs WHERE id = %s', (refine_id,)
+    ).fetchone()
+    if row != (source_table, 'completed'):
+        raise SystemExit('explicit Refine Run must be completed and belong to source-table')
+
+
 def database_snapshot(connection, source_table: str) -> dict:
     from track.v2.db.source_table import validate_source_table
     contract = validate_source_table(connection, source_table)
@@ -55,6 +71,7 @@ def database_snapshot(connection, source_table: str) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--source-table', required=True)
+    parser.add_argument('--refine-id', help='Explicit completed Refine Run to reuse; source-table remains the count target.')
     parser.add_argument('--record', required=True, type=Path)
     parser.add_argument('--revision', required=True)
     parser.add_argument('--pipeline-arg', action='append', default=[],
@@ -68,16 +85,20 @@ def main() -> int:
     events_before = read_cgroup('memory.events')
     with psycopg.connect(host=config['host'], port=config['port'], dbname=config['database'],
                         user=config['user'], password=os.environ['POSTGRES_PASSWORD']) as connection:
+        if args.refine_id is not None:
+            require_completed_refine_source(connection, args.refine_id, args.source_table)
         database_before = database_snapshot(connection, args.source_table)
         stats_path = args.record.with_suffix('.stats.json')
         stats_path.parent.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
         return_code = subprocess.call([sys.executable, '-m', 'pipeline', 'run',
-                                       '--source-table', args.source_table, '--stats-json', str(stats_path),
+                                       *pipeline_selection_args(args.source_table, args.refine_id),
+                                       '--stats-json', str(stats_path),
                                        *args.pipeline_arg])
         elapsed = time.monotonic() - started
         database_after = database_snapshot(connection, args.source_table)
     record = {'revision': args.revision, 'config': str(config_path), 'source_table': args.source_table,
+              'refine_id': args.refine_id,
               'return_code': return_code, 'elapsed_seconds': elapsed, 'pipeline_args': args.pipeline_arg,
               'stats_path': str(stats_path),
               'pipeline_stats': json.loads(stats_path.read_text()) if stats_path.exists() else None,

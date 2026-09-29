@@ -17,6 +17,34 @@ def test_measurement_rejects_container_hard_cap():
     module.require_uncapped_memory("max")
     with pytest.raises(SystemExit, match="memory.max=max"):
         module.require_uncapped_memory("4000000000")
+    assert module.pipeline_selection_args("public.trajectory_points", None) == [
+        "--source-table", "public.trajectory_points",
+    ]
+    assert module.pipeline_selection_args("public.trajectory_points", "completed-refine-id") == [
+        "--refine-id", "completed-refine-id",
+    ]
+
+    class RefineLookup:
+        def __init__(self, row):
+            self.row = row
+
+        def execute(self, statement, parameters):
+            assert "FROM refine_runs" in statement
+            assert parameters == ("completed-refine-id",)
+            return self
+
+        def fetchone(self):
+            return self.row
+
+    module.require_completed_refine_source(
+        RefineLookup(("public.trajectory_points", "completed")),
+        "completed-refine-id", "public.trajectory_points",
+    )
+    with pytest.raises(SystemExit, match="completed and belong"):
+        module.require_completed_refine_source(
+            RefineLookup(("public.trajectory_points", "running")),
+            "completed-refine-id", "public.trajectory_points",
+        )
 
 
 def test_threshold_logs_error_once_per_episode_and_does_not_stop(monkeypatch):
