@@ -6,7 +6,11 @@
 
 状态：实施中
 创建日期：2026-09-19
-更新日期：2026-09-22
+更新日期：2026-09-29
+
+转向事件以当前 Refine 数据和 DuckDB SQL 计算结果为权威；阈值直接按配置值判断，
+不为匹配旧 Python 输出扩宽阈值或设置容差。下文其他卡片的历史实现步骤不构成
+转向事件的现行验收依据。
 
 ## 1. 执行规则
 
@@ -272,11 +276,11 @@ Detect/Pipeline 入口，也不改变 Detect 算子。
 ### C07a — Detect 转向候选列式迁移
 
 范围：以 DuckDB 对 Refine 清单视图执行按车辆、子轨迹排序的转向窗口、圆均值和阈值
-过滤；过滤后才构造最小 `TurnEvent`。正式 Parquet 路径不再调用 Python 转向算子，旧
-PostgreSQL 路径保留为差分参考实现。
+过滤；过滤后才构造转向事件列批。正式 Parquet 路径和内存轨迹入口使用同一 SQL
+计算规则，不调用旧 Python 转向算子。
 
-验证：真实 Parquet 与 `detect_turn_patch` 按 Q49 差分，覆盖窗口、圆周、阈值、异常
-时间、短轨、多车辆/子轨迹和读取批次边界；断言正式路径未调用 Python 转向算子。
+验证：以当前输入检查窗口、圆周、配置阈值、异常时间、短轨、多车辆/子轨迹和读取
+批次边界；不以旧输出差分或容差作为通过条件。
 
 提交：`cfecadd`。
 
@@ -761,11 +765,6 @@ cells。这些是真实长跳段触发历史 global fallback，而非输入成�
 overflow guard；要保持历史候选语义并有界处理该规模，需要后续另行设计等价的
 DuckDB/Polars broad phase，不能在本卡直接抬高保护阈值。
 
-turn event 也按稳定 `(subtrack_index, refined_sequence_in_subtrack)` 做了只读对齐：
-56,176 个公共事件的 bearing/turn 最大差为 `1.1369e-13`，另有 63 个新增、2 个缺失；
-这 65 个集合差全部处于闭区间 45°/170° 边界，是 DuckDB 与历史 Python 三角函数及求和
-舍入方向不同造成的边界翻转，并非 Refine 成员变化。该兼容修复不混入本卡。
-
 本卡同时修正 `tracks_cross` 无向身份：候选成员证据与行身份都按稳定
 `(subtrack_index, sequence_in_subtrack)` 端点排序，不再依赖 surrogate ID 的 from/to
 顺序；端点反转等价回归已覆盖。定向测试 `20 passed`，标准 Pipeline 全量
@@ -786,26 +785,16 @@ batch；遗留 grid 配置继续校验但不影响候选。固定 1M Parquet 的
 验证：定向 `58 passed`，Pipeline 全量 `935 passed, 50 skipped`。
 提交：`0f88034`。
 
-#### C12d2 — Turn 闭区间边界兼容
+#### C12d2 — Turn SQL 单一路径（2026-09-29 现行规则）
 
-DuckDB 继续负责按子轨迹 partition/window、leg/elapsed/speed 条件、圆均值近似、稳定排序
-与单一有序结果流。SQL 的 turn 阈值改为 Q49 `1e-12°` 宽筛，绑定下限/上限分别用
-`math.nextafter` 向外扩张；远离阈值且数值稳定的行直接使用 SQL 值。位于 45°/170° 等
-阈值邻域的行仅携带有序 in/out heading 小窗口，由现有 Python
-`_circular_mean_deg`、`_angle_delta_deg` 按历史闭区间精算，未通过的行跳过且不占
-`event_calculate_index`，因此最终索引连续、无第二查询归并。
+DuckDB 按车辆和子轨迹计算窗口、leg/elapsed/speed、圆均值与转向角，直接以配置的
+闭区间阈值筛选并稳定排序。只把选中的事件列按批送往后续阶段；内存轨迹入口先将
+输入写入临时 DuckDB 表，再调用同一 SQL 路径。旧 Python 逐点精算、边界宽筛、
+容差和历史事件差分均不参与当前计算或验收；当前数据和 SQL 结果为权威。
 
-病态圆向量也强制进入同一最小 fallback：SQL 携带 resultant magnitude 与 sin/cos
-绝对和，以 `gamma_n = n*u/(1-n*u)`、`u=2^-53` 判断累计舍入误差是否足以覆盖 resultant。
-该规则防止近零向量的 SQL 方位近似决定成员，但与历史 oracle 的最终一致仍以固定镜像和
-libm 为验证前提，不声称对任意 libm 提供数学同一性。Q44 上，DuckDB 保持列式、可外存的
-全量工作，Python 只处理阈值邻域或病态窗口，不引入全表 Python、自研 spill、并发池或
-Dask。本卡不重跑 1M，C12 仍为进行中。
-
-验证：turn 定向 `6 passed`；Pipeline 与 `scripts/cv_human_check/tests` 合并全量
-`967 passed, 50 skipped`，其中 scripts 单独 `29 passed`；`git diff --check` 通过。
-
-提交：待记录。
+实现入口： `RefineDatasetReader.iter_turn_candidates` 与
+`RefineDatasetReader._iter_turn_candidates_sql`；内存入口由
+`collect_candidates.extract_turn_candidates` 调用同一 SQL 方法。
 
 #### C12e1 — Cross-track 保守数值宽筛
 
