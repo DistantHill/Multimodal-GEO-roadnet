@@ -23,10 +23,10 @@ Detect 先提取转向事件（turn events）和跨轨迹候选（cross-track ca
 SQL 阈值，输出的事件再组成有界批次。内存轨迹入口将轨迹任务块写入临时
 DuckDB 表，调用同一 SQL 计算路径。关闭转向检测时仍消费输入任务块。
 
-跨轨迹路径先准备线段，再由 `build_cross_track_index` 构建空间网格，
+内存轨迹入口先准备跨轨迹线段，再由 `build_cross_track_index` 构建空间网格，
 `iter_cross_track_patches` 输出有界线段对数组，交给检测内核计算。
 网格跨度保存在调度模块中，检测线段不携带网格属性。
-同车配对被跳过，覆盖多个网格的配对只归属一个网格，长线段走有界回退配对。
+同一子轨迹的线段不配对；同车不同子轨迹允许配对。覆盖多个网格的配对只归属一个网格，长线段走有界回退配对。
 所有命中按原有顺序排序后赋予全局编号，聚类在汇总后执行。
 
 INFO 开始与结束摘要、定时心跳和进度更新由外层候选提取负责，检测内核不打印
@@ -34,191 +34,32 @@ INFO 开始与结束摘要、定时心跳和进度更新由外层候选提取负
 
 跨轨迹候选仍使用 NumPy 批量计算；转向事件的窗口和阈值计算由 DuckDB 完成。
 内存轨迹入口仍由调用方持有轨迹工作区，也未引入进程池。
-配置字段及持久化结构保持原有格式；性能报告中的 `stream_m1` 阶段改名为
-`load_tracks_and_turn_candidates`，内存入口分别记录 `turn_candidates`
+配置字段及持久化结构保持原有格式；内存入口分别记录 `turn_candidates`
 与 `cross_track_candidates`。
 
 回归测试见 `services/pipeline/tests/v2/test_candidate_patches.py`，覆盖任务块惰性读取、
 尾批次、候选编号与来源、同车子轨迹、读取器异常关闭，以及不同网格大小和
 线段对批量下与历史参考实现的候选一致性。完整验证命令为 `make test`。
 
-## DB Detect 磁盘工作区（2026-09-14）
+## 正式 DB Detect 入口（2026-09-29）
 
-上述抽离之后，2600 万行源数据测试在读取约 274 万个点时已经出现全局轨迹
-工作区导致的内存压力。因此 DB Detect 进一步改为临时磁盘工作区；内存入口
-保留原网格路径，作为小数据接口及语义对照。两者调用同一个转向、精确线段求交
-和圆穿越内核，并使用相同的全局聚类入口。
+正式入口 `_detect_intersections_db` 要求 Refine 列式读取器，使用独立的
+`TurnEventRelation` 与 `CrossCandidateRelation` 承接候选；入口和资源释放见
+[/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/detect_intersections.py:433](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/detect_intersections.py:433) 。
 
-`detect_workspace.py` 在 `DATA_ROOT` 下创建独立临时目录；未设置 `DATA_ROOT`
-的本地调用使用系统临时目录。SQLite 表保存压缩后的完整子轨迹、真实相邻线段、
-段起点来源以及候选。R-tree 保存所有真实相邻线段的包围盒，包含非直行线段，
-供拓扑查询使用。该 SQLite 数据库属于本次运行的临时制品，不向 PostgreSQL
-安装函数、触发器或持久业务表。Detect 正常返回、读取失败、计算失败或取消时，
-上下文管理器关闭 SQLite 并清理目录；进程被强制杀死不保证执行 Python 清理。
+- 转向事件由 Refine Parquet 读取器执行 DuckDB SQL 窗口和配置阈值计算，按批写入
+  `TurnEventRelation`，并更新累计事件数与心跳。调用见
+  [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/detect_intersections.py:450](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/detect_intersections.py:450) ，
+  SQL 入口见
+  [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/results/read_parquet.py:281](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/results/read_parquet.py:281) 。
+- 跨轨迹候选由 `run_grid_cross_track_task` 按 Refine 范围和网格任务调度，候选写入
+  `CrossCandidateRelation`。网格内点及邻点使用 PostgreSQL 临时命中表和服务端游标
+  分批读取；调用见
+  [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/detect_intersections.py:476](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/detect_intersections.py:476) ，
+  读取边界见
+  [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/db/fetch_refine_points_in_grid.py:155](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/db/fetch_refine_points_in_grid.py:155) 。
+- 聚类后由 Refine 读取器提供拓扑所需子轨迹；正式路径调用见
+  [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/detect_intersections.py:480](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/intersections/detect_intersections.py:480) 。
 
-DB 路径在读取时按完整子轨迹写入磁盘，不再调用全量 `_prepare_segments`。
-空间索引以真实线段包围盒查询候选线段对，通过严格车辆顺序保证配对只出现一次。
-R-tree 对浮点边界作向外舍入，查询再用原始双精度包围盒复核；精确求交仍由
-`detect_cross_track_patch` 决定。长线段直接进入相同索引，不采用端点窗口过滤，
-也不再创建全局网格归属列表或内存窗口回退。
-
-DB 与内存入口的调度配置适用范围明确如下：
-
-| 字段 | DB 磁盘入口 | 内存入口 |
-| --- | --- | --- |
-| `stream_batch_size` | 每个转向任务块的完整子轨迹数 | 同义 |
-| `cross_track_pair_batch_size` | 精确求交的段对数量上限，另限制最多 8192 对以约束解码元数据 | 原配置上限 |
-| `cross_track_grid_cell_m` | 不用于 R-tree 分块 | 网格尺寸 |
-| `cross_track_max_grid_cells_per_segment` | 不用于 R-tree；长线段直接索引 | 网格归属与溢出判定 |
-| `spatial_window_size` / `spatial_window_overlap` | 不用于 DB 跨轨迹调度 | 历史窗口对照调用仍可使用 |
-| 直行阈值、求交角度、聚类参数 | 保持原语义 | 保持原语义 |
-
-命中候选先写临时表，按原有车辆、段位置、轨迹顺序在磁盘排序，再赋全局编号。
-SQLite 页缓存设为 32 MiB，关闭全文件内存映射，排序允许使用临时磁盘。
-每个段对任务块只解码该块涉及的段；不存在全量 Python 点或段列表。
-
-拓扑查询按线段包围盒找到子轨迹，然后按原有轨迹顺序逐条读取完整子轨迹。
-这样保持真正的初始圆内状态、所有相邻线段以及方向计算上下文。逐轨迹内核产生
-局部穿越点编号后，外层按已有累计数量平移编号，同时更新观测引用；得到的
-完整交叉口、穿越点和进出观测与内存入口一致。
-
-内存限制仍需明确：完整单条子轨迹是现有内核的不可分割输入，转向任务块仍可能
-包含多条较长子轨迹；车辆/子轨迹排序元数据随轨迹数增长；最终候选、聚类成员、
-拓扑穿越点和观测仍全局保留。此修改消除的是随全部有效点增长的点/段工作区，
-没有把全局聚类换成局部聚类，也不能据此承诺任意事件密度下的固定内存上限。
-磁盘暂存页缓存还需纳入实际控制组观测。
-
-新增 `test_detect_disk_workspace.py` 对照跨块交点、长段、网格边界、R-tree 舍入、
-同车不同子轨迹、全局候选编号、注入点来源、非有限末点方向兼容、拓扑圆内起始、
-切点和顶点穿越。生命周期用例验证源点释放、逐轨迹读取及异常清理。当前局部
-回归为 133 项通过、1 项跳过；全量内存表现以实际运行记录为准。
-
-### 跨轨迹命中前只处理数值（2026-09-14）
-
-百万行实跑暴露了第一版磁盘调度的额外成本：每个包围盒候选段对批次先反序列化
-所有涉及的起点，即使精确求交最终没有命中。调度现改为只加载 XY 和方向角数组，
-先调用共享的 `intersect_cross_track_patch` 数值内核；得到命中索引后，才批量查询
-相应来源点。每个任务块内同一命中段只加载一次，再由
-`build_cross_track_patch_candidates` 构造来源信息。原 `detect_cross_track_patch`
-组合这两个纯计算步骤，内存入口与磁盘入口使用相同的角度、包围盒和精确求交规则。
-SQL 中没有再实现角度判断，候选全局排序及编号保持原样。
-
-固定随机种子 1443、1500 条两点合成轨迹的同输入局部剖析结果如下；两版均得到
-5650 个候选，完整候选 JSON 的 SHA-256 均为
-`5bce884e5247ab4f8886332b8e4b8543ca5601cd592da73581663ef223f1f135`。
-
-| 指标 | 原磁盘调度 | 仅命中后解码 |
-| --- | --- | --- |
-| 跨轨迹总耗时（含剖析） | 4.218 秒 | 2.238 秒 |
-| `pickle.loads` 次数（含最终候选读取） | 70,595 | 10,133 |
-| 其中来源点解码次数 | 64,945 | 4,483 |
-| `pickle.loads` 累计耗时 | 1.800 秒 | 0.251 秒 |
-| 单块最大完整段对象数量 | 1,470 | 488 |
-
-基准脚本位于本次任务的 `/tmp/roadnet_detect_numeric_bench.py`，前后日志分别为
-`/tmp/roadnet_numeric_before.log`、`/tmp/roadnet_numeric_after.log`。这是局部成本
-定位和同输入验证，不能外推为 2600 万行的耗时保证。新回归额外确认所有数值
-求交均未命中时不查询来源 payload、不反序列化任何来源点。
-
-### R-tree 增加保守方向粗筛（2026-09-14）
-
-新的临时工作区将 R-tree 第三维用于固定 5° 方向粗桶。正常 `[0,360)` 方向有
-72 个桶；NaN、无穷值和范围外方向统一进入 unknown 桶。该结构只减少进入数值
-内核之前的宽筛段对，不改变任何精确求交或角度配置。
-
-两个实际方向与对应桶中心的圆周角距离差不超过一个桶宽；允许范围额外再扩一个
-桶宽。因此小型允许区间表用桶中心距离的 ±10° 包住可能满足配置的段对，精确
-判定仍由原数值内核执行。区间按目标桶号合并为不重叠区间，处理 0°/360° 环绕，
-避免同一段对因多个允许区间重复输出。正常源始终包含 unknown 目标；unknown 源
-查询全部桶。非有限、反序或超出 `[0,180]` 的角度配置也回退全部桶。
-
-拓扑查询不指定第三维，继续查询原 XY 包围盒并用双精度边界复核，保持完整子轨迹
-集合。此结构仅在新建临时工作区时安装，不修改正在运行的 2D 工作区，也不在
-生产代码中保留另一套 2D 算法入口。
-
-在独立工作区的 `EXPLAIN QUERY PLAN` 中，新增
-`tracks(track_key, vehicle)` 索引使车辆枚举和轨迹排序均使用覆盖索引（covering index），
-无需为这两项元数据查询访问带压缩轨迹 payload 的表记录。车辆去重仍使用临时
-B 树（B-tree），不声称取消了去重工作。
-
-固定随机种子 1713、每组 1000 条两点合成轨迹，最终版本（包括覆盖索引）的
-同输入结果如下。时间是单次局部测量，包含调度及候选保存/排序，不能外推为
-真实全量任务耗时；构建时间的小幅差异也不足以证明建树本身更快。
-
-| 分布 | 索引 | 构建秒数 | 宽筛段对 | 提取秒数 | 初始工作区字节数 | 候选数 |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 99% 同方向 | 2D | 0.095 | 220,442 | 0.889 | 704,512 | 2,270 |
-| 99% 同方向 | 3D | 0.077 | 4,441 | 0.128 | 753,664 | 2,270 |
-| 方向均匀 | 2D | 0.134 | 220,930 | 1.508 | 733,184 | 13,084 |
-| 方向均匀 | 3D | 0.093 | 55,114 | 1.074 | 786,432 | 13,084 |
-| 全 unknown | 2D | 0.093 | 220,442 | 0.518 | 708,608 | 0 |
-| 全 unknown | 3D | 0.078 | 220,442 | 0.618 | 782,336 | 0 |
-
-每组 2D/3D 完整候选 JSON 摘要相同；三个摘要依次为
-`126c3ec3b5438796b5c83318c78236ee0ec520d579c5b7f540c6ef029295b86c`、
-`c032ef5e70e95cac0e97457146b37fbb5e5d3370ad0ace566a0f3451b15ff851`、
-`4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945`。
-全 unknown 没有筛选收益，本次约增加 19% 提取耗时；空间增加约 7%–10%。
-
-基准脚本 `/tmp/roadnet_heading_index_bench.py` 使用任务临时保存的 2D 参考模块
-`/tmp/roadnet_detect_workspace_2d_reference.py`，最终日志为
-`/tmp/roadnet_heading_index_final.log`。回归覆盖桶边界相邻浮点值、wrap、精确角度
-阈值、异常配置、unknown、长段、同车子轨迹、全局编号以及拓扑集合一致性。
-跨轨迹长期心跳同时报告累计宽筛段对和累计候选命中数量，不新增逐批 INFO。
-
-### 跨轨迹数值查询使用覆盖索引（2026-09-14）
-
-2600 万行实跑进入跨轨迹阶段后仍表现出较多磁盘读取。检查查询计划发现，原有
-`tracks_key_vehicle` 只覆盖车辆枚举和轨迹排序；宽筛中的 `ta.id`、`tb.id` 关联
-仍访问带压缩轨迹 payload 的表。线段宽筛和后续数值批量读取也访问带来源点
-payload 的 `segments` 表。只取消 Python 反序列化不能消除这些宽表页的读取。
-
-新工作区增加 `tracks_id_vehicle(id, vehicle)` 与 `segments_numeric` 覆盖索引。
-后者包含线段 ID、轨迹 ID、段位置、直行标记、XY、方向、包围盒和方向粗桶，
-不包含 payload。宽筛中的 `a`、`b`、`ta`、`tb` 及数值字段批量查询明确使用
-对应索引。精确命中后仍读取原来源点，候选保存、全局排序编号、精确内核和拓扑
-查询保持原语义。索引只随新的临时工作区创建，不修改正在运行的工作区。
-
-隔离基准使用固定种子 4911、8000 条两点合成轨迹，分布在 200 个空间组中，
-每点携带 1800 字节不可压缩扩展数据，使初始工作区超过 32 MiB SQLite 页缓存。
-主全量容器在测量期间暂停，基准容器限制为 256 MiB 内存、无额外交换空间、
-1 核 CPU、175 秒进程时限（另留 3 秒强制结束），候选保存上限 100,000。
-每个布局使用自己的临时工作区；只对该文件请求释放文件缓存，不操作全量数据。
-
-| 指标 | 原宽表查询 | 覆盖索引查询 |
-| --- | ---: | ---: |
-| 工作区构建 | 1.837 秒 | 1.379 秒 |
-| 候选提取、保存与排序 | 7.825 秒 | 2.973 秒 |
-| 提取阶段进程读取字节数 | 845,586,432 | 109,232,128 |
-| 初始工作区字节数 | 66,600,960 | 67,579,904 |
-| 宽筛段对数 | 35,126 | 35,126 |
-| 最终候选数 | 18,190 | 18,190 |
-
-两者完整候选 JSON 的 SHA-256 相同：
-`9085b7c203d992598f7af0e62774f37f687d40d27f3ab4cad9e2b1485fa596db`。
-查询计划确认四个表别名均为 `USING COVERING INDEX`。整个基准容器运行 19.29 秒，
-`memory.peak` 为 247,877,632 字节（236.39 MiB），退出码为 0，`oom` 与
-`oom_kill` 均为 0。两个布局在同一受限进程中依次运行，单次构建差异受缓存影响，
-不能据此声称增加索引反而降低构建成本。
-
-基准脚本为 `/tmp/roadnet_io_layout_bench_capped.py`，结果日志为
-`/tmp/roadnet_io_layout_bench_capped.log`，容器
-`roadnet-io-cover-capped-20260914` 保留供本次验收。此前与全量同时运行的无资源
-上限基准发生竞争，其耗时不作为性能证据。上述隔离结果支持数值查询减少宽表
-读取；不代表 2600 万行已取得相同提速，也不改变全局候选输出的内存限制。
-
-回归对实际执行的宽筛和数值查询运行 `EXPLAIN QUERY PLAN`，确认无需读取
-payload 表即可取得全部筛选字段；同时与内存入口对照长段、端点边界、同车
-子轨迹、注入点来源及跨批次全局编号的完整候选摘要。
-
-跨轨迹查询显式按源段 `a.id ASC` 排序，覆盖索引直接提供该顺序；回归同时检查
-查询计划和执行指令中不存在额外临时排序。每个任务块被外层消费后，调度者把
-已扫描源段数量的保守下界更新为该块最大源段 ID 减一。当前源段可能还有后续
-任务块，因此不把它算作完成，也不使用目标段 ID 推算扫描进度。段 ID 连续分配，
-下界包含已越过的非直行段和零命中段；只有游标正常耗尽才补齐零命中尾部。
-异常退出或关闭游标不会把扫描状态标为完成。
-
-原有长期心跳以“源线段已扫描至少 X/N；候选命中 Y”展示这一状态，保留累计
-宽筛段对数，不增加逐批 INFO。外层观察下界可能滞后一批，正常耗尽后额外刷新
-一次。扫描进度不能用于按比例预测剩余时间；源段全部扫描后仍有候选全局排序、
-聚类及后续阶段，不表示 Detect 已完成。
+对应回归位于 `test_refine_parquet_reader.py`、`test_turn_event_wiring.py` 和
+`test_grid_detect_wiring.py`。
