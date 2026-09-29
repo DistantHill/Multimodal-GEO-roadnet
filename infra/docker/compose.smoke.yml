@@ -1,0 +1,7 @@
+# 独立容器
+name: roadnet-smoke
+services:
+  pipeline:
+    environment:
+      PIPELINE_CONFIG_PATH: /app/config/pipeline-roadnet-test.toml
+    command: ["python", "-m", "pytest", "-q"]

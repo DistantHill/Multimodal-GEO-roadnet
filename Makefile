@@ -36,12 +36,11 @@ test: compose-test services-up
 	$(COMPOSE_DEV) run --rm backend pytest
 	$(COMPOSE_DEV) run --rm pipeline python -m pytest tests scripts/cv_human_check/tests
 
-pipeline-debug: services-up
-	$(COMPOSE_DEV) run --rm --entrypoint /bin/sh pipeline
-
 pipeline-smoke-test: validate-pipeline-smoke-selection
 	$(MAKE) --no-print-directory services-up
-	$(COMPOSE_DEV) run --rm -e PIPELINE_CONFIG_PATH=/app/config/pipeline-roadnet-test.toml pipeline python -m pipeline run $(PIPELINE_SELECTION_ARGS)
+	$(COMPOSE_DEV)  -f infra/docker/compose.smoke.yml \
+	 run --rm -e PIPELINE_CONFIG_PATH=/app/config/pipeline-roadnet-test.toml \
+	 pipeline python -m pipeline run $(PIPELINE_SELECTION_ARGS)
 
 pipeline-full-test: validate-pipeline-full-selection
 	$(MAKE) --no-print-directory services-up

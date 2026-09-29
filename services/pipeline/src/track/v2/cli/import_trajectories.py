@@ -15,17 +15,34 @@ Usage / 用法::
 from __future__ import annotations
 
 import argparse
+from itertools import chain, groupby, islice
 import time
+from typing import Iterable, Iterator
 
 from ..config import connect as pg_connect
 from ..telemetry.console_logging import init_logger, shutdown_logger
-from ..models import CsvSource
+from ..models import CsvSource, SourceBatch
 from ..trajectories.read_source import get_database
-from ..db.insert_trajectory_points import insert_trajectory_points
+from ..db.insert_trajectory_points import copy_trajectory_point_batches
 from ._load_config import load_startup_config
 
 
 # ── Import logic ─────────────────────────────────────────────────────
+
+
+def _iter_vehicle_groups(
+    batches: Iterable[SourceBatch], *, vehicles_per_group: int = 10_000,
+) -> Iterator[Iterator[SourceBatch]]:
+    """Yield one lazy stream of batches for each group of vehicles."""
+    if vehicles_per_group <= 0:
+        raise ValueError("vehicles_per_group must be positive")
+    by_vehicle = groupby(batches, key=lambda batch: batch.vehicle_id)
+    while True:
+        first = next(by_vehicle, None)
+        if first is None:
+            return
+        vehicles = chain((first,), islice(by_vehicle, vehicles_per_group - 1))
+        yield (batch for _, vehicle_batches in vehicles for batch in vehicle_batches)
 
 
 def main() -> int:
@@ -65,22 +82,22 @@ def main() -> int:
             hash_csv_rows=False,
         )
 
-        # ── Stream insert: 每批 BATCH_SIZE 行边读边写 / batch-insert as we read ──
+        # ── Stream insert: one COPY per 10,000 vehicles ──
         total_parsed = 0
         total_written = 0
 
         with pg_connect(db_config) as conn:
-            for batch in handle.iter_vehicle_batches(
+            batches = handle.iter_vehicle_batches(
                 max_batch_size=pc.runtime.import_batch_size,
-            ):
+            )
+            for group in _iter_vehicle_groups(batches):
                 t0 = time.perf_counter()
-                written = insert_trajectory_points(conn, batch, table=args.table,
-                                                    batch_size=pc.runtime.import_batch_size)
+                written = copy_trajectory_point_batches(conn, group, table=args.table)
                 total_written += written
-                total_parsed += len(batch)
+                total_parsed += written
                 print(f"  ... 已解析 / parsed: {total_parsed:>12,}  "
                       f"已写入 / written: {total_written:>12,}  "
-                      f"({time.perf_counter() - t0:.1f}s per batch)")
+                      f"({time.perf_counter() - t0:.1f}s per vehicle group)")
 
             conn.commit()
 
