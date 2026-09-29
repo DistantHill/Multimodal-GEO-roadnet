@@ -142,15 +142,14 @@ def _build_topology_for_cluster(cluster, observations, cfg):
     return topology,cluster,observations
 
 
-def _build_topologies_from_tracks(clusters, tracks, cfg, transformer, *, refine_reader=None, **_kwargs):
+def _build_topologies_from_reader(clusters, cfg, transformer, *, refine_reader):
     windows=[SpatialWindow(c.centroid_x-max(cfg.min_intersection_radius_m,c.radius_m+cfg.topology_radius_padding_m),c.centroid_y-max(cfg.min_intersection_radius_m,c.radius_m+cfg.topology_radius_padding_m),c.centroid_x+max(cfg.min_intersection_radius_m,c.radius_m+cfg.topology_radius_padding_m),c.centroid_y+max(cfg.min_intersection_radius_m,c.radius_m+cfg.topology_radius_padding_m)) for c in clusters]
     crossing_pieces=[[] for _ in clusters]; observation_pieces=[[] for _ in clusters]; offsets=np.zeros(len(clusters),dtype=np.int64)
-    reader_selections = None
-    if refine_reader is None:
-        selections=((i,track) for i in range(len(clusters)) for track in tracks.values())
-    else:
-        reader_selections = refine_reader.iter_topology_tracks(cfg.source_table or cfg.db_table,windows,batch_size=cfg.stream_batch_size)
-        selections=((i,selection.points) for selection in reader_selections for i in selection.window_indices)
+    reader_selections = refine_reader.iter_topology_tracks(
+        cfg.source_table or cfg.db_table, windows, batch_size=cfg.stream_batch_size,
+    )
+    selections = ((i, selection.points) for selection in reader_selections
+                  for i in selection.window_indices)
     try:
         for i,track in selections:
             cluster=clusters[i]
@@ -169,7 +168,3 @@ def _build_topologies_from_tracks(clusters, tracks, cfg, transformer, *, refine_
         topology,cluster,_=_build_topology_for_cluster(replace(cluster,crossing_points=cross),obs,cfg)
         topologies.append(topology); annotated.append(cluster); all_observations.append(obs)
     return topologies,annotated,all_observations
-
-
-def _build_intersection_topologies(clusters,tracks,transformer,cfg,**kwargs):
-    return _build_topologies_from_tracks(clusters,tracks,cfg,transformer,**kwargs)

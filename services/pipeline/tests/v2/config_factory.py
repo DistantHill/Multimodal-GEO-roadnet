@@ -34,7 +34,6 @@ def intersect_config(**changes: Any):
 
 def detect_context(**changes: Any) -> DetectRuntimeContext:
     values = {
-        "query_active_from_db": False,
         "db_table": "trajectory_points",
         "kept_table": None,
         "source_table": None,

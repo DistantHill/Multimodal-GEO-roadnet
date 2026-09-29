@@ -19,7 +19,7 @@ from ..models import CrossCandidateBatch
 from ..projection import CoordinateTransformer
 from ..telemetry.console_logging import log_info
 from .build_patches import (
-    CrossTrackCapacityError, build_cross_track_index, iter_cross_track_filtered_patches,
+    build_cross_track_index, iter_cross_track_filtered_patches,
 )
 from .detect_cross_track_pairs import (intersect_cross_track_patch, build_cross_track_patch_candidates, concatenate_cross_batches)
 from .cross_track_timing import CrossTrackTiming
@@ -387,7 +387,7 @@ def run_grid_cross_track_task(
                         if staged:
                             candidate_store.discard_grid(grid_order[cell])
                         if (is_temp_quota_exhausted(exc)
-                                or isinstance(exc, (GridSegmentBudgetError, CrossTrackCapacityError, MemoryError, ValueError, TypeError))
+                                or isinstance(exc, (GridSegmentBudgetError, MemoryError, ValueError, TypeError))
                                 or attempts.get(cell, 0) >= 2):
                             raise
                         attempts[cell] = attempt + 1

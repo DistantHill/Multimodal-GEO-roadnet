@@ -13,6 +13,35 @@ def subtrack(xy, *, subtrack_index=7, vehicle_id="original_vehicle", headings=No
 
 
 def sql_turns_from_subtrack(track, cfg, *, first_index=0):
-    from track.v2.candidates.collect_candidates import extract_turn_candidates
-    batch = extract_turn_candidates([{track.subtrack_index: track}], cfg)
+    """Exercise the production DuckDB turn query with a small test relation."""
+    from uuid import UUID
+    import duckdb
+    from track.v2.candidates.detect_turn_events import concatenate_turn_batches
+    from track.v2.trajectories.results.read_parquet import RefineDatasetReader
+
+    with duckdb.connect(":memory:") as connection:
+        connection.execute("""
+            CREATE TABLE refine_points (
+                refine_id UUID, point_id BIGINT, vehicle_id VARCHAR,
+                subtrack_index BIGINT, refined_sequence_in_subtrack BIGINT,
+                timestamp DOUBLE, lon DOUBLE, lat DOUBLE, x DOUBLE, y DOUBLE,
+                heading DOUBLE, point_kind VARCHAR, source_row_key BIGINT,
+                generated_reason VARCHAR, refine_point_id_valid BOOLEAN,
+                source_id VARCHAR
+            )
+        """)
+        rows = [(
+            UUID(int=0), int(track.refine_point_id[i]), track.vehicle_id,
+            track.subtrack_index, i, float(track.timestamp[i]),
+            float(track.lonlat[i, 0]), float(track.lonlat[i, 1]),
+            float(track.xy[i, 0]), float(track.xy[i, 1]), float(track.heading[i]),
+            "kept" if track.kind[i] == "p" else "injected",
+            int(track.source_row_key[i]) if track.source_row_key_valid[i] else None,
+            str(track.generated_reason[i]), bool(track.refine_point_id_valid[i]),
+            track.source_id,
+        ) for i in range(len(track))]
+        connection.executemany("INSERT INTO refine_points VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        batch = concatenate_turn_batches(list(RefineDatasetReader._iter_turn_candidates_sql(
+            connection, UUID(int=0), track.source_id, cfg, cfg.stream_batch_size,
+        )))
     return replace(batch, calculation_index=batch.calculation_index + first_index)

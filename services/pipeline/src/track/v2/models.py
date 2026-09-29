@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import date, datetime
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal, Protocol
+from typing import Any, Callable, Iterator, Literal
 
 
 ColumnSelector = Callable[[list[str]], dict[str, str]]
@@ -361,27 +361,6 @@ class RuntimeConfig(TrackModel):
             if match is None or not math.isfinite(float(match.group(1))):
                 raise ValueError(f"{name} must be a non-negative finite capacity")
 
-
-class TrajectorySourceHandle(Protocol):
-    @property
-    def source_info(self) -> SourceInfo: ...
-
-    @property
-    def report(self) -> ReadReport: ...
-
-    @property
-    def read_report(self) -> ReadReport: ...
-
-    @property
-    def field_mapping(self) -> FieldMapping: ...
-
-    def iter_vehicle_batches(self) -> Iterator[SourceBatch]: ...
-
-    def close(self) -> None: ...
-
-    def __enter__(self) -> "TrajectorySourceHandle": ...
-
-    def __exit__(self, *args: object) -> None: ...
 
 class GeneratedReason(StrEnum):
     HEADING_ORTHOGONAL = "heading_orthogonal"

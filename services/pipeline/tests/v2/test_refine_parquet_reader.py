@@ -20,10 +20,9 @@ from track.v2.artifacts.parquet_manifest import build_descriptor
 from track.v2.db.artifact_registry import ArtifactDescriptor, canonical_json
 from track.v2.projection import SpatialWindow
 from track.v2.intersections.detect_intersections import IntersectConfig
-from track.v2.candidates.detect_cross_track_pairs import _prepare_segments
 from track.v2.candidates.cross_track_relation import CrossCandidateRelation
 from track.v2.candidates.collect_candidates import (
-    extract_columnar_cross_track_candidates, extract_cross_track_candidates,
+    extract_columnar_cross_track_candidates,
 )
 from track.v2.models import RuntimeConfig, SpatialContext
 from track.v2.projection import CoordinateTransformer

@@ -7,11 +7,9 @@ from unittest.mock import MagicMock,patch
 import numpy as np
 import pytest
 from .config_factory import intersect_config,runtime_config
-from .detect_columns_helpers import CONTEXT as _CONTEXT,TRANSFORMER as _TRANSFORMER,subtrack
+from .detect_columns_helpers import CONTEXT as _CONTEXT,TRANSFORMER as _TRANSFORMER,subtrack,sql_turns_from_subtrack
 from .writer_relation_helpers import turn_batch
 from .test_turn_event_relation import concatenate,assert_batch_equal
-from track.v2.candidates.collect_candidates import extract_turn_candidates
-from track.v2.candidates.build_patches import iter_track_patches
 from track.v2.candidates.turn_event_relation import TurnEventRelation
 from track.v2.candidates.detect_turn_events import empty_turn_batch
 from track.v2.candidates.detect_cross_track_pairs import empty_cross_batch
@@ -32,7 +30,7 @@ def _turn_tracks():
 
 
 def _run_config(config):
-    return _IntersectRunConfig(**config.as_dict(),query_active_from_db=True,db_table='raw_points',
+    return _IntersectRunConfig(**config.as_dict(),db_table='raw_points',
         kept_table='kept_trajectory_points',source_table='raw_points',refine_id=REFINE_ID,live_status=None)
 
 
@@ -46,18 +44,6 @@ class TrackingSequence(TurnEventRelation):
         super().__init__(*args,**kwargs); self.written=[]
     def append_batch(self,value):
         self.written.append(weakref.ref(value.xy)); super().append_batch(value)
-
-
-@pytest.mark.parametrize('batch_size',[1,2,1000])
-def test_direct_relation_matches_memory_events_and_releases_patch_outputs(tmp_path,batch_size):
-    tracks=_turn_tracks(); cfg=intersect_config(stream_batch_size=batch_size,turn_window=1,min_leg_m=10)
-    expected=extract_turn_candidates(iter_track_patches(tracks.items(),batch_size),cfg)
-    with TrackingSequence(tmp_path) as spool:
-        actual=extract_turn_candidates(iter_track_patches(tracks.items(),batch_size),cfg,event_store=spool)
-        assert actual is spool
-        gc.collect(); assert all(reference() is None for reference in spool.written)
-        for _ in range(2): assert_batch_equal(concatenate(spool.iter_batches()),expected)
-        assert concatenate(spool.iter_batches()).calculation_index.tolist()==list(range(len(expected)))
 
 
 @pytest.mark.parametrize('radius,xy',[
@@ -77,7 +63,11 @@ def test_compact_gstar_matches_full_event_scores_and_hotspots(tmp_path,radius,xy
 
 def test_db_result_survives_columnar_run_and_cross_holds_no_full_turns(tmp_path,monkeypatch):
     tracks=_turn_tracks(); cfg=intersect_config(stream_batch_size=1000,turn_window=1,min_leg_m=10,g_star_min_z=-100.)
-    expected_turns=extract_turn_candidates(iter_track_patches(tracks.items(),1000),cfg)
+    from track.v2.candidates.detect_turn_events import concatenate_turn_batches
+    expected_turns = concatenate_turn_batches([
+        sql_turns_from_subtrack(track, cfg, first_index=i)
+        for i, track in enumerate(tracks.values())
+    ])
     expected_hotspots,expected_clusters=_cluster_pipeline(expected_turns,empty_cross_batch(),_TRANSFORMER,cfg)
     stored=[]
     class OwnedSequence(TrackingSequence):
@@ -89,7 +79,7 @@ def test_db_result_survives_columnar_run_and_cross_holds_no_full_turns(tmp_path,
         return empty_cross_batch()
     reader=type('Reader',(),{'extent':lambda self:(0.,0.,1.,1.),
         'iter_turn_candidates':lambda self,*a,**kw:iter([expected_turns]),'track_count':lambda self:len(tracks)})()
-    with patch('track.v2.intersections.detect_intersections.TurnEventRelation',OwnedSequence),patch('track.v2.intersections.detect_intersections.run_grid_cross_track_task',side_effect=cross),patch('track.v2.intersections.detect_intersections._build_topologies_from_tracks',side_effect=lambda clusters,*a,**kw:([],clusters,[])):
+    with patch('track.v2.intersections.detect_intersections.TurnEventRelation',OwnedSequence),patch('track.v2.intersections.detect_intersections.run_grid_cross_track_task',side_effect=cross),patch('track.v2.intersections.detect_intersections._build_topologies_from_reader',side_effect=lambda clusters,*a,**kw:([],clusters,[])):
         result=_detect_intersections_db(object(),_run_config(cfg),_CONTEXT,runtime=runtime_config(),data_root=tmp_path,refine_reader=reader,connect_worker=lambda:object())
     assert result.turn_events is stored[0]
     assert_batch_equal(concatenate(result.turn_events.iter_batches()),expected_turns)
@@ -106,7 +96,7 @@ def test_columnar_detect_feeds_turn_relation_through_bounded_batches(tmp_path):
             calls.append(self._batch_size); return super().append_batch(event)
     reader=type('Reader',(),{'extent':lambda self:(0.,0.,1.,1.),'iter_turn_candidates':lambda self,*a,**kw:iter([_events([[0., 0.]])]),'track_count':lambda self:0})()
     cfg=intersect_config(stream_batch_size=7,use_cross_track_candidates=False)
-    with patch('track.v2.intersections.detect_intersections.TurnEventRelation',ObservedRelation),patch('track.v2.intersections.detect_intersections._build_topologies_from_tracks',return_value=([],[],[])):
+    with patch('track.v2.intersections.detect_intersections.TurnEventRelation',ObservedRelation),patch('track.v2.intersections.detect_intersections._build_topologies_from_reader',return_value=([],[],[])):
         result=_detect_intersections_db(object(),_run_config(cfg),_CONTEXT,runtime=runtime_config(relation_batch_size=7),data_root=tmp_path,refine_reader=reader)
     assert calls==[7]; result.close()
 
@@ -122,7 +112,7 @@ def test_columnar_turn_detection_emits_heartbeat_and_batch_counts(tmp_path):
     cfg = replace(_run_config(intersect_config(use_cross_track_candidates=False)), live_status=live)
     with patch('track.v2.intersections.detect_intersections.heartbeat_progress') as progress, \
          patch('track.v2.intersections.detect_intersections._cluster_pipeline', return_value=(empty_turn_batch(), [])), \
-         patch('track.v2.intersections.detect_intersections._build_topologies_from_tracks', return_value=([], [], [])):
+         patch('track.v2.intersections.detect_intersections._build_topologies_from_reader', return_value=([], [], [])):
         result = _detect_intersections_db(
             object(), cfg, _CONTEXT, runtime=runtime_config(), data_root=tmp_path,
             refine_reader=reader,

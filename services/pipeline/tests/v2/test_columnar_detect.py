@@ -3,32 +3,13 @@ import numpy as np
 import pytest
 from .config_factory import intersect_config,runtime_config
 from .detect_columns_helpers import CONTEXT,TRANSFORMER,subtrack,sql_turns_from_subtrack
-from track.v2.candidates.collect_candidates import extract_cross_track_candidates
 from track.v2.candidates.turn_event_relation import TurnEventRelation
 from track.v2.candidates.cross_track_relation import CrossCandidateRelation
+from track.v2.candidates.detect_grid_crossings import iter_grid_crossings, iter_grid_candidates
+from .test_detect_identity_routes import _grid_columns
 from track.v2.intersections.detect_intersections import _compute_getis_ord_g_star,_cluster_pipeline,_run_dbscan
 from track.v2.intersections.extract_topology import _extract_entry_exit_observations_batch
 from track.v2.models import HotspotCluster
-
-
-def test_same_vehicle_distinct_run_subtracks_can_cross():
-    a=subtrack([[-10,0],[10,0]],subtrack_index=701,headings=[90,90],keys=[0,-1])
-    b=subtrack([[0,-10],[0,10]],subtrack_index=902,headings=[0,0])
-    result,_,_=extract_cross_track_candidates({701:a,902:b},TRANSFORMER,intersect_config())
-    assert len(result)==1
-    assert result.from_subtrack_index.tolist()==[701]
-    assert result.to_subtrack_index.tolist()==[902]
-    assert result.from_vehicle_id.tolist()==result.to_vehicle_id.tolist()==["original_vehicle"]
-    assert result.from_source_row_key.tolist()==[0]
-    assert result.from_source_row_key_valid.tolist()==[True]
-    assert np.array_equal(result.xy,[[0,0]])
-    assert not result.xy.flags.writeable
-
-
-def test_same_subtrack_segments_are_excluded():
-    a=subtrack([[-10,0],[10,0],[0,-10],[0,10]],subtrack_index=701,headings=[90,90,0,0])
-    result,_,_=extract_cross_track_candidates({701:a},TRANSFORMER,intersect_config(cross_track_straightness_deg=180))
-    assert len(result)==0
 
 
 @pytest.mark.parametrize("batch_size",[1,2,10])
@@ -51,7 +32,10 @@ def test_turn_relation_roundtrip_preserves_numeric_keys_masks_and_identity(tmp_p
 
 def test_cross_relation_reads_batches_without_candidate_objects(tmp_path):
     a=subtrack([[-10,0],[10,0]],subtrack_index=3,headings=[90,90]); b=subtrack([[0,-10],[0,10]],subtrack_index=11)
-    batch=extract_cross_track_candidates({3:a,11:b},TRANSFORMER,intersect_config())[0]
+    segments = _grid_columns([a, b])
+    crossings = iter_grid_crossings(segments, intersect_config(),
+                                    max_grid_memberships=1000, max_overflow_pair_space=1000)
+    batch = next(iter_grid_candidates(segments, crossings, TRANSFORMER))
     with CrossCandidateRelation(runtime_config(),tmp_path.resolve(),batch_size=1) as relation:
         relation.append_batch(batch); relation.seal()
         read=list(relation.iter_batches(indices=np.asarray([0],dtype=np.int64)))

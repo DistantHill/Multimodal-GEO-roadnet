@@ -7,10 +7,11 @@ from uuid import uuid4
 import pytest
 
 from track.v2.candidates import detect_grid_crossings
+from track.v2.candidates.detect_grid_crossings import iter_grid_crossings, iter_grid_candidates
 import numpy as np
 from .detect_columns_helpers import subtrack, TRANSFORMER
+from .test_detect_identity_routes import _grid_columns
 from .config_factory import intersect_config
-from track.v2.candidates.collect_candidates import extract_cross_track_candidates
 
 
 class _WorkerConnection:
@@ -29,11 +30,12 @@ _RUNTIME = SimpleNamespace(duckdb_memory_limit="16MB", duckdb_threads=1,
 
 
 def _candidate():
-    batch, _, _ = extract_cross_track_candidates(
-        {1: subtrack([[-10, 0], [10, 0]], subtrack_index=1, headings=[90, 90]),
-         2: subtrack([[0, -10], [0, 10]], subtrack_index=2, headings=[0, 0])},
-        TRANSFORMER, intersect_config())
-    return batch
+    tracks = [subtrack([[-10, 0], [10, 0]], subtrack_index=1, headings=[90, 90]),
+              subtrack([[0, -10], [0, 10]], subtrack_index=2, headings=[0, 0])]
+    segments = _grid_columns(tracks)
+    crossings = iter_grid_crossings(segments, intersect_config(),
+                                    max_grid_memberships=1000, max_overflow_pair_space=1000)
+    return next(iter_grid_candidates(segments, crossings, TRANSFORMER))
 
 
 def test_grid_scheduler_retries_then_deduplicates_and_writes_on_main_thread(monkeypatch, tmp_path):

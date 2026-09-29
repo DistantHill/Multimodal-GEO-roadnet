@@ -7,7 +7,7 @@ from .detect_columns_helpers import subtrack, TRANSFORMER
 from track.v2.models import HotspotCluster, IntersectionTopology
 from track.v2.trajectories.results.read_parquet import TopologyTrackSelection
 from track.v2.intersections.extract_topology import (
-    _build_topologies_from_tracks, _extract_entry_exit_observations_batch,
+    _build_topologies_from_reader, _extract_entry_exit_observations_batch,
     _cluster_angles_greedy, _nearest_angle_id,
 )
 
@@ -21,13 +21,21 @@ def cfg():
     return intersect_run_config(min_intersection_radius_m=50., topology_radius_padding_m=0., bearing_window=1)
 
 
+def _reader(tracks):
+    reader = Mock()
+    reader.iter_topology_tracks.return_value = iter(
+        TopologyTrackSelection((0,), str(track.subtrack_index), track) for track in tracks
+    )
+    return reader
+
+
 @pytest.mark.parametrize("points,indices", [
     ([[-250.,0.],[0.,0.],[250.,0.]],[0,1]),
     ([[-250.,0.],[250.,0.]],[0,0]),
 ])
 def test_segments_with_outer_endpoints_still_produce_entry_and_exit(points,indices):
     track=subtrack(points,subtrack_index=123)
-    topologies,annotated,observations=_build_topologies_from_tracks([cluster()],{123:track},cfg(),TRANSFORMER)
+    topologies,annotated,observations=_build_topologies_from_reader([cluster()],cfg(),TRANSFORMER,refine_reader=_reader([track]))
     crossings=annotated[0].crossing_points
     assert crossings.is_entry.tolist()==[True,False]
     assert crossings.point_index.tolist()==indices
@@ -40,7 +48,7 @@ def test_segments_with_outer_endpoints_still_produce_entry_and_exit(points,indic
 def test_same_vehicle_subtracks_do_not_form_a_synthetic_segment():
     tracks={17:subtrack([[-90.,0.],[-80.,0.]],subtrack_index=17),
             42:subtrack([[80.,0.],[90.,0.]],subtrack_index=42)}
-    _,annotated,observations=_build_topologies_from_tracks([cluster()],tracks,cfg(),TRANSFORMER)
+    _,annotated,observations=_build_topologies_from_reader([cluster()],cfg(),TRANSFORMER,refine_reader=_reader(tracks.values()))
     assert len(annotated[0].crossing_points)==0
     assert sum(len(batch) for batch in observations)==0
 
@@ -55,7 +63,7 @@ def test_reader_topology_closes_selection_iterator_on_geometry_failure():
     reader=Mock()
     reader.iter_topology_tracks.return_value=selections()
     with patch("track.v2.intersections.extract_topology._extract_entry_exit_observations_batch",side_effect=KeyboardInterrupt),pytest.raises(KeyboardInterrupt):
-        _build_topologies_from_tracks([cluster()],{},cfg(),TRANSFORMER,refine_reader=reader)
+        _build_topologies_from_reader([cluster()],cfg(),TRANSFORMER,refine_reader=reader)
     assert closed==[True]
 
 
@@ -64,7 +72,7 @@ def test_reader_topology_matches_index_for_duplicate_windows_and_track_order():
     b=subtrack([[0.,-100.],[0.,100.]],subtrack_index=2)
     reader=Mock()
     reader.iter_topology_tracks.return_value=iter([TopologyTrackSelection((0,1),"99",a),TopologyTrackSelection((0,1),"2",b)])
-    _,annotated,observations=_build_topologies_from_tracks([cluster(),cluster(1)],{},cfg(),TRANSFORMER,refine_reader=reader)
+    _,annotated,observations=_build_topologies_from_reader([cluster(),cluster(1)],cfg(),TRANSFORMER,refine_reader=reader)
     for result in annotated:
         assert result.crossing_points.calculation_index.tolist()==[0,1,2,3]
         assert result.crossing_points.subtrack_index.tolist()==[99,99,2,2]

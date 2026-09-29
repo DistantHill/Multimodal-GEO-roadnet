@@ -25,43 +25,12 @@ _TEST_TRANSFORMER=CoordinateTransformer(_TEST_SPATIAL_CONTEXT)
 
 
 class ProjectionContextContractTest(unittest.TestCase):
-    class _Handle:
-        def __init__(self, tracks=(), spatial_context=None):
-            self.subtracks=tuple(tracks)
-            self.spatial_context=spatial_context
-
-    def test_detect_requires_explicit_run_spatial_context(self):
-        with self.assertRaisesRegex(V2Error, "requires.*SpatialContext"):
-            detect_intersections(
-                self._Handle(), config=intersect_config(), context=detect_context(),
-                runtime=runtime_config(),
-            )
-
-
-    def test_empty_result_carries_parent_run_spatial_context(self):
-        result = detect_intersections(
-            self._Handle(), config=intersect_config(), context=detect_context(),
-            runtime=runtime_config(), spatial_context=_TEST_SPATIAL_CONTEXT,
-        )
-
-        self.assertEqual(result.spatial_context, _TEST_SPATIAL_CONTEXT)
-
-
-    def test_refine_handle_context_must_match_detect_context(self):
-        with self.assertRaisesRegex(V2Error, "does not match"):
-            detect_intersections(
-                self._Handle(spatial_context=object()),
-                config=intersect_config(), context=detect_context(),
-                runtime=runtime_config(), spatial_context=_TEST_SPATIAL_CONTEXT,
-            )
-
-
     def test_formal_db_detect_requires_refine_before_any_data_query(self):
         with self.assertRaisesRegex(V2Error, "requires refine_id"):
             detect_intersections(
                 conn=object(),
                 config=intersect_config(),
-                context=detect_context(query_active_from_db=True),
+                context=detect_context(),
                 runtime=runtime_config(),
             )
 
@@ -81,7 +50,7 @@ class ProjectionContextContractTest(unittest.TestCase):
             detect_intersections(
                 conn=object(),
                 config=intersect_config(),
-                context=detect_context(query_active_from_db=True, refine_id="refine-1"),
+                context=detect_context(refine_id="refine-1"),
                 runtime=runtime_config(), refine_reader=reader,
             )
 
@@ -99,7 +68,7 @@ class ProjectionContextContractTest(unittest.TestCase):
             detect_intersections(
                 conn=object(),
                 config=intersect_config(),
-                context=detect_context(query_active_from_db=True, refine_id="refine-1"),
+                context=detect_context(refine_id="refine-1"),
                 runtime=runtime_config(), data_root=Path(tempfile.mkdtemp()),
             )
         fingerprint.assert_not_called()
@@ -124,7 +93,7 @@ class ProjectionContextContractTest(unittest.TestCase):
             detect_intersections(
                 conn=object(),
                 config=intersect_config(),
-                context=detect_context(query_active_from_db=True, refine_id=refine.refine_id),
+                context=detect_context(refine_id=refine.refine_id),
                 runtime=runtime_config(), refine_reader=reader,
             )
         compute.assert_not_called()
@@ -142,23 +111,14 @@ class ProjectionContextContractTest(unittest.TestCase):
         self.assertEqual(result.report.track_count, 0)
 
 
-    def test_formal_parquet_cross_track_uses_columnar_pairs_not_disk_index(self):
+    def test_direct_parquet_pair_api_handles_empty_iterator(self):
         reader = MagicMock()
         reader.iter_cross_track_pair_batches.return_value = iter(())
-        with (
-            patch("track.v2.candidates.collect_candidates._prepare_segments") as prepare,
-            patch("track.v2.candidates.collect_candidates.build_cross_track_index") as build_index,
-        ):
-            actual = extract_columnar_cross_track_candidates(
-                reader,
-                "source",
-                _TEST_TRANSFORMER,
-                intersect_run_config(source_table="source"),
-            )
+        actual = extract_columnar_cross_track_candidates(
+            reader, "source", _TEST_TRANSFORMER,
+            intersect_run_config(source_table="source"),
+        )
         self.assertEqual(len(actual), 0)
-        prepare.assert_not_called()
-        build_index.assert_not_called()
-
 
     def test_disabled_formal_parquet_cross_track_does_not_read_pair_planner(self):
         reader = MagicMock()
@@ -169,7 +129,7 @@ class ProjectionContextContractTest(unittest.TestCase):
         with (
             patch("track.v2.intersections.detect_intersections.run_grid_cross_track_task") as columnar,
             patch("track.v2.intersections.detect_intersections._cluster_pipeline", return_value=(empty_turn_batch(), [])),
-            patch("track.v2.intersections.detect_intersections._build_topologies_from_tracks", return_value=([], [], [])),
+            patch("track.v2.intersections.detect_intersections._build_topologies_from_reader", return_value=([], [], [])),
         ):
             _run_columnar_db_detect(
                 cfg,
@@ -195,7 +155,7 @@ class ProjectionContextContractTest(unittest.TestCase):
             with self.assertRaisesRegex(V2Error, "does not match"):
                 detect_intersections(
                     conn=object(), config=intersect_config(),
-                    context=detect_context(query_active_from_db=True, refine_id="refine-1"),
+                    context=detect_context(refine_id="refine-1"),
                     runtime=runtime_config(), spatial_context=different,
                 )
             with self.assertRaisesRegex(V2Error, "source_table"):
@@ -203,7 +163,7 @@ class ProjectionContextContractTest(unittest.TestCase):
                     conn=object(),
                     config=intersect_config(),
                     context=detect_context(
-                        query_active_from_db=True, refine_id="refine-1", source_table="wrong",
+                        refine_id="refine-1", source_table="wrong",
                     ),
                     runtime=runtime_config(),
                 )
@@ -223,7 +183,7 @@ class ProjectionContextContractTest(unittest.TestCase):
                     detect_intersections(
                         conn=object(),
                         config=intersect_config(),
-                        context=detect_context(query_active_from_db=True, refine_id="refine-1"),
+                        context=detect_context(refine_id="refine-1"),
                         runtime=runtime_config(),
                     )
 
@@ -244,7 +204,7 @@ class ProjectionContextContractTest(unittest.TestCase):
                         conn=object(),
                         config=intersect_config(),
                         context=detect_context(
-                            query_active_from_db=True, refine_id="refine-1", **override,
+                            refine_id="refine-1", **override,
                         ),
                         runtime=runtime_config(),
                     )
@@ -345,15 +305,6 @@ class ActivePointsWindowQueryTelemetryTest(unittest.TestCase):
         self.assertEqual([t.subtrack_index for t in tracks],[1,2])
 
 
-def test_authoritative_subtrack_xy_is_preserved_without_forward_projection():
-    from .detect_columns_helpers import CONTEXT, TRANSFORMER
-    track=subtrack([[12345.25,-98765.5],[12346.25,-98765.5]],headings=[90,90])
-    with patch.object(TRANSFORMER.__class__,'forward_many',side_effect=AssertionError('projection must be reused')):
-        result=detect_intersections({track.subtrack_index:track},config=intersect_config(),context=detect_context(),runtime=runtime_config(),spatial_context=CONTEXT)
-    assert result.report.track_count==1
-    np.testing.assert_array_equal(track.xy,[[12345.25,-98765.5],[12346.25,-98765.5]])
-
-
 def test_half_populated_authoritative_geometry_is_rejected_at_model_boundary():
     track=subtrack([[0,0],[1,1]])
     with pytest.raises(ValueError,match=r'float64 \(N,2\)'):
@@ -365,11 +316,6 @@ def test_projection_uses_fixed_context_independent_of_input_order():
     projected=_TEST_TRANSFORMER.forward_many(lonlat)
     reversed_projected=_TEST_TRANSFORMER.forward_many(lonlat[::-1])
     np.testing.assert_array_equal(projected,reversed_projected[::-1])
-
-
-def test_detect_rejects_unprojected_source_columns_instead_of_legacy_point_graph():
-    with pytest.raises(TypeError,match='RefinementSubtrack'):
-        detect_intersections([object()],config=intersect_config(),context=detect_context(),runtime=runtime_config(),spatial_context=_TEST_SPATIAL_CONTEXT)
 
 
 @pytest.mark.parametrize('heading,expected_turn',[(45.,45.),(170.,170.),(44.9,None),(170.1,None)])

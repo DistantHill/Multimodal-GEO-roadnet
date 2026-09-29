@@ -192,7 +192,7 @@ def test_db_owner_closes_all_spools_on_failure(tmp_path,monkeypatch,phase,failur
     cfg=intersect_run_config(use_turn_events=False,candidate_dbscan_min_samples=1,refine_id='refine-1')
     reader=MagicMock();reader.extent.return_value=(0.,0.,1.,1.);reader.track_count.return_value=0
     with ExitStack() as stack:
-        target={'reader':'run_grid_cross_track_task','clustering':'_cluster_pipeline','topology':'_build_topologies_from_tracks'}[phase]
+        target={'reader':'run_grid_cross_track_task','clustering':'_cluster_pipeline','topology':'_build_topologies_from_reader'}[phase]
         if phase!='reader':stack.enter_context(patch.object(detect,'run_grid_cross_track_task',return_value=empty_cross_batch()))
         stack.enter_context(patch.object(detect,target,side_effect=failure))
         with pytest.raises(type(failure)):

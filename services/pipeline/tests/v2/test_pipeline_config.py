@@ -106,7 +106,7 @@ def test_detect_task_threads_requires_integer_between_one_and_eight(
 
 
 def test_tunable_dataclasses_have_no_python_defaults() -> None:
-    context_fields = {"query_active_from_db", "db_table", "kept_table", "source_table",
+    context_fields = {"db_table", "kept_table", "source_table",
                       "refine_id", "live_status"}
     for cls in CONFIG_TYPES:
         for item in fields(cls):

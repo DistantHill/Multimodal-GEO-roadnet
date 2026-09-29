@@ -10,22 +10,20 @@ from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Callable
 import numpy as np
-from ..models import (TrackModel, RuntimeConfig, SpatialContext, RefinementSubtrack, TurnBatch, CrossCandidateBatch, MemberBatch, ObservationBatch, HotspotCluster, IntersectionTopology, IntersectReport)
+from ..models import (TrackModel, RuntimeConfig, SpatialContext, TurnBatch, CrossCandidateBatch, MemberBatch, ObservationBatch, HotspotCluster, IntersectionTopology, IntersectReport)
 from ..projection import CoordinateTransformer
 from ..exceptions import V2Error
 from ..candidates.turn_event_relation import TurnEventRelation
 from ..candidates.cross_track_relation import CrossCandidateRelation
 from ..candidates.detect_turn_events import empty_turn_batch, concatenate_turn_batches
 from ..candidates.detect_cross_track_pairs import empty_cross_batch
-from ..candidates.collect_candidates import extract_turn_candidates, extract_cross_track_candidates
-from ..candidates.build_patches import iter_track_patches
 from ..candidates.detect_grid_crossings import run_grid_cross_track_task
 from ..candidates.dbscan_index import ActiveGridLinks, index_typecode
 from ..telemetry.console_logging import log_info
 from ..telemetry.heartbeat import heartbeat_progress, operation_heartbeat
 from .performance_timing import PerfTracker
 from .progress import report_detect_progress
-from .extract_topology import _build_topologies_from_tracks
+from .extract_topology import _build_topologies_from_reader
 from ..trajectories.query_refine_points import fetch_refine_run_row
 from ..db.artifact_registry import canonical_json
 
@@ -95,7 +93,6 @@ class IntersectConfig(TrackModel):
 class DetectRuntimeContext:
     """Per-run dependencies and identity; never loaded from static TOML."""
 
-    query_active_from_db: bool
     db_table: str
     kept_table: str | None
     source_table: str | None
@@ -107,7 +104,6 @@ class DetectRuntimeContext:
 class _IntersectRunConfig(IntersectConfig):
     """Internal view combining immutable tuning with one run's context."""
 
-    query_active_from_db: bool
     db_table: str
     kept_table: str | None
     source_table: str | None
@@ -385,52 +381,6 @@ def _empty_intersect_result(spatial_context):
     return IntersectResult(empty_turn_batch(),empty_turn_batch(),[],[],_build_intersect_report([],[],empty_turn_batch(),empty_turn_batch(),empty_cross_batch(),track_count=0),spatial_context)
 
 
-def _detect_intersections_handle(source,cfg,spatial_context):
-    # Eager APIs use the same business subtrack columns and Run identity.
-    parent_context = getattr(source, "spatial_context", None)
-    if parent_context is not None and parent_context != spatial_context:
-        raise V2Error("Refine spatial context does not match Detect spatial context")
-    inputs=source.subtracks if hasattr(source,"subtracks") else source
-    if isinstance(inputs,dict): tracks=inputs
-    else:
-        tracks = {}
-        for track in inputs:
-            if not isinstance(track, RefinementSubtrack):
-                raise TypeError("Detect requires RefinementSubtrack columns")
-            if track.subtrack_index in tracks:
-                raise ValueError("duplicate Run-scoped subtrack identity")
-            tracks[track.subtrack_index] = track
-    if any(not isinstance(track,RefinementSubtrack) for track in tracks.values()): raise TypeError("Detect requires RefinementSubtrack columns")
-    if not tracks:
-        return _empty_intersect_result(spatial_context)
-    transformer = CoordinateTransformer(spatial_context)
-    live = getattr(cfg,"live_status",None)
-    own_live = False
-    if live is None:
-        try:
-            from ..telemetry.console_logging import LiveStatus
-            live = LiveStatus("Detect: 交叉口检测 / Intersection Detection")
-            live.start()
-            own_live = True
-        except Exception:
-            live = None
-    tracker = PerfTracker("detect_handle")
-    try:
-        with tracker.stage("turn_candidates"):
-            turns = extract_turn_candidates(iter_track_patches(tracks.items(),cfg.stream_batch_size),cfg,live_status=live,perf=tracker)
-        with tracker.stage("cross_track_candidates"):
-            crosses = extract_cross_track_candidates(tracks,transformer,cfg,live_status=live,perf=tracker)[0] if cfg.use_cross_track_candidates else empty_cross_batch()
-        with tracker.stage("cluster_pipeline"):
-            hotspot,clusters = _cluster_pipeline(turns,crosses,transformer,cfg,live_status=live,perf=tracker)
-        with tracker.stage("topology"):
-            topologies,clusters,observations = _build_topologies_from_tracks(clusters,tracks,cfg,transformer,live_status=live,perf=tracker)
-        log_info(tracker.report())
-        return IntersectResult(turns,hotspot,clusters,topologies,_build_intersect_report(clusters,topologies,turns,hotspot,crosses,track_count=len(tracks)),spatial_context,observations,crosses)
-    finally:
-        if own_live and live is not None:
-            live.stop()
-
-
 def _detect_intersections_db(conn,cfg,spatial_context,*,runtime,data_root,refine_reader=None,connect_worker=None):
     if refine_reader is None:
         raise V2Error("formal DB Detect requires a columnar reader")
@@ -479,11 +429,10 @@ def _run_columnar_db_detect(cfg,spatial_context,refine_reader,*,runtime,data_roo
         if conn is None or refine_id is None or connect_worker is None: raise V2Error("formal DB cross-track requires connection, refine_id, and worker connector")
         crosses=run_grid_cross_track_task(refine_id,refine_reader.extent(),spatial_context,transformer,cfg,connect_worker=connect_worker,grid_cell_size_m=cfg.cross_track_task_grid_m,thread_count=cfg.cross_track_task_threads,max_segments=200_000,max_segment_bytes=268_435_456,max_grid_memberships=2_000_000,max_overflow_pair_space=20_000_000,max_candidates=500_000,max_result_bytes=536_870_912,candidate_store=candidate_store,live_status=cfg.live_status,runtime=runtime,data_root=data_root)
     hotspot,clusters=_cluster_pipeline(turns,crosses,transformer,cfg)
-    topologies,clusters,observations=_build_topologies_from_tracks(clusters,{},cfg,transformer,refine_reader=refine_reader)
+    topologies,clusters,observations=_build_topologies_from_reader(clusters,cfg,transformer,refine_reader=refine_reader)
     return IntersectResult(turns,hotspot,clusters,topologies,_build_intersect_report(clusters,topologies,turns,hotspot,crosses,track_count=refine_reader.track_count()),spatial_context,observations,crosses)
 
 def detect_intersections(
-    source: TrajectorySourceHandle | None = None,
     *,
     config: IntersectConfig,
     context: DetectRuntimeContext,
@@ -494,75 +443,51 @@ def detect_intersections(
     runtime: RuntimeConfig,
     data_root: str | Path | None = None,
 ) -> IntersectResult:
-    """Run intersection detection and topology extraction.
-
-    PRD v2 Detect §2
-
-    Two modes:
-      - **Handle mode**: ``source`` is a ``TrajectorySourceHandle``.
-        All points are read into memory and grouped by vehicle_id.
-      - **DB mode**: ``conn`` is a psycopg connection and
-        ``config.query_active_from_db`` is True.  A ``RefineDatasetReader``
-        supplies columnar turn candidates, cross-track segment pairs and
-        complete subtracks for Topology window verification.
-    """
+    """Run Detect from one completed Refine Run and its columnar dataset."""
     cfg = _IntersectRunConfig(
         **config.as_dict(),
-        query_active_from_db=context.query_active_from_db,
         db_table=context.db_table,
         kept_table=context.kept_table,
         source_table=context.source_table,
         refine_id=context.refine_id,
         live_status=context.live_status,
     )
-    if conn is not None and cfg.query_active_from_db:
-        if cfg.refine_id is None:
-            raise V2Error("formal DB Detect requires refine_id")
-        refine = fetch_refine_run_row(conn, cfg.refine_id)
-        if refine.status != "completed" or refine.source_fingerprint is None:
-            raise V2Error(
-                f"Refine Run {cfg.refine_id} is not a completed immutable-source run"
-            )
-        if spatial_context is not None and spatial_context != refine.spatial_context:
-            raise V2Error("supplied SpatialContext does not match the parent Refine Run")
-        if cfg.source_table is not None and cfg.source_table != refine.source_table:
-            raise V2Error("configured source_table does not belong to the parent Refine Run")
-        if cfg.db_table != "trajectory_points" and cfg.db_table != refine.source_table:
-            raise V2Error("configured db_table does not belong to the parent Refine Run")
-        if cfg.kept_table not in (None, "kept_trajectory_points"):
-            raise V2Error("formal DB Detect must use kept_trajectory_points")
-        cfg = replace(
-            cfg,
-            db_table=refine.source_table,
-            source_table=refine.source_table,
-            kept_table="kept_trajectory_points",
-        )
-        if refine_reader is None:
-            raise V2Error("formal DB Detect requires a RefineDatasetReader")
-        descriptor = refine_reader.descriptor
-        if descriptor.refine_id is None or str(descriptor.refine_id) != refine.refine_id:
-            raise V2Error("Refine artifact does not belong to the parent Refine Run")
-        if descriptor.source_fingerprint_json != canonical_json(refine.source_fingerprint):
-            raise V2Error("Refine artifact source fingerprint does not match its Run")
-        if runtime is None or data_root is None:
-            raise V2Error("formal DB Detect requires runtime and data_root")
-        return _detect_intersections_db(
-            conn, cfg, refine.spatial_context, runtime=runtime, data_root=data_root,
-            refine_reader=refine_reader, connect_worker=connect_worker,
-        )
-    elif source is not None:
-        if spatial_context is None:
-            raise V2Error(
-                "handle Detect requires an explicit SpatialContext; a first-point "
-                "or extent-centre projection is not a safe fallback"
-            )
-        return _detect_intersections_handle(source, cfg, spatial_context)
-    else:
+    if conn is None:
+        raise V2Error("formal DB Detect requires a connection")
+    if cfg.refine_id is None:
+        raise V2Error("formal DB Detect requires refine_id")
+    refine = fetch_refine_run_row(conn, cfg.refine_id)
+    if refine.status != "completed" or refine.source_fingerprint is None:
         raise V2Error(
-            "detect_intersections: provide either 'source' (handle mode) "
-            "or 'conn' + query_active_from_db (DB mode)"
+            f"Refine Run {cfg.refine_id} is not a completed immutable-source run"
         )
-
+    if spatial_context is not None and spatial_context != refine.spatial_context:
+        raise V2Error("supplied SpatialContext does not match the parent Refine Run")
+    if cfg.source_table is not None and cfg.source_table != refine.source_table:
+        raise V2Error("configured source_table does not belong to the parent Refine Run")
+    if cfg.db_table != "trajectory_points" and cfg.db_table != refine.source_table:
+        raise V2Error("configured db_table does not belong to the parent Refine Run")
+    if cfg.kept_table not in (None, "kept_trajectory_points"):
+        raise V2Error("formal DB Detect must use kept_trajectory_points")
+    cfg = replace(
+        cfg,
+        db_table=refine.source_table,
+        source_table=refine.source_table,
+        kept_table="kept_trajectory_points",
+    )
+    if refine_reader is None:
+        raise V2Error("formal DB Detect requires a RefineDatasetReader")
+    descriptor = refine_reader.descriptor
+    if descriptor.refine_id is None or str(descriptor.refine_id) != refine.refine_id:
+        raise V2Error("Refine artifact does not belong to the parent Refine Run")
+    if descriptor.source_fingerprint_json != canonical_json(refine.source_fingerprint):
+        raise V2Error("Refine artifact source fingerprint does not match its Run")
+    if runtime is None or data_root is None:
+        raise V2Error("formal DB Detect requires runtime and data_root")
+    return _detect_intersections_db(
+        conn, cfg, refine.spatial_context, runtime=runtime, data_root=data_root,
+        refine_reader=refine_reader, connect_worker=connect_worker,
+    )
 
 def _neighbors_indices(
     xs: list[float],

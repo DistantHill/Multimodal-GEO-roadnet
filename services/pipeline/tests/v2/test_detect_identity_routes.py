@@ -11,7 +11,7 @@ from track.v2.trajectories.results.read_parquet import RefineDatasetReader
 from track.v2.candidates.grid_segments import build_grid_segments
 from track.v2.candidates.detect_grid_crossings import iter_grid_crossings, iter_grid_candidates
 from track.v2.candidates.detect_cross_track_pairs import concatenate_cross_batches
-from track.v2.candidates.collect_candidates import extract_cross_track_candidates, extract_columnar_cross_track_candidates
+from track.v2.candidates.collect_candidates import extract_columnar_cross_track_candidates
 
 
 def _grid_columns(tracks):
@@ -31,20 +31,19 @@ def _grid_columns(tracks):
 
 
 @pytest.mark.parametrize("same_subtrack",[False,True])
-def test_grid_parquet_and_eager_use_identical_run_partition_rule(tmp_path,same_subtrack):
+def test_grid_and_parquet_use_identical_run_partition_rule(tmp_path,same_subtrack):
     if same_subtrack:
         tracks=[subtrack([[-20.,0.],[20.,0.],[0.,-20.],[0.,20.]],subtrack_index=212,headings=[90.,90.,0.,0.])]
     else:
         tracks=[subtrack([[-20.,0.],[20.,0.]],subtrack_index=212,headings=[90.,90.]),
                 subtrack([[0.,-20.],[0.,20.]],subtrack_index=37,headings=[0.,0.])]
     cfg=intersect_config()
-    eager=extract_cross_track_candidates({track.subtrack_index:track for track in tracks},TRANSFORMER,cfg)[0]
     segments=_grid_columns(tracks)
     grid=concatenate_cross_batches(list(iter_grid_candidates(segments,iter_grid_crossings(segments,cfg,max_grid_memberships=10000,max_overflow_pair_space=10000),TRANSFORMER)))
     published=_published_tracks(tmp_path,[(track.vehicle_id,track.subtrack_index,list(zip(track.timestamp,track.xy[:,0],track.xy[:,1],track.heading))) for track in tracks])
     with RefineDatasetReader(tmp_path,published,"present",runtime_config()) as reader:
         parquet=extract_columnar_cross_track_candidates(reader,"source",TRANSFORMER,cfg)
-    for result in (eager,grid,parquet):
+    for result in (grid,parquet):
         if same_subtrack:
             assert len(result)==0
         else:
@@ -85,7 +84,6 @@ def test_cross_track_endpoint_average_speed_is_shared_by_all_routes(tmp_path, sp
                               headings=[90., 90.]), speed=np.asarray(speeds)),
               subtrack([[0., -20.], [0., 20.]], subtrack_index=2)]
     cfg = intersect_config()
-    eager = extract_cross_track_candidates({t.subtrack_index: t for t in tracks}, TRANSFORMER, cfg)[0]
     segments = _grid_columns(tracks)
     assert segments['end_speed'].tolist() == [speeds[1], 20.]
     timing = CrossTrackTiming()
@@ -107,7 +105,7 @@ def test_cross_track_endpoint_average_speed_is_shared_by_all_routes(tmp_path, sp
         speeds=[*speeds, 20., 20.])
     with RefineDatasetReader(tmp_path, published, "present", runtime_config()) as reader:
         parquet = extract_columnar_cross_track_candidates(reader, "source", TRANSFORMER, cfg)
-    for result in (eager, grid, spilled, parquet):
+    for result in (grid, spilled, parquet):
         assert len(result) == expected
         if expected:
             np.testing.assert_array_equal(result.xy, [[0., 0.]])

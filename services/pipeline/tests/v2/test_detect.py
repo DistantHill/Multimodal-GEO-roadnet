@@ -11,12 +11,11 @@ from .config_factory import intersect_config,intersect_run_config,detect_context
 from .detect_columns_helpers import CONTEXT as _TEST_SPATIAL_CONTEXT,TRANSFORMER as _TEST_TRANSFORMER,subtrack,sql_turns_from_subtrack
 from track.v2._geometry import _batch_segment_intersections,_iter_bounded_segment_intersections,_paired_segment_intersections
 from track.v2.candidates.build_patches import _iter_pair_batches as _iter_cross_track_pair_batches
-from track.v2.candidates.collect_candidates import extract_cross_track_candidates
 from track.v2.candidates.detect_turn_events import empty_turn_batch
 from track.v2.candidates.detect_cross_track_pairs import empty_cross_batch
 from track.v2.intersections.performance_timing import PerfTracker
-from track.v2.intersections.detect_intersections import (_build_dbscan_grid,_run_dbscan,_cluster_pipeline,_compute_getis_ord_g_star,detect_intersections,_detect_intersections_handle,_cluster_dbscan,_merge_clusters)
-from track.v2.intersections.extract_topology import _cluster_angles_greedy,_nearest_angle_id,_build_topologies_from_tracks
+from track.v2.intersections.detect_intersections import (_build_dbscan_grid,_run_dbscan,_cluster_pipeline,_compute_getis_ord_g_star,detect_intersections,_cluster_dbscan,_merge_clusters)
+from track.v2.intersections.extract_topology import _cluster_angles_greedy,_nearest_angle_id
 from track.v2.exceptions import V2Error
 from track.v2.models import IntersectReport
 class PairedSegmentIntersectionTest(unittest.TestCase):
@@ -204,22 +203,10 @@ def test_branch_angles_wrap_and_nearest():
     assert len(_cluster_angles_greedy([359,1,90,180,270],5))==4
     assert _nearest_angle_id(359,[0,90,180])==0
 
-def test_public_detect_eager_preserves_report_and_identity():
-    a=subtrack([[-20,0],[20,0]],subtrack_index=123,headings=[90,90])
-    b=subtrack([[0,-20],[0,20]],subtrack_index=999,headings=[0,0])
-    cfg=intersect_run_config(use_turn_events=False,min_intersection_radius_m=10,topology_radius_padding_m=0,candidate_dbscan_min_samples=1,min_observations=1,min_branches=2,min_directed_transitions=1)
-    result=_detect_intersections_handle({123:a,999:b},cfg,_TEST_SPATIAL_CONTEXT)
-    assert result.report.track_count==2
-    assert result.report.cross_track_candidate_count==1
-    assert result.cross_track_candidates.from_subtrack_index.tolist()==[123]
-    assert result.cross_track_candidates.to_subtrack_index.tolist()==[999]
-    assert result.clusters[0].members.kind.tolist()==["orthogonal_cross_track"]
-    assert result.clusters[0].crossing_points.calculation_index.tolist()==[0,1,2,3]
-    assert result.report.complete_intersection_count==1
-
-def test_public_handle_requires_spatial_context():
-    with pytest.raises(V2Error,match="SpatialContext"):
-        detect_intersections({},config=intersect_config(),context=detect_context(query_active_from_db=False),runtime=runtime_config())
+def test_public_detect_requires_database_connection():
+    with pytest.raises(V2Error, match="connection"):
+        detect_intersections(config=intersect_config(), context=detect_context(),
+                             runtime=runtime_config())
 
 
 class IntersectReportTest(unittest.TestCase):

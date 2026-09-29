@@ -11,7 +11,7 @@ def test_db_detect_uses_grid_task_and_turn_reader_with_explicit_runtime_bounds(t
     reader=MagicMock(); reader.extent.return_value=(0.,0.,10.,10.); reader.iter_turn_candidates.return_value=iter(()); reader.track_count.return_value=0
     cfg=intersect_run_config(refine_id="run",source_table="trajectory_points",cross_track_task_grid_m=2500.,cross_track_task_threads=2)
     connector=lambda:object()
-    with patch("track.v2.intersections.detect_intersections.run_grid_cross_track_task",return_value=empty_cross_batch()) as grid,patch("track.v2.intersections.detect_intersections._cluster_pipeline",return_value=(empty_turn_batch(),[])),patch("track.v2.intersections.detect_intersections._build_topologies_from_tracks",return_value=([],[],[])):
+    with patch("track.v2.intersections.detect_intersections.run_grid_cross_track_task",return_value=empty_cross_batch()) as grid,patch("track.v2.intersections.detect_intersections._cluster_pipeline",return_value=(empty_turn_batch(),[])),patch("track.v2.intersections.detect_intersections._build_topologies_from_reader",return_value=([],[],[])):
         result=_run_columnar_db_detect(cfg,CONTEXT,reader,conn=object(),refine_id=cfg.refine_id,connect_worker=connector,runtime=runtime_config(),data_root=tmp_path)
     assert len(result.cross_track_candidates)==0
     reader.iter_turn_candidates.assert_called_once()

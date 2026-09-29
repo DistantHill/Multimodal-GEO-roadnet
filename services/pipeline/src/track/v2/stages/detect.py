@@ -52,7 +52,6 @@ def run_detect_stage(
     progress = EventProgressAdapter(_STAGE_LABEL, emit, completion_pending=True)
     progress.start()
     context = DetectRuntimeContext(
-        query_active_from_db=True,
         db_table=refine.source_table,
         kept_table="kept_trajectory_points",
         source_table=refine.source_table,
