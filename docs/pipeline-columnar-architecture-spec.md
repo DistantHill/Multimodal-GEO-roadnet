@@ -18,6 +18,12 @@
 > Q100–Q107 本轮 grid 超预算处理的权威实施正文见下文
 > [“Q100–Q107 现行实施计划”](#q100q107-现行实施计划2026-09-28已获恢复授权)；
 > 第 6.1、7.3 节与历史 QA 中较早的 failfast/待授权表述均以该节和本轮实际验证记录为准。
+> 2026-09-29 早先 4,000,000,000 B 父控制组硬上限与 swap 0 对应已失败的
+> 26M 历史实测，不再是现行资源边界。开发人员 @reid 于 2026-09-29 22:34
+> （Asia/Shanghai）要求不设置 Pipeline 容器硬内存上限，只记录 6,000,000,000 B
+> 观测阈值；超过时写 ERROR，作业继续。Turn/Cross/Grid 独立 DuckDB 实例各用
+> 4GB memory_limit，其他实例保留公共 1GB，grid 工作线程仍为 4。现行条件见
+> 第 6.1、7.2、7.3 节；旧 2GB 和 4GB 运行数据只作历史失败证据。
 
 ## 1. 背景与问题
 
@@ -254,11 +260,12 @@ Q76 对 2026-09-24 的新跨轨迹算法作局部更正：保留外部接口字�
 并审计本节模型文件的全部类。该方向已明确，完整方案已由 Q99 确认并授权实施；本记录不表示运行代码已完成修改。
 原有已确认方案与实施记录继续保留，本节不是对历史性能验收的追认。
 
-#### 5.6.1 当前生产数据流与分配证据
+#### 5.6.1 Q99 实施前生产数据流与分配证据（2026-09-26 基线）
 
 审计范围覆盖 Parser、Refine、Detect、Clip、Fitting、Network、持久化、Pipeline 回放与
 Backend 交叉口回放。模型文件顶层共 60 个 class，包含基类、Protocol 和 Enum。
-以下是静态调用与代码结构事实，不是性能基准：
+以下主要是 Q99 实施前的静态调用与代码结构记录，不是当前性能基准；
+转向路径条目已按后续 SQL 实现更新，其余逐点分配描述仍属实施前基线：
 
 - Parser 的 PostgreSQL 快速路径已避免逐行 dict，但仍逐行构建 PointRef、
   TrajectoryPoint 和空 extra 字典。证据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/parse_rows.py:33](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/parse_rows.py:33)  和 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/parse_rows.py:135](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/parse_rows.py:135) 。
@@ -485,12 +492,12 @@ Q91 已明确只将 trajectory_points 与 day01 源表作为必须保留的数�
 其余单字段配置、错误结构与序列化函数的局部形式由实施者按实际调用选择，
 无需新增设计问题；不能由此扩大为通用框架。完整范围见 Q98。
 
-#### 5.6.7 主要几何内核布局审计（2026-09-26）
+#### 5.6.7 主要几何内核布局审计（2026-09-26 基线；转向行后续更新）
 
 本轮按正式生产内核族核查，不以函数数或未经测量的运行时占比计票。
 审计推荐权威 XY 布局为 float64 (N,2)，已由 Q99 明确采纳，取代此前暂定 (2,N)。
 
-| 生产内核族 | 当前输入/主要运算 | 布局证据 |
+| 生产内核族 | 审计时输入/主要运算；转向行已更新 | 布局证据 |
 | --- | --- | --- |
 | Refine 与投影 | 整车状态机、点对象标量；forward_many 物化经纬度列表和输出元组列表 | 无二维 ndarray 布局偏好。 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/refine_trajectories.py:52](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/refine_trajectories.py:52)  [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/projection.py:286](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/projection.py:286)  |
 | Detect 转向、G*、DBSCAN | 正式转向和内存入口复用 DuckDB SQL 窗口与阈值；G*/DBSCAN 为 x/y 标量或独立一维列。 | 均不计作 (2,N) 矩阵证据。 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/results/read_parquet.py:280](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/results/read_parquet.py:280)  [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/collect_candidates.py:15](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/collect_candidates.py:15)  |
@@ -520,17 +527,19 @@ Q99 已确认最终布局并单独明确实施授权；审计本身不构成性�
 
 ### 6.1 资源边界
 
-默认验收使用新建 Pipeline 父控制组：
+现行 26M 测量使用新建 Pipeline 父控制组（2026-09-29 22:34，开发人员 @reid 更正）：
 
-- memory.max = 2,000,000,000 B；
-- memory.swap.max = 0；
+- Pipeline 容器不设置硬内存上限，实际 `memory.max=max`；
+- 不强制 `memory.swap.max=0`，记录实际值；
+- `memory.current` 超过 6,000,000,000 B 时在当次日志写 `ERROR`，作业继续；该值不是内存上限或失败条件；
 - 计入 Python、DuckDB、Polars、原生线程和本控制组文件页缓存；
 - PostgreSQL 容器单独计量；
-- DuckDB 初始 memory_limit = 1 GB、threads <= 4；
+- DuckDB 公共 memory_limit = 1 GB；Turn/Cross/Grid 独立实例各自 memory_limit = 4 GB；threads <= 4；
 - Polars 强制流式执行并限制线程数。
 
-DuckDB memory_limit 只约束其主要缓冲管理器，不能替代控制组硬边界。参数可依据基准
-向下或向上校准，但默认验收不得突破 2 GB。
+DuckDB memory_limit 只约束各实例的主要缓冲管理器，不是 Pipeline 容器硬上限。
+旧 2GB 与 4GB 父控制组运行属于历史失败记录；不把旧运行的 swap 0、
+`memory.peak < 4,000,000,000 B` 或控制组 OOM 条件沿用为本轮验收标准。
 
 Q73–Q77 的新跨轨迹任务仅使用本地最小线程调度：可配置默认 4、最多 8 个线程，
 每线程独立 PostgreSQL 连接；不建立通用调度框架或 Dask 集成。一般可恢复网格
@@ -588,9 +597,9 @@ Q78 已选择独立功能验收：用少量基于权威源数据的已知交叉�
 ### 7.2 26M 性能
 
 - Refine 原始输入精确为 26,000,000 行；
-- 使用默认 2 GB 硬上限，不使用 3 GB 运营重跑上限；
-- memory.swap.max = 0，结束时无新增 oom/oom_kill；
-- Pipeline 父控制组 memory.peak < 2,000,000,000 B；
+- 不设置 Pipeline 容器硬内存上限；测量开始前核对 `memory.max=max`；
+- 记录 `memory.swap.max`、`memory.peak` 与 `memory.events` 实际值，不要求 swap 0 或峰值低于旧 4GB 上限；
+- 超过 6,000,000,000 B 仅在日志记 `ERROR`，继续运行，不据此判定性能失败；
 - PostgreSQL 内存、临时文件和磁盘单独报告；
 - 从 Refine 开始至 Network 完成的墙钟时间 < 3,600 秒；
 - Q99 本次全链路重构按 7.1 的更正规则执行独立功能、身份/顺序/锚点和回放验证，
@@ -607,7 +616,7 @@ membership 索引、整 grid 输入、候选及全 Run 去重累计四层均纳�
 生效额度并记录日志。每个独立 DuckDB 实例初始 50GB，倍增至 100GB、200GB 封顶，
 不设置 Run 合计配额；Q106 仅对 DuckDB 临时额度耗尽执行受限重试。用户已确认
 完整实施计划与后续索引方案，实施授权已恢复。
-既有 2 GB Pipeline 控制组硬上限、swap 0、规则与精确完整性保持；不跳过 grid 或
+本轮 Pipeline 容器无硬内存上限，6GB 仅记日志；精确完整性保持，不跳过 grid 或
 配对，普通 grid 路径保留。1 小时仍是性能目标，不因继续运行而放宽。
 当前实现已接入整 grid 输入 TEMP 切换和全 Run 候选暂存/去重路径；这些结构及
 独立功能测试不等于 26M 实际全部 grid 已完成，也不证明整条链路达成内存/时间目标。
@@ -3422,3 +3431,10 @@ source 列和 pieces→concat 重复数组，测实际候选规模、labels/grid
 用户回答：待回答。正文关联：本节“源数据指纹、制品 SHA-256 和业务校验”。当前解释：待确认。
 
 本轮检查：Q108–Q110 仅发问前记录，尚无回答；此前 Q1–Q107 与历史实施授权保持原貌，本轮不新增实施授权。两条用户调查输入均已记录原文。
+
+### 2026-09-29 22:34（Asia/Shanghai）资源边界再更正
+
+开发人员 @reid 要求不设置 Pipeline 容器硬内存上限，只记录 6,000,000,000 B
+观测阈值。超过阈值写 `ERROR`，作业继续；记录实际 `memory.max`、
+`memory.swap.max`、`memory.peak` 与事件计数。此前 4GB 硬上限与 swap 0
+只对应已失败的历史运行。现行条款已在第 6.1、7.2、7.3 节原位置更新。
