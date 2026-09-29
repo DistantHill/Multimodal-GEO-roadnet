@@ -346,7 +346,17 @@ def test_unknown_resolved_ids_are_not_found_after_context_validation() -> None:
         )
 
 
-def test_store_clip_reads_resolved_crossings_and_returns_between_clip() -> None:
+def test_store_clip_reads_resolved_crossings_and_returns_between_clip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "backend.stores.map_layers.validate_source_table",
+        lambda *_args: object(),
+    )
+    monkeypatch.setattr(
+        "backend.stores.map_layers.calculate_source_fingerprint",
+        lambda *_args: _EMPTY_FINGERPRINT,
+    )
     detect_id = "12345678-1234-5678-1234-567812345678"
     intersection_rows = [
         [item.intersection_id, item.lon, item.lat, item.radius_m]
@@ -356,8 +366,6 @@ def test_store_clip_reads_resolved_crossings_and_returns_between_clip() -> None:
     connection = ScriptedConnection(
         [detect_row(detect_id, "refine-1")],
         [["int8"]],
-        [[False]],
-        [],
         intersection_rows,
         [["vehicle-1", 7, None]],
         rows,
