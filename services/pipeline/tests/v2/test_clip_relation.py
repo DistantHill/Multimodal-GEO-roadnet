@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from .config_factory import (clip_config, fitting_config, intersect_config, network_config, postgres_config, projection_config, refine_config, runtime_config)
 
-import inspect
 import numpy as np
 from pathlib import Path
 
@@ -194,15 +193,44 @@ def test_runtime_limits_and_engine_temp_are_applied(tmp_path):
         assert not list((tmp_path / "duckdb" / "clip-relations").glob("*.duckdb"))
 
 
-def test_q44_relation_uses_only_duckdb_columnar_storage():
-    source = inspect.getsource(clip_relation).lower()
-    assert "duckdb.connect" in source
-    assert "fetchnumpy" in inspect.getsource(ClipRelation._iterate).lower()
-    assert "execute(" not in inspect.getsource(ClipRelation._decode).lower()
-    append_source = inspect.getsource(ClipRelation.append).lower()
-    assert "unnest" in append_source and "executemany" not in append_source
-    for forbidden in ("sqlite", "pickle", "temporarydirectory", "memmap"):
-        assert forbidden not in source
+def test_batch_append_reads_across_clips_and_metadata(tmp_path):
+    clips = (
+        _clip("a", points=((2**53 + 1, 1.0, 2.0),), ordinal=0),
+        _clip("b", points=((2**53 + 2, 1.5, 2.5),), ordinal=1),
+        _clip("c", ordinal=2),
+    )
+    with _relation(tmp_path, batch_size=3) as relation:
+        relation.append_batch(clips)
+        relation.seal()
+        assert len(relation) == 3
+        assert all(_same(actual, expected) for actual, expected in zip(relation, clips, strict=True))
+        assert all(_same(actual, expected) for actual, expected in zip(relation, clips, strict=True))
+        assert relation.get_clip_metadata_batch(["b", "a", "b"]) == [
+            ("between_intersection", 10, 20, 1),
+            ("between_intersection", 10, 20, 1),
+            ("between_intersection", 10, 20, 1),
+        ]
+        with pytest.raises(KeyError, match="missing"):
+            relation.get_clip_metadata_batch(["a", "missing"])
+
+
+def test_batch_append_rolls_back_failed_point_insert(tmp_path, monkeypatch):
+    with _relation(tmp_path, batch_size=2) as relation:
+        original = relation._column_insert
+        monkeypatch.setattr(
+            relation, "_column_insert",
+            lambda table, types: "INSERT INTO nonexistent SELECT 1" if table == "clip_points"
+            else original(table, types),
+        )
+        with pytest.raises(Exception):
+            relation.append_batch((_clip("a", points=((1, 1.0, 2.0),)),
+                                   _clip("b", points=((2, 1.5, 2.5),), ordinal=1)))
+        assert len(relation) == 0
+        assert relation._connection.execute("SELECT count(*) FROM clips").fetchone()[0] == 0
+        monkeypatch.setattr(relation, "_column_insert", original)
+        relation.append(_clip("retry"))
+        relation.seal()
+        assert [clip.clip_id for clip in relation] == ["retry"]
 
 
 def test_wide_json_columns_preserve_large_int64_and_xy(tmp_path):

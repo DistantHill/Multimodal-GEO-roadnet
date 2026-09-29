@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from itertools import islice
 from typing import Any
 
 from ..models import CenterlineFitBundle, ClipConfig, ClipResult, FittingConfig
@@ -127,25 +128,41 @@ def insert_centerline_bundle(
         )]
         for centerline in centerlines
     )
-    get_clip = getattr(clips.clips, "get_by_clip_id", None)
-    if not callable(get_clip):
-        clips_by_id = {clip.clip_id: clip for clip in clips.clips}
-        get_clip = clips_by_id.__getitem__
     manifest_rows: list[tuple[Any, ...]] = []
-    for centerline_id, centerline in zip(ordered_ids, centerlines, strict=True):
-        for ordinal, clip_id in enumerate(centerline.source_clip_ids):
-            clip = get_clip(clip_id)
-            if clip.clip_type != "between_intersection":
-                raise ValueError("only between_intersection clips may back a centerline")
-            if clip.start_crossing_id is None or clip.end_crossing_id is None:
-                raise ValueError("centerline source clips require crossing IDs")
-            manifest_rows.append((
-                centerline_id,
-                detect_id,
-                ordinal,
-                clip.start_crossing_id,
-                clip.end_crossing_id,
-                clip.start_intersection_id != centerline.from_intersection_id,
+    requests = (
+        (centerline_id, centerline.from_intersection_id, ordinal, clip_id)
+        for centerline_id, centerline in zip(ordered_ids, centerlines, strict=True)
+        for ordinal, clip_id in enumerate(centerline.source_clip_ids)
+    )
+
+    def add_manifest_row(request, metadata) -> None:
+        centerline_id, from_intersection_id, ordinal, _clip_id = request
+        clip_type, start_crossing_id, end_crossing_id, start_intersection_id = metadata
+        if clip_type != "between_intersection":
+            raise ValueError("only between_intersection clips may back a centerline")
+        if start_crossing_id is None or end_crossing_id is None:
+            raise ValueError("centerline source clips require crossing IDs")
+        manifest_rows.append((
+            centerline_id, detect_id, ordinal, start_crossing_id, end_crossing_id,
+            start_intersection_id != from_intersection_id,
+        ))
+
+    read_metadata = getattr(clips.clips, "get_clip_metadata_batch", None)
+    if callable(read_metadata):
+        while batch := tuple(islice(requests, 1024)):
+            metadata = read_metadata([request[3] for request in batch])
+            for request, values in zip(batch, metadata, strict=True):
+                add_manifest_row(request, values)
+    else:
+        get_clip = getattr(clips.clips, "get_by_clip_id", None)
+        if not callable(get_clip):
+            clips_by_id = {clip.clip_id: clip for clip in clips.clips}
+            get_clip = clips_by_id.__getitem__
+        for request in requests:
+            clip = get_clip(request[3])
+            add_manifest_row(request, (
+                clip.clip_type, clip.start_crossing_id, clip.end_crossing_id,
+                clip.start_intersection_id,
             ))
     with conn.cursor() as cur:
         _copy_insert(
@@ -159,4 +176,3 @@ def insert_centerline_bundle(
             manifest_rows,
         )
     return ordered_ids
-

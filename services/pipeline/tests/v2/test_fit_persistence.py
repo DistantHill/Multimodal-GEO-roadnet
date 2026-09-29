@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 import numpy as np
+from track.v2.clips.clip_input import ClipRelation
 from track.v2.projection import CoordinateTransformer
 
 from track.v2 import fit_centerline_variants
@@ -12,7 +15,7 @@ from track.v2.models import (
     SpatialContext,
     TrackClip,
 )
-from .config_factory import fitting_config
+from .config_factory import fitting_config, runtime_config
 
 
 _SPATIAL_CONTEXT = SpatialContext(
@@ -130,6 +133,39 @@ def _report(*, vehicles: int, clips: int, points: int) -> ClipReport:
 
 
 class FitPersistenceTest(unittest.TestCase):
+    def test_duckdb_manifest_reads_metadata_without_decoding_source_points(self) -> None:
+        source_clips = (
+            _clip("forward", 10, 20, False),
+            _clip("reverse", 20, 10, True),
+        )
+        tuple_result = ClipResult(
+            clips=source_clips,
+            report=_report(vehicles=2, clips=2, points=6),
+            spatial_context=_SPATIAL_CONTEXT,
+            detect_id="detect-1",
+        )
+        bundle = fit_centerline_variants(tuple_result, config=fitting_config())
+        expected = _Connection()
+        insert_centerline_bundle(
+            expected, bundle, tuple_result, fit_id="fit-1", detect_id="detect-1",
+        )
+        with TemporaryDirectory() as data_root:
+            with ClipRelation(runtime_config(), data_root, batch_size=2) as relation:
+                relation.append_batch(source_clips)
+                relation.seal()
+                streamed = ClipResult(
+                    clips=relation, report=tuple_result.report,
+                    spatial_context=_SPATIAL_CONTEXT, detect_id="detect-1",
+                )
+                actual = _Connection()
+                with patch.object(relation, "_read_point_batch", side_effect=AssertionError(
+                    "source points decoded during manifest write",
+                )):
+                    insert_centerline_bundle(
+                        actual, bundle, streamed, fit_id="fit-1", detect_id="detect-1",
+                    )
+                self.assertEqual(actual.copied_rows, expected.copied_rows)
+
     def test_bundle_persists_three_lines_and_ordered_clip_manifests(self) -> None:
         clips = ClipResult(
             clips=(

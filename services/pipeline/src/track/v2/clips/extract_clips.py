@@ -109,6 +109,16 @@ def extract_clips_for_detect(
     seen_subtracks: set[int] = set()
     counts: Counter[str] = Counter()
     skipped = point_count = 0
+    pending_clips: list[TrackClip] = []
+    pending_points = 0
+
+    def flush_clips() -> None:
+        nonlocal pending_points
+        if pending_clips:
+            relation.append_batch(pending_clips)
+            pending_clips.clear()
+            pending_points = 0
+
     try:
         with DetectDatasetReader(
             publication_root, registered.descriptor, registered.state, runtime,
@@ -134,7 +144,17 @@ def extract_clips_for_detect(
                     )
                     skipped += track_skipped
                     for clip in track_clips:
-                        relation.append(clip)
+                        interior_count = len(clip.resolved_point_ids)
+                        if pending_clips and (
+                            len(pending_clips) >= runtime.relation_batch_size
+                            or pending_points + interior_count > runtime.relation_batch_size
+                        ):
+                            flush_clips()
+                        pending_clips.append(clip)
+                        pending_points += interior_count
+                        if (len(pending_clips) >= runtime.relation_batch_size
+                                or pending_points >= runtime.relation_batch_size):
+                            flush_clips()
                         counts[clip.clip_type] += 1
                         point_count += clip.point_count
                     heartbeat_progress(len(seen_subtracks))
@@ -142,6 +162,7 @@ def extract_clips_for_detect(
                 close = getattr(tracks, "close", None)
                 if close is not None:
                     close()
+        flush_clips()
         relation.seal()
         return ClipResult(
             clips=relation,

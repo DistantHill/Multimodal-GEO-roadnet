@@ -15,6 +15,14 @@ from ..models import RuntimeConfig, TrackClip
 class ClipRelation(Sequence[TrackClip]):
     """Build once, validate, then repeatedly read ``TrackClip`` rows."""
 
+    _CLIP_TYPES = (
+        "BIGINT", "VARCHAR", "VARCHAR", "VARCHAR", "VARCHAR", "VARCHAR",
+        "DOUBLE", "DOUBLE", "BIGINT", "BIGINT", "VARCHAR", "DOUBLE", "DOUBLE",
+        "BIGINT", "BIGINT", "DOUBLE", "BIGINT", "BIGINT", "BIGINT", "BIGINT",
+        "BIGINT", "BIGINT", "BIGINT", "DOUBLE", "DOUBLE", "DOUBLE", "DOUBLE",
+    )
+    _POINT_TYPES = ("BIGINT", "BIGINT", "BIGINT", "DOUBLE", "DOUBLE", "DOUBLE", "DOUBLE")
+
     def __init__(
         self, runtime: RuntimeConfig, data_root: str | Path, *, batch_size: int | None = None,
         relation_id: str | None = None,
@@ -79,44 +87,89 @@ class ClipRelation(Sequence[TrackClip]):
             )
         """)
 
+    @staticmethod
+    def _column_insert(table: str, types: tuple[str, ...]) -> str:
+        columns = ", ".join(
+            f"unnest(from_json(?, '[\"{kind}\"]'))" for kind in types
+        )
+        return f"INSERT INTO {table} SELECT {columns}"
+
+    @staticmethod
+    def _clip_row(ordinal: int, clip: TrackClip) -> tuple[object, ...]:
+        return (
+            ordinal, clip.clip_id, clip.vehicle_id, clip.trip_id, clip.clip_type,
+            clip.start_kind, float(clip.lonlat[0, 0]), float(clip.lonlat[0, 1]),
+            clip.start_intersection_id, clip.start_crossing_id,
+            clip.end_kind, float(clip.lonlat[-1, 0]), float(clip.lonlat[-1, 1]),
+            clip.end_intersection_id, clip.end_crossing_id,
+            clip.distance_m, clip.point_count, clip.subtrack_index,
+            clip.clip_ordinal_in_track, clip.start_index, clip.end_index,
+            clip.interior_start, clip.interior_end,
+            float(clip.xy[0, 0]), float(clip.xy[0, 1]),
+            float(clip.xy[-1, 0]), float(clip.xy[-1, 1]),
+        )
+
+    @staticmethod
+    def _json_column(values: Sequence[object]) -> str:
+        return json.dumps(
+            values, separators=(",", ":"),
+            default=lambda value: value.item() if isinstance(value, np.generic) else value,
+        )
+
     def append(self, clip: TrackClip) -> None:
+        self.append_batch((clip,))
+
+    def append_batch(self, clips: Sequence[TrackClip]) -> None:
+        """Commit one bounded group; a single long clip streams its points in chunks."""
         if self._sealed:
             raise RuntimeError("clip relation is sealed")
         connection = self._require_open()
-        ordinal = self._count
+        if not clips:
+            return
+        point_count = sum(len(clip.resolved_point_ids) for clip in clips)
+        if len(clips) > self._batch_size or (len(clips) > 1 and point_count > self._batch_size):
+            raise ValueError("Clip batch exceeds the relation row budget")
+        rows = [self._clip_row(self._count + index, clip) for index, clip in enumerate(clips)]
+        clip_columns = [self._json_column(column) for column in zip(*rows, strict=True)]
+        points: list[list[object]] = [[] for _ in self._POINT_TYPES]
+
+        def flush_points() -> None:
+            if not points[0]:
+                return
+            connection.execute(
+                self._column_insert("clip_points", self._POINT_TYPES),
+                [self._json_column(column) for column in points],
+            )
+            for column in points:
+                column.clear()
+
         connection.execute("BEGIN")
         try:
             connection.execute(
-                "INSERT INTO clips VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    ordinal, clip.clip_id, clip.vehicle_id, clip.trip_id, clip.clip_type,
-                    clip.start_kind, float(clip.lonlat[0, 0]), float(clip.lonlat[0, 1]),
-                    clip.start_intersection_id, clip.start_crossing_id,
-                    clip.end_kind, float(clip.lonlat[-1, 0]), float(clip.lonlat[-1, 1]),
-                    clip.end_intersection_id, clip.end_crossing_id,
-                    clip.distance_m, clip.point_count, clip.subtrack_index,
-                    clip.clip_ordinal_in_track, clip.start_index, clip.end_index,
-                    clip.interior_start, clip.interior_end,
-                    float(clip.xy[0,0]), float(clip.xy[0,1]),
-                    float(clip.xy[-1,0]), float(clip.xy[-1,1]),
-                ),
+                self._column_insert("clips", self._CLIP_TYPES), clip_columns,
             )
-            for lo in range(0, len(clip.resolved_point_ids), self._batch_size):
-                hi = min(lo+self._batch_size, len(clip.resolved_point_ids))
-                connection.execute(
-                    "INSERT INTO clip_points SELECT ?, unnest(from_json(?, '[\"BIGINT\"]')), "
-                    "unnest(from_json(?, '[\"BIGINT\"]')), unnest(from_json(?, '[\"DOUBLE\"]')), unnest(from_json(?, '[\"DOUBLE\"]')), "
-                    "unnest(from_json(?, '[\"DOUBLE\"]')), unnest(from_json(?, '[\"DOUBLE\"]'))",
-                    (ordinal, json.dumps(np.arange(lo, hi, dtype=np.int64).tolist(), separators=(",", ":")),
-                     json.dumps(clip.resolved_point_ids[lo:hi].tolist(), separators=(",", ":")),
-                     json.dumps(clip.lonlat[lo+1:hi+1,0].tolist(), separators=(",", ":")), json.dumps(clip.lonlat[lo+1:hi+1,1].tolist(), separators=(",", ":")),
-                     json.dumps(clip.xy[lo+1:hi+1,0].tolist(), separators=(",", ":")), json.dumps(clip.xy[lo+1:hi+1,1].tolist(), separators=(",", ":"))),
-                )
+            for index, clip in enumerate(clips):
+                ordinal = self._count + index
+                lo = 0
+                while lo < len(clip.resolved_point_ids):
+                    hi = min(lo + self._batch_size - len(points[0]), len(clip.resolved_point_ids))
+                    count = hi - lo
+                    points[0].extend([ordinal] * count)
+                    points[1].extend(range(lo, hi))
+                    points[2].extend(clip.resolved_point_ids[lo:hi].tolist())
+                    points[3].extend(clip.lonlat[lo+1:hi+1, 0].tolist())
+                    points[4].extend(clip.lonlat[lo+1:hi+1, 1].tolist())
+                    points[5].extend(clip.xy[lo+1:hi+1, 0].tolist())
+                    points[6].extend(clip.xy[lo+1:hi+1, 1].tolist())
+                    if len(points[0]) == self._batch_size:
+                        flush_points()
+                    lo = hi
+            flush_points()
             connection.execute("COMMIT")
         except Exception:
             connection.execute("ROLLBACK")
             raise
-        self._count += 1
+        self._count += len(clips)
 
     def seal(self) -> None:
         if self._sealed:
@@ -235,6 +288,28 @@ class ClipRelation(Sequence[TrackClip]):
         finally:
             iterator.close()
 
+    def get_clip_metadata_batch(
+        self, clip_ids: Sequence[str],
+    ) -> list[tuple[str, int | None, int | None, int | None]]:
+        """Read only the fields needed by Fitting's source manifest."""
+        if not clip_ids:
+            return []
+        connection = self._require_sealed()
+        by_id: dict[str, tuple[str, int | None, int | None, int | None]] = {}
+        for start in range(0, len(clip_ids), self._batch_size):
+            selected = clip_ids[start:start+self._batch_size]
+            placeholders = ",".join("?" for _ in selected)
+            rows = connection.execute(
+                "SELECT clip_id,clip_type,start_crossing_id,end_crossing_id,"
+                "start_intersection_id FROM clips WHERE clip_id IN (" + placeholders + ")",
+                list(selected),
+            ).fetchall()
+            by_id.update((str(row[0]), row[1:]) for row in rows)
+        try:
+            return [by_id[clip_id] for clip_id in clip_ids]
+        except KeyError as exc:
+            raise KeyError(exc.args[0]) from exc
+
     def iter_pair(
         self, pair: tuple[int, int], *, reverse: bool | None = None,
     ) -> Iterator[TrackClip]:
@@ -280,14 +355,74 @@ class ClipRelation(Sequence[TrackClip]):
         try:
             cursor.execute(f"SELECT c.* FROM clips c {where} ORDER BY {order_by}", params)
             while rows := cursor.fetchmany(self._batch_size):
-                for row in rows:
-                    values = connection.execute(
-                        "SELECT resolved_point_id,lon,lat,x,y FROM clip_points "
-                        "WHERE clip_ordinal=? ORDER BY point_ordinal", (row[0],),
-                    ).fetchnumpy()
-                    yield self._decode(row, values)
+                start = 0
+                while start < len(rows):
+                    end = start
+                    point_count = 0
+                    while end < len(rows):
+                        next_count = int(rows[end][16]) - 2
+                        if end > start and point_count + next_count > self._batch_size:
+                            break
+                        point_count += next_count
+                        end += 1
+                    yield from self._read_point_batch(connection, rows[start:end])
+                    start = end
         finally:
             cursor.close()
+
+    def _read_point_batch(
+        self, connection: duckdb.DuckDBPyConnection, rows: Sequence[tuple[object, ...]],
+    ) -> Iterator[TrackClip]:
+        ordinals = [int(row[0]) for row in rows]
+        ranks = list(range(len(rows)))
+        point_cursor = connection.cursor()
+        try:
+            point_cursor.execute("""
+                WITH selected AS (
+                    SELECT unnest(from_json(?, '["BIGINT"]')) AS clip_ordinal,
+                           unnest(from_json(?, '["INTEGER"]')) AS read_order
+                )
+                SELECT s.read_order,p.point_ordinal,p.resolved_point_id,
+                       p.lon,p.lat,p.x,p.y
+                FROM selected s JOIN clip_points p USING (clip_ordinal)
+                ORDER BY s.read_order,p.point_ordinal
+            """, (json.dumps(ordinals), json.dumps(ranks)))
+            fetched: list[tuple[object, ...]] = []
+            offset = 0
+
+            def next_point() -> tuple[object, ...] | None:
+                nonlocal fetched, offset
+                if offset == len(fetched):
+                    fetched = point_cursor.fetchmany(self._batch_size)
+                    offset = 0
+                if not fetched:
+                    return None
+                point = fetched[offset]
+                offset += 1
+                return point
+
+            point = next_point()
+            for rank, row in enumerate(rows):
+                count = int(row[16]) - 2
+                values = {
+                    "resolved_point_id": np.empty(count, dtype=np.int64),
+                    "lon": np.empty(count, dtype=np.float64),
+                    "lat": np.empty(count, dtype=np.float64),
+                    "x": np.empty(count, dtype=np.float64),
+                    "y": np.empty(count, dtype=np.float64),
+                }
+                for point_ordinal in range(count):
+                    if point is None or (int(point[0]), int(point[1])) != (rank, point_ordinal):
+                        raise ValueError("Clip point order changed during read")
+                    values["resolved_point_id"][point_ordinal] = point[2]
+                    for name, value in zip(("lon", "lat", "x", "y"), point[3:], strict=True):
+                        values[name][point_ordinal] = value
+                    point = next_point()
+                yield self._decode(row, values)
+            if point is not None:
+                raise ValueError("Clip point count changed during read")
+        finally:
+            point_cursor.close()
 
     @staticmethod
     def _decode(row: tuple[object, ...], values: dict[str, np.ndarray]) -> TrackClip:
