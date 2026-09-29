@@ -4,12 +4,12 @@
 
 `init/001-enable-postgis.sql` 只在空数据目录首次初始化时启用 PostGIS。业务
 Schema 的唯一权威入口是 `services/pipeline/src/track/v2/cli/init_db.py`。当前版本为
-schema v6：v3 使用 `init-db --migrate-refine` 串联升级，v4/v5 使用
-`init-db --migrate-artifacts` 升级；v1/v2 仍需另行处理或用 `init-db --reset`
-全量重建。不要混跑依赖不同版本字段的服务。
+schema v9：v4 至 v8 使用 `init-db --migrate-artifacts` 升级；v3 及更早版本
+不再支持保留数据的 CLI 迁移，`init-db --reset` 会全量重建已知 Pipeline 表。
+不要混跑依赖不同版本字段的服务。
 
-`refine_runs` 唯一保存外部 `source_table`，kept/excluded 使用字符串化的
-`source_row_key`。仓内实体关系使用 `BIGINT` 主键。Detect 在最终事务中写入
+`refine_runs` 唯一保存外部 `source_table`，kept/excluded 的
+`source_row_key` 为 `BIGINT`。仓内实体关系使用 `BIGINT` 主键。Detect 在最终事务中写入
 `resolved_subtrack_points`，每行恰好引用 kept、injected 或完整交叉口的 candidate
 crossing 之一。Clip 只消费 completed Detect 的最终顺序；Centerline manifest
 仅保存起止 crossing 血缘。

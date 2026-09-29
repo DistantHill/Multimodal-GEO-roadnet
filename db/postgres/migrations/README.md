@@ -1,13 +1,13 @@
-# Schema v7 migrations
+# Schema v9 migrations
 
-`track.v2` 数据库结构（schema）v4 将 Clean 统一改名为 Refine。v3 可执行
-`python -m pipeline init-db --migrate-refine`，在一个事务内
-保留数据、改名并依次升级至 v7。v4/v5/v6 使用 `--migrate-artifacts` 升至 v7。
-执行前停止相关读写服务，完成后一起部署 Pipeline、Backend 和客户端。具体步骤见
+`track.v2` 数据库结构（schema）当前为 v9。v4 至 v8 使用
+`python -m pipeline init-db --migrate-artifacts` 逐级升级至 v9。
+v3 的保留数据迁移 CLI 已删除；早期迁移经过见
 [迁移说明](../../../docs/refine-migration-and-performance.md)。
+执行迁移前停止相关读写服务，完成后一起部署 Pipeline、Backend 和客户端。
 
-无迁移选项时初始化器只接受空库或已登记为 v7 的库。v1、v2 或未版本化
-Pipeline 表仍需另行处理；`--reset` 会破坏性重建。v4 业务表的权威数据定义语言
+无迁移选项时初始化器只接受空库或已登记为 v9 的库。v3 及更早版本或未版本化
+Pipeline 表需要重建；`--reset` 会删除已知 Pipeline 表及其数据。业务表的权威数据定义语言
 （data definition language，DDL）位于
 `services/pipeline/src/track/v2/cli/init_db.py`。
 
