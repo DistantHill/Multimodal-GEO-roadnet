@@ -40,7 +40,7 @@ def _published(tmp_path: Path):
         "{sequence}::BIGINT AS refined_sequence_in_subtrack, "
         "1.0::DOUBLE AS \"timestamp\", 120.0::DOUBLE AS lon, 30.0::DOUBLE AS lat, "
         "10.0::DOUBLE AS x, 20.0::DOUBLE AS y, 90.0::DOUBLE AS heading, "
-        "4.0::DOUBLE AS speed"
+        "20.0::DOUBLE AS speed"
     )
     with duckdb.connect() as connection:
         for table in refine_schema.REFINE_PARQUET_V1:
@@ -72,7 +72,7 @@ def _published(tmp_path: Path):
     return descriptor
 
 
-def _published_tracks(tmp_path: Path, tracks, *, source_keys=None):
+def _published_tracks(tmp_path: Path, tracks, *, source_keys=None, speeds=None):
     """Publish real Parquet rows used to differential-test the SQL operator."""
     handle = publish_dataset.create_staging(
         tmp_path.resolve(), "refine", uuid4(), uuid4(),
@@ -89,7 +89,8 @@ def _published_tracks(tmp_path: Path, tracks, *, source_keys=None):
                              sequence, timestamp,
                              120 + x / 1e6 if x is not None else 120,
                              30 + y / 1e6 if y is not None else 30,
-                             x, y, heading, 4.0, point_id if source_keys is None else source_keys[point_id-1]))
+                             x, y, heading, 20.0 if speeds is None else speeds[point_id-1],
+                             point_id if source_keys is None else source_keys[point_id-1]))
         connection.execute("""
             CREATE TABLE input_points(
               refine_id UUID, point_id BIGINT, vehicle_id VARCHAR,
@@ -716,7 +717,7 @@ def test_cross_track_pair_api_never_fetches_all() -> None:
     assert create_sql.count("FROM refine_points") == 1
     assert "end_x <> x" not in create_sql
     default = intersect_config()
-    assert create_parameters == [default.cross_track_straightness_deg]
+    assert create_parameters == [default.cross_track_straightness_deg, default.cross_track_min_avg_speed]
     assert connection.execute.call_args_list[2].args[0].startswith("ANALYZE cross_track_straight_")
     sql, parameters = connection.execute.call_args_list[3].args
     assert "FROM refine_points" not in sql

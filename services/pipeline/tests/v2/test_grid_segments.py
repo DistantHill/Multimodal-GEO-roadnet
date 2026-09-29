@@ -13,7 +13,7 @@ def _point(point_id, sequence, x, *, kind=0):
         "source_row_key": None if kind else str(point_id),
         "generated_reason": "test" if kind else None,
         "timestamp": float(sequence), "lon": 110.0, "lat": 20.0,
-        "heading": 90.0, "speed": 5.0, "x": x, "y": 0.0,
+        "heading": 90.0, "speed": 20.0, "x": x, "y": 0.0,
     }
 
 

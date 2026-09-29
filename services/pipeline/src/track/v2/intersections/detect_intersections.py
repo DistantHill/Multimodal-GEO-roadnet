@@ -62,6 +62,7 @@ class IntersectConfig(TrackModel):
     candidate_dbscan_min_samples: int
 
     # ── Cross-track orthogonal detection (Method 3) ──────────────────
+    cross_track_min_avg_speed: float
     cross_track_straightness_deg: float
     cross_track_min_angle_deg: float
     cross_track_max_angle_deg: float

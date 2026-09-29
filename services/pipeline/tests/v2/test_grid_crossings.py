@@ -19,6 +19,7 @@ def _segments():
         ("e", 1.5, -1.0, 1.5, 1.0, 0.0, 0.0),
     )
     return {
+        "speed": np.full(len(values), 20.), "end_speed": np.full(len(values), 20.),
         "vehicle_id": np.asarray([row[0] for row in values],dtype=object),
         "subtrack_index": np.asarray([0,0,1,2,3,4],dtype=np.int64),
         "segment_identity": np.column_stack((np.asarray([0,0,1,2,3,4],dtype=np.int64),
@@ -37,6 +38,7 @@ def _segments():
 
 def _cfg():
     return SimpleNamespace(
+        cross_track_min_avg_speed=20.0,
         cross_track_straightness_deg=10.0,
         cross_track_min_angle_deg=45.0,
         cross_track_max_angle_deg=135.0,
@@ -102,3 +104,79 @@ def test_same_subtrack_is_excluded_independently_of_vehicle_identity():
     assert batches[0]['segment_index_a'].tolist()==[0]
     assert batches[0]['segment_index_b'].tolist()==[5]
     assert segments['vehicle_id'][0]!=segments['vehicle_id'][2]
+
+
+@pytest.mark.parametrize("angle_range", [(0., 180.), (80., 100.), (0., 0.), (180., 180.)])
+@pytest.mark.parametrize("batch_size", [1, 7, 65536])
+@pytest.mark.parametrize("memberships,max_cells", [(0, 1), (100000, 1), (100000, 1000)])
+def test_filtered_grid_pairs_match_exhaustive_geometry(batch_size, memberships, max_cells, angle_range):
+    from track.v2._geometry import _paired_segment_intersections
+    from track.v2.candidates.cross_track_timing import CrossTrackTiming
+
+    rng = np.random.default_rng(882)
+    n = 70
+    start = rng.uniform(-8, 8, (n, 2))
+    end = rng.uniform(-8, 8, (n, 2))
+    # Coincident minima/endpoints, zero-length segments, angle-bin boundaries,
+    # negative/large headings, same subtrack and same vehicle are intentional.
+    start[:8] = 0
+    end[:2] = 0
+    headings = np.resize(np.array([-360., -10., 0., 10., 45., 80., 90., 100.,
+                                   135., 180., 350., 360., 1e20]), n)
+    partitions = rng.integers(0, 10, n)
+    segments = {
+        "speed": np.full(n, 20.), "end_speed": np.full(n, 20.),
+        "vehicle_id": np.full(n, "same", dtype=object),
+        "subtrack_index": partitions,
+        "segment_identity": np.column_stack((partitions, np.zeros(n, dtype=int),
+                                               np.arange(n), np.zeros(n, dtype=int), np.arange(n)+1)),
+        "x_start": start[:, 0], "y_start": start[:, 1],
+        "x_end": end[:, 0], "y_end": end[:, 1],
+        "heading": headings, "end_heading": headings,
+    }
+    cfg = _cfg()
+    cfg.cross_track_pair_batch_size = batch_size
+    cfg.cross_track_min_angle_deg, cfg.cross_track_max_angle_deg = angle_range
+    cfg.cross_track_grid_cell_m = 4.
+    cfg.cross_track_max_grid_cells_per_segment = max_cells
+    a, b = np.triu_indices(n, 1)
+    keep = partitions[a] != partitions[b]
+    a, b = a[keep], b[keep]
+    swap = partitions[a] > partitions[b]
+    a, b = np.where(swap, b, a), np.where(swap, a, b)
+    x, y, hit = _paired_segment_intersections(start[a], end[a], headings[a],
+        start[b], end[b], headings[b], cfg.cross_track_min_angle_deg, cfg.cross_track_max_angle_deg)
+    expected = {(int(a[i]), int(b[i])): (xx, yy) for i, xx, yy in zip(hit, x, y)}
+    timing = CrossTrackTiming()
+    batches = list(iter_grid_crossings(segments, cfg, max_grid_memberships=memberships,
+                                      max_overflow_pair_space=0, timing=timing))
+    actual = {}
+    for batch in batches:
+        assert len(batch['x']) <= batch_size
+        for a, b, x, y in zip(batch['segment_index_a'], batch['segment_index_b'], batch['x'], batch['y']):
+            assert (int(a), int(b)) not in actual
+            actual[int(a), int(b)] = (x, y)
+    assert actual == expected
+    assert timing.values['hit_count'] == len(expected)
+    assert timing.values['pair_count'] >= len(expected)
+
+
+def test_parallel_dense_bucket_is_rejected_before_pair_enumeration():
+    from track.v2.candidates.cross_track_timing import CrossTrackTiming
+    n = 10000
+    segments = {
+        "speed": np.full(n, 20.), "end_speed": np.full(n, 20.),
+        "vehicle_id": np.full(n, "same", dtype=object),
+        "subtrack_index": np.arange(n),
+        "segment_identity": np.zeros((n, 5), dtype=np.int64),
+        "x_start": np.zeros(n), "y_start": np.zeros(n),
+        "x_end": np.ones(n), "y_end": np.zeros(n),
+        "heading": np.full(n, 90.), "end_heading": np.full(n, 90.),
+    }
+    cfg = _cfg()
+    cfg.cross_track_pair_batch_size = 10000
+    timing = CrossTrackTiming()
+    assert list(iter_grid_crossings(segments, cfg, max_grid_memberships=100000,
+                                   max_overflow_pair_space=0, timing=timing)) == []
+    assert timing.values.get('bbox_query_pairs', 0) == 0
+    assert timing.values['pair_count'] == 0

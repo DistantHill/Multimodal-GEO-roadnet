@@ -214,6 +214,7 @@ def _validate(values: dict[str, dict[str, Any]], errors: list[str]) -> None:
     non_negative_numbers = {
         "refine.min_speed_mps", "refine.max_stationary_duration_s",
         "detect.min_movement_speed_mps", "detect.merge_centroid_distance_m",
+        "detect.cross_track_min_avg_speed",
         "detect.topology_radius_padding_m",
     }
     positive_integers = {

@@ -10,6 +10,7 @@ import duckdb
 import numpy as np
 
 from .temp_quota import TempQuota
+from .cross_track_timing import CrossTrackTiming
 
 
 class GridSegmentBudgetError(RuntimeError):
@@ -18,7 +19,7 @@ class GridSegmentBudgetError(RuntimeError):
 
 _INT = {"subtrack_index", "start_refined_sequence_in_subtrack", "end_refined_sequence_in_subtrack", "start_point_id", "end_point_id", "start_source_row_key"}
 _TEXT = {"vehicle_id", "start_point_kind", "end_point_kind", "start_source_id", "start_generated_reason"}
-_FLOAT = {"timestamp", "lon", "lat", "heading", "speed", "x_start", "y_start", "x_end", "y_end", "end_heading"}
+_FLOAT = {"timestamp", "lon", "lat", "heading", "speed", "x_start", "y_start", "x_end", "y_end", "end_heading", "end_speed"}
 _COLUMNS = tuple(sorted(_INT | _TEXT | _FLOAT))
 _KEY = ("subtrack_index", "start_point_kind", "start_point_id", "end_point_kind", "end_point_id")
 
@@ -75,6 +76,7 @@ def _pieces(batch, bounds=None):
             values["x_" + label] = column(prefix, "x", np.float64)
             values["y_" + label] = column(prefix, "y", np.float64)
         values["end_heading"] = column(end_prefix, "heading", np.float64)
+        values["end_speed"] = column(end_prefix, "speed", np.float64)
         values["segment_identity"] = np.column_stack((subtrack, start_kind, a[ids].astype(np.int64), end_kind, b[ids].astype(np.int64)))
         pieces.append(values)
     return pieces
@@ -204,46 +206,49 @@ class GridSegmentRelation:
 
 @contextmanager
 def open_grid_segments(point_batches, *, max_segments: int, max_bytes: int, runtime,
-                       data_root, owner="grid-segments", bounds=None):
+                       data_root, owner="grid-segments", bounds=None, timing: CrossTrackTiming | None = None):
     """Build one grid once, spilling before its buffered pieces exceed the budget."""
     if max_segments < 0 or max_bytes < 0:
         raise ValueError("segment budgets must be non-negative")
+    timing = timing or CrossTrackTiming()
     buffered = []
     buffered_count = buffered_bytes = 0
     relation = None
     iterator = iter(point_batches)
     try:
-        for batch in iterator:
-            pieces = _pieces(batch, bounds)
-            if not pieces:
-                continue
-            if relation is None:
-                added_count = sum(len(piece["subtrack_index"]) for piece in pieces)
-                added_bytes = sum(value.nbytes for piece in pieces for value in piece.values())
-                projected = buffered_count + added_count
-                cost = 3 * (buffered_bytes + added_bytes) + 128 * projected
-                if projected > max_segments or cost > max_bytes:
-                    relation = GridSegmentRelation(runtime, Path(data_root), owner=owner)
-                    for piece in buffered:
+        for batch in timing.iterate(iterator, "read_s"):
+            with timing.measure("segment_s"):
+                pieces = _pieces(batch, bounds)
+                if not pieces:
+                    continue
+                if relation is None:
+                    added_count = sum(len(piece["subtrack_index"]) for piece in pieces)
+                    added_bytes = sum(value.nbytes for piece in pieces for value in piece.values())
+                    projected = buffered_count + added_count
+                    cost = 3 * (buffered_bytes + added_bytes) + 128 * projected
+                    if projected > max_segments or cost > max_bytes:
+                        relation = GridSegmentRelation(runtime, Path(data_root), owner=owner)
+                        for piece in buffered:
+                            relation.append(piece)
+                        buffered = []
+                if relation is not None:
+                    for piece in pieces:
                         relation.append(piece)
-                    buffered = []
+                    continue
+                buffered.extend(pieces)
+                buffered_count = projected
+                buffered_bytes += added_bytes
+        with timing.measure("sort_s"):
             if relation is not None:
-                for piece in pieces:
-                    relation.append(piece)
-                continue
-            buffered.extend(pieces)
-            buffered_count = projected
-            buffered_bytes += added_bytes
-        if relation is not None:
-            relation.finish(deduplicate=bounds is None)
-            delivered = relation
-        else:
-            combined = ({name: np.concatenate([piece[name] for piece in buffered])
-                         for name in buffered[0]} if buffered else {})
-            if bounds is None and combined:
-                _, unique = np.unique(combined["segment_identity"], axis=0, return_index=True)
-                combined = {name: value[unique] for name, value in combined.items()}
-            delivered = _finish_memory(combined)
+                relation.finish(deduplicate=bounds is None)
+                delivered = relation
+            else:
+                combined = ({name: np.concatenate([piece[name] for piece in buffered])
+                             for name in buffered[0]} if buffered else {})
+                if bounds is None and combined:
+                    _, unique = np.unique(combined["segment_identity"], axis=0, return_index=True)
+                    combined = {name: value[unique] for name, value in combined.items()}
+                delivered = _finish_memory(combined)
         # The contextmanager frame stays alive while the worker consumes a grid.
         # Drop input batches and unsorted pieces before handing columns to the worker.
         batch = pieces = combined = unique = _ = buffered = None

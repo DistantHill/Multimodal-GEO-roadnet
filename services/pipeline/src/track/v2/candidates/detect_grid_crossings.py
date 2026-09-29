@@ -19,9 +19,10 @@ from ..models import CrossCandidateBatch
 from ..projection import CoordinateTransformer
 from ..telemetry.console_logging import log_info
 from .build_patches import (
-    CrossTrackCapacityError, build_cross_track_index, iter_cross_track_patches,
+    CrossTrackCapacityError, build_cross_track_index, iter_cross_track_filtered_patches,
 )
 from .detect_cross_track_pairs import (intersect_cross_track_patch, build_cross_track_patch_candidates, concatenate_cross_batches)
+from .cross_track_timing import CrossTrackTiming
 from .grid import create_grid
 from .grid_segments import GridSegmentBudgetError, GridSegmentRelation, open_grid_segments
 from .build_patches import _iter_cross_subtrack_pair_batches, _iter_pair_batches
@@ -34,6 +35,7 @@ def iter_grid_crossings(
     *,
     max_grid_memberships: int,
     max_overflow_pair_space: int,
+    timing: CrossTrackTiming | None = None,
 ) -> Iterator[dict[str, np.ndarray | tuple[Any, ...]]]:
     """Yield bounded exact cross-vehicle hits from one grid's segment columns.
 
@@ -43,6 +45,7 @@ def iter_grid_crossings(
     contains at most ``cfg.cross_track_pair_batch_size`` exact hits and retains
     original segment column indices plus stable identities for later grid merge.
     """
+    timing = timing or CrossTrackTiming()
     threshold = float(cfg.cross_track_straightness_deg)
     batch_size = int(cfg.cross_track_pair_batch_size)
     cell_m = float(cfg.cross_track_grid_cell_m)
@@ -58,122 +61,149 @@ def iter_grid_crossings(
     identities = segments["segment_identity"]
     size = len(vehicle_ids)
     required = (
-        "x_start", "y_start", "x_end", "y_end", "heading", "end_heading",
+        "x_start", "y_start", "x_end", "y_end", "heading", "end_heading", "speed", "end_speed",
     )
     if len(identities) != size or any(len(segments[name]) != size for name in required):
         raise ValueError("segment columns have inconsistent lengths")
     if size < 2:
         return
-    heading = np.asarray(segments["heading"], dtype=np.float64)
-    end_heading = np.asarray(segments["end_heading"], dtype=np.float64)
-    delta = (end_heading - heading + 180.0) % 360.0 - 180.0
-    retained = np.flatnonzero(np.abs(delta) <= threshold)
-    if len(retained) < 2:
-        return
-    start = np.column_stack((
-        np.asarray(segments["x_start"], dtype=np.float64)[retained],
-        np.asarray(segments["y_start"], dtype=np.float64)[retained],
-    ))
-    end = np.column_stack((
-        np.asarray(segments["x_end"], dtype=np.float64)[retained],
-        np.asarray(segments["y_end"], dtype=np.float64)[retained],
-    ))
-    headings = heading[retained]
-    if not (np.isfinite(start).all() and np.isfinite(end).all()
-            and np.isfinite(headings).all()):
-        raise ValueError("segment coordinates and headings must be finite")
-    partitions = np.asarray(segments["subtrack_index"], dtype=np.int64)[retained]
-    # Pair ordering follows the Run-scoped subtrack identity, independently of vehicle.
-    order = np.argsort(partitions, kind="stable")
-    retained = retained[order]
-    start, end, headings, partitions = start[order], end[order], headings[order], partitions[order]
-    index = build_cross_track_index(
-        start, end, partitions, cell_m=cell_m, max_cells=max_cells,
-        max_grid_memberships=max_grid_memberships,
-        max_overflow_pair_space=max_overflow_pair_space,
-    )
-    for ids_a, ids_b in iter_cross_track_patches(index, batch_size):
+    with timing.measure("prepare_s"):
+        heading = np.asarray(segments["heading"], dtype=np.float64)
+        end_heading = np.asarray(segments["end_heading"], dtype=np.float64)
+        delta = (end_heading - heading + 180.0) % 360.0 - 180.0
+        mean_speed = (np.asarray(segments["speed"], dtype=np.float64)
+                      + np.asarray(segments["end_speed"], dtype=np.float64)) / 2.0
+        speed_ok = mean_speed >= cfg.cross_track_min_avg_speed
+        timing.values["speed_rejected_segments"] = int(np.count_nonzero(~speed_ok))
+        straight = np.abs(delta) <= threshold
+        timing.values["straight_segments"] = int(np.count_nonzero(straight))
+        retained = np.flatnonzero(straight & speed_ok)
+        timing.values["eligible_segments"] = len(retained)
+        if len(retained) < 2:
+            return
+        start = np.column_stack((
+            np.asarray(segments["x_start"], dtype=np.float64)[retained],
+            np.asarray(segments["y_start"], dtype=np.float64)[retained],
+        ))
+        end = np.column_stack((
+            np.asarray(segments["x_end"], dtype=np.float64)[retained],
+            np.asarray(segments["y_end"], dtype=np.float64)[retained],
+        ))
+        headings = heading[retained]
+        if not (np.isfinite(start).all() and np.isfinite(end).all()
+                and np.isfinite(headings).all()):
+            raise ValueError("segment coordinates and headings must be finite")
+        partitions = np.asarray(segments["subtrack_index"], dtype=np.int64)[retained]
+        # Pair ordering follows the Run-scoped subtrack identity, independently of vehicle.
+        order = np.argsort(partitions, kind="stable")
+        retained = retained[order]
+        start, end, headings, partitions = start[order], end[order], headings[order], partitions[order]
+    with timing.measure("index_s"):
+        index = build_cross_track_index(
+            start, end, partitions, cell_m=cell_m, max_cells=max_cells,
+            max_grid_memberships=max_grid_memberships,
+            max_overflow_pair_space=max_overflow_pair_space, telemetry=timing.values,
+        )
+    for ids_a, ids_b in timing.iterate(iter_cross_track_filtered_patches(
+            index, start, end, headings, cfg, telemetry=timing.values), "candidate_s"):
         xs, ys, hit_indices = intersect_cross_track_patch(
-            start, end, headings, ids_a, ids_b, cfg,
+            start, end, headings, ids_a, ids_b, cfg, timing=timing,
         )
         if len(hit_indices) == 0:
             continue
-        original_a = retained[ids_a[hit_indices]]
-        original_b = retained[ids_b[hit_indices]]
-        yield {
-            "x": xs, "y": ys,
-            "segment_index_a": original_a,
-            "segment_index_b": original_b,
-            "segment_identity_a": identities[original_a],
-            "segment_identity_b": identities[original_b],
-        }
+        with timing.measure("output_s"):
+            original_a = retained[ids_a[hit_indices]]
+            original_b = retained[ids_b[hit_indices]]
+            result = {
+                "x": xs, "y": ys,
+                "segment_index_a": original_a,
+                "segment_index_b": original_b,
+                "segment_identity_a": identities[original_a],
+                "segment_identity_b": identities[original_b],
+            }
+        yield result
 
 
-def iter_grid_candidates(segments, crossing_batches, transformer):
+def iter_grid_candidates(segments, crossing_batches, transformer, *, timing: CrossTrackTiming | None = None):
     """Yield aligned candidate arrays, preserving source and segment identities."""
-    size = len(segments["subtrack_index"])
-    columns = {
-        "vehicle_id": np.asarray(segments["vehicle_id"], dtype=object),
-        "subtrack_index": segments["subtrack_index"],
-        "point_index": segments["start_refined_sequence_in_subtrack"],
-        "point_kind": np.where(np.asarray(segments["start_point_kind"]) == "kept", "p", "i"),
-        "refine_point_id": segments["start_point_id"],
-        "refine_point_id_valid": np.ones(size, dtype=np.bool_),
-        "source_id": np.asarray(segments["start_source_id"], dtype=object),
-        "source_row_key": np.asarray(segments["start_source_row_key"], dtype=np.int64),
-        "source_row_key_valid": np.asarray(segments["start_point_kind"]) == "kept",
-        "generated_reason": np.asarray(segments["start_generated_reason"], dtype=object),
-        "timestamp": segments["timestamp"], "heading": segments["heading"], "speed": segments["speed"],
-    }
+    timing = timing or CrossTrackTiming()
+    with timing.measure("output_s"):
+        size = len(segments["subtrack_index"])
+        columns = {
+            "vehicle_id": np.asarray(segments["vehicle_id"], dtype=object),
+            "subtrack_index": segments["subtrack_index"],
+            "point_index": segments["start_refined_sequence_in_subtrack"],
+            "point_kind": np.where(np.asarray(segments["start_point_kind"]) == "kept", "p", "i"),
+            "refine_point_id": segments["start_point_id"],
+            "refine_point_id_valid": np.ones(size, dtype=np.bool_),
+            "source_id": np.asarray(segments["start_source_id"], dtype=object),
+            "source_row_key": np.asarray(segments["start_source_row_key"], dtype=np.int64),
+            "source_row_key_valid": np.asarray(segments["start_point_kind"]) == "kept",
+            "generated_reason": np.asarray(segments["start_generated_reason"], dtype=object),
+            "timestamp": segments["timestamp"], "heading": segments["heading"], "speed": segments["speed"],
+        }
     for batch in crossing_batches:
         a, b = batch["segment_index_a"], batch["segment_index_b"]
-        yield build_cross_track_patch_candidates(columns, a, b, batch["x"], batch["y"], np.arange(len(a)), transformer)
+        with timing.measure("output_s"):
+            result = build_cross_track_patch_candidates(columns, a, b, batch["x"], batch["y"], np.arange(len(a)), transformer)
+        yield result
 
 
-def iter_spilled_grid_candidates(relation: GridSegmentRelation, cfg, transformer, *, block_size: int = 4096):
+def iter_spilled_grid_candidates(relation: GridSegmentRelation, cfg, transformer, *, block_size: int = 4096, timing: CrossTrackTiming | None = None):
     """Compare every distinct block pair without retaining the whole grid."""
     if block_size < 1:
         raise ValueError("segment block size must be positive")
+    timing = timing or CrossTrackTiming()
     pair_size = int(cfg.cross_track_pair_batch_size)
     threshold = float(cfg.cross_track_straightness_deg)
     total = relation.count
     for first in range(0, total, block_size):
-        left = relation.block(first, block_size)
+        with timing.measure("gather_s"):
+            left = relation.block(first, block_size)
+            speed_ok = (left["speed"] + left["end_speed"]) / 2.0 >= cfg.cross_track_min_avg_speed
+            straight = np.abs((left["end_heading"] - left["heading"] + 180.0) % 360.0 - 180.0) <= threshold
+            timing.values["speed_rejected_segments"] += int(np.count_nonzero(~speed_ok))
+            timing.values["straight_segments"] += int(np.count_nonzero(straight))
+            timing.values["eligible_segments"] += int(np.count_nonzero(straight & speed_ok))
         for second in range(first, total, block_size):
-            right = left if first == second else relation.block(second, block_size)
-            if first == second:
-                segments = left
-                pairs = _iter_cross_subtrack_pair_batches(
-                    np.arange(len(left["subtrack_index"]), dtype=np.int64),
-                    left["subtrack_index"], pair_size,
-                )
-            else:
-                segments = {name: np.concatenate((left[name], right[name])) for name in left}
-                base = len(left["subtrack_index"])
-                pairs = _iter_pair_batches(
-                    np.arange(base, dtype=np.int64),
-                    np.arange(base, len(segments["subtrack_index"]), dtype=np.int64),
-                    pair_size,
-                )
-            headings = np.asarray(segments["heading"], dtype=np.float64)
-            end_heading = np.asarray(segments["end_heading"], dtype=np.float64)
-            straight = np.abs((end_heading - headings + 180.0) % 360.0 - 180.0) <= threshold
-            starts = np.column_stack((segments["x_start"], segments["y_start"]))
-            ends = np.column_stack((segments["x_end"], segments["y_end"]))
-            if not (np.isfinite(starts[straight]).all() and np.isfinite(ends[straight]).all()
-                    and np.isfinite(headings[straight]).all()):
-                raise ValueError("segment coordinates and headings must be finite")
-            for a, b in pairs:
-                keep = straight[a] & straight[b]
-                keep &= segments["subtrack_index"][a] != segments["subtrack_index"][b]
-                if not np.any(keep):
-                    continue
-                a, b = a[keep], b[keep]
-                xs, ys, hit = intersect_cross_track_patch(starts, ends, headings, a, b, cfg)
+            with timing.measure("gather_s"):
+                right = left if first == second else relation.block(second, block_size)
+            with timing.measure("gather_s"):
+                if first == second:
+                    segments = left
+                    pairs = _iter_cross_subtrack_pair_batches(
+                        np.arange(len(left["subtrack_index"]), dtype=np.int64),
+                        left["subtrack_index"], pair_size,
+                    )
+                else:
+                    segments = {name: np.concatenate((left[name], right[name])) for name in left}
+                    base = len(left["subtrack_index"])
+                    pairs = _iter_pair_batches(
+                        np.arange(base, dtype=np.int64),
+                        np.arange(base, len(segments["subtrack_index"]), dtype=np.int64),
+                        pair_size,
+                    )
+                headings = np.asarray(segments["heading"], dtype=np.float64)
+                end_heading = np.asarray(segments["end_heading"], dtype=np.float64)
+                straight = np.abs((end_heading - headings + 180.0) % 360.0 - 180.0) <= threshold
+                straight &= (segments["speed"] + segments["end_speed"]) / 2.0 >= cfg.cross_track_min_avg_speed
+                starts = np.column_stack((segments["x_start"], segments["y_start"]))
+                ends = np.column_stack((segments["x_end"], segments["y_end"]))
+                if not (np.isfinite(starts[straight]).all() and np.isfinite(ends[straight]).all()
+                        and np.isfinite(headings[straight]).all()):
+                    raise ValueError("segment coordinates and headings must be finite")
+            for a, b in timing.iterate(pairs, "candidate_s"):
+                with timing.measure("candidate_s"):
+                    keep = straight[a] & straight[b]
+                    keep &= segments["subtrack_index"][a] != segments["subtrack_index"][b]
+                    if not np.any(keep):
+                        continue
+                    a, b = a[keep], b[keep]
+                xs, ys, hit = intersect_cross_track_patch(starts, ends, headings, a, b, cfg, timing=timing)
                 if not len(hit):
                     continue
                 batch = {"x": xs, "y": ys, "segment_index_a": a[hit], "segment_index_b": b[hit]}
-                yield from iter_grid_candidates(segments, (batch,), transformer)
+                yield from iter_grid_candidates(segments, (batch,), transformer, timing=timing)
 
 def run_grid_cross_track_task(
     refine_id: Any,
@@ -232,6 +262,7 @@ def run_grid_cross_track_task(
     result_count = done_count = segment_count = 0
     attempts: dict[tuple[int, int], int] = {}
     active: dict[Any, tuple[tuple[int, int], int, float]] = {}
+    active_timings = {}
     active_segments: dict[tuple[int, int], int] = {}
     grid_order = {(col, row): ordinal for ordinal, (col, row) in enumerate(pending)}
     events: Queue[tuple[str, tuple[int, int], int, Any]] = Queue(maxsize=2)
@@ -248,7 +279,7 @@ def run_grid_cross_track_task(
             segments_text = f"{count:,}" if count is not None else "读取中"
             lines.append(
                 f"  ({cell[0]}, {cell[1]}) 线段数：{segments_text}，"
-                f"运行时间：{now - started_at:.1f}s"
+                f"运行时间：{now - started_at:.1f}s\n    {active_timings[cell].summary()}"
             )
         return "\n".join(lines)
 
@@ -262,7 +293,7 @@ def run_grid_cross_track_task(
                 if not isinstance(error, Full):
                     raise
 
-    def worker(cell, attempt):
+    def worker(cell, attempt, timing):
         conn = getattr(thread_state, "connection", None)
         if conn is None or conn.closed:
             conn = connect_worker()
@@ -275,23 +306,26 @@ def run_grid_cross_track_task(
                 fetch_points_in_grid(conn, cell, grids, refine_id, spatial_context),
                 max_segments=max_segments, max_bytes=max_segment_bytes,
                 runtime=runtime, data_root=data_root, owner=f"grid-segments-{grid_order[cell]}",
-                bounds=grids[cell[0]][cell[1]],
+                bounds=grids[cell[0]][cell[1]], timing=timing,
             ) as segments:
                 if isinstance(segments, GridSegmentRelation):
-                    batches = iter_spilled_grid_candidates(segments, cfg, transformer)
+                    timing.mode = "spill"
+                    batches = iter_spilled_grid_candidates(segments, cfg, transformer, timing=timing)
                     count = segments.count
                 else:
+                    timing.mode = "memory"
                     crossings = iter_grid_crossings(
                         segments, cfg, max_grid_memberships=max_grid_memberships,
-                        max_overflow_pair_space=max_overflow_pair_space,
+                        max_overflow_pair_space=max_overflow_pair_space, timing=timing,
                     )
-                    batches = iter_grid_candidates(segments, crossings, transformer)
+                    batches = iter_grid_candidates(segments, crossings, transformer, timing=timing)
                     count = len(segments["subtrack_index"])
                 enqueue("segments", cell, attempt, count)
                 for batch in batches:
                     if canceled.is_set():
                         return count
-                    enqueue("batch", cell, attempt, (local_index, batch))
+                    with timing.measure("queue_s"):
+                        enqueue("batch", cell, attempt, (local_index, batch))
                     local_index += len(batch)
         return count
 
@@ -304,10 +338,11 @@ def run_grid_cross_track_task(
             active_segments[cell] = payload
         elif kind == "batch":
             local_index, batch = payload
-            if staged:
-                candidate_store.append_staged(grid_order[cell], local_index, batch)
-            else:
-                legacy_batches.append((cell, attempt, batch))
+            with active_timings[cell].measure("write_s"):
+                if staged:
+                    candidate_store.append_staged(grid_order[cell], local_index, batch)
+                else:
+                    legacy_batches.append((cell, attempt, batch))
             result_count += len(batch)
             attempt_counts[(cell, attempt)] = attempt_counts.get((cell, attempt), 0) + len(batch)
 
@@ -318,7 +353,8 @@ def run_grid_cross_track_task(
                     cell = pending.popleft()
                     attempt = attempts.get(cell, 0)
                     grids[cell[0]][cell[1]].status = "running"
-                    active[pool.submit(worker, cell, attempt)] = (cell, attempt, time.monotonic())
+                    active_timings[cell] = CrossTrackTiming()
+                    active[pool.submit(worker, cell, attempt, active_timings[cell])] = (cell, attempt, time.monotonic())
                 try:
                     process_event(events.get(timeout=0.1))
                     while True:
@@ -357,8 +393,13 @@ def run_grid_cross_track_task(
                         attempts[cell] = attempt + 1
                         pending.appendleft(cell)
                         continue
-                    if staged:
-                        candidate_store.finish_grid(grid_order[cell])
+                    with active_timings[cell].measure("write_s"):
+                        if staged:
+                            candidate_store.finish_grid(grid_order[cell])
+                    log_info(f"cross-track grid={cell} segments={count:,} "
+                             f"elapsed_s={time.monotonic()-_started_at:.3f} "
+                             f"{active_timings[cell].summary()}")
+                    del active_timings[cell]
                     grids[cell[0]][cell[1]].status = "done"
                     segment_count += count
                     done_count += 1
@@ -374,8 +415,10 @@ def run_grid_cross_track_task(
         for conn in opened_connections:
             conn.close()
 
+    finalize_started = time.monotonic()
     if staged:
         candidate_store.finalize_staged()
+        log_info(f"cross-track finalize output_s={time.monotonic()-finalize_started:.3f}")
         return candidate_store
     combined = concatenate_cross_batches([
         batch for cell, attempt, batch in legacy_batches
@@ -389,5 +432,7 @@ def run_grid_cross_track_task(
         combined = replace(combined.take(order), calculation_index=np.arange(len(combined), dtype=np.int64))
     if candidate_store is not None:
         candidate_store.extend([combined]); candidate_store.seal()
+        log_info(f"cross-track finalize output_s={time.monotonic()-finalize_started:.3f}")
         return candidate_store
+    log_info(f"cross-track finalize output_s={time.monotonic()-finalize_started:.3f}")
     return combined

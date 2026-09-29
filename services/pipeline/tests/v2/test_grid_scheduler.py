@@ -67,7 +67,7 @@ def test_grid_scheduler_retries_then_deduplicates_and_writes_on_main_thread(monk
     monkeypatch.setattr(detect_grid_crossings, "open_grid_segments", segments)
     monkeypatch.setattr(detect_grid_crossings, "iter_grid_crossings", lambda segments, *_a, **_kw:
                         [segments["grid"]])
-    monkeypatch.setattr(detect_grid_crossings, "iter_grid_candidates", lambda *_args:
+    monkeypatch.setattr(detect_grid_crossings, "iter_grid_candidates", lambda *_args, **_kwargs:
                         [_candidate()])
     updates = []
     status = SimpleNamespace(update=lambda **kwargs: updates.append(kwargs))
@@ -93,6 +93,11 @@ def test_grid_scheduler_retries_then_deduplicates_and_writes_on_main_thread(monk
     assert attempts == {(0, 0): 1, (1, 0): 2}
     assert all(cell.status == "done" for column in grids for cell in column)
     assert opened and all(conn.closed for conn in opened)
+    completed = next(message for message in logs if message.startswith("cross-track grid="))
+    for key in ("read_s=", "sort_s=", "index_s=", "candidate_s=", "gather_s=",
+                "kernel_s=", "output_s=", "pair_count=", "pre_intersection_s="):
+        assert key in completed
+    assert any(message.startswith("cross-track finalize output_s=") for message in logs)
     assert "0/2" in updates[0]["detail"]
     assert "2/2" in updates[-1]["detail"]
     assert any("0/2" in message and "耗时 3.1s" in message for message in logs)
@@ -117,7 +122,7 @@ def test_grid_scheduler_shows_running_grid_segments_in_shared_status(monkeypatch
     monkeypatch.setattr(detect_grid_crossings, "open_grid_segments", segments)
     monkeypatch.setattr(detect_grid_crossings, "iter_grid_crossings", lambda *_args, **_kwargs: ())
 
-    def candidates(*_args):
+    def candidates(*_args, **_kwargs):
         assert release_worker.wait(timeout=5)
         yield from ()
 
@@ -177,7 +182,7 @@ def test_grid_scheduler_streams_worker_candidate_results_past_old_budget(monkeyp
     monkeypatch.setattr(detect_grid_crossings, "open_grid_segments", segments)
     monkeypatch.setattr(detect_grid_crossings, "iter_grid_crossings", lambda *_args, **_kw:
                         [object()])
-    monkeypatch.setattr(detect_grid_crossings, "iter_grid_candidates", lambda *_args:
+    monkeypatch.setattr(detect_grid_crossings, "iter_grid_candidates", lambda *_args, **_kwargs:
                         [_candidate()])
     result = detect_grid_crossings.run_grid_cross_track_task(
             uuid4(), (0.0, 0.0, 1.0, 1.0), None, None, None,
@@ -204,7 +209,7 @@ def test_grid_scheduler_discards_partial_attempt_before_retry(monkeypatch, tmp_p
         yield {"subtrack_index": np.array([1, 2]), "segment_identity": np.array([[1, 2]])}
     monkeypatch.setattr(detect_grid_crossings, "open_grid_segments", segments)
     monkeypatch.setattr(detect_grid_crossings, "iter_grid_crossings", lambda *_a, **_kw: [object()])
-    def candidates(_segments, _crossings, _transformer):
+    def candidates(_segments, _crossings, _transformer, **_kwargs):
         yield _candidate()
         if attempts[(0, 0)] == 1:
             raise RuntimeError("failed after first candidate batch")

@@ -50,6 +50,7 @@ g_star_radius_m = 180.0 # G* 搜索半径；米，>0；算法语义。
 g_star_min_z = 0.5 # G* 最低 Z 分数；有限数；算法语义。
 candidate_dbscan_eps_m = 100.0 # 所有候选点统一 DBSCAN 半径；米，>0；算法语义。
 candidate_dbscan_min_samples = 3 # 所有候选点统一 DBSCAN 最少样本；>=1；算法语义。
+cross_track_min_avg_speed = 20.0 # 线段两端平均速度下限；与源 speed 字段同单位，>=0；算法语义。
 cross_track_straightness_deg = 15.0 # 直线容差；度，0..180；算法语义。
 cross_track_min_angle_deg = 80.0 # 交叉最小夹角；度，0..180；算法语义。
 cross_track_max_angle_deg = 100.0 # 交叉最大夹角；度，0..180；算法语义。

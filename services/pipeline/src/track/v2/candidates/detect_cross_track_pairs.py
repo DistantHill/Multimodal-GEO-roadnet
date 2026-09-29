@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from contextlib import nullcontext
 from typing import Any
 import numpy as np
 from .._geometry import _paired_segment_intersections
@@ -48,7 +49,9 @@ def _prepare_segments(tracks: dict[int, RefinementSubtrack], transformer: Coordi
         if not np.isfinite(track.xy).all() or not np.isfinite(track.lonlat).all():
             raise ValueError("subtrack geometry contains non-finite coordinates")
         delta = (track.heading[1:] - track.heading[:-1] + 180) % 360 - 180
-        ids = np.flatnonzero(np.abs(delta) <= cfg.cross_track_straightness_deg)
+        mean_speed = (track.speed[:-1] + track.speed[1:]) / 2.0
+        ids = np.flatnonzero((np.abs(delta) <= cfg.cross_track_straightness_deg)
+                             & (mean_speed >= cfg.cross_track_min_avg_speed))
         pieces["starts"].append(track.xy[ids]); pieces["ends"].append(track.xy[ids + 1])
         for name in ("heading", "timestamp", "speed", "source_row_key", "source_row_key_valid", "refine_point_id", "refine_point_id_valid", "generated_reason"):
             pieces[name].append(getattr(track, name)[ids])
@@ -67,8 +70,16 @@ def _prepare_segments(tracks: dict[int, RefinementSubtrack], transformer: Coordi
     return columns, len(seen)
 
 
-def intersect_cross_track_patch(starts, ends, headings, segment_ids_a, segment_ids_b, cfg):
-    return _paired_segment_intersections(starts[segment_ids_a], ends[segment_ids_a], headings[segment_ids_a], starts[segment_ids_b], ends[segment_ids_b], headings[segment_ids_b], cfg.cross_track_min_angle_deg, cfg.cross_track_max_angle_deg)
+def intersect_cross_track_patch(starts, ends, headings, segment_ids_a, segment_ids_b, cfg, *, timing=None):
+    with timing.measure("gather_s") if timing else nullcontext():
+        arrays = (starts[segment_ids_a], ends[segment_ids_a], headings[segment_ids_a],
+                  starts[segment_ids_b], ends[segment_ids_b], headings[segment_ids_b])
+    with timing.measure("kernel_s") if timing else nullcontext():
+        result = _paired_segment_intersections(*arrays, cfg.cross_track_min_angle_deg, cfg.cross_track_max_angle_deg)
+    if timing:
+        timing.values["pair_count"] += len(segment_ids_a)
+        timing.values["hit_count"] += len(result[2])
+    return result
 
 
 def build_cross_track_patch_candidates(segments, segment_ids_a, segment_ids_b, xs, ys, hit_indices, transformer, *, first_index=0):

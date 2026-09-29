@@ -163,3 +163,16 @@ def test_loaded_config_is_immutable() -> None:
     config = pipeline_config()
     with pytest.raises(Exception):
         config.runtime = replace(config.runtime, duckdb_threads=1)
+
+
+@pytest.mark.parametrize("value", ["-1.0", "nan", "inf"])
+def test_cross_track_average_speed_threshold_must_be_finite_non_negative(tmp_path, value):
+    from pathlib import Path
+    from track.v2.config import load_pipeline_config
+    from track.v2.errors import ConfigError
+    source = Path(__file__).resolve().parents[2] / "config" / "pipeline.toml"
+    config = tmp_path / "pipeline.toml"
+    config.write_text(source.read_text().replace("cross_track_min_avg_speed = 20.0",
+                                                f"cross_track_min_avg_speed = {value}"))
+    with pytest.raises(ConfigError, match="detect.cross_track_min_avg_speed"):
+        load_pipeline_config(config, postgres_password="test")

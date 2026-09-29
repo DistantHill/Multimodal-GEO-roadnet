@@ -383,7 +383,7 @@ class RefineDatasetReader:
           FROM straight
           ORDER BY track_rank, segment_index
         """)
-        result = connection.execute(query, [threshold])
+        result = connection.execute(query, [threshold, cfg.cross_track_min_avg_speed])
         while rows := result.fetchmany(batch_size):
             yield self._decode_segment_columns(rows, source_table)
 
@@ -461,7 +461,8 @@ class RefineDatasetReader:
                    a.segment_index, b.segment_index, a.track_rank, b.track_rank
         """
         try:
-            connection.execute(f"CREATE TEMP TABLE {table} AS {materialize}", [threshold])
+            connection.execute(f"CREATE TEMP TABLE {table} AS {materialize}",
+                               [threshold, cfg.cross_track_min_avg_speed])
             connection.execute(f"ANALYZE {table}")
             result = connection.execute(query, [min_angle, max_angle])
             while rows := result.fetchmany(batch_size):
@@ -535,7 +536,8 @@ class RefineDatasetReader:
                 AS track_rank,
               row_number() OVER track - 1 AS segment_index,
               lead(x) OVER track AS end_x, lead(y) OVER track AS end_y,
-              lead(heading) OVER track AS end_heading
+              lead(heading) OVER track AS end_heading,
+              lead(speed) OVER track AS end_speed
             FROM refine_points
             WINDOW track AS (PARTITION BY vehicle_id, subtrack_index
                              ORDER BY refined_sequence_in_subtrack, point_kind, point_id)
@@ -553,6 +555,7 @@ class RefineDatasetReader:
                    least(x, end_x) AS min_x, greatest(x, end_x) AS max_x,
                    least(y, end_y) AS min_y, greatest(y, end_y) AS max_y
             FROM deltas WHERE abs(heading_delta) <= ?
+              AND (speed + end_speed) / 2.0 >= ?
           )
         """ + select_sql
 
