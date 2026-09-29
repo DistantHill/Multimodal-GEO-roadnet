@@ -282,8 +282,8 @@ class _VersionCursor:
         return [(table,) for table in self.tables]
 
 
-def test_unversioned_legacy_schema_is_refused_without_reset() -> None:
-    with pytest.raises(RuntimeError, match="no legacy in-place migration"):
+def test_unversioned_schema_is_refused_without_reset() -> None:
+    with pytest.raises(RuntimeError, match="no unversioned in-place migration"):
         _require_empty_or_current(_VersionCursor(None, ["refine_runs"]))
 
 
@@ -291,7 +291,13 @@ def test_existing_v9_schema_is_accepted() -> None:
     _require_empty_or_current(_VersionCursor(9, ["refine_runs"]))
 
 
-@pytest.mark.parametrize("version", [4, 5, 6, 7])
-def test_existing_v4_through_v7_schema_requires_artifact_migration(version: int) -> None:
+@pytest.mark.parametrize("version", [4, 5, 6, 7, 8])
+def test_existing_v4_through_v8_schema_requires_artifact_migration(version: int) -> None:
     with pytest.raises(RuntimeError, match="--migrate-artifacts"):
+        _require_empty_or_current(_VersionCursor(version, ["refine_runs"]))
+
+
+@pytest.mark.parametrize("version", [3, SCHEMA_VERSION + 1])
+def test_unsupported_schema_versions_are_not_accepted(version: int) -> None:
+    with pytest.raises(RuntimeError, match="requires v9"):
         _require_empty_or_current(_VersionCursor(version, ["refine_runs"]))
