@@ -57,22 +57,20 @@ class IntersectConfig(TrackModel):
     g_star_radius_m: float
     g_star_min_z: float
 
-    # ── DBSCAN (per method) ────────────────────────────────────────
-    dbscan_eps_m_turn: float
-    dbscan_min_samples_turn: int
+    # ── DBSCAN (all candidate points together) ────────────────────
+    candidate_dbscan_eps_m: float
+    candidate_dbscan_min_samples: int
 
     # ── Cross-track orthogonal detection (Method 3) ──────────────────
     cross_track_straightness_deg: float
     cross_track_min_angle_deg: float
     cross_track_max_angle_deg: float
-    cross_track_dbscan_eps_m: float
-    cross_track_dbscan_min_samples: int
     # Structural memory bounds owned by candidates.build_patches.
     cross_track_grid_cell_m: float
     cross_track_pair_batch_size: int
     cross_track_max_grid_cells_per_segment: int
 
-    # ── Cluster merge ──────────────────────────────────────────────
+    # ── Ablation centroid matching ────────────────────────────────
     merge_centroid_distance_m: float
 
     # ── Topology verification (shared) ─────────────────────────────
@@ -283,18 +281,77 @@ def _merge_clusters(clusters,merge_distance_m,transformer,**_kwargs):
     return kept
 
 
-def _build_candidate_clusters(hotspot_events,cross_track_candidates,cfg,transformer,*,disabled_sources=None,**kwargs):
-    disabled=disabled_sources or set(); clusters=[]
-    if "turn" not in disabled and len(hotspot_events): clusters.extend(_cluster_dbscan(hotspot_events,transformer,eps_m=cfg.dbscan_eps_m_turn,min_samples=cfg.dbscan_min_samples_turn,**kwargs))
-    if "orthogonal_cross_track" not in disabled and len(cross_track_candidates): clusters.extend(_cluster_orthogonal_cross_track_candidates(cross_track_candidates,transformer,eps_m=cfg.cross_track_dbscan_eps_m,min_samples=cfg.cross_track_dbscan_min_samples,**kwargs))
-    return _merge_clusters(clusters,cfg.merge_centroid_distance_m,transformer)
+def _cluster_from_points(point_sources,transformer,*,eps_m,min_samples,**kwargs):
+    """Cluster all enabled candidate sources in one DBSCAN pass."""
+    point_sources=tuple((kind,events) for kind,events in point_sources if len(events))
+    total=sum(len(events) for _,events in point_sources)
+    if not total:
+        return []
+    xy=np.empty((total,2),dtype=np.float64)
+    calculation_indices=np.empty(total,dtype=np.int64)
+    point_source_ids=np.empty(total,dtype=object)
+    point_kinds=np.empty(total,dtype=object)
+    secondary_sources=[]
+    offset=0
+    for kind,events in point_sources:
+        stop=offset+len(events)
+        source_xy,source_indices,from_source_ids=_coordinates(events)
+        xy[offset:stop]=source_xy
+        calculation_indices[offset:stop]=source_indices
+        point_source_ids[offset:stop]=from_source_ids
+        point_kinds[offset:stop]=kind
+        if hasattr(events,"iter_source_batches") or hasattr(events,"to_source_id"):
+            secondary_sources.append((events,calculation_indices[offset:stop],offset))
+        offset=stop
+    del source_xy,source_indices,from_source_ids
+    labels=np.asarray(_run_dbscan(xy[:,0],xy[:,1],eps_m=eps_m,min_samples=min_samples,**kwargs),dtype=np.int64)
+    secondary_ids=defaultdict(set)
+    for events,expected_indices,offset in secondary_sources:
+        batches=events.iter_source_batches() if hasattr(events,"iter_source_batches") else ((events.calculation_index,events.from_source_id,events.to_source_id),)
+        cursor=0
+        try:
+            for batch_indices,_,to_source_ids in batches:
+                stop=cursor+len(batch_indices)
+                if not np.array_equal(batch_indices,expected_indices[cursor:stop]):
+                    raise ValueError("candidate relation source order changed during scan")
+                for label,source_id in zip(labels[offset+cursor:offset+stop],to_source_ids):
+                    if label>=0:
+                        secondary_ids[int(label)].add(str(source_id))
+                cursor=stop
+        finally:
+            close=getattr(batches,"close",None)
+            if close is not None:
+                close()
+        if cursor!=len(expected_indices):
+            raise ValueError("candidate relation source count changed during scan")
+    clusters=[]
+    for cid in np.unique(labels[labels>=0]):
+        positions=np.flatnonzero(labels==cid)
+        center=xy[positions].mean(axis=0)
+        lon,lat=transformer.inverse(*center)
+        member_kinds=point_kinds[positions]
+        counts={str(kind):int(np.count_nonzero(member_kinds==kind)) for kind in np.unique(member_kinds)}
+        sources=set(str(value) for value in point_source_ids[positions])
+        sources.update(secondary_ids[int(cid)])
+        members=MemberBatch(member_kinds,calculation_indices[positions],np.arange(len(positions),dtype=np.int64),point_source_ids[positions],np.ones(len(positions),dtype=np.bool_))
+        algorithm_sources=tuple(sorted(counts))
+        clusters.append(HotspotCluster(cluster_calculate_index=int(cid),centroid_x=float(center[0]),centroid_y=float(center[1]),centroid_lon=lon,centroid_lat=lat,radius_m=float(np.linalg.norm(xy[positions]-center,axis=1).max()),cluster_ref=f"cluster_candidates_{cid}",members=members,source=algorithm_sources[0] if len(algorithm_sources)==1 else "merged",algorithm_sources=algorithm_sources,source_ids=tuple(sorted(sources)),source_counts=counts,source_ratios=_ratio_dict(counts)))
+    return clusters
 
 
-def _annotate_source_ablation(clusters,hotspot_events,cross_track_candidates,cfg,transformer,**kwargs):
-    sources=sorted({source for cluster in clusters for source in cluster.algorithm_sources})
+def _build_candidate_clusters(point_sources,cfg,transformer,*,disabled_sources=None,**kwargs):
+    disabled=disabled_sources or set()
+    return _cluster_from_points(((kind,events) for kind,events in point_sources if kind not in disabled),transformer,eps_m=cfg.candidate_dbscan_eps_m,min_samples=cfg.candidate_dbscan_min_samples,**kwargs)
+
+
+def _annotate_source_ablation(clusters,point_sources,cfg,transformer,**kwargs):
+    point_sources=tuple(point_sources)
+    sources=sorted({kind for kind,events in point_sources if len(events)} |
+                   {kind for cluster in clusters for kind in cluster.algorithm_sources})
     without={}
     for source in sources:
-        rebuilt=_build_candidate_clusters(hotspot_events,cross_track_candidates,cfg,transformer,disabled_sources={source},**kwargs)
+        # Each pass jointly reclusters every source except this one.
+        rebuilt=_build_candidate_clusters(point_sources,cfg,transformer,disabled_sources={source},**kwargs)
         without[source]=np.asarray([(item.centroid_x,item.centroid_y) for item in rebuilt],dtype=np.float64).reshape(-1,2)
         del rebuilt
     return [replace(cluster,critical_sources=tuple(source for source in cluster.algorithm_sources if not any(math.hypot(cluster.centroid_x-other[0],cluster.centroid_y-other[1])<=cfg.merge_centroid_distance_m for other in without[source]))) for cluster in clusters]
@@ -302,9 +359,10 @@ def _annotate_source_ablation(clusters,hotspot_events,cross_track_candidates,cfg
 
 def _cluster_pipeline(turn_events,cross_candidates,transformer,cfg,**kwargs):
     hotspot=_select_hotspot_events(turn_events,cfg,**kwargs) if cfg.use_turn_events and len(turn_events) else empty_turn_batch()
-    clusters=_build_candidate_clusters(hotspot,cross_candidates,cfg,transformer,**kwargs)
+    point_sources=(("turn",hotspot),("orthogonal_cross_track",cross_candidates))
+    clusters=_build_candidate_clusters(point_sources,cfg,transformer,**kwargs)
     clusters=[replace(cluster,cluster_calculate_index=i) for i,cluster in enumerate(clusters)]
-    return hotspot,_annotate_source_ablation(clusters,hotspot,cross_candidates,cfg,transformer,**kwargs)
+    return hotspot,_annotate_source_ablation(clusters,point_sources,cfg,transformer,**kwargs)
 
 
 def _ratio_dict(counts):

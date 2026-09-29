@@ -42,6 +42,8 @@ def test_checked_in_complete_config_loads() -> None:
     assert config.runtime.duckdb_grid_memory_limit == "4GB"
     assert config.detect.cross_track_task_grid_m == 5000.0
     assert config.detect.cross_track_task_threads == 4
+    assert config.detect.candidate_dbscan_eps_m == 100.0
+    assert config.detect.candidate_dbscan_min_samples == 3
     assert len(config.parser.fields.specs) == 9
 
 
@@ -58,12 +60,37 @@ def test_smoke_config_and_optional_event_limit(tmp_path: Path) -> None:
     assert loaded.runtime.duckdb_grid_memory_limit == "1GB"
 
 
+def test_debug_config_uses_joint_candidate_clustering() -> None:
+    debug = load_pipeline_config(CONFIG_PATH.with_name("pipeline-debug.toml"), postgres_password="secret")
+    assert debug.postgres.database == "roadnet_test"
+    assert debug.detect.candidate_dbscan_eps_m == 100.0
+    assert debug.detect.candidate_dbscan_min_samples == 3
+
+
 @pytest.mark.parametrize("value", ["0.0", "-1.0", "inf", "nan"])
 def test_detect_task_grid_size_requires_finite_positive_number(tmp_path: Path, value: str) -> None:
     path = _write(tmp_path, lambda text: text.replace(
         "cross_track_task_grid_m = 5000.0", f"cross_track_task_grid_m = {value}",
     ))
     with pytest.raises(ConfigError, match="detect.cross_track_task_grid_m"):
+        load_pipeline_config(path, postgres_password="secret")
+
+
+@pytest.mark.parametrize("value", ["0.0", "-1.0", "inf", "nan"])
+def test_joint_candidate_dbscan_radius_requires_finite_positive_number(tmp_path: Path, value: str) -> None:
+    path = _write(tmp_path, lambda text: text.replace(
+        "candidate_dbscan_eps_m = 100.0", f"candidate_dbscan_eps_m = {value}",
+    ))
+    with pytest.raises(ConfigError, match="detect.candidate_dbscan_eps_m"):
+        load_pipeline_config(path, postgres_password="secret")
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_joint_candidate_dbscan_min_samples_requires_positive_integer(tmp_path: Path, value: str) -> None:
+    path = _write(tmp_path, lambda text: text.replace(
+        "candidate_dbscan_min_samples = 3", f"candidate_dbscan_min_samples = {value}",
+    ))
+    with pytest.raises(ConfigError, match="detect.candidate_dbscan_min_samples"):
         load_pipeline_config(path, postgres_password="secret")
 
 

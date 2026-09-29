@@ -205,8 +205,8 @@ def _validate(values: dict[str, dict[str, Any]], errors: list[str]) -> None:
             errors.append(f"{path}: must be >= {minimum}")
     strictly_positive = {
         "refine.max_extension_m", "refine.max_gap_s", "detect.min_leg_m",
-        "detect.g_star_radius_m", "detect.dbscan_eps_m_turn",
-        "detect.cross_track_dbscan_eps_m", "detect.cross_track_grid_cell_m",
+        "detect.g_star_radius_m", "detect.candidate_dbscan_eps_m",
+        "detect.cross_track_grid_cell_m",
         "detect.cross_track_task_grid_m",
         "detect.min_intersection_radius_m", "fitting.point_spacing_m",
         "fitting.fit_sample_spacing_m", "runtime.progress_time_threshold_s",
@@ -218,7 +218,7 @@ def _validate(values: dict[str, dict[str, Any]], errors: list[str]) -> None:
     }
     positive_integers = {
         "refine.excluded_sample_max", "detect.turn_window",
-        "detect.dbscan_min_samples_turn", "detect.cross_track_dbscan_min_samples",
+        "detect.candidate_dbscan_min_samples",
         "detect.cross_track_pair_batch_size", "detect.cross_track_max_grid_cells_per_segment",
         "detect.cross_track_task_threads",
         "detect.min_branches", "detect.min_observations", "detect.min_directed_transitions",

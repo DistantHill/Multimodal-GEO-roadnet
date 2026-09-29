@@ -57,7 +57,7 @@ def test_turn_candidates_disabled_still_consume_patches_and_report_tracks():
 
 def test_public_eager_entry_forwards_live_and_shared_perf_tracker():
     live=Mock()
-    config=intersect_run_config(use_turn_events=False,live_status=live,cross_track_dbscan_min_samples=1)
+    config=intersect_run_config(use_turn_events=False,live_status=live,candidate_dbscan_min_samples=1)
     with patch("track.v2.intersections.detect_intersections.extract_turn_candidates",wraps=collect.extract_turn_candidates) as turns,patch("track.v2.intersections.detect_intersections.extract_cross_track_candidates",wraps=collect.extract_cross_track_candidates) as crosses:
         result=_detect_intersections_handle(_tracks(),config,CONTEXT)
     assert len(result.cross_track_candidates)==1

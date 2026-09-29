@@ -68,8 +68,8 @@ def eager_membership_rows(clusters,ids):
 @pytest.mark.parametrize('merge_distance',[0.,30.,100.])
 def test_complete_pipeline_matches_eager_order_refs_ablation_and_writer_membership(tmp_path,merge_distance):
     values=candidates(); turns=turns_for(values)
-    cfg=intersect_config(g_star_min_z=-100.,g_star_radius_m=15.,dbscan_eps_m_turn=2.,dbscan_min_samples_turn=2,
-        cross_track_dbscan_eps_m=2.,cross_track_dbscan_min_samples=2,merge_centroid_distance_m=merge_distance)
+    cfg=intersect_config(g_star_min_z=-100.,g_star_radius_m=15.,candidate_dbscan_eps_m=2.,candidate_dbscan_min_samples=2,
+        merge_centroid_distance_m=merge_distance)
     expected_hotspots,expected=detect._cluster_pipeline(turns,values,TRANSFORMER,cfg)
     with stored(tmp_path,values) as spool:
         actual_hotspots,actual=detect._cluster_pipeline(turns,spool,TRANSFORMER,cfg)
@@ -101,16 +101,17 @@ def test_cross_dbscan_uses_same_kernel_and_compact_float_arrays(tmp_path,count):
 
 
 def test_lazy_members_merge_and_provenance_do_not_retain_decoded_payloads(tmp_path):
-    values=candidates(129); cfg=intersect_config(cross_track_dbscan_eps_m=2.,cross_track_dbscan_min_samples=2,
-        dbscan_eps_m_turn=2.,dbscan_min_samples_turn=2,merge_centroid_distance_m=100.)
+    values=candidates(129); cfg=intersect_config(candidate_dbscan_eps_m=2.,candidate_dbscan_min_samples=2,
+        merge_centroid_distance_m=100.)
     with stored(tmp_path,values) as spool:
         reference=weakref.ref(values.xy); del values; gc.collect(); assert reference() is None
         # Coordinate-only clustering must not read business payload batches.
         with patch.object(spool,'iter_batches',side_effect=AssertionError('business payload decoded')):
-            clusters=detect._build_candidate_clusters(empty_turn_batch(),spool,cfg,TRANSFORMER)
+            clusters=detect._build_candidate_clusters((("orthogonal_cross_track",spool),),cfg,TRANSFORMER)
             turns=turn_batch(4,xy=np.tile([clusters[0].centroid_x,clusters[0].centroid_y],(4,1)))
-            combined=detect._build_candidate_clusters(turns,spool,cfg,TRANSFORMER)
-            annotated=detect._annotate_source_ablation(combined,turns,spool,cfg,TRANSFORMER)
+            sources=(("turn",turns),("orthogonal_cross_track",spool))
+            combined=detect._build_candidate_clusters(sources,cfg,TRANSFORMER)
+            annotated=detect._annotate_source_ablation(combined,sources,cfg,TRANSFORMER)
             assert serialized(annotated)
         assert all(isinstance(cluster.members,MemberBatch) for cluster in clusters)
 
@@ -134,22 +135,22 @@ def test_manual_reference_source_ids_and_duplicate_order_survive_lazy_merge(tmp_
 
 @pytest.mark.parametrize('failure',[RuntimeError('ablation failed'),KeyboardInterrupt()])
 def test_ablation_failure_closes_only_its_pass(tmp_path,failure):
-    values=candidates();cfg=intersect_config(cross_track_dbscan_eps_m=2.,cross_track_dbscan_min_samples=2)
+    values=candidates();cfg=intersect_config(candidate_dbscan_eps_m=2.,candidate_dbscan_min_samples=2)
     with stored(tmp_path,values) as spool:
-        main=detect._build_candidate_clusters(empty_turn_batch(),spool,cfg,TRANSFORMER);before=serialized(main)
+        main=detect._build_candidate_clusters((("orthogonal_cross_track",spool),),cfg,TRANSFORMER);before=serialized(main)
         mixed=[replace(main[0],algorithm_sources=('turn','orthogonal_cross_track'))]
         real=detect._build_candidate_clusters
         def fail(*args,**kwargs):
             kwargs['disabled_sources']={'turn'};real(*args,**kwargs);raise failure
         with patch.object(detect,'_build_candidate_clusters',side_effect=fail):
-            with pytest.raises(type(failure)):detect._annotate_source_ablation(mixed,empty_turn_batch(),spool,cfg,TRANSFORMER)
+            with pytest.raises(type(failure)):detect._annotate_source_ablation(mixed,(("turn",empty_turn_batch()),("orthogonal_cross_track",spool)),cfg,TRANSFORMER)
         assert serialized(main)==before
         assert_batch_equal(concatenate(spool.iter_batches()),values)
         assert not spool._connection.execute("SELECT table_name FROM duckdb_tables() WHERE table_name LIKE '%member%'").fetchall()
 
 
 def test_sorted_relation_to_result_writes_same_rows(tmp_path):
-    cfg=intersect_config(cross_track_pair_batch_size=3,use_turn_events=False,cross_track_dbscan_min_samples=1)
+    cfg=intersect_config(cross_track_pair_batch_size=3,use_turn_events=False,candidate_dbscan_min_samples=1)
     expected=candidates(8)
     with stored(tmp_path,expected) as spool:
         _,eager_clusters=detect._cluster_pipeline(empty_turn_batch(),expected,TRANSFORMER,cfg)
@@ -188,7 +189,7 @@ def test_sorted_relation_to_result_writes_same_rows(tmp_path):
 @pytest.mark.parametrize('phase',['reader','clustering','topology'])
 @pytest.mark.parametrize('failure',[RuntimeError('stage failed'),KeyboardInterrupt()])
 def test_db_owner_closes_all_spools_on_failure(tmp_path,monkeypatch,phase,failure):
-    cfg=intersect_run_config(use_turn_events=False,cross_track_dbscan_min_samples=1,refine_id='refine-1')
+    cfg=intersect_run_config(use_turn_events=False,candidate_dbscan_min_samples=1,refine_id='refine-1')
     reader=MagicMock();reader.extent.return_value=(0.,0.,1.,1.);reader.track_count.return_value=0
     with ExitStack() as stack:
         target={'reader':'run_grid_cross_track_task','clustering':'_cluster_pipeline','topology':'_build_topologies_from_tracks'}[phase]
@@ -200,18 +201,19 @@ def test_db_owner_closes_all_spools_on_failure(tmp_path,monkeypatch,phase,failur
     assert not list(tmp_path.glob('duckdb/cross-event-relations/*'))
 
 
-def test_summary_merge_and_reference_lengths_do_not_decode_members_again(tmp_path):
-    values=candidates();cfg=intersect_config(dbscan_eps_m_turn=2.,dbscan_min_samples_turn=2,cross_track_dbscan_eps_m=2.,cross_track_dbscan_min_samples=2,merge_centroid_distance_m=100.)
+def test_joint_cluster_summary_and_reference_lengths_do_not_decode_members_again(tmp_path):
+    values=candidates();cfg=intersect_config(candidate_dbscan_eps_m=2.,candidate_dbscan_min_samples=2,merge_centroid_distance_m=100.)
     turns=turns_for(values)
     with stored(tmp_path,values) as spool,patch.object(spool,'iter_batches',side_effect=AssertionError('business payload decoded')):
         crosses=detect._cluster_orthogonal_cross_track_candidates(spool,TRANSFORMER,eps_m=2.,min_samples=2)
-        turn_clusters=detect._cluster_dbscan(turns,TRANSFORMER,eps_m=2.,min_samples=2,source='turn')
         assert len(crosses)>1
-        initial=detect._merge_clusters([*turn_clusters,*crosses],100.,TRANSFORMER)
+        sources=(("turn",turns),("orthogonal_cross_track",spool))
+        initial=detect._build_candidate_clusters(sources,cfg,TRANSFORMER)
         assert sum(np.count_nonzero(cluster.members.kind=='orthogonal_cross_track') for cluster in initial)==16
         assert sum(np.count_nonzero(cluster.members.kind=='turn') for cluster in initial)==4
-        annotated=detect._annotate_source_ablation(initial,turns,spool,cfg,TRANSFORMER)
-        expected=detect._annotate_source_ablation(detect._build_candidate_clusters(turns,values,cfg,TRANSFORMER),turns,values,cfg,TRANSFORMER)
+        annotated=detect._annotate_source_ablation(initial,(("turn",turns),("orthogonal_cross_track",spool)),cfg,TRANSFORMER)
+        eager_sources=(("turn",turns),("orthogonal_cross_track",values))
+        expected=detect._annotate_source_ablation(detect._build_candidate_clusters(eager_sources,cfg,TRANSFORMER),eager_sources,cfg,TRANSFORMER)
         assert serialized(annotated)==serialized(expected)
 
 

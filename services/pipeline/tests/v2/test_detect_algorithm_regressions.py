@@ -14,7 +14,8 @@ from track.v2.intersections.performance_timing import PerfTracker
 from track.v2.intersections.detect_intersections import (
     _run_dbscan, _build_dbscan_grid, _compute_getis_ord_g_star,
     _select_hotspot_events, _cluster_dbscan, _merge_clusters,
-    _cluster_orthogonal_cross_track_candidates, _annotate_source_ablation,
+    _cluster_orthogonal_cross_track_candidates, _build_candidate_clusters,
+    _annotate_source_ablation,
 )
 
 
@@ -241,17 +242,38 @@ def test_distant_empty_cluster_summaries_do_not_merge():
 @pytest.mark.parametrize('cross',[False,True])
 def test_source_ablation_reclusters_and_marks_only_source_critical(cross):
     events=_events([[i*2,i*2] for i in range(4)],cross=cross)
-    cfg=intersect_config(dbscan_eps_m_turn=100.,dbscan_min_samples_turn=3,
-                         cross_track_dbscan_eps_m=100.,cross_track_dbscan_min_samples=2)
+    cfg=intersect_config(candidate_dbscan_eps_m=100.,candidate_dbscan_min_samples=2)
     turns=empty_turn_batch() if cross else events
     candidates=events if cross else empty_cross_batch()
-    clusterer=_cluster_orthogonal_cross_track_candidates if cross else _cluster_dbscan
-    clusters=clusterer(events,TRANSFORMER,eps_m=100.,min_samples=2)
-    annotated=_annotate_source_ablation(clusters,turns,candidates,cfg,TRANSFORMER)
+    point_sources=(("turn",turns),("orthogonal_cross_track",candidates))
+    clusters=_build_candidate_clusters(point_sources,cfg,TRANSFORMER)
+    annotated=_annotate_source_ablation(clusters,point_sources,cfg,TRANSFORMER)
     source='orthogonal_cross_track' if cross else 'turn'
     assert len(annotated)==1
     assert annotated[0].algorithm_sources==(source,)
     assert annotated[0].critical_sources==(source,)
+
+
+def test_three_candidate_sources_cluster_together_and_ablate_as_pairs():
+    sources=(("a",_events([[0.,0.]])),
+             ("b",_events([[0.5,0.]])),
+             ("c",_events([[1.,0.]])))
+    cfg=intersect_config(candidate_dbscan_eps_m=0.6,candidate_dbscan_min_samples=2,
+                         merge_centroid_distance_m=0.3)
+    with patch("track.v2.intersections.detect_intersections._run_dbscan",wraps=_run_dbscan) as dbscan:
+        clusters=_build_candidate_clusters(sources,cfg,TRANSFORMER)
+        assert dbscan.call_count==1
+        assert len(dbscan.call_args.args[0])==3
+    assert len(clusters)==1
+    assert clusters[0].source_counts=={"a":1,"b":1,"c":1}
+    assert clusters[0].members.kind.tolist()==["a","b","c"]
+    with patch("track.v2.intersections.detect_intersections._build_candidate_clusters",wraps=_build_candidate_clusters) as build:
+        ablated=_annotate_source_ablation(clusters,sources,cfg,TRANSFORMER)
+    assert [call.kwargs["disabled_sources"] for call in build.call_args_list]==[{"a"},{"b"},{"c"}]
+    assert ablated[0].critical_sources==("b",)
+    assert _build_candidate_clusters(sources,cfg,TRANSFORMER,disabled_sources={"a"})[0].source_counts=={"b":1,"c":1}
+    assert _build_candidate_clusters(sources,cfg,TRANSFORMER,disabled_sources={"b"})==[]
+    assert _build_candidate_clusters(sources,cfg,TRANSFORMER,disabled_sources={"c"})[0].source_counts=={"a":1,"b":1}
 
 
 def test_gstar_negative_grid_coordinates_and_duplicate_members():

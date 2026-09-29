@@ -24,7 +24,7 @@ def test_rebuilt_clusters_are_released_between_source_passes():
         references.extend((weakref.ref(rebuilt),weakref.ref(members.calculation_index),weakref.ref(members.kind)))
         return [rebuilt]
     with patch("track.v2.intersections.detect_intersections._build_candidate_clusters",side_effect=build):
-        output=_annotate_source_ablation([cluster],empty_turn_batch(),empty_cross_batch(),intersect_config(),TRANSFORMER)
+        output=_annotate_source_ablation([cluster],(("turn",empty_turn_batch()),("orthogonal_cross_track",empty_cross_batch())),intersect_config(),TRANSFORMER)
     assert sources==[{"orthogonal_cross_track"},{"turn"}]
     assert output[0].critical_sources==()
     gc.collect(); assert all(value() is None for value in references)
@@ -36,9 +36,10 @@ def test_compact_ablation_preserves_independent_expected_source_criticality(sepa
     from track.v2.intersections.detect_intersections import _build_candidate_clusters
     turns=_events([[i,i] for i in range(4)])
     cross=_events([[separation+i,i] for i in range(4)],cross=True)
-    config=intersect_config(dbscan_eps_m_turn=20.,dbscan_min_samples_turn=2,cross_track_dbscan_eps_m=20.,cross_track_dbscan_min_samples=2,merge_centroid_distance_m=25.)
-    clusters=_build_candidate_clusters(turns,cross,config,TRANSFORMER)
-    annotated=_annotate_source_ablation(clusters,turns,cross,config,TRANSFORMER)
+    config=intersect_config(candidate_dbscan_eps_m=20.,candidate_dbscan_min_samples=2,merge_centroid_distance_m=25.)
+    sources=(("turn",turns),("orthogonal_cross_track",cross))
+    clusters=_build_candidate_clusters(sources,config,TRANSFORMER)
+    annotated=_annotate_source_ablation(clusters,sources,config,TRANSFORMER)
     assert tuple(sorted(source for cluster in annotated for source in cluster.critical_sources))==critical
 
 
@@ -47,5 +48,5 @@ def test_rediscovery_includes_distance_boundary(distance,critical):
     cluster=HotspotCluster(0,0.,0.,0.,0.,1.,algorithm_sources=("turn",))
     other=replace(cluster,centroid_x=3.,centroid_y=4.)
     with patch("track.v2.intersections.detect_intersections._build_candidate_clusters",return_value=[other]):
-        result=_annotate_source_ablation([cluster],empty_turn_batch(),empty_cross_batch(),intersect_config(merge_centroid_distance_m=distance),TRANSFORMER)
+        result=_annotate_source_ablation([cluster],(("turn",empty_turn_batch()),),intersect_config(merge_centroid_distance_m=distance),TRANSFORMER)
     assert result[0].critical_sources==critical

@@ -207,7 +207,7 @@ def test_branch_angles_wrap_and_nearest():
 def test_public_detect_eager_preserves_report_and_identity():
     a=subtrack([[-20,0],[20,0]],subtrack_index=123,headings=[90,90])
     b=subtrack([[0,-20],[0,20]],subtrack_index=999,headings=[0,0])
-    cfg=intersect_run_config(use_turn_events=False,min_intersection_radius_m=10,topology_radius_padding_m=0,cross_track_dbscan_min_samples=1,min_observations=1,min_branches=2,min_directed_transitions=1)
+    cfg=intersect_run_config(use_turn_events=False,min_intersection_radius_m=10,topology_radius_padding_m=0,candidate_dbscan_min_samples=1,min_observations=1,min_branches=2,min_directed_transitions=1)
     result=_detect_intersections_handle({123:a,999:b},cfg,_TEST_SPATIAL_CONTEXT)
     assert result.report.track_count==2
     assert result.report.cross_track_candidate_count==1

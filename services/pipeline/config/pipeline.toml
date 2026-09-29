@@ -48,19 +48,17 @@ min_leg_m = 35.0 # 转向边最短长度；米，>0；算法语义。
 min_movement_speed_mps = 1.5 # 最低移动速度；米/秒，>=0；算法语义。
 g_star_radius_m = 180.0 # G* 搜索半径；米，>0；算法语义。
 g_star_min_z = 0.5 # G* 最低 Z 分数；有限数；算法语义。
-dbscan_eps_m_turn = 140.0 # 转向 DBSCAN 半径；米，>0；算法语义。
-dbscan_min_samples_turn = 4 # 转向 DBSCAN 最少样本；>=1；算法语义。
+candidate_dbscan_eps_m = 100.0 # 所有候选点统一 DBSCAN 半径；米，>0；算法语义。
+candidate_dbscan_min_samples = 3 # 所有候选点统一 DBSCAN 最少样本；>=1；算法语义。
 cross_track_straightness_deg = 15.0 # 直线容差；度，0..180；算法语义。
 cross_track_min_angle_deg = 80.0 # 交叉最小夹角；度，0..180；算法语义。
 cross_track_max_angle_deg = 100.0 # 交叉最大夹角；度，0..180；算法语义。
-cross_track_dbscan_eps_m = 100.0 # 交叉 DBSCAN 半径；米，>0；算法语义。
-cross_track_dbscan_min_samples = 3 # 交叉 DBSCAN 最少样本；>=1；算法语义。
 cross_track_grid_cell_m = 100.0 # 空间网格边长；米，>0；算法及执行语义。
 cross_track_pair_batch_size = 65536 # 线段对批大小；>=1；执行语义。
 cross_track_max_grid_cells_per_segment = 25 # 单线段最大网格数；>=1；执行语义。
 cross_track_task_grid_m = 5000.0 # 跨轨迹任务网格边长；米，>0；算法语义。
 cross_track_task_threads = 4 # 跨轨迹任务线程数；1..8；执行语义。
-merge_centroid_distance_m = 80.0 # 聚类合并距离；米，>=0；算法语义。
+merge_centroid_distance_m = 80.0 # 消融结果质心匹配距离；米，>=0；算法语义。
 min_intersection_radius_m = 90.0 # 最小路口半径；米，>0；算法语义。
 topology_radius_padding_m = 70.0 # 拓扑半径增量；米，>=0；算法语义。
 branch_threshold_deg = 35.0 # 分支角阈值；度，0..180；算法语义。
