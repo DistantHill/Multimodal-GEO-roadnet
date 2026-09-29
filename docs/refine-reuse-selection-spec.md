@@ -4,8 +4,8 @@
 
 状态：已确认
 创建日期：2026-09-26
-更新日期：2026-09-27
-访谈进度：Q1–Q13 已回答；完整设计已确认；指定 gpt-6-luna（high）实施和跑测，主 session 仅验收；2026-09-27 完成功能范围验收。
+更新日期：2026-09-29
+访谈进度：Q1–Q13 已回答；完整设计已确认；指定 gpt-6-luna（high）实施和跑测，主 session 仅验收；2026-09-27 完成功能范围验收。2026-09-29 用户补充允许不指定来源表直接自动复用全库最近完成的 Refine；历史 QA 原文保留，以下现行规则以本次补充为准。
 
 ## 1. 背景与问题
 
@@ -28,7 +28,7 @@
 
 目标：减少手工查询和复制 Refine UUID；同时支持交互选择、自动选择、强制新建及显式 UUID 复用。
 
-已确认范围（Q1、Q2）：Pipeline CLI，以及 Make 全量和冒烟入口；来源使用现有表名。两个 Make 入口支持 `SOURCE_TABLE` 或 `REFINE_ID`，以及与来源表配套的 `REFINE_RESUME_LAST`。
+已确认范围（Q1、Q2 及 2026-09-29 补充）：Pipeline CLI，以及 Make 全量和冒烟入口；来源使用现有表名。两个 Make 入口支持 `SOURCE_TABLE` 或 `REFINE_ID`；`REFINE_RESUME_LAST=true` 可与 `SOURCE_TABLE` 同传，也可单独传入。
 
 本次不新增来源 ID、不合并来源表别名、不增加来源扫描校验、不增加失败后自动选择旧批次或重算。Q13 已授权指定子代理实施和跑测；主 session 仅负责验收。
 
@@ -39,21 +39,22 @@
 | SOURCE_TABLE，未传 Bool | 展示候选并询问 `[Y/n]` | 提示后新建 Refine | Q3、Q4、Q6 |
 | SOURCE_TABLE，true | 直接复用最新候选 | 提示后新建 Refine | Q3–Q5 |
 | SOURCE_TABLE，false | 直接新建，不询问 | 直接新建 | Q3 |
+| 仅 REFINE_RESUME_LAST=true | 从当前数据库全部来源中复用最近完成的 Refine，并使用该记录保存的来源表 | 报错退出；没有来源表可用于新建 | 2026-09-29 补充 |
 | 仅 REFINE_ID | 直接复用指定 UUID，沿用已有校验 | 指定 UUID 不存在或未完成时报错，不新建 | Q8 |
 
-交互规则（Q6、Q7）：只展示最新一条；回车、y/yes（忽略大小写和首尾空格）复用，n/no 新建，其他输入重复提示。存在候选但无交互终端，或者提示遇到 EOF，退出并要求显式 true/false；Ctrl+C 取消。无候选按 Q4 新建，无须终端回答。
+交互规则（Q6、Q7）：只展示最新一条；回车、y/yes（忽略大小写和首尾空格）复用，n/no 新建，其他输入重复提示。存在候选但无交互终端，或者提示遇到 EOF，退出并要求显式 true/false；Ctrl+C 取消。已指定来源表而无候选时按 Q4 新建，无须终端回答；单独传 true 而全库无候选时按后续更正报错。
 
-来源匹配与候选（Q5、Q10）：在当前连接数据库中，按保存的 `source_table` 文本精确匹配，仅查询 completed；按 `started_at DESC` 取第一条。不把 `day01` 与 `public.day01` 合并。实现细节：开始时间相同时用 UUID 固定排序，避免每次查询随机变动。
+来源匹配与候选（Q5、Q10 及 2026-09-29 补充）：传入来源表时，在当前连接数据库中按保存的 `source_table` 文本精确匹配，不把 `day01` 与 `public.day01` 合并。单独传 `REFINE_RESUME_LAST=true` 时不按来源过滤，在全部来源的 completed Refine 中选择最近一条。两种查询都按 `started_at DESC, id DESC` 排序。复用时从选中 Refine Run 的持久化记录读取其来源表和空间上下文；不猜测来源表，也不重新执行 Parser/Refine。
 
 ## 4. 方案与关键决策
 
 已确认的选择树：
 
-1. 验证来源输入二选一，以及 Bool 只能随来源表使用（Q8）。
+1. 拒绝同时传来源表和 UUID、UUID 加任何显式 Bool；没有来源表、UUID 或单独的 true 时也报错。单独的 false 不构成新建输入（Q8 及 2026-09-29 补充）。
 2. 显式 UUID：直接进入已有复用路径（Q8）。
 3. 来源表 + false：进入新建路径（Q3）。
-4. 来源表 + true 或未传：查找最新 completed（Q5、Q10）；查询错误直接暴露，不当作无候选（Q7、Q11 的失败处理原则）。
-5. 无候选：提示后新建（Q4）；有候选 + true：复用；有候选 + 未传：按 Q6、Q7 交互。
+4. 来源表 + true 或未传：按来源查找最新 completed；单独的 true：从全库查找最新 completed。查询错误直接暴露，不当作无候选（Q5、Q7、Q10、Q11 及 2026-09-29 补充）。
+5. 有来源表但无候选：提示后新建（Q4）；没有来源表且无候选：报错退出。有候选 + true：复用；有来源表、有候选且未传 Bool：按 Q6、Q7 交互。
 6. 复用失败：输出 UUID 与原因并退出，不自动尝试旧批次，不自动重算（Q11）。
 
 复用继承范围（Q9）：复用历史 Refine 数据及其持久化空间上下文，允许与当前 Parser/Refine/投影配置不同。当前 Parser/Refine 不重新执行；后续 Detect、Clip、Fitting、Network 仍使用当前启动配置，并创建新的 Detect/Fit Run。
@@ -70,31 +71,31 @@ Q13 已确认的具体输出：
 
 ## 5. 接口、数据与架构影响
 
-Q13 已确认接口：
+现行接口（Q13 及 2026-09-29 后续更正）：
 
-- CLI：`--source-table TABLE` 或 `--refine-id UUID`；可选 `--refine-resume-last true|false`，只配合来源表使用。
-- Make：`SOURCE_TABLE=...` 或 `REFINE_ID=...`；可选 `REFINE_RESUME_LAST=true|false`，只配合来源表使用。未传不注入 false；显式非法或空 Bool 报错。
+- CLI：`--source-table TABLE` 或 `--refine-id UUID`；`--refine-resume-last true|false` 可配合来源表使用，其中 true 也可单独传入，从全库自动选择最近完成的 Refine。
+- Make：`SOURCE_TABLE=...` 或 `REFINE_ID=...`；`REFINE_RESUME_LAST=true|false` 可配合来源表使用，其中 true 也可单独传入。未传不注入 false；显式非法或空 Bool 报错。
 - 两个 Make 入口保留各自配置；配置文件名分别为 `pipeline-roadnet-test.toml` 与 `pipeline.toml`。
 - 交互仅发生在 CLI/Make 启动流程；直接调用运行函数不依赖终端提示，保持现有显式来源或 UUID 的调用语义。
 - 数据访问层增加最新 completed 查询及时间元数据读取，使用数据库既有字段与索引；不要求数据库迁移。
 - Refine 结果持久化及下游阶段仍属于 Pipeline，Backend 不承载长任务。
 
-参数约束（Q8）：同时给来源表和 UUID、两者都未给、UUID 加任何显式 Bool（包括 false），均报错，禁止忽略冲突参数。
+参数约束（Q8 及 2026-09-29 补充）：同时给来源表和 UUID、没有来源表或 UUID 且未单独传 true、UUID 加任何显式 Bool（包括 false），均报错，禁止忽略冲突参数。仅 true 而无来源表时允许自动复用，但不允许在无候选时新建。
 
 ## 6. 约束与非功能要求
 
 沿用既有数据库、产物及投影校验。Q12 明确不增加全表扫描校验，也不新增基于历史引用来源行的指纹扫描。
 
-候选发现为单来源已完成批次的有序查询，不读取轨迹点数据；无新增量化性能指标。无运行数据目录变更，无数据库结构变更。
+候选发现为已完成批次的有序元数据查询：传入来源表时限制为该来源，单独传 true 时查询全库；均不读取轨迹点数据。无新增量化性能指标、运行数据目录变更或数据库结构变更。
 
 现有产物校验可能在 Detect Run 创建后失败；保留既有 failed 状态处理，不承诺运行记录零写入。
 
 ## 7. 验收标准
 
-1. CLI、Make 全量和冒烟均可用来源表、显式 UUID 启动；非法组合报错（Q1、Q2、Q8）。
+1. CLI、Make 全量和冒烟均可用来源表、显式 UUID 或单独的 true 启动；非法组合报错（Q1、Q2、Q8 及 2026-09-29 补充）。
 2. Bool 未传、true、false 分别触发交互、自动复用、强制新建；未传与 false 可区分，非法 Bool 不被当作 true（Q3；具体接口已由 Q13 确认）。
-3. 无 completed 候选时提示并新建；数据库查询失败时暴露错误而非新建（Q4、Q7）。
-4. 同来源多个批次时排除 running/failed，按开始时间降序选择；来源文本不一致不合并（Q5、Q10）。
+3. 有来源表但无 completed 候选时提示并新建；单独传 true 且全库无候选时失败退出；数据库查询失败时暴露错误而非新建（Q4、Q7 及 2026-09-29 补充）。
+4. 传入来源表时只在文本精确匹配的 completed 批次中选择；单独传 true 时在全库 completed 批次中选择。均按开始时间及 UUID 降序排序，排除 running/failed，并从所选记录继承来源表；来源文本不一致不合并（Q5、Q10 及 2026-09-29 补充）。
 5. 提示支持回车/y/yes、n/no、非法输入重试；no 新建；无终端/EOF/取消时退出，不替用户决定（Q6、Q7）。
 6. 显式 UUID 不查询最新、不询问，并沿用指定批次的完成状态等校验（Q8）。
 7. 当前 Refine 参数或投影不同仍允许复用；输出真实历史参数、空间上下文、复用结果范围与当前下游配置范围（Q9；具体输出已由 Q13 确认）。
@@ -122,14 +123,21 @@ Q13 授权：指定 gpt-6-luna（high）子代理负责实施和跑测，形成�
 - Q10：同一实际表的不同文本写法可能查不到彼此历史；保持现有规则。
 - Q11：completed 不等于产物仍可用；最新产物失败时退出，由用户明确选择后续动作。
 - Q12：不增加来源扫描，因此选择过程不保证当前来源数据与历史输入一致。
+- 2026-09-29 补充：单独传 true 时从全库最近完成记录读取来源表和投影；选中后的复用仍走既有 completed、产物及持久化来源校验，不依赖调用方猜测来源表。无候选时由于缺少新建输入而退出。
 
-无新增业务分支待决。Q13 已确认完整设计、具体 Bool 接口与继承信息展示，并授权指定子代理实施。子代理报告已保留；主 session 已完成本功能范围验收。仓库整体 Backend 单测失败单列，不宣称全部测试通过。
+无新增业务分支待决。Q13 已确认原设计、具体 Bool 接口与继承信息展示；2026-09-29 用户补充了单独传 true 的全库选择分支。此前子代理报告与 2026-09-27 验收只覆盖当时范围，不作为新增分支的性能验收。仓库整体 Backend 单测失败单列，不宣称全部测试通过。
 
 ## 10. 确认记录
 
-完整设计：已由 Q13 确认。实施：已由 Q13 授权 gpt-6-luna（high）子代理实施和跑测。验收：主 session 于 2026-09-27 完成本功能范围验收；用户补充百万行新建路径真实冒烟成功，已核对日志。仓库整体 make test 仍有一个 Backend 失败项。
+原设计：已由 Q13 确认；2026-09-29 后续更正见下文。原设计实施：已由 Q13 授权 gpt-6-luna（high）子代理实施和跑测。验收：主 session 于 2026-09-27 完成当时功能范围验收；用户补充百万行新建路径真实冒烟成功，已核对日志。仓库整体 make test 仍有一个 Backend 失败项。
 
 Q1–Q12 的局部决定及原文均已记录，不能替代完整设计确认。
+
+### 2026-09-29 22:28（Asia/Shanghai）后续更正
+
+用户要求修改 Spec：不指定来源表而单独传 `refine_resume_last=true` 时，自动识别当前数据库最近完成的 Refine 结果及其来源表，并明确此路径不影响正确性。此更正仅覆盖 Q8 中 Bool 必须随来源表使用的限制；来源表与 UUID 互斥、UUID 与 Bool 互斥及其他历史决定继续有效。原 Q8/Q13 问答保留原貌；现行选择树、接口、无候选处理和验收标准已同步至第 2–9 节。
+
+当前实现通过已完成 Refine 的持久化记录恢复来源表和空间上下文；后续运行传入所选 Refine UUID，不用调用方提供新的来源表。依据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/cli/refine_selection.py:33](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/cli/refine_selection.py:33) 、 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/cli/run_pipeline.py:170](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/cli/run_pipeline.py:170) 、 [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/stages/refine.py:39](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/stages/refine.py:39) 。
 
 访谈技能要求：“Do not act on it until the user confirms you have reached a shared understanding.” 因此完整设计确认前只维护文档。项目 hook 已授权文档维护；Q13 另行授权指定子代理实施和跑测。
 
