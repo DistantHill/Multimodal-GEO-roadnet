@@ -72,4 +72,6 @@ def network_config(**changes: Any):
 def runtime_config(**changes: Any):
     if "duckdb_memory_limit" in changes and "duckdb_event_memory_limit" not in changes:
         changes["duckdb_event_memory_limit"] = changes["duckdb_memory_limit"]
+    if "duckdb_memory_limit" in changes and "duckdb_grid_memory_limit" not in changes:
+        changes["duckdb_grid_memory_limit"] = changes["duckdb_memory_limit"]
     return replace(pipeline_config().runtime, **changes)

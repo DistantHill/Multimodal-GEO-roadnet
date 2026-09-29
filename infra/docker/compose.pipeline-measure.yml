@@ -1,0 +1,7 @@
+# Add after compose.dev.yml for an uncapped, measured Pipeline run.
+# Docker does not preserve memory.swap.max=0 without a hard memory limit;
+# measure_pipeline_run.py records the effective memory and swap settings.
+services:
+  pipeline:
+    mem_limit: 0
+    memswap_limit: 0

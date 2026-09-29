@@ -164,6 +164,7 @@ def _collect_section(name: str, cls: type[Any], raw: Any, base_dir: Path,
     missing = set(fields) - set(raw)
     if cls is RuntimeConfig:
         missing.discard("duckdb_event_memory_limit")
+        missing.discard("duckdb_grid_memory_limit")
     errors.extend(f"{name}.{key}: missing required key" for key in sorted(missing))
     hints = get_type_hints(cls)
     result = {}
@@ -175,6 +176,8 @@ def _collect_section(name: str, cls: type[Any], raw: Any, base_dir: Path,
             result[key] = _convert(raw[key], annotation, base_dir)
     if cls is RuntimeConfig and "duckdb_event_memory_limit" not in raw and "duckdb_memory_limit" in result:
         result["duckdb_event_memory_limit"] = result["duckdb_memory_limit"]
+    if cls is RuntimeConfig and "duckdb_grid_memory_limit" not in raw and "duckdb_memory_limit" in result:
+        result["duckdb_grid_memory_limit"] = result["duckdb_memory_limit"]
     return result
 
 

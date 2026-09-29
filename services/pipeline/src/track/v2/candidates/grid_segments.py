@@ -120,7 +120,7 @@ class GridSegmentRelation:
         self._connection = None
         try:
             self._connection = duckdb.connect(":memory:", config={
-                "memory_limit": runtime.duckdb_memory_limit,
+                "memory_limit": getattr(runtime, "duckdb_grid_memory_limit", runtime.duckdb_memory_limit),
                 "threads": min(runtime.duckdb_threads, 4),
                 "temp_directory": self._directory.name,
                 "max_temp_directory_size": runtime.duckdb_max_temp_directory_size,

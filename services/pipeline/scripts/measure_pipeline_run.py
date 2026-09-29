@@ -1,8 +1,19 @@
 """Measure one fresh container's Pipeline Run without resetting shared counters.
 
-Launch this in a new container with memory.max=4,000,000,000 and swap disabled.
-The subprocess inherits the container cgroup; the final sample is taken before
-container teardown. Source row counts and PostgreSQL counters are read-only.
+Launch in a fresh uncapped Pipeline container using the versioned
+infra/docker/compose.pipeline-measure.yml override. The Pipeline process logs
+ERROR above 6,000,000,000 B without stopping. Docker does not keep swap
+disabled when its memory cap is removed, so record the effective swap setting.
+The final cgroup sample is taken before teardown. Source and PostgreSQL
+snapshots are read-only.
+
+Example (from the repository root, with the existing local .env):
+  docker compose --env-file .env -f infra/docker/compose.dev.yml \
+    -f infra/docker/compose.pipeline-measure.yml run --rm \
+    -e PIPELINE_CONFIG_PATH=/app/config/pipeline.toml pipeline \
+    python scripts/measure_pipeline_run.py --source-table public.trajectory_points \
+    --record /data/logs/full-measurement.json --revision <fixed-revision> \
+    --pipeline-arg=--refine-resume-last --pipeline-arg=false
 """
 from __future__ import annotations
 
@@ -17,9 +28,16 @@ import tomllib
 
 import psycopg
 
+from track.v2.telemetry.memory_warning import MEMORY_WARNING_BYTES
+
 
 def read_cgroup(name: str) -> str:
     return (Path('/sys/fs/cgroup') / name).read_text().strip()
+
+
+def require_uncapped_memory(memory_max: str) -> None:
+    if memory_max != 'max':
+        raise SystemExit('measurement requires memory.max=max (no container hard memory limit)')
 
 
 def database_snapshot(connection, source_table: str) -> dict:
@@ -46,10 +64,7 @@ def main() -> int:
     config = tomllib.loads(config_path.read_text())['postgres']
     memory_limit = read_cgroup('memory.max')
     swap_limit = read_cgroup('memory.swap.max')
-    # cgroup v2 rounds Docker's byte limit down to an OS page boundary.
-    effective_limit = int(memory_limit) if memory_limit != 'max' else 0
-    if not 0 <= 4_000_000_000 - effective_limit < os.sysconf('SC_PAGE_SIZE') or swap_limit != '0':
-        raise SystemExit('measurement requires memory.max=4000000000 and memory.swap.max=0')
+    require_uncapped_memory(memory_limit)
     events_before = read_cgroup('memory.events')
     with psycopg.connect(host=config['host'], port=config['port'], dbname=config['database'],
                         user=config['user'], password=os.environ['POSTGRES_PASSWORD']) as connection:
@@ -66,8 +81,10 @@ def main() -> int:
               'return_code': return_code, 'elapsed_seconds': elapsed, 'pipeline_args': args.pipeline_arg,
               'stats_path': str(stats_path),
               'pipeline_stats': json.loads(stats_path.read_text()) if stats_path.exists() else None,
-              'requested_memory_max_bytes': 4_000_000_000,
-              'memory_max_bytes': effective_limit, 'memory_swap_max_bytes': int(swap_limit),
+              'memory_warning_threshold_bytes': MEMORY_WARNING_BYTES,
+              'memory_max': memory_limit, 'memory_swap_max': swap_limit,
+              'memory_current_bytes': int(read_cgroup('memory.current')),
+              'memory_swap_current_bytes': int(read_cgroup('memory.swap.current')),
               'memory_peak_bytes': int(read_cgroup('memory.peak')),
               'memory_events_before': events_before, 'memory_events_after': read_cgroup('memory.events'),
               'postgres_before': database_before, 'postgres_after': database_after,

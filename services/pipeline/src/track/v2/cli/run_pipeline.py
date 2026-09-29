@@ -164,6 +164,9 @@ def main() -> int:
         else f"postgresql://{db_config.database}/{args.source_table}"
     )
     log_path = init_logger(config.logging.directory)
+    from track.v2.telemetry.memory_warning import MemoryWarningMonitor
+    memory_warning = MemoryWarningMonitor()
+    memory_warning.start()
     print(f"日志文件 / Log file: {log_path}")
     print(f"数据源 / Source: {source_label}")
     print(f"连接目标 / Target: {db_config.safe_dsn()}")
@@ -194,6 +197,7 @@ def main() -> int:
         traceback.print_exc()
         return 1
     finally:
+        memory_warning.close()
         shutdown_logger()
 
 

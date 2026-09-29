@@ -95,6 +95,17 @@ def test_spilled_grid_switches_before_large_concat_and_keeps_cross_batch_segment
     assert not list((tmp_path / "duckdb").iterdir())
 
 
+def test_grid_owner_uses_dedicated_memory_limit(tmp_path):
+    from .config_factory import runtime_config
+
+    runtime = runtime_config(duckdb_memory_limit="64MB", duckdb_grid_memory_limit="128MB")
+    owner = GridSegmentRelation(runtime, tmp_path)
+    try:
+        assert owner._connection.execute("SELECT current_setting('memory_limit')").fetchone()[0] == "122.0 MiB"
+    finally:
+        owner.close()
+
+
 def test_spilled_grid_compares_distinct_blocks_with_exact_kernel(tmp_path):
     from types import SimpleNamespace
     from track.v2.candidates.detect_grid_crossings import iter_spilled_grid_candidates
