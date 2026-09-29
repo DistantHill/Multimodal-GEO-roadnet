@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 from track.v2.candidates.grid_segments import GridSegmentBudgetError, GridSegmentRelation, build_grid_segments, open_grid_segments
 
@@ -51,6 +52,29 @@ def test_build_grid_segments_deduplicates_both_hit_endpoints_and_sorts():
     assert result["start_generated_reason"][1] == "test"
     assert result["start_source_row_key"].tolist() == [10, 0, 30]
     assert result["start_source_row_key"].dtype == np.int64
+
+
+@pytest.mark.parametrize("spill", [False, True])
+def test_open_grid_assigns_each_segment_once_with_closed_boundary(tmp_path, spill):
+    outside_left = _point(10, 0, -1.0)
+    on_left = _point(11, 1, 0.0)
+    on_right = _point(12, 2, 1.0)
+    outside_right = _point(13, 3, 2.0)
+    batches = (
+        _batch(_row("car", on_left, prev=outside_left, next_=on_right)),
+        _batch(_row("car", on_right, prev=on_left, next_=outside_right)),
+    )
+    runtime = SimpleNamespace(duckdb_memory_limit="16MB", duckdb_threads=1,
+                              duckdb_max_temp_directory_size="64MB")
+    with open_grid_segments(batches, max_segments=1 if spill else 3,
+                            max_bytes=100_000, runtime=runtime, data_root=tmp_path,
+                            bounds=(0.0, -1.0, 1.0, 1.0)) as segments:
+        if spill:
+            assert isinstance(segments, GridSegmentRelation)
+            assert segments.count == 3
+            segments = segments.block(0, 3)
+        assert segments["start_point_id"].tolist() == [10, 11, 12]
+        assert segments["end_point_id"].tolist() == [11, 12, 13]
 
 
 def test_build_grid_segments_budget_fails_without_retry():
@@ -159,8 +183,8 @@ def test_open_grid_releases_build_workspaces_before_worker_consumes(tmp_path, mo
     original_pieces = grid_segments._pieces
     original_finish = grid_segments._finish_memory
 
-    def tracked_pieces(batch):
-        pieces = original_pieces(batch)
+    def tracked_pieces(batch, bounds=None):
+        pieces = original_pieces(batch, bounds)
         refs.extend(weakref.ref(value) for piece in pieces for value in piece.values())
         return pieces
 

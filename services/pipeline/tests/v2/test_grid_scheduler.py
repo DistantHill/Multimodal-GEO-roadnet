@@ -1,6 +1,6 @@
 from collections import Counter
 from contextlib import contextmanager, nullcontext
-from threading import get_ident
+from threading import Event, get_ident
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -96,6 +96,53 @@ def test_grid_scheduler_retries_then_deduplicates_and_writes_on_main_thread(monk
     assert "0/2" in updates[0]["detail"]
     assert "2/2" in updates[-1]["detail"]
     assert any("0/2" in message and "耗时 3.1s" in message for message in logs)
+
+
+def test_grid_scheduler_shows_running_grid_segments_in_shared_status(monkeypatch, tmp_path):
+    logs = []
+    monkeypatch.setattr(detect_grid_crossings, "log_info", logs.append)
+    ticks = iter((0.0,))
+    monkeypatch.setattr(
+        detect_grid_crossings, "time",
+        SimpleNamespace(monotonic=lambda: next(ticks, 3.1)),
+    )
+    release_worker = Event()
+    updates = []
+    monkeypatch.setattr(detect_grid_crossings, "fetch_points_in_grid", lambda *_args: ())
+
+    @contextmanager
+    def segments(_batches, **_kwargs):
+        yield {"subtrack_index": np.array([1, 2, 3]), "segment_identity": np.empty((3, 5))}
+
+    monkeypatch.setattr(detect_grid_crossings, "open_grid_segments", segments)
+    monkeypatch.setattr(detect_grid_crossings, "iter_grid_crossings", lambda *_args, **_kwargs: ())
+
+    def candidates(*_args):
+        assert release_worker.wait(timeout=5)
+        yield from ()
+
+    monkeypatch.setattr(detect_grid_crossings, "iter_grid_candidates", candidates)
+
+    def update(**kwargs):
+        updates.append(kwargs)
+        if "(0, 0) 线段数：3" in kwargs.get("sub_detail", ""):
+            release_worker.set()
+
+    detect_grid_crossings.run_grid_cross_track_task(
+        uuid4(), (0.0, 0.0, 1.0, 1.0), None, None, None,
+        connect_worker=_WorkerConnection, grid_cell_size_m=5.0,
+        max_segments=3, max_segment_bytes=100_000, max_grid_memberships=3,
+        max_overflow_pair_space=3, max_candidates=0, max_result_bytes=0,
+        runtime=_RUNTIME, data_root=tmp_path, thread_count=1,
+        live_status=SimpleNamespace(update=update),
+    )
+
+    assert release_worker.is_set()
+    assert "运行时间：" in next(item["sub_detail"] for item in updates
+                            if "线段数：3" in item["sub_detail"])
+    assert any("当前grid(1)" in message and "(0, 0) 线段数：3" in message
+               for message in logs)
+    assert updates[-1]["sub_detail"] == "当前grid(0)："
 
 
 def test_grid_scheduler_does_not_retry_budget_error(monkeypatch, tmp_path):

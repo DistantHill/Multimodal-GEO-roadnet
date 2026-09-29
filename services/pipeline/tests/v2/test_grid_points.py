@@ -61,17 +61,16 @@ def test_fetch_points_in_grid_uses_closed_xy_and_bounded_column_batches(monkeypa
     assert batches[0]["next_refined_sequence_in_subtrack"] == (1,)
     assert batches[0]["next_source_id"] == ("trajectory_points",)
     assert batches[1]["prev_point_id"] == (11,)
-    assert metadata.query.startswith("CREATE TEMP TABLE cross_track_hits_")
-    assert "ON COMMIT DROP AS" in metadata.query
-    assert metadata.query.count("%s") == len(metadata.params)
-    assert "ST_Intersects(ST_Transform(s.geom, 32650), ST_MakeEnvelope(%s, %s, %s, %s, 32650))" in metadata.query
-    assert "i.x <= %s" in metadata.query
-    assert metadata.params[1:5] == (0.0, 0.0, 1.0, 1.0)
-    assert metadata.params[6:10] == (0.0, 0.0, 1.0, 1.0)
-    assert "i.geom &&" not in metadata.query
-    assert "s.id = k.source_row_key" in metadata.query
-    assert data.query.count("%s") == len(data.params) == 4
-    assert "FROM cross_track_hits_" in data.query
+    assert metadata.query == "SELECT source_table, processing_srid FROM refine_runs WHERE id = %s"
+    assert data.query.count("%s") == len(data.params) == 14
+    assert data.query.lstrip().startswith("WITH hits AS (")
+    assert "ST_Intersects(ST_Transform(s.geom, 32650), ST_MakeEnvelope(%s, %s, %s, %s, 32650))" in data.query
+    assert "i.x <= %s" in data.query
+    assert data.params[1:5] == (0.0, 0.0, 1.0, 1.0)
+    assert data.params[6:10] == (0.0, 0.0, 1.0, 1.0)
+    assert "i.geom &&" not in data.query
+    assert "s.id = k.source_row_key" in data.query
+    assert "FROM hits h" in data.query
 
 
 def test_fetch_points_in_grid_rejects_negative_or_out_of_range_index():

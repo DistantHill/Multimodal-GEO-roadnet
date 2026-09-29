@@ -152,12 +152,7 @@ def fetch_points_in_grid(
         AND i.x >= %s AND i.y >= %s AND i.x <= %s AND i.y <= %s
     )
     """
-    # A server-side cursor is planned for a small initial fetch. For this
-    # query that can choose a nested loop which rescans the entire Refine kept
-    # set for every spatial hit. Build hits with a regular statement first;
-    # the cursor then streams only the neighbour lookups.
-    hits_table = f"cross_track_hits_{uuid.uuid4().hex}"
-    query = f"""
+    query = hits_cte + f"""
     SELECT h.vehicle_id, h.subtrack_index, h.anchor, h.kind, h.point_id,
            h.source_row_key, h.x, h.y, h.heading, h.timestamp, h.speed,
            h.lon, h.lat, h.generated_reason, h.refined_sequence, h.source_id,
@@ -169,16 +164,13 @@ def fetch_points_in_grid(
            nxt.x, nxt.y, nxt.heading, nxt.timestamp, nxt.speed,
            nxt.lon, nxt.lat, nxt.generated_reason, nxt.refined_sequence,
            nxt.source_id
-    FROM {hits_table} h
+    FROM hits h
     {neighbour('prev')}
     {neighbour('nxt')}
     ORDER BY h.vehicle_id, h.subtrack_index, h.anchor, h.kind, h.point_id
     """
     xy = (x_min, y_min, x_max, y_max)
-    hit_params = (
-        refine_id, *xy, refine_id, *xy,
-    )
-    neighbour_params = (refine_id,) * 4
+    params = (refine_id, *xy, refine_id, *xy) + (refine_id,) * 4
     names = (
         "vehicle_id", "subtrack_index", "anchor_sequence", "point_kind",
         "point_id", "source_row_key", "x", "y", "heading", "timestamp",
@@ -193,16 +185,10 @@ def fetch_points_in_grid(
         "next_timestamp", "next_speed", "next_lon", "next_lat",
         "next_generated_reason", "next_refined_sequence_in_subtrack", "next_source_id",
     )
-    with conn.cursor() as cur:
-        cur.execute(
-            f"CREATE TEMP TABLE {hits_table} ON COMMIT DROP AS "
-            + hits_cte + " SELECT * FROM hits",
-            hit_params,
-        )
     if before_cursor_execute is not None:
-        before_cursor_execute(query, neighbour_params)
+        before_cursor_execute(query, params)
     with conn.cursor(name=f"cross_track_grid_{uuid.uuid4().hex}") as cur:
-        cur.execute(query, neighbour_params)
+        cur.execute(query, params)
         while rows := cur.fetchmany(batch_size):
             yield {name: tuple(row[index] for row in rows)
                    for index, name in enumerate(names)}

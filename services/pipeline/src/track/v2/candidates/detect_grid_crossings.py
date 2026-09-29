@@ -218,7 +218,8 @@ def run_grid_cross_track_task(
     log_info(f"Detect cross-track grid task: {total:,} grids")
     if live_status is not None:
         live_status.update(detail=f"跨轨迹网格：0/{total} 完成，0 线段，0 候选",
-                           elapsed=0.0, stage="Detect: 跨轨迹网格")
+                           sub_detail="当前grid(0)：", elapsed=0.0,
+                           stage="Detect: 跨轨迹网格")
     if total == 0:
         if candidate_store is not None:
             candidate_store.seal()
@@ -230,7 +231,8 @@ def run_grid_cross_track_task(
     connection_lock = Lock()
     result_count = done_count = segment_count = 0
     attempts: dict[tuple[int, int], int] = {}
-    active: dict[Any, tuple[tuple[int, int], int]] = {}
+    active: dict[Any, tuple[tuple[int, int], int, float]] = {}
+    active_segments: dict[tuple[int, int], int] = {}
     grid_order = {(col, row): ordinal for ordinal, (col, row) in enumerate(pending)}
     events: Queue[tuple[str, tuple[int, int], int, Any]] = Queue(maxsize=2)
     from threading import Event
@@ -238,6 +240,17 @@ def run_grid_cross_track_task(
     staged = candidate_store is not None and hasattr(candidate_store, "append_staged")
     legacy_batches = []
     attempt_counts: dict[tuple[tuple[int, int], int], int] = {}
+
+    def active_detail(now: float) -> str:
+        lines = [f"当前grid({len(active)})："]
+        for cell, _attempt, started_at in active.values():
+            count = active_segments.get(cell)
+            segments_text = f"{count:,}" if count is not None else "读取中"
+            lines.append(
+                f"  ({cell[0]}, {cell[1]}) 线段数：{segments_text}，"
+                f"运行时间：{now - started_at:.1f}s"
+            )
+        return "\n".join(lines)
 
     def enqueue(kind, cell, attempt, payload):
         while not canceled.is_set():
@@ -262,6 +275,7 @@ def run_grid_cross_track_task(
                 fetch_points_in_grid(conn, cell, grids, refine_id, spatial_context),
                 max_segments=max_segments, max_bytes=max_segment_bytes,
                 runtime=runtime, data_root=data_root, owner=f"grid-segments-{grid_order[cell]}",
+                bounds=grids[cell[0]][cell[1]],
             ) as segments:
                 if isinstance(segments, GridSegmentRelation):
                     batches = iter_spilled_grid_candidates(segments, cfg, transformer)
@@ -273,6 +287,7 @@ def run_grid_cross_track_task(
                     )
                     batches = iter_grid_candidates(segments, crossings, transformer)
                     count = len(segments["subtrack_index"])
+                enqueue("segments", cell, attempt, count)
                 for batch in batches:
                     if canceled.is_set():
                         return count
@@ -285,7 +300,9 @@ def run_grid_cross_track_task(
         kind, cell, attempt, payload = event
         if attempt != attempts.get(cell, 0):
             return
-        if kind == "batch":
+        if kind == "segments":
+            active_segments[cell] = payload
+        elif kind == "batch":
             local_index, batch = payload
             if staged:
                 candidate_store.append_staged(grid_order[cell], local_index, batch)
@@ -301,7 +318,7 @@ def run_grid_cross_track_task(
                     cell = pending.popleft()
                     attempt = attempts.get(cell, 0)
                     grids[cell[0]][cell[1]].status = "running"
-                    active[pool.submit(worker, cell, attempt)] = (cell, attempt)
+                    active[pool.submit(worker, cell, attempt)] = (cell, attempt, time.monotonic())
                 try:
                     process_event(events.get(timeout=0.1))
                     while True:
@@ -310,7 +327,10 @@ def run_grid_cross_track_task(
                     pass
                 now = time.monotonic()
                 if now - last_log_at >= 3.0:
-                    log_info(f"跨轨迹网格：{done_count}/{total} 完成，{len(active)} 运行中，耗时 {now-started:.1f}s")
+                    log_info(
+                        f"跨轨迹网格：{done_count}/{total} 完成，{segment_count} 线段，"
+                        f"{result_count} 候选，耗时 {now-started:.1f}s\n{active_detail(now)}"
+                    )
                     last_log_at = now
                 finished = [future for future in active if future.done()]
                 # A completed worker has already put all its batches into the FIFO.
@@ -322,7 +342,8 @@ def run_grid_cross_track_task(
                         except Empty:
                             break
                 for future in finished:
-                    cell, attempt = active.pop(future)
+                    cell, attempt, _started_at = active.pop(future)
+                    active_segments.pop(cell, None)
                     try:
                         count = future.result()
                     except Exception as exc:
@@ -342,7 +363,12 @@ def run_grid_cross_track_task(
                     segment_count += count
                     done_count += 1
                 if live_status is not None:
-                    live_status.update(detail=f"跨轨迹网格：{done_count}/{total} 完成，{segment_count} 线段，{result_count} 候选", elapsed=time.monotonic()-started, stage="Detect: 跨轨迹网格")
+                    now = time.monotonic()
+                    live_status.update(
+                        detail=f"跨轨迹网格：{done_count}/{total} 完成，{segment_count} 线段，{result_count} 候选",
+                        sub_detail=active_detail(now), elapsed=now-started,
+                        stage="Detect: 跨轨迹网格",
+                    )
     finally:
         canceled.set()
         for conn in opened_connections:

@@ -29,7 +29,7 @@ def _empty():
     return result
 
 
-def _pieces(batch):
+def _pieces(batch, bounds=None):
     size = len(batch["point_id"])
     if any(len(value) != size for value in batch.values()):
         raise ValueError("point columns differ in length")
@@ -38,6 +38,13 @@ def _pieces(batch):
         a = np.asarray(batch[start_prefix + "point_id"], dtype=object)
         b = np.asarray(batch[end_prefix + "point_id"], dtype=object)
         ids = np.flatnonzero((a != None) & (b != None))
+        if start_prefix and bounds is not None and len(ids):
+            x_min, y_min, x_max, y_max = bounds
+            prev_x = np.asarray(batch["prev_x"], dtype=object)[ids].astype(np.float64)
+            prev_y = np.asarray(batch["prev_y"], dtype=object)[ids].astype(np.float64)
+            inside = ((x_min <= prev_x) & (prev_x <= x_max)
+                      & (y_min <= prev_y) & (prev_y <= y_max))
+            ids = ids[~inside]
         if not len(ids):
             continue
         def column(prefix, name, dtype):
@@ -162,14 +169,21 @@ class GridSegmentRelation:
             self._connection.unregister(relation)
         self._next_order += size
 
-    def finish(self):
-        key = ", ".join(_KEY)
-        # Memory fast path's np.unique first orders the five-column identity;
-        # its stable lexsort then orders by subtrack, sequence and start ID.
+    def finish(self, *, deduplicate: bool = True):
+        # Match the in-memory order before workers read segment blocks.
         order = ("subtrack_index, start_refined_sequence_in_subtrack, start_point_id, "
                  "CASE start_point_kind WHEN 'kept' THEN 0 ELSE 1 END, "
                  "CASE end_point_kind WHEN 'kept' THEN 0 ELSE 1 END, end_point_id")
-        self._quota.run("finish_segments", lambda: self._connection.execute("CREATE TEMP TABLE segment_unique AS SELECT row_number() OVER (ORDER BY " + order + ") - 1 AS segment_order, * EXCLUDE(input_order, rn) FROM (SELECT *, row_number() OVER (PARTITION BY " + key + " ORDER BY input_order) AS rn FROM segment_input) WHERE rn = 1"))
+        if deduplicate:
+            key = ", ".join(_KEY)
+            query = ("CREATE TEMP TABLE segment_unique AS SELECT row_number() OVER (ORDER BY "
+                     + order + ") - 1 AS segment_order, * EXCLUDE(input_order, rn) "
+                     "FROM (SELECT *, row_number() OVER (PARTITION BY " + key
+                     + " ORDER BY input_order) AS rn FROM segment_input) WHERE rn = 1")
+        else:
+            query = ("CREATE TEMP TABLE segment_unique AS SELECT row_number() OVER (ORDER BY "
+                     + order + ") - 1 AS segment_order, * EXCLUDE(input_order) FROM segment_input")
+        self._quota.run("finish_segments", lambda: self._connection.execute(query))
         self.count = self._connection.execute("SELECT count(*) FROM segment_unique").fetchone()[0]
 
     def block(self, offset: int, size: int):
@@ -189,42 +203,50 @@ class GridSegmentRelation:
 
 
 @contextmanager
-def open_grid_segments(point_batches, *, max_segments: int, max_bytes: int, runtime, data_root, owner="grid-segments"):
-    """Switch to native TEMP storage before allocating an oversized concatenation."""
+def open_grid_segments(point_batches, *, max_segments: int, max_bytes: int, runtime,
+                       data_root, owner="grid-segments", bounds=None):
+    """Build one grid once, spilling before its buffered pieces exceed the budget."""
     if max_segments < 0 or max_bytes < 0:
         raise ValueError("segment budgets must be non-negative")
-    result = {}
+    buffered = []
+    buffered_count = buffered_bytes = 0
     relation = None
     iterator = iter(point_batches)
     try:
         for batch in iterator:
-            pieces = _pieces(batch)
+            pieces = _pieces(batch, bounds)
             if not pieces:
                 continue
             if relation is None:
-                projected = len(result.get("subtrack_index", ())) + sum(len(piece["subtrack_index"]) for piece in pieces)
-                cost = 3 * (sum(value.nbytes for value in result.values()) + sum(value.nbytes for piece in pieces for value in piece.values())) + 128 * projected
+                added_count = sum(len(piece["subtrack_index"]) for piece in pieces)
+                added_bytes = sum(value.nbytes for piece in pieces for value in piece.values())
+                projected = buffered_count + added_count
+                cost = 3 * (buffered_bytes + added_bytes) + 128 * projected
                 if projected > max_segments or cost > max_bytes:
                     relation = GridSegmentRelation(runtime, Path(data_root), owner=owner)
-                    if result:
-                        relation.append(result)
-                    result = {}
+                    for piece in buffered:
+                        relation.append(piece)
+                    buffered = []
             if relation is not None:
                 for piece in pieces:
                     relation.append(piece)
                 continue
-            combined = {name: np.concatenate(([result[name]] if result else []) + [piece[name] for piece in pieces]) for name in pieces[0]}
-            _, unique = np.unique(combined["segment_identity"], axis=0, return_index=True)
-            result = {name: value[unique] for name, value in combined.items()}
+            buffered.extend(pieces)
+            buffered_count = projected
+            buffered_bytes += added_bytes
         if relation is not None:
-            relation.finish()
+            relation.finish(deduplicate=bounds is None)
             delivered = relation
         else:
-            delivered = _finish_memory(result)
+            combined = ({name: np.concatenate([piece[name] for piece in buffered])
+                         for name in buffered[0]} if buffered else {})
+            if bounds is None and combined:
+                _, unique = np.unique(combined["segment_identity"], axis=0, return_index=True)
+                combined = {name: value[unique] for name, value in combined.items()}
+            delivered = _finish_memory(combined)
         # The contextmanager frame stays alive while the worker consumes a grid.
-        # Drop the final cursor batch, pieces, concat/unique workspaces and the
-        # unsorted result before handing the completed columns to that worker.
-        batch = pieces = combined = unique = _ = result = None
+        # Drop input batches and unsorted pieces before handing columns to the worker.
+        batch = pieces = combined = unique = _ = buffered = None
         yield delivered
     finally:
         close = getattr(iterator, "close", None)
