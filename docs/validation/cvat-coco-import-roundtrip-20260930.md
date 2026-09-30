@@ -13,7 +13,8 @@ CVAT 版本 2.76.1，`cvat_server` 与 `cvat_ui` 已连续运行 5 天，UI 监�
 灰度图与 28 个检测框。**本次验证没有重新运行 `export_coco`，而是直接复用了该已生成包**，
 因此 `export_coco` 的写出行为、`DATA_ROOT` 归属和 `--method` 语义都未在本轮覆盖。
 
-源包位于 `/home/reid/workspace/data/road-network/vision/datasets/detect-173ade7d-f03d-4c9d-8e46-906279085c9b-bbox-20260916/coco-review`。
+验证时源包位于 `/home/reid/workspace/data/road-network/vision/datasets/detect-173ade7d-f03d-4c9d-8e46-906279085c9b-bbox-20260916/coco-review`，
+其后复制到 `/data/datasets/roadnet/vision/...`，见下文「数据集归位」。
 注意该路径不在 live `.env` 的 `DATA_ROOT=/data/tmp/road-network` 之下，也不在 personal
 checkout 的 `DATA_ROOT=/home/reed/workspace/data/road-network` 之下（用户 `reed` 在本机不存在）。
 `vision/` 目录建于 2026-09-16 12:05，先于包生成时间 9 小时。
@@ -89,6 +90,32 @@ checkout 的 `DATA_ROOT=/home/reed/workspace/data/road-network` 之下（用户 
 CVAT 中保留验证任务 `roadnet-coco-roundtrip-20260930`，其已恢复为导入后的干净状态：
 28 个框、几何与源包逐框一致、无演示框、`review_status` 全为 `unreviewed`。CVAT 服务端
 `cache/export/` 下另有 3 个导出缓存文件，可随任务删除。
+
+## 数据集归位
+
+2026-09-30 将宿主机数据集复制到 `/data/datasets/roadnet/vision`，并在 CVAT 侧保持可见。
+该位置位于 CVAT 的 share 挂载根 `/data/datasets` 之下，因此容器内路径为
+`/home/django/share/datasets/roadnet/vision`，Server files 填
+`datasets/roadnet/vision/...`。复制范围与校验：
+
+| 内容 | 来源 | 文件数 | 校验 |
+| --- | --- | --- | --- |
+| `datasets/` | `/home/reid/workspace/data/road-network/vision` | 169 | 逐文件 sha256 一致，无缺失 |
+| `normalization/` | 同上 | 638 | 逐文件 sha256 一致 |
+| 两个往返导出包 | `/data/service-data/vision/datasets` | 2 | sha256 与移动后一致 |
+
+源目录保留未删。数据集目录现在同时存在于三个位置，来源与用途各不相同：
+
+- `/home/reid/workspace/data/road-network/vision`：生成 `coco-review` 时的原始位置，保留。
+- `/data/service-data/vision`：`MODEL_ROOT` 所在的模型目录，另含上述两个导出包。
+- `/data/datasets/roadnet/vision`：本次归位后的位置，也是 CVAT 直接可读的位置。
+
+注意这三处都不是通过 `DATA_ROOT` 派生的。仓库 README 将 `DATA_ROOT`
+（`/data/tmp/road-network`）定义为「保存可丢弃的 Pipeline 工作区、中间文件和运行产物」的
+挂载根，而本数据集不在其下；`export_coco` 的 README 示例使用的容器内路径
+`/data/vision/datasets/...`（即宿主机 `/data/tmp/road-network/vision/datasets/...`）
+在当前部署中并不存在。因此重新生成或重建 CVAT 任务时，需按实际位置指定路径，
+不能直接照搬该示例。
 
 ## 复现备忘
 
