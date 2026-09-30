@@ -19,3 +19,13 @@ crossing 之一。Clip 只消费 completed Detect 的最终顺序；Centerline m
 entry/exit crossing。两者不是同一种实体。
 
 当前不使用 Alembic，也不在此目录复制第二份可能漂移的业务 Schema。
+
+Detect 在同一结果写入事务内，按当前 `detect_id` 将转向事件物化到
+`turn_evnets_gemo`（沿用既有表名）。该表保存 `turn_events` 的全部字段及
+`geometry(Point, 4326)` 类型的非空 `geom`：kept 点通过当前 Refine 的
+`source_table` 获取几何，injected 点直接取 `injected_points.geom`。
+事件 ID 保持不变，删除源事件时级联删除副本；completed Detect 的副本同样不可修改。
+
+已有 schema v9 执行 `init-db` 即可添加此表；此前手动物化的同名表会保留数据，
+并补充非空、外键和索引约束。初始化不自动回填其他历史 Detect 批次；
+新执行的 Detect 会自动物化，复用已完成 Detect 不会重新写入。

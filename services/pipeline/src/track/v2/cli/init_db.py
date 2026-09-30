@@ -291,6 +291,15 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         """,
     ),
     (
+        "turn_evnets_gemo",
+        """
+        CREATE TABLE IF NOT EXISTS turn_evnets_gemo (
+            LIKE turn_events,
+            geom geometry(Point, 4326) NOT NULL
+        )
+        """,
+    ),
+    (
         "candidate_entry_exit_points",
         """
         CREATE TABLE IF NOT EXISTS candidate_entry_exit_points (
@@ -528,6 +537,17 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
 
 INDEX_STATEMENTS: list[tuple[str, str]] = [
     (
+        "idx_turn_evnets_gemo_id",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_turn_evnets_gemo_id "
+        "ON turn_evnets_gemo(id)",
+    ),
+    (
+        "idx_turn_evnets_gemo_detect",
+        "CREATE INDEX IF NOT EXISTS idx_turn_evnets_gemo_detect "
+        "ON turn_evnets_gemo(detect_id)",
+    ),
+
+    (
         "uq_pipeline_artifacts_refine_run",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_pipeline_artifacts_refine_run "
         "ON pipeline_artifacts(refine_id) WHERE stage = 'refine'",
@@ -643,6 +663,30 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
 
 
 POST_DDL_STATEMENTS: list[tuple[str, str]] = [
+    (
+        "turn_evnets_gemo_constraints",
+        """
+        ALTER TABLE turn_evnets_gemo
+            ALTER COLUMN id SET NOT NULL,
+            ALTER COLUMN detect_id SET NOT NULL,
+            ALTER COLUMN geom SET NOT NULL;
+        DO $ddl$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'turn_evnets_gemo'::regclass
+                  AND conname = 'turn_evnets_gemo_event_fkey'
+            ) THEN
+                ALTER TABLE turn_evnets_gemo
+                    ADD CONSTRAINT turn_evnets_gemo_event_fkey
+                    FOREIGN KEY (id, detect_id)
+                    REFERENCES turn_events(id, detect_id) ON DELETE CASCADE;
+            END IF;
+        END
+        $ddl$
+        """,
+    ),
+
     (
         "guard_pipeline_artifact_immutability_function",
         """
@@ -1579,6 +1623,7 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                 'candidate_intersections',
                 'tracks_cross',
                 'turn_events',
+                'turn_evnets_gemo',
                 'candidate_entry_exit_points',
                 'intersections',
                 'entry_exit_points'

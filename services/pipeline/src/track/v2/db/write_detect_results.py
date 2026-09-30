@@ -14,6 +14,7 @@ from ..intersections.detect_intersections import IntersectResult
 from ..intersections.relations.source_associations import WriterRelation
 from ..models import HotspotCluster, RuntimeConfig, SpatialContext
 from ..telemetry.heartbeat import heartbeat_progress, observed_operation
+from .source_table import quote_table_name
 from .insert_batches import (
     _BATCH, _copy_insert, _chunked_template, _chunked_template_returning,
 )
@@ -193,6 +194,7 @@ def _persist_detect_result(conn, detect_id, result, *, batch_size, workspace):
     workspace.prepare_annotations(ordered_clusters, candidate_by_calculation, result.hotspot_events)
     tracks_cross_count = _insert_tracks_cross(conn, detect_id, workspace, batch_size=batch_size)
     turn_event_count = _insert_turn_events(conn, detect_id, workspace, batch_size=batch_size)
+    materialize_turn_event_geom(conn, detect_id)
     _insert_candidate_crossings(conn, detect_id, workspace, batch_size=batch_size)
     _insert_intersections(
         conn,
@@ -449,6 +451,43 @@ def _insert_turn_events(conn, detect_id, workspace, *, batch_size):
          "exit_bearing", "turn_deg", "score", "g_star_z"],
         workspace.iter_rows(0, detect_id), total=workspace.counts[0], batch_size=batch_size,
     )
+
+
+@observed_operation("物化转向事件几何")
+def materialize_turn_event_geom(conn: Any, detect_id: str) -> int:
+    """Copy this Detect Run's events and geometry in the caller's transaction."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT r.source_table FROM detect_runs d "
+            "JOIN refine_runs r ON r.id = d.refine_id WHERE d.id = %s",
+            (detect_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError(f"unknown Detect Run: {detect_id}")
+        source = quote_table_name(str(row[0]))
+        cur.execute(
+            f"""
+            INSERT INTO turn_evnets_gemo (
+                id, detect_id, candidate_intersection_id, resolved_point_id,
+                entry_bearing, exit_bearing, turn_deg, score, g_star_z,
+                created_at, geom
+            )
+            SELECT te.id, te.detect_id, te.candidate_intersection_id,
+                   te.resolved_point_id, te.entry_bearing, te.exit_bearing,
+                   te.turn_deg, te.score, te.g_star_z, te.created_at,
+                   COALESCE(tp.geom, ip.geom)
+            FROM turn_events te
+            LEFT JOIN resolved_subtrack_points rp
+              ON rp.id = te.resolved_point_id AND rp.detect_id = te.detect_id
+            LEFT JOIN kept_trajectory_points kp ON kp.id = rp.kept_point_id
+            LEFT JOIN {source} tp ON tp.id = kp.source_row_key
+            LEFT JOIN injected_points ip ON ip.id = rp.injected_point_id
+            WHERE te.detect_id = %s
+            """,
+            (detect_id,),
+        )
+        return int(cur.rowcount)
 
 
 @observed_operation("写入候选穿越点")
