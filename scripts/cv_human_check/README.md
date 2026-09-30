@@ -11,6 +11,7 @@
 - `export_intersections.py`：按 Detect 和经纬度范围导出全部交叉口的原始点裁剪，
   保存计数、三组灰度图、规则圆元数据和离线对比页。
 - `export_coco.py`：将已有裁剪导出为 CVAT Community 可导入的 COCO 检测预标注包。
+  导入与往返实测见[CVAT Community 导入与往返实测](../../docs/validation/cvat-coco-import-roundtrip-20260930.md)。
 - `tests/`：归一化、报告、命令与输出路径的回归测试。
 
 这些工具供人工比较输入灰度图，不训练模型，也不自动选择最佳参数。
@@ -56,7 +57,7 @@ docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm --no-dep
 保留矩形内全部原始点（包括 Refine 排除的点），不缩放、不绘制规则圆、不生成分割掩膜。
 筛选范围只限制圆心，完整裁剪可以包含范围外的点。共享 P99.5 标尺从本批非零像素估计，
 重叠像素只计一次；log1p、asinh 均先取尺度 1，明确标为未调优的初始值。
-本批是待复核的训练正样本候选，尚未补充负样本或划分验证/测试区。
+本批是待复核的训练正样本候选。实测该包 26 张图每张至少有一个检测框，因此其中没有负样本，验证/测试区也尚未划分。
 
 ## 标注工具与数据集格式
 
@@ -73,7 +74,10 @@ docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm --no-dep
 ```
 
 包内提供 `images.zip`、`annotations/instances_default.json`、完整 `coco.zip` 和导入说明。
+输出必须是尚不存在的新目录；`export_coco` 已存在时直接抛出 `FileExistsError`，命令行入口以 `output already exists` 拒绝，重新生成需先删除该目录或换新路径。
 只标注一组灰度图片，其余两组按图片名复用标签，不扩增独立样本数量。
 检测标签包含可见相邻规则圆的外接框；尚未生成的掩膜以空 `segmentation` 表示。
 COCO 无原生圆字段，原始圆及地理变换保存在 `metadata/circles.json`；编辑矩形不会
 同步修改原始圆。当前包用于复核已有裁剪，区域窗口和背景样本仍待补充。
+
+CVAT 2.76.1 的格式名是 `COCO 1.0`，没有名为 COCO 1.1 的格式：导入时在“上传标注”处选择 COCO 1.0 并上传 `annotations/instances_default.json`。同一版本的旧导出接口 `GET /api/tasks/id/annotations?format=...` 已返回 410，导出复核结果改用 `POST /api/tasks/id/dataset/export`，再从 `GET /api/requests/{rq_id}` 返回的 `result_url` 下载。
