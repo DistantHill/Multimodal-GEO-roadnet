@@ -1,5 +1,5 @@
 import OlMap from 'ol/Map.js';
-import { selectFeaturesInExtent, replayFocusFeatures } from './selection.js';
+import { selectFeaturesInExtent, replayFocusFeatures, replayEventSelection } from './selection.js';
 import { planViewTiles, TileLayerLoader } from './map-tiles.js';
 import View from 'ol/View.js';
 import GeoJSON from 'ol/format/GeoJSON.js';
@@ -270,7 +270,7 @@ const tmpSource = new VectorSource();
 const replayHighlightStyle = createLayerStyle('tmp');
 replayHighlightStyle.setZIndex(2);
 const replayContextStyle = new Style({
-  stroke: new Stroke({ color: 'rgba(140, 148, 154, 0.65)', width: 2 }),
+  stroke: new Stroke({ color: 'rgba(128, 128, 128, 0.5)', width: 2 }),
   zIndex: 1,
 });
 const tmpLayer = new VectorLayer({
@@ -394,7 +394,7 @@ function createLayerStyle(role) {
     intersection: { color: '#d76b2b', fill: '#fff8ee', width: 2, radius: 5.5 },
     point: { color: '#466b9d', fill: '#ecf4ff', width: 1.8, radius: 4 },
     road: { color: '#697987', fill: 'rgba(105, 121, 135, 0.12)', width: 2, radius: 3 },
-    tmp: { color: '#e33f8e', fill: 'rgba(227, 63, 142, 0.14)', width: 3, radius: 5 },
+    tmp: { color: '#ff00ff', fill: 'rgba(255, 0, 255, 0.14)', width: 3, radius: 5 },
     trajectory: { color: '#1c9c96', fill: '#e3faf8', width: 2.2, radius: 3.5 },
   };
   const definition = styles[role] || styles.generic;
@@ -910,7 +910,7 @@ function updateActionState() {
   const intersectionReady = centerlines.length === 0 && features.length > 0 && intersections.length === features.length
     && unique(intersectionIds).length === features.length && detectIds.length === 1;
   const replayReady = !state.busy && (
-    centerlineReady || intersectionReady || (
+    centerlineReady || intersectionReady || (replayEventSelection(features) && replayDetectIds.length === 1) || (
       centerlines.length === 0 &&
       intersections.length === 0 &&
       replayKeys.length > 0 &&
@@ -991,6 +991,15 @@ function unique(values) {
 async function runReplay() {
   if (dom.replayAction.disabled) return;
   const features = selectedFeatures.getFeatures().getArray();
+  const eventSelection = replayEventSelection(features);
+  if (eventSelection) {
+    await runAnalysis('Replay', (signal) => requestReplay({
+      databaseName: state.databaseName,
+      detectId: features[0].get('_detectId') || state.context.detectId,
+      ...eventSelection,
+    }, { signal }));
+    return;
+  }
   const centerlineFeatures = features.filter((feature) => feature.get('_layerId') === 'centerlines');
   if (centerlineFeatures.length) {
     await runAnalysis('Replay', (signal) => requestReplay({

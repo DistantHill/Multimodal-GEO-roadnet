@@ -6,7 +6,9 @@ from pydantic import ValidationError
 
 from backend.map_errors import MapDataError, MapNotFoundError
 from backend.stores.map_layers import PostgresMapStore
-from backend.api.map_contracts import ReplayRequest
+from backend.api.map_contracts import ReplayRequest, resolve_replay_limits
+from backend.database import _require_config
+from backend.replay.select_intersection_members import replay_intersection
 
 
 DETECT_ID = "12345678-1234-5678-1234-567812345678"
@@ -24,6 +26,11 @@ def make_store(rows=()):
     return store
 
 
+def select_members(store, request):
+    """Test the event-member query before its segment expansion."""
+    return replay_intersection(store, resolve_replay_limits(request, _require_config().map))
+
+
 def member(point_id, source_key, timestamp, injected_id=None):
     return (point_id, source_key, injected_id, "vehicle-1", timestamp,
             120.1, 30.2, 90.0, 10.0, [{"kind": "turn_event", "id": 9}])
@@ -31,7 +38,7 @@ def member(point_id, source_key, timestamp, injected_id=None):
 
 def test_intersection_preserves_injected_namespace_identity_and_time_order():
     store = make_store([member(1, "7", 20), member(2, None, 10, injected_id=7)])
-    result = store.replay(ReplayRequest(intersection_id=5))
+    result = select_members(store, ReplayRequest(intersection_id=5))
     store._verify_source_fingerprint.assert_not_called()
     assert [feature["id"] for feature in result["features"]] == [2, 1]
     assert all(feature["geometry"]["type"] == "Point" for feature in result["features"])
@@ -50,27 +57,27 @@ def test_intersection_missing_or_wrong_detect():
     store = make_store()
     store._fetchone.return_value = None
     with pytest.raises(MapNotFoundError):
-        store.replay(ReplayRequest(intersection_id=5))
+        select_members(store, ReplayRequest(intersection_id=5))
     store._fetchone.return_value = (DETECT_ID, 42)
     with pytest.raises(MapNotFoundError):
-        store.replay(ReplayRequest(intersection_id=5, detect_id="22345678-1234-5678-1234-567812345678"))
+        select_members(store, ReplayRequest(intersection_id=5, detect_id="22345678-1234-5678-1234-567812345678"))
     store._fetchall.assert_not_called()
 
 
 def test_intersection_does_not_silently_truncate():
     store = make_store([member(1, "1", 1), member(2, "2", 2), member(3, "3", 3)])
     with pytest.raises(MapDataError, match="max_points"):
-        store.replay(ReplayRequest(intersection_id=5, max_points=2))
+        select_members(store, ReplayRequest(intersection_id=5, max_points=2))
 
 
 def test_intersection_missing_source_fails():
     store = make_store([member(1, "1", None)])
     with pytest.raises(MapDataError, match="构成点缺失"):
-        store.replay(ReplayRequest(intersection_id=5))
+        select_members(store, ReplayRequest(intersection_id=5))
 
 
 def test_intersection_empty_members_returns_empty_collection():
-    assert make_store().replay(ReplayRequest(intersection_id=5))["features"] == []
+    assert select_members(make_store(), ReplayRequest(intersection_id=5))["features"] == []
 
 
 @pytest.mark.parametrize("selection", [{"source_row_keys": ["1"]}, {"bbox": [0, 0, 1, 1]}])

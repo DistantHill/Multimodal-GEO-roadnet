@@ -94,13 +94,14 @@ class RoadnetToolsPlugin:
     def replay_selection(self) -> None:
         try:
             layer = self.iface.activeLayer()
-            intersection_layer = (
-                isinstance(layer, QgsVectorLayer)
-                and layer.providerType() == "postgres"
-                and QgsDataSourceUri(layer.source()).table() == "intersections"
+            source_table = (
+                QgsDataSourceUri(layer.source()).table()
+                if isinstance(layer, QgsVectorLayer) and layer.providerType() == "postgres"
+                else None
             )
+            intersection_layer = source_table == "intersections"
             records = self._selected_point_records(allow_polygon=intersection_layer)
-            payload = build_replay_payload(records, intersection_layer=intersection_layer)
+            payload = build_replay_payload(records, intersection_layer=intersection_layer, source_table=source_table)
             payload["database_name"] = self._selected_database_name()
             settings = PluginSettings.load()
             url = endpoint_url(settings.backend_url, settings.replay_path)
@@ -111,7 +112,11 @@ class RoadnetToolsPlugin:
 
     def clip_selection(self) -> None:
         try:
-            records = self._selected_point_records()
+            layer = self.iface.activeLayer()
+            if not (isinstance(layer, QgsVectorLayer) and layer.providerType() == "postgres"
+                    and QgsDataSourceUri(layer.source()).table() == "intersections"):
+                raise ContractError("Clip requires the intersections layer.")
+            records = self._selected_point_records(allow_polygon=True)
             payload = build_clip_payload(records)
             payload["database_name"] = self._selected_database_name()
             settings = PluginSettings.load()

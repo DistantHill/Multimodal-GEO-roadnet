@@ -251,7 +251,7 @@ export async function loadMapLayer(
 }
 
 export async function requestReplay(
-  { detectId, fitId, refineId, sourceRowKeys, resolvedPointIds, intersectionId, intersectionIds, centerlineIds, bbox, maxVehicles, maxPoints, databaseName },
+  { detectId, fitId, refineId, sourceRowKeys, resolvedPointIds, intersectionId, intersectionIds, centerlineIds, tracksCrossIds, turnEventIds, bbox, maxVehicles, maxPoints, databaseName },
   { signal } = {},
 ) {
   const body = {};
@@ -285,10 +285,20 @@ export async function requestReplay(
     body.fit_id = fitId;
     if (refineId !== undefined && refineId !== null && refineId !== '') body.refine_id = refineId;
   }
+  for (const [field, ids] of [['tracks_cross_ids', tracksCrossIds], ['turn_event_ids', turnEventIds]]) {
+    if (ids === undefined) continue;
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > 1000
+      || new Set(ids.map(Number)).size !== ids.length
+      || ids.some((id) => !Number.isSafeInteger(Number(id)) || Number(id) < 1)) {
+      throw new MapApiError('事件 Replay 需要 1 到 1000 个有效且互不重复的事件 ID。');
+    }
+    if (!detectId) throw new MapApiError('事件 Replay 缺少 detect_id 上下文。');
+    body[field] = ids.map(Number);
+  }
   if (maxVehicles !== undefined) body.max_vehicles = maxVehicles;
   if (maxPoints !== undefined) body.max_points = maxPoints;
 
-  const selections = [body.source_row_keys, body.resolved_point_ids, body.intersection_id, body.intersection_ids, body.centerline_ids]
+  const selections = [body.source_row_keys, body.resolved_point_ids, body.intersection_id, body.intersection_ids, body.centerline_ids, body.tracks_cross_ids, body.turn_event_ids]
     .filter((value) => value !== undefined);
   if (selections.length !== 1) {
     throw new MapApiError('Replay 需要且只能提供来源键、resolved point ID、交叉口 ID 或中心线 ID。');

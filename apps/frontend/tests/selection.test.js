@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { selectFeaturesInExtent, replayFocusFeatures } from '../src/selection.js';
+import { selectFeaturesInExtent, replayFocusFeatures, replayEventSelection } from '../src/selection.js';
 
 test('Replay auto-fit excludes grey context segments and preserves legacy results', () => {
   const high = { get: () => 'highlight' };
@@ -23,4 +23,12 @@ test('box selection visits every intersecting feature without early termination'
   const selected = [];
   selectFeaturesInExtent(source, [0, 0, 4, 4], selected);
   assert.deepEqual(selected.map((feature) => feature.id), [1, 2, 3]);
+});
+
+test('event selections preserve entity identity instead of using source keys', () => {
+  const feature = (layerId, id) => ({ get: (key) => ({ _layerId: layerId, id })[key], getId: () => id });
+  assert.deepEqual(replayEventSelection([feature('tracks_cross', 7)]), { tracksCrossIds: [7] });
+  assert.deepEqual(replayEventSelection([feature('turn_event_geom', 8)]), { turnEventIds: [8] });
+  assert.equal(replayEventSelection([feature('tracks_cross', 7), feature('turn_event_geom', 8)]), null);
+  assert.equal(replayEventSelection([feature('tracks_cross', -1)]), null);
 });

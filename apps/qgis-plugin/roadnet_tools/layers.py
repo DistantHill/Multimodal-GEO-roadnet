@@ -146,12 +146,13 @@ def _make_memory_layer(
         geometry = geojson_feature.get("geometry")
         if geometry is not None:
             encoded = json.dumps(
-                geometry, ensure_ascii=False, separators=(",", ":")
+                {"type": "Feature", "geometry": geometry, "properties": {}},
+                ensure_ascii=False, separators=(",", ":")
             )
-            qgis_geometry = QgsJsonUtils.geometryFromGeoJson(encoded)
-            if qgis_geometry.isNull():
+            parsed_features = QgsJsonUtils.stringToFeatureList(encoded)
+            if len(parsed_features) != 1 or not parsed_features[0].hasGeometry():
                 raise ContractError(f"QGIS could not parse output geometry {index}.")
-            qgis_feature.setGeometry(qgis_geometry)
+            qgis_feature.setGeometry(parsed_features[0].geometry())
 
         properties = geojson_feature.get("properties") or {}
         qgis_feature.setAttributes(
@@ -212,15 +213,20 @@ def _apply_default_style(layer: QgsVectorLayer, operation: str) -> None:
     if operation == "replay" and layer.fields().indexFromName("replay_role") >= 0:
         categories = []
         for role, color, width, label in (
-            ("context", "#9ca3af", 0.4, "其他 segment"),
-            ("highlight", "#e33f8e", 1.0, "直接参与 segment"),
+            ("context", "#808080", 0.4, "其他 segment"),
+            ("highlight", "#ff00ff", 1.0, "直接参与 segment"),
         ):
             symbol = QgsSymbol.defaultSymbol(layer.geometryType())
             symbol.setColor(QColor(color))
+            symbol.setOpacity(0.5 if role == "context" else 1.0)
             if hasattr(symbol, "setWidth"):
                 symbol.setWidth(width)
+            for index in range(symbol.symbolLayerCount()):
+                symbol.symbolLayer(index).setRenderingPass(1 if role == "highlight" else 0)
             categories.append(QgsRendererCategory(role, symbol, label))
-        layer.setRenderer(QgsCategorizedSymbolRenderer("replay_role", categories))
+        renderer = QgsCategorizedSymbolRenderer("replay_role", categories)
+        renderer.setUsingSymbolLevels(True)
+        layer.setRenderer(renderer)
         return
     renderer = layer.renderer()
     symbol = renderer.symbol() if renderer is not None else None

@@ -43,10 +43,24 @@ class RequestContractTests(unittest.TestCase):
             [record({"id": 42, "detect_id": DETECT_ID}, 999)], intersection_layer=True,
         ), {"intersection_id": 42, "detect_id": DETECT_ID})
 
-    def test_replay_intersection_rejects_missing_or_multiple_ids(self):
-        for records in ([record({})], [record({"id": 1}), record({"id": 2})]):
-            with self.assertRaises(ContractError):
-                build_replay_payload(records, intersection_layer=True)
+    def test_replay_intersection_rejects_missing_ids(self):
+        with self.assertRaises(ContractError):
+            build_replay_payload([record({})], intersection_layer=True)
+
+    def test_replay_two_intersections_uses_database_ids(self):
+        records = [record({"id": i, "detect_id": DETECT_ID}, i + 100) for i in (1, 2)]
+        self.assertEqual(build_replay_payload(records, intersection_layer=True),
+                         {"intersection_ids": [1, 2], "detect_id": DETECT_ID})
+        self.assertEqual(build_clip_payload(records),
+                         {"intersection_ids": [1, 2], "detect_id": DETECT_ID})
+
+    def test_event_and_injected_entity_ids_never_become_source_keys(self):
+        for table, field in (("tracks_cross", "tracks_cross_ids"),
+                             ("turn_evnets_gemo", "turn_event_ids")):
+            payload = build_replay_payload([record({"id": 7, "detect_id": DETECT_ID})], source_table=table)
+            self.assertEqual(payload, {field: [7], "detect_id": DETECT_ID})
+        payload = build_replay_payload([record({"id": 7, "refine_id": DETECT_ID})], source_table="injected_points")
+        self.assertEqual(payload, {"injected_point_ids": [7], "refine_id": DETECT_ID})
 
     def test_replay_prefers_resolved_ids_and_requires_detect(self):
         payload = build_replay_payload(

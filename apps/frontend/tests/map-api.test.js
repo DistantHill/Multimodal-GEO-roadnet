@@ -273,3 +273,20 @@ test('layers preserve entry-exit and centerline feature collections unchanged', 
     },
   });
 });
+
+test('event replay sends typed entity IDs and rejects mixed namespaces', async () => {
+  let body;
+  globalThis.fetch = async (_url, options) => {
+    body = JSON.parse(options.body);
+    return jsonResponse({ type: 'FeatureCollection', features: [], metadata: {} });
+  };
+  await requestReplay({ tracksCrossIds: [7], detectId: 'detect' });
+  assert.deepEqual(body, { tracks_cross_ids: [7], detect_id: 'detect' });
+  await requestReplay({ turnEventIds: [8], detectId: 'detect' });
+  assert.deepEqual(body, { turn_event_ids: [8], detect_id: 'detect' });
+  for (const invalid of [
+    { tracksCrossIds: [7] }, { turnEventIds: [], detectId: 'detect' },
+    { tracksCrossIds: [7], sourceRowKeys: ['7'], detectId: 'detect' },
+    { tracksCrossIds: [7], turnEventIds: [8], detectId: 'detect' },
+  ]) await assert.rejects(requestReplay(invalid), MapApiError);
+});

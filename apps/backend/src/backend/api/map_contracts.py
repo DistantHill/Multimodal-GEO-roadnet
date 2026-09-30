@@ -4,7 +4,7 @@ import math
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 if TYPE_CHECKING:
     from ..config import MapConfig
@@ -41,6 +41,9 @@ class ReplayRequest(BaseModel):
     intersection_id: int | None = Field(default=None, ge=1)
     intersection_ids: list[int] | None = Field(default=None, min_length=1)
     centerline_ids: list[int] | None = Field(default=None, min_length=1)
+    tracks_cross_ids: list[int] | None = None
+    turn_event_ids: list[int] | None = None
+    injected_point_ids: list[int] | None = None
     database_name: str | None = Field(default=None, min_length=1, max_length=63)
     detect_id: UUID | None = None
     fit_id: UUID | None = None
@@ -87,17 +90,17 @@ class ReplayRequest(BaseModel):
             raise ValueError("source_row_keys must be distinct")
         return normalized
 
-    @field_validator("resolved_point_ids")
+    @field_validator("resolved_point_ids", "tracks_cross_ids", "turn_event_ids", "injected_point_ids")
     @classmethod
-    def validate_resolved_point_ids(cls, value: list[int] | None) -> list[int] | None:
+    def validate_point_and_event_ids(cls, value: list[int] | None, info: ValidationInfo) -> list[int] | None:
         if value is None:
             return None
         if not value:
-            raise ValueError("resolved_point_ids must not be empty")
+            raise ValueError(f"{info.field_name} must not be empty")
         if any(item <= 0 for item in value):
-            raise ValueError("resolved_point_ids must contain positive integers")
+            raise ValueError(f"{info.field_name} must contain positive integers")
         if len(set(value)) != len(value):
-            raise ValueError("resolved_point_ids must be distinct")
+            raise ValueError(f"{info.field_name} must be distinct")
         return value
 
     @field_validator("bbox")
@@ -115,16 +118,23 @@ class ReplayRequest(BaseModel):
             self.intersection_id,
             self.intersection_ids,
             self.centerline_ids,
+            self.tracks_cross_ids,
+            self.turn_event_ids,
+            self.injected_point_ids,
             self.source_row_keys,
             self.resolved_point_ids,
             self.bbox,
         )
         if sum(value is not None for value in selections) != 1:
             raise ValueError(
-                "provide exactly one of source_row_keys, resolved_point_ids, intersection_id, intersection_ids, or centerline_ids"
+                "provide exactly one of source_row_keys, resolved_point_ids, intersection_id, intersection_ids, centerline_ids, tracks_cross_ids, turn_event_ids, or injected_point_ids"
             )
         if self.resolved_point_ids is not None and self.detect_id is None:
             raise ValueError("resolved_point_ids requires detect_id")
+        if (self.tracks_cross_ids is not None or self.turn_event_ids is not None) and self.detect_id is None:
+            raise ValueError("event Replay requires detect_id")
+        if self.injected_point_ids is not None and self.detect_id is not None:
+            raise ValueError("injected point Replay uses Refine provenance, not detect_id")
         if self.centerline_ids is not None and (self.fit_id is None or self.detect_id is None):
             raise ValueError("centerline_ids requires fit_id and detect_id")
         return self
@@ -161,6 +171,9 @@ def resolve_replay_limits(request: ReplayRequest, config: "MapConfig") -> Replay
         ("centerline_ids", request.centerline_ids),
         ("source_row_keys", request.source_row_keys),
         ("resolved_point_ids", request.resolved_point_ids),
+        ("tracks_cross_ids", request.tracks_cross_ids),
+        ("turn_event_ids", request.turn_event_ids),
+        ("injected_point_ids", request.injected_point_ids),
     ):
         if values is not None and len(values) > config.replay_selection_ids_max:
             raise ValueError(

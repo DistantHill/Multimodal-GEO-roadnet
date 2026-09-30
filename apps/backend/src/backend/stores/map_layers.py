@@ -43,6 +43,16 @@ _SOURCE_KEY_TYPES = {
 
 _LAYER_DEFINITIONS = (
     {
+        "id": "tracks_cross", "title": "跨轨迹事件", "role": "point",
+        "geometry_type": "Point", "required_context": ["detect_id"],
+        "default_context": "latest completed Detect Run",
+    },
+    {
+        "id": "turn_event_geom", "title": "转向事件", "role": "point",
+        "geometry_type": "Point", "required_context": ["detect_id"],
+        "default_context": "latest completed Detect Run",
+    },
+    {
         "id": "resolved_subtrack_points",
         "title": "Resolved subtrack points",
         "role": "trajectory",
@@ -137,6 +147,18 @@ class PostgresMapStore:
                 for row in rows[:limit]
             ]
             metadata = {"detect_id": context.detect_id, "refine_id": context.refine.refine_id}
+        elif layer_id in {"tracks_cross", "turn_event_geom"}:
+            context = self._resolve_detect(detect_id)
+            table = "tracks_cross" if layer_id == "tracks_cross" else "turn_evnets_gemo"
+            bbox_clause, bbox_params = _bbox_clause("event.geom", bbox)
+            rows = self._fetchall(
+                "SELECT event.id, ST_AsGeoJSON(event.geom)::jsonb, to_jsonb(event) - 'geom' "
+                f"FROM {table} AS event WHERE event.detect_id = %s" + bbox_clause
+                + " ORDER BY event.id LIMIT %s OFFSET %s",
+                (context.detect_id, *bbox_params, limit + 1, offset),
+            )
+            features = [create_map_feature(row[0], row[1], **row[2]) for row in rows[:limit]]
+            metadata = {"detect_id": context.detect_id, "refine_id": context.refine.refine_id}
         elif layer_id == "centerlines":
             resolved_fit_id, resolved_detect_id = self._resolve_fit(fit_id)
             if detect_id is not None and str(detect_id) != resolved_detect_id:
@@ -171,18 +193,28 @@ class PostgresMapStore:
             return replay_centerlines(self, request, _require_config().map)
         if request.intersection_id is not None:
             from ..replay.select_intersection_members import replay_intersection
+            from ..replay.select_event_segments import expand_intersection_segments
 
-            return replay_intersection(self, request)
+            return expand_intersection_segments(self, request, replay_intersection(self, request))
         if request.intersection_ids is not None:
             from ..replay.select_intersection_members import replay_intersections
+            from ..replay.select_event_segments import expand_intersection_segments
 
-            return replay_intersections(self, request)
+            return expand_intersection_segments(self, request, replay_intersections(self, request))
+        if request.injected_point_ids is not None:
+            from ..replay.select_event_segments import replay_injected_points
+
+            return replay_injected_points(self, request)
+        if request.tracks_cross_ids is not None or request.turn_event_ids is not None:
+            from ..replay.select_event_segments import replay_events
+
+            return replay_events(self, request)
         detect = (
             self._resolve_detect(str(request.detect_id))
             if request.detect_id is not None
             else None
         )
-        refine = detect.refine if detect is not None else self._resolve_refine(None)
+        refine = detect.refine if detect is not None else self._resolve_refine(str(request.refine_id) if request.refine_id else None)
         if request.resolved_point_ids is not None:
             assert detect is not None
             selection = "resolved_point_ids"
@@ -726,8 +758,8 @@ class PostgresMapStore:
             " AND subtrack_index = ANY(%s::integer[])"
             " ORDER BY subtrack_index, sequence_in_subtrack LIMIT %s"
             ") SELECT point.subtrack_index, vehicle.vehicle_id, point.id, kept.source_row_key,"
-            " COALESCE(source.lon, injected.lon, crossing.crossing_lon),"
-            " COALESCE(source.lat, injected.lat, crossing.crossing_lat),"
+            " ST_X(COALESCE(source.geom, injected.geom, crossing.geom)),"
+            " ST_Y(COALESCE(source.geom, injected.geom, crossing.geom)),"
             " CASE WHEN point.kept_point_id IS NOT NULL THEN 'kept'"
             " WHEN point.injected_point_id IS NOT NULL THEN 'injected' ELSE 'crossing' END,"
             " crossing.id, intersection.id, crossing.crossing_type"
@@ -761,13 +793,13 @@ class PostgresMapStore:
             "SELECT subtrack_index, vehicle_id, NULL::bigint, source_row_key, "
             "lon, lat, point_kind, NULL::bigint, NULL::bigint, NULL::smallint FROM ("
             " SELECT kept.subtrack_index, kept.vehicle_id, kept.source_row_key, "
-            " source.lon, source.lat, 'kept'::text AS point_kind, "
+            " ST_X(source.geom) AS lon, ST_Y(source.geom) AS lat, 'kept'::text AS point_kind, "
             " kept.sequence_in_subtrack AS anchor_sequence, 0 AS kind_order, kept.id AS row_id "
             f" FROM kept_trajectory_points AS kept JOIN {refine.quoted_source_table} AS source "
             f" ON source.id = kept.source_row_key::{refine.source_key_sql_type} "
             " WHERE kept.refine_id = %s AND kept.subtrack_index = ANY(%s::integer[]) "
             " UNION ALL SELECT injected.subtrack_index, injected.vehicle_id, NULL::text, "
-            " injected.lon, injected.lat, 'injected', injected.after_sequence_in_subtrack, "
+            " ST_X(injected.geom), ST_Y(injected.geom), 'injected', injected.after_sequence_in_subtrack, "
             " 1, injected.id FROM injected_points AS injected WHERE injected.refine_id = %s "
             " AND injected.subtrack_index = ANY(%s::integer[])"
             ") AS refine_points ORDER BY subtrack_index, anchor_sequence, kind_order, row_id LIMIT %s",

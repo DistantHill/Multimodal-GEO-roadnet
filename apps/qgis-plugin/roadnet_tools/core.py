@@ -69,22 +69,45 @@ def endpoint_url(base_url: str, endpoint_path: str) -> str:
     return normalize_backend_url(base_url) + normalize_endpoint_path(endpoint_path)
 
 
-def build_replay_payload(records: Sequence[SelectionRecord], *, intersection_layer: bool = False) -> dict[str, Any]:
-    """Build a schema-v3 replay body from selected trajectory features."""
+def build_replay_payload(records: Sequence[SelectionRecord], *, intersection_layer: bool = False, source_table: str | None = None) -> dict[str, Any]:
+    """Build a typed replay body from selected database features."""
 
     if not records:
         raise ContractError("Select one or more trajectory points before Replay.")
 
-    if intersection_layer:
-        if len(records) != 1:
-            raise ContractError("交叉口 Replay 需要恰好选择一个交叉口。")
-        value = _first_present(records[0].properties, ("intersection_id", "id", "database_id"))
-        if value is None:
-            raise ContractError("交叉口图层缺少 intersections.id，无法回放。")
-        payload = {"intersection_id": _integer_identifier(value, "intersection ID", 1)}
+    if intersection_layer or source_table == "intersections":
+        ids = []
+        for record in records:
+            value = _first_present(record.properties, ("intersection_id", "id", "database_id"))
+            if value is None:
+                raise ContractError("交叉口图层缺少 intersections.id，无法回放。")
+            _append_unique(ids, _integer_identifier(value, "intersection ID", 1))
+        if len(ids) > 1000:
+            raise ContractError("Replay accepts at most 1000 intersections.")
+        payload = {"intersection_id": ids[0]} if len(ids) == 1 else {"intersection_ids": ids}
         detect_id = _common_property(records, "detect_id", required=False)
         if detect_id is not None:
             payload["detect_id"] = _uuid_identifier(detect_id)
+        return payload
+
+    selectors = {
+        "tracks_cross": "tracks_cross_ids",
+        "turn_evnets_gemo": "turn_event_ids",
+        "turn_events": "turn_event_ids",
+        "injected_points": "injected_point_ids",
+    }
+    if source_table in selectors:
+        ids = []
+        for record in records:
+            value = _first_present(record.properties, ("id", "database_id"))
+            if value is None:
+                raise ContractError("所选要素缺少数据库 id。")
+            _append_unique(ids, _integer_identifier(value, "source ID", 1))
+        if len(ids) > 1000:
+            raise ContractError("Replay accepts at most 1000 selected IDs.")
+        payload = {selectors[source_table]: ids}
+        context = "refine_id" if source_table == "injected_points" else "detect_id"
+        payload[context] = _uuid_identifier(_common_property(records, context, required=True))
         return payload
 
     resolved_point_ids: list[Any] = []
@@ -160,7 +183,7 @@ def build_clip_payload(records: Sequence[SelectionRecord]) -> dict[str, Any]:
 
     intersection_ids: list[Any] = []
     for record in records:
-        value = _first_present(record.properties, ("intersection_id",))
+        value = _first_present(record.properties, ("intersection_id", "id", "database_id"))
         if value is None:
             value = record.feature_id
         _append_unique(intersection_ids, _integer_identifier(value, "intersection ID", 1))

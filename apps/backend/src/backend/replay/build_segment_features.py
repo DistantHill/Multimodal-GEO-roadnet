@@ -6,14 +6,14 @@ from ..map_errors import MapDataError
 from .track_points import build_track_feature
 
 
-def build_segment_features(store, grouped, request, detect_id):
+def build_segment_features(store, grouped, request, detect_id, *, segment_start_ids=()):
     selected_ids = set(request.resolved_point_ids or [])
     selected_keys = set(request.source_row_keys or [])
     crossing_ids = [int(identifier) for track in grouped.values()
                     for identifier in track.crossing_ids[
                         track.resolved_valid & np.isin(track.resolved_point_ids, list(selected_ids))
                         & (track.point_kinds == "crossing") & track.crossing_valid]]
-    starts = set()
+    starts = set(segment_start_ids)
     if crossing_ids:
         rows = store._fetchall(
             "SELECT id, segment_start_point_id FROM candidate_entry_exit_points"
@@ -22,7 +22,7 @@ def build_segment_features(store, grouped, request, detect_id):
         )
         if {row[0] for row in rows} != set(crossing_ids):
             raise MapDataError("所选进出点的 segment 溯源记录缺失。")
-        starts = {row[1] for row in rows}
+        starts.update(row[1] for row in rows)
 
     def selected(track, index):
         return (track.resolved_valid[index] and int(track.resolved_point_ids[index]) in selected_ids) or (
