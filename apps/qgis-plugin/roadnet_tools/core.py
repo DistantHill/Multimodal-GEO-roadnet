@@ -92,7 +92,7 @@ def build_replay_payload(records: Sequence[SelectionRecord], *, intersection_lay
 
     selectors = {
         "tracks_cross": "tracks_cross_ids",
-        "turn_evnets_gemo": "turn_event_ids",
+        "turn_events_geom": "turn_event_ids",
         "turn_events": "turn_event_ids",
         "injected_points": "injected_point_ids",
     }

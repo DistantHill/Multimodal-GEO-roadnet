@@ -20,6 +20,7 @@ DETECT_ARTIFACT_TABLES = (
     "entry_exit_points",
     "intersections",
     "candidate_entry_exit_points",
+    "trun_hot_ponits",
     "turn_events",
     "tracks_cross",
     "resolved_subtrack_points",

@@ -26,9 +26,9 @@ def connection():
             conn.execute(sql.SQL("SET LOCAL search_path TO {}, public").format(sql.Identifier(schema)))
             for _, ddl in DDL_STATEMENTS:
                 conn.execute(ddl)
-            conn.execute(dict(POST_DDL_STATEMENTS)["turn_evnets_gemo_constraints"])
+            conn.execute(dict(POST_DDL_STATEMENTS)["turn_events_geom_constraints"])
             for name, ddl in INDEX_STATEMENTS:
-                if name.startswith("idx_turn_evnets_gemo"):
+                if name.startswith("idx_turn_events_geom"):
                     conn.execute(ddl)
             conn.execute("CREATE TABLE custom_source (id bigint PRIMARY KEY, geom geometry(Point,4326))")
             yield conn
@@ -73,16 +73,16 @@ def test_materializes_both_point_types_and_only_requested_run(connection):
     other, _ = seed(conn)
     assert materialize_turn_event_geom(conn, str(detect)) == 2
     rows = conn.execute("""
-        SELECT ST_AsText(geom), ST_SRID(geom) FROM turn_evnets_gemo ORDER BY id
+        SELECT ST_AsText(geom), ST_SRID(geom) FROM turn_events_geom ORDER BY id
     """).fetchall()
     assert rows == [("POINT(120 30)", 4326), ("POINT(121 31)", 4326)]
     assert conn.execute("""
-        SELECT count(*) FROM turn_evnets_gemo g JOIN turn_events e USING(id,detect_id)
+        SELECT count(*) FROM turn_events_geom g JOIN turn_events e USING(id,detect_id)
         WHERE (to_jsonb(g)-'geom') = to_jsonb(e)
     """).fetchone() == (2,)
     assert materialize_turn_event_geom(conn, str(other)) == 2
     conn.execute("DELETE FROM turn_events WHERE detect_id=%s", (detect,))
-    assert conn.execute("SELECT count(*) FROM turn_evnets_gemo").fetchone() == (2,)
+    assert conn.execute("SELECT count(*) FROM turn_events_geom").fetchone() == (2,)
 
 
 def test_missing_geometry_rolls_back_entire_insert(connection):
@@ -93,25 +93,25 @@ def test_missing_geometry_rolls_back_entire_insert(connection):
     conn.execute("UPDATE custom_source SET geom=NULL WHERE id=%s", (source,))
     with pytest.raises(psycopg.errors.NotNullViolation), conn.transaction():
         materialize_turn_event_geom(conn, str(detect))
-    assert conn.execute("SELECT count(*) FROM turn_evnets_gemo").fetchone() == (0,)
+    assert conn.execute("SELECT count(*) FROM turn_events_geom").fetchone() == (0,)
 
 
 def test_init_adopts_existing_ctas_without_losing_rows(connection):
     conn = connection
     detect, _ = seed(conn)
     materialize_turn_event_geom(conn, str(detect))
-    conn.execute("CREATE TEMP TABLE saved AS TABLE turn_evnets_gemo")
-    conn.execute("DROP TABLE turn_evnets_gemo")
-    conn.execute("CREATE TABLE turn_evnets_gemo AS TABLE saved")
+    conn.execute("CREATE TEMP TABLE saved AS TABLE turn_events_geom")
+    conn.execute("DROP TABLE turn_events_geom")
+    conn.execute("CREATE TABLE turn_events_geom AS TABLE saved")
     for _ in range(2):
-        conn.execute(dict(DDL_STATEMENTS)["turn_evnets_gemo"])
-        conn.execute(dict(POST_DDL_STATEMENTS)["turn_evnets_gemo_constraints"])
+        conn.execute(dict(DDL_STATEMENTS)["turn_events_geom"])
+        conn.execute(dict(POST_DDL_STATEMENTS)["turn_events_geom_constraints"])
         for name, ddl in INDEX_STATEMENTS:
-            if name.startswith("idx_turn_evnets_gemo"):
+            if name.startswith("idx_turn_events_geom"):
                 conn.execute(ddl)
-    assert conn.execute("SELECT count(*) FROM turn_evnets_gemo").fetchone() == (2,)
+    assert conn.execute("SELECT count(*) FROM turn_events_geom").fetchone() == (2,)
     conn.execute("DELETE FROM turn_events WHERE detect_id=%s", (detect,))
-    assert conn.execute("SELECT count(*) FROM turn_evnets_gemo").fetchone() == (0,)
+    assert conn.execute("SELECT count(*) FROM turn_events_geom").fetchone() == (0,)
 
 
 def test_empty_events_and_completed_snapshot_guard(connection):
@@ -127,7 +127,42 @@ def test_empty_events_and_completed_snapshot_guard(connection):
         assert materialize_turn_event_geom(conn, str(detect)) == 2
         conn.execute("UPDATE detect_runs SET status='completed' WHERE id=%s", (detect,))
         with pytest.raises(psycopg.errors.RaiseException, match="immutable"), conn.transaction():
-            conn.execute("UPDATE turn_evnets_gemo SET score=0 WHERE detect_id=%s", (detect,))
+            conn.execute("UPDATE turn_events_geom SET score=0 WHERE detect_id=%s", (detect,))
     other, _ = seed(conn)
     conn.execute("DELETE FROM turn_events WHERE detect_id=%s", (other,))
     assert materialize_turn_event_geom(conn, str(other)) == 0
+
+
+def test_hot_points_preserve_g_star_inputs_including_dbscan_noise(connection):
+    from track.v2.db.write_detect_results import materialize_turn_hot_points
+
+    conn = connection
+    detect, _ = seed(conn)
+    other, _ = seed(conn)
+    hotspot_id = conn.execute(
+        "SELECT min(id) FROM turn_events WHERE detect_id=%s", (detect,),
+    ).fetchone()[0]
+    # A selected hotspot with no candidate is DBSCAN noise and must be kept.
+    conn.execute("UPDATE turn_events SET g_star_z=2.5 WHERE id=%s", (hotspot_id,))
+    conn.execute("UPDATE turn_events SET g_star_z=3 WHERE detect_id=%s", (other,))
+    materialize_turn_event_geom(conn, str(detect))
+    materialize_turn_event_geom(conn, str(other))
+    assert materialize_turn_hot_points(conn, str(detect)) == 1
+    assert conn.execute("""
+        SELECT id, g_star_z, candidate_intersection_id, ST_AsText(geom)
+        FROM trun_hot_ponits
+    """).fetchall() == [(hotspot_id, 2.5, None, 'POINT(120 30)')]
+    assert materialize_turn_hot_points(conn, str(other)) == 2
+    assert conn.execute("""
+        SELECT count(*) FROM trun_hot_ponits h JOIN turn_events_geom g USING(id,detect_id)
+        WHERE to_jsonb(h)=to_jsonb(g)
+    """).fetchone() == (3,)
+    post = dict(POST_DDL_STATEMENTS)
+    conn.execute(post['guard_detect_artifact_mutation_function'])
+    conn.execute(post['detect_artifact_mutation_triggers'])
+    conn.execute("UPDATE detect_runs SET status='completed' WHERE id=%s", (other,))
+    import psycopg
+    with pytest.raises(psycopg.errors.RaiseException, match='immutable'), conn.transaction():
+        conn.execute("UPDATE trun_hot_ponits SET score=0 WHERE detect_id=%s", (other,))
+    conn.execute("DELETE FROM turn_events WHERE detect_id=%s", (detect,))
+    assert conn.execute("SELECT count(*) FROM trun_hot_ponits").fetchone() == (2,)

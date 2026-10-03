@@ -291,11 +291,24 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         """,
     ),
     (
-        "turn_evnets_gemo",
+        "turn_events_geom",
         """
-        CREATE TABLE IF NOT EXISTS turn_evnets_gemo (
+        CREATE TABLE IF NOT EXISTS turn_events_geom (
             LIKE turn_events,
             geom geometry(Point, 4326) NOT NULL
+        )
+        """,
+    ),
+    (
+        "trun_hot_ponits",
+        """
+        CREATE TABLE IF NOT EXISTS trun_hot_ponits (
+            LIKE turn_events,
+            geom geometry(Point, 4326) NOT NULL,
+            CONSTRAINT trun_hot_ponits_pkey PRIMARY KEY (id),
+            CONSTRAINT trun_hot_ponits_event_fkey FOREIGN KEY (id, detect_id)
+                REFERENCES turn_events(id, detect_id) ON DELETE CASCADE,
+            CONSTRAINT trun_hot_ponits_g_star_required CHECK (g_star_z IS NOT NULL)
         )
         """,
     ),
@@ -537,14 +550,22 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
 
 INDEX_STATEMENTS: list[tuple[str, str]] = [
     (
-        "idx_turn_evnets_gemo_id",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_turn_evnets_gemo_id "
-        "ON turn_evnets_gemo(id)",
+        "idx_trun_hot_ponits_detect",
+        "CREATE INDEX IF NOT EXISTS idx_trun_hot_ponits_detect ON trun_hot_ponits(detect_id)",
     ),
     (
-        "idx_turn_evnets_gemo_detect",
-        "CREATE INDEX IF NOT EXISTS idx_turn_evnets_gemo_detect "
-        "ON turn_evnets_gemo(detect_id)",
+        "idx_trun_hot_ponits_geom",
+        "CREATE INDEX IF NOT EXISTS idx_trun_hot_ponits_geom ON trun_hot_ponits USING GIST (geom)",
+    ),
+    (
+        "idx_turn_events_geom_id",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_turn_events_geom_id "
+        "ON turn_events_geom(id)",
+    ),
+    (
+        "idx_turn_events_geom_detect",
+        "CREATE INDEX IF NOT EXISTS idx_turn_events_geom_detect "
+        "ON turn_events_geom(detect_id)",
     ),
 
     (
@@ -664,9 +685,9 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
 
 POST_DDL_STATEMENTS: list[tuple[str, str]] = [
     (
-        "turn_evnets_gemo_constraints",
+        "turn_events_geom_constraints",
         """
-        ALTER TABLE turn_evnets_gemo
+        ALTER TABLE turn_events_geom
             ALTER COLUMN id SET NOT NULL,
             ALTER COLUMN detect_id SET NOT NULL,
             ALTER COLUMN geom SET NOT NULL;
@@ -674,11 +695,11 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
         BEGIN
             IF NOT EXISTS (
                 SELECT 1 FROM pg_constraint
-                WHERE conrelid = 'turn_evnets_gemo'::regclass
-                  AND conname = 'turn_evnets_gemo_event_fkey'
+                WHERE conrelid = 'turn_events_geom'::regclass
+                  AND conname = 'turn_events_geom_event_fkey'
             ) THEN
-                ALTER TABLE turn_evnets_gemo
-                    ADD CONSTRAINT turn_evnets_gemo_event_fkey
+                ALTER TABLE turn_events_geom
+                    ADD CONSTRAINT turn_events_geom_event_fkey
                     FOREIGN KEY (id, detect_id)
                     REFERENCES turn_events(id, detect_id) ON DELETE CASCADE;
             END IF;
@@ -1623,7 +1644,8 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                 'candidate_intersections',
                 'tracks_cross',
                 'turn_events',
-                'turn_evnets_gemo',
+                'turn_events_geom',
+                'trun_hot_ponits',
                 'candidate_entry_exit_points',
                 'intersections',
                 'entry_exit_points'
@@ -2011,6 +2033,7 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
 
 
 LEGACY_TABLES = (
+    "turn_evnets_gemo",
     "clean_runs",
     "candidate_intersection_events",
     "pipeline_runs",
@@ -2030,7 +2053,10 @@ def _schema_version(cur: Any) -> int | None:
 
 
 def _existing_pipeline_tables(cur: Any) -> list[str]:
-    names = [name for name, _ in DDL_STATEMENTS if name != "pipeline_schema_versions"]
+    names = [
+        name for name, _ in DDL_STATEMENTS
+        if name not in {"pipeline_schema_versions", "trajectory_points"}
+    ]
     names.extend(LEGACY_TABLES)
     cur.execute(
         """
@@ -2067,8 +2093,10 @@ def _require_empty_or_current(cur: Any) -> None:
 
 
 def reset_tables(config: PostgresConfig) -> int:
-    """Explicitly discard all known Pipeline tables, including legacy names."""
-    current_names = [name for name, _ in reversed(DDL_STATEMENTS)]
+    """Discard Pipeline results and legacy tables, preserving source trajectories."""
+    current_names = [
+        name for name, _ in reversed(DDL_STATEMENTS) if name != "trajectory_points"
+    ]
     drop_names = [*current_names, *LEGACY_TABLES]
     with pg_connect(config) as conn:
         with conn.cursor() as cur:
@@ -2076,6 +2104,7 @@ def reset_tables(config: PostgresConfig) -> int:
             database, user, schema = cur.fetchone()
             print("\n── 重置目标核对 / Reset Target ──")
             print(f"  database={database} user={user} schema={schema}")
+            print("  保留 / Preserved: trajectory_points (data and sequence)")
             print("\n── 重置数据表 / Resetting Tables ──")
             for name in drop_names:
                 cur.execute(f'DROP TABLE IF EXISTS "{name}" CASCADE')
@@ -2192,7 +2221,8 @@ def main() -> int:
     migration.add_argument(
         "--reset",
         action="store_true",
-        help="Destructively drop all known Pipeline tables before creating v9.",
+        help="Drop Pipeline result and legacy tables before creating v9; "
+        "preserve trajectory_points data and its ID sequence.",
     )
     migration.add_argument(
         "--migrate-artifacts", action="store_true",

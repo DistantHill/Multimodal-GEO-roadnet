@@ -195,6 +195,7 @@ def _persist_detect_result(conn, detect_id, result, *, batch_size, workspace):
     tracks_cross_count = _insert_tracks_cross(conn, detect_id, workspace, batch_size=batch_size)
     turn_event_count = _insert_turn_events(conn, detect_id, workspace, batch_size=batch_size)
     materialize_turn_event_geom(conn, detect_id)
+    materialize_turn_hot_points(conn, detect_id)
     _insert_candidate_crossings(conn, detect_id, workspace, batch_size=batch_size)
     _insert_intersections(
         conn,
@@ -213,6 +214,16 @@ def _persist_detect_result(conn, detect_id, result, *, batch_size, workspace):
         intersection_by_calculation,
         crossing_id_by_calculation,
     )
+    # Export joins several freshly populated tables by this new Detect UUID.
+    # Publish their statistics with the rows instead of waiting for autovacuum,
+    # which can otherwise leave the export plan estimating one matching row.
+    with conn.cursor() as cur:
+        cur.execute(
+            "ANALYZE resolved_subtrack_points, candidate_entry_exit_points, "
+            "candidate_intersections, intersections, entry_exit_points, "
+            "turn_events, tracks_cross, detect_runs, turn_events_geom, "
+            "trun_hot_ponits"
+        )
     return DetectWriteCounts(
         resolved_point_count=resolved_point_count,
         tracks_cross_count=tracks_cross_count,
@@ -468,7 +479,7 @@ def materialize_turn_event_geom(conn: Any, detect_id: str) -> int:
         source = quote_table_name(str(row[0]))
         cur.execute(
             f"""
-            INSERT INTO turn_evnets_gemo (
+            INSERT INTO turn_events_geom (
                 id, detect_id, candidate_intersection_id, resolved_point_id,
                 entry_bearing, exit_bearing, turn_deg, score, g_star_z,
                 created_at, geom
@@ -479,11 +490,40 @@ def materialize_turn_event_geom(conn: Any, detect_id: str) -> int:
                    COALESCE(tp.geom, ip.geom)
             FROM turn_events te
             LEFT JOIN resolved_subtrack_points rp
-              ON rp.id = te.resolved_point_id AND rp.detect_id = te.detect_id
+              -- The composite event FK already enforces matching Detect IDs.
+              -- Joining by the global PK avoids a detect-only scan with stale
+              -- statistics immediately after COPY inserts a new Run.
+              ON rp.id = te.resolved_point_id
             LEFT JOIN kept_trajectory_points kp ON kp.id = rp.kept_point_id
             LEFT JOIN {source} tp ON tp.id = kp.source_row_key
             LEFT JOIN injected_points ip ON ip.id = rp.injected_point_id
             WHERE te.detect_id = %s
+            """,
+            (detect_id,),
+        )
+        return int(cur.rowcount)
+
+
+@observed_operation("物化转向热点")
+def materialize_turn_hot_points(conn: Any, detect_id: str) -> int:
+    """Persist G* selected DBSCAN inputs, including unclustered noise.
+
+    Writer annotations assign g_star_z only to result.hotspot_events.
+    Candidate membership is deliberately independent of hotspot selection.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO trun_hot_ponits (
+                id, detect_id, candidate_intersection_id, resolved_point_id,
+                entry_bearing, exit_bearing, turn_deg, score, g_star_z,
+                created_at, geom
+            )
+            SELECT id, detect_id, candidate_intersection_id, resolved_point_id,
+                   entry_bearing, exit_bearing, turn_deg, score, g_star_z,
+                   created_at, geom
+            FROM turn_events_geom
+            WHERE detect_id = %s AND g_star_z IS NOT NULL
             """,
             (detect_id,),
         )

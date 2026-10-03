@@ -8,6 +8,7 @@ from track.v2.cli.init_db import (
     POST_DDL_STATEMENTS,
     SCHEMA_COMPONENT,
     SCHEMA_VERSION,
+    _existing_pipeline_tables,
     _require_empty_or_current,
 )
 
@@ -289,6 +290,18 @@ def test_unversioned_schema_is_refused_without_reset() -> None:
 
 def test_existing_v9_schema_is_accepted() -> None:
     _require_empty_or_current(_VersionCursor(9, ["refine_runs"]))
+
+
+def test_source_table_alone_does_not_require_reset() -> None:
+    class SourceCursor(_VersionCursor):
+        def execute(self, sql: str, params: object = None) -> None:
+            super().execute(sql, params)
+            if "information_schema.tables" in sql:
+                self.tables = [name for name in params[0] if name == "trajectory_points"]
+
+    cursor = SourceCursor(None, ["trajectory_points"])
+    assert _existing_pipeline_tables(cursor) == []
+    _require_empty_or_current(cursor)
 
 
 @pytest.mark.parametrize("version", [4, 5, 6, 7, 8])

@@ -56,7 +56,7 @@ class RequestContractTests(unittest.TestCase):
 
     def test_event_and_injected_entity_ids_never_become_source_keys(self):
         for table, field in (("tracks_cross", "tracks_cross_ids"),
-                             ("turn_evnets_gemo", "turn_event_ids")):
+                             ("turn_events_geom", "turn_event_ids")):
             payload = build_replay_payload([record({"id": 7, "detect_id": DETECT_ID})], source_table=table)
             self.assertEqual(payload, {field: [7], "detect_id": DETECT_ID})
         payload = build_replay_payload([record({"id": 7, "refine_id": DETECT_ID})], source_table="injected_points")

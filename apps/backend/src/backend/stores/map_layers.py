@@ -149,7 +149,7 @@ class PostgresMapStore:
             metadata = {"detect_id": context.detect_id, "refine_id": context.refine.refine_id}
         elif layer_id in {"tracks_cross", "turn_event_geom"}:
             context = self._resolve_detect(detect_id)
-            table = "tracks_cross" if layer_id == "tracks_cross" else "turn_evnets_gemo"
+            table = "tracks_cross" if layer_id == "tracks_cross" else "turn_events_geom"
             bbox_clause, bbox_params = _bbox_clause("event.geom", bbox)
             rows = self._fetchall(
                 "SELECT event.id, ST_AsGeoJSON(event.geom)::jsonb, to_jsonb(event) - 'geom' "
