@@ -25,6 +25,9 @@ def test_publish_uses_one_rename_and_makes_tree_read_only(tmp_path, monkeypatch)
     real_rename = os.rename
     def observed_rename(source, target):
         calls.append((source, target))
+        assert stat.S_IMODE(source.stat().st_mode) == 0o755
+        assert stat.S_IMODE(table.stat().st_mode) == 0o555
+        assert stat.S_IMODE(data.stat().st_mode) == 0o444
         real_rename(source, target)
 
     monkeypatch.setattr(os, "rename", observed_rename)
@@ -115,7 +118,7 @@ def test_rename_failure_leaves_cleanable_staging_and_no_final(tmp_path, monkeypa
         raise OSError("failed")
 
     monkeypatch.setattr(os, "rename", fail_rename)
-    with pytest.raises(publication.PublicationError, match="rename failed"):
+    with pytest.raises(publication.PublicationError, match="rename failed: failed"):
         publication.publish(handle)
     assert not handle.final_path.exists()
     assert stat.S_IMODE(data.stat().st_mode) == 0o644

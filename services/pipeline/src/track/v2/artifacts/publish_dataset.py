@@ -159,7 +159,7 @@ def _scan_and_sync(handle: StagingDataset) -> tuple[str, ...]:
     return tuple(sorted(files))
 
 
-def _set_tree_modes(path: Path, *, readonly: bool) -> None:
+def _set_tree_modes(path: Path, *, readonly: bool, writable_root: bool = False) -> None:
     file_mode, directory_mode = (0o444, 0o555) if readonly else (0o644, 0o755)
     for current, names, filenames in os.walk(path, topdown=False):
         directory = Path(current)
@@ -170,7 +170,7 @@ def _set_tree_modes(path: Path, *, readonly: bool) -> None:
                 os.fsync(stream.fileno())
         for name in names:
             (directory / name).chmod(directory_mode)
-        directory.chmod(directory_mode)
+        directory.chmod(0o755 if writable_root and directory == path else directory_mode)
         descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(descriptor)
@@ -179,7 +179,7 @@ def _set_tree_modes(path: Path, *, readonly: bool) -> None:
 
 
 def publish(handle: StagingDataset) -> PublicationResult:
-    """Make an owned dataset read-only, then atomically rename it into final."""
+    """Atomically publish an owned dataset and seal its final directory read-only."""
     _validate_handle(handle)
     files = _scan_and_sync(handle)
     handle.final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -188,7 +188,9 @@ def publish(handle: StagingDataset) -> PublicationResult:
         raise PublicationError("final dataset already exists")
     if handle.path.stat().st_dev != handle.final_path.parent.stat().st_dev:
         raise PublicationError("staging and final paths are on different filesystems")
-    _set_tree_modes(handle.path, readonly=True)
+    # Moving a directory between parents updates its ".." entry on POSIX.
+    # Keep its root writable until rename; files and child directories are sealed.
+    _set_tree_modes(handle.path, readonly=True, writable_root=True)
     try:
         os.rename(handle.path, handle.final_path)
     except OSError as exc:
@@ -196,13 +198,15 @@ def publish(handle: StagingDataset) -> PublicationResult:
             _set_tree_modes(handle.path, readonly=False)
         except OSError:
             pass
-        raise PublicationError("atomic dataset rename failed") from exc
+        raise PublicationError(f"atomic dataset rename failed: {exc}") from exc
+    handle.final_path.chmod(0o555)
     _marker_path(handle).unlink()
-    descriptor = os.open(handle.final_path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    for directory in (handle.final_path, handle.final_path.parent):
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
     relative = handle.final_path.relative_to(handle.root).as_posix()
     return PublicationResult(handle.root, relative, handle.final_path, files)
 
