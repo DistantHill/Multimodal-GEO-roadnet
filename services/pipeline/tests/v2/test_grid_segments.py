@@ -256,3 +256,20 @@ def test_grid_owner_native_temp_spill_and_quota_retry(tmp_path):
     finally:
         owner.close()
     assert not list((tmp_path / "duckdb").iterdir())
+
+
+def test_spilled_text_columns_preserve_unicode_and_empty_reasons(tmp_path):
+    first = _point(10, 0, 0.0)
+    injected = _point(20, 1, 1.0, kind=1)
+    injected['generated_reason'] = '正交补点：转向'
+    third = _point(11, 2, 2.0)
+    batch = _batch(_row('陕A-长车辆标识', first, next_=injected),
+                   _row('陕A-长车辆标识', injected, prev=first, next_=third))
+    expected = build_grid_segments([batch], max_segments=10, max_bytes=100_000)
+    runtime = SimpleNamespace(duckdb_memory_limit='16MB', duckdb_threads=1,
+                              duckdb_max_temp_directory_size='64MB')
+    with open_grid_segments([batch], max_segments=0, max_bytes=100_000,
+                            runtime=runtime, data_root=tmp_path) as owner:
+        actual = owner.block(0, owner.count)
+        for name in expected:
+            np.testing.assert_array_equal(actual[name], expected[name])

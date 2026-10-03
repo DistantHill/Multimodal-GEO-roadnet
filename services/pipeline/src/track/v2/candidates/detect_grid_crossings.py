@@ -170,6 +170,8 @@ def iter_spilled_grid_candidates(relation: GridSegmentRelation, cfg, transformer
             timing.values["speed_rejected_segments"] += int(np.count_nonzero(~speed_ok))
             timing.values["straight_segments"] += int(np.count_nonzero(straight))
             timing.values["eligible_segments"] += int(np.count_nonzero(straight & speed_ok))
+        if not np.any(straight & speed_ok):
+            continue
         for second in range(first, total, block_size):
             with timing.measure("gather_s"):
                 right = left if first == second else relation.block(second, block_size)
@@ -177,10 +179,6 @@ def iter_spilled_grid_candidates(relation: GridSegmentRelation, cfg, transformer
                 if first == second:
                     segments = left
                     bearings = left_bearings
-                    pairs = _iter_cross_subtrack_pair_batches(
-                        np.arange(len(left["subtrack_index"]), dtype=np.int64),
-                        left["subtrack_index"], pair_size,
-                    )
                 else:
                     segments = {name: np.concatenate((left[name], right[name])) for name in left}
                     right_bearings = _endpoint_bearings(
@@ -189,15 +187,19 @@ def iter_spilled_grid_candidates(relation: GridSegmentRelation, cfg, transformer
                     )
                     bearings = np.concatenate((left_bearings, right_bearings))
                     base = len(left["subtrack_index"])
-                    pairs = _iter_pair_batches(
-                        np.arange(base, dtype=np.int64),
-                        np.arange(base, len(segments["subtrack_index"]), dtype=np.int64),
-                        pair_size,
-                    )
                 headings = np.asarray(segments["heading"], dtype=np.float64)
                 end_heading = np.asarray(segments["end_heading"], dtype=np.float64)
                 straight = np.abs((end_heading - headings + 180.0) % 360.0 - 180.0) <= threshold
                 straight &= (segments["speed"] + segments["end_speed"]) / 2.0 >= cfg.cross_track_min_avg_speed
+                if first == second:
+                    pairs = _iter_cross_subtrack_pair_batches(
+                        np.flatnonzero(straight), left["subtrack_index"], pair_size,
+                    )
+                else:
+                    pairs = _iter_pair_batches(
+                        np.flatnonzero(straight[:base]),
+                        base + np.flatnonzero(straight[base:]), pair_size,
+                    )
                 starts = np.column_stack((segments["x_start"], segments["y_start"]))
                 ends = np.column_stack((segments["x_end"], segments["y_end"]))
                 if not (np.isfinite(starts[straight]).all() and np.isfinite(ends[straight]).all()

@@ -149,7 +149,13 @@ class GridSegmentRelation:
         size = len(piece["subtrack_index"])
         if not size:
             return
-        columns = {name: piece[name] for name in _COLUMNS}
+        # Text values are non-null strings (_pieces normalizes missing reasons).
+        # Unicode arrays avoid DuckDB's object scanner repeatedly importing the
+        # optional pandas dependency for each string when pandas is absent.
+        columns = {
+            name: np.asarray(piece[name], dtype=str) if name in _TEXT else piece[name]
+            for name in _COLUMNS
+        }
         columns["input_order"] = np.arange(self._next_order, self._next_order + size, dtype=np.int64)
         relation = "segment_batch_" + uuid4().hex
         self._connection.register(relation, columns)

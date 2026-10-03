@@ -158,3 +158,34 @@ def test_endpoint_angle_is_shared_by_grid_overflow_spill_and_sql(tmp_path, angle
             np.testing.assert_allclose(result.xy, [[0., 0.]], atol=1e-12)
             # Geometric direction is internal; source metadata remains intact.
             assert result.heading.tolist() == [0.]
+
+
+def test_spilled_grid_skips_pairs_for_speed_rejected_blocks(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from track.v2.candidates import detect_grid_crossings as grids
+    from track.v2.candidates.grid_segments import GridSegmentRelation
+    from track.v2.candidates.cross_track_timing import CrossTrackTiming
+
+    segments = _grid_columns([
+        subtrack([[-20., 0.], [20., 0.]], subtrack_index=1, headings=[90., 90.]),
+        subtrack([[0., -20.], [0., 20.]], subtrack_index=2),
+    ])
+    cfg = replace(intersect_config(), cross_track_min_avg_speed=100.)
+    timing = CrossTrackTiming()
+
+    def unexpected_pairs(*args, **kwargs):
+        raise AssertionError('rejected blocks must not enumerate segment pairs')
+
+    monkeypatch.setattr(grids, '_iter_pair_batches', unexpected_pairs)
+    monkeypatch.setattr(grids, '_iter_cross_subtrack_pair_batches', unexpected_pairs)
+    relation = GridSegmentRelation(runtime_config(), tmp_path)
+    try:
+        relation.append(segments)
+        relation.finish()
+        assert list(grids.iter_spilled_grid_candidates(
+            relation, cfg, TRANSFORMER, block_size=1, timing=timing,
+        )) == []
+        assert timing.values['speed_rejected_segments'] == 2
+        assert timing.values['eligible_segments'] == 0
+    finally:
+        relation.close()
