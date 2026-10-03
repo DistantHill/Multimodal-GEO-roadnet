@@ -4,7 +4,7 @@
 
 状态：已确认
 创建日期：2026-09-13
-更新日期：2026-09-30
+更新日期：2026-10-02
 访谈进度：Q1–Q8 已回答；用户确认实施。
 
 ## 1. 背景与问题
@@ -82,6 +82,43 @@ Q1–Q8 已回答并确认实施；浏览器端实际操作与 QGIS 3.44 目标�
 ## 10. 确认记录
 
 设计确认：Q8 用户明确回答“确认实施”。用户已确认实施；代码与自动验证已完成，环境验收限制见第 8 节。
+
+## 2026-10-02 扩展：交叉口分层溯源
+
+用户直接提出新功能，实施已获该请求授权，不启动新一轮访谈。原 0.2.0 的问答和测试记录保持其历史适用范围。
+
+交叉口 Replay 遍历 `intersection → turn_events / tracks_cross → resolved 点与来源 segment → 完整 subtrack`，将各层保留到返回结果中。递归的终点是完整子轨迹，不发现或生成新的业务要素。
+
+QGIS 的 `tmp` 组包含 `tmp.turn_events`、`tmp.cross_points`、`tmp.segments`、`tmp.subtracks`。其中 cross_points 对应产生交叉口的 tracks_cross 事件；完整子轨迹灰色 alpha=0.5，相关来源段洋红色，事件点另用蓝色及橙色。每个图层可独立开关。无该类事件时提供空图层。
+
+Backend 继续返回 GeoJSON FeatureCollection，属性 replay_layer 标记输出层，metadata.replay_layers 声明图层及空层类型。事件层保留数据库身份和所选交叉口关系；线段、子轨迹属性 events 保留准确上游事件关系。共享事件、来源段和子轨迹去重，完整子轨迹保持原顺序及 injected 几何。普通点、单独事件与 Clip 的既有返回方式继续适用。
+
+查询使用既有预算：超出车辆、点数或事件数上限时拒绝残缺结果；来源缺失时不替换上次输出。前端兼容分层标记，分别显示事件、子轨迹背景和来源段。
+
+2026-10-02 验证完成：
+
+- Backend 全套启用 PostgreSQL 临时表集成测试：122 passed；涵盖单交叉口转向分支、多交叉口共享事件去重、完整子轨迹及上游属性、中间事件 geom 缺失拒绝部分输出。
+- QGIS：31 项通过；实际本机 QGIS 3.22.4 运行时验证相同几何类型按语义分层、四层命名、事件点可见样式、空图层与失败保留旧输出。
+- 前端：3 个测试文件通过，静态构建成功；事件点样式兼容分层返回。
+- make test：Compose 18 项通过；Backend 119 passed、3 skipped；Pipeline 1266 passed、76 skipped、12 个既有 rasterio 警告。Pipeline 使用 /app/config/pipeline.toml ，对应 services/pipeline/config/pipeline.toml ，仅执行 pytest 套件，无全量数据作业。
+- git diff --check 通过。插件 0.3.0 安装包 ZIP 校验通过，并确认版本字段；文件位于 apps/qgis-plugin/qgis插件.zip ，属于 reid 且权限为 644。
+
+环境限制延续上轮：未验证目标 QGIS 3.44 桌面及真实浏览器操作。上述后端验证使用临时表并回滚，未改业务数据。
+
+### 前端界面同步
+
+用户追加要求“前端界面也同步实现”。前端将交叉口 Replay 返回的四种语义要素分别加载为独立矢量图层，归入 `tmp` 组：`tmp.turn_events`、`tmp.cross_points`、`tmp.segments`、`tmp.subtracks`。支持展开、折叠、整组或单层显隐、按名称或中文说明筛选，并显示各层数量；无该类要素时保留声明的空图层。完整子轨迹为灰色 alpha=0.5，相关来源段为洋红色，事件点显示在来源段之上。
+
+选择临时子图层后，可点选或框选查看来源属性，包括 detect_id、subtrack_index、resolved_point_ids、source_row_keys、events 和 intersection_ids 等返回字段。单选默认展开属性，多选逐项展开。临时结果不作为新 Replay 或 Clip 的输入；切回业务图层后恢复原操作。普通点、独立事件 Replay 与 Clip 的既有输出归入 `tmp.result`，保留原样式及几何。
+
+新结果完成分层校验与几何解析后才替换旧结果。清除结果会移除所有临时子图层及其选择；刷新业务图层保留临时结果。总要素数仅统计各个实际图层，避免与组的汇总重复计数。
+
+2026-10-02 验证记录：
+
+- `make frontend-test`：4 个测试文件通过，新增 6 项分层及属性回归用例，静态构建通过；主模块语法检查通过。
+- 当前开发前端容器构建通过；通过 HTTP 读取 main.js、result-layers.js、style.css，均返回 200 且内容与挂载源码一致。
+- `make test`：Compose 18 项通过；Backend 119 passed、3 skipped；Pipeline 1266 passed、76 skipped、12 个既有 rasterio 警告。Pipeline 使用 /app/config/pipeline.toml ，对应 services/pipeline/config/pipeline.toml ，仅运行 pytest 套件。
+- 当前浏览器工具未连接任何浏览器；本轮未完成真实浏览器点击与截图验收。
 
 ## 历史附录：原规格（2026-09-13）
 

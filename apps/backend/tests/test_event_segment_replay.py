@@ -51,16 +51,56 @@ def test_turn_event_keeps_injected_endpoint_and_full_subtrack_context():
 
 def test_two_intersections_expand_shared_events_once():
     store = store_with_tracks()
-    store._fetchall = Mock(return_value=[(90, 2, 12)])
-    members = {"features": [{"properties": {"events": [{"kind": "tracks_cross", "id": 90}]}}] * 2,
+    geometry = {"type": "Point", "coordinates": [108.002, 34]}
+    props = {"id": 90, "detect_id": DETECT, "from_segment_start_point_id": 2, "to_segment_start_point_id": 12}
+    store._fetchall = Mock(return_value=[(90, 2, 12, geometry, props)])
+    members = {"features": [{"properties": {"intersection_id": i, "events": [{"kind": "tracks_cross", "id": 90}]}}
+                             for i in [1, 2]],
                "metadata": {"selection": "intersection_ids", "intersection_ids": [1, 2], "detect_id": DETECT,
                             "operation": "replay", "returned_point_count": 4, "truncated": False}}
     with patch("backend.replay.select_intersection_members.replay_intersections", return_value=members):
         result = store.replay(ReplayRequest(intersection_ids=[1, 2]))
-    assert len(result["features"]) == 6
+    assert len(result["features"]) == 5  # event + two exact segments + two whole subtracks
     assert result["metadata"]["intersection_ids"] == [1, 2]
     assert result["metadata"]["highlight_segment_count"] == 2
     store._fetchall.assert_called_once()
+    layers = {name: [f for f in result["features"] if f["properties"]["replay_layer"] == name]
+              for name in ("turn_events", "cross_points", "subtracks", "segments")}
+    assert len(layers["cross_points"]) == 1
+    assert layers["cross_points"][0]["properties"]["intersection_ids"] == [1, 2]
+    assert len(layers["subtracks"]) == 2
+    assert [f["properties"]["point_count"] for f in layers["subtracks"]] == [4, 4]
+    assert all(f["properties"]["events"][0]["id"] == 90 for f in layers["segments"] + layers["subtracks"])
+    assert len({f["id"] for f in result["features"]}) == 5
+
+
+def test_intersection_turn_event_is_visible_and_reaches_complete_subtrack():
+    store = store_with_tracks()
+    store._fetchall = Mock(return_value=[(80, 3, {"type": "Point", "coordinates": [108.003, 34]},
+                                          {"id": 80, "detect_id": DETECT, "resolved_point_id": 3})])
+    store._select_resolved_tracks.return_value = ([1], {3}, False)
+    store._fetch_resolved_tracks.return_value = [point(i) for i in range(1, 6)]
+    members = {"features": [{"properties": {"intersection_id": 1, "events": [{"kind": "turn_event", "id": 80}]}}],
+               "metadata": {"selection": "intersection_id", "intersection_id": 1, "detect_id": DETECT}}
+    with patch("backend.replay.select_intersection_members.replay_intersection", return_value=members):
+        result = store.replay(ReplayRequest(intersection_id=1))
+    assert result["metadata"]["returned_turn_event_count"] == 1
+    assert result["metadata"]["returned_subtrack_count"] == 1
+    assert result["metadata"]["returned_segment_count"] == 2
+    subtrack = next(f for f in result["features"] if f["properties"]["replay_layer"] == "subtracks")
+    assert subtrack["properties"]["resolved_point_ids"] == [1, 2, 3, 4, 5]
+    assert subtrack["properties"]["events"] == [{"kind": "turn_events", "id": 80, "intersection_ids": [1]}]
+
+
+def test_intersection_missing_intermediate_geom_keeps_replay_from_returning_partial_chain():
+    store = store_with_tracks()
+    store._fetchall = Mock(return_value=[(90, 2, 12, None, {})])
+    members = {"features": [{"properties": {"events": [{"kind": "tracks_cross", "id": 90}]}}],
+               "metadata": {"selection": "intersection_id", "intersection_id": 1, "detect_id": DETECT}}
+    with patch("backend.replay.select_intersection_members.replay_intersection", return_value=members):
+        with pytest.raises(MapDataError, match="geom"):
+            store.replay(ReplayRequest(intersection_id=1))
+
 
 
 def test_injected_replay_uses_kept_brackets_without_detect():
@@ -122,7 +162,7 @@ def test_event_and_injected_queries_against_postgis():
                 from_segment_start_point_id bigint, to_segment_start_point_id bigint, geom geometry(Point,4326));
             CREATE TEMP TABLE turn_events (id bigint, detect_id uuid, candidate_intersection_id bigint,
                 resolved_point_id bigint);
-            CREATE TEMP TABLE turn_evnets_gemo (LIKE turn_events, geom geometry(Point,4326));
+            CREATE TEMP TABLE turn_events_geom (LIKE turn_events, geom geometry(Point,4326));
             CREATE TEMP TABLE candidate_entry_exit_points (id bigint, detect_id uuid,
                 candidate_intersection_id bigint, crossing_type int, segment_start_point_id bigint,
                 geom geometry(Point,4326));
@@ -144,7 +184,7 @@ def test_event_and_injected_queries_against_postgis():
         connection.execute("INSERT INTO candidate_entry_exit_points VALUES (90,%s,42,0,2,ST_SetSRID(ST_MakePoint(108.0022,34),4326))", (DETECT,))
         connection.execute("INSERT INTO tracks_cross VALUES (9,%s,42,2,12,ST_SetSRID(ST_MakePoint(108.0022,34),4326))", (DETECT,))
         connection.execute("INSERT INTO turn_events VALUES (8,%s,43,70)", (DETECT,))
-        connection.execute("INSERT INTO turn_evnets_gemo SELECT *,ST_SetSRID(ST_MakePoint(108.0025,34),4326) FROM turn_events")
+        connection.execute("INSERT INTO turn_events_geom SELECT *,ST_SetSRID(ST_MakePoint(108.0025,34),4326) FROM turn_events")
         connection.execute("INSERT INTO intersections VALUES (101,%s,42),(202,%s,43)", (DETECT, DETECT))
         store = PostgresMapStore(connection)
         refine = SimpleNamespace(refine_id=REFINE, quoted_source_table='"source_points"', source_key_sql_type="bigint")
@@ -158,6 +198,14 @@ def test_event_and_injected_queries_against_postgis():
         result = store.replay(ReplayRequest(intersection_ids=[101, 202]))
         assert result["metadata"]["highlight_segment_count"] == 3
         assert result["metadata"]["intersection_ids"] == [101, 202]
+        layers = {name: [f for f in result["features"] if f["properties"]["replay_layer"] == name]
+                  for name in ("turn_events", "cross_points", "subtracks", "segments")}
+        assert [len(layers[name]) for name in ("turn_events", "cross_points", "subtracks", "segments")] == [1, 1, 2, 3]
+        assert layers["turn_events"][0]["geometry"]["coordinates"] == [108.0025, 34]
+        assert layers["turn_events"][0]["properties"]["intersection_ids"] == [202]
+        assert layers["cross_points"][0]["properties"]["intersection_ids"] == [101]
+        subtrack = next(f for f in layers["subtracks"] if f["properties"]["subtrack_index"] == 1)
+        assert subtrack["properties"]["resolved_point_ids"] == [1, 2, 90, 70, 3, 4]
         store._resolve_detect.reset_mock()
         result = store.replay(ReplayRequest(injected_point_ids=[70]))
         store._resolve_detect.assert_not_called()

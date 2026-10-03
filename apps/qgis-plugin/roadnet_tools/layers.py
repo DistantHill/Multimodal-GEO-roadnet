@@ -58,14 +58,9 @@ def replace_output_layers(
     if not crs.isValid():
         raise ContractError(f"Backend returned an invalid CRS: {parsed.crs!r}.")
 
-    groups = geometry_groups(parsed.feature_collection)
-    if not groups:
-        groups = [("None", [])]
-    groups.sort(key=lambda item: _GEOMETRY_PRIORITY.get(item[0], 99))
-
+    groups = _output_groups(parsed)
     layers: list[QgsVectorLayer] = []
-    for index, (geometry_type, features) in enumerate(groups):
-        name = OUTPUT_LAYER_NAME if index == 0 else f"tmp — {geometry_type}"
+    for name, geometry_type, features, replay_layer in groups:
         layer = _make_memory_layer(name, geometry_type, features, crs)
         layer.setCustomProperty(OUTPUT_PROPERTY, True)
         layer.setCustomProperty("roadnet_tools/operation", operation)
@@ -73,7 +68,8 @@ def replace_output_layers(
             "roadnet_tools/metadata",
             json.dumps(parsed.metadata, ensure_ascii=False, default=str),
         )
-        _apply_default_style(layer, operation)
+        layer.setCustomProperty("roadnet_tools/replay_layer", replay_layer or "")
+        _apply_default_style(layer, operation, replay_layer=replay_layer)
         layers.append(layer)
 
     project = QgsProject.instance()
@@ -102,6 +98,43 @@ def replace_output_layers(
 
     feature_count = sum(layer.featureCount() for layer in layers)
     return layers, feature_count
+
+
+def _output_groups(parsed: ParsedGeoJson):
+    definitions = parsed.metadata.get("replay_layers")
+    if definitions is None:
+        groups = geometry_groups(parsed.feature_collection) or [("None", [])]
+        groups.sort(key=lambda item: _GEOMETRY_PRIORITY.get(item[0], 99))
+        return [(OUTPUT_LAYER_NAME if index == 0 else f"tmp — {kind}", kind, features, None)
+                for index, (kind, features) in enumerate(groups)]
+    allowed = {"turn_events", "cross_points", "subtracks", "segments"}
+    if not isinstance(definitions, list) or not definitions:
+        raise ContractError("Backend returned invalid replay layer definitions.")
+    features_by_layer = {}
+    for definition in definitions:
+        if not isinstance(definition, dict):
+            raise ContractError("Backend returned invalid replay layer definitions.")
+        identifier = definition.get("id")
+        if identifier not in allowed or identifier in features_by_layer:
+            raise ContractError("Backend returned unknown or duplicate replay layers.")
+        if definition.get("geometry_type") not in _GEOMETRY_TYPES:
+            raise ContractError("Backend returned an invalid replay geometry type.")
+        features_by_layer[identifier] = []
+    for feature in parsed.feature_collection["features"]:
+        identifier = (feature.get("properties") or {}).get("replay_layer")
+        if identifier not in features_by_layer:
+            raise ContractError("Replay feature has no matching output layer.")
+        features_by_layer[identifier].append(feature)
+    groups = []
+    for definition in definitions:
+        identifier = definition["id"]
+        geometry = geometry_groups({"features": features_by_layer[identifier]})
+        if not geometry:
+            geometry = [(definition["geometry_type"], [])]
+        for kind, features in geometry:
+            name = f"tmp.{identifier}" if len(geometry) == 1 else f"tmp.{identifier} — {kind}"
+            groups.append((name, kind, features, identifier))
+    return groups
 
 
 def _make_memory_layer(
@@ -209,8 +242,9 @@ def _field_value(value: Any, field_type: Any) -> Any:
     return value
 
 
-def _apply_default_style(layer: QgsVectorLayer, operation: str) -> None:
-    if operation == "replay" and layer.fields().indexFromName("replay_role") >= 0:
+def _apply_default_style(layer: QgsVectorLayer, operation: str, *, replay_layer: str | None = None) -> None:
+    if (operation == "replay" and replay_layer not in {"turn_events", "cross_points"}
+            and layer.fields().indexFromName("replay_role") >= 0):
         categories = []
         for role, color, width, label in (
             ("context", "#808080", 0.4, "其他 segment"),
@@ -232,7 +266,8 @@ def _apply_default_style(layer: QgsVectorLayer, operation: str) -> None:
     symbol = renderer.symbol() if renderer is not None else None
     if symbol is None:
         return
-    symbol.setColor(QColor("#2563eb" if operation == "replay" else "#f97316"))
+    event_colors = {"turn_events": "#2563eb", "cross_points": "#f97316"}
+    symbol.setColor(QColor(event_colors.get(replay_layer, "#2563eb" if operation == "replay" else "#f97316")))
     if hasattr(symbol, "setWidth"):
         symbol.setWidth(0.8)
     if hasattr(symbol, "setSize"):

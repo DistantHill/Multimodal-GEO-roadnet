@@ -75,3 +75,38 @@ class ReplayGeometryTests(unittest.TestCase):
         for call in plugin._client.post_json.call_args_list:
             self.assertEqual(set(call.args[2]["intersection_ids"]), {101, 202})
             self.assertEqual(call.args[2]["database_name"], "roadnet")
+
+    def test_intersection_replay_splits_semantic_layers_with_same_geometry(self):
+        from roadnet_tools.core import ContractError, parse_geojson_response
+        from roadnet_tools.layers import replace_output_layers
+        definitions = [
+            {"id": "turn_events", "geometry_type": "Point"},
+            {"id": "cross_points", "geometry_type": "Point"},
+            {"id": "segments", "geometry_type": "LineString"},
+            {"id": "subtracks", "geometry_type": "LineString"},
+        ]
+        features = []
+        for name, role in (("turn_events", "event"), ("cross_points", "event"),
+                           ("subtracks", "context"), ("segments", "highlight")):
+            geometry = {"type": "Point", "coordinates": [108, 34]} if role == "event" else {
+                "type": "LineString", "coordinates": [[108, 34], [108.1, 34.1]]}
+            features.append({"type": "Feature", "geometry": geometry,
+                             "properties": {"replay_layer": name, "replay_role": role}})
+        payload = {"type": "FeatureCollection", "features": features, "metadata": {"replay_layers": definitions}}
+        layers, count = replace_output_layers(parse_geojson_response(payload), "replay")
+        self.assertEqual(count, 4)
+        self.assertEqual([layer.name() for layer in layers],
+                         ["tmp.turn_events", "tmp.cross_points", "tmp.segments", "tmp.subtracks"])
+        self.assertTrue(all(f.hasGeometry() for layer in layers for f in layer.getFeatures()))
+        self.assertEqual(layers[0].renderer().symbol().color().name(), "#2563eb")
+        self.assertEqual(layers[1].renderer().symbol().color().name(), "#f97316")
+        old_ids = {layer.id() for layer in layers}
+        payload["features"] = [{**features[0], "properties": {"replay_layer": "unknown"}}]
+        with self.assertRaises(ContractError):
+            replace_output_layers(parse_geojson_response(payload), "replay")
+        self.assertTrue(old_ids <= set(QgsProject.instance().mapLayers()))
+        payload["features"] = []
+        new_layers, count = replace_output_layers(parse_geojson_response(payload), "replay")
+        self.assertEqual(count, 0)
+        self.assertEqual(len(new_layers), 4)
+        self.assertFalse(old_ids & set(QgsProject.instance().mapLayers()))

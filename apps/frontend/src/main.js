@@ -10,6 +10,8 @@ import Select from 'ol/interaction/Select.js';
 import { defaults as defaultInteractions } from 'ol/interaction/defaults.js';
 import TileLayer from 'ol/layer/Tile.js';
 import VectorLayer from 'ol/layer/Vector.js';
+import LayerGroup from 'ol/layer/Group.js';
+import { partitionResultLayers, resultPropertyEntries } from './result-layers.js';
 import { defaults as defaultControls } from 'ol/control/defaults.js';
 import OSM from 'ol/source/OSM.js';
 import VectorSource from 'ol/source/Vector.js';
@@ -194,7 +196,7 @@ app.innerHTML = `
             <span><strong id="result-title">tmp</strong><small id="result-detail">0 个要素</small></span>
             <button type="button" id="clear-result" aria-label="清除临时结果" title="清除临时结果">${icon('close', 15)}</button>
           </div>
-          <p class="analysis-footnote" id="analysis-footnote">结果仅绘制到 <b>tmp</b> 图层，不写入数据库。</p>
+          <p class="analysis-footnote" id="analysis-footnote">结果显示在 <b>tmp</b> 组，可独立显隐和查看来源属性，不写入数据库。</p>
         </section>
       </aside>
     </div>
@@ -266,28 +268,29 @@ const baseLayer = new TileLayer({
   },
 });
 
-const tmpSource = new VectorSource();
 const replayHighlightStyle = createLayerStyle('tmp');
 replayHighlightStyle.setZIndex(2);
 const replayContextStyle = new Style({
   stroke: new Stroke({ color: 'rgba(128, 128, 128, 0.5)', width: 2 }),
   zIndex: 1,
 });
-const tmpLayer = new VectorLayer({
-  source: tmpSource,
-  style: (feature) => feature.get('replay_role') === 'context' ? replayContextStyle : replayHighlightStyle,
-  zIndex: 900,
-  properties: {
-    id: 'tmp',
-    name: 'tmp',
-    role: 'tmp',
-    selectable: false,
-  },
+const replayTurnStyle = createLayerStyle('point');
+const replayCrossStyle = createLayerStyle('intersection');
+replayTurnStyle.setZIndex(3);
+replayCrossStyle.setZIndex(3);
+function replayResultStyle(feature) {
+  if (feature.get('replay_layer') === 'turn_events') return replayTurnStyle;
+  if (feature.get('replay_layer') === 'cross_points') return replayCrossStyle;
+  return feature.get('replay_role') === 'context' ? replayContextStyle : replayHighlightStyle;
+}
+const tmpGroup = new LayerGroup({
+  layers: [], zIndex: 900,
+  properties: { id: 'tmp', name: 'tmp', selectable: false },
 });
 
 const map = new OlMap({
   target: 'map',
-  layers: [baseLayer, tmpLayer],
+  layers: [baseLayer, tmpGroup],
   view,
   controls: defaultControls({
     zoom: false,
@@ -314,6 +317,7 @@ const state = {
   viewportTimer: null,
   layerRecords: new Map(),
   lastResult: null,
+  resultGroupExpanded: true,
   selectionBbox: null,
   selectionOrigin: null,
   tool: 'pan',
@@ -327,10 +331,10 @@ state.layerRecords.set('osm', {
   status: 'ready',
 });
 state.layerRecords.set('tmp', {
-  descriptor: { id: 'tmp', name: 'tmp', role: 'tmp', selectable: false },
+  descriptor: { id: 'tmp', name: 'tmp', role: 'tmp', selectable: false, isResult: true, isGroup: true },
   featureCount: 0,
-  layer: tmpLayer,
-  source: tmpSource,
+  layer: tmpGroup,
+  source: null,
   status: 'ready',
 });
 
@@ -340,7 +344,8 @@ const selectedFeatures = new Select({
   layers: (layer) =>
     layer.get('id') === state.activeLayerId &&
     layer.get('selectable') === true &&
-    layer.getVisible(),
+    layer.getVisible() &&
+    (!state.layerRecords.get(layer.get('id'))?.descriptor.isResult || tmpGroup.getVisible()),
   multi: true,
   style: createSelectionStyle,
 });
@@ -378,7 +383,7 @@ dragBox.on('boxend', () => {
   const record = state.layerRecords.get(state.activeLayerId);
   const collection = selectedFeatures.getFeatures();
 
-  if (record?.descriptor.selectable && record.layer.getVisible() && record.source instanceof VectorSource) {
+  if (record?.descriptor.selectable && isRecordVisible(record) && record.source instanceof VectorSource) {
     selectFeaturesInExtent(record.source, extent, collection);
   }
 
@@ -451,7 +456,7 @@ function roundCoordinate(value) {
 
 function decorateFeature(feature, descriptor, metadata) {
   const properties = feature.getProperties();
-  const role = inferRole(descriptor);
+  const role = descriptor.isResult ? descriptor.role : inferRole(descriptor);
   const detectId = firstValue(
     properties.detect_id,
     properties.detectId,
@@ -679,7 +684,7 @@ function scheduleViewportLoad() {
 
 function removeBusinessLayers() {
   Array.from(state.layerRecords.entries()).forEach(([id, record]) => {
-    if (id === 'osm' || id === 'tmp') return;
+    if (id === 'osm' || record.descriptor.isResult) return;
     map.removeLayer(record.layer);
     state.layerRecords.delete(id);
   });
@@ -689,43 +694,71 @@ function removeBusinessLayers() {
 
 function renderLayerTree() {
   const filter = dom.layerFilter.value.trim().toLocaleLowerCase('zh-CN');
-  const records = Array.from(state.layerRecords.values()).filter((record) =>
-    record.descriptor.name.toLocaleLowerCase('zh-CN').includes(filter),
-  );
-  dom.layerTotal.textContent = state.layerRecords.size;
+  const matches = (record) => `${record.descriptor.name} ${record.descriptor.label || ''}`
+    .toLocaleLowerCase('zh-CN').includes(filter);
+  const records = Array.from(state.layerRecords.values());
+  dom.layerTotal.textContent = records.filter((record) => !record.descriptor.isGroup).length;
+  const children = records.filter((record) => record.descriptor.isResult && !record.descriptor.isGroup);
+  const group = state.layerRecords.get('tmp');
+  const visibleChildren = matches(group) ? children : children.filter(matches);
+  const expanded = Boolean(filter) || state.resultGroupExpanded;
+  const resultTree = matches(group) || visibleChildren.length ? `
+    <div class="result-layer-group" role="treeitem" aria-label="tmp 临时结果" aria-expanded="${expanded}">
+      ${layerRow(group, { expanded })}
+      <div class="result-layer-children" role="group" ${expanded ? '' : 'hidden'}>
+        ${visibleChildren.map((record) => layerRow(record)).join('')}
+      </div>
+    </div>` : '';
+  dom.layerTree.innerHTML = records.filter((record) => !record.descriptor.isResult && matches(record))
+    .map((record) => layerRow(record)).join('') + resultTree;
+  const groupCheckbox = dom.layerTree.querySelector('[data-layer-visible="tmp"]');
+  if (groupCheckbox) {
+    const anyVisible = children.some((record) => record.layer.getVisible());
+    groupCheckbox.checked = tmpGroup.getVisible() && (!children.length || anyVisible);
+    groupCheckbox.indeterminate = tmpGroup.getVisible() && anyVisible
+      && children.some((record) => !record.layer.getVisible());
+  }
+}
 
-  dom.layerTree.innerHTML = records
-    .map((record) => {
-      const { descriptor, featureCount, layer, status } = record;
-      const active = descriptor.id === state.activeLayerId;
-      const checked = layer.getVisible();
-      const role = inferRole(descriptor);
-      const count = featureCount === null ? '' : featureCount.toLocaleString('zh-CN');
-      const statusIcon = status === 'loading'
-        ? '<span class="layer-spinner" title="加载中"></span>'
-        : status === 'error'
-          ? '<span class="layer-error" title="加载失败">!</span>'
-          : `<span class="layer-count">${count}</span>`;
+function layerRow(record, { expanded } = {}) {
+  const { descriptor, featureCount, status } = record;
+  const active = descriptor.id === state.activeLayerId;
+  const checked = isRecordVisible(record);
+  const role = descriptor.isResult ? descriptor.role : inferRole(descriptor);
+  const count = featureCount === null ? '' : featureCount.toLocaleString('zh-CN');
+  const statusIcon = status === 'loading'
+    ? '<span class="layer-spinner" title="加载中"></span>'
+    : status === 'error'
+      ? '<span class="layer-error" title="加载失败">!</span>'
+      : `<span class="layer-count">${count}</span>`;
+  const mainAction = descriptor.isGroup
+    ? `data-result-toggle aria-expanded="${expanded}" aria-label="${expanded ? '折叠' : '展开'} tmp 组"`
+    : `data-layer-activate="${escapeHtml(descriptor.id)}" ${descriptor.selectable ? '' : 'tabindex="-1"'}`;
+  const swatch = descriptor.isGroup ? icon(expanded ? 'chevron' : 'collapse', 18)
+    : `<i class="layer-swatch layer-swatch--${role}"></i>`;
+  return `
+    <div class="layer-row ${active ? 'is-active' : ''} ${descriptor.selectable || descriptor.isGroup ? '' : 'is-static'} ${checked ? '' : 'is-hidden'}"
+      data-layer-id="${escapeHtml(descriptor.id)}" ${descriptor.isGroup ? '' : `role="treeitem" aria-selected="${active}"`}>
+      <label class="layer-visibility" title="显示或隐藏 ${escapeHtml(descriptor.name)}">
+        <input type="checkbox" ${checked ? 'checked' : ''} data-layer-visible="${escapeHtml(descriptor.id)}" aria-label="显示 ${escapeHtml(descriptor.name)}" />
+        <span></span>
+      </label>
+      <button class="layer-main" type="button" ${mainAction}>
+        ${swatch}
+        <span class="layer-label"><strong>${escapeHtml(descriptor.name)}</strong><small>${layerSubtitle(record)}</small></span>
+      </button>
+      ${statusIcon}
+    </div>`;
+}
 
-      return `
-        <div class="layer-row ${active ? 'is-active' : ''} ${descriptor.selectable ? '' : 'is-static'}" data-layer-id="${escapeHtml(descriptor.id)}" role="treeitem" aria-selected="${active}">
-          <label class="layer-visibility" title="显示或隐藏 ${escapeHtml(descriptor.name)}">
-            <input type="checkbox" ${checked ? 'checked' : ''} data-layer-visible="${escapeHtml(descriptor.id)}" aria-label="显示 ${escapeHtml(descriptor.name)}" />
-            <span></span>
-          </label>
-          <button class="layer-main" type="button" data-layer-activate="${escapeHtml(descriptor.id)}" ${descriptor.selectable ? '' : 'tabindex="-1"'}>
-            <i class="layer-swatch layer-swatch--${role}"></i>
-            <span class="layer-label"><strong>${escapeHtml(descriptor.name)}</strong><small>${layerSubtitle(record)}</small></span>
-          </button>
-          ${statusIcon}
-        </div>`;
-    })
-    .join('');
+function isRecordVisible(record) {
+  return record.layer.getVisible() && (!record.descriptor.isResult || record.descriptor.isGroup || tmpGroup.getVisible());
 }
 
 function layerSubtitle(record) {
   if (record.descriptor.id === 'osm') return 'XYZ 瓦片底图';
-  if (record.descriptor.id === 'tmp') return '内存临时结果';
+  if (record.descriptor.isGroup) return record.featureCount ? '临时结果 · 展开查看来源图层' : '内存临时结果 · 暂无结果';
+  if (record.descriptor.isResult) return escapeHtml(record.descriptor.label);
   if (record.status === 'zoom') return escapeHtml(record.error || '请放大至 zoom 12');
   if (record.status === 'hidden') return '已隐藏 · 暂停区域加载';
   if (record.status === 'loading') {
@@ -756,6 +789,7 @@ function setActiveLayer(layerId) {
   if (state.activeLayerId !== layerId) clearSelection();
   state.activeLayerId = layerId;
   renderLayerTree();
+  updateActionState();
   setStatus(`活动图层：${record.descriptor.name}`);
 }
 
@@ -763,7 +797,13 @@ function setLayerVisibility(layerId, visible) {
   const record = state.layerRecords.get(layerId);
   if (!record) return;
   record.layer.setVisible(visible);
-  if (!visible && state.activeLayerId === layerId) clearSelection();
+  if (record.descriptor.isGroup) {
+    tmpGroup.getLayers().forEach((layer) => layer.setVisible(visible));
+  } else if (record.descriptor.isResult && visible) {
+    tmpGroup.setVisible(true);
+  }
+  const active = state.layerRecords.get(state.activeLayerId);
+  if (active && !isRecordVisible(active)) clearSelection();
   if (record.tileLoader) scheduleViewportLoad();
   renderLayerTree();
 }
@@ -835,6 +875,13 @@ function selectionItem(feature, index) {
     feature.getId(),
     index + 1,
   );
+  const resultRecord = state.layerRecords.get(feature.get('_layerId'));
+  const attributes = resultRecord?.descriptor.isResult ? `
+    <details class="result-properties" ${selectedFeatures.getFeatures().getLength() === 1 ? 'open' : ''}>
+      <summary>来源属性 · ${escapeHtml(resultRecord.descriptor.name)}</summary>
+      <dl>${resultPropertyEntries(properties).map(([key, value]) =>
+        `<div><dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('')}</dl>
+    </details>` : '';
   const geometry = feature.getGeometry();
   let coordinateLabel = geometry?.getType() || 'Feature';
   if (geometry?.getType() === 'Point') {
@@ -847,7 +894,7 @@ function selectionItem(feature, index) {
       <span class="selection-item__number">${index + 1}</span>
       <span class="selection-item__copy"><strong>${escapeHtml(displayId)}</strong><small>${escapeHtml(coordinateLabel)}</small></span>
       <button type="button" data-remove-selection="${index}" aria-label="移除此要素" title="移除此要素">${icon('close', 14)}</button>
-    </div>`;
+    </div>${attributes}`;
 }
 
 function formatBbox(bbox) {
@@ -855,6 +902,13 @@ function formatBbox(bbox) {
 }
 
 function updateActionState() {
+  if (state.layerRecords.get(state.activeLayerId)?.descriptor.isResult) {
+    dom.replayAction.disabled = true;
+    dom.clipAction.disabled = true;
+    dom.replayHint.textContent = '临时结果可点选或框选查看来源属性';
+    dom.clipHint.textContent = '选择业务交叉口图层后执行 Clip';
+    return;
+  }
   const features = selectedFeatures.getFeatures().getArray();
   const centerlines = features.filter((feature) => feature.get('_layerId') === 'centerlines');
   const centerlineOnly = features.length > 0 && centerlines.length === features.length;
@@ -933,7 +987,7 @@ function updateActionState() {
       ? '所选中心线必须属于当前 Fit、Detect 与 Refine Run'
       : `回放 ${centerlineIds.length} 条中心线 · Fit ${centerlineFitIds[0]}`;
   } else if (intersectionReady) {
-    dom.replayHint.textContent = `回放 ${intersectionIds.length} 个交叉口构成点`;
+    dom.replayHint.textContent = `回放 ${intersectionIds.length} 个交叉口的事件、来源段与完整子轨迹`;
   } else if (intersections.length) {
     dom.replayHint.textContent = intersections.length !== features.length
       ? 'Replay 不支持混选交叉口与轨迹点'
@@ -1075,22 +1129,36 @@ async function runAnalysis(name, request) {
   } finally {
     if (state.analysisAbortController === controller) {
       state.busy = false;
-      dom.analysisFootnote.innerHTML = '结果仅绘制到 <b>tmp</b> 图层，不写入数据库。';
+      dom.analysisFootnote.innerHTML = '结果显示在 <b>tmp</b> 组，可独立显隐和查看来源属性，不写入数据库。';
       updateActionState();
     }
   }
 }
 
 function drawResult(name, featureCollection, metadata = {}) {
-  const features = geoJson.readFeatures(featureCollection, {
-    dataProjection: 'EPSG:4326',
-    featureProjection: 'EPSG:3857',
+  const outputs = partitionResultLayers(featureCollection, metadata).map((definition) => {
+    const descriptor = { ...definition, selectable: true, isResult: true };
+    delete descriptor.featureCollection;
+    const features = geoJson.readFeatures(definition.featureCollection, {
+      dataProjection: 'EPSG:4326', featureProjection: 'EPSG:3857',
+    });
+    features.forEach((feature) => decorateFeature(feature, descriptor, metadata));
+    const source = new VectorSource({ features });
+    const layer = new VectorLayer({
+      source, style: replayResultStyle, zIndex: 900 + definition.zIndex,
+      properties: { id: descriptor.id, name: descriptor.name, selectable: true },
+    });
+    return { descriptor, featureCount: features.length, layer, source, metadata, status: 'ready' };
   });
-  tmpSource.clear();
-  tmpSource.addFeatures(features);
-  tmpLayer.setVisible(true);
-  const record = state.layerRecords.get('tmp');
-  record.featureCount = features.length;
+  const features = outputs.flatMap((record) => record.source.getFeatures());
+  removeResultLayers();
+  outputs.forEach((record) => {
+    state.layerRecords.set(record.descriptor.id, record);
+    tmpGroup.getLayers().push(record.layer);
+  });
+  tmpGroup.setVisible(true);
+  state.resultGroupExpanded = true;
+  state.layerRecords.get('tmp').featureCount = features.length;
   state.lastResult = { name, featureCount: features.length, metadata };
   dom.resultCard.hidden = false;
   dom.resultTitle.textContent = `tmp · ${name}`;
@@ -1100,6 +1168,8 @@ function drawResult(name, featureCollection, metadata = {}) {
     && metadata.returned_clip_count >= 0;
   const resultSummary = hasCenterlineCounts
     ? `${metadata.returned_point_count.toLocaleString('zh-CN')} 个唯一构成点 · ${metadata.returned_clip_count.toLocaleString('zh-CN')} 个来源片段 · ${features.length.toLocaleString('zh-CN')} 个几何要素`
+    : metadata.replay_layers
+    ? outputs.map((record) => `${record.descriptor.label.split(' · ')[0]} ${record.featureCount.toLocaleString('zh-CN')}`).join(' · ')
     : `${features.length.toLocaleString('zh-CN')} 个要素`;
   const sourceSemanticsNote = metadata.selection === 'centerline_ids'
     && metadata.source_fingerprint_verified !== true
@@ -1128,8 +1198,19 @@ function drawResult(name, featureCollection, metadata = {}) {
   }
 }
 
+function removeResultLayers() {
+  if (state.layerRecords.get(state.activeLayerId)?.descriptor.isResult) {
+    state.activeLayerId = null;
+    clearSelection();
+  }
+  tmpGroup.getLayers().clear();
+  Array.from(state.layerRecords.entries()).forEach(([id, record]) => {
+    if (record.descriptor.isResult && !record.descriptor.isGroup) state.layerRecords.delete(id);
+  });
+}
+
 function clearResult() {
-  tmpSource.clear();
+  removeResultLayers();
   state.layerRecords.get('tmp').featureCount = 0;
   state.lastResult = null;
   dom.resultCard.hidden = true;
@@ -1140,21 +1221,21 @@ function clearResult() {
 
 function getBusinessFeatureCount() {
   return Array.from(state.layerRecords.entries()).reduce((total, [id, record]) => {
-    if (id === 'osm' || id === 'tmp') return total;
+    if (id === 'osm' || record.descriptor.isResult) return total;
     return total + (record.featureCount || 0);
   }, 0);
 }
 
 function updateFeatureTotal() {
   const total = Array.from(state.layerRecords.entries()).reduce((sum, [id, record]) =>
-    id === 'osm' ? sum : sum + (record.featureCount || 0), 0);
+    id === 'osm' || record.descriptor.isGroup ? sum : sum + (record.featureCount || 0), 0);
   dom.featureTotal.textContent = total.toLocaleString('zh-CN');
 }
 
 function fitToData({ animate = true } = {}) {
   const extent = createEmpty();
   state.layerRecords.forEach((record, id) => {
-    if (id === 'osm' || !record.layer.getVisible() || !(record.source instanceof VectorSource)) return;
+    if (id === 'osm' || !isRecordVisible(record) || !(record.source instanceof VectorSource)) return;
     const sourceExtent = record.source.getExtent();
     if (!isEmptyExtent(sourceExtent)) extend(extent, sourceExtent);
   });
@@ -1239,6 +1320,11 @@ document.addEventListener('click', (event) => {
 
   const command = event.target.closest('[data-command]')?.dataset.command;
   if (command) executeCommand(command);
+
+  if (event.target.closest('[data-result-toggle]')) {
+    state.resultGroupExpanded = !state.resultGroupExpanded;
+    renderLayerTree();
+  }
 
   const activate = event.target.closest('[data-layer-activate]')?.dataset.layerActivate;
   if (activate) setActiveLayer(activate);

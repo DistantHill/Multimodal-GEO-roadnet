@@ -74,7 +74,16 @@ read permissions on each target database; no credentials or host from QGIS are u
 - 直接选择 `injected_points` 时，发送 `injected_point_ids` 与 `refine_id`，不需要 Detect。Backend 从注入点的前后 kept 锚点找到原始数据源 `geom`，突出生成注入点的来源线段。
 - 普通轨迹点仍优先使用 `resolved_point_id` 与 `detect_id`，否则使用 `source_row_key`；原始数据图层允许以数据库 `id` 作为源行键。
 
-点击 Replay 后自动加载带真实线几何的 `tmp` 图层，保留完整子轨迹：背景灰色、alpha=0.5，相关 segment 洋红色并绘制在背景之上。数组追溯属性保留在属性表中，无需再次执行展开操作。事件回放超过配置的车辆或点数上限时明确报错，不返回残缺子轨迹。
+交叉口 Replay 自动沿 `intersection → turn_events / tracks_cross → resolved 点与来源线段 → subtrack` 追溯，在 `tmp` 组生成四层：
+
+- `tmp.turn_events`：产生所选交叉口的转向事件，使用其来源点几何，蓝色显示。
+- `tmp.cross_points`：产生所选交叉口的跨轨迹事件，读取 `tracks_cross.geom`，橙色显示。
+- `tmp.subtracks`：去重后的所有完整来源子轨迹，灰色、alpha=0.5。
+- `tmp.segments`：直接参与事件计算的来源线段，洋红色。
+
+每层可单独显示、隐藏和查看属性。事件层保留数据库事件 ID、交叉口 ID；线段与子轨迹属性保留其上游事件、已解析点和原始行键，追溯在完整子轨迹处结束。多交叉口共享的事件、线段与子轨迹只显示一次。无某类事件时保留对应空图层；来源缺失或超过预算时明确报错并保留上次输出。
+
+普通点或单独事件 Replay 点击后自动加载带真实线几何的 `tmp` 图层，保留完整子轨迹：背景灰色、alpha=0.5，相关 segment 洋红色并绘制在背景之上。数组追溯属性保留在属性表中，无需再次执行展开操作。事件回放超过配置的车辆或点数上限时明确报错，不返回残缺子轨迹。
 
 Requests run asynchronously and do not freeze the QGIS UI. Only the newest reply
 for each operation is applied. A validation, network, HTTP, JSON, CRS, or geometry
