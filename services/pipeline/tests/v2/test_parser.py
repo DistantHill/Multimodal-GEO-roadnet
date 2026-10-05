@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 import io
 import math
 import tempfile
@@ -541,6 +542,68 @@ class ExtraFieldTest(unittest.TestCase):
             # road_id and altitude should be in extra
             self.assertIn("road_id", points[0].extra)
             self.assertIn("altitude", points[0].extra)
+
+
+class PostgresFieldParityTest(unittest.TestCase):
+    """PostgreSQL tuple parsing retains CSV field/default semantics."""
+
+    def _read(self, columns, rows, fields):
+        connection = MagicMock()
+        cursor = MagicMock()
+        cursor.description = [(column,) for column in columns]
+        cursor.__iter__.return_value = iter(rows)
+        connection.cursor.side_effect = [MagicMock(), cursor]
+        source = PostgresSource(
+            config=MagicMock(), query="SELECT * FROM points", primary_key_field="id",
+            connection_factory=lambda _config: connection,
+        )
+        with patch.object(PostgresTrajectorySourceHandle, "_discover_columns", return_value=columns):
+            with get_database(source, field_config=fields, runtime=_CONFIG.runtime) as handle:
+                batches = list(handle.iter_vehicle_batches())
+                return batches, handle.report
+
+    def test_extra_values_and_invalid_value_warning_survive_tuple_parser(self):
+        columns = ["id", "vid", "lng", "lat", "included_angle", "gps_speed",
+                   "gps_time_a", "road_id_suite", "altitude"]
+        batches, report = self._read(columns, [
+            (1, "v1", 116, 39, 90, 40, 1700000000, "R001", "100.5"),
+            (2, "v1", 116, 39, 90, 40, 1700000001, "R002", "invalid"),
+        ], _field_config())
+        self.assertEqual(batches[0].extra["road_id"].tolist(), ["R001", "R002"])
+        self.assertEqual(batches[0].extra["altitude"].tolist(), [100.5, None])
+        self.assertEqual(report.warn_count, 1)
+        self.assertEqual(report.sample_errors[0].reason, "altitude extra invalid; skipped")
+
+    def test_unmapped_optional_fields_apply_scaled_defaults(self):
+        fields = replace(_field_config(), specs=[
+            replace(spec, required=False, default=90.0, unit_scale=2.0)
+            if spec.canonical == "heading" else
+            replace(spec, required=False, default=36.0, unit_scale=1 / 3.6)
+            if spec.canonical == "speed" else spec
+            for spec in _field_config().specs
+        ])
+        batches, report = self._read(
+            ["id", "vid", "lng", "lat", "gps_time_a"],
+            [(1, "v1", 116, 39, 1700000000)], fields,
+        )
+        self.assertEqual(batches[0].heading.tolist(), [180.0])
+        self.assertEqual(batches[0].speed.tolist(), [10.0])
+        self.assertEqual(report.warn_count, 0)
+
+    def test_missing_required_optional_value_warns(self):
+        fields = replace(_field_config(), specs=[
+            replace(spec, required=True, default=0.0)
+            if spec.canonical in ("heading", "speed") else spec
+            for spec in _field_config().specs
+        ])
+        _, report = self._read(
+            ["id", "vid", "lng", "lat", "gps_time_a", "included_angle", "gps_speed"],
+            [(1, "v1", 116, 39, 1700000000, None, None)], fields,
+        )
+        self.assertEqual(report.warn_count, 2)
+        self.assertEqual({issue.reason for issue in report.sample_errors}, {
+            "heading missing; using default", "speed missing; using default",
+        })
 
 
 class HeadingNormalizationTest(unittest.TestCase):

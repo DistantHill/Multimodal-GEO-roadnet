@@ -146,3 +146,28 @@ def test_symlink_and_malformed_entries_fail_closed(tmp_path):
 def test_time_and_grace_validation(tmp_path, now, days):
     with pytest.raises(ValueError):
         build_reconcile_plan(Cursor(), tmp_path.resolve(), now, days)
+
+
+@pytest.mark.parametrize("kind", ["final", "run", "artifact", "marker"])
+@pytest.mark.parametrize("name", ["ABCDEF00-1234-1234-1234-123456789ABC",
+                                   "abcdef00123412341234123456789abc", "not-a-uuid"])
+def test_noncanonical_uuid_entries_are_protected_during_planning(tmp_path, kind, name):
+    run_id, artifact_id = uuid4(), uuid4()
+    if kind == "final":
+        relative = f"refine/{name}"
+    elif kind == "run":
+        relative = f".artifact-staging/refine/{name}/{artifact_id}"
+    elif kind == "artifact":
+        relative = f".artifact-staging/refine/{run_id}/{name}"
+    else:
+        relative = f".artifact-staging/refine/{run_id}/.{name}.publication.json"
+    if kind == "marker":
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True)
+        path.write_text("{}")
+    else:
+        directory(tmp_path, relative)
+    actions = build_reconcile_plan(Cursor(), tmp_path.resolve(), NOW, 0).actions
+    assert len(actions) == 1
+    assert actions[0].kind == "malformed_path"
+    assert actions[0].protected and not actions[0].eligible

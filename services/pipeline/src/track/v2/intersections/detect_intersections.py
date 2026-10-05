@@ -6,6 +6,7 @@ import time
 from array import array
 from collections import defaultdict
 from collections.abc import Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -386,11 +387,17 @@ def _detect_intersections_db(conn,cfg,spatial_context,*,runtime,data_root,refine
         raise V2Error("formal DB Detect requires a columnar reader")
     if refine_reader.extent() is None:
         return _empty_intersect_result(spatial_context)
-    event_store=TurnEventRelation(runtime,data_root); candidate_store=CrossCandidateRelation(runtime,data_root)
-    try:
-        return _run_columnar_db_detect(cfg,spatial_context,refine_reader,event_store=event_store,candidate_store=candidate_store,conn=conn,refine_id=cfg.refine_id,connect_worker=connect_worker,runtime=runtime,data_root=data_root)
-    except BaseException:
-        event_store.close(); candidate_store.close(); raise
+    with ExitStack() as cleanup:
+        event_store = TurnEventRelation(runtime, data_root)
+        cleanup.callback(event_store.close)
+        candidate_store = None
+        if cfg.use_cross_track_candidates:
+            candidate_store = CrossCandidateRelation(runtime, data_root)
+            cleanup.callback(candidate_store.close)
+        result = _run_columnar_db_detect(cfg,spatial_context,refine_reader,event_store=event_store,candidate_store=candidate_store,conn=conn,refine_id=cfg.refine_id,connect_worker=connect_worker,runtime=runtime,data_root=data_root)
+        # The result owns both relations after successful computation.
+        cleanup.pop_all()
+        return result
 
 
 def _run_columnar_db_detect(cfg,spatial_context,refine_reader,*,runtime,data_root,event_store=None,candidate_store=None,conn=None,refine_id=None,connect_worker=None):

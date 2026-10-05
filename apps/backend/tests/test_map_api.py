@@ -152,9 +152,22 @@ def test_layer_query_rejects_invalid_bbox(bbox: str) -> None:
     assert store.layer_calls == []
 
 
+@pytest.mark.parametrize("key", ["external-7", "1.5", "", "1e3", str(2**63), str(-(2**63) - 1)])
+def test_replay_rejects_source_keys_that_cannot_bind_to_bigint(key) -> None:
+    with pytest.raises(ValidationError, match="source_row_keys"):
+        ReplayRequest(source_row_keys=[key])
+
+
+def test_replay_normalizes_numeric_source_keys_for_selection_and_highlights() -> None:
+    request = ReplayRequest(source_row_keys=[" +0001 ", "-0", "-02", str(-(2**63)), str(2**63 - 1)])
+    assert request.source_row_keys == ["1", "0", "-2", str(-(2**63)), str(2**63 - 1)]
+    with pytest.raises(ValidationError, match="distinct"):
+        ReplayRequest(source_row_keys=["1", "+01"])
+
+
 def test_replay_accepts_external_and_internal_id_namespaces() -> None:
     store = FakeMapStore()
-    source_request = ReplayRequest(source_row_keys=["external-7", "9"])
+    source_request = ReplayRequest(source_row_keys=["-7", "9"])
     replay(source_request, store=store, map_config=MAP_CONFIG)
     assert store.replay_request.max_vehicles == 25
     assert store.replay_request.max_points == 10_000

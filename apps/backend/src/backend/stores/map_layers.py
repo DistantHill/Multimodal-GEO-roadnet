@@ -798,7 +798,7 @@ class PostgresMapStore:
             f" FROM kept_trajectory_points AS kept JOIN {refine.quoted_source_table} AS source "
             f" ON source.id = kept.source_row_key::{refine.source_key_sql_type} "
             " WHERE kept.refine_id = %s AND kept.subtrack_index = ANY(%s::integer[]) "
-            " UNION ALL SELECT injected.subtrack_index, injected.vehicle_id, NULL::text, "
+            " UNION ALL SELECT injected.subtrack_index, injected.vehicle_id, NULL::bigint, "
             " ST_X(injected.geom), ST_Y(injected.geom), 'injected', injected.after_sequence_in_subtrack, "
             " 1, injected.id FROM injected_points AS injected WHERE injected.refine_id = %s "
             " AND injected.subtrack_index = ANY(%s::integer[])"

@@ -3,5 +3,5 @@ name: roadnet-full
 services:
   pipeline:
     environment:
-      PIPELINE_CONFIG_PATH: /app/config/pipeline-roadnet-test.toml
+      PIPELINE_CONFIG_PATH: /app/config/pipeline.toml
     command: ["python", "-m", "pytest", "-q"]

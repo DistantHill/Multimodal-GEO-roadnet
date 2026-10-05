@@ -271,7 +271,9 @@ def _fit_pair_stream(
             )
         if actual != count:
             raise ValueError("clip reader count changed")
-        fitted_xy[start:end] = np.median(sampled, axis=0)
+        # This block is no longer needed after aggregation. Partition it in
+        # place instead of allocating a second full sampling block.
+        fitted_xy[start:end] = np.median(sampled, axis=0, overwrite_input=True)
     if _xy_polyline_length(fitted_xy) <= _EPS:
         return None
     spaced_xy = _resample_at_spacing(fitted_xy, config.point_spacing_m)
@@ -298,10 +300,9 @@ def _resample_at_progress(points: np.ndarray, progress: np.ndarray) -> np.ndarra
 def _resample_at_spacing(points: np.ndarray, spacing_m: float) -> np.ndarray:
     points, cumulative = _deduplicate_xy(points)
     total = cumulative[-1]
-    targets = list(np.arange(0.0, total, spacing_m))
-    if not targets or total - targets[-1] > _EPS:
-        targets.append(total)
-    target_array = np.asarray(targets, dtype=float)
+    target_array = np.arange(0.0, total, spacing_m)
+    if not len(target_array) or total - target_array[-1] > _EPS:
+        target_array = np.append(target_array, total)
     return np.column_stack(
         (
             np.interp(target_array, cumulative, points[:, 0]),

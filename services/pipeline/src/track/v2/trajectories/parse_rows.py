@@ -99,10 +99,12 @@ def _parse_row_from_tuple(
     # ── heading (optional float) ──
     hdg_spec = specs.get("heading")
     heading: float = 0.0
-    if hdg_spec is not None and "heading" in col_index:
-        hdg_raw = row[col_index["heading"]]
+    if hdg_spec is not None:
+        hdg_raw = row[col_index["heading"]] if "heading" in col_index else hdg_spec.default
         if hdg_raw in (None, ""):
             heading = _float_default(hdg_spec)
+            if hdg_spec.required:
+                issues.append(_fast_issue("WARN", "heading missing; using default"))
         else:
             try:
                 heading = float(hdg_raw) * hdg_spec.unit_scale
@@ -119,10 +121,12 @@ def _parse_row_from_tuple(
     # ── speed (optional float) ──
     spd_spec = specs.get("speed")
     speed: float = 0.0
-    if spd_spec is not None and "speed" in col_index:
-        spd_raw = row[col_index["speed"]]
+    if spd_spec is not None:
+        spd_raw = row[col_index["speed"]] if "speed" in col_index else spd_spec.default
         if spd_raw in (None, ""):
             speed = _float_default(spd_spec)
+            if spd_spec.required:
+                issues.append(_fast_issue("WARN", "speed missing; using default"))
         else:
             try:
                 speed = float(spd_raw) * spd_spec.unit_scale
@@ -133,7 +137,21 @@ def _parse_row_from_tuple(
         speed = _float_default(spd_spec) if spd_spec else 0.0
         issues.append(_fast_issue("WARN", "speed invalid; using default"))
 
-    return (vehicle_id, timestamp, lon, lat, heading, speed, None), issues
+    extra: dict[str, Any] = {}
+    for spec in specs.values():
+        if not spec.extra:
+            continue
+        raw = row[col_index[spec.canonical]] if spec.canonical in col_index else spec.default
+        if raw in (None, ""):
+            if spec.default not in (None, ""):
+                extra[spec.canonical] = spec.default
+            continue
+        try:
+            extra[spec.canonical] = _parse_scalar(raw, spec)
+        except (TypeError, ValueError, OverflowError):
+            issues.append(_fast_issue("WARN", f"{spec.canonical} extra invalid; skipped"))
+
+    return (vehicle_id, timestamp, lon, lat, heading, speed, extra), issues
 
 
 def parse_row(

@@ -168,6 +168,9 @@ def validate_published(
     expected = f"{descriptor.stage}/{owner}"
     if descriptor.relative_path != expected:
         raise ParquetArtifactError("descriptor does not use its controlled stage/run path")
+    stage_path = base / descriptor.stage
+    if (not stage_path.exists() or stage_path.is_symlink() or not stage_path.is_dir()):
+        raise ParquetArtifactError("published stage is missing or not a real directory")
     final = base / expected
     if not final.exists() or stat.S_ISLNK(final.lstat().st_mode) or not final.is_dir():
         raise ParquetArtifactError("published dataset is missing or not a real directory")

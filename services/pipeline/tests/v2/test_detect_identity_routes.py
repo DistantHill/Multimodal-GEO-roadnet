@@ -83,7 +83,7 @@ def test_cross_track_endpoint_average_speed_is_shared_by_all_routes(tmp_path, sp
     tracks = [replace(subtrack([[-20., 0.], [20., 0.]], subtrack_index=1,
                               headings=[90., 90.]), speed=np.asarray(speeds)),
               subtrack([[0., -20.], [0., 20.]], subtrack_index=2)]
-    cfg = intersect_config()
+    cfg = intersect_config(cross_track_min_avg_speed=20.)
     segments = _grid_columns(tracks)
     assert segments['end_speed'].tolist() == [speeds[1], 20.]
     timing = CrossTrackTiming()

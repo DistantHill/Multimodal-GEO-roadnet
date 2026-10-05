@@ -1,4 +1,5 @@
-import { createReadStream, existsSync, readFileSync, watch } from 'node:fs';
+import { createReadStream, watch } from 'node:fs';
+import { readFile, stat } from 'node:fs/promises';
 import { createServer, request as httpRequest } from 'node:http';
 import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,9 +19,48 @@ const contentTypes = {
 
 function safePath(urlPath) {
   const pathname = decodeURIComponent(urlPath.split('?')[0]);
+  if (pathname.includes('\0')) throw new URIError('Invalid path');
   const candidate = normalize(join(root, pathname === '/' ? 'index.html' : pathname));
   const rootWithSeparator = root.endsWith(sep) ? root : `${root}${sep}`;
   return candidate === root || candidate.startsWith(rootWithSeparator) ? candidate : null;
+}
+
+async function serveStatic(request, response) {
+  let filePath;
+  try {
+    filePath = safePath(request.url || '/');
+  } catch {
+    response.writeHead(400).end('Invalid path');
+    return;
+  }
+  try {
+    if (!filePath || !(await stat(filePath)).isFile()) {
+      response.writeHead(404).end('Not found');
+      return;
+    }
+
+    const headers = { 'Content-Type': contentTypes[extname(filePath)] || 'application/octet-stream' };
+    if (filePath.endsWith('index.html')) {
+      const html = (await readFile(filePath, 'utf8')).replace(
+        '</body>',
+        '<script>new EventSource("/__hmr").onmessage = () => location.reload();</script></body>',
+      );
+      response.writeHead(200, headers).end(html);
+    } else {
+      const stream = createReadStream(filePath);
+      stream.on('error', (error) => {
+        if (response.headersSent) response.destroy(error);
+        else response.writeHead(error.code === 'ENOENT' ? 404 : 500).end('File unavailable');
+      });
+      response.on('close', () => stream.destroy());
+      stream.on('open', () => {
+        response.writeHead(200, headers);
+        stream.pipe(response);
+      });
+    }
+  } catch (error) {
+    response.writeHead(['ENOENT', 'ENOTDIR'].includes(error.code) ? 404 : 500).end('File unavailable');
+  }
 }
 
 function proxyApi(request, response) {
@@ -53,23 +93,7 @@ const server = createServer((request, response) => {
     return;
   }
 
-  const filePath = safePath(request.url || '/');
-  if (!filePath || !existsSync(filePath)) {
-    response.writeHead(404).end('Not found');
-    return;
-  }
-
-  const contentType = contentTypes[extname(filePath)] || 'application/octet-stream';
-  response.writeHead(200, { 'Content-Type': contentType });
-  if (filePath.endsWith('index.html')) {
-    const html = readFileSync(filePath, 'utf8').replace(
-      '</body>',
-      '<script>new EventSource("/__hmr").onmessage = () => location.reload();</script></body>',
-    );
-    response.end(html);
-  } else {
-    createReadStream(filePath).pipe(response);
-  }
+  void serveStatic(request, response);
 });
 
 watch(join(root, 'src'), { recursive: true }, () => {
@@ -77,5 +101,5 @@ watch(join(root, 'src'), { recursive: true }, () => {
 });
 
 server.listen(port, host, () => {
-  console.log(`Frontend dev server listening on http://${host}:${port}`);
+  console.log(`Frontend dev server listening on http://${host}:${server.address().port}`);
 });

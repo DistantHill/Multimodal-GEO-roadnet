@@ -220,3 +220,14 @@ def test_published_root_and_final_symlinks_fail_closed(tmp_path):
     descriptor_path.symlink_to(moved, target_is_directory=True)
     with pytest.raises(parquet_manifest.ParquetArtifactError, match="real directory"):
         parquet_manifest.validate_published(real.resolve(), descriptor, "present")
+
+
+def test_published_validation_rejects_symlinked_stage_parent(tmp_path):
+    handle, descriptor = _built(tmp_path)
+    publish_dataset.publish(handle)
+    stage = tmp_path / "refine"
+    moved = tmp_path / "saved-stage"
+    stage.rename(moved)
+    stage.symlink_to(moved, target_is_directory=True)
+    with pytest.raises(parquet_manifest.ParquetArtifactError, match="stage.*real directory"):
+        parquet_manifest.validate_published(tmp_path.resolve(), descriptor, "present")

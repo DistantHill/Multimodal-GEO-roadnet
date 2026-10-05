@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import MISSING, fields, replace
 from pathlib import Path
+import re
+import tomllib
 
 import pytest
 
@@ -61,10 +63,12 @@ def test_smoke_config_and_optional_event_limit(tmp_path: Path) -> None:
 
 
 def test_debug_config_uses_joint_candidate_clustering() -> None:
-    debug = load_pipeline_config(CONFIG_PATH.with_name("pipeline-debug.toml"), postgres_password="secret")
+    path = CONFIG_PATH.with_name("pipeline-debug.toml")
+    expected = tomllib.loads(path.read_text(encoding="utf-8"))["detect"]
+    debug = load_pipeline_config(path, postgres_password="secret")
     assert debug.postgres.database == "roadnet_test"
-    assert debug.detect.candidate_dbscan_eps_m == 100.0
-    assert debug.detect.candidate_dbscan_min_samples == 3
+    assert debug.detect.candidate_dbscan_eps_m == expected["candidate_dbscan_eps_m"]
+    assert debug.detect.candidate_dbscan_min_samples == expected["candidate_dbscan_min_samples"]
 
 
 @pytest.mark.parametrize("value", ["0.0", "-1.0", "inf", "nan"])
@@ -167,12 +171,15 @@ def test_loaded_config_is_immutable() -> None:
 
 @pytest.mark.parametrize("value", ["-1.0", "nan", "inf"])
 def test_cross_track_average_speed_threshold_must_be_finite_non_negative(tmp_path, value):
-    from pathlib import Path
-    from track.v2.config import load_pipeline_config
-    from track.v2.errors import ConfigError
-    source = Path(__file__).resolve().parents[2] / "config" / "pipeline.toml"
-    config = tmp_path / "pipeline.toml"
-    config.write_text(source.read_text().replace("cross_track_min_avg_speed = 20.0",
-                                                f"cross_track_min_avg_speed = {value}"))
+    def replace_threshold(text: str) -> str:
+        updated, count = re.subn(
+            r"(?m)^cross_track_min_avg_speed\s*=\s*[^#\n]+",
+            f"cross_track_min_avg_speed = {value} ",
+            text,
+        )
+        assert count == 1, "The invalid threshold must be injected exactly once"
+        return updated
+
+    config = _write(tmp_path, replace_threshold)
     with pytest.raises(ConfigError, match="detect.cross_track_min_avg_speed"):
         load_pipeline_config(config, postgres_password="test")

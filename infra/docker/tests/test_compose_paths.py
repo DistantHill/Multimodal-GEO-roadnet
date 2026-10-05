@@ -35,7 +35,7 @@ class ComposePathsTest(unittest.TestCase):
         )
         return json.loads(result.stdout)["services"]["pipeline"]
 
-    def resolve_config(self, mode):
+    def resolve_config(self, mode, overlay=None):
         environment = {
             **os.environ,
             "POSTGRES_PASSWORD": "compose-config-test-only",
@@ -47,13 +47,26 @@ class ComposePathsTest(unittest.TestCase):
         environment.pop("PROFILE_OUTPUT_DIR", None)
         environment.pop("PIPELINE_LOG_DIR", None)
         environment.pop("PARQUET_ROOT", None)
+        command = ["docker", "compose", "--env-file", os.devnull, "-f",
+                   str(ROOT / "infra/docker" / f"compose.{mode}.yml")]
+        if overlay is not None:
+            command.extend(["-f", str(ROOT / "infra/docker" / f"compose.{overlay}.yml")])
         result = subprocess.run(
-            ["docker", "compose", "--env-file", os.devnull, "-f",
-             str(ROOT / "infra/docker" / f"compose.{mode}.yml"),
-             "config", "--format", "json"],
+            [*command, "config", "--format", "json"],
             env=environment, capture_output=True, text=True, check=True,
         )
         return json.loads(result.stdout)
+
+    def test_test_overlays_select_their_matching_pipeline_config(self):
+        for overlay, filename in (("smoke", "pipeline-roadnet-test.toml"),
+                                  ("full", "pipeline.toml")):
+            with self.subTest(overlay=overlay):
+                config = self.resolve_config("dev", overlay=overlay)
+                self.assertEqual(config["name"], f"roadnet-{overlay}")
+                self.assertEqual(
+                    config["services"]["pipeline"]["environment"]["PIPELINE_CONFIG_PATH"],
+                    f"/app/config/{filename}",
+                )
 
     def assert_paths(self, pipeline, data, parquet, logs):
         mounts = {entry["target"]: entry for entry in pipeline["volumes"]}

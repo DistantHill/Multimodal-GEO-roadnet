@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 import tomllib
@@ -111,11 +112,17 @@ def _parse_spec(entry: Any, index: int, errors: list[str]) -> FieldSpec | None:
         errors.append(f"{prefix}.canonical: must be a non-empty string")
     if not isinstance(aliases, list) or not aliases or not all(isinstance(item, str) for item in aliases):
         errors.append(f"{prefix}.aliases: must be a non-empty string list")
-    if field_type not in VALID_FIELD_TYPES:
+    if not isinstance(field_type, str) or field_type not in VALID_FIELD_TYPES:
         errors.append(f"{prefix}.type: unsupported field type {field_type!r}")
-    unit_scale = entry.get("unit_scale")
-    if type(unit_scale) not in (int, float) or unit_scale <= 0:
-        errors.append(f"{prefix}.unit_scale: must be a number > 0")
+    raw_unit_scale = entry.get("unit_scale")
+    unit_scale = None
+    if type(raw_unit_scale) in (int, float):
+        try:
+            unit_scale = float(raw_unit_scale)
+        except OverflowError:
+            pass
+    if unit_scale is None or not math.isfinite(unit_scale) or unit_scale <= 0:
+        errors.append(f"{prefix}.unit_scale: must be a finite number > 0")
     for key in ("required", "has_default", "extra"):
         if type(entry.get(key)) is not bool:
             errors.append(f"{prefix}.{key}: must be a boolean")

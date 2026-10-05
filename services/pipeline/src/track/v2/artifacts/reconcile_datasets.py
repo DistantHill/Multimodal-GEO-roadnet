@@ -139,16 +139,13 @@ def _filesystem_entries(root: Path) -> tuple[dict[str, datetime], list[Reconcile
         for entry in stage_path.iterdir():
             relative = f"{stage}/{entry.name}"
             mode = entry.lstat().st_mode
-            try:
-                UUID(entry.name)
-                valid = stat.S_ISDIR(mode) and not stat.S_ISLNK(mode)
-            except ValueError:
-                valid = False
+            valid = (_canonical_uuid(entry.name) and stat.S_ISDIR(mode)
+                     and not stat.S_ISLNK(mode))
             if valid:
                 found[relative] = datetime.fromtimestamp(entry.stat().st_mtime).astimezone()
             else:
                 issues.append(ReconcileAction("malformed_path", relative, None,
-                    "final entry is not a real UUID directory", None, False, True))
+                    "final entry is not a real canonical UUID directory", None, False, True))
     staging = root / ".artifact-staging"
     if staging.exists():
         if stat.S_ISLNK(staging.lstat().st_mode) or not staging.is_dir():
@@ -166,37 +163,33 @@ def _filesystem_entries(root: Path) -> tuple[dict[str, datetime], list[Reconcile
                         run_path.relative_to(root).as_posix(), None,
                         "staging Run is not a real directory", None, False, True))
                     continue
-                try:
-                    UUID(run_path.name)
-                except ValueError:
+                if not _canonical_uuid(run_path.name):
                     issues.append(ReconcileAction("malformed_path",
                         run_path.relative_to(root).as_posix(), None,
-                        "staging Run name is not a UUID", None, False, True))
+                        "staging Run name is not a canonical UUID", None, False, True))
                     continue
                 artifact_names: set[str] = set()
                 for entry in run_path.iterdir():
                     if entry.name.startswith(".") and entry.name.endswith(".publication.json"):
                         continue
                     relative = entry.relative_to(root).as_posix()
-                    try:
-                        UUID(entry.name)
-                        valid = stat.S_ISDIR(entry.lstat().st_mode) and not entry.is_symlink()
-                    except ValueError:
-                        valid = False
+                    valid = (_canonical_uuid(entry.name)
+                             and stat.S_ISDIR(entry.lstat().st_mode) and not entry.is_symlink())
                     if valid:
                         artifact_names.add(entry.name)
                         found[relative] = datetime.fromtimestamp(entry.stat().st_mtime).astimezone()
                     else:
                         issues.append(ReconcileAction("malformed_path", relative, None,
-                            "staging entry is not a real UUID directory", None, False, True))
+                            "staging entry is not a real canonical UUID directory", None, False, True))
                 for marker in run_path.glob(".*.publication.json"):
                     artifact_name = marker.name[1:-len(".publication.json")]
                     if artifact_name in artifact_names:
                         continue
                     relative = marker.relative_to(root).as_posix()
-                    if marker.is_symlink() or not marker.is_file():
+                    if (not _canonical_uuid(artifact_name) or marker.is_symlink()
+                            or not marker.is_file()):
                         issues.append(ReconcileAction("malformed_path", relative, None,
-                            "staging marker is not a real file", None, False, True))
+                            "staging marker is not a real file with a canonical UUID", None, False, True))
                     else:
                         found[relative] = datetime.fromtimestamp(marker.stat().st_mtime).astimezone()
     return found, issues

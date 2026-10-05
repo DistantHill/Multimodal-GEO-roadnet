@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -83,9 +84,15 @@ class ReplayRequest(BaseModel):
             return None
         if not value:
             raise ValueError("source_row_keys must not be empty")
-        normalized = [str(item) for item in value]
-        if any(not item for item in normalized):
-            raise ValueError("source_row_keys must contain non-empty strings")
+        normalized = []
+        for item in value:
+            key = item.strip()
+            if re.fullmatch(r"[+-]?[0-9]+", key) is None:
+                raise ValueError("source_row_keys must contain BIGINT integer strings")
+            number = int(key)
+            if not -(2**63) <= number < 2**63:
+                raise ValueError("source_row_keys must be within the BIGINT range")
+            normalized.append(str(number))
         if len(set(normalized)) != len(normalized):
             raise ValueError("source_row_keys must be distinct")
         return normalized
