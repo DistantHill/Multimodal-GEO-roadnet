@@ -74,7 +74,7 @@ class ProjectionContextContractTest(unittest.TestCase):
         fingerprint.assert_not_called()
 
 
-    def test_formal_parquet_detect_rejects_fingerprint_mismatch_without_pg_scan(self):
+    def test_formal_parquet_detect_accepts_matching_uuid_despite_old_fingerprint(self):
         refine = SimpleNamespace(
             refine_id="11111111-1111-1111-1111-111111111111",
             source_table="raw_points", status="completed",
@@ -88,13 +88,35 @@ class ProjectionContextContractTest(unittest.TestCase):
         with (
             patch("track.v2.intersections.detect_intersections.fetch_refine_run_row", return_value=refine),
             patch("track.v2.intersections.detect_intersections._detect_intersections_db") as compute,
-            self.assertRaisesRegex(V2Error, "fingerprint"),
         ):
             detect_intersections(
                 conn=object(),
                 config=intersect_config(),
                 context=detect_context(refine_id=refine.refine_id),
+                runtime=runtime_config(), refine_reader=reader, data_root=Path(tempfile.mkdtemp()),
+            )
+        compute.assert_called_once()
+
+
+    def test_formal_parquet_detect_rejects_wrong_refine_uuid(self):
+        refine = SimpleNamespace(
+            refine_id="11111111-1111-1111-1111-111111111111",
+            source_table="raw_points", status="completed",
+            spatial_context=_TEST_SPATIAL_CONTEXT, source_fingerprint=None,
+        )
+        reader = SimpleNamespace(descriptor=SimpleNamespace(
+            refine_id="22222222-2222-2222-2222-222222222222",
+        ))
+        with (
+            patch("track.v2.intersections.detect_intersections.fetch_refine_run_row", return_value=refine),
+            patch("track.v2.intersections.detect_intersections._detect_intersections_db") as compute,
+            self.assertRaisesRegex(V2Error, "does not belong"),
+        ):
+            detect_intersections(
+                conn=object(), config=intersect_config(),
+                context=detect_context(refine_id=refine.refine_id),
                 runtime=runtime_config(), refine_reader=reader,
+                data_root=Path(tempfile.mkdtemp()),
             )
         compute.assert_not_called()
 
@@ -170,7 +192,7 @@ class ProjectionContextContractTest(unittest.TestCase):
 
 
     def test_formal_db_detect_rejects_unready_refine_and_table_overrides_before_reads(self):
-        for status, fingerprint in (("running", {"version": 1}), ("completed", None)):
+        for status, fingerprint in (("running", {"version": 1}), ("failed", None)):
             refine = SimpleNamespace(
                 refine_id="refine-1", source_table="raw_points", status=status,
                 spatial_context=_TEST_SPATIAL_CONTEXT, source_fingerprint=fingerprint,
@@ -179,7 +201,7 @@ class ProjectionContextContractTest(unittest.TestCase):
                 self.subTest(status=status, fingerprint=fingerprint),
                 patch("track.v2.intersections.detect_intersections.fetch_refine_run_row", return_value=refine),
             ):
-                with self.assertRaisesRegex(V2Error, "completed immutable-source"):
+                with self.assertRaisesRegex(V2Error, "not completed"):
                     detect_intersections(
                         conn=object(),
                         config=intersect_config(),

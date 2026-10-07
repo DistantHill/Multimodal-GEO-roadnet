@@ -169,9 +169,8 @@ class PipelineConfigWiringTest(unittest.TestCase):
             patch("track.v2.orchestration.run_pipeline.pg_connect", return_value=_Connection()),
             patch("track.v2.orchestration.run_pipeline.PostgresPipelineStore", return_value=store),
             patch("track.v2.orchestration.run_pipeline.require_current_schema"),
-            patch("track.v2.stages.detect.validate_source_table", return_value=MagicMock()),
             patch(
-                "track.v2.stages.detect.calculate_source_fingerprint",
+                "track.v2.db.source_table.calculate_source_fingerprint",
                 return_value={"version": 1, "row_count": 0, "sha256": "0"},
             ),
             patch("track.v2.stages.detect.find_refine_artifact", return_value=MagicMock()),

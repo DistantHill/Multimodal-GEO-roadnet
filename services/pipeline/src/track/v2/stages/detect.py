@@ -11,7 +11,6 @@ from ..artifacts.publish_dataset import StagingDataset, abandon_staging, create_
 from ..config import PathsConfig, PostgresConfig
 from ..db.artifact_registry import find_refine_artifact
 from ..db.pipeline_store import DetectPersistenceResult, PipelineStore
-from ..db.source_table import calculate_source_fingerprint, validate_source_table
 from ..intersections.detect_intersections import DetectRuntimeContext, IntersectConfig, IntersectResult, detect_intersections
 from ..intersections.results.export_to_parquet import export_detect_results_to_parquet
 from ..telemetry.heartbeat import operation_heartbeat
@@ -138,10 +137,7 @@ def run_detect_stage(
         result.close()
         result = None
 
-        source_contract = validate_source_table(store.connection, refine.source_table)
-        fingerprint = calculate_source_fingerprint(
-            store.connection, refine.refine_id, source_contract,
-        )
+        source_identity = {"refine_id": refine.refine_id, "detect_id": detect_id}
         staging = create_staging(
             paths_config.parquet_directory, "detect", detect_id, uuid4(),
         )
@@ -150,18 +146,13 @@ def run_detect_stage(
             postgres_config,
             staging,
             runtime_config,
-            fingerprint,
+            source_identity,
             data_root=paths_config.data_root,
             postgres_extension_path=paths_config.duckdb_postgres_extension_path,
             refine_descriptor=registered.descriptor,
             parquet_directory=paths_config.parquet_directory,
         )
         store.rollback()
-        confirmed_fingerprint = calculate_source_fingerprint(
-            store.connection, refine.refine_id, source_contract,
-        )
-        if confirmed_fingerprint != fingerprint:
-            raise RuntimeError("Detect source changed during Parquet export")
         publish(staging)
         published = True
         with operation_heartbeat(

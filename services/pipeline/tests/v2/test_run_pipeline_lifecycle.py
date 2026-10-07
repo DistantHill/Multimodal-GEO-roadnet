@@ -271,16 +271,10 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             "track.v2.stages.refine.validate_source_table",
             return_value=source_contract,
         ))
-        self.stack.enter_context(patch(
-            "track.v2.stages.detect.validate_source_table",
-            return_value=source_contract,
+        self.fingerprint_scan = self.stack.enter_context(patch(
+            "track.v2.db.source_table.calculate_source_fingerprint",
+            side_effect=AssertionError("Pipeline must not rescan source fingerprints"),
         ))
-        self.fingerprint = {"version": 1, "row_count": 0, "sha256": "0"}
-        for module in ("stages.refine", "stages.detect"):
-            self.stack.enter_context(patch(
-                f"track.v2.{module}.calculate_source_fingerprint",
-                side_effect=lambda *_args: self.events.append("fingerprint") or self.fingerprint,
-            ))
         self.refine_staging = SimpleNamespace(path="refine-staging", stage="refine")
         self.detect_staging = SimpleNamespace(path="detect-staging", stage="detect")
         self.descriptor = SimpleNamespace(id="artifact", relative_path=f"refine/{REFINE_ID}")
@@ -301,7 +295,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
                     f"create_staging:{stage}"
                 ) or (self.refine_staging if stage == "refine" else self.detect_staging),
             ))
-        self.stack.enter_context(patch(
+        self.export_refine = self.stack.enter_context(patch(
             "track.v2.stages.refine.export_refine_parquet",
             side_effect=lambda *args, **kwargs: self.events.append("export_refine") or self.descriptor,
         ))
@@ -406,13 +400,13 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertEqual(
             self.events,
             [
-                "start_refine", "commit", "persist_refine_batch", "fingerprint",
+                "start_refine", "commit", "persist_refine_batch",
                 "commit", "create_staging:refine", "export_refine", "rollback",
-                "fingerprint", "publish:refine",
+                "publish:refine",
                 "artifact:metadata", "artifact:present", "finish_refine:completed", "commit",
                 "start_detect", "commit", "rollback",
-                "persist_detect", "commit", "fingerprint", "create_staging:detect",
-                "export_detect", "rollback", "fingerprint", "publish:detect",
+                "persist_detect", "commit", "create_staging:detect",
+                "export_detect", "rollback", "publish:detect",
                 "artifact:metadata", "artifact:present", "finish_detect:completed", "commit",
                 "load_clip", "start_fit", "commit", "persist_fit", "finish_fit:completed", "commit",
             ],
@@ -512,23 +506,12 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertFalse(any(event.kind == PipelineEventKind.STAGE_FINISH for event in emitted))
         self.assertFalse(any(event.progress == 1.0 for event in emitted))
 
-    def test_detect_source_change_abandons_staging_without_publish(self) -> None:
-        changed = {"version": 1, "row_count": 1, "sha256": "changed"}
-        with (
-            patch(
-                "track.v2.stages.detect.calculate_source_fingerprint",
-                side_effect=(self.fingerprint, changed),
-            ),
-            self.assertRaisesRegex(RuntimeError, "Detect source changed"),
-        ):
-            run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
-
-        self.assertIn("abandon:detect", self.events)
-        self.assertNotIn("publish:detect", self.events)
-        self.assertEqual(
-            self.events[-4:],
-            ["rollback", "abandon:detect", "finish_detect:failed", "commit"],
-        )
+    def test_detect_uses_run_identity_without_source_fingerprint_scans(self) -> None:
+        run_pipeline(PipelineInput(refine_id=REFINE_ID), self.config)
+        self.fingerprint_scan.assert_not_called()
+        self.assertEqual(self.export_detect.call_args.args[4],
+                         {"refine_id": REFINE_ID, "detect_id": DETECT_ID})
+        self.assertIn("finish_detect:completed", self.events)
 
     def test_detect_export_failure_abandons_staging_and_marks_failed(self) -> None:
         self.export_detect.side_effect = RuntimeError("detect export failed")
@@ -651,20 +634,11 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertEqual(self.handle.close_calls, 1)
         self.assertNotIn("start_detect", self.events)
 
-    def test_refine_source_change_abandons_staging_without_publish(self) -> None:
-        fingerprints = iter((
-            {"version": 1, "row_count": 0, "sha256": "0"},
-            {"version": 1, "row_count": 1, "sha256": "1"},
-        ))
-        with (
-            patch("track.v2.stages.refine.calculate_source_fingerprint", side_effect=fingerprints),
-            self.assertRaisesRegex(RuntimeError, "source changed"),
-        ):
-            run_pipeline(PipelineInput(source_table="raw_points"), self.config)
-
-        self.assertIn("abandon:refine", self.events)
-        self.assertNotIn("publish:refine", self.events)
-        self.assertEqual(self.events[-3:], ["get_refine", "finish_refine:failed", "commit"])
+    def test_refine_uses_run_identity_without_source_fingerprint_scans(self) -> None:
+        run_pipeline(PipelineInput(source_table="raw_points"), self.config)
+        self.fingerprint_scan.assert_not_called()
+        self.assertEqual(self.export_refine.call_args.args[4], {"refine_id": REFINE_ID})
+        self.assertIn("finish_refine:completed", self.events)
 
     def test_refine_export_failure_abandons_staging_and_preserves_error(self) -> None:
         with (

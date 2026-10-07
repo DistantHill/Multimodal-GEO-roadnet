@@ -12,6 +12,7 @@ from ..models import (
     SpatialContext,
 )
 from ..projection import CoordinateTransformer, spatial_context_from_values
+from .point_geometry import point_ewkt
 from .insert_batches import _BATCH, _chunked_insert, _copy_insert
 
 @dataclass(frozen=True, slots=True)
@@ -105,10 +106,11 @@ def fetch_refine_run(conn: Any, refine_id: str) -> RefineRunRecord:
 
 def insert_excluded_points(conn: Any, excluded: ExcludedBatch, *, refine_id: str,
                            batch_size: int = _BATCH) -> int:
-    rows = [(refine_id, int(excluded.source_row_key[i]), str(excluded.reason[i]))
+    rows = [(refine_id, int(excluded.source_row_key[i]), str(excluded.reason[i]),
+             point_ewkt(excluded.lonlat[i]))
             for i in range(len(excluded))]
     with conn.cursor() as cur:
-        _chunked_insert(cur, "excluded_points", ["refine_id", "source_row_key", "reason"],
+        _chunked_insert(cur, "excluded_points", ["refine_id", "source_row_key", "reason", "geom"],
                         rows, batch_size=batch_size)
     return len(rows)
 
@@ -119,11 +121,12 @@ def insert_kept_trajectory_points(conn: Any, subtracks: list[RefinementSubtrack]
     for track in subtracks:
         kept = np.flatnonzero(track.kind == "p")
         rows.extend((refine_id, int(track.source_row_key[i]), track.vehicle_id,
-                     track.subtrack_index, sequence, float(track.xy[i,0]), float(track.xy[i,1]))
+                     track.subtrack_index, sequence, float(track.xy[i,0]), float(track.xy[i,1]),
+                     point_ewkt(track.lonlat[i]))
                     for sequence, i in enumerate(kept))
     with conn.cursor() as cur:
         _copy_insert(cur, "kept_trajectory_points", ["refine_id", "source_row_key", "vehicle_id",
-                     "subtrack_index", "sequence_in_subtrack", "x", "y"], rows)
+                     "subtrack_index", "sequence_in_subtrack", "x", "y", "geom"], rows)
     return len(rows)
 
 

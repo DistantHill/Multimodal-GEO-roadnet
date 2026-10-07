@@ -113,6 +113,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             refine_id        UUID NOT NULL REFERENCES refine_runs(id) ON DELETE CASCADE,
             source_row_key  BIGINT NOT NULL,
             reason          TEXT NOT NULL,
+            geom            geometry(Point, 4326),
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             PRIMARY KEY (refine_id, source_row_key)
         )
@@ -132,6 +133,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
                                     CHECK (sequence_in_subtrack >= 0),
             x                       DOUBLE PRECISION,
             y                       DOUBLE PRECISION,
+            geom                    geometry(Point, 4326),
             created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             CONSTRAINT kept_points_source_member_key
                 UNIQUE (refine_id, source_row_key),
@@ -183,6 +185,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             kept_point_id                   BIGINT REFERENCES kept_trajectory_points(id),
             injected_point_id               BIGINT REFERENCES injected_points(id),
             crossing_point_id               BIGINT,
+            geom                            geometry(Point, 4326),
             created_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             CONSTRAINT resolved_points_id_detect_key UNIQUE (id, detect_id),
             CONSTRAINT resolved_points_exactly_one_source
@@ -388,6 +391,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             exit_bearing        DOUBLE PRECISION NOT NULL,
             entry_crossing_id   BIGINT NOT NULL,
             exit_crossing_id    BIGINT NOT NULL,
+            geom                geometry(MultiPoint, 4326),
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             CONSTRAINT entry_exit_points_id_detect_key UNIQUE (id, detect_id),
             CONSTRAINT entry_exit_points_intersection_fkey
@@ -694,6 +698,17 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
 
 
 POST_DDL_STATEMENTS: list[tuple[str, str]] = [
+    (
+        "refine_and_entry_exit_geometry",
+        "ALTER TABLE kept_trajectory_points ADD COLUMN IF NOT EXISTS geom geometry(Point, 4326); "
+        "ALTER TABLE excluded_points ADD COLUMN IF NOT EXISTS geom geometry(Point, 4326); "
+        "ALTER TABLE entry_exit_points ADD COLUMN IF NOT EXISTS geom geometry(MultiPoint, 4326)",
+    ),
+    (
+        "resolved_subtrack_points_geom",
+        "ALTER TABLE resolved_subtrack_points "
+        "ADD COLUMN IF NOT EXISTS geom geometry(Point, 4326)",
+    ),
     (
         "turn_events_geom_constraints",
         """

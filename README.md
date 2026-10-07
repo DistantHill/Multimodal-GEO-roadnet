@@ -143,8 +143,14 @@ docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm pipeline
 输入使用 `--source-table` 或 `--refine-id` 二选一。来源表接受
 `public.day01` 这类 schema-qualified 名称，并必须提供唯一非空的 `id` 以及
 `vehicle_id/timestamp/lon/lat/heading/speed/geom`；`extra` 可选。Pipeline 不再把
-CSV 当作运行入口，需要时先用独立 importer 导入 PostgreSQL。`--refine-id UUID`
-只复用已完成 Refine Run，并沿用既有产物及来源指纹校验；候选发现不额外扫描当前来源数据。每次始终创建新的 Detect Run；Detect
+CSV 当作运行入口，需要时先用独立 importer 导入 PostgreSQL。
+独立 importer 支持 `--extra=true|false`，默认 `true` 保留原有额外字段解析行为；
+`--extra=false` 只解析并导入映射的 `vehicle_id/timestamp/lon/lat/heading/speed`，
+不解析额外字段，也不写入 `extra` 列（已有列使用数据库默认值）。
+例如：`python -m pipeline import-trajectories --csv input.csv --extra=false`。
+`--refine-id UUID`
+只复用已完成 Refine Run；上下游产物按 `refine_id`、`detect_id` 的 UUID 关联，
+Refine 后及 Detect 前后不扫描或比较源数据指纹。每次始终创建新的 Detect Run；Detect
 完成后再创建 Fit Run。Pipeline 是独立批处理进程，不经由 Backend 请求启动。
 
 `make test` 运行 pytest 测试套件。`pipeline-smoke-test` 则执行真实流水线，

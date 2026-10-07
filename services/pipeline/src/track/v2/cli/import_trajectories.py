@@ -45,6 +45,13 @@ def _iter_vehicle_groups(
         yield (batch for _, vehicle_batches in vehicles for batch in vehicle_batches)
 
 
+def _bool_arg(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in ("true", "false"):
+        return normalized == "true"
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Import CSV trajectory data into the trajectory_points table."
@@ -57,6 +64,10 @@ def main() -> int:
     parser.add_argument(
         "--table", default="trajectory_points",
         help="目标表名 / Target table name (default: trajectory_points)."
+    )
+    parser.add_argument(
+        "--extra", type=_bool_arg, default=True, metavar="true|false",
+        help="保留额外字段到 extra；false 时仅导入映射的轨迹字段 (default: true).",
     )
     args = parser.parse_args()
 
@@ -80,6 +91,7 @@ def main() -> int:
             field_config=pc.parser.fields,
             runtime=pc.runtime,
             hash_csv_rows=False,
+            include_csv_extra=args.extra,
         )
 
         # ── Stream insert: one COPY per 10,000 vehicles ──
@@ -92,7 +104,7 @@ def main() -> int:
             )
             for group in _iter_vehicle_groups(batches):
                 t0 = time.perf_counter()
-                written = copy_trajectory_point_batches(conn, group, table=args.table)
+                written = copy_trajectory_point_batches(conn, group, table=args.table, include_extra=args.extra)
                 total_written += written
                 total_parsed += written
                 print(f"  ... 已解析 / parsed: {total_parsed:>12,}  "

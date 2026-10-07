@@ -2,6 +2,7 @@ from __future__ import annotations
 from types import SimpleNamespace as NS
 import numpy as np
 import pytest
+from track.v2.db.point_geometry import point_ewkt
 from track.v2.db.write_detect_results import WriterCrossingIDs
 from track.v2.db.write_refine_results import finish_refine_run
 from track.v2.models import CrossingBatch, TurnBatch, CrossCandidateBatch
@@ -10,7 +11,8 @@ from .writer_relation_helpers import _batch
 
 def member_columns(kinds, ids, tracks, sequences):
     return {"point_kind":np.asarray(kinds),"point_id":np.asarray(ids,dtype=np.int64),
-            "subtrack_index":np.asarray(tracks,dtype=np.int64),"refined_sequence":np.asarray(sequences,dtype=np.int64)}
+            "subtrack_index":np.asarray(tracks,dtype=np.int64),"refined_sequence":np.asarray(sequences,dtype=np.int64),
+            "geom":np.full(len(ids), "SRID=4326;POINT(120.0 30.0)", dtype=object)}
 
 
 def crossing_batch(indices, *, ids, tracks, sequences, fractions, entries, kinds=None):
@@ -38,7 +40,7 @@ def _build_resolved_rows(detect_id,members,refined_ids,complete_crossings,crossi
         track=int(members["subtrack_index"][i]); sequence=int(members["refined_sequence"][i])
         point_id=int(members["point_id"][i]); kept=members["point_kind"][i]=="kept"
         by_subtrack.setdefault(track,[]).append(((float(sequence),1,-1,-1,resolved_id),
-            (resolved_id,detect_id,track,sequence,point_id if kept else None,None if kept else point_id,None)))
+            (resolved_id,detect_id,track,sequence,point_id if kept else None,None if kept else point_id,None,members["geom"][i])))
     position=0
     for cluster,batch in complete_crossings:
         for i in range(len(batch)):
@@ -48,7 +50,7 @@ def _build_resolved_rows(detect_id,members,refined_ids,complete_crossings,crossi
             crossing_id=ids.resolve(cluster.cluster_calculate_index,int(batch.calculation_index[i]))
             key=(int(batch.point_index[i])+fraction,0 if fraction>=1-1e-12 else 2,
                  int(batch.is_entry[i]),cluster.cluster_calculate_index,crossing_id)
-            by_subtrack.setdefault(track,[]).append((key,(resolved_id,detect_id,track,None,None,None,crossing_id)))
+            by_subtrack.setdefault(track,[]).append((key,(resolved_id,detect_id,track,None,None,None,crossing_id,point_ewkt(batch.lonlat[i]))))
     return [(*row[:4],sequence,*row[4:]) for track in sorted(by_subtrack)
             for sequence,(_,row) in enumerate(sorted(by_subtrack[track],key=lambda item:item[0]))]
 

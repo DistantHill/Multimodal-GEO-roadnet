@@ -54,6 +54,7 @@ def get_database(
     runtime: RuntimeConfig,
     selector: ColumnSelector | None = None,
     hash_csv_rows: bool = True,
+    include_csv_extra: bool = True,
 ) -> "BaseTrajectorySourceHandle":
     config = field_config
     if runtime.csv_max_field_size > csv.field_size_limit():
@@ -61,6 +62,7 @@ def get_database(
     if isinstance(source, CsvSource):
         return CsvTrajectorySourceHandle(
             source, config, selector, runtime, hash_rows=hash_csv_rows,
+            include_extra=include_csv_extra,
         )
     if isinstance(source, PostgresSource):
         return PostgresTrajectorySourceHandle(source, config, selector)
@@ -281,9 +283,11 @@ class CsvTrajectorySourceHandle(BaseTrajectorySourceHandle):
         runtime: RuntimeConfig,
         *,
         hash_rows: bool = True,
+        include_extra: bool = True,
     ) -> None:
         self._source = source
         self._hash_rows = hash_rows
+        self._include_extra = include_extra
         self._path = Path(source.path)
         self._encoding = detect_encoding(
             self._path,
@@ -321,7 +325,7 @@ class CsvTrajectorySourceHandle(BaseTrajectorySourceHandle):
                 self._state.total_rows += 1
                 point_ref = str(row_number)
                 try:
-                    point, issues = parse_row(row, point_ref, row_number, self._mapping)
+                    point, issues = parse_row(row, point_ref, row_number, self._mapping, include_extra=self._include_extra)
                 except _SkipRow as exc:
                     self._state.add_issue(exc.issue)
                     self._state.assert_thresholds()

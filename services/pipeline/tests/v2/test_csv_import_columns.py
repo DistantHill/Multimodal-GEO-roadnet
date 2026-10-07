@@ -46,7 +46,8 @@ def test_import_bounded_copy_preserves_unicode_extra_and_values():
 
 
 @pytest.mark.skipif(not os.environ.get('ROADNET_TEST_DSN'), reason='ROADNET_TEST_DSN is not set')
-def test_actual_csv_import_cli_writes_multiple_vehicles_and_closes_handle(tmp_path, capsys):
+@pytest.mark.parametrize("extra", [True, False])
+def test_actual_csv_import_cli_writes_multiple_vehicles_and_closes_handle(tmp_path, capsys, extra):
     import psycopg
     from contextlib import nullcontext
     from track.v2.cli import import_trajectories
@@ -64,15 +65,15 @@ def test_actual_csv_import_cli_writes_multiple_vehicles_and_closes_handle(tmp_pa
     with psycopg.connect(os.environ['ROADNET_TEST_DSN']) as connection:
         connection.execute('''CREATE TEMP TABLE csv_cli_points (
             vehicle_id text, timestamp double precision, lon double precision,
-            lat double precision, heading double precision, speed double precision, extra jsonb)''')
+            lat double precision, heading double precision, speed double precision, extra jsonb DEFAULT '{}'::jsonb)''')
         with patch.object(import_trajectories, 'load_startup_config', return_value=config), \
              patch.object(import_trajectories, 'pg_connect', return_value=nullcontext(connection)), \
              patch.object(import_trajectories, 'get_database', side_effect=database), \
              patch.object(import_trajectories, 'init_logger'), patch.object(import_trajectories, 'shutdown_logger'), \
-             patch('sys.argv', ['import-trajectories','--csv',str(csv),'--table','pg_temp.csv_cli_points']):
+             patch('sys.argv', ['import-trajectories','--csv',str(csv),'--table','pg_temp.csv_cli_points'] + ([] if extra else ['--extra=false'])):
             assert import_trajectories.main() == 0
         assert connection.execute('SELECT vehicle_id,count(*) FROM pg_temp.csv_cli_points GROUP BY vehicle_id ORDER BY vehicle_id').fetchall() == [('A甲',2),('B乙',1)]
-        assert connection.execute('SELECT extra FROM pg_temp.csv_cli_points WHERE vehicle_id=%s ORDER BY timestamp',('A甲',)).fetchall() == [({'road_id':'道路甲'},),({'road_id':'道路乙'},)]
+        assert connection.execute('SELECT extra FROM pg_temp.csv_cli_points WHERE vehicle_id=%s ORDER BY timestamp',('A甲',)).fetchall() == ([({'road_id':'道路甲'},),({'road_id':'道路乙'},)] if extra else [({},),({},)])
     assert handles == ['closed']
     assert '3 rows' in capsys.readouterr().out
 
@@ -88,3 +89,48 @@ def test_numeric_exclusion_lookup_preserves_source_order_and_last_reason():
     replay = replay_refine('车辆甲', {'车辆甲':source}, refine_result=result)
     assert replay.excluded_indices.tolist() == [0,1]
     assert replay.excluded_reasons.tolist() == ['zero','last']
+
+
+@pytest.mark.parametrize("extra", [True, False])
+def test_csv_extra_option_controls_configured_extra_field_parsing(tmp_path, extra):
+    from track.v2.models import CsvSource
+    from track.v2.trajectories.read_source import get_database
+    from .config_factory import pipeline_config
+    csv = tmp_path / 'extra.csv'
+    csv.write_text('vehicle_id,timestamp,lon,lat,heading,speed,road_id\nA,0,113,30,90,36,discard-me\n')
+    config = pipeline_config()
+    handle = get_database(CsvSource(path=csv), field_config=config.parser.fields,
+                          runtime=config.runtime, hash_csv_rows=False, include_csv_extra=extra)
+    try:
+        points = list(handle.iter_vehicle_batches(max_batch_size=2))[0]
+        assert bool(points.extra) is extra
+        assert points.lonlat.tolist() == [[113.,30.]]
+        if extra:
+            assert points.extra['road_id'].tolist() == ['discard-me']
+    finally:
+        handle.close()
+
+
+def test_disabled_extra_is_not_serialized_or_included_in_copy(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from track.v2.db import insert_trajectory_points as module
+    writes = []
+    statements = []
+    monkeypatch.setattr(module.json, 'dumps', lambda *a, **kw: pytest.fail('extra serialized'))
+    copy = SimpleNamespace(write_row=writes.append)
+    cursor = SimpleNamespace(copy=lambda statement: (statements.append(statement), nullcontext(copy))[1])
+    conn = SimpleNamespace(cursor=lambda: nullcontext(cursor))
+    assert module.copy_trajectory_point_batches(conn, [batch()], include_extra=False) == 3
+    assert 'extra' not in statements[0]
+    assert all(len(row) == 6 for row in writes)
+
+
+def test_extra_cli_rejects_invalid_boolean_before_loading_config():
+    from track.v2.cli import import_trajectories
+    with patch('sys.argv', ['import-trajectories','--csv','unused.csv','--extra=invalid']), \
+         patch.object(import_trajectories, 'load_startup_config') as load, \
+         pytest.raises(SystemExit) as exc:
+        import_trajectories.main()
+    assert exc.value.code == 2
+    load.assert_not_called()

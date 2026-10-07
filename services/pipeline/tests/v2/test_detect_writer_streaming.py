@@ -108,21 +108,22 @@ def test_named_cursor_and_batched_copy_share_atomic_transaction(tmp_path):
             # Temporary tables shadow runtime tables and disappear on rollback.
             conn.execute('''CREATE TEMP TABLE kept_trajectory_points (
                 id bigint, refine_id text, vehicle_id text, subtrack_index int,
-                sequence_in_subtrack int)''')
+                sequence_in_subtrack int, geom geometry(Point,4326) DEFAULT ST_GeomFromText('POINT(120 30)',4326))''')
             conn.execute('''CREATE TEMP TABLE injected_points (
                 id bigint, refine_id text, vehicle_id text, subtrack_index int,
-                after_sequence_in_subtrack int)''')
+                after_sequence_in_subtrack int, geom geometry(Point,4326) DEFAULT ST_GeomFromText('POINT(120 30)',4326))''')
             conn.execute('''CREATE TEMP TABLE resolved_subtrack_points (
                 id bigserial PRIMARY KEY, detect_id text, subtrack_index int,
                 refined_sequence_in_subtrack int, sequence_in_subtrack int,
-                kept_point_id bigint, injected_point_id bigint, crossing_point_id bigint)''')
-            conn.execute("INSERT INTO kept_trajectory_points VALUES (1,'r','v',1,0),(2,'r','v',1,1),(3,'r','w',2,0)")
-            conn.execute("INSERT INTO injected_points VALUES (1,'r','v',1,0)")
+                kept_point_id bigint, injected_point_id bigint, crossing_point_id bigint, geom geometry(Point,4326))''')
+            conn.execute("INSERT INTO kept_trajectory_points(id,refine_id,vehicle_id,subtrack_index,sequence_in_subtrack) VALUES (1,'r','v',1,0),(2,'r','v',1,1),(3,'r','w',2,0)")
+            conn.execute("INSERT INTO injected_points(id,refine_id,vehicle_id,subtrack_index,after_sequence_in_subtrack) VALUES (1,'r','v',1,0)")
             result = empty_result()
             count, mapping = run_resolved_sequence(
                 conn, 'd', 'r', result, [], [], {}, batch_size=1, data_root=tmp_path,
             )
             assert count == 4 and mapping == {}
+            assert conn.execute("SELECT count(*) FROM resolved_subtrack_points WHERE ST_AsText(geom)='POINT(120 30)' AND ST_SRID(geom)=4326").fetchone() == (4,)
             assert conn.execute('''SELECT id,subtrack_index,refined_sequence_in_subtrack,
                     sequence_in_subtrack,kept_point_id,injected_point_id
                     FROM resolved_subtrack_points ORDER BY id''').fetchall() == [
@@ -169,7 +170,7 @@ def test_refine_vehicle_check_crosses_fetch_batch_boundary():
         def fetchmany(self, size):
             assert size == 1
             self.calls += 1
-            return [('kept', self.calls, 'v1' if self.calls == 1 else 'v2', 1, self.calls - 1)]
+            return [('kept', self.calls, 'v1' if self.calls == 1 else 'v2', 1, self.calls - 1, 'SRID=4326;POINT(120 30)')]
 
     cursor = Cursor()
     conn = SimpleNamespace(cursor=lambda **kwargs: cursor)

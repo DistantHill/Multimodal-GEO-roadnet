@@ -26,7 +26,6 @@ from .performance_timing import PerfTracker
 from .progress import report_detect_progress
 from .extract_topology import _build_topologies_from_reader
 from ..trajectories.query_refine_points import fetch_refine_run_row
-from ..db.artifact_registry import canonical_json
 
 def _perf_iter(perf, iterable, *, name, total=None, track=True):
     return perf.timed_iter(iterable,name=name,total=total,track=track) if perf is not None else iterable
@@ -464,9 +463,9 @@ def detect_intersections(
     if cfg.refine_id is None:
         raise V2Error("formal DB Detect requires refine_id")
     refine = fetch_refine_run_row(conn, cfg.refine_id)
-    if refine.status != "completed" or refine.source_fingerprint is None:
+    if refine.status != "completed":
         raise V2Error(
-            f"Refine Run {cfg.refine_id} is not a completed immutable-source run"
+            f"Refine Run {cfg.refine_id} is not completed"
         )
     if spatial_context is not None and spatial_context != refine.spatial_context:
         raise V2Error("supplied SpatialContext does not match the parent Refine Run")
@@ -487,8 +486,6 @@ def detect_intersections(
     descriptor = refine_reader.descriptor
     if descriptor.refine_id is None or str(descriptor.refine_id) != refine.refine_id:
         raise V2Error("Refine artifact does not belong to the parent Refine Run")
-    if descriptor.source_fingerprint_json != canonical_json(refine.source_fingerprint):
-        raise V2Error("Refine artifact source fingerprint does not match its Run")
     if runtime is None or data_root is None:
         raise V2Error("formal DB Detect requires runtime and data_root")
     return _detect_intersections_db(

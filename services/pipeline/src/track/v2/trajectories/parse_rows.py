@@ -159,6 +159,8 @@ def parse_row(
     point_ref: str,
     row_number: int,
     mapping: FieldMapping,
+    *,
+    include_extra: bool = True,
 ) -> tuple[tuple, list[ParseIssue]]:
     specs = mapping.specs_by_canonical
     issues: list[ParseIssue] = []
@@ -185,7 +187,7 @@ def parse_row(
         speed = _float_default(specs.get("speed"))
         issues.append(_issue(point_ref, row_number, "WARN", "speed invalid; using default", row))
 
-    extra = _parse_extra(row, mapping, point_ref, row_number, issues)
+    extra = _parse_extra(row, mapping, point_ref, row_number, issues) if include_extra else {}
     return (vehicle_id, timestamp, lon, lat, heading, speed, extra), issues
 
 

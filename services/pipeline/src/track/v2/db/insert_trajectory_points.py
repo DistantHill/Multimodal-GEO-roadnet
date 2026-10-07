@@ -13,30 +13,35 @@ from .insert_batches import _copy_insert
 _COLUMNS = ["vehicle_id", "timestamp", "lon", "lat", "heading", "speed", "extra"]
 
 
-def _point_row(points: SourceBatch, index: int) -> tuple[Any, ...]:
-    return (
+def _point_row(points: SourceBatch, index: int, *, include_extra: bool = True) -> tuple[Any, ...]:
+    values = (
         points.vehicle_id, float(points.timestamp[index]),
         float(points.lonlat[index, 0]), float(points.lonlat[index, 1]),
         float(points.heading[index]), float(points.speed[index]),
-        json.dumps(
-            {name: _to_output_value(values[index]) for name, values in points.extra.items()},
-            ensure_ascii=False,
-        ),
     )
+    if not include_extra:
+        return values
+    extra = json.dumps(
+        {name: _to_output_value(column[index]) for name, column in points.extra.items()},
+        ensure_ascii=False,
+    )
+    return (*values, extra)
 
 
 def copy_trajectory_point_batches(
     conn: Any, batches: Iterable[SourceBatch], *, table: str = "trajectory_points",
+    include_extra: bool = True,
 ) -> int:
     """Write a lazy group of vehicle batches through one COPY."""
     target = quote_table_name(table)
+    columns = _COLUMNS if include_extra else _COLUMNS[:-1]
     count = 0
     with operation_heartbeat(f"写入 {target}"):
         with conn.cursor() as cursor:
-            with cursor.copy(f"COPY {target} ({', '.join(_COLUMNS)}) FROM STDIN") as copy:
+            with cursor.copy(f"COPY {target} ({', '.join(columns)}) FROM STDIN") as copy:
                 for points in batches:
                     for index in range(len(points)):
-                        copy.write_row(_point_row(points, index))
+                        copy.write_row(_point_row(points, index, include_extra=include_extra))
                         count += 1
                         if count % 10_000 == 0:
                             heartbeat_progress(count)

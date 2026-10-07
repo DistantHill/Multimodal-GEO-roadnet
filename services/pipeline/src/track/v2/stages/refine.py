@@ -11,7 +11,6 @@ from ..artifacts.publish_dataset import StagingDataset, abandon_staging, create_
 from ..config import ParserConfig, PathsConfig, PostgresConfig
 from ..db.pipeline_store import PipelineStore
 from ..db.source_table import (
-    calculate_source_fingerprint,
     source_order_query,
     validate_source_table,
 )
@@ -115,9 +114,8 @@ def run_refine_stage(
         emit_message(emit, f"  kept_trajectory_points: {kept_count:,} rows")
         emit_message(emit, f"  injected_points: {injected_count:,} rows")
 
-        fingerprint = calculate_source_fingerprint(
-            store.connection, refine_id, source_contract,
-        )
+        # Keep the legacy metadata field without rescanning source rows.
+        source_identity = {"refine_id": refine_id}
         store.commit()
         staging = create_staging(
             paths_config.parquet_directory, "refine", refine_id, uuid4(),
@@ -127,20 +125,15 @@ def run_refine_stage(
             postgres_config,
             staging,
             runtime_config,
-            fingerprint,
+            source_identity,
             data_root=paths_config.data_root,
             postgres_extension_path=paths_config.duckdb_postgres_extension_path,
         )
         store.rollback()
-        confirmed_fingerprint = calculate_source_fingerprint(
-            store.connection, refine_id, source_contract,
-        )
-        if confirmed_fingerprint != fingerprint:
-            raise RuntimeError("Refine source changed during Parquet export")
         publish(staging)
         published = True
         store.complete_refine_with_artifact(
-            refine_id, descriptor, confirmed_fingerprint,
+            refine_id, descriptor, source_identity,
         )
         store.commit()
     except Exception:

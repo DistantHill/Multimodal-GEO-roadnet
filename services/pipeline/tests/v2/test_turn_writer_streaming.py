@@ -183,7 +183,7 @@ def test_turn_relation_survives_sparse_mapping_scan_and_batched_write(monkeypatc
     def members(*args):
         for start in range(0, 5, 2):
             indices=np.arange(start,min(start+2,5),dtype=np.int64)
-            yield {'point_kind':np.full(len(indices),'kept'),'point_id':100+indices,'subtrack_index':np.ones(len(indices),dtype=np.int64),'refined_sequence':indices}
+            yield {'point_kind':np.full(len(indices),'kept'),'point_id':100+indices,'subtrack_index':np.ones(len(indices),dtype=np.int64),'refined_sequence':indices,'geom':np.full(len(indices),'SRID=4326;POINT(113 30)',dtype=object)}
 
     def reserve(cur, table, count):
         values = tuple(range(next_id[0], next_id[0] + count))

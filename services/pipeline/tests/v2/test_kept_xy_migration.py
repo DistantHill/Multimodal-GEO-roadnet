@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(not os.environ.get('ROADNET_TEST_DSN'), reason='
 def test_v8_upgrade_preserves_old_derived_keys_and_does_not_backfill():
     import psycopg
     with psycopg.connect(os.environ['ROADNET_TEST_DSN']) as connection:
-        connection.execute('SET LOCAL search_path TO pg_temp, pg_catalog')
+        connection.execute('SET LOCAL search_path TO pg_temp, public, pg_catalog')
         connection.execute('''CREATE TEMP TABLE pipeline_schema_versions(component text,version integer);
             INSERT INTO pipeline_schema_versions VALUES ('track.v2',8);
             CREATE TEMP TABLE kept_trajectory_points(source_row_key bigint);
@@ -35,11 +35,12 @@ def test_writer_persists_exact_authoritative_xy_with_zero_negative_keys():
     track = refine_vehicle(source, spatial_context=SpatialContext(4326,32651,{'coordinate_semantics_version':2,'enforce_area_of_use':False,'max_scale_error':.1}),
                            config=RefineConfig(100,45,135,50,1,20,10)).subtracks[0]
     with psycopg.connect(os.environ['ROADNET_TEST_DSN']) as connection:
-        connection.execute('SET LOCAL search_path TO pg_temp, pg_catalog')
+        connection.execute('SET LOCAL search_path TO pg_temp, public, pg_catalog')
         connection.execute('''CREATE TEMP TABLE kept_trajectory_points(refine_id text, source_row_key bigint, vehicle_id text,
-            subtrack_index integer, sequence_in_subtrack integer, x double precision,y double precision)''')
+            subtrack_index integer, sequence_in_subtrack integer, x double precision,y double precision, geom geometry(Point,4326))''')
         assert insert_kept_trajectory_points(connection,[track],refine_id='run') == 2
         rows = connection.execute('SELECT source_row_key,x,y FROM kept_trajectory_points ORDER BY sequence_in_subtrack').fetchall()
         assert [row[0] for row in rows] == [0,-1]
         np.testing.assert_array_equal(np.array([row[1:] for row in rows]),track.xy)
+        assert connection.execute('SELECT ST_X(geom),ST_Y(geom),ST_SRID(geom) FROM kept_trajectory_points ORDER BY sequence_in_subtrack').fetchall() == [(120.,30.,4326),(120.001,30.,4326)]
         connection.rollback()

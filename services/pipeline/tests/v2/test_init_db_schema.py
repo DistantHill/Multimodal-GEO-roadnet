@@ -46,11 +46,19 @@ def test_resolved_sequence_has_one_stable_source_and_two_snapshots() -> None:
     ddl = _ddl("resolved_subtrack_points")
 
     assert "vehicle_id" not in ddl
+    assert "geom                            geometry(Point, 4326)," in ddl
     assert "sequence_in_subtrack            INTEGER NOT NULL" in ddl
     assert "refined_sequence_in_subtrack    INTEGER" in ddl
     assert "num_nonnulls(kept_point_id, injected_point_id, crossing_point_id) = 1" in ddl
     assert "UNIQUE (detect_id, subtrack_index, sequence_in_subtrack)" in ddl
     assert "UNIQUE (detect_id, subtrack_index, refined_sequence_in_subtrack)" in ddl
+
+
+def test_existing_resolved_points_receive_nullable_geometry() -> None:
+    assert dict(POST_DDL_STATEMENTS)["resolved_subtrack_points_geom"] == (
+        "ALTER TABLE resolved_subtrack_points "
+        "ADD COLUMN IF NOT EXISTS geom geometry(Point, 4326)"
+    )
 
 
 def test_detect_artifacts_use_internal_ids_and_do_not_repeat_derived_fields() -> None:

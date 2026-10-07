@@ -14,6 +14,7 @@ from ..intersections.detect_intersections import IntersectResult
 from ..intersections.relations.source_associations import WriterRelation
 from ..models import HotspotCluster, RuntimeConfig, SpatialContext
 from ..telemetry.heartbeat import heartbeat_progress, observed_operation
+from .point_geometry import point_ewkt, entry_exit_ewkt
 from .source_table import quote_table_name
 from .insert_batches import (
     _BATCH, _copy_insert, _chunked_template, _chunked_template_returning,
@@ -66,7 +67,6 @@ def create_detect_run(
             "INSERT INTO detect_runs (id, refine_id, parameters, status) "
             "SELECT %s, c.id, %s, 'running' FROM refine_runs AS c "
             "WHERE c.id = %s AND c.status = 'completed' "
-            "AND c.source_fingerprint IS NOT NULL "
             "AND c.processing_srid IS NOT NULL "
             "AND c.projection_config->>'coordinate_semantics_version' = '2' "
             "RETURNING id",
@@ -74,7 +74,7 @@ def create_detect_run(
         )
         if cur.fetchone() is None:
             raise ValueError(
-                f"Refine Run {refine_id} is not a completed immutable-source run"
+                f"Refine Run {refine_id} is not a completed projected run"
             )
     return detect_id
 
@@ -248,14 +248,14 @@ def _iter_refine_member_batches(
     # operations use the existing atomic write transaction and connection.
     with conn.cursor(name=f"resolved_members_{uuid.uuid4().hex}") as cur:
         cur.execute(
-            "SELECT point_kind, point_id, vehicle_id, subtrack_index, anchor_sequence "
+            "SELECT point_kind, point_id, vehicle_id, subtrack_index, anchor_sequence, geom "
             "FROM ("
             " SELECT 'kept'::text AS point_kind, id AS point_id, vehicle_id, "
-            "        subtrack_index, sequence_in_subtrack AS anchor_sequence, 0 AS kind_order "
+            "        subtrack_index, sequence_in_subtrack AS anchor_sequence, 0 AS kind_order, geom::text AS geom "
             " FROM kept_trajectory_points WHERE refine_id = %s "
             " UNION ALL "
             " SELECT 'injected', id, vehicle_id, subtrack_index, "
-            "        after_sequence_in_subtrack, 1 "
+            "        after_sequence_in_subtrack, 1, geom::text "
             " FROM injected_points WHERE refine_id = %s"
             ") AS members "
             "ORDER BY subtrack_index, anchor_sequence, kind_order, point_id",
@@ -266,13 +266,13 @@ def _iter_refine_member_batches(
         sequence = 0
         while raw_rows := cur.fetchmany(batch_size):
             sequences=[]
-            for kind,point_id,vehicle,subtrack,_anchor in raw_rows:
+            for kind,point_id,vehicle,subtrack,_anchor,_geom in raw_rows:
                 subtrack=int(subtrack); vehicle=str(vehicle)
                 if subtrack!=current_subtrack:
                     current_subtrack,current_vehicle=subtrack,vehicle; sequence=0
                 elif vehicle!=current_vehicle: raise ValueError(f"a subtrack contains multiple vehicles: {subtrack}")
                 sequences.append(sequence); sequence+=1
-            yield {"point_kind":np.asarray([row[0] for row in raw_rows]),"point_id":np.asarray([row[1] for row in raw_rows],dtype=np.int64),"subtrack_index":np.asarray([row[3] for row in raw_rows],dtype=np.int64),"refined_sequence":np.asarray(sequences,dtype=np.int64)}
+            yield {"point_kind":np.asarray([row[0] for row in raw_rows]),"point_id":np.asarray([row[1] for row in raw_rows],dtype=np.int64),"subtrack_index":np.asarray([row[3] for row in raw_rows],dtype=np.int64),"refined_sequence":np.asarray(sequences,dtype=np.int64),"geom":np.asarray([row[5] for row in raw_rows],dtype=object)}
 
 
 @observed_operation("写入 Detect 解析序列")
@@ -312,7 +312,7 @@ def _persist_resolved_sequence(
     crossing_sequences=np.zeros(offset,dtype=np.int64)
     columns = [
         "id", "detect_id", "subtrack_index", "refined_sequence_in_subtrack",
-        "sequence_in_subtrack", "kept_point_id", "injected_point_id", "crossing_point_id",
+        "sequence_in_subtrack", "kept_point_id", "injected_point_id", "crossing_point_id", "geom",
     ]
     count = 0
     current_subtrack: int | None = None
@@ -344,7 +344,7 @@ def _persist_resolved_sequence(
                     while event_index<len(current_events) and before_point(current_events[event_index]):
                         crossing_sequences[current_events[event_index]]=sequence; event_index+=1; sequence+=1
                     kept=members["point_kind"][i]=="kept"; point_id=int(members["point_id"][i])
-                    rows.append((resolved_id,detect_id,subtrack,refined_sequence,sequence,point_id if kept else None,point_id if not kept else None,None)); sequence+=1
+                    rows.append((resolved_id,detect_id,subtrack,refined_sequence,sequence,point_id if kept else None,point_id if not kept else None,None,members["geom"][i])); sequence+=1
                 workspace.add_mappings(members["point_kind"],members["point_id"],members["subtrack_index"],np.asarray(ids,dtype=np.int64))
                 _copy_insert(cur, "resolved_subtrack_points", columns, rows, observe=False)
                 count += len(rows)
@@ -361,7 +361,7 @@ def _persist_resolved_sequence(
             stop=min(start+batch_size,len(batch))
             with conn.cursor() as cur:
                 ids=_reserve_ids(cur,"resolved_subtrack_points",stop-start)
-                rows=[(resolved_id,detect_id,int(batch.subtrack_index[i]),None,crossing_sequences[offset+i],None,None,crossing_id_by_calculation.resolve(cluster.cluster_calculate_index,int(batch.calculation_index[i]))) for i,resolved_id in zip(range(start,stop),ids)]
+                rows=[(resolved_id,detect_id,int(batch.subtrack_index[i]),None,crossing_sequences[offset+i],None,None,crossing_id_by_calculation.resolve(cluster.cluster_calculate_index,int(batch.calculation_index[i])),point_ewkt(batch.lonlat[i])) for i,resolved_id in zip(range(start,stop),ids)]
                 _copy_insert(cur,"resolved_subtrack_points",columns,rows,observe=False); count+=len(rows); heartbeat_progress(count)
     return count
 
@@ -619,14 +619,14 @@ def _insert_entry_exit_points(
             if not batch.is_entry[a] or batch.is_entry[b]: raise ValueError("observation types must be entry/exit")
             if batch.subtrack_index[a]!=batch.subtrack_index[b] or batch.vehicle_id[a]!=batch.vehicle_id[b]: raise ValueError("observation crossings must share one subtrack")
             if batch.point_index[a]+batch.segment_fraction[a]>=batch.point_index[b]+batch.segment_fraction[b]: raise ValueError("entry crossing must precede exit")
-            rows.append((detect_id,intersection_id,float(observations.entry_bearing[i]),float(observations.exit_bearing[i]),crossing_ids.resolve(*entry_key),crossing_ids.resolve(*exit_key)))
+            rows.append((detect_id,intersection_id,float(observations.entry_bearing[i]),float(observations.exit_bearing[i]),crossing_ids.resolve(*entry_key),crossing_ids.resolve(*exit_key),entry_exit_ewkt(batch.lonlat[a],batch.lonlat[b])))
     with conn.cursor() as cur:
         _copy_insert(
             cur,
             "entry_exit_points",
             [
                 "detect_id", "intersection_id", "entry_bearing", "exit_bearing",
-                "entry_crossing_id", "exit_crossing_id",
+                "entry_crossing_id", "exit_crossing_id", "geom",
             ],
             rows,
         )
