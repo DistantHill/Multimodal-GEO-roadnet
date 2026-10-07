@@ -418,9 +418,41 @@ def test_clip_track_batches_same_position_exit_then_entry_without_false_road() -
         {101, 202},
         "detect-1",
         _TRANSFORMER,
+        _TRANSFORMER.forward_many(np.asarray(
+            [(item.lon, item.lat) for item in custom_intersections], dtype=np.float64,
+        )),
     )
 
     assert features == []
+
+
+def test_clip_projects_intersections_once_for_multiple_tracks(monkeypatch) -> None:
+    from backend.replay.build_clip_features import build_clip_features
+
+    grouped = group_track_rows([
+        (subtrack, f"vehicle-{subtrack}", *row)
+        for subtrack in (7, 8) for row in clip_points()
+    ])
+    expected = []
+    for key, points in grouped.items():
+        features, truncated = build_clip_features({key: points}, intersections(), {101, 202}, _DETECT, 10)
+        assert not truncated
+        expected.extend(features)
+    calls = []
+    forward_many = CoordinateTransformer.forward_many
+
+    def forward(self, coordinates):
+        calls.append(coordinates.copy())
+        return forward_many(self, coordinates)
+
+    monkeypatch.setattr(CoordinateTransformer, "forward_many", forward)
+    features, truncated = build_clip_features(grouped, intersections(), {101, 202}, _DETECT, 10)
+    assert features == expected
+    assert not truncated
+    assert [len(coordinates) for coordinates in calls] == [2, 7, 7]
+    features, truncated = build_clip_features(grouped, intersections(), {101, 202}, _DETECT, 1)
+    assert features == expected[:1]
+    assert truncated
 
 
 def test_clip_rejects_detect_without_fixed_processing_crs() -> None:

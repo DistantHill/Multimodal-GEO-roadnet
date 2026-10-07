@@ -85,10 +85,11 @@ def test_incompatible_target_schema_returns_structured_error():
 
 
 def test_target_connection_error_is_sanitized_by_route_dependency():
-    dependency = get_map_store(connection=Mock(), database_name=None)
-    next(dependency)
-    with pytest.raises(HTTPException) as error:
-        dependency.throw(psycopg.OperationalError("sensitive connection details"))
+    with patch("backend.api.map_routes.open_read_connection"):
+        dependency = get_map_store(database_name=None)
+        next(dependency)
+        with pytest.raises(HTTPException) as error:
+            dependency.throw(psycopg.OperationalError("sensitive connection details"))
     assert error.value.status_code == 503
     assert error.value.detail["error"] == "database_query_failed"
     assert "sensitive" not in str(error.value.detail)

@@ -92,6 +92,28 @@ def test_intersection_turn_event_is_visible_and_reaches_complete_subtrack():
     assert subtrack["properties"]["events"] == [{"kind": "turn_events", "id": 80, "intersection_ids": [1]}]
 
 
+def test_sparse_intersection_event_only_builds_participating_segments():
+    from backend.replay.track_points import build_track_feature
+
+    store = store_with_tracks()
+    store._fetchall = Mock(return_value=[(80, 5000, {"type": "Point", "coordinates": [113., 34.]},
+                                          {"id": 80, "detect_id": DETECT, "resolved_point_id": 5000})])
+    store._select_resolved_tracks.return_value = ([1], {5000}, False)
+    store._fetch_resolved_tracks.return_value = [point(i) for i in range(1, 10001)]
+    members = {"features": [{"properties": {"intersection_id": 1, "events": [{"kind": "turn_event", "id": 80}]}}],
+               "metadata": {"selection": "intersection_id", "intersection_id": 1, "detect_id": DETECT}}
+    with patch("backend.replay.select_intersection_members.replay_intersection", return_value=members), patch(
+        "backend.replay.build_segment_features.build_track_feature", wraps=build_track_feature,
+    ) as build_segment:
+        result = store.replay(ReplayRequest(intersection_id=1))
+    assert build_segment.call_count == 2
+    segments = [feature for feature in result["features"] if feature["properties"]["replay_layer"] == "segments"]
+    assert [feature["properties"]["resolved_point_ids"] for feature in segments] == [[4999, 5000], [5000, 5001]]
+    assert result["metadata"]["returned_subtrack_count"] == 1
+    assert result["metadata"]["context_segment_count"] == 0
+    assert result["features"][-1]["properties"]["point_count"] == 10000
+
+
 def test_intersection_missing_intermediate_geom_keeps_replay_from_returning_partial_chain():
     store = store_with_tracks()
     store._fetchall = Mock(return_value=[(90, 2, 12, None, {})])

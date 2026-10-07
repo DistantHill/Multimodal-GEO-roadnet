@@ -567,6 +567,11 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS idx_turn_events_geom_detect "
         "ON turn_events_geom(detect_id)",
     ),
+    (
+        "idx_turn_events_geom_geom",
+        "CREATE INDEX IF NOT EXISTS idx_turn_events_geom_geom "
+        "ON turn_events_geom USING GIST (geom)",
+    ),
 
     (
         "uq_pipeline_artifacts_refine_run",
@@ -679,6 +684,11 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
         "idx_centerlines_fit",
         "CREATE INDEX IF NOT EXISTS idx_centerlines_fit "
         "ON centerlines(fit_id, variant)",
+    ),
+    (
+        "idx_centerlines_geom",
+        "CREATE INDEX IF NOT EXISTS idx_centerlines_geom "
+        "ON centerlines USING GIST (geom)",
     ),
 ]
 

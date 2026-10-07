@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from decimal import Decimal
 from typing import Any
 
@@ -104,6 +104,29 @@ def replay_centerlines(
             )
         manifest_by_centerline[centerline_id] = manifest
 
+    clip_uses = Counter(
+        (int(item[1]), int(item[2]))
+        for manifest in manifest_by_centerline.values() for item in manifest
+    )
+    endpoint_ids = sorted({identifier for pair in clip_uses for identifier in pair})
+    endpoint_rows = store._fetchall(
+        "SELECT crossing.id, crossing.crossing_type, crossing.candidate_intersection_id, "
+        "intersection.id, resolved.id, resolved.subtrack_index, "
+        "resolved.sequence_in_subtrack "
+        "FROM candidate_entry_exit_points AS crossing "
+        "JOIN resolved_subtrack_points AS resolved "
+        "ON resolved.detect_id = crossing.detect_id "
+        "AND resolved.crossing_point_id = crossing.id "
+        "JOIN intersections AS intersection "
+        "ON intersection.detect_id = crossing.detect_id "
+        "AND intersection.candidate_intersection_id = crossing.candidate_intersection_id "
+        "WHERE crossing.detect_id = %s AND crossing.id = ANY(%s::bigint[]) "
+        "ORDER BY crossing.id",
+        (fit_detect_id, endpoint_ids),
+    )
+    endpoints = {int(item[0]): item for item in endpoint_rows}
+    shared_members: dict[tuple[int, int], list[Any]] = {}
+
     point_records: OrderedDict[int, dict[str, Any]] = OrderedDict()
     clip_features: list[dict[str, Any]] = []
     membership_reference_count = 0
@@ -120,23 +143,7 @@ def replay_centerlines(
             start_crossing_id = int(start_crossing_id)
             end_crossing_id = int(end_crossing_id)
             reverse = bool(reverse)
-            endpoint_rows = store._fetchall(
-                "SELECT crossing.id, crossing.crossing_type, crossing.candidate_intersection_id, "
-                "intersection.id, resolved.id, resolved.subtrack_index, "
-                "resolved.sequence_in_subtrack "
-                "FROM candidate_entry_exit_points AS crossing "
-                "JOIN resolved_subtrack_points AS resolved "
-                "ON resolved.detect_id = crossing.detect_id "
-                "AND resolved.crossing_point_id = crossing.id "
-                "JOIN intersections AS intersection "
-                "ON intersection.detect_id = crossing.detect_id "
-                "AND intersection.candidate_intersection_id = crossing.candidate_intersection_id "
-                "WHERE crossing.detect_id = %s AND crossing.id = ANY(%s::bigint[]) "
-                "ORDER BY crossing.id",
-                (fit_detect_id, [start_crossing_id, end_crossing_id]),
-            )
-            endpoints = {int(item[0]): item for item in endpoint_rows}
-            if set(endpoints) != {start_crossing_id, end_crossing_id}:
+            if start_crossing_id not in endpoints or end_crossing_id not in endpoints:
                 raise MapDataError(
                     f"Centerline {centerline_id} Clip {ordinal} has a missing crossing endpoint"
                 )
@@ -163,57 +170,60 @@ def replay_centerlines(
                 raise MapDataError(
                     f"centerline replay exceeds membership reference limit {membership_reference_limit}"
                 )
-            point_rows = store._fetchall(
-                f"SELECT resolved.id, resolved.sequence_in_subtrack, resolved.subtrack_index, "
-                "CASE WHEN resolved.kept_point_id IS NOT NULL THEN 'kept' "
-                "WHEN resolved.injected_point_id IS NOT NULL THEN 'injected' "
-                "WHEN resolved.crossing_point_id IS NOT NULL THEN 'crossing' END AS point_kind, "
-                "kept.source_row_key::text, resolved.injected_point_id, crossing.id, "
-                "intersection.id, crossing.crossing_type, "
-                "COALESCE(source.lon, injected.lon, crossing.crossing_lon), "
-                "COALESCE(source.lat, injected.lat, crossing.crossing_lat), "
-                "COALESCE(source.timestamp, injected.timestamp), "
-                "COALESCE(source.heading, injected.heading), "
-                "COALESCE(source.speed, injected.speed), vehicle.vehicle_id, "
-                "source.vehicle_id, "
-                "COALESCE(kept.vehicle_id, injected.vehicle_id) "
-                "FROM resolved_subtrack_points AS resolved "
-                "LEFT JOIN kept_trajectory_points AS kept "
-                "ON kept.id = resolved.kept_point_id AND kept.refine_id = %s "
-                f"LEFT JOIN {detect.refine.quoted_source_table} AS source "
-                f"ON source.id = kept.source_row_key::{detect.refine.source_key_sql_type} "
-                "LEFT JOIN injected_points AS injected "
-                "ON injected.id = resolved.injected_point_id AND injected.refine_id = %s "
-                "LEFT JOIN candidate_entry_exit_points AS crossing "
-                "ON crossing.id = resolved.crossing_point_id AND crossing.detect_id = resolved.detect_id "
-                "LEFT JOIN intersections AS intersection "
-                "ON intersection.detect_id = crossing.detect_id "
-                "AND intersection.candidate_intersection_id = crossing.candidate_intersection_id "
-                "LEFT JOIN LATERAL (SELECT COALESCE(anchor_kept.vehicle_id, anchor_injected.vehicle_id) "
-                "AS vehicle_id FROM resolved_subtrack_points AS anchor "
-                "LEFT JOIN kept_trajectory_points AS anchor_kept "
-                "ON anchor_kept.id = anchor.kept_point_id AND anchor_kept.refine_id = %s "
-                "LEFT JOIN injected_points AS anchor_injected "
-                "ON anchor_injected.id = anchor.injected_point_id AND anchor_injected.refine_id = %s "
-                "WHERE anchor.detect_id = resolved.detect_id "
-                "AND anchor.subtrack_index = resolved.subtrack_index "
-                "AND (anchor_kept.vehicle_id IS NOT NULL OR anchor_injected.vehicle_id IS NOT NULL) "
-                "ORDER BY anchor.sequence_in_subtrack LIMIT 1) AS vehicle ON TRUE "
-                "WHERE resolved.detect_id = %s AND resolved.subtrack_index = %s "
-                "AND resolved.sequence_in_subtrack BETWEEN %s AND %s "
-                "ORDER BY resolved.sequence_in_subtrack, resolved.id LIMIT %s",
-                (
-                    detect.refine.refine_id,
-                    detect.refine.refine_id,
-                    detect.refine.refine_id,
-                    detect.refine.refine_id,
-                    fit_detect_id,
-                    int(start[5]),
-                    int(start[6]),
-                    int(end[6]),
-                    remaining_references + 1,
-                ),
-            )
+            clip_key = (start_crossing_id, end_crossing_id)
+            point_rows = shared_members.get(clip_key)
+            if point_rows is None:
+                point_rows = store._fetchall(
+                    f"SELECT resolved.id, resolved.sequence_in_subtrack, resolved.subtrack_index, "
+                    "CASE WHEN resolved.kept_point_id IS NOT NULL THEN 'kept' "
+                    "WHEN resolved.injected_point_id IS NOT NULL THEN 'injected' "
+                    "WHEN resolved.crossing_point_id IS NOT NULL THEN 'crossing' END AS point_kind, "
+                    "kept.source_row_key::text, resolved.injected_point_id, crossing.id, "
+                    "intersection.id, crossing.crossing_type, "
+                    "COALESCE(source.lon, injected.lon, crossing.crossing_lon), "
+                    "COALESCE(source.lat, injected.lat, crossing.crossing_lat), "
+                    "COALESCE(source.timestamp, injected.timestamp), "
+                    "COALESCE(source.heading, injected.heading), "
+                    "COALESCE(source.speed, injected.speed), vehicle.vehicle_id, "
+                    "source.vehicle_id, "
+                    "COALESCE(kept.vehicle_id, injected.vehicle_id) "
+                    "FROM resolved_subtrack_points AS resolved "
+                    "LEFT JOIN kept_trajectory_points AS kept "
+                    "ON kept.id = resolved.kept_point_id AND kept.refine_id = %s "
+                    f"LEFT JOIN {detect.refine.quoted_source_table} AS source "
+                    f"ON source.id = kept.source_row_key::{detect.refine.source_key_sql_type} "
+                    "LEFT JOIN injected_points AS injected "
+                    "ON injected.id = resolved.injected_point_id AND injected.refine_id = %s "
+                    "LEFT JOIN candidate_entry_exit_points AS crossing "
+                    "ON crossing.id = resolved.crossing_point_id AND crossing.detect_id = resolved.detect_id "
+                    "LEFT JOIN intersections AS intersection "
+                    "ON intersection.detect_id = crossing.detect_id "
+                    "AND intersection.candidate_intersection_id = crossing.candidate_intersection_id "
+                    "LEFT JOIN LATERAL (SELECT COALESCE(anchor_kept.vehicle_id, anchor_injected.vehicle_id) "
+                    "AS vehicle_id FROM resolved_subtrack_points AS anchor "
+                    "LEFT JOIN kept_trajectory_points AS anchor_kept "
+                    "ON anchor_kept.id = anchor.kept_point_id AND anchor_kept.refine_id = %s "
+                    "LEFT JOIN injected_points AS anchor_injected "
+                    "ON anchor_injected.id = anchor.injected_point_id AND anchor_injected.refine_id = %s "
+                    "WHERE anchor.detect_id = resolved.detect_id "
+                    "AND anchor.subtrack_index = resolved.subtrack_index "
+                    "AND (anchor_kept.vehicle_id IS NOT NULL OR anchor_injected.vehicle_id IS NOT NULL) "
+                    "ORDER BY anchor.sequence_in_subtrack LIMIT 1) AS vehicle ON TRUE "
+                    "WHERE resolved.detect_id = %s AND resolved.subtrack_index = %s "
+                    "AND resolved.sequence_in_subtrack BETWEEN %s AND %s "
+                    "ORDER BY resolved.sequence_in_subtrack, resolved.id LIMIT %s",
+                    (
+                        detect.refine.refine_id,
+                        detect.refine.refine_id,
+                        detect.refine.refine_id,
+                        detect.refine.refine_id,
+                        fit_detect_id,
+                        int(start[5]),
+                        int(start[6]),
+                        int(end[6]),
+                        remaining_references + 1,
+                    ),
+                )
             if not point_rows:
                 raise MapDataError(
                     f"Centerline {centerline_id} Clip {ordinal} has no resolved members"
@@ -232,6 +242,11 @@ def replay_centerlines(
                     f"Centerline {centerline_id} Clip {ordinal} interval endpoints are inconsistent"
                 )
             membership_reference_count += len(point_rows)
+            clip_uses[clip_key] -= 1
+            if clip_uses[clip_key]:
+                shared_members[clip_key] = point_rows
+            else:
+                shared_members.pop(clip_key, None)
 
             clip_source = {
                 "centerline_id": centerline_id,

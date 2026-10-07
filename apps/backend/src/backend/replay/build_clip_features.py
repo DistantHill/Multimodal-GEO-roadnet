@@ -156,13 +156,13 @@ class CoordinateTransformer:
 def _clip_track(
     key: tuple[str, int], points: TrackBatch, intersections: list[ClipIntersection],
     requested: set[int], detect_id: str, transformer: CoordinateTransformer,
+    centers: np.ndarray,
 ) -> list[dict[str, Any]]:
     if len(points) < 2:
         return []
     if np.any(points.crossing_valid != points.intersection_valid):
         raise MapDataError(f"subtrack {key[1]} has invalid crossing metadata")
     xy = transformer.forward_many(points.lonlat)
-    centers = transformer.forward_many(np.asarray([(item.lon,item.lat) for item in intersections], dtype=np.float64).reshape(-1,2))
     first_x,first_y = xy[0]
     active = {item.intersection_id for item,(cx,cy) in zip(intersections,centers,strict=True)
               if math.hypot(first_x-cx, first_y-cy) < item.radius_m-_EPS}
@@ -247,9 +247,17 @@ def build_clip_features(
 ) -> tuple[list[dict[str, Any]], bool]:
     """Build bounded Clip features from already selected and ordered DB rows."""
     transformer = CoordinateTransformer(context)
+    centers: np.ndarray | None = None
     features: list[dict[str, Any]] = []
     truncated = False
     for key, points in grouped_tracks.items():
+        if len(points) < 2:
+            continue
+        if centers is None:
+            centers = transformer.forward_many(np.asarray(
+                [(item.lon, item.lat) for item in intersections], dtype=np.float64,
+            ).reshape(-1, 2))
+            centers.setflags(write=False)
         for feature in _clip_track(
             key,
             points,
@@ -257,6 +265,7 @@ def build_clip_features(
             requested_intersection_ids,
             context.detect_id,
             transformer,
+            centers,
         ):
             if len(features) >= feature_limit:
                 truncated = True

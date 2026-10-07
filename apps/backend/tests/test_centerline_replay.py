@@ -90,6 +90,63 @@ def test_shared_points_keep_all_clip_memberships_without_spending_point_budget_t
                for feature in result["features"][:3])
     assert all(len(feature["properties"]["clip_sources"]) == 2
                for feature in result["features"][:3])
+    queries = [call.args[0] for call in store._fetchall.call_args_list]
+    assert sum("FROM candidate_entry_exit_points AS crossing" in sql for sql in queries) == 1
+    assert sum("FROM resolved_subtrack_points AS resolved" in sql for sql in queries) == 1
+
+
+def test_shared_clip_keeps_both_directions_and_does_not_cache_between_requests():
+    store = make_store()
+    store.centerlines.append((82, DETECT_ID, "combined", 12, 11, 0, 1))
+    fetch = store._fetchall.side_effect
+
+    def fetch_direction(sql, params):
+        if "FROM centerline_source_clips" in sql and params[0] == 82:
+            return [(0, 100, 101, True)]
+        return fetch(sql, params)
+
+    store._fetchall.side_effect = fetch_direction
+    request = replay_request(centerline_ids=[81, 82], max_points=3)
+    result = store.replay(request)
+    assert result["features"][-2]["properties"]["resolved_point_ids"] == [1, 2, 3]
+    assert result["features"][-1]["properties"]["resolved_point_ids"] == [3, 2, 1]
+    assert result["metadata"]["membership_reference_count"] == 6
+    changed = list(store.points[1])
+    changed[9] = 120.25
+    store.points[1] = tuple(changed)
+    result = store.replay(request)
+    assert result["features"][1]["geometry"]["coordinates"][0] == 120.25
+
+
+def test_distinct_clips_share_endpoint_query_but_keep_separate_members():
+    store = make_store()
+    store.centerlines.append((82, DETECT_ID, "combined", 11, 12, 1, 0))
+    store.endpoints += [(200, 0, 9, 11, 4, 8, 0), (201, 1, 10, 12, 6, 8, 2)]
+    other_points = []
+    for original in store.points:
+        row = list(original)
+        row[0] += 3
+        row[2] = 8
+        if row[6] is not None:
+            row[6] += 100
+        other_points.append(tuple(row))
+    fetch = store._fetchall.side_effect
+
+    def fetch_distinct(sql, params):
+        if "FROM centerline_source_clips" in sql and params[0] == 82:
+            return [(0, 200, 201, False)]
+        if "FROM resolved_subtrack_points AS resolved" in sql and params[5] == 8:
+            return other_points
+        return fetch(sql, params)
+
+    store._fetchall.side_effect = fetch_distinct
+    result = store.replay(replay_request(centerline_ids=[81, 82]))
+    assert result["metadata"]["returned_point_count"] == 6
+    assert result["features"][-1]["properties"]["resolved_point_ids"] == [4, 5, 6]
+    endpoint_calls = [call for call in store._fetchall.call_args_list
+                      if "FROM candidate_entry_exit_points AS crossing" in call.args[0]]
+    assert len(endpoint_calls) == 1
+    assert endpoint_calls[0].args[1] == (DETECT_ID, [100, 101, 200, 201])
 
 
 @pytest.mark.parametrize("damage,message", [

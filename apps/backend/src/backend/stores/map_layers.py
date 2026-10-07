@@ -482,14 +482,13 @@ class PostgresMapStore:
         if bbox is not None:
             return self._resolved_point_layer_in_bbox(context, bbox, limit, offset)
 
-        base = self._resolved_base_sql(context.refine)
-        return self._fetchall(
-            base
-            + " SELECT subtrack_index, vehicle_id, resolved_point_id, source_row_key, "
-            "point_kind, crossing_id, intersection_id, crossing_type, "
-            "ST_AsGeoJSON(geom)::jsonb FROM resolved WHERE detect_id = %s"
-            + " ORDER BY subtrack_index, sequence_in_subtrack, resolved_point_id LIMIT %s OFFSET %s",
-            (context.detect_id, context.detect_id, limit, offset),
+        return self._read_resolved_point_page(
+            context,
+            "WITH page AS MATERIALIZED ("
+            "SELECT id AS resolved_point_id, subtrack_index "
+            "FROM resolved_subtrack_points WHERE detect_id = %s "
+            "ORDER BY subtrack_index, sequence_in_subtrack, id LIMIT %s OFFSET %s)",
+            (context.detect_id, limit, offset),
         )
 
     def _resolved_point_layer_in_bbox(
@@ -504,13 +503,13 @@ class PostgresMapStore:
         Kept points get their geometry from the Refine source table, while injected
         points and crossings have their own stored geometry. Spatial candidate CTEs
         use those source geometries' GiST indexes before looking up resolved IDs.
-        Vehicle IDs are then aggregated only for subtracks represented in the bbox.
+        Page the spatial candidates before resolving vehicles and source attributes.
         """
         sql = f"""
             WITH tile AS (
                 SELECT ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS geom
-            ), spatial_points AS MATERIALIZED (
-                SELECT point.id AS resolved_point_id, point.subtrack_index
+            ), spatial_points AS (
+                SELECT point.id AS resolved_point_id, point.subtrack_index, point.sequence_in_subtrack
                   FROM {context.refine.quoted_source_table} AS source
                   JOIN kept_trajectory_points AS kept
                     ON source.id = kept.source_row_key::{context.refine.source_key_sql_type}
@@ -521,7 +520,7 @@ class PostgresMapStore:
                    AND source.geom && tile.geom
                    AND ST_Intersects(source.geom, tile.geom)
                 UNION ALL
-                SELECT point.id AS resolved_point_id, point.subtrack_index
+                SELECT point.id AS resolved_point_id, point.subtrack_index, point.sequence_in_subtrack
                   FROM injected_points AS injected
                   JOIN resolved_subtrack_points AS point
                     ON point.detect_id = %s AND point.injected_point_id = injected.id
@@ -530,7 +529,7 @@ class PostgresMapStore:
                    AND injected.geom && tile.geom
                    AND ST_Intersects(injected.geom, tile.geom)
                 UNION ALL
-                SELECT point.id AS resolved_point_id, point.subtrack_index
+                SELECT point.id AS resolved_point_id, point.subtrack_index, point.sequence_in_subtrack
                   FROM candidate_entry_exit_points AS crossing
                   JOIN resolved_subtrack_points AS point
                     ON point.detect_id = %s AND point.crossing_point_id = crossing.id
@@ -538,8 +537,26 @@ class PostgresMapStore:
                  WHERE crossing.detect_id = %s
                    AND crossing.geom && tile.geom
                    AND ST_Intersects(crossing.geom, tile.geom)
-            ), candidate_subtracks AS MATERIALIZED (
-                SELECT DISTINCT subtrack_index FROM spatial_points
+            ), page AS MATERIALIZED (
+                SELECT resolved_point_id, subtrack_index FROM spatial_points
+                 ORDER BY subtrack_index, sequence_in_subtrack, resolved_point_id
+                 LIMIT %s OFFSET %s
+            )
+        """
+        return self._read_resolved_point_page(
+            context, sql,
+            (*bbox, context.detect_id, context.refine.refine_id,
+             context.detect_id, context.refine.refine_id,
+             context.detect_id, context.detect_id, limit, offset),
+        )
+
+    def _read_resolved_point_page(
+        self, context: _DetectContext, page_sql: str, page_params: tuple[Any, ...],
+    ) -> list[Any]:
+        """Enrich only the selected page; vehicle anchors may be outside the page."""
+        sql = page_sql + f"""
+            , candidate_subtracks AS MATERIALIZED (
+                SELECT DISTINCT subtrack_index FROM page
             ), subtrack_vehicle AS (
                 SELECT member.subtrack_index,
                        MIN(COALESCE(kept.vehicle_id, injected.vehicle_id)) AS vehicle_id
@@ -565,7 +582,7 @@ class PostgresMapStore:
                        crossing.id AS crossing_id,
                        intersection.id AS intersection_id,
                        crossing.crossing_type
-                  FROM spatial_points AS selected
+                  FROM page AS selected
                   JOIN resolved_subtrack_points AS point
                     ON point.id = selected.resolved_point_id AND point.detect_id = %s
                   JOIN subtrack_vehicle AS vehicle
@@ -588,24 +605,8 @@ class PostgresMapStore:
                    ST_AsGeoJSON(geom)::jsonb
               FROM resolved
              ORDER BY subtrack_index, sequence_in_subtrack, resolved_point_id
-             LIMIT %s OFFSET %s
         """
-        return self._fetchall(
-            sql,
-            (
-                *bbox,
-                context.detect_id,
-                context.refine.refine_id,
-                context.detect_id,
-                context.refine.refine_id,
-                context.detect_id,
-                context.detect_id,
-                context.detect_id,
-                context.detect_id,
-                limit,
-                offset,
-            ),
-        )
+        return self._fetchall(sql, (*page_params, context.detect_id, context.detect_id))
 
     def _intersection_layer(self, detect_id: str, bbox: BBox | None, limit: int, offset: int = 0) -> list[Any]:
         bbox_clause, bbox_params = _bbox_clause("intersection.geom", bbox)
@@ -805,48 +806,6 @@ class PostgresMapStore:
             ") AS refine_points ORDER BY subtrack_index, anchor_sequence, kind_order, row_id LIMIT %s",
             (refine.refine_id, subtrack_indexes, refine.refine_id, subtrack_indexes, limit),
         )
-
-    def _resolved_base_sql(self, refine: _RefineContext) -> str:
-        return f"""
-            WITH subtrack_vehicle AS (
-                SELECT resolved.subtrack_index,
-                       MIN(COALESCE(kept.vehicle_id, injected.vehicle_id)) AS vehicle_id
-                  FROM resolved_subtrack_points AS resolved
-                  LEFT JOIN kept_trajectory_points AS kept
-                    ON kept.id = resolved.kept_point_id
-                  LEFT JOIN injected_points AS injected
-                    ON injected.id = resolved.injected_point_id
-                 WHERE resolved.detect_id = %s
-                 GROUP BY resolved.subtrack_index
-            ), resolved AS (
-                SELECT point.detect_id, point.subtrack_index,
-                       point.sequence_in_subtrack, vehicle.vehicle_id,
-                       point.id AS resolved_point_id, kept.source_row_key,
-                       COALESCE(source.lon, injected.lon, crossing.crossing_lon) AS lon,
-                       COALESCE(source.lat, injected.lat, crossing.crossing_lat) AS lat,
-                       COALESCE(source.geom, injected.geom, crossing.geom) AS geom,
-                       CASE WHEN point.kept_point_id IS NOT NULL THEN 'kept'
-                            WHEN point.injected_point_id IS NOT NULL THEN 'injected'
-                            ELSE 'crossing' END AS point_kind,
-                       crossing.id AS crossing_id,
-                       intersection.id AS intersection_id,
-                       crossing.crossing_type
-                  FROM resolved_subtrack_points AS point
-                  JOIN subtrack_vehicle AS vehicle USING (subtrack_index)
-                  LEFT JOIN kept_trajectory_points AS kept
-                    ON kept.id = point.kept_point_id
-                  LEFT JOIN {refine.quoted_source_table} AS source
-                    ON source.id = kept.source_row_key::{refine.source_key_sql_type}
-                  LEFT JOIN injected_points AS injected
-                    ON injected.id = point.injected_point_id
-                  LEFT JOIN candidate_entry_exit_points AS crossing
-                    ON crossing.id = point.crossing_point_id
-                   AND crossing.detect_id = point.detect_id
-                  LEFT JOIN intersections AS intersection
-                    ON intersection.detect_id = crossing.detect_id
-                   AND intersection.candidate_intersection_id = crossing.candidate_intersection_id
-            )
-        """
 
     def _fetch_intersections(self, detect_id: str) -> list[ClipIntersection]:
         rows = self._fetchall(

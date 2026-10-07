@@ -6,7 +6,7 @@ from ..map_errors import MapDataError
 from .track_points import build_track_feature
 
 
-def build_segment_features(store, grouped, request, detect_id, *, segment_start_ids=()):
+def build_segment_features(store, grouped, request, detect_id, *, segment_start_ids=(), highlight_only=False):
     selected_ids = set(request.resolved_point_ids or [])
     selected_keys = set(request.source_row_keys or [])
     crossing_ids = [int(identifier) for track in grouped.values()
@@ -39,11 +39,13 @@ def build_segment_features(store, grouped, request, detect_id, *, segment_start_
         if len(points) == 1:
             spans = [(0, 0)]
         for start, end in spans:
-            segment = points.slice(start,end+1)
             participating = (
                 int(points.resolved_point_ids[start]) in starts
                 or selected(points,start) or selected(points,end)
             )
+            if highlight_only and not participating:
+                continue
+            segment = points.slice(start,end+1)
             feature = build_track_feature(key, segment, detect_id)
             feature["id"] = f"{feature['id']}:segment:{start}"
             feature["properties"].update(

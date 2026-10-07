@@ -29,7 +29,7 @@ def _collection(features, grouped, **metadata):
     )
 
 
-def _event_segments(store, request, detect_id, cross_ids, turn_ids, *, event_features=None):
+def _event_segments(store, request, detect_id, cross_ids, turn_ids, *, event_features=None, highlight_only=False):
     starts = set()
     turns = set()
     detect = store._resolve_detect(detect_id) if event_features is not None else None
@@ -92,7 +92,10 @@ def _event_segments(store, request, detect_id, cross_ids, turn_ids, *, event_fea
     # Only turn anchors select adjacent segments. Cross events identify exact
     # segment starts; treating these starts as ordinary points highlights neighbors.
     selection = request.model_copy(update={"resolved_point_ids": sorted(turns), "source_row_keys": None})
-    features = build_segment_features(store, grouped, selection, detect_id, segment_start_ids=starts)
+    features = build_segment_features(
+        store, grouped, selection, detect_id,
+        segment_start_ids=starts, highlight_only=highlight_only,
+    )
     highlighted_starts = {
         f["properties"]["segment_start_point_id"] for f in features
         if f["properties"]["replay_role"] == "highlight"
@@ -177,7 +180,8 @@ def expand_intersection_segments(store, request, members):
         raise MapDataError("交叉口来源事件超过 max_points 上限，请提高上限后重试。")
     event_features = []
     features, grouped, refine_id = _event_segments(
-        store, request, metadata["detect_id"], cross_ids, turn_ids, event_features=event_features,
+        store, request, metadata["detect_id"], cross_ids, turn_ids,
+        event_features=event_features, highlight_only=True,
     )
     for event in event_features:
         props = event["properties"]
@@ -185,7 +189,7 @@ def expand_intersection_segments(store, request, members):
         props["intersection_ids"] = sorted(roots)
         props["refine_id"] = refine_id
     indexes = _event_indexes(event_features)
-    segments = [feature for feature in features if feature["properties"]["replay_role"] == "highlight"]
+    segments = features
     for feature in segments:
         feature["properties"].update(replay_layer="segments", refine_id=refine_id,
                                      events=_source_events(feature, indexes))

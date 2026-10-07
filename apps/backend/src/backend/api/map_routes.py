@@ -10,7 +10,7 @@ import psycopg
 
 from .map_contracts import BBox, ClipRequest, FeatureCollection, ReplayRequest, parse_bbox, resolve_clip_limits, resolve_replay_limits
 from ..config import MapConfig
-from ..database import get_read_connection, open_read_connection, require_current_schema
+from ..database import SCHEMA_VERSION, open_read_connection, postgres_connection_settings, require_current_schema
 from ..map_errors import MapDataError, MapDatabaseNotFoundError, MapNotFoundError, MapSchemaMismatchError
 from ..stores.map_layers import PostgresMapStore
 
@@ -49,33 +49,52 @@ class MapStore(Protocol):
     def clip(self, request: ClipRequest) -> dict[str, Any]: ...
 
 
-def get_map_store(connection: Any = Depends(get_read_connection), database_name: str | None = Query(default=None, min_length=1, max_length=63)):
-    store = PostgresMapStore(connection)
-    if database_name is None:
-        try:
-            yield store
-        except psycopg.Error as exc:
-            raise database_query_error(exc) from exc
-        return
+def _validate_map_schema(connection: Any, *, body_selection: bool) -> None:
     try:
-        store._validate_database(database_name)
-    except MapDatabaseNotFoundError as exc:
-        raise HTTPException(404, detail={
-            "error": "database_not_found", "message": str(exc),
-        }) from exc
-    except psycopg.Error as exc:
-        raise database_query_error(exc) from exc
+        require_current_schema(connection)
+    except RuntimeError as exc:
+        message = f"所选数据库不兼容当前 schema v{SCHEMA_VERSION}，请选择业务数据库。"
+        detail = {"error": "database_schema_mismatch", "message": message} if body_selection else message
+        raise HTTPException(409, detail=detail) from exc
+
+
+def _selected_map_store(database_name: str | None, *, body_selection: bool = False):
+    """Hold one read connection, including while serving explicitly selected DBs."""
     try:
+        with open_read_connection() as connection:
+            if database_name is None or database_name == postgres_connection_settings()["dbname"]:
+                if database_name is not None:
+                    _validate_map_schema(connection, body_selection=body_selection)
+                yield PostgresMapStore(connection)
+                return
+            PostgresMapStore(connection)._validate_database(database_name)
+        # Release the catalog connection before reading the selected database.
         with open_read_connection(database_name) as target:
-            try:
-                require_current_schema(target)
-            except RuntimeError as exc:
-                raise HTTPException(409, detail="所选数据库不兼容当前 schema v8，请选择业务数据库。") from exc
+            _validate_map_schema(target, body_selection=body_selection)
             yield PostgresMapStore(target)
     except psycopg.Error as exc:
         raise database_query_error(exc) from exc
     except MapDatabaseNotFoundError as exc:
         raise HTTPException(404, detail={"error": "database_not_found", "message": str(exc)}) from exc
+
+
+DatabaseName = Annotated[str | None, Query(min_length=1, max_length=63)]
+
+
+def get_map_store(database_name: DatabaseName = None):
+    yield from _selected_map_store(database_name)
+
+
+def get_replay_store(request: ReplayRequest, database_name: DatabaseName = None):
+    yield from _selected_map_store(
+        request.database_name or database_name, body_selection=request.database_name is not None,
+    )
+
+
+def get_clip_store(request: ClipRequest, database_name: DatabaseName = None):
+    yield from _selected_map_store(
+        request.database_name or database_name, body_selection=request.database_name is not None,
+    )
 
 
 @router.get("/layers")
@@ -125,9 +144,13 @@ def read_layer(layer_id: str, bbox: str | None = Query(default=None, description
 
 
 @router.post("/replay", response_model=FeatureCollection)
-def replay(request: ReplayRequest, store: MapStore = Depends(get_map_store), map_config: MapConfig = Depends(get_map_config)) -> dict[str, Any]:
+def replay(request: ReplayRequest, store: MapStore = Depends(get_replay_store), map_config: MapConfig = Depends(get_map_config)) -> dict[str, Any]:
     try:
-        return store.replay(resolve_replay_limits(request, map_config))
+        resolved = resolve_replay_limits(request, map_config)
+        result = store.replay(resolved.model_copy(update={"database_name": None}))
+        if request.database_name is not None:
+            result.setdefault("metadata", {})["database_name"] = request.database_name
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except MapSchemaMismatchError as exc:
@@ -141,9 +164,13 @@ def replay(request: ReplayRequest, store: MapStore = Depends(get_map_store), map
 
 
 @router.post("/clip", response_model=FeatureCollection)
-def clip(request: ClipRequest, store: MapStore = Depends(get_map_store), map_config: MapConfig = Depends(get_map_config)) -> dict[str, Any]:
+def clip(request: ClipRequest, store: MapStore = Depends(get_clip_store), map_config: MapConfig = Depends(get_map_config)) -> dict[str, Any]:
     try:
-        return store.clip(resolve_clip_limits(request, map_config))
+        resolved = resolve_clip_limits(request, map_config)
+        result = store.clip(resolved.model_copy(update={"database_name": None}))
+        if request.database_name is not None:
+            result.setdefault("metadata", {})["database_name"] = request.database_name
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except MapSchemaMismatchError as exc:
