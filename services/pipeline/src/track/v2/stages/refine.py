@@ -39,8 +39,9 @@ def load_completed_refine_ref(
     *,
     store: PipelineStore,
     refine_id: str,
+    record: Any | None = None,
 ) -> RefineStageRef:
-    record = store.get_refine_run(refine_id)
+    record = store.get_refine_run(refine_id) if record is None else record
     if record.status != "completed":
         raise ValueError(f"Refine Run {refine_id} is not completed")
     return RefineStageRef(refine_id, record.source_table, record.spatial_context)
@@ -58,12 +59,18 @@ def run_refine_stage(
     paths_config: PathsConfig,
     parameters: dict[str, Any],
     emit: EventSink,
+    selection: Any | None = None,
 ) -> RefineStageResult:
     """Execute, publish, and complete one new Refine Run."""
     source_contract = validate_source_table(store.connection, source_table)
+    query, query_params = (source_order_query(source_contract), ())
+    if selection is not None:
+        query, query_params = selection.source_query(source_contract)
     source = PostgresSource(
         config=postgres_config,
-        query=source_order_query(source_contract),
+        query=query,
+        params=query_params,
+        break_column="_experiment_segment" if selection is not None and hasattr(selection, "geometry") else None,
         source_id=source_table,
         primary_key_field="id",
     )

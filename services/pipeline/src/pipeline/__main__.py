@@ -56,6 +56,7 @@ def serve(config: PipelineConfig) -> int:
 
 def main() -> int:
     delegated_modules = {
+        "experiment": "experiment",
         "artifacts": "reconcile_artifacts",
         "delete-run": "delete_run",
         "import-trajectories": "import_trajectories",
@@ -67,7 +68,9 @@ def main() -> int:
     }
     if len(sys.argv) > 1 and sys.argv[1] in delegated_modules:
         command, forwarded = sys.argv[1], sys.argv[2:]
-        if command == "init-db":
+        if command == "experiment":
+            from track.v2.cli.experiment import main as delegated_main
+        elif command == "init-db":
             from track.v2.cli.init_db import main as delegated_main
         elif command == "artifacts":
             from track.v2.cli.reconcile_artifacts import main as delegated_main

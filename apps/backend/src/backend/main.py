@@ -13,6 +13,7 @@ from .config import BackendConfig, load_backend_config_from_environment
 from .database import configure_database, postgres_connection_settings, verify_runtime_schema
 from .api.map_routes import router as map_router
 from .api.database_catalog import router as database_catalog_router
+from .api.experiments import router as experiments_router
 
 
 @asynccontextmanager
@@ -34,6 +35,7 @@ async def lifespan(active_app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(lifespan=lifespan)
 app.include_router(map_router)
 app.include_router(database_catalog_router)
+app.include_router(experiments_router)
 
 
 def _postgres_status(config: BackendConfig) -> str:

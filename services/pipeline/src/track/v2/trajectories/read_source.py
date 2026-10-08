@@ -439,6 +439,10 @@ class PostgresTrajectorySourceHandle(BaseTrajectorySourceHandle):
                     self._state.assert_thresholds()
                     continue
 
+                if self._source.break_column is not None:
+                    segment = row[col_index[self._source.break_column]]
+                    point = (*point[:6], {**(point[6] or {}), "_experiment_segment": segment})
+
                 for issue in issues:
                     self._state.add_issue(issue)
                 source_key = str(row[pk_idx]) if pk_idx is not None and row[pk_idx] is not None else str(ordinal)

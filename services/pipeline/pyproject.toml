@@ -16,6 +16,7 @@ dependencies = [
     "pyproj>=3.7,<4",
     "rasterio>=1.4,<2",
     "rich>=13.0",
+    "shapely>=2.0,<3",
 ]
 
 [project.optional-dependencies]

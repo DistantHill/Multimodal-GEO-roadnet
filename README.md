@@ -178,6 +178,29 @@ make pipeline-full-test SOURCE_TABLE=public.day01 REFINE_RESUME_LAST=false
 make pipeline-full-test REFINE_RESUME_LAST=true
 ```
 
+### 全量测试日志监控
+
+启动全量测试后，使用独立后台脚本 `scripts/watch_pipeline_log.py` 监控本次运行
+的日志，不在 agent session 内循环等待或轮询日志、进程。脚本启动时记录一次
+日志末尾，此后每 10 分钟记录一次，默认每次 20 行并附带时间戳。
+
+将 `run_log` 设置为本次 Pipeline 输出的日志文件对应的宿主机路径；默认宿主机
+日志目录为 `DATA_ROOT/logs`，设置了 `PIPELINE_LOG_DIR` 时以该挂载目录为准。
+使用明确的文件名，避免跟随其他并行任务的日志。监控输出也保存在仓库外：
+
+```sh
+run_log=/data/tmp/road-network/logs/本次运行日志.txt
+monitor_log=/tmp/roadnet-full-monitor.log
+nohup python3 scripts/watch_pipeline_log.py --log "$run_log" --output "$monitor_log" \
+  > /tmp/roadnet-full-monitor-launch.log 2>&1 < /dev/null &
+monitor_pid=$!
+echo "$monitor_pid"
+```
+
+按需一次性查看 `monitor_log`，不要在会话中继续轮询监控脚本。脚本只记录日志，
+不判断测试是否成功，也不启动、重启或终止 Pipeline。确认测试结束后，用
+`kill "$monitor_pid"` 停止监控，再结合测试退出码和最终日志确认结果。
+
 单独传 `REFINE_RESUME_LAST=true` 时，从当前配置连接的数据库中选择最近完成的 Refine Run；
 没有已完成批次则报错。与 `SOURCE_TABLE` 同传时只在该来源表的批次中选择。
 
@@ -232,3 +255,14 @@ make dev-down
 ```
 
 `make test` 会运行 Backend 与 Pipeline 的 pytest 套件。提交或性能报告必须列出实际执行的验证命令和结果，并逐项说明已知失败；不要用来源仓库或“legacy 基线”笼统替代当前验证状态。
+## 交叉口实验评价入口
+
+实验入口管理仓库外单份 TOML、命名案例、批量参数方案和实验历史。`ARGS` 是传给实验命令的参数：`init` 初始化、`run` 运行、`list` 查看历史。下面的命令可在任意目录执行，查看历史且不启动算法：
+
+```sh
+make -C /data/workspace/Multimodal-GEO-roadnet pipeline-experiment ARGS='list'
+```
+
+当前机器已初始化，本地配置为 /data/tmp/road-network/experiments/experiment.toml 。填写案例时间和区域后，将 `ARGS='list'` 改为 `ARGS='run'` 即可运行，无需重新初始化。首次安装、配置示例和其他操作见 [实验工作台](docs/experiment-workspace.md) 。
+
+`pipeline-full-test` 默认限定北京时间 2023 年 3 月 1 日全天，仍使用全量配置；例如 `make pipeline-full-test SOURCE_TABLE=trajectory_points`。这项默认时间限制不应用于冒烟测试。

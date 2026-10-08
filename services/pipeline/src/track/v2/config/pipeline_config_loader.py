@@ -303,6 +303,14 @@ def load_pipeline_config(path: str | Path, *, postgres_password: str) -> Pipelin
         raise ConfigError(f"invalid TOML pipeline config: {resolved}: {exc}") from exc
     except OSError as exc:
         raise ConfigError(f"cannot read pipeline config: {resolved}: {exc}") from exc
+    return load_pipeline_payload(payload, base_directory=resolved.parent, postgres_password=postgres_password)
+
+
+def load_pipeline_payload(payload: dict[str, Any], *, base_directory: str | Path, postgres_password: str) -> PipelineConfig:
+    """Validate an in-memory configuration using exactly the file-loader rules."""
+    resolved = Path(base_directory).resolve() / "pipeline.toml"
+    errors = ([] if postgres_password.strip() and postgres_password.strip() != "change-me" else
+              ["postgres.password: POSTGRES_PASSWORD is required and cannot be a placeholder"])
     expected = set(_SECTION_TYPES) | {"parser"}
     errors.extend(f"{name}: unknown section" for name in sorted(set(payload) - expected))
     errors.extend(f"{name}: missing required section" for name in sorted(expected - set(payload)))

@@ -79,7 +79,7 @@ app.innerHTML = `
       <button type="button">编辑</button>
       <button type="button">视图</button>
       <button type="button">图层</button>
-      <button type="button">分析</button>
+      <a class="experiment-nav" href="#experiments">实验评价</a>
       <button type="button">帮助</button>
     </nav>
 

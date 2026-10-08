@@ -27,6 +27,27 @@ class MakePipelineCommandsTest(unittest.TestCase):
         self.assertIn('python -m pipeline run --source-table "public.day01"', result.stdout)
         self.assertNotIn("pytest", result.stdout)
 
+    def test_full_selects_march_first_in_beijing_time(self):
+        result = self.dry_run("pipeline-full-test", "SOURCE_TABLE=trajectory_points")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--time-start "2023-03-01T00:00:00+08:00"', result.stdout)
+        self.assertIn('--time-end "2023-03-02T00:00:00+08:00"', result.stdout)
+        smoke = self.dry_run("pipeline-smoke-test", "SOURCE_TABLE=trajectory_points")
+        self.assertNotIn("--time-start", smoke.stdout)
+
+    def test_full_time_range_can_be_overridden_but_not_blank(self):
+        result = self.dry_run(
+            "pipeline-full-test", "SOURCE_TABLE=trajectory_points",
+            "FULL_TEST_TIME_START=2023-03-02T00:00:00+08:00",
+            "FULL_TEST_TIME_END=2023-03-03T00:00:00+08:00",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--time-end "2023-03-03T00:00:00+08:00"', result.stdout)
+        for name in ("FULL_TEST_TIME_START", "FULL_TEST_TIME_END"):
+            invalid = self.dry_run("pipeline-full-test", "SOURCE_TABLE=trajectory_points", f"{name}=")
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertIn(f"{name} 不能为空", invalid.stderr)
+
     def test_smoke_requires_source(self):
         result = self.dry_run("pipeline-smoke-test", "SOURCE_TABLE=")
         self.assertNotEqual(result.returncode, 0)
@@ -118,6 +139,12 @@ class MakePipelineCommandsTest(unittest.TestCase):
         result = self.dry_run("test")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("pipeline python -m pytest tests", result.stdout)
+
+    def test_experiment_uses_one_external_config_and_host_commit(self):
+        result = self.dry_run("pipeline-experiment", "ARGS=run --scheme turn")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PIPELINE_GIT_COMMIT=", result.stdout)
+        self.assertIn('experiment --config "/data/experiments/experiment.toml" run --scheme turn', result.stdout)
 
 
 if __name__ == "__main__":

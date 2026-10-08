@@ -35,6 +35,7 @@ class PipelineInput:
 
     source_table: str | None = None
     refine_id: str | None = None
+    selection: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +59,8 @@ def run_pipeline(
     sink: EventSink = _noop_event_sink if emit is None else emit
     _validate_pipeline_input(pipeline_input)
     parameters = config.snapshot_parameters()
+    if pipeline_input.selection is not None:
+        parameters["source_selection"] = pipeline_input.selection.snapshot()
     started_at = time.perf_counter()
 
     with pg_connect(config.postgres) as conn:
@@ -140,9 +143,13 @@ def _resolve_refine(
     emit: EventSink,
 ) -> tuple[RefineStageRef, RefineStageResult | None]:
     if pipeline_input.refine_id is not None:
+        record = store.get_refine_run(pipeline_input.refine_id)
+        if record.parameters.get("source_selection") != parameters.get("source_selection"):
+            raise ValueError("Refine source time selection does not match this run")
         refine_ref = load_completed_refine_ref(
             store=store,
             refine_id=pipeline_input.refine_id,
+            record=record,
         )
         # These historical messages mean Refine was not executed in this run.
         emit_message(emit, "  排除 / Excluded: 0")
@@ -165,6 +172,7 @@ def _resolve_refine(
         paths_config=config.paths,
         parameters=parameters,
         emit=emit,
+        selection=pipeline_input.selection,
     )
     return result.ref, result
 

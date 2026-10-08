@@ -13,7 +13,10 @@ def refine_vehicle(vehicle_points: SourceBatch, *, spatial_context: SpatialConte
                    _transformer: CoordinateTransformer | None = None) -> RefineIncrementalResult:
     source = vehicle_points
     transformer = _transformer or CoordinateTransformer(spatial_context)
-    cuts = np.r_[0, np.flatnonzero(np.diff(source.timestamp) > config.max_gap_s) + 1, len(source)]
+    breaks = np.diff(source.timestamp) > config.max_gap_s
+    if "_experiment_segment" in source.extra:
+        breaks |= np.diff(source.extra["_experiment_segment"]) != 0
+    cuts = np.r_[0, np.flatnonzero(breaks) + 1, len(source)]
     subtracks = []
     removed = np.zeros(len(source), dtype=np.bool_)
     injected_count = 0

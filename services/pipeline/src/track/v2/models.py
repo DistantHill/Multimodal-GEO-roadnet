@@ -522,6 +522,7 @@ class PostgresSource(TrackModel):
     connection_factory: Callable[[Any], Any] | None = None
     source_id: str | None = None
     primary_key_field: str = "point_id"
+    break_column: str | None = None
 
 
 # ── Detect output models ──────────────────────────────────────────

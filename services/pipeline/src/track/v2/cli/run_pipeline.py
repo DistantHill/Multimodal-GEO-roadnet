@@ -29,11 +29,13 @@ def run_pipeline(
     *,
     source_table: str | None = None,
     refine_id: str | None = None,
+    selection: object | None = None,
 ) -> dict[str, float | int | str | list[int]]:
     """Run with a configuration object already loaded at the process boundary."""
     pipeline_input = PipelineInput(
         source_table=source_table,
         refine_id=refine_id,
+        selection=selection,
     )
     reporter = PipelineReporter()
     try:
@@ -108,7 +110,18 @@ def main() -> int:
         metavar="PATH",
         help="Write counts and A65 phase timings as JSON after a successful run.",
     )
+    parser.add_argument("--time-start", help="Inclusive ISO timestamp with timezone")
+    parser.add_argument("--time-end", help="Exclusive ISO timestamp with timezone")
     args = parser.parse_args()
+    selection = None
+    if bool(args.time_start) != bool(args.time_end):
+        parser.error("--time-start and --time-end must be provided together")
+    if args.time_start:
+        from ..experiments.config import TimeSelection, parse_time
+        try:
+            selection = TimeSelection(parse_time(args.time_start, "time-start"), parse_time(args.time_end, "time-end"))
+        except ValueError as exc:
+            parser.error(str(exc))
 
     if args.refine_id is not None and args.refine_resume_last is not None:
         parser.error("--refine-resume-last 不能与 --refine-id 配合使用")
@@ -184,6 +197,7 @@ def main() -> int:
             config,
             source_table=args.source_table if selected_refine_id is None else None,
             refine_id=selected_refine_id,
+            **({"selection": selection} if selection is not None else {}),
         )
         _print_write_summary(stats)
         if args.stats_json is not None:

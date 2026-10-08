@@ -44,7 +44,11 @@ pipeline-smoke-test: validate-pipeline-smoke-selection
 
 pipeline-full-test: validate-pipeline-full-selection
 	$(MAKE) --no-print-directory services-up
-	$(COMPOSE_DEV) run --rm -e PIPELINE_CONFIG_PATH=/app/config/pipeline.toml pipeline python -m pipeline run $(PIPELINE_SELECTION_ARGS)
+	$(COMPOSE_DEV) run --rm -e PIPELINE_CONFIG_PATH=/app/config/pipeline.toml pipeline python -m pipeline run $(PIPELINE_SELECTION_ARGS) --time-start "$(FULL_TEST_TIME_START)" --time-end "$(FULL_TEST_TIME_END)"
+
+# Full data runs select March 1 in the source dataset's Beijing timezone.
+FULL_TEST_TIME_START ?= 2023-03-01T00:00:00+08:00
+FULL_TEST_TIME_END ?= 2023-03-02T00:00:00+08:00
 
 PIPELINE_SELECTION_ARGS = $(if $(strip $(SOURCE_TABLE)),--source-table "$(SOURCE_TABLE)",$(if $(strip $(REFINE_ID)),--refine-id "$(REFINE_ID)")) $(if $(filter undefined,$(origin REFINE_RESUME_LAST)),,--refine-resume-last "$(REFINE_RESUME_LAST)")
 
@@ -61,6 +65,8 @@ validate-pipeline-smoke-selection:
 	@:
 
 validate-pipeline-full-selection:
+	$(if $(strip $(FULL_TEST_TIME_START)),,$(error FULL_TEST_TIME_START 不能为空))
+	$(if $(strip $(FULL_TEST_TIME_END)),,$(error FULL_TEST_TIME_END 不能为空))
 	$(if $(and $(strip $(SOURCE_TABLE)),$(strip $(REFINE_ID))),$(error SOURCE_TABLE 与 REFINE_ID 只能指定一个))
 	$(if $(and $(filter-out undefined,$(origin REFINE_ID)),$(if $(strip $(REFINE_ID)),,true)),$(error REFINE_ID 不能为空))
 	$(if $(and $(filter-out undefined,$(origin SOURCE_TABLE)),$(if $(strip $(SOURCE_TABLE)),,true)),$(error SOURCE_TABLE 不能为空))
@@ -90,6 +96,14 @@ pipeline-init-db:
 
 pipeline-help:
 	$(COMPOSE_DEV) run --rm pipeline python -m pipeline run --help
+
+.PHONY: pipeline-experiment
+EXPERIMENT_CONFIG_PATH ?= /data/experiments/experiment.toml
+PIPELINE_GIT_COMMIT = $(shell git rev-parse HEAD)
+# Draft configuration must remain editable by the host user.
+EXPERIMENT_DRAFT_USER = $(if $(filter init restore,$(firstword $(ARGS))),--user "$(shell id -u):$(shell id -g)")
+pipeline-experiment:
+	$(COMPOSE_DEV) run --rm $(EXPERIMENT_DRAFT_USER) -e PIPELINE_GIT_COMMIT="$(PIPELINE_GIT_COMMIT)" pipeline python -m pipeline experiment --config "$(EXPERIMENT_CONFIG_PATH)" $(ARGS)
 
 vision-build:
 	$(COMPOSE_DEV) --profile vision build vision

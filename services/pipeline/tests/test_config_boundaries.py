@@ -59,6 +59,8 @@ REMOVED_ENVIRONMENT_KEYS = {
     "TRACK_PG_USER",
     "ROADNET_DIFF_DSN",
 }
+EXPERIMENT_ENTRYPOINT = PIPELINE_ROOT / "src/track/v2/cli/experiment.py"
+
 REMOVED_CLI_OPTIONS = {
     "--config",
     "--processing-srid",
@@ -164,6 +166,8 @@ def test_removed_configuration_cli_options_do_not_return() -> None:
                 continue
             option = node.args[0]
             if isinstance(option, ast.Constant) and option.value in REMOVED_CLI_OPTIONS:
+                if path == EXPERIMENT_ENTRYPOINT and option.value == "--config":
+                    continue
                 violations.append(
                     f"{path.relative_to(REPOSITORY_ROOT)}:{node.lineno} {option.value}"
                 )
@@ -177,3 +181,10 @@ def test_package_internal_toml_defaults_do_not_return() -> None:
     )
     remaining = [str(path.relative_to(REPOSITORY_ROOT)) for path in removed_paths if path.exists()]
     assert not remaining, "package-internal TOML remains:\n" + "\n".join(remaining)
+
+
+def test_experiment_entrypoint_explicitly_selects_local_workspace() -> None:
+    tree = _tree(EXPERIMENT_ENTRYPOINT)
+    assert any(isinstance(node, ast.Call) and node.args and
+               isinstance(node.args[0], ast.Constant) and node.args[0].value == "--config"
+               for node in ast.walk(tree))
