@@ -46,13 +46,16 @@ def _cluster_angles_greedy(
 
     Each input angle is assigned to the nearest existing cluster center
     if within ``threshold_deg``; otherwise a new center is created.
-    Centers are updated via circular mean on assignment.
+    Centers are updated via the circular mean of all assigned members,
+    retaining each member's sine and cosine contribution in running sums.
 
     Input angles are sorted to produce deterministic output regardless
     of the caller's ordering.
     """
     sorted_angles = sorted(angles)
     centers: list[float] = []
+    sine_sums: list[float] = []
+    cosine_sums: list[float] = []
     for angle in sorted_angles:
         nearest: int | None = None
         nearest_delta = 999.0
@@ -63,8 +66,15 @@ def _cluster_angles_greedy(
                 nearest_delta = delta
         if nearest is None or nearest_delta > threshold_deg:
             centers.append(angle)
+            sine_sums.append(math.sin(math.radians(angle)))
+            cosine_sums.append(math.cos(math.radians(angle)))
         else:
-            centers[nearest] = _circular_mean_deg([centers[nearest], angle])
+            sine_sums[nearest] += math.sin(math.radians(angle))
+            cosine_sums[nearest] += math.cos(math.radians(angle))
+            centers[nearest] = (
+                math.degrees(math.atan2(sine_sums[nearest], cosine_sums[nearest]))
+                + 360.0
+            ) % 360.0
     return sorted(centers)
 
 

@@ -101,6 +101,27 @@ def test_branch_clustering():
     assert len(centers)==4
 
 
+def test_branch_center_weights_every_member_equally():
+    assert _cluster_angles_greedy([0., 20., 40.], 35.) == pytest.approx([20.])
+
+
+def test_branch_center_does_not_drift_into_a_separate_branch():
+    # Pairwise averaging follows the chain and absorbs the 70/80 degree branch.
+    angles = [0., 10., 20., 30., 40., 50., 70., 80.]
+    centers = _cluster_angles_greedy(angles, 35.)
+    assert centers == pytest.approx([25., 75.])
+    assert _cluster_angles_greedy(list(reversed(angles)), 35.) == centers
+
+
+def test_branch_center_preserves_member_weights_across_zero_degrees():
+    centers = _cluster_angles_greedy([1., 2., 359.], 35.)
+    expected = np.degrees(np.arctan2(
+        np.sin(np.radians([1., 2., 359.])).sum(),
+        np.cos(np.radians([1., 2., 359.])).sum(),
+    )) % 360.
+    assert centers == pytest.approx([expected])
+
+
 def test_nearest_angle_id():
     assert [_nearest_angle_id(angle,[0.,90.,180.,270.]) for angle in [359.,89.,181.,269.]]==[0,1,2,3]
 
