@@ -35,7 +35,7 @@ class MakePipelineCommandsTest(unittest.TestCase):
         smoke = self.dry_run("pipeline-smoke-test", "SOURCE_TABLE=trajectory_points")
         self.assertNotIn("--time-start", smoke.stdout)
 
-    def test_full_time_range_can_be_overridden_but_not_blank(self):
+    def test_full_time_range_can_be_overridden_or_blank(self):
         result = self.dry_run(
             "pipeline-full-test", "SOURCE_TABLE=trajectory_points",
             "FULL_TEST_TIME_START=2023-03-02T00:00:00+08:00",
@@ -43,10 +43,13 @@ class MakePipelineCommandsTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('--time-end "2023-03-03T00:00:00+08:00"', result.stdout)
-        for name in ("FULL_TEST_TIME_START", "FULL_TEST_TIME_END"):
-            invalid = self.dry_run("pipeline-full-test", "SOURCE_TABLE=trajectory_points", f"{name}=")
-            self.assertNotEqual(invalid.returncode, 0)
-            self.assertIn(f"{name} 不能为空", invalid.stderr)
+        blank = self.dry_run("pipeline-full-test", "REFINE_ID=11111111-1111-1111-1111-111111111111",
+                             "FULL_TEST_TIME_START=", "FULL_TEST_TIME_END=")
+        self.assertEqual(blank.returncode, 0, blank.stderr)
+        self.assertIn('--time-start "" --time-end ""', blank.stdout)
+        smoke = self.dry_run("pipeline-smoke-test", "REFINE_ID=11111111-1111-1111-1111-111111111111",
+                             "TIME_START=2023-03-01T00:00:00+08:00", "TIME_END=2023-03-02T00:00:00+08:00")
+        self.assertIn('--time-start "2023-03-01T00:00:00+08:00"', smoke.stdout)
 
     def test_smoke_requires_source(self):
         result = self.dry_run("pipeline-smoke-test", "SOURCE_TABLE=")

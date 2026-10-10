@@ -266,3 +266,28 @@ make -C /data/workspace/Multimodal-GEO-roadnet pipeline-experiment ARGS='list'
 当前机器已初始化，本地配置为 /data/tmp/road-network/experiments/experiment.toml 。填写案例时间和区域后，将 `ARGS='list'` 改为 `ARGS='run'` 即可运行，无需重新初始化。首次安装、配置示例和其他操作见 [实验工作台](docs/experiment-workspace.md) 。
 
 `pipeline-full-test` 默认限定北京时间 2023 年 3 月 1 日全天，仍使用全量配置；例如 `make pipeline-full-test SOURCE_TABLE=trajectory_points`。这项默认时间限制不应用于冒烟测试。
+
+复用 Refine 时可选择其时间范围内的任意子区间，无需与历史范围完全一致。
+`time_start` 包含，`time_end` 不包含；两者均为空时使用 Refine 的全部内容。
+单侧为空时沿用 Refine 的对应边界。显式时间必须带时区，且不能超出 Refine
+保存的来源时间范围。没有保存时间范围的历史 Refine，按其 kept/injected 点的
+实际时间边界检查；空结果不能指定时间切片。
+
+```sh
+# 从七天 Refine 中选取北京时间 3 月 1 日
+make pipeline-full-test REFINE_ID=你的UUID TIME_START=2023-03-01T00:00:00+08:00 TIME_END=2023-03-02T00:00:00+08:00
+# 使用全部 Refine 内容；兼容 FULL_TEST_TIME_START / FULL_TEST_TIME_END
+make pipeline-full-test REFINE_ID=你的UUID TIME_START= TIME_END=
+# 冒烟入口也支持相同时间参数
+make pipeline-smoke-test REFINE_ID=你的UUID TIME_START=2023-03-01T00:00:00+08:00 TIME_END=2023-03-02T00:00:00+08:00
+```
+
+Pipeline 命令行和栅格化命令均支持 `--time-start` / `--time-end`。验证案例的
+`time_start` / `time_end` 可设为 `""` 或省略；显式 `--refine-id` 使用已完成 Refine
+及其历史投影和 Parser/Refine 结果，Detect 使用当前方案参数。空时间的新建验证
+案例处理区域内全部时间数据；普通 Pipeline 新建 Refine 时需同时提供两个时间
+边界，或同时省略。
+
+时间筛选始于 schema v10，当前 Pipeline 与 Backend 要求 schema v11。已有 v9/v10 数据库使用 `python -m pipeline init-db --migrate-artifacts`
+进行迁移，保留已有 Refine 与 Parquet 制品。迁移须连接到
+实际运行使用的数据库。本次测试只在隔离 schema 中验证迁移，不自动修改业务数据库。

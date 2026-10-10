@@ -1,8 +1,8 @@
 # Parser 字段映射；修改后必须重启 Pipeline。
 [quality]
-sample_errors_max = 50 # 错误样本上限；>=1；执行语义。
-max_consecutive_errors = 50 # 连续错误上限；>=1；解析语义。
-max_error_ratio = 1.0 # 最大错误比例；0..1；解析语义。
+sample_errors_max = 50                           # 错误样本上限；>=1；执行语义。
+max_consecutive_errors = 50                      # 连续错误上限；>=1；解析语义。
+max_error_ratio = 1.0                            # 最大错误比例；0..1；解析语义。
 
 [[field]]
 canonical = "vehicle_id"

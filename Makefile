@@ -40,15 +40,17 @@ pipeline-smoke-test: validate-pipeline-smoke-selection
 	$(MAKE) --no-print-directory services-up
 	$(COMPOSE_DEV)  -f infra/docker/compose.smoke.yml \
 	 run --rm -e PIPELINE_CONFIG_PATH=/app/config/pipeline-roadnet-test.toml \
-	 pipeline python -m pipeline run $(PIPELINE_SELECTION_ARGS)
+	 pipeline python -m pipeline run $(PIPELINE_SELECTION_ARGS) $(PIPELINE_TIME_ARGS)
 
 pipeline-full-test: validate-pipeline-full-selection
 	$(MAKE) --no-print-directory services-up
 	$(COMPOSE_DEV) run --rm -e PIPELINE_CONFIG_PATH=/app/config/pipeline.toml pipeline python -m pipeline run $(PIPELINE_SELECTION_ARGS) --time-start "$(FULL_TEST_TIME_START)" --time-end "$(FULL_TEST_TIME_END)"
 
 # Full data runs select March 1 in the source dataset's Beijing timezone.
-FULL_TEST_TIME_START ?= 2023-03-01T00:00:00+08:00
-FULL_TEST_TIME_END ?= 2023-03-02T00:00:00+08:00
+PIPELINE_TIME_ARGS = $(if $(strip $(TIME_START)),--time-start "$(TIME_START)") $(if $(strip $(TIME_END)),--time-end "$(TIME_END)")
+
+FULL_TEST_TIME_START ?= $(if $(filter undefined,$(origin TIME_START)),2023-03-01T00:00:00+08:00,$(TIME_START))
+FULL_TEST_TIME_END ?= $(if $(filter undefined,$(origin TIME_END)),2023-03-02T00:00:00+08:00,$(TIME_END))
 
 PIPELINE_SELECTION_ARGS = $(if $(strip $(SOURCE_TABLE)),--source-table "$(SOURCE_TABLE)",$(if $(strip $(REFINE_ID)),--refine-id "$(REFINE_ID)")) $(if $(filter undefined,$(origin REFINE_RESUME_LAST)),,--refine-resume-last "$(REFINE_RESUME_LAST)")
 
@@ -65,8 +67,6 @@ validate-pipeline-smoke-selection:
 	@:
 
 validate-pipeline-full-selection:
-	$(if $(strip $(FULL_TEST_TIME_START)),,$(error FULL_TEST_TIME_START 不能为空))
-	$(if $(strip $(FULL_TEST_TIME_END)),,$(error FULL_TEST_TIME_END 不能为空))
 	$(if $(and $(strip $(SOURCE_TABLE)),$(strip $(REFINE_ID))),$(error SOURCE_TABLE 与 REFINE_ID 只能指定一个))
 	$(if $(and $(filter-out undefined,$(origin REFINE_ID)),$(if $(strip $(REFINE_ID)),,true)),$(error REFINE_ID 不能为空))
 	$(if $(and $(filter-out undefined,$(origin SOURCE_TABLE)),$(if $(strip $(SOURCE_TABLE)),,true)),$(error SOURCE_TABLE 不能为空))

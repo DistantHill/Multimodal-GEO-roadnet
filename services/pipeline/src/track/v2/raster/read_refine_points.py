@@ -21,7 +21,9 @@ def load_refine_spatial_context(
 
 def iter_refined_points(conn: object, *, refine_id: str, source_table: str,
                         spatial_context: SpatialContext,
-                        batch_size: int) -> Iterator[list[tuple[float, float]]]:
+                        batch_size: int, time_start=None, time_end=None) -> Iterator[list[tuple[float, float]]]:
+    from ..time_selection import time_bounds
+    start, end = time_bounds(time_start, time_end)
     contract = validate_source_table(conn, source_table)
     query = build_stream_all_sql(
         contract.quoted_table, has_refine_id=True,
@@ -31,6 +33,16 @@ def iter_refined_points(conn: object, *, refine_id: str, source_table: str,
     )
     # Same source label and two Refine Run bindings as Detect's stream_tracks.
     params = (source_table, refine_id, "public.injected_points", refine_id)
+    if start is not None or end is not None:
+        predicates = []
+        params = list(params)
+        if start is not None:
+            predicates.append("timestamp >= %s")
+            params.append(start.timestamp())
+        if end is not None:
+            predicates.append("timestamp < %s")
+            params.append(end.timestamp())
+        query = "SELECT * FROM (" + query + ") refined WHERE " + " AND ".join(predicates)
     with conn.cursor(name=f"raster_points_{uuid.uuid4().hex}") as cur:
         cur.execute(query, params)
         while rows := cur.fetchmany(batch_size):

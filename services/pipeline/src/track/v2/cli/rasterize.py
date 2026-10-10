@@ -27,12 +27,15 @@ def main() -> int:
                         metavar=("WEST", "SOUTH", "EAST", "NORTH"),
                         help="Optional processing-CRS bounds, expanded outward to the "
                              "global pixel grid at the configured resolution")
+    parser.add_argument("--time-start", help="Inclusive ISO timestamp with timezone; empty uses Refine start")
+    parser.add_argument("--time-end", help="Exclusive ISO timestamp with timezone; empty uses Refine end")
     parser.add_argument("--ask-password", action="store_true")
     args = parser.parse_args()
     try:
         config = load_startup_config(ask_password=args.ask_password)
         request = RasterRunRequest(args.refine_id, config.paths.data_root,
-                                   tuple(args.bounds) if args.bounds else None)
+                                   tuple(args.bounds) if args.bounds else None,
+                                   time_start=args.time_start, time_end=args.time_end)
         with connect(config.postgres) as conn:
             require_current_schema(conn)
             result = run_rasterization(conn, request, config.raster)

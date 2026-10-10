@@ -63,6 +63,13 @@ def _estimate_disk_bytes(width: int, height: int, config: RasterConfig) -> int:
 def run_rasterization(conn: object, request: RasterRunRequest,
                       config: RasterConfig) -> RasterRunResult:
     """Create complete artifacts after a single named-cursor database scan."""
+    from ..db.pipeline_store import PostgresPipelineStore
+    from ..time_selection import validate_refine_time
+    store = PostgresPipelineStore(conn)
+    start = end = None
+    if request.time_start or request.time_end:
+        start, end = validate_refine_time(store, store.get_refine_run(request.refine_id),
+                                        request.time_start, request.time_end)
     run_id = str(uuid.uuid4())
     identities = {name: str(uuid.uuid5(uuid.UUID(run_id), name)) for name in (
         "grid_id", "count_artifact_id", "normalization_id", "render_id", "tile_set_id")}
@@ -86,7 +93,9 @@ def run_rasterization(conn: object, request: RasterRunRequest,
                 iter_refined_points(conn, refine_id=request.refine_id,
                                     source_table=source_table,
                                     spatial_context=spatial_context,
-                                    batch_size=config.stream_batch_size), spool)
+                                    batch_size=config.stream_batch_size,
+                                    **({"time_start": start, "time_end": end}
+                                       if start is not None or end is not None else {})), spool)
             bounds = request.bounds or inferred_bounds
             if bounds is None:
                 raise ValueError("empty Refine point stream needs explicit raster bounds")
@@ -174,6 +183,8 @@ def run_rasterization(conn: object, request: RasterRunRequest,
                 "raster_run_id": run_id, "refine_id": request.refine_id,
                 "source_table": source_table, "source_srid": spatial_context.source_srid,
                 "source_fingerprint": source_fingerprint,
+                "time_start": start.isoformat() if start else None,
+                "time_end": end.isoformat() if end else None,
                 "processing_srid": srid, "projection_config": spatial_context.projection_config,
                 "status": "complete", **identities, "semantic_config": semantic,
                 "semantic_config_digest": digest,

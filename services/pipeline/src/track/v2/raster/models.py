@@ -80,6 +80,8 @@ class RasterRunRequest:
     refine_id: str
     output_root: Path
     bounds: tuple[float, float, float, float] | None = None  # west, south, east, north
+    time_start: str | None = None
+    time_end: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
