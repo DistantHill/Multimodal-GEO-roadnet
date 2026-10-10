@@ -1,0 +1,214 @@
+{
+  "services/pipeline/src/track/v2/time_selection.py#249d1dd3e1f7095c919cff62d0a117c9a4e9740577c6c0168b639b1c42126092": {
+    "status": "not-applicable",
+    "reason": "按 refine_id 读取完整精炼点集合的时间最小值和最大值；不含空间过滤或计算，空间筛选会遗漏时间边界，使用 refine_id 与来源主键关联。"
+  },
+  "services/pipeline/src/track/v2/trajectories/results/read_parquet.py#706a00c5f0764a6f14e3dcf9e122b3e9d31c0d4f1a9900c958d49b7964e00b0f": {
+    "status": "not-applicable",
+    "reason": "DuckDB 内存视图重命名，不查询空间数据。"
+  },
+  "services/pipeline/src/track/v2/trajectories/results/read_parquet.py#9f5323c1bc3e059990cb0ca1039d0c2b03e14f87d8d3d0f333a27f6aa43319ff": {
+    "status": "not-applicable",
+    "reason": "DuckDB Parquet 时间筛选视图，按时间筛选后计算所选子轨迹序号；没有空间谓词，读取器未创建空间索引，时间筛选需涵盖所有位置。"
+  },
+  "services/pipeline/src/track/v2/cli/init_db.py#2be5dfc66f2179020607c9b98161720aacbcb3be7996de92eebb3303c570b611": {
+    "status": "not-applicable",
+    "reason": "DDL 安装 Detect 完成校验函数，按运行身份、精炼点成员主键和时间窗校验集合及序号，不进行空间过滤。需校验所有位置，空间筛选会遗漏成员。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/detect_time_v10.py#07405af2f65a994816b65ede08d2fd5d2ea4eff62fe54d43a7b6bf3f2099cc87": {
+    "status": "not-applicable",
+    "reason": "更新 schema 版本元数据，无空间数据。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/detect_time_v10.py#c2097c1c3dbae39c5ee701d840943b8a9ebf68184da8bc1f5ed8cae925441439": {
+    "status": "not-applicable",
+    "reason": "按 component 查询并锁定 schema 版本元数据，无空间数据。"
+  },
+  "services/pipeline/src/track/v2/db/write_detect_results.py#09a874003b9ab7c809364e2cbe60cca80e9f2b5b4e0fbc387a6894fbd01ab016": {
+    "status": "not-applicable",
+    "reason": "按 refine_id 获取来源表名称元数据，不涉及空间数据。"
+  },
+  "services/pipeline/src/track/v2/db/write_detect_results.py#87ac8e847a61ba2024ea699a9c15b3ff183368b87c941bd0c1268296341ebf97": {
+    "status": "not-applicable",
+    "reason": "按 detect_id 获取参数元数据，无空间数据。"
+  },
+  "services/pipeline/src/track/v2/raster/read_refine_points.py#9b166fc407be694f5177679d815de834806eb154daaa79c50c789d127e68ee20": {
+    "status": "not-applicable",
+    "reason": "栅格化需读取选定时间范围内的所有位置以推导栅格边界，没有空间过滤范围。按 refine_id 限定成员后按时间筛选，无法用空间索引缩小范围而保留全部点。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#0511dedb32a8694f619e2cd74b7702901de2dcb4da91b5fe6a902ebd84eaa45c": {
+    "status": "not-applicable",
+    "reason": "隔离并最终回滚的时间切片校验测试；仅按运行身份或主键构造/删除测试成员、更新元数据、创建时间列表，不含空间过滤或计算。空间筛选会改变待校验的完整成员集合。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#0ee03f1c34fef0313c4d0bee70513c72ed1bd6a471e6075a86b1187df27939d4": {
+    "status": "not-applicable",
+    "reason": "隔离并最终回滚的时间切片校验测试；仅按运行身份或主键构造/删除测试成员、更新元数据、创建时间列表，不含空间过滤或计算。空间筛选会改变待校验的完整成员集合。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#101d4ff4ab84cfdc2407ef335b283e3f3c47b9f773bdd94a20c40ddfe91eab9d": {
+    "status": "not-applicable",
+    "reason": "隔离并最终回滚的时间切片校验测试；仅按运行身份或主键构造/删除测试成员、更新元数据、创建时间列表，不含空间过滤或计算。空间筛选会改变待校验的完整成员集合。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#2e2a62b2a06cb3e4dcd45f42587db3c293087d41b067847f9b9f5ff6ca4147df": {
+    "status": "not-applicable",
+    "reason": "隔离并最终回滚的时间切片校验测试；仅按运行身份或主键构造/删除测试成员、更新元数据、创建时间列表，不含空间过滤或计算。空间筛选会改变待校验的完整成员集合。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#6160d953efee124c479def5c85c8b4cae3b747187492d8e1fd3b20877a775b29": {
+    "status": "not-applicable",
+    "reason": "隔离并最终回滚的时间切片校验测试；仅按运行身份或主键构造/删除测试成员、更新元数据、创建时间列表，不含空间过滤或计算。空间筛选会改变待校验的完整成员集合。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#6c847c7d984b03523631e274e4bf4a6f677abe2a74729b327b424cfa93085660": {
+    "status": "not-applicable",
+    "reason": "隔离并最终回滚的时间切片校验测试；仅按运行身份或主键构造/删除测试成员、更新元数据、创建时间列表，不含空间过滤或计算。空间筛选会改变待校验的完整成员集合。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#8612a49b337076dcc35c662f45b4621da4a6064c2b1747129fb8a33cc6c25bbd": {
+    "status": "not-applicable",
+    "reason": "隔离并最终回滚的时间切片校验测试；仅按运行身份或主键构造/删除测试成员、更新元数据、创建时间列表，不含空间过滤或计算。空间筛选会改变待校验的完整成员集合。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#c0d32243846f586a32aaa84c02c3d0e7448a126f6734ff73ce01ad84c57300c0": {
+    "status": "not-applicable",
+    "reason": "隔离并最终回滚的时间切片校验测试；仅按运行身份或主键构造/删除测试成员、更新元数据、创建时间列表，不含空间过滤或计算。空间筛选会改变待校验的完整成员集合。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#c38f24555d07c7c045d8f666d3def42af8fa6557f62f8c79a00d70df51079539": {
+    "status": "not-applicable",
+    "reason": "隔离并最终回滚的时间切片校验测试；仅按运行身份或主键构造/删除测试成员、更新元数据、创建时间列表，不含空间过滤或计算。空间筛选会改变待校验的完整成员集合。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#c99deeaf6a13310b91aa38c1681f04d33c9ace63ecee3254b379025315929d05": {
+    "status": "not-applicable",
+    "reason": "隔离并最终回滚的时间切片校验测试；仅按运行身份或主键构造/删除测试成员、更新元数据、创建时间列表，不含空间过滤或计算。空间筛选会改变待校验的完整成员集合。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#ca519cb257fb16bf9349f5fb02568a25b1dc210c65214a97be5eed8b0ef1ac5f": {
+    "status": "not-applicable",
+    "reason": "隔离并最终回滚的时间切片校验测试；仅按运行身份或主键构造/删除测试成员、更新元数据、创建时间列表，不含空间过滤或计算。空间筛选会改变待校验的完整成员集合。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#d27a6d2616ecfd6cf0e7df4469c6a28821a1d5ab31dd0a91d13ece2b9f092df8": {
+    "status": "not-applicable",
+    "reason": "隔离并最终回滚的时间切片校验测试；仅按运行身份或主键构造/删除测试成员、更新元数据、创建时间列表，不含空间过滤或计算。空间筛选会改变待校验的完整成员集合。"
+  },
+  "services/pipeline/src/track/v2/candidates/candidate.py#ece9f4d022275f1128a75ca5bb666718a417431e2e8406307f36ee6d5fbc360a": {
+    "status": "not-applicable",
+    "reason": "文件顶层 docstring 以 Select 开头，扫描器将自然语言说明误识别为 SQL；实际代码使用 NumPy 转向角筛选，没有数据库查询。"
+  },
+  "services/pipeline/src/track/v2/cli/init_db.py#a97cc6f2e8ac458b838d07d9459b8aee0a21f09720ea738d9c7bbe8b46fa85ab": {
+    "status": "not-applicable",
+    "reason": "create_tables 函数 docstring 以 Create 开头，属于描述 schema 版本的自然语言，并非 SQL。"
+  },
+  "services/pipeline/tests/v2/test_completion_postgres.py#8f3f1cc780cb37eabd8b18a27b8a65e62adf1578d321c51befd7dc5bd12d3c0e": {
+    "status": "not-applicable",
+    "reason": "隔离 schema 的测试运行元数据 INSERT，保存 refine UUID 与来源表名称，不涉及空间数据。"
+  },
+  "services/pipeline/src/track/v2/experiments/runner.py#09a874003b9ab7c809364e2cbe60cca80e9f2b5b4e0fbc387a6894fbd01ab016": {
+    "status": "not-applicable",
+    "reason": "按 refine_id 读取来源表名称元数据，不涉及空间数据。"
+  },
+  "services/pipeline/src/track/v2/experiments/runner.py#6ff82340d9911753ec0fbe42115c87fc9827f193ca3167a5c6aa0a44d3cc6611": {
+    "status": "not-applicable",
+    "reason": "计数所选时间范围内 refine 的全部 kept/excluded 来源成员；不进行空间计算或筛选，需要覆盖全部位置。先按 refine_id 选成员，再用来源主键关联并筛选时间，空间索引不能缩小范围而保留完整计数语义。"
+  },
+  "services/pipeline/src/track/v2/db/write_detect_results.py#c912170e42054219330e7e73755717aa67eda61f1dab296be46ef028df152d95": {
+    "status": "not-applicable",
+    "reason": "按 refine_id 限定精炼成员并通过来源主键读取时间，筛选后排序并输出所选范围的全部点，geom 仅作为持久化值读取，不做空间过滤或计算。空间筛选会遗漏所选时间内的点，因此无法通过空间索引缩小完整解析序列。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#0a26afd15608fa18026940fec23384030f807289a8d2d5ccfd1792cadea4ef1d": {
+    "status": "not-applicable",
+    "reason": "隔离 schema 迁移测试仅读写 schema 版本与制品身份元数据，不涉及空间点或空间计算。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#9a6a214ef1d5cd02c3a44bee42a1eb098524384ea557d50316cf8cc61513190c": {
+    "status": "not-applicable",
+    "reason": "隔离 schema 迁移测试仅读写 schema 版本与制品身份元数据，不涉及空间点或空间计算。"
+  },
+  "services/pipeline/tests/v2/test_refine_time_postgres.py#a0cc1e94cb73c4ee93b0222a8c10e64d45f41ab861ad95676721e5f0c050fb7a": {
+    "status": "not-applicable",
+    "reason": "隔离 schema 迁移测试仅读写 schema 版本与制品身份元数据，不涉及空间点或空间计算。"
+  },
+  "services/pipeline/src/track/v2/trajectories/query_refine_points.py#90756a586f0220f6319e6c20985ca72a1e17942cb2c0527f6c0e680c5dffc8d3": {
+    "status": "not-applicable",
+    "reason": "传统逐车读取入口先按 refine_id 读取成员，再按时间限制，并保持子轨迹顺序；没有空间过滤范围，必须包含所有位置，无法用空间索引缩小时间切片而保持全部轨迹点。"
+  },
+  "docs/validation/sql-plans/turn-success-locations-20261010.sql#e18c394af6672fa0f09cb7fbcdddf112b53fd4c245d0e25d88683c0bf987582a": {
+    "status": "uses-index",
+    "indexes": [
+      "idx_turn_events_geom_geom"
+    ],
+    "crs": "EPSG:4326",
+    "plan": "docs/validation/sql-plans/turn-success-locations-20261010.json"
+  },
+  "docs/validation/sql-plans/joint-candidates-20261010.sql#e7b80077f5e98df3bc75250a31b660bbed1ec2b0a273817dfccbc46568c0a359": {
+    "status": "not-applicable",
+    "reason": "按两个 detect_id 读取全部候选簇的标量元数据与来源贡献，用于检查中心迁移、全域半径与来源。无空间谓词；局部空间过滤会遗漏移出比较区域的候选，故不适用空间索引。"
+  },
+  "docs/validation/sql-plans/turn-global-events-20261010.sql#777d46d093ae32a6154bb8a46b7391b975f099fe8b8ae88059639c5cd618700d": {
+    "status": "not-applicable",
+    "reason": "G* 归一化需要两个 detect_id 各自全部转向事件的邻居数量分布，按 detect_id 已有 btree 索引限定运行。ST_X/ST_Y 仅投影输出坐标，不含空间谓词；空间筛选会改变全局均值、标准差及统计量。"
+  },
+  "services/pipeline/src/track/v2/cli/experiment.py#679db8f1226449d7b85234ce30ee951d258ec04f9f8c6a9312bfc5bd129a47cd": {
+    "status": "not-applicable",
+    "reason": "CLI 写入实验 TOML 模板的说明文本（Fill case time_start/time_end 提示），不是提交给数据库执行的 SQL；不读取或计算任何空间数据，无适用空间索引。"
+  },
+  "services/pipeline/src/track/v2/db/write_detect_results.py#a9d00b5f660344a35b95cf7e0a71f80c9e55f2ae1df7e04808a4acc8457b68f2": {
+    "status": "not-applicable",
+    "reason": "INSERT 写入 detect_candidate_instances 算法实例参数、行数及证据偏移元数据，VALUES 无空间过滤、计算或几何关联，空间索引不适用。"
+  },
+  "services/pipeline/src/track/v2/intersections/relations/source_associations.py#3917f576a00c0fff4372f07bc4de408da6259ab37eba8fed4380d2dff0da93a7": {
+    "status": "not-applicable",
+    "reason": "DuckDB 磁盘暂存来源关系按稳定点 ID 关联、排序并检查同实例的线段对重复；无几何列运算或空间谓词，须处理全部已选候选以保存成员身份，空间索引不适用。"
+  },
+  "services/pipeline/src/track/v2/intersections/relations/source_associations.py#e4e54e564935c2258e3008e9f86253481a2a947058164a597798bcb91915c0af": {
+    "status": "not-applicable",
+    "reason": "按实例证据索引范围检查 DuckDB 来源点 ID 关系中的线段对重复，涉及整数身份关联与排序，不含空间谓词；必须检查本实例全部既有候选，空间索引不适用。"
+  },
+  "services/pipeline/src/track/v2/db/write_detect_results.py#b02d39baace69572b853d6a1a68d617ce0f4b1d39f3a58b62191c85395a439bf": {
+    "status": "not-applicable",
+    "reason": "按 Detect UUID 物化该运行完整转向证据，源几何通过已解析点的主键关联直接读取；没有空间筛选要求，空间过滤会删减应保存事件。新增字段仅传递算法实例身份。"
+  },
+  "services/pipeline/src/track/v2/db/write_detect_results.py#5cd9a878b9a0b7a8d9ebea217207206184c121d94b3de1e0a4f8a7e691857ce8": {
+    "status": "not-applicable",
+    "reason": "按 Detect UUID 物化该运行完整转向证据，源几何通过已解析点的主键关联直接读取；没有空间筛选要求，空间过滤会删减应保存事件。新增字段仅传递算法实例身份。"
+  },
+  "services/pipeline/src/track/v2/cli/init_db.py#fb85abcbfc4fd1cf83a62f9ce587fe66e6a9ce8963a89e6c8393892a2c8b02eb": {
+    "status": "not-applicable",
+    "reason": "算法实例身份迁移 DDL：新增元数据/身份列及唯一约束，不执行空间筛选或计算；既有几何列和 GiST 空间索引保持不变，DDL 不适用 EXPLAIN 空间执行计划。"
+  },
+  "services/pipeline/src/track/v2/cli/init_db.py#7fcc7088f254f37ee730441ecdb92af720d297faa2fbc35d42a05e7fc82bc245": {
+    "status": "not-applicable",
+    "reason": "算法实例身份迁移 DDL：新增元数据/身份列及唯一约束，不执行空间筛选或计算；既有几何列和 GiST 空间索引保持不变，DDL 不适用 EXPLAIN 空间执行计划。"
+  },
+  "services/pipeline/src/track/v2/cli/init_db.py#0c40230aa931d39e26c65c651af61b7f0fce2e6e59a8dcaf3d1d7e3a7d51d49b": {
+    "status": "not-applicable",
+    "reason": "算法实例身份迁移 DDL：新增元数据/身份列及唯一约束，不执行空间筛选或计算；既有几何列和 GiST 空间索引保持不变，DDL 不适用 EXPLAIN 空间执行计划。"
+  },
+  "services/pipeline/src/track/v2/cli/init_db.py#d75e00658676550e0920055f34d7436a8541c51e69db750731a12a226a41b8d6": {
+    "status": "not-applicable",
+    "reason": "算法实例身份迁移 DDL：新增元数据/身份列及唯一约束，不执行空间筛选或计算；既有几何列和 GiST 空间索引保持不变，DDL 不适用 EXPLAIN 空间执行计划。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/detect_plugins_v11.py#c2097c1c3dbae39c5ee701d840943b8a9ebf68184da8bc1f5ed8cae925441439": {
+    "status": "not-applicable",
+    "reason": "按组件键读取并锁定或更新 pipeline_schema_versions 版本元数据，不涉及空间数据。迁移说明文本亦非空间查询。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/detect_plugins_v11.py#95bbdb98869ca032235369c010ec662ab58d7e2fa40405bb8eb4b14f55e130f6": {
+    "status": "not-applicable",
+    "reason": "算法实例身份迁移 DDL：新增元数据/身份列及唯一约束，不执行空间筛选或计算；既有几何列和 GiST 空间索引保持不变，DDL 不适用 EXPLAIN 空间执行计划。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/detect_plugins_v11.py#fc3807f82ee12565957c442e22a312af227b1ae096c576d52a6f1fd5f399db8c": {
+    "status": "not-applicable",
+    "reason": "算法实例身份迁移 DDL：新增元数据/身份列及唯一约束，不执行空间筛选或计算；既有几何列和 GiST 空间索引保持不变，DDL 不适用 EXPLAIN 空间执行计划。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/detect_plugins_v11.py#cc80e40498059b8ca0f1391a248f7dc934b98b110f88f389fa85681ed117e6e2": {
+    "status": "not-applicable",
+    "reason": "算法实例身份迁移 DDL：新增元数据/身份列及唯一约束，不执行空间筛选或计算；既有几何列和 GiST 空间索引保持不变，DDL 不适用 EXPLAIN 空间执行计划。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/detect_plugins_v11.py#015bf4a7013f89131d6e33d30aec3c06a525f9ba8f8cacf9f921a9735a2c9556": {
+    "status": "not-applicable",
+    "reason": "算法实例身份迁移 DDL：新增元数据/身份列及唯一约束，不执行空间筛选或计算；既有几何列和 GiST 空间索引保持不变，DDL 不适用 EXPLAIN 空间执行计划。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/detect_plugins_v11.py#d02ccb809011ccb52d8be0f4c13c82fb2918f0695a4e8da8bb2877e85108d89e": {
+    "status": "not-applicable",
+    "reason": "算法实例身份迁移 DDL：新增元数据/身份列及唯一约束，不执行空间筛选或计算；既有几何列和 GiST 空间索引保持不变，DDL 不适用 EXPLAIN 空间执行计划。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/detect_plugins_v11.py#5e1921138fe5d41befee79f24088532405fbefde5964e66269b24ba5fae93270": {
+    "status": "not-applicable",
+    "reason": "算法实例身份迁移 DDL：新增元数据/身份列及唯一约束，不执行空间筛选或计算；既有几何列和 GiST 空间索引保持不变，DDL 不适用 EXPLAIN 空间执行计划。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/detect_plugins_v11.py#a79c74de372c6c95aea9f79ed53418d11e47887b90427e44c91a6b53cf33e6d5": {
+    "status": "not-applicable",
+    "reason": "按组件键读取并锁定或更新 pipeline_schema_versions 版本元数据，不涉及空间数据。迁移说明文本亦非空间查询。"
+  }
+}

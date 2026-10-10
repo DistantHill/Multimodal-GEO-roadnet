@@ -1,0 +1,68 @@
+[
+  {
+    "Plan": {
+      "Node Type": "Sort",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Startup Cost": 44.80,
+      "Total Cost": 45.13,
+      "Plan Rows": 132,
+      "Plan Width": 436,
+      "Sort Key": ["c.detect_id", "c.id"],
+      "Plans": [
+        {
+          "Node Type": "Hash Join",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Join Type": "Left",
+          "Startup Cost": 17.07,
+          "Total Cost": 40.16,
+          "Plan Rows": 132,
+          "Plan Width": 436,
+          "Inner Unique": true,
+          "Hash Cond": "((c.id = i.candidate_intersection_id) AND (c.detect_id = i.detect_id))",
+          "Plans": [
+            {
+              "Node Type": "Seq Scan",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Relation Name": "candidate_intersections",
+              "Alias": "c",
+              "Startup Cost": 0.00,
+              "Total Cost": 22.39,
+              "Plan Rows": 132,
+              "Plan Width": 180,
+              "Filter": "(detect_id = ANY ('{9f79758c-5a04-4d73-ad6b-2db11cff8a61,b2fa03bc-2931-4a0a-9f63-811a508cae2f}'::uuid[]))"
+            },
+            {
+              "Node Type": "Hash",
+              "Parent Relationship": "Inner",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Startup Cost": 15.23,
+              "Total Cost": 15.23,
+              "Plan Rows": 123,
+              "Plan Width": 280,
+              "Plans": [
+                {
+                  "Node Type": "Seq Scan",
+                  "Parent Relationship": "Outer",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Relation Name": "intersections",
+                  "Alias": "i",
+                  "Startup Cost": 0.00,
+                  "Total Cost": 15.23,
+                  "Plan Rows": 123,
+                  "Plan Width": 280
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

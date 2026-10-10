@@ -1,0 +1,77 @@
+[
+  {
+    "Plan": {
+      "Node Type": "Aggregate",
+      "Strategy": "Sorted",
+      "Partial Mode": "Simple",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Startup Cost": 27.20,
+      "Total Cost": 54.12,
+      "Plan Rows": 2,
+      "Plan Width": 96,
+      "Group Key": ["c.id", "e.detect_id"],
+      "Plans": [
+        {
+          "Node Type": "Incremental Sort",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 27.20,
+          "Total Cost": 54.05,
+          "Plan Rows": 2,
+          "Plan Width": 40,
+          "Sort Key": ["c.id", "e.detect_id", "e.candidate_intersection_id"],
+          "Presorted Key": ["c.id"],
+          "Plans": [
+            {
+              "Node Type": "Nested Loop",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Join Type": "Inner",
+              "Startup Cost": 0.43,
+              "Total Cost": 53.96,
+              "Plan Rows": 2,
+              "Plan Width": 40,
+              "Inner Unique": false,
+              "Plans": [
+                {
+                  "Node Type": "Index Scan",
+                  "Parent Relationship": "Outer",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Scan Direction": "Forward",
+                  "Index Name": "candidate_intersections_pkey",
+                  "Relation Name": "candidate_intersections",
+                  "Alias": "c",
+                  "Startup Cost": 0.14,
+                  "Total Cost": 12.32,
+                  "Plan Rows": 2,
+                  "Plan Width": 576,
+                  "Index Cond": "(id = ANY ('{55,56}'::bigint[]))"
+                },
+                {
+                  "Node Type": "Index Scan",
+                  "Parent Relationship": "Inner",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Scan Direction": "Forward",
+                  "Index Name": "idx_turn_events_geom_geom",
+                  "Relation Name": "turn_events_geom",
+                  "Alias": "e",
+                  "Startup Cost": 0.28,
+                  "Total Cost": 20.80,
+                  "Plan Rows": 1,
+                  "Plan Width": 64,
+                  "Index Cond": "((geom && c.geom) AND (geom @ c.geom))",
+                  "Filter": "((detect_id = ANY ('{cf84aabc-614a-46d1-a66b-7575df02f221,1a37960b-5f69-44a5-a8cf-58bb3da31eb5}'::uuid[])) AND st_covers(c.geom, geom))"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

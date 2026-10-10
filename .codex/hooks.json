@@ -12,6 +12,42 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/scripts/hooks/sql_spatial_index.py\"",
+            "timeout": 15,
+            "statusMessage": "Checking SQL spatial-index review"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/scripts/hooks/sql_spatial_index.py\"",
+            "timeout": 15,
+            "statusMessage": "Checking SQL spatial-index review"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/scripts/hooks/sql_spatial_index.py\"",
+            "timeout": 15,
+            "statusMessage": "Checking SQL spatial-index review"
+          }
+        ]
+      }
     ]
   }
 }
