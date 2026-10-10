@@ -344,7 +344,7 @@ def _adapter_row(owner, *, vehicle="v1", sequence=0, kind="kept", source_key="1"
     return (owner, 1, vehicle, 4, sequence, 1.0, 120.0, 30.0, 10.0, 20.0,
             90.0, 4.0, kind, source_key,
             None if kind == "kept" else "orthogonal",
-            None if kind == "kept" else 0, 1)
+            None if kind == "kept" else 0, 1, None)
 
 
 @pytest.mark.parametrize("change,message", [
@@ -370,7 +370,7 @@ def test_adapter_rejects_sequence_gap_and_non_finite_or_out_of_range_values() ->
                 list(_adapter_row(owner))[7:])], "non-finite"),
         ([tuple(list(_adapter_row(owner))[:6] + [181.0] +
                 list(_adapter_row(owner))[7:])], "outside"),
-        ([tuple(list(_adapter_row(owner))[:-1] + [2])], "multiple vehicles"),
+        ([tuple(list(_adapter_row(owner))[:-2] + [2, None])], "multiple vehicles"),
     ]:
         reader, result = _adapter_reader(rows, owner)
         with pytest.raises(refine_reader.RefineParquetError, match=message):

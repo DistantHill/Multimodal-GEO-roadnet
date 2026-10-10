@@ -290,6 +290,30 @@ Pipeline 命令行和栅格化命令均支持 `--time-start` / `--time-end`。�
 案例处理区域内全部时间数据；普通 Pipeline 新建 Refine 时需同时提供两个时间
 边界，或同时省略。
 
-时间筛选始于 schema v10，当前 Pipeline 与 Backend 要求 schema v11。已有 v9/v10 数据库使用 `python -m pipeline init-db --migrate-artifacts`
+时间筛选始于 schema v10，当前 Pipeline 与 Backend 要求 schema v12。已有 v9/v10/v11 数据库使用 `python -m pipeline init-db --migrate-artifacts`
 进行迁移，保留已有 Refine 与 Parquet 制品。迁移须连接到
 实际运行使用的数据库。本次测试只在隔离 schema 中验证迁移，不自动修改业务数据库。
+
+
+## Refine 航向与短子轨迹
+
+三份 Pipeline 运行 TOML 的 `[refine].min_subtrack_points` 暂定为 10，必须是正整数。
+Refine 先按时间间隔分段、清理静止冗余点，再按剩余 p 点数判断；恰好达到阈值保留。
+低于阈值的剩余 p 点直接保存为 GeoParquet，每点一行，保留原航向、时间、源行身份、
+子轨迹顺序和坐标；不生成注入点，不计算 `heading_cal`，不写 PostgreSQL 点表。
+文件含 WKB 点几何及明确 CRS 元数据，随同一次 Refine 制品发布，通过既有
+`pipeline_artifacts.manifest.tables` 中的 `short_subtrack` 登记，不新增登记表。
+
+通过过滤的轨迹完成注入后，按最终 p/i 序列计算 `heading_cal`：当前点到下一点的
+投影 XY 方位角，0° 为投影网格北，顺时针 [0,360)。相邻坐标完全相同时为空，
+末点沿用本子轨迹最后非零线段方向；全轨迹无非零线段时为空。原 `heading` 保留。
+内存空值使用 NaN，数据库及正常 Parquet 空值使用 NULL。现有下游算法继续使用原输入。
+
+`RefineDatasetReader.iter_tracks()` 返回正常轨迹及新增航向列；
+`iter_short_subtrack_batches()` 单独按序、分批读取短子轨迹点字典，不送入 Detect。
+旧制品通过显式 v1 适配，新航向列为空、短子轨迹读取为空；不补算或改写历史文件。
+运行统计新增 `short_subtracks` 和 `short_subtrack_points`。
+
+航向列由 schema v12 迁移增加；启用前在实际运行数据库执行
+`python -m pipeline init-db --migrate-artifacts`。迁移保留旧行，新增航向为空，不回填。
+完整决定与问答见 [Refine 航向 Spec](docs/pipeline-refine-heading-cal-spec.md)。

@@ -18,6 +18,7 @@ def refine_vehicle(vehicle_points: SourceBatch, *, spatial_context: SpatialConte
         breaks |= np.diff(source.extra["_experiment_segment"]) != 0
     cuts = np.r_[0, np.flatnonzero(breaks) + 1, len(source)]
     subtracks = []
+    short_subtracks = []
     removed = np.zeros(len(source), dtype=np.bool_)
     injected_count = 0
     for partition, (start, stop) in enumerate(zip(cuts[:-1], cuts[1:]), 1):
@@ -39,6 +40,16 @@ def refine_vehicle(vehicle_points: SourceBatch, *, spatial_context: SpatialConte
             continue
         kept_lonlat = source.lonlat[indices]
         kept_xy = transformer.forward_many(kept_lonlat)
+        if len(indices) < config.min_subtrack_points:
+            size = len(indices)
+            short_subtracks.append(RefinementSubtrack(
+                source.vehicle_id, partition, source.source_id, kept_xy, kept_lonlat,
+                source.timestamp[indices], source.heading[indices], source.speed[indices],
+                np.full(size, "p"), source.source_row_key[indices], source.source_stable[indices],
+                np.zeros(size, dtype=np.int64), np.zeros(size, dtype=bool),
+                np.full(size, ""), np.full(size, -1, dtype=np.int64),
+            ))
+            continue
         capacity = 2 * len(indices) - 1
         xy = np.empty((capacity, 2), dtype=np.float64)
         lonlat = np.empty((capacity, 2), dtype=np.float64)
@@ -92,12 +103,26 @@ def refine_vehicle(vehicle_points: SourceBatch, *, spatial_context: SpatialConte
             source.vehicle_id, partition, source.source_id, xy[:size], lonlat[:size],
             timestamps[:size], headings[:size], speeds[:size], kinds[:size], keys[:size],
             key_valid[:size], np.zeros(size, dtype=np.int64), np.zeros(size, dtype=np.bool_),
-            reasons[:size], anchors[:size],
+            reasons[:size], anchors[:size], calculated_headings(xy[:size]),
         ))
     excluded = ExcludedBatch(source.source_id, source.source_row_key[removed],
                              np.full(int(removed.sum()), "stationary"), source.lonlat[removed])
     return RefineIncrementalResult(excluded, spatial_context,
-                                   {GeneratedReason.HEADING_ORTHOGONAL: injected_count}, subtracks)
+                                   {GeneratedReason.HEADING_ORTHOGONAL: injected_count}, subtracks, short_subtracks)
+
+
+def calculated_headings(xy: np.ndarray) -> np.ndarray:
+    """Outgoing grid-north bearings; NaN denotes an undefined direction."""
+    headings = np.full(len(xy), np.nan, dtype=np.float64)
+    if len(xy) < 2:
+        return headings
+    deltas = np.diff(xy, axis=0)
+    valid = np.any(deltas != 0, axis=1)
+    positions = np.flatnonzero(valid)
+    headings[positions] = np.degrees(np.arctan2(deltas[valid, 0], deltas[valid, 1])) % 360
+    if len(positions):
+        headings[-1] = headings[positions[-1]]
+    return headings
 
 
 def angle_delta_deg(start: float, end: float) -> float:
@@ -132,7 +157,7 @@ def ray_intersection(
 
 
 def refine(source, *, spatial_context: SpatialContext, config: RefineConfig) -> RefineResult:
-    subtracks, exclusions = [], []
+    subtracks, exclusions, short_subtracks = [], [], []
     injected = 0
     transformer = CoordinateTransformer(spatial_context)
     for batch in source.iter_vehicle_batches():
@@ -142,6 +167,9 @@ def refine(source, *, spatial_context: SpatialContext, config: RefineConfig) -> 
         from dataclasses import replace
         subtracks.extend(replace(track, subtrack_index=offset + i + 1)
                          for i, track in enumerate(result.subtracks))
+        short_offset = len(short_subtracks)
+        short_subtracks.extend(replace(track, subtrack_index=short_offset + i + 1)
+                               for i, track in enumerate(result.short_subtracks))
         exclusions.append(result.excluded)
         injected += sum(result.derived_counts.values())
     reasons = {}
@@ -153,4 +181,4 @@ def refine(source, *, spatial_context: SpatialContext, config: RefineConfig) -> 
             samples.append((str(excluded.source_row_key[i]), str(excluded.reason[i])))
     return RefineResult(subtracks, exclusions,
                         RefineReport(sum(map(len, subtracks)), sum(map(len, exclusions)),
-                                     injected, reasons, samples), spatial_context)
+                                     injected, reasons, samples), spatial_context, short_subtracks)

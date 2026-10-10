@@ -14,7 +14,7 @@ def source(times, speeds, headings=None):
 def test_gap_and_stationary_columns_preserve_vehicle_and_source_keys():
     result = refine_vehicle(source([0, 1, 30, 31, 100, 101], [0] * 6),
                             spatial_context=SpatialContext(4326, 32651, {"coordinate_semantics_version": 2, "enforce_area_of_use": False, "max_scale_error": 0.1}),
-                            config=RefineConfig(100, 45, 135, 50, 1, 20, 10))
+                            config=RefineConfig(100, 45, 135, 50, 1, 20, 10, 1))
     assert [t.vehicle_id for t in result.subtracks] == ['original', 'original']
     assert [t.subtrack_index for t in result.subtracks] == [1, 2]
     assert result.excluded.source_row_key.tolist() == [1, 2]
@@ -33,7 +33,7 @@ def test_zero_and_negative_source_keys_are_valid():
     batch.source_row_key[:] = [0, -1]
     batch.source_row_key.flags.writeable = False
     result = refine_vehicle(batch, spatial_context=SpatialContext(4326, 32651, {"coordinate_semantics_version": 2, "enforce_area_of_use": False, "max_scale_error": 0.1}),
-                            config=RefineConfig(100, 45, 135, 50, 1, 20, 10))
+                            config=RefineConfig(100, 45, 135, 50, 1, 20, 10, 1))
     assert result.subtracks[0].source_row_key.tolist() == [0, -1]
     assert result.subtracks[0].source_row_key_valid.tolist() == [True, True]
 

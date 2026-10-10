@@ -7,7 +7,7 @@ import numpy as np
 from contextlib import ExitStack
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from track.v2.config import PostgresConfig
 from track.v2.config.pipeline_config_loader import PipelineConfig
@@ -275,6 +275,8 @@ class RunPipelineLifecycleTest(unittest.TestCase):
             "track.v2.db.source_table.calculate_source_fingerprint",
             side_effect=AssertionError("Pipeline must not rescan source fingerprints"),
         ))
+        self.stack.enter_context(patch("track.v2.stages.refine.ShortSubtrackWriter",
+            return_value=Mock(track_count=0, point_count=0, finish=Mock(return_value=[]))))
         self.refine_staging = SimpleNamespace(path="refine-staging", stage="refine")
         self.detect_staging = SimpleNamespace(path="detect-staging", stage="detect")
         self.descriptor = SimpleNamespace(id="artifact", relative_path=f"refine/{REFINE_ID}")
@@ -355,6 +357,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         expected_keys = {
             "refine_id", "detect_id", "fit_id", "source_srid", "processing_srid",
             "source_points", "kept_trajectory_points", "injected_points",
+            "short_subtracks", "short_subtrack_points",
             "detect_compute_s", "detect_persist_s", "resolved_sequence_s",
             "tracks_cross", "resolved_subtrack_points", "turn_events",
             "candidate_intersections", "candidate_entry_exit_points",
@@ -400,8 +403,8 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         self.assertEqual(
             self.events,
             [
-                "start_refine", "commit", "persist_refine_batch",
-                "commit", "create_staging:refine", "export_refine", "rollback",
+                "start_refine", "commit", "create_staging:refine", "persist_refine_batch",
+                "commit", "export_refine", "rollback",
                 "publish:refine",
                 "artifact:metadata", "artifact:present", "finish_refine:completed", "commit",
                 "start_detect", "commit", "rollback",
@@ -680,6 +683,7 @@ class RunPipelineLifecycleTest(unittest.TestCase):
         transformer.validate_bounds.side_effect = ValueError("outside projection bounds")
         refine_result = SimpleNamespace(
             derived_counts={},
+            short_subtracks=[],
             excluded=[],
             subtracks=[],
         )

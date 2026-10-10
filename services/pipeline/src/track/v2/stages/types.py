@@ -34,6 +34,8 @@ class RefineStageResult:
     vehicle_count: int
     artifact: ArtifactDescriptor
     elapsed_s: float
+    short_subtrack_count: int = 0
+    short_point_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)

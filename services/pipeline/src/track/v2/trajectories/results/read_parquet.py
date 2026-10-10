@@ -45,7 +45,7 @@ class RefineDatasetReader:
         )
         if descriptor.stage != "refine" or descriptor.refine_id is None:
             raise RefineParquetError("dataset must belong to the refine stage")
-        _validate_schema(descriptor)
+        self._schema_version = _validate_schema(descriptor)
         from ...time_selection import time_bounds
         self.time_start, self.time_end = time_bounds(time_start, time_end)
         self._descriptor = descriptor
@@ -88,9 +88,13 @@ class RefineDatasetReader:
             for table in manifest["tables"]:
                 paths = [str(final / item["relative_path"]) for item in table["files"]]
                 literals = ", ".join(quote_sql_literal(path) for path in paths)
+                if table["name"] == "short_subtrack":
+                    from .short_subtracks import validate_geo_metadata
+                    validate_geo_metadata(self._connection, paths)
+                heading_adapter = ", NULL::DOUBLE AS heading_cal" if self._schema_version == 1 else ""
                 self._connection.execute(
                     f"CREATE TEMP VIEW {table['name']} AS "
-                    f"SELECT * FROM read_parquet([{literals}])"
+                    f"SELECT *{heading_adapter} FROM read_parquet([{literals}])"
                 )
             self._connection.execute("""
                 CREATE TEMP VIEW refine_points AS
@@ -152,7 +156,7 @@ class RefineDatasetReader:
           SELECT refine_id, point_id, vehicle_id, subtrack_index,
                  refined_sequence_in_subtrack, timestamp, lon, lat, x, y,
                  heading, speed, point_kind, source_row_key, generated_reason,
-                 after_sequence_in_subtrack
+                 after_sequence_in_subtrack, heading_cal
           FROM refine_points points
           WHERE vehicle_id = ? AND subtrack_index = ?
           ORDER BY refined_sequence_in_subtrack, point_kind, point_id
@@ -160,6 +164,24 @@ class RefineDatasetReader:
         result = self._connection.execute(query, [vehicle_id, subtrack_index])
         while rows := result.fetchmany(batch_size):
             yield tuple(rows)
+
+    def iter_short_subtrack_batches(self, *, batch_size: int | None = None):
+        """Yield bounded dictionaries of short p observations, separate from Detect."""
+        connection = self._require_open()
+        size = self._runtime.parquet_read_batch_size if batch_size is None else batch_size
+        if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+            raise RefineParquetError("batch_size is invalid")
+        if self._schema_version == 1:
+            return
+        result = connection.execute("SELECT * FROM short_subtrack ORDER BY subtrack_index, sequence_in_subtrack")
+        names = [column[0] for column in result.description]
+        while rows := result.fetchmany(size):
+            for row in rows:
+                if row[0] != str(self._descriptor.refine_id):
+                    raise RefineParquetError("short subtrack owner differs from descriptor")
+            from .short_subtracks import validate_short_rows
+            validate_short_rows(rows)
+            yield tuple(dict(zip(names, row)) for row in rows)
 
     def extent(self) -> tuple[float, float, float, float] | None:
         """Return processing-CRS bounds without materializing dataset rows."""
@@ -202,7 +224,7 @@ class RefineDatasetReader:
                  refined_sequence_in_subtrack, timestamp, lon, lat, x, y,
                  heading, speed, point_kind, source_row_key, generated_reason,
                  after_sequence_in_subtrack,
-                 count(DISTINCT vehicle_id) OVER (PARTITION BY subtrack_index)
+                 count(DISTINCT vehicle_id) OVER (PARTITION BY subtrack_index), heading_cal
           FROM refine_points points
           ORDER BY vehicle_id, subtrack_index, refined_sequence_in_subtrack,
                    point_kind, point_id
@@ -279,7 +301,7 @@ class RefineDatasetReader:
                      p.refined_sequence_in_subtrack, p.timestamp, p.lon, p.lat,
                      p.x, p.y, p.heading, p.speed, p.point_kind, p.source_row_key,
                      p.generated_reason, p.after_sequence_in_subtrack, 1 AS vehicles,
-                     s.window_order
+                     s.window_order, p.heading_cal
               FROM selected s JOIN refine_points p USING (vehicle_id, subtrack_index)
               ORDER BY s.window_order, p.vehicle_id,
                        CAST(p.subtrack_index AS VARCHAR),
@@ -527,6 +549,7 @@ class RefineDatasetReader:
              OR NOT coalesce(isfinite(timestamp), false)
              OR NOT coalesce(isfinite(lon), false) OR NOT coalesce(isfinite(lat), false)
              OR NOT coalesce(isfinite(x), false) OR NOT coalesce(isfinite(y), false)
+             OR (heading_cal IS NOT NULL AND (NOT isfinite(heading_cal) OR heading_cal < 0 OR heading_cal >= 360))
              OR NOT coalesce(isfinite(heading), false)
              OR NOT coalesce(isfinite(speed), false) OR lon NOT BETWEEN -180 AND 180
              OR lat NOT BETWEEN -90 AND 90 OR point_kind IS NULL
@@ -632,7 +655,7 @@ def _turn_batch_from_sql_rows(rows) -> TurnBatch:
 
 def _point_columns_from_driver_batch(rows, owner, *, topology):
     size = len(rows)
-    width = 18 if topology else 17
+    width = 19 if topology else 18
     if any(len(row) != width or row[0] != owner for row in rows):
         raise RefineParquetError("row owner differs from descriptor owner")
     def numeric(position, dtype):
@@ -654,6 +677,7 @@ def _point_columns_from_driver_batch(rows, owner, *, topology):
         "lon":numeric(6,np.float64), "lat":numeric(7,np.float64),
         "x":numeric(8,np.float64), "y":numeric(9,np.float64),
         "heading":numeric(10,np.float64), "speed":numeric(11,np.float64), "kind":text(12),
+        "heading_cal":np.fromiter((np.nan if row[-1] is None else float(row[-1]) for row in rows), dtype=np.float64, count=size),
         "source_row_key":np.fromiter((int(row[13]) if row[13] is not None else 0 for row in rows),dtype=np.int64,count=size),
         "source_row_key_valid":source_valid,
         "generated_reason":np.asarray([row[14] if row[14] is not None else "" for row in rows],dtype=object),
@@ -726,4 +750,5 @@ def _subtrack_from_point_columns(columns, source_table):
         xy=xy,lonlat=lonlat,timestamp=columns["timestamp"],heading=columns["heading"],speed=columns["speed"],
         kind=np.where(kept,"p","i"),source_row_key=columns["source_row_key"],refine_point_id=columns["point_id"],
         after_sequence=columns["after_sequence"],generated_reason=columns["generated_reason"],
+        heading_cal=columns["heading_cal"],
     )

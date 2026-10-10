@@ -26,7 +26,7 @@ from track.v2.db.source_table import calculate_source_fingerprint, validate_sour
 from track.v2.models import RuntimeConfig
 from track.v2.projection import spatial_context_from_values
 from track.v2.trajectories.results.export_to_parquet import export_refine_parquet
-from track.v2.trajectories.results.parquet_schema import REFINE_PARQUET_V1
+from track.v2.trajectories.results.parquet_schema import REFINE_PARQUET_V2
 from track.v2.trajectories.results.read_parquet import RefineDatasetReader
 
 
@@ -187,6 +187,9 @@ def _make_writable(path: Path) -> None:
 def test_real_refine_export_publish_register_and_complete(refine_database, tmp_path) -> None:
     conn, config, schema = refine_database
     run_id, fingerprint = _seed(conn, schema)
+    conn.execute("UPDATE kept_trajectory_points SET heading_cal=90 WHERE refine_id=%s", (run_id,))
+    conn.execute("UPDATE injected_points SET heading_cal=45 WHERE refine_id=%s", (run_id,))
+    conn.commit()
     handle, descriptor = _export(conn, config, tmp_path, run_id, fingerprint)
     result = publish(handle)
     store = PostgresPipelineStore(conn)
@@ -198,18 +201,18 @@ def test_real_refine_export_publish_register_and_complete(refine_database, tmp_p
                (k.sequence_in_subtrack + k.sequence_in_subtrack)::bigint,
                s.timestamp, s.lon, s.lat,
                k.x, k.y,
-               s.heading, s.speed, k.source_row_key
+               s.heading, s.speed, k.source_row_key, k.heading_cal
           FROM kept_trajectory_points k JOIN source_points s ON s.id = k.source_row_key
          WHERE k.refine_id = %s ORDER BY k.sequence_in_subtrack
     """, (run_id,)).fetchall()
-    kept_names = [column.name for column in REFINE_PARQUET_V1["kept_points"]]
+    kept_names = [column.name for column in REFINE_PARQUET_V2["kept_points"]]
     expected_kept_dicts = [dict(zip(kept_names, row, strict=True)) for row in expected_kept]
     injected = conn.execute("""
         SELECT refine_id, id, vehicle_id, subtrack_index, 1::bigint, timestamp, lon, lat,
-               x, y, heading, speed, generated_reason, after_sequence_in_subtrack
+               x, y, heading, speed, generated_reason, after_sequence_in_subtrack, heading_cal
           FROM injected_points WHERE refine_id = %s
     """, (run_id,)).fetchall()
-    injected_names = [column.name for column in REFINE_PARQUET_V1["injected_points"]]
+    injected_names = [column.name for column in REFINE_PARQUET_V2["injected_points"]]
     actual_kept = _read(result.final_path, "kept_points")
     _assert_rows(actual_kept, expected_kept_dicts)
     _assert_rows(

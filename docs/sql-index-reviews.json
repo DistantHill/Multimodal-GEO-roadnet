@@ -300,5 +300,133 @@
     "status": "not-applicable",
     "reason": "DuckDB 临时 Clip 关系按 ordinal 顺序读取标量元数据，或按交叉口端点整数相等、片段类型及方向筛选后按 clip_id、ordinal 排序；不含空间谓词或空间计算。clips 仅保存数值坐标和标量字段，没有 geometry 列或 GiST 空间索引，CRS 不参与这些筛选与排序。",
     "query": "SELECT c.* FROM clips c WHERE least(c.start_intersection_id,c.end_intersection_id)=? AND greatest(c.start_intersection_id,c.end_intersection_id)=? AND start_intersection_id=? AND end_intersection_id=? AND c.clip_type='between_intersection' AND c.start_intersection_id IS NOT NULL AND c.end_intersection_id IS NOT NULL AND c.start_intersection_id<>c.end_intersection_id ORDER BY c.clip_id,c.ordinal"
+  },
+  "services/pipeline/src/track/v2/cli/init_db.py#28d813ce7dffa7939f9f8f49bcd9c34cd2813ff663031b76d2bf21438365604a": {
+    "status": "not-applicable",
+    "reason": "模块说明字符串，未执行 SQL，不读取空间数据。"
+  },
+  "services/pipeline/src/track/v2/cli/init_db.py#820c973fb718fa7431fde4169e3bfea57563743a2ba8da4cdc6f2fd66890478e": {
+    "status": "not-applicable",
+    "reason": "create_tables 的说明字符串，未执行 SQL，不读取空间数据。"
+  },
+  "services/pipeline/src/track/v2/cli/init_db.py#8db94c548e5efb88e4f5ce4de2492062c1c6d75965edf41b1cade3dbf3de30b8": {
+    "status": "not-applicable",
+    "reason": "建表 DDL，仅新增可空 heading_cal 属性与角度 CHECK；不筛选或计算几何，不涉及空间查询计划。既有 geom 为 EPSG:4326。"
+  },
+  "services/pipeline/src/track/v2/cli/init_db.py#ef23c291895277d5d0d89abd0da21255b1ad45047385c0d510f89221fdf531e1": {
+    "status": "not-applicable",
+    "reason": "建表 DDL，仅新增可空 heading_cal 属性与角度 CHECK；保留已有 EPSG:4326 生成几何定义，不进行空间数据候选查询。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/refine_heading_v12.py#6114bc72d4fee72f7a7a62c9fd74a28492153869dda66368785170a76ec668a2": {
+    "status": "not-applicable",
+    "reason": "ALTER TABLE 新增可空标量航向列及 CHECK，不读取或修改旧行几何，无空间筛选。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/refine_heading_v12.py#75bfbfa3705dbbb61c52e71f4155e9a99aea01690a7cc7da5442017b42e05de9": {
+    "status": "not-applicable",
+    "reason": "ALTER TABLE 新增可空标量航向列及 CHECK，不读取或修改旧行几何，无空间筛选。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/refine_heading_v12.py#c2097c1c3dbae39c5ee701d840943b8a9ebf68184da8bc1f5ed8cae925441439": {
+    "status": "not-applicable",
+    "reason": "按 component 主键锁定 schema 版本元数据，不涉及空间数据。"
+  },
+  "services/pipeline/src/track/v2/db/migrations/refine_heading_v12.py#fb3617f6ed74083c56583d1b3ceb8abe81b5b315cbf61ac210eba35f91a0a7f6": {
+    "status": "not-applicable",
+    "reason": "按 component 主键更新 schema 版本元数据，不涉及空间数据。"
+  },
+  "services/pipeline/src/track/v2/trajectories/results/export_to_parquet.py#61e87130f57139ed6fe16e1203116e7aa909121354823fb3bb4265b859b3a28d": {
+    "status": "not-applicable",
+    "reason": "导出指定 Refine Run 全部 p/i 点并保持完整序列，按 refine_id 及源 id 定位；新增属性投影 heading_cal，不执行空间谓词或几何计算。geom 的 CRS 为 EPSG:4326，输出 XY 是运行 processing_srid；没有业务空间范围可先裁剪，空间索引无法缩小必须完整导出的 Run。"
+  },
+  "services/pipeline/src/track/v2/trajectories/query_refine_points.py#9825fc52ed777bdbbee0d75d7e98c99e5e8065cd9f180731d2a2fb46edf5ab99": {
+    "status": "not-applicable",
+    "reason": "完整逐车/Run 点序列读取，新增 heading_cal 属性，不改变已有按 Run 和源主键定位。无 bbox 或业务空间候选范围；提前空间裁剪会丢失子轨迹上下文。源几何 EPSG:4326，投影按运行 processing_srid；全序列坐标变换无法使用空间索引缩减所需点。"
+  },
+  "services/pipeline/src/track/v2/trajectories/query_refine_points.py#a202c18f9c85c13f5b1e1aebd45480094c9ca85301bfd9a7754bb522ef6db1c3": {
+    "status": "not-applicable",
+    "reason": "完整逐车/Run 点序列读取，新增 heading_cal 属性，不改变已有按 Run 和源主键定位。无 bbox 或业务空间候选范围；提前空间裁剪会丢失子轨迹上下文。源几何 EPSG:4326，投影按运行 processing_srid；全序列坐标变换无法使用空间索引缩减所需点。"
+  },
+  "services/pipeline/src/track/v2/trajectories/results/read_parquet.py#03ea0ac4878424ecf040770c68f078d2fb72f46cf49cabe1d9709b5bc94d0154": {
+    "status": "not-applicable",
+    "reason": "DuckDB 文件视图读取完整 Refine 子轨迹，新增航向属性，不改变窗口统计或排序；不存在空间筛选范围，不能裁剪点。"
+  },
+  "services/pipeline/src/track/v2/trajectories/results/read_parquet.py#13a5ff5df96f3d1313041b997d172856f784522098e4d3289d3c5bc10a932a96": {
+    "status": "not-applicable",
+    "reason": "按子轨迹及序号流式读取全部短点文件，不进行空间筛选或几何计算，DuckDB Parquet 非 PG 索引表。"
+  },
+  "services/pipeline/src/track/v2/trajectories/results/read_parquet.py#d4c06839a4788aadc9137835f9884fdd12ba53e3a6479b886c1392e2b876fc9a": {
+    "status": "not-applicable",
+    "reason": "创建 DuckDB Parquet 临时视图，对旧版本添加 NULL 标量属性，未查询空间范围；无 PostgreSQL 空间索引可用。"
+  },
+  "services/pipeline/src/track/v2/trajectories/results/read_parquet.py#e4d8d3fa1871213a0bea02ac05a0d6c9a384f5844cf4d9dcd8b297dc4647e21e": {
+    "status": "not-applicable",
+    "reason": "按车辆和子轨迹身份读取全部点的新增航向属性；保持完整顺序，无空间候选条件。DuckDB Parquet 不存在 PG GiST 索引。"
+  },
+  "services/pipeline/src/track/v2/trajectories/results/read_parquet.py#5ca6547e3c0d3e666ebbf5549877daa8d9fa2d63e97905a973e1114fd4fa51eb": {
+    "status": "not-applicable",
+    "reason": "DuckDB Parquet 文件视图完整序列读取/校验或完整候选子轨迹读取；本次只新增 heading_cal 输出与有限角度校验，不改变现有窗口 bbox 候选筛选及上下文语义。无 PG 空间索引可用，DuckDB 文件原有 bbox 过滤保持不变。"
+  },
+  "services/pipeline/src/track/v2/trajectories/results/read_parquet.py#4260768157d93ecc60c806db4c28f6301fd144f458c5dfc89bfb4b1a2c4c9561": {
+    "status": "not-applicable",
+    "reason": "DuckDB Parquet 文件视图完整序列读取/校验或完整候选子轨迹读取；本次只新增 heading_cal 输出与有限角度校验，不改变现有窗口 bbox 候选筛选及上下文语义。无 PG 空间索引可用，DuckDB 文件原有 bbox 过滤保持不变。"
+  },
+  "services/pipeline/tests/v2/test_kept_xy_migration.py#1ace72db03420e88dd802be5520b0637f06c43be1a25d9d976a74b4f705dbd7f": {
+    "status": "not-applicable",
+    "reason": "隔离测试的临时建表 DDL，新增航向属性，不执行空间查询；测试 geometry 为 EPSG:4326。"
+  },
+  "services/pipeline/tests/v2/test_refine_heading_cal.py#2f558a4fcef49befc05e23ace4b4386a947182f802ec441a4fc9937235f27040": {
+    "status": "not-applicable",
+    "reason": "测试通过 DuckDB 读取 Parquet 页脚元数据或构造零行带类型文件，不读取业务空间数据，不存在可缩减的空间候选。"
+  },
+  "services/pipeline/tests/v2/test_refine_heading_cal.py#4f8ffab77bdfde83a6cba26b3ff0851319fe709fe7210ef4cb99c7a6a6128dec": {
+    "status": "not-applicable",
+    "reason": "测试通过 DuckDB 读取 Parquet 页脚元数据或构造零行带类型文件，不读取业务空间数据，不存在可缩减的空间候选。"
+  },
+  "services/pipeline/tests/v2/test_refine_parquet_postgres.py#62b36d1bb9cc9e63e6b6aba360880b545bd7b5fe858aa53192a60bdd1a3a9f7d": {
+    "status": "not-applicable",
+    "reason": "隔离 PostgreSQL 集成测试按单个 Run 读取完整已写入的点属性，新增 heading_cal 核验，不筛选空间范围；保持全部点序列，空间索引无法缩减必需的核验行。"
+  },
+  "services/pipeline/tests/v2/test_refine_parquet_postgres.py#6cf38dec562ab333f88cfaa10005d733662dfa66ba2f46665fd1369ebf2fe111": {
+    "status": "not-applicable",
+    "reason": "隔离 PostgreSQL 集成测试按单个 Run 读取完整已写入的点属性，新增 heading_cal 核验，不筛选空间范围；保持全部点序列，空间索引无法缩减必需的核验行。"
+  },
+  "services/pipeline/tests/v2/test_refine_heading_migration.py#3167e9cf9c2fd3e99392b069b4a5a975636929ceabf3e904e31f78a7d09cfada": {
+    "status": "not-applicable",
+    "reason": "迁移回归测试使用无几何列的隔离临时表，读取 schema 版本及标量航向，构造行与检查角度约束；没有空间数据或空间谓词。"
+  },
+  "services/pipeline/tests/v2/test_refine_heading_migration.py#ac4350710033130f3acf75608a1b554bfe449a031de5bb34d777f8a46c187392": {
+    "status": "not-applicable",
+    "reason": "迁移回归测试使用无几何列的隔离临时表，读取 schema 版本及标量航向，构造行与检查角度约束；没有空间数据或空间谓词。"
+  },
+  "services/pipeline/tests/v2/test_refine_heading_migration.py#28b50d89a840fce67d1b655d64c499f5014714f9643da791f8fd5b9a86f26811": {
+    "status": "not-applicable",
+    "reason": "迁移回归测试使用无几何列的隔离临时表，读取 schema 版本及标量航向，构造行与检查角度约束；没有空间数据或空间谓词。"
+  },
+  "services/pipeline/tests/v2/test_refine_heading_migration.py#f77041e47394af694616a9fda9828352c2f5d78df3a5b19b09c00ee5aa1a8926": {
+    "status": "not-applicable",
+    "reason": "迁移回归测试使用无几何列的隔离临时表，读取 schema 版本及标量航向，构造行与检查角度约束；没有空间数据或空间谓词。"
+  },
+  "services/pipeline/tests/v2/test_refine_heading_migration.py#8d4b5b0d93bb261dcbdba75c3b932af7a9fe0a1f539f4265c6a19f08b343a9b5": {
+    "status": "not-applicable",
+    "reason": "迁移回归测试使用无几何列的隔离临时表，读取 schema 版本及标量航向，构造行与检查角度约束；没有空间数据或空间谓词。"
+  },
+  "services/pipeline/tests/v2/test_refine_heading_migration.py#cf0eb360bd722bc6fb54f133d0cd6bdaffd3796720bafeb021a9253633ab8edf": {
+    "status": "not-applicable",
+    "reason": "迁移回归测试使用无几何列的隔离临时表，读取 schema 版本及标量航向，构造行与检查角度约束；没有空间数据或空间谓词。"
+  },
+  "services/pipeline/tests/v2/test_refine_heading_migration.py#a3f7d04bd48d2d9ba7c36279d107f25d05fa3082e9bfe436da89e15fff936507": {
+    "status": "not-applicable",
+    "reason": "迁移回归测试使用无几何列的隔离临时表，读取 schema 版本及标量航向，构造行与检查角度约束；没有空间数据或空间谓词。"
+  },
+  "services/pipeline/src/track/v2/trajectories/results/short_subtracks.py#4f8ffab77bdfde83a6cba26b3ff0851319fe709fe7210ef4cb99c7a6a6128dec": {
+    "status": "not-applicable",
+    "reason": "按文件路径读取 Parquet 页脚键值元数据以核验 GeoParquet 格式，不查询空间数据行，不存在空间谓词或 PG 空间索引。"
+  },
+  "services/pipeline/tests/v2/test_refine_parquet_postgres.py#d322b9c6ccde05bf24cb747ad9183230e7c0f37535984278567bf282700423d4": {
+    "status": "not-applicable",
+    "reason": "隔离 PostgreSQL 测试按 refine_id 写入标量 heading_cal，测试正常导出新增属性，无空间谓词或几何计算。"
+  },
+  "services/pipeline/tests/v2/test_refine_parquet_postgres.py#bf9f268d0c0cfe3079d4d87f0284c0e4bc8838d7be3a9fc5cfc49d90d453d12b": {
+    "status": "not-applicable",
+    "reason": "隔离 PostgreSQL 测试按 refine_id 写入标量 heading_cal，测试正常导出新增属性，无空间谓词或几何计算。"
   }
 }

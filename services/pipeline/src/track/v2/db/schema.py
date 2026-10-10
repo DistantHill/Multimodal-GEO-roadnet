@@ -1,4 +1,4 @@
-"""Runtime guard for the destructive track.v2 schema-v10 API."""
+"""Runtime guard for the destructive track.v2 schema-v12 API."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from typing import Any
 
 
 SCHEMA_COMPONENT = "track.v2"
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 def require_current_schema(conn: Any) -> None:
@@ -26,6 +26,6 @@ def require_current_schema(conn: Any) -> None:
         actual = "missing" if row is None else f"v{int(row[0])}"
         raise RuntimeError(
             f"track.v2 schema mismatch: expected v{SCHEMA_VERSION}, got {actual}; "
-            "for v4 through v10 run init-db --migrate-artifacts; "
+            "for v4 through v11 run init-db --migrate-artifacts; "
             "v3 and older schemas require --reset"
         )

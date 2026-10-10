@@ -228,6 +228,8 @@ def _build_pipeline_result(
                 "source_points": refine_result.source_point_count,
                 "kept_trajectory_points": refine_result.kept_point_count,
                 "injected_points": refine_result.injected_point_count,
+                "short_subtracks": refine_result.short_subtrack_count,
+                "short_subtrack_points": refine_result.short_point_count,
             }
         )
     for prefix, report in (

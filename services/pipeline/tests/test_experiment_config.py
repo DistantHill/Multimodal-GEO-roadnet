@@ -77,7 +77,7 @@ def test_refine_preserves_spatial_exit_reentry():
         np.arange(n,dtype=np.float64),np.zeros(n),np.ones(n),np.arange(n,dtype=np.int64),
         np.ones(n,dtype=np.bool_),np.full(n,'',dtype=object),{'_experiment_segment':np.array([0,0,2,2])})
     result=refine_vehicle(source,spatial_context=SpatialContext(4326,32649,{"coordinate_semantics_version":2,
-        "enforce_area_of_use":False,"max_scale_error":0.1}),config=RefineConfig(100,45,135,120,0.3,300,50))
+        "enforce_area_of_use":False,"max_scale_error":0.1}),config=RefineConfig(100,45,135,120,0.3,300,50, 1))
     assert [track.source_row_key.tolist() for track in result.subtracks] == [[0,1],[2,3]]
     assert all(track.vehicle_id == 'car' for track in result.subtracks)
 

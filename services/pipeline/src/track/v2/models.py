@@ -272,6 +272,7 @@ class RefineConfig(TrackModel):
     min_speed_mps: float
     max_stationary_duration_s: float
     excluded_sample_max: int
+    min_subtrack_points: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,6 +374,7 @@ class RefineResult(TrackModel):
     excluded: list[ExcludedBatch]
     report: RefineReport
     spatial_context: SpatialContext
+    short_subtracks: list[RefinementSubtrack] = field(default_factory=list)
 
 
 def require_array_columns(instance: object) -> None:
@@ -482,10 +484,18 @@ class RefinementSubtrack(TrackModel):
     refine_point_id_valid: np.ndarray
     generated_reason: np.ndarray
     after_sequence: np.ndarray
+    heading_cal: np.ndarray | None = None
 
     def __post_init__(self) -> None:
+        if self.heading_cal is None:
+            object.__setattr__(self, "heading_cal", np.full(len(self.timestamp), np.nan))
         require_array_columns(self)
         size = len(self.timestamp)
+        if self.heading_cal.dtype != np.float64 or self.heading_cal.ndim != 1:
+            raise ValueError("heading_cal must be float64 (N,)")
+        finite = np.isfinite(self.heading_cal)
+        if np.isinf(self.heading_cal).any() or np.any(finite & ((self.heading_cal < 0) | (self.heading_cal >= 360))):
+            raise ValueError("heading_cal must be NaN or in [0, 360)")
         for name in ("xy", "lonlat"):
             value = getattr(self, name)
             if value.shape != (size, 2) or value.dtype != np.float64:
@@ -506,6 +516,7 @@ class RefineIncrementalResult(TrackModel):
     spatial_context: SpatialContext
     derived_counts: dict[GeneratedReason, int] = field(default_factory=dict)
     subtracks: list[RefinementSubtrack] = field(default_factory=list)
+    short_subtracks: list[RefinementSubtrack] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

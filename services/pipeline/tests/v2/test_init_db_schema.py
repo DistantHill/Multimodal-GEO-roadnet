@@ -19,7 +19,7 @@ def _ddl(table: str) -> str:
 
 def test_schema_v11_is_an_explicit_contract() -> None:
     assert SCHEMA_COMPONENT == "track.v2"
-    assert SCHEMA_VERSION == 11
+    assert SCHEMA_VERSION == 12
     assert "pipeline_schema_versions" in dict(DDL_STATEMENTS)
 
 
@@ -296,8 +296,8 @@ def test_unversioned_schema_is_refused_without_reset() -> None:
         _require_empty_or_current(_VersionCursor(None, ["refine_runs"]))
 
 
-def test_existing_v11_schema_is_accepted() -> None:
-    _require_empty_or_current(_VersionCursor(11, ["refine_runs"]))
+def test_existing_v12_schema_is_accepted() -> None:
+    _require_empty_or_current(_VersionCursor(12, ["refine_runs"]))
 
 
 def test_source_table_alone_does_not_require_reset() -> None:
@@ -320,5 +320,5 @@ def test_existing_v4_through_v8_schema_requires_artifact_migration(version: int)
 
 @pytest.mark.parametrize("version", [3, SCHEMA_VERSION + 1])
 def test_unsupported_schema_versions_are_not_accepted(version: int) -> None:
-    with pytest.raises(RuntimeError, match="requires v11"):
+    with pytest.raises(RuntimeError, match="requires v12"):
         _require_empty_or_current(_VersionCursor(version, ["refine_runs"]))

@@ -10,7 +10,7 @@ def refinement_subtrack_from_columns(*, vehicle_id: str, subtrack_index: int,
                                     timestamp: np.ndarray, heading: np.ndarray, speed: np.ndarray,
                                     kind: np.ndarray, source_row_key: np.ndarray,
                                     refine_point_id: np.ndarray, after_sequence: np.ndarray,
-                                    generated_reason: np.ndarray) -> RefinementSubtrack:
+                                    generated_reason: np.ndarray, heading_cal: np.ndarray | None = None) -> RefinementSubtrack:
     kind = np.asarray(kind)
     kept = (kind == 'p') | (kind == 'kept') | (kind == 0)
     kind = np.where(kept, 'p', 'i')
@@ -23,4 +23,5 @@ def refinement_subtrack_from_columns(*, vehicle_id: str, subtrack_index: int,
         np.asarray(heading, dtype=np.float64), np.asarray(speed, dtype=np.float64), kind,
         keys, kept, np.asarray(refine_point_id, dtype=np.int64), np.ones(size, dtype=bool),
         np.asarray(generated_reason, dtype=object), anchors,
+        None if heading_cal is None else np.asarray(heading_cal, dtype=np.float64),
     )

@@ -19,7 +19,7 @@ def test_refine_numeric_identity_and_replay_kept_source_metadata_are_preserved()
     result = refine_vehicle(source,
         spatial_context=SpatialContext(4326,32651,{"coordinate_semantics_version":2,
                          "enforce_area_of_use":False,"max_scale_error":0.1}),
-        config=RefineConfig(100,45,135,50,1,20,10))
+        config=RefineConfig(100,45,135,50,1,20,10, 1))
     track = result.subtracks[0]
     assert track.source_row_key.dtype == np.int64
     assert track.source_row_key.tolist() == [0,-1]
@@ -90,7 +90,7 @@ def test_subtrack_and_member_batch_reject_nonarray_columns():
     result = refine_vehicle(_source(),
         spatial_context=SpatialContext(4326,32651,{"coordinate_semantics_version":2,
                          "enforce_area_of_use":False,"max_scale_error":0.1}),
-        config=RefineConfig(100,45,135,50,1,20,10))
+        config=RefineConfig(100,45,135,50,1,20,10, 1))
     with pytest.raises(ValueError):
         replace(result.subtracks[0], source_row_key_valid=[True])
     with pytest.raises(ValueError):

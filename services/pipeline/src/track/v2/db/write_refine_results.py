@@ -122,11 +122,11 @@ def insert_kept_trajectory_points(conn: Any, subtracks: list[RefinementSubtrack]
         kept = np.flatnonzero(track.kind == "p")
         rows.extend((refine_id, int(track.source_row_key[i]), track.vehicle_id,
                      track.subtrack_index, sequence, float(track.xy[i,0]), float(track.xy[i,1]),
-                     point_ewkt(track.lonlat[i]))
+                     point_ewkt(track.lonlat[i]), _nullable_heading(track.heading_cal[i]))
                     for sequence, i in enumerate(kept))
     with conn.cursor() as cur:
         _copy_insert(cur, "kept_trajectory_points", ["refine_id", "source_row_key", "vehicle_id",
-                     "subtrack_index", "sequence_in_subtrack", "x", "y", "geom"], rows)
+                     "subtrack_index", "sequence_in_subtrack", "x", "y", "geom", "heading_cal"], rows)
     return len(rows)
 
 
@@ -141,11 +141,11 @@ def insert_injected_points(conn: Any, subtracks: list[RefinementSubtrack], *, re
                          int(track.after_sequence[i]), float(track.timestamp[i]),
                          float(track.lonlat[i, 0]), float(track.lonlat[i, 1]),
                          float(track.xy[i, 0]), float(track.xy[i, 1]),
-                         float(track.heading[i]), float(track.speed[i]), str(track.generated_reason[i])))
+                         float(track.heading[i]), float(track.speed[i]), str(track.generated_reason[i]), _nullable_heading(track.heading_cal[i])))
     with conn.cursor() as cur:
         _chunked_insert(cur, "injected_points", ["refine_id", "vehicle_id", "subtrack_index",
                         "after_sequence_in_subtrack", "timestamp", "lon", "lat", "x", "y",
-                        "heading", "speed", "generated_reason"], rows, batch_size=batch_size)
+                        "heading", "speed", "generated_reason", "heading_cal"], rows, batch_size=batch_size)
     return len(rows)
 
 
@@ -158,3 +158,7 @@ def _json_object(value: Any, label: str) -> dict[str, Any]:
             return decoded
     raise ValueError(f"{label} must be a JSON object")
 
+
+
+def _nullable_heading(value: float) -> float | None:
+    return float(value) if np.isfinite(value) else None

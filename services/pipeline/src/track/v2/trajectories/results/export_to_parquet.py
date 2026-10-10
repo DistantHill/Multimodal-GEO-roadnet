@@ -14,11 +14,11 @@ from track.v2.artifacts.publish_dataset import StagingDataset, _validate_handle
 from track.v2.config import PostgresConfig
 from track.v2.db.artifact_registry import ArtifactDescriptor
 from track.v2.db.source_table import SourceTableContract, validate_source_table
-from track.v2.models import RuntimeConfig
+from track.v2.models import RuntimeConfig, SpatialContext
 from track.v2.projection import spatial_context_from_values
 
 from . import RefineParquetError
-from .parquet_schema import REFINE_PARQUET_V1, _validate_schema
+from .parquet_schema import REFINE_PARQUET_V2, _validate_schema
 
 
 def _quote_identifier(value: str) -> str:
@@ -27,7 +27,7 @@ def _quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
-def _run_metadata(conn: Any, refine_id: UUID) -> tuple[str, int, str]:
+def _run_metadata(conn: Any, refine_id: UUID) -> tuple[str, SpatialContext, str]:
     with conn.cursor() as cur:
         cur.execute(
             "SELECT source_table, source_srid, processing_srid, projection_config, status, "
@@ -49,7 +49,7 @@ def _run_metadata(conn: Any, refine_id: UUID) -> tuple[str, int, str]:
         spatial_context = spatial_context_from_values(row[1], row[2], row[3])
     except (TypeError, ValueError) as exc:
         raise RefineParquetError("Refine Run processing_srid metadata is invalid") from exc
-    return str(row[0]), spatial_context.processing_srid, result_schema
+    return str(row[0]), spatial_context, result_schema
 
 
 def _postgres_query(
@@ -63,7 +63,7 @@ WITH points AS (
         s.timestamp, s.lon, s.lat,
         k.x AS x,
         k.y AS y,
-        s.heading, s.speed, k.source_row_key AS source_row_key, NULL::text AS generated_reason,
+        k.heading_cal, s.heading, s.speed, k.source_row_key AS source_row_key, NULL::text AS generated_reason,
         NULL::integer AS after_sequence_in_subtrack
  FROM {result_schema}.kept_trajectory_points k JOIN {contract.quoted_table} s
    ON s.id = k.source_row_key
@@ -71,7 +71,7 @@ WITH points AS (
  UNION ALL
  SELECT i.refine_id, i.id, i.vehicle_id, i.subtrack_index,
         i.after_sequence_in_subtrack, 1, i.timestamp, i.lon, i.lat, i.x, i.y,
-        i.heading, i.speed, NULL::bigint, i.generated_reason,
+        i.heading_cal, i.heading, i.speed, NULL::bigint, i.generated_reason,
         i.after_sequence_in_subtrack
  FROM {result_schema}.injected_points i WHERE i.refine_id = {run}::uuid
 ), sequenced AS (
@@ -85,7 +85,7 @@ SELECT * FROM sequenced""".strip()
 
 
 def _relation(postgres_sql: str, table: str) -> str:
-    columns = REFINE_PARQUET_V1[table]
+    columns = REFINE_PARQUET_V2[table]
     projection = ", ".join(f"{column.name}::{column.duckdb_type} AS {column.name}" for column in columns)
     point_kind = 0 if table == "kept_points" else 1
     return (
@@ -125,7 +125,7 @@ def _copy_table(
     if runtime.parquet_row_group_size_rows:
         options.append(f"ROW_GROUP_SIZE {runtime.parquet_row_group_size_rows}")
     connection.execute(f"COPY ({relation}) TO {quote_sql_literal(str(output))} ({', '.join(options)})")
-    null_predicate = " OR ".join(f"{column.name} IS NULL" for column in REFINE_PARQUET_V1[table])
+    null_predicate = " OR ".join(f"{column.name} IS NULL" for column in REFINE_PARQUET_V2[table] if column.required)
     if connection.execute(
         f"SELECT count(*) FROM read_parquet({quote_sql_literal(str(output))}) WHERE {null_predicate}"
     ).fetchone()[0]:
@@ -136,6 +136,7 @@ def export_refine_parquet(
     conn: Any, postgres: PostgresConfig, handle: StagingDataset,
     runtime: RuntimeConfig, source_fingerprint: dict[str, object],
     *, data_root: Path, postgres_extension_path: Path,
+    short_files: list[str] | None = None,
 ) -> ArtifactDescriptor:
     """Write and inspect staging only; never publish, commit, rollback, or finish.
 
@@ -146,11 +147,15 @@ def export_refine_parquet(
     _validate_handle(handle)
     if handle.stage != "refine":
         raise RefineParquetError("staging dataset must belong to the refine stage")
-    source_table, srid, result_schema = _run_metadata(conn, handle.run_id)
+    source_table, spatial_context, result_schema = _run_metadata(conn, handle.run_id)
+    srid = spatial_context.processing_srid
+    if short_files is None:
+        from .short_subtracks import ShortSubtrackWriter
+        short_files = ShortSubtrackWriter(handle, runtime, spatial_context).finish()
     contract = validate_source_table(conn, source_table)
     postgres_sql = _postgres_query(handle.run_id, contract, srid, result_schema)
     outputs = {
-        name: f"{name}/part-00000.parquet" for name in REFINE_PARQUET_V1
+        name: f"{name}/part-00000.parquet" for name in REFINE_PARQUET_V2
     }
     # C05a deliberately writes one file per logical table. Target file sizing
     # remains zero/engine-default until the benchmark introduces partitioning.
@@ -169,7 +174,8 @@ def export_refine_parquet(
                 handle.path / relative, name, runtime,
             )
     descriptor = build_descriptor(
-        handle, {name: [relative] for name, relative in outputs.items()}, source_fingerprint,
+        handle, {**{name: [relative] for name, relative in outputs.items()},
+                 "short_subtrack": short_files}, source_fingerprint,
     )
     _validate_schema(descriptor)
     return descriptor

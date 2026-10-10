@@ -25,7 +25,7 @@ def projection_config(**changes: Any):
 
 
 def refine_config(**changes: Any):
-    return replace(pipeline_config().refine, **changes)
+    return replace(pipeline_config().refine, **{"min_subtrack_points": 1, **changes})
 
 
 def detect_config(**changes: Any):

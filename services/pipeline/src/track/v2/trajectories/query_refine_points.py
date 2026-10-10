@@ -58,18 +58,18 @@ def build_stream_all_sql(
             f"       ''::text AS generated_reason, "
             f"       ST_X({projected_tp}) AS x, ST_Y({projected_tp}) AS y, "
             f"       0 AS point_kind, ktp.id AS row_id, ktp.subtrack_index, "
-            f"       ktp.sequence_in_subtrack AS anchor_sequence "
+            f"       ktp.sequence_in_subtrack AS anchor_sequence, ktp.heading_cal "
             f"FROM {kept_table} AS ktp "
             f"JOIN {table} AS tp "
             f"  ON tp.id = ktp.source_row_key "
             f"WHERE ktp.refine_id = %s "
             f"UNION ALL "
-            f"SELECT {_IP_UNIFIED_COLS} "
+            f"SELECT {_IP_UNIFIED_COLS}, heading_cal "
             f"FROM injected_points WHERE refine_id = %s "
             f"ORDER BY subtrack_index, anchor_sequence, point_kind, row_id"
         )
     return (
-        f"SELECT {_tp_unified_cols(processing_srid)} "
+        f"SELECT {_tp_unified_cols(processing_srid)}, NULL::double precision AS heading_cal "
         f"FROM {table} "
         f"ORDER BY vehicle_id, timestamp, id::text"
     )
@@ -142,14 +142,14 @@ def _stream_vehicle_tracks_from_db(
                      + " ORDER BY subtrack_index, anchor_sequence, point_kind, row_id")
         cur.execute(query, params)
         current_subtrack: tuple[str, int] | None = None
-        columns = [[] for _ in range(16)]
+        columns = [[] for _ in range(17)]
         for row_count, row in enumerate(cur, 1):
             if row_count % 10_000 == 0:
                 heartbeat_progress(row_count)
             subtrack_key = (str(row[0]), int(row[14]))
             if current_subtrack is not None and subtrack_key != current_subtrack:
                 yield _decode_track_columns(columns)
-                columns = [[] for _ in range(16)]
+                columns = [[] for _ in range(17)]
             current_subtrack = subtrack_key
             for column, value in zip(columns, row):
                 column.append(value)
@@ -164,7 +164,8 @@ def _decode_track_columns(columns: list[list]) -> RefinementSubtrack:
         lonlat=np.column_stack((columns[2], columns[3])), timestamp=np.asarray(columns[1]),
         heading=np.asarray(columns[4]), speed=np.asarray(columns[5]), kind=np.asarray(columns[12]),
         source_row_key=np.asarray(columns[7], dtype=np.int64), refine_point_id=np.asarray(columns[13]),
-        after_sequence=np.asarray(columns[15]), generated_reason=np.asarray(columns[9]))
+        after_sequence=np.asarray(columns[15]), generated_reason=np.asarray(columns[9]),
+        heading_cal=np.asarray(columns[16], dtype=np.float64) if len(columns) > 16 and columns[16] else None)
 
 @dataclass(frozen=True, slots=True)
 class _RefineRunRow:

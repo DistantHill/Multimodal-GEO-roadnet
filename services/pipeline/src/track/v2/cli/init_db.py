@@ -1,6 +1,6 @@
-"""Create track.v2 schema v11 or migrate an existing v4 through v10 schema in place.
+"""Create track.v2 schema v12 or migrate an existing v4 through v11 schema in place.
 
-Schema v11 records Detect plugin instances. Schemas v4 through v10 support ``--migrate-artifacts``.
+Schema v11 records Detect plugin instances. Schemas v4 through v11 support ``--migrate-artifacts``.
 An existing v3 or older database must be recreated with ``--reset`` so an old column can never retain
 an ambiguous meaning behind a new API.
 """
@@ -16,7 +16,7 @@ from ..telemetry.console_logging import init_logger, shutdown_logger
 
 
 SCHEMA_COMPONENT = "track.v2"
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 DDL_STATEMENTS: list[tuple[str, str]] = [
@@ -131,6 +131,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             subtrack_index          INTEGER NOT NULL CHECK (subtrack_index >= 1),
             sequence_in_subtrack    INTEGER NOT NULL
                                     CHECK (sequence_in_subtrack >= 0),
+            heading_cal             DOUBLE PRECISION CHECK (heading_cal >= 0 AND heading_cal < 360),
             x                       DOUBLE PRECISION,
             y                       DOUBLE PRECISION,
             geom                    geometry(Point, 4326),
@@ -159,6 +160,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             x                           DOUBLE PRECISION NOT NULL,
             y                           DOUBLE PRECISION NOT NULL,
             heading                     DOUBLE PRECISION NOT NULL,
+            heading_cal                 DOUBLE PRECISION CHECK (heading_cal >= 0 AND heading_cal < 360),
             speed                       DOUBLE PRECISION NOT NULL DEFAULT 0,
             geom                        geometry(Point, 4326) GENERATED ALWAYS AS (
                                             ST_SetSRID(ST_MakePoint(lon, lat), 4326)
@@ -2169,7 +2171,7 @@ def _require_empty_or_current(cur: Any) -> None:
     if version is not None:
         raise RuntimeError(
             f"database schema is v{version}; track.v2 requires v{SCHEMA_VERSION}. "
-            "For v4 through v10 use init-db --migrate-artifacts; "
+            "For v4 through v11 use init-db --migrate-artifacts; "
             "v3 and older schemas require --reset."
         )
     existing = _existing_pipeline_tables(cur)
@@ -2178,7 +2180,7 @@ def _require_empty_or_current(cur: Any) -> None:
         suffix = " ..." if len(existing) > 8 else ""
         raise RuntimeError(
             "unversioned/legacy pipeline tables exist "
-            f"({preview}{suffix}); schema v11 has no unversioned in-place migration. "
+            f"({preview}{suffix}); schema v12 has no unversioned in-place migration. "
             "Run init-db --reset."
         )
 
@@ -2232,7 +2234,7 @@ def create_tables(
     *,
     migrate_artifacts: bool = False,
 ) -> int:
-    """Create schema v11, optionally migrating v4 through v10 in one transaction."""
+    """Create schema v12, optionally migrating v4 through v11 in one transaction."""
     with pg_connect(config) as conn:
         with conn.cursor() as cur:
             installed_before = _schema_version(cur)
@@ -2260,6 +2262,9 @@ def create_tables(
                 if _schema_version(cur) == 10:
                     from ..db.migrations.detect_plugins_v11 import migrate_detect_plugins_v11
                     migrate_detect_plugins_v11(cur)
+                if _schema_version(cur) == 11:
+                    from ..db.migrations.refine_heading_v12 import migrate_refine_heading_v12
+                    migrate_refine_heading_v12(cur)
             _require_empty_or_current(cur)
 
             print("\n── 创建数据表 / Creating Tables ──")

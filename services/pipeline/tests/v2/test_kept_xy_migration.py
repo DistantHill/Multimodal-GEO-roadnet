@@ -33,11 +33,11 @@ def test_writer_persists_exact_authoritative_xy_with_zero_negative_keys():
                          np.array([0.,1.]),np.array([0.,0.]),np.array([1.,1.]),
                          np.array([0,-1],dtype=np.int64),np.ones(2,dtype=bool),np.full(2,''))
     track = refine_vehicle(source, spatial_context=SpatialContext(4326,32651,{'coordinate_semantics_version':2,'enforce_area_of_use':False,'max_scale_error':.1}),
-                           config=RefineConfig(100,45,135,50,1,20,10)).subtracks[0]
+                           config=RefineConfig(100,45,135,50,1,20,10, 1)).subtracks[0]
     with psycopg.connect(os.environ['ROADNET_TEST_DSN']) as connection:
         connection.execute('SET LOCAL search_path TO pg_temp, public, pg_catalog')
         connection.execute('''CREATE TEMP TABLE kept_trajectory_points(refine_id text, source_row_key bigint, vehicle_id text,
-            subtrack_index integer, sequence_in_subtrack integer, x double precision,y double precision, geom geometry(Point,4326))''')
+            subtrack_index integer, sequence_in_subtrack integer, x double precision,y double precision, geom geometry(Point,4326), heading_cal double precision)''')
         assert insert_kept_trajectory_points(connection,[track],refine_id='run') == 2
         rows = connection.execute('SELECT source_row_key,x,y FROM kept_trajectory_points ORDER BY sequence_in_subtrack').fetchall()
         assert [row[0] for row in rows] == [0,-1]

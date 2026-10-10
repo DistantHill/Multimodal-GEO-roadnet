@@ -325,7 +325,7 @@ def _validate(values: dict[str, dict[str, Any]], errors: list[str]) -> None:
         "detect.topology_radius_padding_m",
     }
     positive_integers = {
-        "refine.excluded_sample_max",
+        "refine.excluded_sample_max", "refine.min_subtrack_points",
 
 
 

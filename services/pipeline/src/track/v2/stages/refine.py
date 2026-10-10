@@ -28,6 +28,7 @@ from ..orchestration.events import EventProgressAdapter, EventSink
 from ..projection import CoordinateTransformer
 from ..trajectories.refine_trajectories import refine_vehicle
 from ..trajectories.results.export_to_parquet import export_refine_parquet
+from ..trajectories.results.short_subtracks import ShortSubtrackWriter
 from .support import emit_message, log_stage_finish, log_stage_start
 from .types import RefineStageRef, RefineStageResult
 
@@ -96,6 +97,10 @@ def run_refine_stage(
     staging: StagingDataset | None = None
     published = False
     try:
+        staging = create_staging(
+            paths_config.parquet_directory, "refine", refine_id, uuid4(),
+        )
+        short_writer = ShortSubtrackWriter(staging, runtime_config, spatial_context)
         counts = _stream_and_persist(
             store=store,
             source=source,
@@ -106,7 +111,9 @@ def run_refine_stage(
             runtime_config=runtime_config,
             progress=progress,
             emit=emit,
+            short_writer=short_writer,
         )
+        short_files = short_writer.finish()
         (
             source_count,
             kept_count,
@@ -122,15 +129,13 @@ def run_refine_stage(
         )
         emit_message(emit, f"  排除 / Excluded: {excluded_count:,}")
         emit_message(emit, f"  注入 / Injected: {injected_count:,}")
+        emit_message(emit, f"  短子轨迹 / Short subtracks: {short_writer.track_count:,}, {short_writer.point_count:,} points")
         emit_message(emit, f"  kept_trajectory_points: {kept_count:,} rows")
         emit_message(emit, f"  injected_points: {injected_count:,} rows")
 
         # Keep the legacy metadata field without rescanning source rows.
         source_identity = {"refine_id": refine_id}
         store.commit()
-        staging = create_staging(
-            paths_config.parquet_directory, "refine", refine_id, uuid4(),
-        )
         descriptor = export_refine_parquet(
             store.connection,
             postgres_config,
@@ -139,6 +144,7 @@ def run_refine_stage(
             source_identity,
             data_root=paths_config.data_root,
             postgres_extension_path=paths_config.duckdb_postgres_extension_path,
+            short_files=short_files,
         )
         store.rollback()
         publish(staging)
@@ -165,6 +171,8 @@ def run_refine_stage(
         vehicle_count=vehicle_count,
         artifact=descriptor,
         elapsed_s=elapsed,
+        short_subtrack_count=short_writer.track_count,
+        short_point_count=short_writer.point_count,
     )
 
 
@@ -179,6 +187,7 @@ def _stream_and_persist(
     runtime_config: RuntimeConfig,
     progress: EventProgressAdapter,
     emit: EventSink,
+    short_writer: ShortSubtrackWriter,
 ) -> tuple[int, int, int, int, int, float]:
     handle = get_database(
         source,
@@ -222,6 +231,7 @@ def _stream_and_persist(
                 spatial_context=spatial_context,
                 _transformer=transformer,
             )
+            short_writer.append(result.short_subtracks)
             injected_count += result.derived_counts.get(
                 GeneratedReason.HEADING_ORTHOGONAL, 0,
             )
