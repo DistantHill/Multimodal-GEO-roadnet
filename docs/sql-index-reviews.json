@@ -286,5 +286,19 @@
   "services/pipeline/src/track/v2/cli/init_db.py#e55dfaff17ca312ba27e3e6b3b0292aec4d8523bcade6b0b0e6840803e337f34": {
     "status": "not-applicable",
     "reason": "模块顶部说明文档字符串，描述初始化与迁移版本，不是执行的 SQL，无空间查询。"
+  },
+  "services/pipeline/src/track/v2/clips/clip_input.py#e9c3078f316c110c1fb09c424ebf6f1c3fd59505f204605bc81a4b6554b4c2a6": {
+    "status": "not-applicable",
+    "reason": "DuckDB 临时 Clip 关系按 ordinal 顺序读取标量元数据，或按交叉口端点整数相等、片段类型及方向筛选后按 clip_id、ordinal 排序；不含空间谓词或空间计算。clips 仅保存数值坐标和标量字段，没有 geometry 列或 GiST 空间索引，CRS 不参与这些筛选与排序。"
+  },
+  "services/pipeline/src/track/v2/clips/clip_input.py#0a8725c4942fc69083b297ab9342ac388f089a791ec6ea922d22929526e51897": {
+    "status": "not-applicable",
+    "reason": "DuckDB 临时 Clip 关系按 ordinal 顺序读取标量元数据，或按交叉口端点整数相等、片段类型及方向筛选后按 clip_id、ordinal 排序；不含空间谓词或空间计算。clips 仅保存数值坐标和标量字段，没有 geometry 列或 GiST 空间索引，CRS 不参与这些筛选与排序。",
+    "query": "SELECT c.* FROM clips c WHERE least(c.start_intersection_id,c.end_intersection_id)=? AND greatest(c.start_intersection_id,c.end_intersection_id)=? AND c.clip_type='between_intersection' AND c.start_intersection_id IS NOT NULL AND c.end_intersection_id IS NOT NULL AND c.start_intersection_id<>c.end_intersection_id ORDER BY c.clip_id,c.ordinal"
+  },
+  "services/pipeline/src/track/v2/clips/clip_input.py#9788d348a545b65cff5049e49487df329fde19fb694c675b1dff1d8a8fe6d405": {
+    "status": "not-applicable",
+    "reason": "DuckDB 临时 Clip 关系按 ordinal 顺序读取标量元数据，或按交叉口端点整数相等、片段类型及方向筛选后按 clip_id、ordinal 排序；不含空间谓词或空间计算。clips 仅保存数值坐标和标量字段，没有 geometry 列或 GiST 空间索引，CRS 不参与这些筛选与排序。",
+    "query": "SELECT c.* FROM clips c WHERE least(c.start_intersection_id,c.end_intersection_id)=? AND greatest(c.start_intersection_id,c.end_intersection_id)=? AND start_intersection_id=? AND end_intersection_id=? AND c.clip_type='between_intersection' AND c.start_intersection_id IS NOT NULL AND c.end_intersection_id IS NOT NULL AND c.start_intersection_id<>c.end_intersection_id ORDER BY c.clip_id,c.ordinal"
   }
 }

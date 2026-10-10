@@ -269,8 +269,12 @@ def test_fitting_heartbeat_counts_have_separate_scopes_and_units():
         original(completed, total=total, unit=unit)
         statuses.append(heartbeat._current.get().status)
 
-    with patch("track.v2.centerlines.fit_centerlines.heartbeat_progress", side_effect=capture):
-        fit_centerline_variants(clips)
+    with heartbeat.operation_heartbeat("outer fitting"):
+        heartbeat.heartbeat_progress(7, total=10, unit="交叉口对")
+        outer = heartbeat._current.get().status
+        with patch("track.v2.centerlines.fit_centerlines.heartbeat_progress", side_effect=capture):
+            fit_centerline_variants(clips)
+        assert heartbeat._current.get().status == outer
 
     scopes = {}
     for status in statuses:
@@ -278,12 +282,13 @@ def test_fitting_heartbeat_counts_have_separate_scopes_and_units():
     names = {name for name, _started in scopes}
     assert names == {
         "Fitting：准备片段", "Fitting：按交叉口对拟合",
-        "Fitting：筛选正向片段", "Fitting：筛选反向片段",
     }
+    assert len(scopes) == 2
     for (name, _started), samples in scopes.items():
         expected_unit = "交叉口对" if name == "Fitting：按交叉口对拟合" else "片段"
         assert {sample.unit for sample in samples} == {expected_unit}
         assert {sample.total for sample in samples} == {samples[-1].total}
+        assert samples[-1].total == (1 if expected_unit == "交叉口对" else 3)
         assert [sample.completed for sample in samples] == list(range(samples[-1].total + 1))
 
 

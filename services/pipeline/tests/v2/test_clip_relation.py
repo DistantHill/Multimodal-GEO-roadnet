@@ -5,6 +5,7 @@ from .config_factory import (clip_config, fitting_config, intersect_config, netw
 
 import numpy as np
 from pathlib import Path
+from dataclasses import FrozenInstanceError
 
 import pytest
 
@@ -249,3 +250,106 @@ def test_wide_json_columns_preserve_large_int64_and_xy(tmp_path):
         np.testing.assert_array_equal(result.xy, clip.xy)
         np.testing.assert_array_equal(result.lonlat, clip.lonlat)
         assert np.signbit(result.xy[1]).all()
+
+
+def test_fitting_metadata_is_scalar_ordered_immutable_and_never_reads_points(tmp_path, monkeypatch):
+    clips = (_clip("z", points=((7, 1.5, 2.5),)), _clip("a", 2, 1),
+             _clip("boundary", None, None), _clip("same", 1, 1))
+    with _relation(tmp_path) as relation:
+        for clip in clips:
+            relation.append(clip)
+        with pytest.raises(RuntimeError, match="not sealed"):
+            list(relation.iter_fitting_metadata())
+        relation.seal()
+
+        def no_points(*args):
+            pytest.fail("fitting metadata decoded point geometry")
+
+        monkeypatch.setattr(relation, "_read_point_batch", no_points)
+        values = list(relation.iter_fitting_metadata())
+        assert [(v.ordinal, v.clip_id, v.clip_type, v.start_intersection_id,
+                 v.end_intersection_id, v.point_count) for v in values] == [
+            (i, c.clip_id, c.clip_type, c.start_intersection_id,
+             c.end_intersection_id, c.point_count) for i, c in enumerate(clips)
+        ]
+        assert not hasattr(values[0], "__dict__")
+        with pytest.raises(FrozenInstanceError):
+            values[0].ordinal = 99
+        stream = relation.iter_fitting_metadata()
+        assert next(stream) == values[0]
+        stream.close()
+        assert list(relation.iter_fitting_metadata()) == values
+    with pytest.raises(RuntimeError, match="closed"):
+        list(relation.iter_fitting_metadata())
+
+
+def test_fitting_pair_filters_type_and_endpoints_and_keeps_original_ordinal(tmp_path):
+    clips = (_clip("z", 1, 2, points=((7, 1.5, 2.5),)), _clip("a", 2, 1),
+             _clip("boundary", None, None), _clip("same", 1, 1), _clip("other", 1, 3))
+    with _relation(tmp_path) as relation:
+        for clip in clips:
+            relation.append(clip)
+        relation.seal()
+        for pair in ((1, 2), (2, 1)):
+            found = list(relation.iter_fitting_pair(pair))
+            assert [ordinal for ordinal, _ in found] == [1, 0]
+            assert all(_same(actual, clips[ordinal]) for ordinal, actual in found)
+            assert [i for i, _ in relation.iter_fitting_pair(pair, reverse=False)] == [0]
+            assert [i for i, _ in relation.iter_fitting_pair(pair, reverse=True)] == [1]
+        assert list(relation.iter_fitting_pair((1, 1))) == []
+        stream = relation.iter_fitting_pair((1, 2))
+        assert next(stream)[0] == 1
+        stream.close()
+        assert [i for i, _ in relation.iter_fitting_pair((1, 2))] == [1, 0]
+
+
+def test_fitting_readers_close_owned_cursors_on_partial_read_and_decode_failure(tmp_path, monkeypatch):
+    class CursorObserver:
+        def __init__(self, value):
+            self.value = value
+            self.closed = False
+
+        def __getattr__(self, name):
+            return getattr(self.value, name)
+
+        def close(self):
+            self.closed = True
+            self.value.close()
+
+    class ConnectionObserver:
+        def __init__(self, value):
+            self.value = value
+            self.cursors = []
+
+        def __getattr__(self, name):
+            return getattr(self.value, name)
+
+        def cursor(self):
+            cursor = CursorObserver(self.value.cursor())
+            self.cursors.append(cursor)
+            return cursor
+
+    with _relation(tmp_path) as relation:
+        relation.append(_clip("a", points=((7, 1.5, 2.5),)))
+        relation.append(_clip("b"))
+        relation.seal()
+        observer = ConnectionObserver(relation._connection)
+        monkeypatch.setattr(relation, "_connection", observer)
+        for method in (relation.iter_fitting_metadata, lambda: relation.iter_fitting_pair((1, 2))):
+            stream = method()
+            next(stream)
+            stream.close()
+            assert observer.cursors
+            assert all(cursor.closed for cursor in observer.cursors)
+        original = relation._decode
+
+        def fail(*args):
+            raise RuntimeError("decode failed")
+
+        monkeypatch.setattr(relation, "_decode", fail)
+        with pytest.raises(RuntimeError, match="decode failed"):
+            list(relation.iter_fitting_pair((1, 2)))
+        assert all(cursor.closed for cursor in observer.cursors)
+        monkeypatch.setattr(relation, "_decode", original)
+        assert [i for i, _ in relation.iter_fitting_pair((1, 2))] == [0, 1]
+        assert len(relation) == 2

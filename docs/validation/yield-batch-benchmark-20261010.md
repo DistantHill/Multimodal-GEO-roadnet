@@ -70,7 +70,12 @@ Fitting 累计重建 301,151 条片段，相对于 72,834 条输入片段为 4.1
 仍需分别采样和聚合。几何复用应限定内存预算，超大交叉口对保留分块读取或磁盘暂存，
 不能把现有 16 MiB 采样块预算误当作新增几何缓存的预算。
 有效片段判定、异常报告顺序、来源标识符顺序和三个变体的结果需保持一致。
-本轮只定位了问题，未实施此优化。
+本报告所记批量实验只定位了问题，未实施此优化。后续设计已确定超限时复用原 DuckDB
+关系，不新增自写磁盘暂存；两步实现与验收已完成，见
+ [fitting-read-reuse-20261010.md](fitting-read-reuse-20261010.md) 。
+
+后续两步实施计划、仓库约束与验证矩阵见
+ [/data/workspace/Multimodal-GEO-roadnet/docs/fitting-read-reuse-plan.md](/data/workspace/Multimodal-GEO-roadnet/docs/fitting-read-reuse-plan.md) 。
 
 ## 数据库记录与一致性验证
 

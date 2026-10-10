@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 import json
 import numpy as np
 from pathlib import Path
@@ -10,6 +11,18 @@ from uuid import uuid4
 import duckdb
 
 from ..models import RuntimeConfig, TrackClip
+
+
+@dataclass(frozen=True, slots=True)
+class ClipFittingMetadata:
+    """Scalar input fields for Fitting, without reconstructing clip geometry."""
+
+    ordinal: int
+    clip_id: str
+    clip_type: str
+    start_intersection_id: int | None
+    end_intersection_id: int | None
+    point_count: int
 
 
 class ClipRelation(Sequence[TrackClip]):
@@ -318,6 +331,38 @@ class ClipRelation(Sequence[TrackClip]):
             return iter(())
         return self._iterate(where, params, "c.clip_id,c.ordinal")
 
+    def iter_fitting_metadata(self) -> Iterator[ClipFittingMetadata]:
+        """Read bounded scalar batches in the relation's original order."""
+        connection = self._require_sealed()
+        cursor = connection.cursor()
+        try:
+            cursor.execute("""
+                SELECT ordinal,clip_id,clip_type,start_intersection_id,
+                       end_intersection_id,point_count
+                FROM clips ORDER BY ordinal
+            """)
+            while rows := cursor.fetchmany(self._batch_size):
+                for row in rows:
+                    yield ClipFittingMetadata(*row)
+        finally:
+            cursor.close()
+
+    def iter_fitting_pair(
+        self, pair: tuple[int, int], *, reverse: bool | None = None,
+    ) -> Iterator[tuple[int, TrackClip]]:
+        """Read eligible pair geometry with original ordinals and stable clip order."""
+        self._require_sealed()
+        where, params = self._pair_filter(pair, reverse)
+        if not where:
+            return iter(())
+        where += (
+            " AND c.clip_type='between_intersection'"
+            " AND c.start_intersection_id IS NOT NULL"
+            " AND c.end_intersection_id IS NOT NULL"
+            " AND c.start_intersection_id<>c.end_intersection_id"
+        )
+        return self._iterate_indexed(where, params, "c.clip_id,c.ordinal")
+
     def count_pair(self, pair: tuple[int, int], *, reverse: bool | None = None) -> int:
         connection = self._require_sealed()
         where, params = self._pair_filter(pair, reverse)
@@ -350,6 +395,16 @@ class ClipRelation(Sequence[TrackClip]):
     def _iterate(
         self, where: str, params: tuple[object, ...], order_by: str,
     ) -> Iterator[TrackClip]:
+        iterator = self._iterate_indexed(where, params, order_by)
+        try:
+            for _ordinal, clip in iterator:
+                yield clip
+        finally:
+            iterator.close()
+
+    def _iterate_indexed(
+        self, where: str, params: tuple[object, ...], order_by: str,
+    ) -> Iterator[tuple[int, TrackClip]]:
         connection = self._require_sealed()
         cursor = connection.cursor()
         try:
@@ -365,7 +420,13 @@ class ClipRelation(Sequence[TrackClip]):
                             break
                         point_count += next_count
                         end += 1
-                    yield from self._read_point_batch(connection, rows[start:end])
+                    selected = rows[start:end]
+                    points = self._read_point_batch(connection, selected)
+                    try:
+                        for row, clip in zip(selected, points, strict=True):
+                            yield int(row[0]), clip
+                    finally:
+                        points.close()
                     start = end
         finally:
             cursor.close()
