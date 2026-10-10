@@ -7,7 +7,7 @@ from track.v2.candidates.turn_event_relation import TurnEventRelation
 from track.v2.candidates.cross_track_relation import CrossCandidateRelation
 from track.v2.candidates.detect_grid_crossings import iter_grid_crossings, iter_grid_candidates
 from .test_detect_identity_routes import _grid_columns
-from track.v2.intersections.detect_intersections import _compute_getis_ord_g_star,_cluster_pipeline,_run_dbscan
+from track.v2.intersections.detect_intersections import _compute_getis_ord_g_star,_run_dbscan
 from track.v2.intersections.extract_topology import _extract_entry_exit_observations_batch
 from track.v2.models import HotspotCluster
 

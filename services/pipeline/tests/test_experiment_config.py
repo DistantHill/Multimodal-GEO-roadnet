@@ -1,6 +1,7 @@
 from dataclasses import replace
 from pathlib import Path
 import json
+import copy
 import tomllib
 
 import numpy as np
@@ -8,6 +9,7 @@ import pytest
 
 from track.v2.experiments.config import load_case, load_workspace, refine_key, TimeSelection, parse_time
 from track.v2.cli.experiment import toml_text
+from track.v2.errors import ConfigError
 from track.v2.models import SourceBatch, RefineConfig, SpatialContext
 from track.v2.trajectories.refine_trajectories import refine_vehicle
 from track.v2.db.source_table import SourceTableContract
@@ -86,13 +88,50 @@ def test_local_workspace_deep_override_and_archive_operations_ignore_case(tmp_pa
     payload['parser']['field_specs_path']=str(ROOT/'config/field_specs.toml')
     payload['experiment']={'case':'sample','schemes':['turn','joint']}
     payload['cases']={'sample':raw_case()}
-    payload['schemes']={'turn':{'detect':{'use_cross_track_candidates':False}},'joint':{}}
+    single = copy.deepcopy(payload['detect'])
+    single['candidates'] = ['g_star']
+    payload['schemes']={'turn':{'detect':single},'joint':{}}
     config=tmp_path/'experiment.toml';config.write_text(toml_text(payload))
     workspace=load_workspace(config,password='testing-secret')
-    assert workspace.configs['turn'].detect.use_cross_track_candidates is False
-    assert workspace.configs['joint'].detect.use_cross_track_candidates is True
+    assert workspace.configs['turn'].detect.candidates == ('g_star',)
+    assert workspace.configs['joint'].detect.candidates == ('g_star', 'cross')
     assert refine_key(workspace.case,workspace.configs['turn']) == refine_key(workspace.case,workspace.configs['joint'])
     assert refine_key(workspace.case,replace(workspace.configs['turn'],refine=replace(workspace.configs['turn'].refine,max_gap_s=90))) != refine_key(workspace.case,workspace.configs['turn'])
     payload['cases']['sample']={'region_file':'deleted.geojson'}
     config.write_text(toml_text(payload))
     assert load_workspace(config,password='testing-secret',validate_run=False).case is None
+
+
+def test_restore_requires_explicit_conversion_preserves_old_snapshot_and_completes_legacy_scheme():
+    import copy
+    from track.v2.cli.experiment import restore_snapshot
+    current = tomllib.loads((ROOT / 'config/pipeline-roadnet-test.toml').read_text())['detect']
+    legacy = {key: value for key, value in current.items() if key not in {'candidates', 'candidate', 'cluster_algorithm', 'cluster'}}
+    legacy.update(current['candidate']['g_star']['params']['default'])
+    legacy.update(current['candidate']['cross']['params']['default'])
+    legacy.update(use_turn_events=True, use_cross_track_candidates=True,
+                  candidate_dbscan_eps_m=current['cluster']['dbscan']['params']['eps_m'],
+                  candidate_dbscan_min_samples=current['cluster']['dbscan']['params']['min_samples'])
+    snapshot = {'detect': legacy, 'schemes': {'turn': {'detect': {'use_cross_track_candidates': False}}}}
+    original = copy.deepcopy(snapshot)
+    with pytest.raises(ValueError, match='migrate-detect'):
+        restore_snapshot(snapshot)
+    with pytest.raises(ValueError, match='explicit turn and cluster'):
+        restore_snapshot(snapshot, migrate=True)
+    converted = restore_snapshot(snapshot, migrate=True, turn_algorithm='g_star', cluster_algorithm='dbscan')
+    assert snapshot == original
+    assert converted['detect']['candidates'] == ['g_star', 'cross']
+    assert converted['schemes']['turn']['detect']['candidates'] == ['g_star']
+    broken = copy.deepcopy(snapshot)
+    broken['detect'].pop('turn_window')
+    with pytest.raises(ConfigError, match='turn_window'):
+        restore_snapshot(broken, migrate=True, turn_algorithm='g_star', cluster_algorithm='dbscan')
+
+
+def test_scheme_detect_partial_configuration_is_rejected(tmp_path):
+    payload = tomllib.loads((ROOT / 'config/pipeline-roadnet-test.toml').read_text())
+    payload['parser']['field_specs_path'] = str(ROOT / 'config/field_specs.toml')
+    from track.v2.experiments.config import load_experiment_payload
+    with pytest.raises(ConfigError, match='missing required'):
+        load_experiment_payload(payload, {'detect': {'candidates': ['g_star']}},
+                                base_directory=ROOT / 'config', postgres_password='secret')

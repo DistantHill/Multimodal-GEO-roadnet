@@ -1,6 +1,6 @@
-"""Create track.v2 schema v9 or migrate an existing v4/v5/v6/v7/v8 schema in place.
+"""Create track.v2 schema v11 or migrate an existing v4 through v10 schema in place.
 
-Schema v9 persists Refine XY. Schemas v4 through v8 support ``--migrate-artifacts``.
+Schema v11 records Detect plugin instances. Schemas v4 through v10 support ``--migrate-artifacts``.
 An existing v3 or older database must be recreated with ``--reset`` so an old column can never retain
 an ambiguous meaning behind a new API.
 """
@@ -16,7 +16,7 @@ from ..telemetry.console_logging import init_logger, shutdown_logger
 
 
 SCHEMA_COMPONENT = "track.v2"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 
 DDL_STATEMENTS: list[tuple[str, str]] = [
@@ -229,12 +229,32 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
         """,
     ),
     (
+        "detect_candidate_instances",
+        """
+        CREATE TABLE IF NOT EXISTS detect_candidate_instances (
+            detect_id UUID NOT NULL REFERENCES detect_runs(id) ON DELETE CASCADE,
+            algorithm_id TEXT NOT NULL,
+            instance_id TEXT NOT NULL,
+            params JSONB NOT NULL CHECK (jsonb_typeof(params) = 'object'),
+            evidence_kind TEXT NOT NULL,
+            evidence_offset BIGINT NOT NULL CHECK (evidence_offset >= 0),
+            evidence_count BIGINT NOT NULL CHECK (evidence_count >= 0),
+            candidate_count BIGINT NOT NULL CHECK (candidate_count >= 0),
+            PRIMARY KEY (detect_id, algorithm_id, instance_id)
+        )
+        """,
+    ),
+    (
         "tracks_cross",
         """
         CREATE TABLE IF NOT EXISTS tracks_cross (
             id                              BIGSERIAL PRIMARY KEY,
             detect_id                       UUID NOT NULL
                                             REFERENCES detect_runs(id) ON DELETE CASCADE,
+            algorithm_id                    TEXT,
+            instance_id                     TEXT,
+            local_candidate_id              BIGINT,
+            evidence_index                  BIGINT,
             candidate_intersection_id       BIGINT,
             from_segment_start_point_id     BIGINT NOT NULL,
             to_segment_start_point_id       BIGINT NOT NULL,
@@ -246,6 +266,13 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
                                                 ST_SetSRID(ST_MakePoint(lon, lat), 4326)
                                             ) STORED,
             created_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT tracks_cross_instance_identity_check CHECK (
+                (num_nonnulls(algorithm_id, instance_id, local_candidate_id, evidence_index) = 0)
+                OR (num_nonnulls(algorithm_id, instance_id, local_candidate_id, evidence_index) = 4
+                    AND local_candidate_id >= 0 AND evidence_index >= 0)
+            ),
+            CONSTRAINT tracks_cross_instance_candidate_key
+                UNIQUE (detect_id, algorithm_id, instance_id, local_candidate_id),
             CONSTRAINT tracks_cross_candidate_fkey
                 FOREIGN KEY (candidate_intersection_id, detect_id)
                 REFERENCES candidate_intersections(id, detect_id),
@@ -258,8 +285,8 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             CONSTRAINT tracks_cross_segment_order_check
                 CHECK (from_segment_start_point_id < to_segment_start_point_id),
             CONSTRAINT tracks_cross_segment_pair_key
-                UNIQUE (
-                    detect_id,
+                UNIQUE NULLS NOT DISTINCT (
+                    detect_id, algorithm_id, instance_id,
                     from_segment_start_point_id,
                     to_segment_start_point_id
                 )
@@ -273,6 +300,10 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             id                          BIGSERIAL PRIMARY KEY,
             detect_id                   UUID NOT NULL
                                         REFERENCES detect_runs(id) ON DELETE CASCADE,
+            algorithm_id                    TEXT,
+            instance_id                     TEXT,
+            local_candidate_id              BIGINT,
+            evidence_index                  BIGINT,
             candidate_intersection_id   BIGINT,
             resolved_point_id           BIGINT NOT NULL,
             entry_bearing               DOUBLE PRECISION NOT NULL,
@@ -281,6 +312,13 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
             score                       DOUBLE PRECISION NOT NULL,
             g_star_z                    DOUBLE PRECISION,
             created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT turn_events_instance_identity_check CHECK (
+                (num_nonnulls(algorithm_id, instance_id, local_candidate_id, evidence_index) = 0)
+                OR (num_nonnulls(algorithm_id, instance_id, local_candidate_id, evidence_index) = 4
+                    AND local_candidate_id >= 0 AND evidence_index >= 0)
+            ),
+            CONSTRAINT turn_events_instance_candidate_key
+                UNIQUE (detect_id, algorithm_id, instance_id, local_candidate_id),
             CONSTRAINT turn_events_id_detect_key UNIQUE (id, detect_id),
             CONSTRAINT turn_events_candidate_fkey
                 FOREIGN KEY (candidate_intersection_id, detect_id)
@@ -289,7 +327,7 @@ DDL_STATEMENTS: list[tuple[str, str]] = [
                 FOREIGN KEY (resolved_point_id, detect_id)
                 REFERENCES resolved_subtrack_points(id, detect_id),
             CONSTRAINT turn_events_resolved_point_key
-                UNIQUE (detect_id, resolved_point_id)
+                UNIQUE NULLS NOT DISTINCT (detect_id, algorithm_id, instance_id, resolved_point_id)
         )
         """,
     ),
@@ -1077,6 +1115,29 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                     'completed Detect Run requires a completed parent Refine Run';
             END IF;
 
+            -- Select the expected time slice before deriving its local p/i order.
+            CREATE TEMP TABLE IF NOT EXISTS detect_time_members (
+                source_kind TEXT, source_point_id BIGINT,
+                PRIMARY KEY (source_kind, source_point_id)
+            ) ON COMMIT DROP;
+            TRUNCATE pg_temp.detect_time_members;
+            IF NEW.parameters->'refine_time_selection'->>'time_start' IS NOT NULL
+               OR NEW.parameters->'refine_time_selection'->>'time_end' IS NOT NULL THEN
+                EXECUTE format(
+                    'INSERT INTO pg_temp.detect_time_members
+                     SELECT ''kept'', k.id FROM kept_trajectory_points k
+                     JOIN %s s ON s.id=k.source_row_key
+                     WHERE k.refine_id=$1 AND s.timestamp >= $2 AND s.timestamp < $3
+                     UNION ALL SELECT ''injected'', id FROM injected_points
+                     WHERE refine_id=$1 AND timestamp >= $2 AND timestamp < $3',
+                    (SELECT source_table::regclass FROM refine_runs WHERE id=NEW.refine_id)
+                ) USING NEW.refine_id,
+                    COALESCE(EXTRACT(EPOCH FROM
+                        (NEW.parameters->'refine_time_selection'->>'time_start')::timestamptz), '-Infinity'::float8),
+                    COALESCE(EXTRACT(EPOCH FROM
+                        (NEW.parameters->'refine_time_selection'->>'time_end')::timestamptz), 'Infinity'::float8);
+            END IF;
+
             RAISE NOTICE 'track_v2 validation: Detect：校验 Refine 点集合与车辆归属';
 
             -- This is intentionally one aggregate scan, not one query per
@@ -1134,6 +1195,11 @@ POST_DDL_STATEMENTS: list[tuple[str, str]] = [
                           FROM injected_points
                          WHERE refine_id = NEW.refine_id
                        ) AS refine_members
+                 WHERE (NEW.parameters->'refine_time_selection'->>'time_start' IS NULL
+                    AND NEW.parameters->'refine_time_selection'->>'time_end' IS NULL)
+                    OR EXISTS (SELECT 1 FROM pg_temp.detect_time_members timed
+                               WHERE timed.source_kind=refine_members.source_kind
+                                 AND timed.source_point_id=refine_members.source_point_id)
             ), subtrack_checks AS (
                 SELECT subtrack_index,
                        BOOL_OR(
@@ -2103,7 +2169,7 @@ def _require_empty_or_current(cur: Any) -> None:
     if version is not None:
         raise RuntimeError(
             f"database schema is v{version}; track.v2 requires v{SCHEMA_VERSION}. "
-            "For v4 through v8 use init-db --migrate-artifacts; "
+            "For v4 through v10 use init-db --migrate-artifacts; "
             "v3 and older schemas require --reset."
         )
     existing = _existing_pipeline_tables(cur)
@@ -2112,7 +2178,7 @@ def _require_empty_or_current(cur: Any) -> None:
         suffix = " ..." if len(existing) > 8 else ""
         raise RuntimeError(
             "unversioned/legacy pipeline tables exist "
-            f"({preview}{suffix}); schema v9 has no unversioned in-place migration. "
+            f"({preview}{suffix}); schema v11 has no unversioned in-place migration. "
             "Run init-db --reset."
         )
 
@@ -2166,7 +2232,7 @@ def create_tables(
     *,
     migrate_artifacts: bool = False,
 ) -> int:
-    """Create schema v9, optionally migrating v4/v5/v6/v7/v8 in one transaction."""
+    """Create schema v11, optionally migrating v4 through v10 in one transaction."""
     with pg_connect(config) as conn:
         with conn.cursor() as cur:
             installed_before = _schema_version(cur)
@@ -2188,6 +2254,12 @@ def create_tables(
                     from ..db.migrations.kept_xy_v9 import migrate_kept_xy_v9
 
                     migrate_kept_xy_v9(cur)
+                if _schema_version(cur) == 9:
+                    from ..db.migrations.detect_time_v10 import migrate_detect_time_v10
+                    migrate_detect_time_v10(cur)
+                if _schema_version(cur) == 10:
+                    from ..db.migrations.detect_plugins_v11 import migrate_detect_plugins_v11
+                    migrate_detect_plugins_v11(cur)
             _require_empty_or_current(cur)
 
             print("\n── 创建数据表 / Creating Tables ──")

@@ -11,19 +11,24 @@ def test_named_algorithms_share_refine_and_have_distinct_snapshots(tmp_path, mon
     original = workspace(tmp_path)
     payload = original.payload
     payload["experiment"]["schemes"] = ["turn", "turn_threehold", "hdbscan"]
-    payload["schemes"]["turn_threehold"] = {"detect": {"turn_candidate_algorithm": "turn_threehold", "min_turn_deg": 45.}}
-    payload["schemes"]["hdbscan"] = {"detect": {"turn_candidate_algorithm": "turn_threehold", "clustering_algorithm": "hdbscan"}}
+    import copy
+    angle = copy.deepcopy(payload["detect"])
+    angle["candidates"] = ["turn_threehold"]
+    density = copy.deepcopy(angle)
+    density["cluster_algorithm"] = "hdbscan"
+    density["cluster"]["hdbscan"] = copy.deepcopy(density["cluster"]["dbscan"])
+    payload["schemes"]["turn_threehold"] = {"detect": angle}
+    payload["schemes"]["hdbscan"] = {"detect": density}
     text = toml_text(payload)
-    assert "跳过 G*" in text
     assert tomllib.loads(text) == payload
     original.config_path.write_text(text)
     loaded = load_workspace(original.config_path, password="test")
-    assert loaded.configs["turn"].detect.turn_candidate_algorithm == "g_star"
-    assert loaded.configs["turn_threehold"].detect.turn_candidate_algorithm == "turn_threehold"
-    assert loaded.configs["hdbscan"].detect.clustering_algorithm == "hdbscan"
+    assert loaded.configs["turn"].detect.candidates == ("g_star",)
+    assert loaded.configs["turn_threehold"].detect.candidates == ("turn_threehold",)
+    assert loaded.configs["hdbscan"].detect.cluster_algorithm == "hdbscan"
     assert len({refine_key(loaded.case, cfg) for cfg in loaded.configs.values()}) == 1
     assert len({cfg.snapshot_parameters()["config_digest"] for cfg in loaded.configs.values()}) == 3
-    assert loaded.configs["hdbscan"].effective_snapshot()["semantic_config"]["detect"]["clustering_algorithm"] == "hdbscan"
+    assert loaded.configs["hdbscan"].effective_snapshot()["semantic_config"]["detect"]["cluster_algorithm"] == "hdbscan"
     assert load_workspace(original.config_path, password="test", validate_run=False).case is None
 
     counts = setup_stages(monkeypatch)

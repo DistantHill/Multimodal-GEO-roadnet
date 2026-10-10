@@ -42,10 +42,10 @@ def test_checked_in_complete_config_loads() -> None:
     assert config.runtime.duckdb_memory_limit == "1GB"
     assert config.runtime.duckdb_event_memory_limit == "4GB"
     assert config.runtime.duckdb_grid_memory_limit == "4GB"
-    assert config.detect.cross_track_task_grid_m == 5000.0
-    assert config.detect.cross_track_task_threads == 4
-    assert config.detect.candidate_dbscan_eps_m == 100.0
-    assert config.detect.candidate_dbscan_min_samples == 3
+    assert config.detect.candidate["cross"].params["default"].cross_track_task_grid_m == 5000.0
+    assert config.detect.candidate["cross"].params["default"].cross_track_task_threads == 4
+    assert config.detect.cluster["dbscan"].params.eps_m == 100.0
+    assert config.detect.cluster["dbscan"].params.min_samples == 3
     assert len(config.parser.fields.specs) == 9
 
 
@@ -67,8 +67,8 @@ def test_debug_config_uses_joint_candidate_clustering() -> None:
     expected = tomllib.loads(path.read_text(encoding="utf-8"))["detect"]
     debug = load_pipeline_config(path, postgres_password="secret")
     assert debug.postgres.database == "roadnet_test"
-    assert debug.detect.candidate_dbscan_eps_m == expected["candidate_dbscan_eps_m"]
-    assert debug.detect.candidate_dbscan_min_samples == expected["candidate_dbscan_min_samples"]
+    assert debug.detect.cluster["dbscan"].params.eps_m == expected["cluster"]["dbscan"]["params"]["eps_m"]
+    assert debug.detect.cluster["dbscan"].params.min_samples == expected["cluster"]["dbscan"]["params"]["min_samples"]
 
 
 @pytest.mark.parametrize("value", ["0.0", "-1.0", "inf", "nan"])
@@ -76,25 +76,25 @@ def test_detect_task_grid_size_requires_finite_positive_number(tmp_path: Path, v
     path = _write(tmp_path, lambda text: text.replace(
         "cross_track_task_grid_m = 5000.0", f"cross_track_task_grid_m = {value}",
     ))
-    with pytest.raises(ConfigError, match="detect.cross_track_task_grid_m"):
+    with pytest.raises(ConfigError, match="cross_track_task_grid_m"):
         load_pipeline_config(path, postgres_password="secret")
 
 
 @pytest.mark.parametrize("value", ["0.0", "-1.0", "inf", "nan"])
 def test_joint_candidate_dbscan_radius_requires_finite_positive_number(tmp_path: Path, value: str) -> None:
     path = _write(tmp_path, lambda text: text.replace(
-        "candidate_dbscan_eps_m = 100.0", f"candidate_dbscan_eps_m = {value}",
+        "eps_m = 100.0", f"eps_m = {value}",
     ))
-    with pytest.raises(ConfigError, match="detect.candidate_dbscan_eps_m"):
+    with pytest.raises(ConfigError, match="eps_m"):
         load_pipeline_config(path, postgres_password="secret")
 
 
 @pytest.mark.parametrize("value", ["0", "-1"])
-def test_joint_candidate_dbscan_min_samples_requires_positive_integer(tmp_path: Path, value: str) -> None:
+def test_joint_min_samples_requires_positive_integer(tmp_path: Path, value: str) -> None:
     path = _write(tmp_path, lambda text: text.replace(
-        "candidate_dbscan_min_samples = 3", f"candidate_dbscan_min_samples = {value}",
+        "min_samples = 3", f"min_samples = {value}",
     ))
-    with pytest.raises(ConfigError, match="detect.candidate_dbscan_min_samples"):
+    with pytest.raises(ConfigError, match="min_samples"):
         load_pipeline_config(path, postgres_password="secret")
 
 
@@ -105,7 +105,7 @@ def test_detect_task_threads_requires_integer_between_one_and_eight(
     path = _write(tmp_path, lambda text: text.replace(
         "cross_track_task_threads = 4", f"cross_track_task_threads = {value}",
     ))
-    with pytest.raises(ConfigError, match="detect.cross_track_task_threads"):
+    with pytest.raises(ConfigError, match="cross_track_task_threads"):
         load_pipeline_config(path, postgres_password="secret")
 
 
@@ -159,7 +159,7 @@ def test_cross_field_errors_are_aggregated(tmp_path: Path) -> None:
     with pytest.raises(ConfigError) as raised:
         load_pipeline_config(path, postgres_password="secret")
     message = str(raised.value)
-    assert "detect.min_turn_deg" in message
+    assert "min_turn_deg" in message
     assert "refine.min_heading_delta_deg" in message
 
 
@@ -181,5 +181,5 @@ def test_cross_track_average_speed_threshold_must_be_finite_non_negative(tmp_pat
         return updated
 
     config = _write(tmp_path, replace_threshold)
-    with pytest.raises(ConfigError, match="detect.cross_track_min_avg_speed"):
+    with pytest.raises(ConfigError, match="cross_track_min_avg_speed"):
         load_pipeline_config(config, postgres_password="test")

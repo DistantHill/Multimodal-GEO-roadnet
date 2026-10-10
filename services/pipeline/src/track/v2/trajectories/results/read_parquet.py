@@ -38,6 +38,7 @@ class RefineDatasetReader:
         self, publication_root: Path | str, descriptor: ArtifactDescriptor, state: str,
         runtime: RuntimeConfig, *, verify_sha256: bool = False,
         data_root: Path | str | None = None,
+        time_start=None, time_end=None,
     ) -> None:
         validate_published(
             publication_root, descriptor, state, verify_sha256=verify_sha256,
@@ -45,6 +46,8 @@ class RefineDatasetReader:
         if descriptor.stage != "refine" or descriptor.refine_id is None:
             raise RefineParquetError("dataset must belong to the refine stage")
         _validate_schema(descriptor)
+        from ...time_selection import time_bounds
+        self.time_start, self.time_end = time_bounds(time_start, time_end)
         self._descriptor = descriptor
         self._runtime = runtime
         self._root = Path(publication_root).resolve(strict=True)
@@ -102,6 +105,20 @@ class RefineDatasetReader:
                        NULL::BIGINT AS source_row_key
                 FROM injected_points
             """)
+            if self.time_start is not None or self.time_end is not None:
+                self._validate_source(self._connection)
+                conditions = []
+                if self.time_start is not None:
+                    conditions.append(f"timestamp >= {self.time_start.timestamp()!r}")
+                if self.time_end is not None:
+                    conditions.append(f"timestamp < {self.time_end.timestamp()!r}")
+                self._connection.execute("ALTER VIEW refine_points RENAME TO all_refine_points")
+                self._connection.execute(
+                    "CREATE TEMP VIEW refine_points AS SELECT * EXCLUDE (refined_sequence_in_subtrack), "
+                    "row_number() OVER (PARTITION BY vehicle_id, subtrack_index ORDER BY "
+                    "refined_sequence_in_subtrack, point_kind, point_id) - 1 AS refined_sequence_in_subtrack "
+                    "FROM all_refine_points WHERE " + " AND ".join(conditions)
+                )
         except BaseException:
             if self._connection is not None:
                 self._connection.close()

@@ -59,8 +59,10 @@ from .pipeline_config_loader import (  # noqa: E402
     LoggingConfig, ParserConfig, PathsConfig, PipelineConfig, ResourcesConfig,
     load_pipeline_config,
 )
+from .detect_config import DetectConfig, CandidateAlgorithmConfig, ClusterAlgorithmConfig
 
 __all__ = [
     "LoggingConfig", "ParserConfig", "PathsConfig", "PipelineConfig", "PostgresConfig",
     "ResourcesConfig", "connect", "load_pipeline_config",
+    "DetectConfig", "CandidateAlgorithmConfig", "ClusterAlgorithmConfig",
 ]

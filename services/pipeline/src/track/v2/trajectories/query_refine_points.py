@@ -83,6 +83,7 @@ def _stream_vehicle_tracks_from_db(
     source_table: str | None = None,
     refine_id: str | None = None,
     spatial_context: SpatialContext,
+    time_start=None, time_end=None,
 ) -> Iterator[RefinementSubtrack]:
     """Stream tracks one vehicle at a time from DB (global, no spatial filter).
 
@@ -92,6 +93,15 @@ def _stream_vehicle_tracks_from_db(
         kept 模式 (``kept_table`` 非空) 时 trajectory 分支 JOIN 精炼结果表，
         绑定 ``ktp.refine_id`` 与 ``injected_points.refine_id``。
     """
+    from ..time_selection import time_bounds
+    start, end = time_bounds(time_start, time_end)
+    if start is not None or end is not None:
+        if refine_id is None:
+            raise ValueError("Refine time selection requires refine_id")
+        from ..db.pipeline_store import PostgresPipelineStore
+        from ..stages.refine import load_completed_refine_ref
+        load_completed_refine_ref(store=PostgresPipelineStore(conn), refine_id=refine_id,
+                                  time_start=start, time_end=end)
     has_refine_id = refine_id is not None
     if kept_table is not None and refine_id is None:
         raise ValueError("kept_table requires refine_id")
@@ -112,17 +122,25 @@ def _stream_vehicle_tracks_from_db(
     with conn.cursor(
         name=f"stream_tracks_{uuid.uuid4().hex}",
     ) as cur:
-        cur.execute(
-            build_stream_all_sql(
-                contract.quoted_table,
-                has_refine_id=has_refine_id,
-                kept_table=kept_table,
-                spatial_context=spatial_context,
-                source_key_sql_type=contract.key_sql_type,
-                source_has_extra=contract.has_extra,
-            ),
-            params,
+        query = build_stream_all_sql(
+            contract.quoted_table,
+            has_refine_id=has_refine_id,
+            kept_table=kept_table,
+            spatial_context=spatial_context,
+            source_key_sql_type=contract.key_sql_type,
+            source_has_extra=contract.has_extra,
         )
+        if start is not None or end is not None:
+            predicates = []
+            if start is not None:
+                predicates.append("timestamp >= %s")
+                params.append(start.timestamp())
+            if end is not None:
+                predicates.append("timestamp < %s")
+                params.append(end.timestamp())
+            query = ("SELECT * FROM (" + query + ") refined WHERE " + " AND ".join(predicates)
+                     + " ORDER BY subtrack_index, anchor_sequence, point_kind, row_id")
+        cur.execute(query, params)
         current_subtrack: tuple[str, int] | None = None
         columns = [[] for _ in range(16)]
         for row_count, row in enumerate(cur, 1):

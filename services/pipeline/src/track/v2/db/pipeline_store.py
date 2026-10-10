@@ -135,6 +135,7 @@ class PipelineStore(Protocol):
         runtime: RuntimeConfig,
         data_root: Path | str,
         batch_size: int,
+        time_start=None, time_end=None,
     ) -> DetectPersistenceResult: ...
 
     def finish_detect(self, detect_id: str, *, status: str) -> None: ...
@@ -315,6 +316,7 @@ class PostgresPipelineStore:
         runtime: RuntimeConfig,
         data_root: Path | str,
         batch_size: int,
+        time_start=None, time_end=None,
     ) -> DetectPersistenceResult:
         spatial_context = result.spatial_context
         run_row = fetch_detect_row(self._conn, detect_id)
@@ -331,6 +333,8 @@ class PostgresPipelineStore:
             runtime=runtime,
             data_root=data_root,
             batch_size=batch_size,
+            **({"time_start": time_start, "time_end": time_end}
+               if time_start is not None or time_end is not None else {}),
         )
         return DetectPersistenceResult(
             resolved_point_count=counts.resolved_point_count,

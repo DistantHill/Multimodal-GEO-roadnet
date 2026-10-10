@@ -20,6 +20,7 @@ def fetch_points_in_grid(
     spatial_context: SpatialContext,
     *,
     batch_size: int = 4096,
+    time_start=None, time_end=None,
     before_cursor_execute: Callable[[str, tuple[Any, ...]], None] | None = None,
 ) -> Iterator[dict[str, tuple[Any, ...]]]:
     """Yield bounded column batches of in-grid points and adjacent Refine points.
@@ -30,6 +31,10 @@ def fetch_points_in_grid(
     subtrack, including neighbours outside the rectangle. Missing neighbours
     have null columns. The caller owns ``conn`` and its transaction.
     """
+    from ..time_selection import time_bounds
+    start, end = time_bounds(time_start, time_end)
+    def inside(value):
+        return value is not None and (start is None or value >= start.timestamp()) and (end is None or value < end.timestamp())
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     col, row = grid_index
@@ -190,5 +195,17 @@ def fetch_points_in_grid(
     with conn.cursor(name=f"cross_track_grid_{uuid.uuid4().hex}") as cur:
         cur.execute(query, params)
         while rows := cur.fetchmany(batch_size):
-            yield {name: tuple(row[index] for row in rows)
-                   for index, name in enumerate(names)}
+            if start is not None or end is not None:
+                selected = []
+                for row in rows:
+                    if not inside(row[9]):
+                        continue
+                    values = list(row)
+                    for first, timestamp_index in ((16, 23), (30, 37)):
+                        if not inside(values[timestamp_index]):
+                            values[first:first + 14] = [None] * 14
+                    selected.append(values)
+                rows = selected
+            if rows:
+                yield {name: tuple(row[index] for row in rows)
+                       for index, name in enumerate(names)}

@@ -9,9 +9,10 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from types import UnionType
-from typing import Any, Union, get_args, get_origin, get_type_hints
+from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
-from ..intersections.detect_intersections import IntersectConfig
+from .detect_config import DetectConfig, CandidateAlgorithmConfig, ClusterAlgorithmConfig
+from ..plugins.discovery import candidate_plugins, cluster_plugins
 from ..errors import ConfigError
 from .field_mapping import load_field_config
 from ..models import (ClipConfig, FieldConfig, FittingConfig, NetworkConfig,
@@ -51,7 +52,7 @@ class PipelineConfig:
     projection: ProjectionConfig
     parser: ParserConfig
     refine: RefineConfig
-    detect: IntersectConfig
+    detect: DetectConfig
     clip: ClipConfig
     fitting: FittingConfig
     network: NetworkConfig
@@ -113,7 +114,7 @@ class PipelineConfig:
 
 _SECTION_TYPES: dict[str, type[Any]] = {
     "postgres": PostgresConfig, "paths": PathsConfig, "logging": LoggingConfig,
-    "projection": ProjectionConfig, "refine": RefineConfig, "detect": IntersectConfig,
+    "projection": ProjectionConfig, "refine": RefineConfig, "detect": DetectConfig,
     "clip": ClipConfig, "fitting": FittingConfig, "network": NetworkConfig,
     "runtime": RuntimeConfig, "resources": ResourcesConfig, "raster": RasterConfig,
 }
@@ -123,6 +124,13 @@ def _matches(value: Any, annotation: Any) -> bool:
     origin = get_origin(annotation)
     if origin in (Union, UnionType):
         return any(_matches(value, item) for item in get_args(annotation))
+    if origin is Literal:
+        return any(type(value) is type(item) and value == item for item in get_args(annotation))
+    if origin is dict:
+        key_type, value_type = get_args(annotation)
+        return isinstance(value, dict) and all(_matches(k, key_type) and _matches(v, value_type) for k, v in value.items())
+    if origin is list:
+        return isinstance(value, list) and all(_matches(v, get_args(annotation)[0]) for v in value)
     if origin is tuple:
         args = get_args(annotation)
         return isinstance(value, list) and (len(args) == 2 and args[1] is Ellipsis
@@ -138,7 +146,13 @@ def _matches(value: Any, annotation: Any) -> bool:
         return isinstance(value, str)
     if annotation is Path:
         return isinstance(value, str)
-    return True
+    if dataclasses.is_dataclass(annotation):
+        return isinstance(value, dict)
+    if annotation is Any:
+        return True
+    if annotation is type(None):
+        return value is None
+    return False
 
 
 def _convert(value: Any, annotation: Any, base_dir: Path) -> Any:
@@ -150,6 +164,99 @@ def _convert(value: Any, annotation: Any, base_dir: Path) -> Any:
         path = Path(value)
         return path if path.is_absolute() else (base_dir / path).resolve()
     return value
+
+
+def _plugin_params(name: str, cls: type, raw: Any, base_dir: Path, errors: list[str]) -> Any:
+    before = len(errors)
+    values = _collect_section(name, cls, raw, base_dir, errors)
+    if len(errors) != before:
+        return None
+    # Every floating parameter, including unconstrained scores, must be finite.
+    def check_finite(path: str, value: Any) -> None:
+        if isinstance(value, float) and not math.isfinite(value):
+            errors.append(f"{path}: must be finite")
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                check_finite(f"{path}.{key}", child)
+        elif isinstance(value, (tuple, list)):
+            for index, child in enumerate(value):
+                check_finite(f"{path}[{index}]", child)
+    for key, value in values.items():
+        check_finite(f"{name}.{key}", value)
+    if len(errors) != before:
+        return None
+    try:
+        return cls(**values)
+    except (TypeError, ValueError) as exc:
+        errors.append(f"{name}: {exc}")
+        return None
+
+
+def _names(name: str, raw: Any, errors: list[str]) -> tuple[str, ...]:
+    if not isinstance(raw, (list, tuple)) or not raw or any(not isinstance(v, str) or not v.strip() for v in raw):
+        errors.append(f"{name}: expected non-empty list of non-empty strings")
+        return ()
+    if len(set(raw)) != len(raw):
+        errors.append(f"{name}: duplicate IDs")
+    return tuple(raw)
+
+
+def _collect_detect(raw: Any, base_dir: Path, errors: list[str]) -> dict[str, Any]:
+    values = _collect_section("detect", DetectConfig, raw, base_dir, errors)
+    if not isinstance(raw, dict):
+        return values
+    candidates = candidate_plugins()
+    clusters = cluster_plugins()
+    values["candidates"] = _names("detect.candidates", raw.get("candidates"), errors)
+    for identity in values["candidates"]:
+        if identity not in candidates:
+            errors.append(f"detect.candidates: unknown algorithm {identity!r}")
+    selection = raw.get("cluster_algorithm")
+    if not isinstance(selection, str) or selection not in clusters:
+        errors.append(f"detect.cluster_algorithm: unknown algorithm {selection!r}")
+    for section, registry in (("candidate", candidates), ("cluster", clusters)):
+        tables = raw.get(section)
+        parsed = {}
+        if not isinstance(tables, dict):
+            errors.append(f"detect.{section}: expected table")
+            values[section] = parsed
+            continue
+        for identity, table in tables.items():
+            path = f"detect.{section}.{identity}"
+            if identity not in registry:
+                errors.append(f"{path}: unknown algorithm")
+                continue
+            expected = {"params", "output_instances"} if section == "candidate" else {"params"}
+            if not isinstance(table, dict):
+                errors.append(f"{path}: expected table")
+                continue
+            errors.extend(f"{path}.{key}: unknown key" for key in sorted(set(table) - expected))
+            errors.extend(f"{path}.{key}: missing required key" for key in sorted(expected - set(table)))
+            if section == "cluster":
+                params = _plugin_params(path + ".params", registry[identity].params_type, table.get("params"), base_dir, errors)
+                parsed[identity] = ClusterAlgorithmConfig(params)
+                continue
+            instances = table.get("params")
+            if not isinstance(instances, dict) or not instances:
+                errors.append(f"{path}.params: expected non-empty instance table")
+                instances = {}
+            parsed_instances = {}
+            for instance, params in instances.items():
+                if not isinstance(instance, str) or not instance.strip():
+                    errors.append(f"{path}.params: instance ID must be non-empty")
+                parsed_instances[instance] = _plugin_params(f"{path}.params.{instance}", registry[identity].params_type, params, base_dir, errors)
+            outputs = _names(path + ".output_instances", table.get("output_instances"), errors)
+            for instance in outputs:
+                if instance not in instances:
+                    errors.append(f"{path}.output_instances: unknown instance {instance!r}")
+            parsed[identity] = CandidateAlgorithmConfig(outputs, parsed_instances)
+        values[section] = parsed
+    for identity in values["candidates"]:
+        if identity not in values["candidate"]:
+            errors.append(f"detect.candidate.{identity}: missing selected algorithm configuration")
+    if isinstance(selection, str) and selection not in values["cluster"]:
+        errors.append(f"detect.cluster.{selection}: missing selected algorithm configuration")
+    return values
 
 
 def _collect_section(name: str, cls: type[Any], raw: Any, base_dir: Path,
@@ -204,24 +311,24 @@ def _validate(values: dict[str, dict[str, Any]], errors: list[str]) -> None:
         if value is not None and value < minimum:
             errors.append(f"{path}: must be >= {minimum}")
     strictly_positive = {
-        "refine.max_extension_m", "refine.max_gap_s", "detect.min_leg_m",
-        "detect.g_star_radius_m", "detect.candidate_dbscan_eps_m",
-        "detect.cross_track_grid_cell_m",
-        "detect.cross_track_task_grid_m",
+        "refine.max_extension_m", "refine.max_gap_s",
+
+
+
         "detect.min_intersection_radius_m", "fitting.point_spacing_m",
         "fitting.fit_sample_spacing_m", "runtime.progress_time_threshold_s",
     }
     non_negative_numbers = {
         "refine.min_speed_mps", "refine.max_stationary_duration_s",
-        "detect.min_movement_speed_mps", "detect.merge_centroid_distance_m",
-        "detect.cross_track_min_avg_speed",
+         "detect.merge_centroid_distance_m",
+
         "detect.topology_radius_padding_m",
     }
     positive_integers = {
-        "refine.excluded_sample_max", "detect.turn_window",
-        "detect.candidate_dbscan_min_samples",
-        "detect.cross_track_pair_batch_size", "detect.cross_track_max_grid_cells_per_segment",
-        "detect.cross_track_task_threads",
+        "refine.excluded_sample_max",
+
+
+
         "detect.min_branches", "detect.min_observations", "detect.min_directed_transitions",
         "detect.bearing_window", "detect.stream_batch_size", "fitting.min_clips_per_pair",
         "runtime.mark_flush_every_n", "runtime.excluded_flush_threshold",
@@ -241,12 +348,10 @@ def _validate(values: dict[str, dict[str, Any]], errors: list[str]) -> None:
         if value is not None and not 0.0 <= value <= 1.0:
             errors.append(f"{path}: must be in [0, 1]")
     detect = values.get("detect", {})
-    if detect.get("cross_track_task_threads", 4) > 8:
-        errors.append("detect.cross_track_task_threads: must be <= 8")
     angle_paths = ("refine.min_heading_delta_deg", "refine.max_heading_delta_deg",
-                   "detect.min_turn_deg", "detect.max_turn_deg",
-                   "detect.cross_track_straightness_deg", "detect.cross_track_min_angle_deg",
-                   "detect.cross_track_max_angle_deg", "detect.branch_threshold_deg")
+
+
+                    "detect.branch_threshold_deg")
     for path in angle_paths:
         section, key = path.split(".")
         value = values.get(section, {}).get(key)
@@ -260,10 +365,6 @@ def _validate(values: dict[str, dict[str, Any]], errors: list[str]) -> None:
     window = detect.get("spatial_window_size")
     if window is not None and (len(window) != 2 or any(not math.isfinite(v) or v <= 0 for v in window)):
         errors.append("detect.spatial_window_size: must contain two finite positive numbers")
-    for low, high in (("min_turn_deg", "max_turn_deg"),
-                      ("cross_track_min_angle_deg", "cross_track_max_angle_deg")):
-        if low in detect and high in detect and detect[low] > detect[high]:
-            errors.append(f"detect.{low}: must be <= detect.{high}")
     refine = values.get("refine", {})
     if ("min_heading_delta_deg" in refine and "max_heading_delta_deg" in refine
             and refine["min_heading_delta_deg"] > refine["max_heading_delta_deg"]):
@@ -314,7 +415,8 @@ def load_pipeline_payload(payload: dict[str, Any], *, base_directory: str | Path
     expected = set(_SECTION_TYPES) | {"parser"}
     errors.extend(f"{name}: unknown section" for name in sorted(set(payload) - expected))
     errors.extend(f"{name}: missing required section" for name in sorted(expected - set(payload)))
-    values = {name: _collect_section(name, cls, payload.get(name), resolved.parent, errors)
+    values = {name: (_collect_detect(payload.get(name), resolved.parent, errors) if name == "detect"
+                     else _collect_section(name, cls, payload.get(name), resolved.parent, errors))
               for name, cls in _SECTION_TYPES.items()}
     parser_raw = payload.get("parser")
     parser_values = {}

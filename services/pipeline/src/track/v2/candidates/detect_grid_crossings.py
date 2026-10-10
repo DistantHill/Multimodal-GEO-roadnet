@@ -235,6 +235,7 @@ def run_grid_cross_track_task(
     max_result_bytes: int,
     runtime: Any,
     data_root: Any,
+    time_start=None, time_end=None,
     thread_count: int = 4,
     candidate_store: Any = None,
     live_status: Any = None,
@@ -316,7 +317,9 @@ def run_grid_cross_track_task(
         local_index = 0
         with conn.transaction():
             with open_grid_segments(
-                fetch_points_in_grid(conn, cell, grids, refine_id, spatial_context),
+                fetch_points_in_grid(conn, cell, grids, refine_id, spatial_context,
+                                     **({"time_start": time_start, "time_end": time_end}
+                                        if time_start is not None or time_end is not None else {})),
                 max_segments=max_segments, max_bytes=max_segment_bytes,
                 runtime=runtime, data_root=data_root, owner=f"grid-segments-{grid_order[cell]}",
                 bounds=grids[cell[0]][cell[1]], timing=timing,

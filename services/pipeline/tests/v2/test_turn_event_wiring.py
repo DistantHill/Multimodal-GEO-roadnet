@@ -13,7 +13,7 @@ from .test_turn_event_relation import concatenate,assert_batch_equal
 from track.v2.candidates.turn_event_relation import TurnEventRelation
 from track.v2.candidates.detect_turn_events import empty_turn_batch
 from track.v2.candidates.detect_cross_track_pairs import empty_cross_batch
-from track.v2.intersections.detect_intersections import (IntersectConfig,_IntersectRunConfig,_cluster_pipeline,
+from track.v2.intersections.detect_intersections import (IntersectConfig,_IntersectRunConfig,
     _compute_getis_ord_g_star,_select_hotspot_events,_detect_intersections_db)
 from track.v2.orchestration.run_pipeline import PipelineInput,run_pipeline
 from . import test_run_pipeline_lifecycle as lifecycle
@@ -68,7 +68,8 @@ def test_db_result_survives_columnar_run_and_cross_holds_no_full_turns(tmp_path,
         sql_turns_from_subtrack(track, cfg, first_index=i)
         for i, track in enumerate(tracks.values())
     ])
-    expected_hotspots,expected_clusters=_cluster_pipeline(expected_turns,empty_cross_batch(),_TRANSFORMER,cfg)
+    from .detect_columns_helpers import cluster_candidate_batches
+    expected_hotspots,expected_clusters=cluster_candidate_batches(expected_turns,empty_cross_batch(),_TRANSFORMER,cfg)
     stored=[]
     class OwnedSequence(TrackingSequence):
         def __init__(self,*args,**kwargs): super().__init__(*args,**kwargs); stored.append(self)
@@ -81,10 +82,11 @@ def test_db_result_survives_columnar_run_and_cross_holds_no_full_turns(tmp_path,
         'iter_turn_candidates':lambda self,*a,**kw:iter([expected_turns]),'track_count':lambda self:len(tracks)})()
     with patch('track.v2.intersections.detect_intersections.TurnEventRelation',OwnedSequence),patch('track.v2.intersections.detect_intersections.run_grid_cross_track_task',side_effect=cross),patch('track.v2.intersections.detect_intersections._build_topologies_from_reader',side_effect=lambda clusters,*a,**kw:([],clusters,[])):
         result=_detect_intersections_db(object(),_run_config(cfg),_CONTEXT,runtime=runtime_config(),data_root=tmp_path,refine_reader=reader,connect_worker=lambda:object())
-    assert result.turn_events is stored[0]
+    assert result.candidate_results[0].events is stored[0]
     assert_batch_equal(concatenate(result.turn_events.iter_batches()),expected_turns)
-    assert_batch_equal(result.hotspot_events,expected_hotspots)
-    assert [cluster.as_dict() for cluster in result.clusters]==[cluster.as_dict() for cluster in expected_clusters]
+    assert_batch_equal(concatenate(result.hotspot_events.iter_batches()),expected_hotspots)
+    assert [cluster.members.calculation_index.tolist() for cluster in result.clusters]==[cluster.members.calculation_index.tolist() for cluster in expected_clusters]
+    assert all(cluster.algorithm_sources == ("g_star:default",) for cluster in result.clusters)
     assert stored[0]._connection is not None
     result.close(); result.close(); _assert_no_turn_relations(tmp_path)
 
@@ -111,7 +113,7 @@ def test_columnar_turn_detection_emits_heartbeat_and_batch_counts(tmp_path):
     })()
     cfg = replace(_run_config(intersect_config(use_cross_track_candidates=False)), live_status=live)
     with patch('track.v2.intersections.detect_intersections.heartbeat_progress') as progress, \
-         patch('track.v2.intersections.detect_intersections._cluster_pipeline', return_value=(empty_turn_batch(), [])), \
+         patch('track.v2.intersections.detect_intersections._build_candidate_clusters', return_value=[]), \
          patch('track.v2.intersections.detect_intersections._build_topologies_from_reader', return_value=([], [], [])):
         result = _detect_intersections_db(
             object(), cfg, _CONTEXT, runtime=runtime_config(), data_root=tmp_path,
@@ -126,8 +128,11 @@ def test_columnar_turn_detection_emits_heartbeat_and_batch_counts(tmp_path):
 
 @pytest.mark.parametrize('failure',[RuntimeError('failed'),KeyboardInterrupt()])
 def test_detect_internal_failure_closes_output_relation(tmp_path,monkeypatch,failure):
-    def fail(*args,event_store,**kwargs): event_store.append_batch(_events([[0.,0.]])); raise failure
-    with patch('track.v2.intersections.detect_intersections._run_columnar_db_detect',side_effect=fail):
+    def fail(config,execution):
+        relation = execution.own(TurnEventRelation(runtime_config(), tmp_path))
+        relation.append_batch(_events([[0.,0.]]))
+        raise failure
+    with patch('track.v2.intersections.detect_intersections.execute_candidates',side_effect=fail):
         with pytest.raises(type(failure)):
             _detect_intersections_db(object(),_run_config(intersect_config()),_CONTEXT,runtime=runtime_config(),data_root=tmp_path,refine_reader=MagicMock())
     _assert_no_turn_relations(tmp_path)

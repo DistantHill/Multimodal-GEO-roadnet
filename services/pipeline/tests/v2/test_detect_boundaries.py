@@ -150,7 +150,7 @@ class ProjectionContextContractTest(unittest.TestCase):
         reader.track_count.return_value = 0
         with (
             patch("track.v2.intersections.detect_intersections.run_grid_cross_track_task") as columnar,
-            patch("track.v2.intersections.detect_intersections._cluster_pipeline", return_value=(empty_turn_batch(), [])),
+            patch("track.v2.intersections.detect_intersections._build_candidate_clusters", return_value=[]),
             patch("track.v2.intersections.detect_intersections._build_topologies_from_reader", return_value=([], [], [])),
         ):
             _run_columnar_db_detect(

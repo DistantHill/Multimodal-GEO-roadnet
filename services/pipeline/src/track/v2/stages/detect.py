@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from contextlib import suppress
+from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
@@ -39,7 +40,23 @@ def run_detect_stage(
     verify_sha256: bool,
     parameters: dict[str, Any],
     emit: EventSink,
+    time_start=None, time_end=None,
+    candidate_cache=None,
 ) -> DetectStageResult:
+    from ..time_selection import validate_refine_time
+    start = end = None
+    requested_start = refine.time_start if time_start is None else time_start
+    requested_end = refine.time_end if time_end is None else time_end
+    if requested_start is not None or requested_end is not None:
+        start, end = validate_refine_time(
+            store, store.get_refine_run(refine.refine_id), requested_start, requested_end,
+        )
+        refine = replace(refine, time_start=start, time_end=end)
+    parameters = dict(parameters)
+    parameters["refine_time_selection"] = {
+        "time_start": start.isoformat() if start else None,
+        "time_end": end.isoformat() if end else None,
+    }
     detect_id = store.start_detect_run(
         refine_id=refine.refine_id,
         parameters=parameters,
@@ -72,10 +89,11 @@ def run_detect_stage(
             runtime_config,
             verify_sha256=verify_sha256,
             data_root=paths_config.data_root,
+            time_start=start, time_end=end,
         )
         with reader:
             connect_worker = None
-            if detect_config.use_cross_track_candidates:
+            if detect_config.candidates:
                 import psycopg
 
                 worker_parameters = dict(store.connection.info.get_parameters())
@@ -94,6 +112,7 @@ def run_detect_stage(
                 refine_reader=reader,
                 runtime=runtime_config,
                 data_root=paths_config.data_root,
+                **({"candidate_cache": candidate_cache} if candidate_cache is not None else {}),
             )
         compute_elapsed = time.perf_counter() - compute_started
         store.rollback()
@@ -124,6 +143,8 @@ def run_detect_stage(
                 runtime=runtime_config,
                 data_root=paths_config.data_root,
                 batch_size=runtime_config.db_insert_batch,
+                **({"time_start": start, "time_end": end}
+                   if start is not None or end is not None else {}),
             )
         with operation_heartbeat(
             "Detect：结果行校验与事务提交",

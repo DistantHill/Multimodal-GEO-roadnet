@@ -557,3 +557,45 @@ def test_typed_text_scanner_preserves_wide_strings_null_nan_and_large_ids(tmp_pa
             assert relation._connection.execute(f"SELECT count(*) FROM (SELECT {value} AS v FROM {name}) WHERE isnan(v)").fetchone()[0] == size//2
         finally:
             relation._connection.unregister(name)
+
+
+def test_plugin_instance_sources_keep_duplicate_turns_and_cluster_assignments(tmp_path):
+    from track.v2.plugins.execution import CandidateResult, CompositeRelation
+    events = _turns([0])
+    params = None
+    first = CandidateResult('turn_threehold', 'low', 'turn', events, events, params, 0)
+    second = CandidateResult('turn_threehold', 'high', 'turn', events, events, params, 1)
+    with _relation(tmp_path) as relation:
+        relation.collect_sources(NS(turn_events=CompositeRelation(((events, 0), (events, 1))),
+            cross_track_candidates=_crosses([]), candidate_results=(first, second)), [], {}, {})
+        _mappings(relation, [('p', 1, 0)], [100])
+        relation.resolve_sources()
+        relation.prepare_annotations([_cluster(0, [first.source_key], [0]),
+                                      _cluster(1, [second.source_key], [1])], {0: 10, 1: 20},
+                                     CompositeRelation(((events, 0), (events, 1))))
+        rows = list(relation.with_instance_identity('turn', relation.iter_rows(0, 'detect')))
+    assert len(rows) == 2
+    assert [row[1] for row in rows] == [10, 20]
+    assert [row[-4:] for row in rows] == [('turn_threehold', 'low', 0, 0), ('turn_threehold', 'high', 0, 1)]
+
+
+def test_plugin_instances_allow_same_cross_pair_but_reject_duplicate_within_instance(tmp_path):
+    from track.v2.plugins.execution import CandidateResult, CompositeRelation
+    events = _crosses([0])
+    first = CandidateResult('cross', 'a', 'orthogonal_cross_track', events, events, None, 0)
+    second = CandidateResult('cross', 'b', 'orthogonal_cross_track', events, events, None, 1)
+    with _relation(tmp_path) as relation:
+        relation.collect_sources(NS(turn_events=_turns([]),
+            cross_track_candidates=CompositeRelation(((events, 0), (events, 1))),
+            candidate_results=(first, second)), [], {}, {})
+        _mappings(relation, [('p', 1, 0), ('p', 2, 0)], [100, 101])
+        relation.resolve_sources()
+        relation.prepare_annotations([], {}, _turns([]))
+        relation.validate_cross_pairs('detect')
+        rows = list(relation.with_instance_identity('cross', relation.iter_validated_cross_rows()))
+        assert [row[-3] for row in rows] == ['a', 'b']
+        relation._cross_validated = False
+        combined = _crosses([0, 1])
+        relation._plugin_results = (CandidateResult('cross', 'a', 'orthogonal_cross_track', combined, combined, None, 0),)
+        with pytest.raises(ValueError, match='duplicate'):
+            relation.validate_cross_pairs('detect')

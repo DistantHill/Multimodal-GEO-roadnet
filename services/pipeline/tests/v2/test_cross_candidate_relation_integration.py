@@ -1,4 +1,5 @@
 """Cross column relation matches eager clustering and retains output ownership."""
+from .detect_columns_helpers import cluster_candidate_batches
 from contextlib import ExitStack
 from dataclasses import replace
 import gc
@@ -70,9 +71,9 @@ def test_complete_pipeline_matches_eager_order_refs_ablation_and_writer_membersh
     values=candidates(); turns=turns_for(values)
     cfg=intersect_config(g_star_min_z=-100.,g_star_radius_m=15.,candidate_dbscan_eps_m=2.,candidate_dbscan_min_samples=2,
         merge_centroid_distance_m=merge_distance)
-    expected_hotspots,expected=detect._cluster_pipeline(turns,values,TRANSFORMER,cfg)
+    expected_hotspots,expected=cluster_candidate_batches(turns,values,TRANSFORMER,cfg)
     with stored(tmp_path,values) as spool:
-        actual_hotspots,actual=detect._cluster_pipeline(turns,spool,TRANSFORMER,cfg)
+        actual_hotspots,actual=cluster_candidate_batches(turns,spool,TRANSFORMER,cfg)
         from .test_turn_event_relation import assert_batch_equal as assert_turn_equal
         assert_turn_equal(actual_hotspots,expected_hotspots)
         assert serialized(actual)==serialized(expected)==serialized(actual)
@@ -153,8 +154,8 @@ def test_sorted_relation_to_result_writes_same_rows(tmp_path):
     cfg=intersect_config(cross_track_pair_batch_size=3,use_turn_events=False,candidate_dbscan_min_samples=1)
     expected=candidates(8)
     with stored(tmp_path,expected) as spool:
-        _,eager_clusters=detect._cluster_pipeline(empty_turn_batch(),expected,TRANSFORMER,cfg)
-        _,lazy_clusters=detect._cluster_pipeline(empty_turn_batch(),spool,TRANSFORMER,cfg)
+        _,eager_clusters=cluster_candidate_batches(empty_turn_batch(),expected,TRANSFORMER,cfg)
+        _,lazy_clusters=cluster_candidate_batches(empty_turn_batch(),spool,TRANSFORMER,cfg)
         base=detect._empty_intersect_result(CONTEXT)
         result=replace(base,clusters=lazy_clusters,cross_track_candidates=spool)
         eager=replace(base,clusters=eager_clusters,cross_track_candidates=expected)
@@ -176,7 +177,8 @@ def test_sorted_relation_to_result_writes_same_rows(tmp_path):
                     _insert_tracks_cross(NS(cursor=lambda:ExitStack()),'run',relation,batch_size=3)
             rows.append(copied)
         membership={index:value for kind,index,value in eager_membership_rows(eager_clusters,ids) if kind=='cross'}
-        expected_rows=[('run',membership.get(i),*expected_pairs[i],*expected.xy[i],*expected.lonlat[i]) for i in range(len(expected))]
+        expected_rows=[('run',membership.get(i),*expected_pairs[i],*expected.xy[i],*expected.lonlat[i],None,None,None,None) for i in range(len(expected))]
+        assert all(row[-4:] == (None,None,None,None) for row in rows[0])
         assert rows[0]==rows[1]==expected_rows
         assert json.loads(json.dumps(result.as_dict()))==json.loads(json.dumps(eager.as_dict()))
         result.close();result.close()
@@ -192,7 +194,7 @@ def test_db_owner_closes_all_spools_on_failure(tmp_path,monkeypatch,phase,failur
     cfg=intersect_run_config(use_turn_events=False,candidate_dbscan_min_samples=1,refine_id='refine-1')
     reader=MagicMock();reader.extent.return_value=(0.,0.,1.,1.);reader.track_count.return_value=0
     with ExitStack() as stack:
-        target={'reader':'run_grid_cross_track_task','clustering':'_cluster_pipeline','topology':'_build_topologies_from_reader'}[phase]
+        target={'reader':'run_grid_cross_track_task','clustering':'_build_candidate_clusters','topology':'_build_topologies_from_reader'}[phase]
         if phase!='reader':stack.enter_context(patch.object(detect,'run_grid_cross_track_task',return_value=empty_cross_batch()))
         stack.enter_context(patch.object(detect,target,side_effect=failure))
         with pytest.raises(type(failure)):

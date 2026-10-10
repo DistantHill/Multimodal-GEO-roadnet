@@ -14,7 +14,7 @@ from track.v2.candidates.build_patches import _iter_pair_batches as _iter_cross_
 from track.v2.candidates.detect_turn_events import empty_turn_batch
 from track.v2.candidates.detect_cross_track_pairs import empty_cross_batch
 from track.v2.intersections.performance_timing import PerfTracker
-from track.v2.intersections.detect_intersections import (_build_dbscan_grid,_run_dbscan,_cluster_pipeline,_compute_getis_ord_g_star,detect_intersections,_cluster_dbscan,_merge_clusters)
+from track.v2.intersections.detect_intersections import (_build_dbscan_grid,_run_dbscan,_compute_getis_ord_g_star,detect_intersections,_cluster_dbscan,_merge_clusters)
 from track.v2.intersections.extract_topology import _cluster_angles_greedy,_nearest_angle_id
 from track.v2.exceptions import V2Error
 from track.v2.models import IntersectReport

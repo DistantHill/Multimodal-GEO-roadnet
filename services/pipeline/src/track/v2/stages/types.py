@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from ..db.artifact_registry import ArtifactDescriptor
 from ..db.pipeline_store import DetectPersistenceResult
@@ -19,6 +20,8 @@ class RefineStageRef:
     refine_id: str
     source_table: str
     spatial_context: SpatialContext
+    time_start: datetime | None = None
+    time_end: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

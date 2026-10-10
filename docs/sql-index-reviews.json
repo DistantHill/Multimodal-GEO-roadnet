@@ -210,5 +210,81 @@
   "services/pipeline/src/track/v2/db/migrations/detect_plugins_v11.py#a79c74de372c6c95aea9f79ed53418d11e47887b90427e44c91a6b53cf33e6d5": {
     "status": "not-applicable",
     "reason": "按组件键读取并锁定或更新 pipeline_schema_versions 版本元数据，不涉及空间数据。迁移说明文本亦非空间查询。"
+  },
+  "services/pipeline/tests/v2/test_detect_plugins_migration.py#5ffe1f753d314c59f0ad2bed34c08c6adf241208a74a090475718490276b8ca1": {
+    "status": "not-applicable",
+    "reason": "隔离且回滚的身份迁移测试：DDL 调整实例身份约束，或按主键/Detect ID 插入和读取少量固定来源事件与版本元数据；不做空间邻域筛选或几何计算，空间索引不适用。"
+  },
+  "services/pipeline/tests/v2/test_detect_plugins_migration.py#df27666d360784b29ac6f9ad9609fa71c0bb5f651e2c03d586cc2c0556dc9712": {
+    "status": "not-applicable",
+    "reason": "隔离且回滚的身份迁移测试：DDL 调整实例身份约束，或按主键/Detect ID 插入和读取少量固定来源事件与版本元数据；不做空间邻域筛选或几何计算，空间索引不适用。"
+  },
+  "services/pipeline/tests/v2/test_detect_plugins_migration.py#d8f61c060ac3672a8481d5e71e18bc559b8799517a525ed41695def46e2b4eec": {
+    "status": "not-applicable",
+    "reason": "隔离且回滚的身份迁移测试：DDL 调整实例身份约束，或按主键/Detect ID 插入和读取少量固定来源事件与版本元数据；不做空间邻域筛选或几何计算，空间索引不适用。"
+  },
+  "services/pipeline/tests/v2/test_detect_plugins_migration.py#abb7bfb0f7ea3c906074116e385fc9b0656eda51b3fd14f0a1e9bf57359494a4": {
+    "status": "not-applicable",
+    "reason": "隔离且回滚的身份迁移测试：DDL 调整实例身份约束，或按主键/Detect ID 插入和读取少量固定来源事件与版本元数据；不做空间邻域筛选或几何计算，空间索引不适用。"
+  },
+  "services/pipeline/tests/v2/test_detect_plugins_migration.py#3e163fcba2bc37568bb6e61df1f5776a1dc0af30b87f30e1beee6a724b1c132f": {
+    "status": "not-applicable",
+    "reason": "隔离且回滚的身份迁移测试：DDL 调整实例身份约束，或按主键/Detect ID 插入和读取少量固定来源事件与版本元数据；不做空间邻域筛选或几何计算，空间索引不适用。"
+  },
+  "services/pipeline/tests/v2/test_detect_plugins_migration.py#906c6c723e8fd5589a57a284d924c3f92e34c0cb14b4ddc3a753e2034aaeb6ff": {
+    "status": "not-applicable",
+    "reason": "隔离且回滚的身份迁移测试：DDL 调整实例身份约束，或按主键/Detect ID 插入和读取少量固定来源事件与版本元数据；不做空间邻域筛选或几何计算，空间索引不适用。"
+  },
+  "services/pipeline/tests/v2/test_detect_plugins_migration.py#ceaa9d2e85f2f9cc885aa129521fd982c2ae7e9b27b76b4972ed73b1e5cdf995": {
+    "status": "not-applicable",
+    "reason": "隔离且回滚的身份迁移测试：DDL 调整实例身份约束，或按主键/Detect ID 插入和读取少量固定来源事件与版本元数据；不做空间邻域筛选或几何计算，空间索引不适用。"
+  },
+  "services/pipeline/tests/v2/test_detect_plugins_migration.py#d3abbb4572aad4059bd2e24976262d86aa00036930b5d185de77fa9c995d00a3": {
+    "status": "not-applicable",
+    "reason": "隔离且回滚的身份迁移测试：DDL 调整实例身份约束，或按主键/Detect ID 插入和读取少量固定来源事件与版本元数据；不做空间邻域筛选或几何计算，空间索引不适用。"
+  },
+  "services/pipeline/tests/v2/test_detect_plugins_migration.py#4065c0f34f42de1ebf84f82a7b4c25443f832648bc7244f5cb7863fec00b28d7": {
+    "status": "not-applicable",
+    "reason": "隔离且回滚的身份迁移测试：DDL 调整实例身份约束，或按主键/Detect ID 插入和读取少量固定来源事件与版本元数据；不做空间邻域筛选或几何计算，空间索引不适用。"
+  },
+  "services/pipeline/tests/v2/test_detect_plugins_migration.py#a0cc1e94cb73c4ee93b0222a8c10e64d45f41ab861ad95676721e5f0c050fb7a": {
+    "status": "not-applicable",
+    "reason": "隔离且回滚的身份迁移测试：DDL 调整实例身份约束，或按主键/Detect ID 插入和读取少量固定来源事件与版本元数据；不做空间邻域筛选或几何计算，空间索引不适用。"
+  },
+  "services/pipeline/tests/v2/test_detect_plugins_migration.py#86a7d6d9a5b0df4a9dd07301498dab0c0324b0cc9e476f434e7b0c1ad568f9fd": {
+    "status": "not-applicable",
+    "reason": "隔离且回滚的身份迁移测试：DDL 调整实例身份约束，或按主键/Detect ID 插入和读取少量固定来源事件与版本元数据；不做空间邻域筛选或几何计算，空间索引不适用。"
+  },
+  "services/pipeline/tests/v2/test_detect_plugins_migration.py#0636f044d3c1b13a9bbe2d7296ff810f7cac030346fac97688baed569d3f9e3c": {
+    "status": "not-applicable",
+    "reason": "隔离且回滚的身份迁移测试：DDL 调整实例身份约束，或按主键/Detect ID 插入和读取少量固定来源事件与版本元数据；不做空间邻域筛选或几何计算，空间索引不适用。"
+  },
+  "services/pipeline/src/track/v2/experiments/runner.py#1246a1c20a77cefd3013cd6759689f16f2f232242b110a7335cf571b82434e67": {
+    "status": "not-applicable",
+    "reason": "按 Detect UUID 读取算法实例参数与计数元数据；无几何列、空间谓词或空间计算。"
+  },
+  "services/pipeline/tests/v2/test_plugin_writer_postgres.py#db66c3f3e6dc9b41a791d1a35c2282cafcdb5fdae3d9a84727517b45dfd8017b": {
+    "status": "not-applicable",
+    "reason": "隔离事务内的 PostgreSQL 回归测试：建立两点固定源几何、插入固定数据，按 Detect UUID 读取证据身份与实例元数据以验证重复实例落库；无空间范围筛选或几何邻域计算。"
+  },
+  "services/pipeline/tests/v2/test_plugin_writer_postgres.py#2ae80d4311a7504c461bb18599199620ac3322080cf9213dc1a54947bfdc005f": {
+    "status": "not-applicable",
+    "reason": "隔离事务内的 PostgreSQL 回归测试：建立两点固定源几何、插入固定数据，按 Detect UUID 读取证据身份与实例元数据以验证重复实例落库；无空间范围筛选或几何邻域计算。"
+  },
+  "services/pipeline/tests/v2/test_plugin_writer_postgres.py#c755af55a93d49c4341fb79f2f8eb7871082d9a32c3538d70be8937e9fdb374e": {
+    "status": "not-applicable",
+    "reason": "隔离事务内的 PostgreSQL 回归测试：建立两点固定源几何、插入固定数据，按 Detect UUID 读取证据身份与实例元数据以验证重复实例落库；无空间范围筛选或几何邻域计算。"
+  },
+  "services/pipeline/tests/v2/test_plugin_writer_postgres.py#865592c42e3974ad1e08b9ef9eb6265f37d1431320586978750513c8635da388": {
+    "status": "not-applicable",
+    "reason": "隔离事务内的 PostgreSQL 回归测试：建立两点固定源几何、插入固定数据，按 Detect UUID 读取证据身份与实例元数据以验证重复实例落库；无空间范围筛选或几何邻域计算。"
+  },
+  "services/pipeline/src/track/v2/cli/init_db.py#c62e57d22f705918cfaeed6f57a81744918551e8c435dddb507fa4eb22b2c3ec": {
+    "status": "not-applicable",
+    "reason": "模块顶部说明文档字符串，仅描述初始化与迁移版本，不是执行的 SQL，无空间查询。"
+  },
+  "services/pipeline/src/track/v2/cli/init_db.py#e55dfaff17ca312ba27e3e6b3b0292aec4d8523bcade6b0b0e6840803e337f34": {
+    "status": "not-applicable",
+    "reason": "模块顶部说明文档字符串，描述初始化与迁移版本，不是执行的 SQL，无空间查询。"
   }
 }

@@ -36,6 +36,8 @@ class PipelineInput:
     source_table: str | None = None
     refine_id: str | None = None
     selection: object | None = None
+    time_start: str | None = None
+    time_end: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +60,17 @@ def run_pipeline(
     """Run the stage sequence and aggregate its compatibility result."""
     sink: EventSink = _noop_event_sink if emit is None else emit
     _validate_pipeline_input(pipeline_input)
+    from ..time_selection import time_bounds
+    from ..experiments.config import TimeSelection
+    start, end = time_bounds(pipeline_input.time_start, pipeline_input.time_end)
+    if start is not None or end is not None:
+        if pipeline_input.selection is not None:
+            raise ValueError("use either selection or time_start/time_end")
+        if pipeline_input.source_table is not None:
+            if start is None or end is None:
+                raise ValueError("new Refine requires both time_start and time_end")
+            from dataclasses import replace
+            pipeline_input = replace(pipeline_input, selection=TimeSelection(start, end))
     parameters = config.snapshot_parameters()
     if pipeline_input.selection is not None:
         parameters["source_selection"] = pipeline_input.selection.snapshot()
@@ -144,12 +157,12 @@ def _resolve_refine(
 ) -> tuple[RefineStageRef, RefineStageResult | None]:
     if pipeline_input.refine_id is not None:
         record = store.get_refine_run(pipeline_input.refine_id)
-        if record.parameters.get("source_selection") != parameters.get("source_selection"):
-            raise ValueError("Refine source time selection does not match this run")
         refine_ref = load_completed_refine_ref(
             store=store,
             refine_id=pipeline_input.refine_id,
             record=record,
+            time_start=getattr(pipeline_input.selection, "time_start", pipeline_input.time_start),
+            time_end=getattr(pipeline_input.selection, "time_end", pipeline_input.time_end),
         )
         # These historical messages mean Refine was not executed in this run.
         emit_message(emit, "  排除 / Excluded: 0")

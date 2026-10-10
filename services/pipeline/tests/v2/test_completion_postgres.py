@@ -31,9 +31,9 @@ def connection():
             conn.rollback()
 
 
-def seed_detect(conn, *, tracks=1, offset=0, long_subtrack=False, same_vehicle=False):
+def seed_detect(conn, *, tracks=1, offset=0, long_subtrack=False, same_vehicle=False, source_table="public.fixture"):
     refine, detect = uuid4(), uuid4()
-    conn.execute("INSERT INTO refine_runs(id, source_table, status) VALUES (%s, 'public.fixture', 'running')", (refine,))
+    conn.execute("INSERT INTO refine_runs(id, source_table, status) VALUES (%s, %s, 'running')", (refine, source_table))
     conn.execute("""
         INSERT INTO kept_trajectory_points(id, refine_id, source_row_key, vehicle_id, subtrack_index, sequence_in_subtrack)
         SELECT %s + n, %s, n::bigint, ((n-1)/2)::text, (n-1)/2+1, (n-1)%%2

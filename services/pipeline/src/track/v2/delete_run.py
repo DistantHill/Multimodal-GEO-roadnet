@@ -13,6 +13,8 @@ REFINE_ARTIFACT_TABLES = (
 )
 
 # Reverse dependency order for deletion.
+# detect_candidate_instances is immutable run metadata, retained during experiment
+# artifact cleanup. Deleting detect_runs itself removes it through ON DELETE CASCADE.
 DETECT_ARTIFACT_TABLES = (
     "centerline_source_clips",
     "centerlines",

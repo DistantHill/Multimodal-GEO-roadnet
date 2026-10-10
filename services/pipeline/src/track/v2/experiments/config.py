@@ -69,15 +69,15 @@ def polygon_geometry(raw: dict[str, Any]) -> dict[str, Any]:
 class ExperimentCase:
     name: str
     source_table: str
-    time_start: datetime
-    time_end: datetime
+    time_start: datetime | None
+    time_end: datetime | None
     geometry: dict[str, Any]
     region_file: Path | None = None
     truth_file: Path | None = None
 
     def snapshot(self) -> dict[str, Any]:
         return {"name": self.name, "source_table": self.source_table,
-                "time_start": self.time_start.isoformat(), "time_end": self.time_end.isoformat(),
+                "time_start": self.time_start.isoformat() if self.time_start else None, "time_end": self.time_end.isoformat() if self.time_end else None,
                 "geometry": self.geometry}
 
     def source_query(self, contract: SourceTableContract) -> tuple[str, tuple[Any, ...]]:
@@ -103,7 +103,9 @@ class ExperimentCase:
             ) AS timed
           ) AS segmented WHERE _experiment_inside
           ORDER BY vehicle_id, timestamp, id::text"""
-        bounds = (canonical(self.geometry), self.time_start.timestamp(), self.time_end.timestamp())
+        bounds = (canonical(self.geometry),
+                  self.time_start.timestamp() if self.time_start else float("-inf"),
+                  self.time_end.timestamp() if self.time_end else float("inf"))
         return query, bounds + bounds
 
 
@@ -117,9 +119,8 @@ def load_case(name: str, raw: dict[str, Any], base: Path) -> ExperimentCase:
     if not isinstance(source, str):
         raise ValueError(f"case {name}: source_table is required")
     quote_table_name(source)
-    start, end = parse_time(raw.get("time_start"), "time_start"), parse_time(raw.get("time_end"), "time_end")
-    if start >= end:
-        raise ValueError(f"case {name}: time_start must precede time_end")
+    from ..time_selection import time_bounds
+    start, end = time_bounds(raw.get("time_start"), raw.get("time_end"))
     def is_empty(value: Any) -> bool:
         return value is None or (isinstance(value, str) and not value.strip()) or value == []
 
@@ -162,35 +163,25 @@ def merge_parameters(base: dict[str, Any], overrides: dict[str, Any]) -> dict[st
     return result
 
 
-@dataclass(frozen=True)
-class ExperimentDetectConfig(IntersectConfig):
-    """Algorithm switches owned by experiments, excluded from Pipeline TOML."""
-    turn_candidate_algorithm: str = "g_star"
-    clustering_algorithm: str = "dbscan"
-
-    def __post_init__(self) -> None:
-        if self.turn_candidate_algorithm not in ("g_star", "turn_threehold"):
-            raise ValueError("turn_candidate_algorithm must be 'g_star' or 'turn_threehold'")
-        if self.clustering_algorithm not in ("dbscan", "hdbscan"):
-            raise ValueError("clustering_algorithm must be 'dbscan' or 'hdbscan'")
-
-
 def load_experiment_payload(base: dict[str, Any], overrides: dict[str, Any] | None = None,
                             **kwargs: Any) -> PipelineConfig:
-    """Extract experimental switches before invoking the strict Pipeline loader."""
-    experimental = copy.deepcopy(base)
-    if isinstance(experimental.get("detect"), dict):
-        experimental["detect"].setdefault("turn_candidate_algorithm", "g_star")
-        experimental["detect"].setdefault("clustering_algorithm", "dbscan")
-    experimental = merge_parameters(experimental, overrides or {})
-    switches = {}
-    if isinstance(experimental.get("detect"), dict):
-        for key in ("turn_candidate_algorithm", "clustering_algorithm"):
-            if key in experimental["detect"]:
-                switches[key] = experimental["detect"].pop(key)
-    config = load_pipeline_payload(experimental, **kwargs)
-    detect = ExperimentDetectConfig(**config.detect.as_dict(), **switches)
-    return replace(config, detect=detect)
+    """Use shared validation; each scheme supplies a complete Detect config."""
+    changes = copy.deepcopy(overrides or {})
+    detect = changes.pop("detect", None)
+    effective = merge_parameters(base, changes)
+    if detect is not None:
+        effective["detect"] = copy.deepcopy(detect)
+    return load_pipeline_payload(effective, **kwargs)
+
+
+def independent_instance_configs(config: PipelineConfig):
+    """One independent clustering run for each declared instance, without combinations."""
+    for algorithm in config.detect.candidates:
+        definition = config.detect.candidate[algorithm]
+        for instance, params in definition.params.items():
+            selected = replace(definition, output_instances=(instance,))
+            detect = replace(config.detect, candidates=(algorithm,), candidate={algorithm: selected})
+            yield algorithm, instance, params, replace(config, detect=detect)
 
 
 @dataclass(frozen=True)

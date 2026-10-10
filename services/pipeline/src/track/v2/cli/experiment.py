@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -37,8 +38,8 @@ def parameter_comments() -> dict[tuple[str, ...], str]:
 
 
 EXPERIMENT_ALGORITHM_COMMENTS = {
-    "turn_candidate_algorithm": "实验筛选算法：g_star 或 turn_threehold；turn_threehold 按 abs(turn_deg) > min_turn_deg 筛选，跳过 G*。",
-    "clustering_algorithm": "实验聚类算法：dbscan 或 hdbscan；转向和跨轨迹候选仍联合聚类。",
+    "candidates": "本次候选算法；算法内 params 定义实例，output_instances 选择输出。",
+    "cluster_algorithm": "本次聚类算法，参数由 cluster 表配置。",
 }
 
 
@@ -68,7 +69,7 @@ def toml_text(payload: dict[str, Any]) -> str:
             return json.dumps(value, ensure_ascii=False)
         if isinstance(value, (int, float)):
             return repr(value)
-        if isinstance(value, list):
+        if isinstance(value, (list, tuple)):
             return "[" + ", ".join(scalar(item) for item in value) + "]"
         if hasattr(value, "isoformat"):
             return json.dumps(value.isoformat())
@@ -133,10 +134,37 @@ def initialize_workspace(path: Path, base: Path) -> None:
     payload["archive"] = {"database": "roadnet_eval"}
     payload["cases"] = {"example": {"source_table": "trajectory_points", "time_start": "",
                                     "time_end": "", "region_file": "", "bbox": []}}
-    payload["schemes"] = {"turn": {"detect": {"use_turn_events": True, "use_cross_track_candidates": False}},
-                          "joint": {"detect": {"use_turn_events": True, "use_cross_track_candidates": True}}}
+    joint = copy.deepcopy(payload["detect"])
+    single = copy.deepcopy(joint)
+    single["candidates"] = [joint["candidates"][0]]
+    payload["schemes"] = {"turn": {"detect": single}, "joint": {"detect": joint}}
     payload["evaluation"] = {"mode": "center_distance", "distance_m": 30.0}
     path.write_text("# Fill case time_start/time_end and region_file or bbox before running.\n" + toml_text(payload), encoding="utf-8")
+
+
+def restore_snapshot(snapshot: dict, *, migrate: bool = False,
+                     turn_algorithm: str | None = None, cluster_algorithm: str | None = None) -> dict:
+    """Copy a historical draft, explicitly converting legacy Detect before reuse."""
+    from ..config.migrate_detect import convert_legacy_detect
+    restored = copy.deepcopy(snapshot)
+    legacy_base = copy.deepcopy(restored.get("detect", {}))
+    sections = [restored]
+    sections.extend(restored.get("schemes", {}).values())
+    for section in sections:
+        raw = section.get("detect")
+        if raw is None or "candidates" in raw:
+            continue
+        if not migrate:
+            raise ValueError("legacy Detect snapshot requires restore --migrate-detect")
+        if section is not restored:
+            from ..experiments.config import merge_parameters
+            raw = merge_parameters(legacy_base, raw)
+        turn = raw.get("turn_candidate_algorithm", turn_algorithm)
+        cluster = raw.get("clustering_algorithm", cluster_algorithm)
+        if turn is None or cluster is None:
+            raise ValueError("legacy snapshot requires explicit turn and cluster algorithms")
+        section["detect"] = convert_legacy_detect(raw, turn_algorithm=turn, cluster_algorithm=cluster)
+    return restored
 
 
 def cleanup_experiment(workspace: Any, experiment_id: str) -> dict[str, Any]:
@@ -183,7 +211,8 @@ def cleanup_experiment(workspace: Any, experiment_id: str) -> dict[str, Any]:
                                     "(SELECT id FROM centerlines WHERE detect_id=%s)", (detect_id,))
                         for table in DETECT_ARTIFACT_TABLES[1:]:
                             service._delete_rows(table, "detect_id", detect_id)
-                        # Keep immutable Run and registry ownership as history.
+                        # Keep immutable Run, candidate instance parameters/counts,
+                        # and registry ownership as history.
                 if refine_id and guard["can_delete_refine"]:
                     cur.execute("SELECT id FROM refine_runs WHERE id=%s FOR UPDATE", (refine_id,))
                     exists = cur.fetchone() is not None
@@ -221,6 +250,7 @@ def main() -> int:
             sub.add_argument("--case")
             sub.add_argument("--scheme", action="append")
             sub.add_argument("--refine-id")
+            sub.add_argument("--independent-instances", action="store_true")
         elif command == "list":
             sub.add_argument("--case")
             sub.add_argument("--limit", type=int, default=100)
@@ -228,6 +258,9 @@ def main() -> int:
             sub.add_argument("experiment_id")
             if command == "restore":
                 sub.add_argument("--output", type=Path, required=True)
+                sub.add_argument("--migrate-detect", action="store_true")
+                sub.add_argument("--legacy-turn-algorithm")
+                sub.add_argument("--legacy-cluster-algorithm")
             if command == "evaluate":
                 sub.add_argument("--truth-file", type=Path)
     args = parser.parse_args()
@@ -246,7 +279,7 @@ def main() -> int:
                                    case_name=getattr(args, "case", None), schemes=getattr(args, "scheme", None),
                                    validate_run=args.command == "run")
         if args.command == "run":
-            records = run_batch(workspace, explicit_refine_id=args.refine_id)
+            records = run_batch(workspace, explicit_refine_id=args.refine_id, independent_instances=args.independent_instances)
             return 0 if all(record["status"] == "completed" and record["archive_state"] == "archived" and "archive_error" not in record and "evaluation_error" not in record for record in records) else 1
         if args.command == "retry-archive":
             result = archive_local(workspace, workspace.root / "runs" / args.experiment_id)
@@ -264,7 +297,7 @@ def main() -> int:
                 else:
                     record = archive.get_experiment(args.experiment_id)
                     args.output.parent.mkdir(parents=True, exist_ok=True)
-                    args.output.write_text(toml_text(record["draft_snapshot"]), encoding="utf-8")
+                    args.output.write_text(toml_text(restore_snapshot(record["draft_snapshot"], migrate=args.migrate_detect, turn_algorithm=args.legacy_turn_algorithm, cluster_algorithm=args.legacy_cluster_algorithm)), encoding="utf-8")
                     result = {"configuration": str(args.output)}
         print(json.dumps(result, ensure_ascii=False, default=str))
         return 0

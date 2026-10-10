@@ -6,7 +6,7 @@ import time
 import uuid
 import numpy as np
 from contextlib import closing, nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -99,15 +99,17 @@ def persist_detect_result(
     runtime: RuntimeConfig,
     data_root: str | Path,
     batch_size: int = _BATCH,
+    time_start=None, time_end=None,
 ) -> DetectWriteCounts:
     """Persist atomically; own narrow local relations until writer completion."""
     with WriterRelation(
         runtime, data_root, detect_id, batch_size=batch_size,
     ) as workspace:
-        return _persist_detect_result(conn, detect_id, result, batch_size=batch_size, workspace=workspace)
+        return _persist_detect_result(conn, detect_id, result, batch_size=batch_size, workspace=workspace,
+                                      time_start=time_start, time_end=time_end)
 
 
-def _persist_detect_result(conn, detect_id, result, *, batch_size, workspace):
+def _persist_detect_result(conn, detect_id, result, *, batch_size, workspace, time_start=None, time_end=None):
     with conn.cursor() as cur:
         cur.execute(
             "SELECT refine_id, status FROM detect_runs WHERE id = %s FOR UPDATE",
@@ -180,6 +182,7 @@ def _persist_detect_result(conn, detect_id, result, *, batch_size, workspace):
         crossing_id_by_calculation,
         batch_size=batch_size,
         workspace=workspace,
+        time_start=time_start, time_end=time_end,
     )
     resolved_sequence_elapsed = time.perf_counter() - resolved_sequence_started
 
@@ -194,6 +197,7 @@ def _persist_detect_result(conn, detect_id, result, *, batch_size, workspace):
     workspace.prepare_annotations(ordered_clusters, candidate_by_calculation, result.hotspot_events)
     tracks_cross_count = _insert_tracks_cross(conn, detect_id, workspace, batch_size=batch_size)
     turn_event_count = _insert_turn_events(conn, detect_id, workspace, batch_size=batch_size)
+    _insert_candidate_instances(conn, detect_id, result)
     materialize_turn_event_geom(conn, detect_id)
     materialize_turn_hot_points(conn, detect_id)
     _insert_candidate_crossings(conn, detect_id, workspace, batch_size=batch_size)
@@ -240,6 +244,7 @@ def _iter_refine_member_batches(
     conn: Any,
     refine_id: str,
     batch_size: int,
+    *, time_start=None, time_end=None,
 ) -> Iterator[dict[str, np.ndarray]]:
     """Read one ordered Refine snapshot without libpq/Python materializing it."""
     if batch_size < 1:
@@ -247,7 +252,7 @@ def _iter_refine_member_batches(
     # The caller finishes each COPY before resuming this named cursor. Both
     # operations use the existing atomic write transaction and connection.
     with conn.cursor(name=f"resolved_members_{uuid.uuid4().hex}") as cur:
-        cur.execute(
+        query = (
             "SELECT point_kind, point_id, vehicle_id, subtrack_index, anchor_sequence, geom "
             "FROM ("
             " SELECT 'kept'::text AS point_kind, id AS point_id, vehicle_id, "
@@ -258,9 +263,34 @@ def _iter_refine_member_batches(
             "        after_sequence_in_subtrack, 1, geom::text "
             " FROM injected_points WHERE refine_id = %s"
             ") AS members "
-            "ORDER BY subtrack_index, anchor_sequence, kind_order, point_id",
-            (refine_id, refine_id),
+            "ORDER BY subtrack_index, anchor_sequence, kind_order, point_id"
         )
+        params = (refine_id, refine_id)
+        if time_start is not None or time_end is not None:
+            from .source_table import validate_source_table
+            from ..time_selection import time_bounds
+            start, end = time_bounds(time_start, time_end)
+            with conn.cursor() as metadata:
+                metadata.execute("SELECT source_table FROM refine_runs WHERE id=%s", (refine_id,))
+                source = validate_source_table(conn, metadata.fetchone()[0])
+            lower = start.timestamp() if start else float("-inf")
+            upper = end.timestamp() if end else float("inf")
+            query = f"""SELECT point_kind, point_id, vehicle_id, subtrack_index, anchor_sequence, geom
+                FROM (
+                    SELECT 'kept'::text AS point_kind, k.id AS point_id, k.vehicle_id,
+                           k.subtrack_index, k.sequence_in_subtrack AS anchor_sequence,
+                           0 AS kind_order, k.geom::text AS geom
+                    FROM kept_trajectory_points k
+                    JOIN {source.quoted_table} s ON s.id=k.source_row_key
+                    WHERE k.refine_id=%s AND s.timestamp >= %s AND s.timestamp < %s
+                    UNION ALL
+                    SELECT 'injected', id, vehicle_id, subtrack_index,
+                           after_sequence_in_subtrack, 1, geom::text
+                    FROM injected_points
+                    WHERE refine_id=%s AND timestamp >= %s AND timestamp < %s
+                ) members ORDER BY subtrack_index, anchor_sequence, kind_order, point_id"""
+            params = (refine_id, lower, upper, refine_id, lower, upper)
+        cur.execute(query, params)
         current_subtrack: int | None = None
         current_vehicle: str | None = None
         sequence = 0
@@ -287,6 +317,7 @@ def _persist_resolved_sequence(
     *,
     batch_size: int,
     workspace: WriterRelation,
+    time_start=None, time_end=None,
 ) -> int:
     """Keep historical p/i/c ordering, streaming exact source keys to disk."""
     if batch_size < 1:
@@ -327,7 +358,11 @@ def _persist_resolved_sequence(
             event_index += 1
             sequence += 1
 
-    batches = _iter_refine_member_batches(conn, refine_id, batch_size)
+    bounds = {"time_start": time_start, "time_end": time_end}
+    batches = _iter_refine_member_batches(
+        conn, refine_id, batch_size,
+        **(bounds if any(bounds.values()) else {}),
+    )
     try:
         for members in batches:
             with conn.cursor() as cur:
@@ -448,8 +483,9 @@ def _insert_tracks_cross(conn, detect_id, workspace, *, batch_size):
     return _copy_workspace_rows(
         conn, "tracks_cross",
         ["detect_id", "candidate_intersection_id", "from_segment_start_point_id",
-         "to_segment_start_point_id", "x", "y", "lon", "lat"],
-        workspace.iter_validated_cross_rows(),
+         "to_segment_start_point_id", "x", "y", "lon", "lat",
+         "algorithm_id", "instance_id", "local_candidate_id", "evidence_index"],
+        workspace.with_instance_identity("cross", workspace.iter_validated_cross_rows()),
         total=workspace.counts[1], batch_size=batch_size,
     )
 
@@ -459,9 +495,24 @@ def _insert_turn_events(conn, detect_id, workspace, *, batch_size):
     return _copy_workspace_rows(
         conn, "turn_events",
         ["detect_id", "candidate_intersection_id", "resolved_point_id", "entry_bearing",
-         "exit_bearing", "turn_deg", "score", "g_star_z"],
-        workspace.iter_rows(0, detect_id), total=workspace.counts[0], batch_size=batch_size,
+         "exit_bearing", "turn_deg", "score", "g_star_z",
+         "algorithm_id", "instance_id", "local_candidate_id", "evidence_index"],
+        workspace.with_instance_identity("turn", workspace.iter_rows(0, detect_id)), total=workspace.counts[0], batch_size=batch_size,
     )
+
+
+def _insert_candidate_instances(conn, detect_id, result):
+    from psycopg.types.json import Jsonb
+    for item in getattr(result, "candidate_results", ()):
+        evidence = item.events if item.events is not None else item.candidates
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO detect_candidate_instances "
+                "(detect_id,algorithm_id,instance_id,params,evidence_kind,evidence_offset,evidence_count,candidate_count) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (detect_id, item.algorithm_id, item.instance_id, Jsonb(asdict(item.params)),
+                 item.evidence_kind, item.evidence_offset, len(evidence), len(item.candidates)),
+            )
 
 
 @observed_operation("物化转向事件几何")
@@ -482,12 +533,12 @@ def materialize_turn_event_geom(conn: Any, detect_id: str) -> int:
             INSERT INTO turn_events_geom (
                 id, detect_id, candidate_intersection_id, resolved_point_id,
                 entry_bearing, exit_bearing, turn_deg, score, g_star_z,
-                created_at, geom
+                created_at, geom, algorithm_id, instance_id, local_candidate_id, evidence_index
             )
             SELECT te.id, te.detect_id, te.candidate_intersection_id,
                    te.resolved_point_id, te.entry_bearing, te.exit_bearing,
                    te.turn_deg, te.score, te.g_star_z, te.created_at,
-                   COALESCE(tp.geom, ip.geom)
+                   COALESCE(tp.geom, ip.geom), te.algorithm_id, te.instance_id, te.local_candidate_id, te.evidence_index
             FROM turn_events te
             LEFT JOIN resolved_subtrack_points rp
               -- The composite event FK already enforces matching Detect IDs.
@@ -517,11 +568,11 @@ def materialize_turn_hot_points(conn: Any, detect_id: str) -> int:
             INSERT INTO trun_hot_ponits (
                 id, detect_id, candidate_intersection_id, resolved_point_id,
                 entry_bearing, exit_bearing, turn_deg, score, g_star_z,
-                created_at, geom
+                created_at, geom, algorithm_id, instance_id, local_candidate_id, evidence_index
             )
             SELECT id, detect_id, candidate_intersection_id, resolved_point_id,
                    entry_bearing, exit_bearing, turn_deg, score, g_star_z,
-                   created_at, geom
+                   created_at, geom, algorithm_id, instance_id, local_candidate_id, evidence_index
             FROM turn_events_geom
             WHERE detect_id = %s AND g_star_z IS NOT NULL
             """,

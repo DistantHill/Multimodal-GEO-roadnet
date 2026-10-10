@@ -45,3 +45,14 @@ def sql_turns_from_subtrack(track, cfg, *, first_index=0):
             connection, UUID(int=0), track.source_id, cfg, cfg.stream_batch_size,
         )))
     return replace(batch, calculation_index=batch.calculation_index + first_index)
+
+
+def cluster_candidate_batches(turn_events,cross_candidates,transformer,cfg,**kwargs):
+    """Test-only eager oracle for historical turn/cross kernel comparisons."""
+    from track.v2.candidates.detect_turn_events import empty_turn_batch
+    from track.v2.intersections.detect_intersections import _select_hotspot_events, _build_candidate_clusters, _annotate_source_ablation
+    hotspot=_select_hotspot_events(turn_events,cfg,**kwargs) if cfg.use_turn_events and len(turn_events) else empty_turn_batch()
+    point_sources=(("turn",hotspot),("orthogonal_cross_track",cross_candidates))
+    clusters=_build_candidate_clusters(point_sources,cfg,transformer,**kwargs)
+    clusters=[replace(cluster,cluster_calculate_index=i) for i,cluster in enumerate(clusters)]
+    return hotspot,_annotate_source_ablation(clusters,point_sources,cfg,transformer,**kwargs)

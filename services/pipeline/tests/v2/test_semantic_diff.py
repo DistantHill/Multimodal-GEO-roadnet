@@ -114,7 +114,7 @@ class _SchemaCursor:
         if "to_regclass" in sql:
             self.response = ("pipeline_schema_versions",)
         elif "pipeline_schema_versions" in sql:
-            self.response = (9,)
+            self.response = (11,)
         elif "current_setting" in sql:
             self.response = (("0.1", "on") if "enable_nestloop" in sql else ("0.1",))
         elif "set_config" in sql:

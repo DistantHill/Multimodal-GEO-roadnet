@@ -1,4 +1,4 @@
-"""Experiment-only algorithms preserve columnar identities and production defaults."""
+"""Registered algorithms preserve columnar identities and production defaults."""
 from dataclasses import fields, replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,7 +11,7 @@ from track.v2.candidates.hdbscan import run_hdbscan
 from track.v2.candidates.turn_event_relation import TurnEventRelation
 from track.v2.candidates.detect_cross_track_pairs import empty_cross_batch
 from track.v2.errors import ConfigError
-from track.v2.experiments.config import ExperimentDetectConfig, load_experiment_payload
+from track.v2.experiments.config import load_experiment_payload
 from track.v2.intersections import detect_intersections as detect
 from track.v2.config.pipeline_config_loader import load_pipeline_payload
 from .config_factory import intersect_config, runtime_config, detect_context
@@ -21,9 +21,26 @@ from track.v2.models import CrossCandidateBatch
 
 
 def experiment_config(**changes):
-    values = intersect_config().as_dict()
-    values.update(changes)
-    return ExperimentDetectConfig(**values)
+    import tomllib
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    values = tomllib.loads((root / "config/pipeline.toml").read_text())
+    cfg = values["detect"]
+    algorithm = changes.pop("turn_candidate_algorithm", "g_star")
+    cluster = changes.pop("clustering_algorithm", "dbscan")
+    cfg["candidates"] = [algorithm, "cross"]
+    cfg["cluster_algorithm"] = cluster
+    if cluster == "hdbscan":
+        import copy
+        cfg["cluster"][cluster] = copy.deepcopy(cfg["cluster"]["dbscan"])
+    for key, value in changes.items():
+        if key == "candidate_dbscan_eps_m":
+            cfg["cluster"][cluster]["params"]["eps_m"] = value
+        elif key == "candidate_dbscan_min_samples":
+            cfg["cluster"][cluster]["params"]["min_samples"] = value
+        else:
+            cfg["candidate"][algorithm]["params"]["default"][key] = value
+    return load_pipeline_payload(values, base_directory=root / "config", postgres_password="test").detect
 
 
 def assert_batch_equal(actual, expected):
@@ -42,9 +59,10 @@ def test_turn_threehold_strict_absolute_threshold_preserves_all_columns(tmp_path
         relation.seal()
         source = relation if on_disk else batch
         with patch.object(detect, "_compute_getis_ord_g_star", side_effect=AssertionError("G* called")):
-            actual = detect._select_hotspot_events(source, cfg)
+            params = cfg.candidate["turn_threehold"].params["default"]
+            actual = select_turn_threehold_events(source, params)
         assert_batch_equal(actual, batch.take(np.asarray([3, 4, 5])))
-        assert_batch_equal(select_turn_threehold_events(source, replace(cfg, min_turn_deg=89.)),
+        assert_batch_equal(select_turn_threehold_events(source, replace(params, min_turn_deg=89.)),
                            batch.take(np.asarray([5])))
         assert len(source) == 6
 
@@ -78,10 +96,13 @@ def test_joint_clustering_and_ablation_use_selected_algorithm(algorithm):
     crosses = _batch(CrossCandidateBatch, 2, calculation_index=np.asarray([70, 71]),
                      xy=np.asarray([[2., 0.], [3., 0.]]), from_source_id=np.asarray(["a", "a"]),
                      to_source_id=np.asarray(["b", "b"]))
-    cfg = replace(experiment_config(turn_candidate_algorithm="turn_threehold", clustering_algorithm=algorithm),
+    cfg = experiment_config(turn_candidate_algorithm="turn_threehold", clustering_algorithm=algorithm,
                   candidate_dbscan_eps_m=10., candidate_dbscan_min_samples=4)
     with patch.object(detect, "_compute_getis_ord_g_star", side_effect=AssertionError("G* called")):
-        selected, clusters = detect._cluster_pipeline(turns, crosses, TRANSFORMER, cfg)
+        selected = select_turn_threehold_events(turns, cfg.candidate["turn_threehold"].params["default"])
+        sources = (("turn", selected), ("orthogonal_cross_track", crosses))
+        clusters = detect._build_candidate_clusters(sources, cfg, TRANSFORMER)
+        clusters = detect._annotate_source_ablation(clusters, sources, cfg, TRANSFORMER)
     assert_batch_equal(selected, turns)
     assert len(clusters) == 1
     cluster = clusters[0]
@@ -103,8 +124,8 @@ def test_runtime_preserves_experiment_options_and_parent_refine_context(tmp_path
         assert detect.detect_intersections(config=cfg, context=detect_context(refine_id="r"),
             conn=object(), refine_reader=reader, runtime=runtime_config(), data_root=tmp_path) == "result"
     runtime_cfg = run.call_args.args[1]
-    assert runtime_cfg.turn_candidate_algorithm == "turn_threehold"
-    assert runtime_cfg.clustering_algorithm == "hdbscan"
+    assert runtime_cfg.candidates == ("turn_threehold", "cross")
+    assert runtime_cfg.cluster_algorithm == "hdbscan"
     assert run.call_args.args[2] == CONTEXT
 
 
@@ -117,11 +138,11 @@ def test_regular_pipeline_rejects_experimental_switches(tmp_path, switch, value)
     base["detect"][switch] = value
     with pytest.raises(ConfigError, match="unknown key"):
         load_pipeline_payload(base, base_directory=root / "config", postgres_password="test")
-    experiment = load_experiment_payload(base, base_directory=root / "config", postgres_password="test")
-    assert getattr(experiment.detect, switch) == value
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_experiment_payload(base, base_directory=root / "config", postgres_password="test")
 
 
 @pytest.mark.parametrize("switch,value", [("turn_candidate_algorithm", "typo"), ("clustering_algorithm", "typo")])
 def test_experiment_rejects_unknown_algorithms(switch, value):
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         experiment_config(**{switch: value})

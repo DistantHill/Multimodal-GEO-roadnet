@@ -237,6 +237,9 @@ class WriterRelation:
 
     def collect_sources(self, result, pending, crossing_ids, candidate_ids):
         from ..detect_intersections import _batches
+        self._plugin_results = tuple(getattr(result, "candidate_results", ()))
+        self._source_kinds = {item.source_key: "cross" if item.evidence_kind == "orthogonal_cross_track" else "turn"
+                              for item in self._plugin_results}
         annotation_order=sum(self.counts[:2])
         for consumer, events in ((0,result.turn_events),(1,result.cross_track_candidates)):
             with _closing_optional(_batches(events)) as iterator:
@@ -337,6 +340,7 @@ class WriterRelation:
         """, ())
 
     def prepare_annotations(self, clusters, candidate_ids, hotspots):
+        self._source_kinds = getattr(self, "_source_kinds", {})
         connection=self._require_open()
         if not self._resolved: raise RuntimeError("writer relation is not resolved")
         if self._annotations_prepared: raise RuntimeError("writer annotations are already prepared")
@@ -348,11 +352,16 @@ class WriterRelation:
                 if members is None: continue
                 for start in range(0,len(members),self._batch_size):
                     stop=min(start+self._batch_size,len(members)); size=stop-start
-                    self._insert_registered({"kind":np.where(members.kind[start:stop]=="orthogonal_cross_track","cross",members.kind[start:stop]),"calculation_index":members.calculation_index[start:stop],"encounter":np.arange(encounter,encounter+size,dtype=np.int64),"candidate_id":np.full(size,candidate_ids[cluster.cluster_calculate_index],dtype=np.int64)},"INSERT INTO members SELECT * FROM {relation} ORDER BY encounter")
+                    self._insert_registered({"kind":np.asarray([self._source_kinds.get(str(kind), "cross" if kind == "orthogonal_cross_track" else str(kind)) for kind in members.kind[start:stop]]),"calculation_index":members.calculation_index[start:stop],"encounter":np.arange(encounter,encounter+size,dtype=np.int64),"candidate_id":np.full(size,candidate_ids[cluster.cluster_calculate_index],dtype=np.int64)},"INSERT INTO members SELECT * FROM {relation} ORDER BY encounter")
                     encounter+=size
-            for start in range(0,len(hotspots),self._batch_size):
-                stop=min(start+self._batch_size,len(hotspots))
-                self._insert_registered({"calculation_index":hotspots.calculation_index[start:stop],"input_ordinal":np.arange(start,stop,dtype=np.int64),"z":np.where(np.isnan(hotspots.g_star_z[start:stop]),0.0,hotspots.g_star_z[start:stop]),"nan":np.isnan(hotspots.g_star_z[start:stop]),"valid":hotspots.g_star_z_valid[start:stop]},"INSERT INTO hotspots SELECT calculation_index,input_ordinal,CASE WHEN NOT valid THEN NULL WHEN nan THEN 'NaN'::DOUBLE ELSE z END FROM {relation} ORDER BY input_ordinal")
+            from ..detect_intersections import _batches
+            input_offset = 0
+            with _closing_optional(_batches(hotspots)) as hotspot_batches:
+                for hotspots in hotspot_batches:
+                    for start in range(0,len(hotspots),self._batch_size):
+                        stop=min(start+self._batch_size,len(hotspots))
+                        self._insert_registered({"calculation_index":hotspots.calculation_index[start:stop],"input_ordinal":np.arange(input_offset+start,input_offset+stop,dtype=np.int64),"z":np.where(np.isnan(hotspots.g_star_z[start:stop]),0.0,hotspots.g_star_z[start:stop]),"nan":np.isnan(hotspots.g_star_z[start:stop]),"valid":hotspots.g_star_z_valid[start:stop]},"INSERT INTO hotspots SELECT calculation_index,input_ordinal,CASE WHEN NOT valid THEN NULL WHEN nan THEN 'NaN'::DOUBLE ELSE z END FROM {relation} ORDER BY input_ordinal")
+                    input_offset += len(hotspots)
             conflict = connection.execute("""
                 SELECT calculation_index FROM (
                     SELECT calculation_index,encounter,candidate_id,
@@ -497,21 +506,28 @@ class WriterRelation:
             raise RuntimeError("writer annotations are not prepared")
         connection.execute("DELETE FROM validated_cross")
         self._validate_final_inputs(connection, 1)
-        invalid = connection.execute("""
-            WITH pairs AS (
-                SELECT least(s0.resolved_id,s1.resolved_id) low_id,
-                       greatest(s0.resolved_id,s1.resolved_id) high_id
-                FROM cross_raw r
-                JOIN resolved_sources s0
-                  ON s0.consumer=1 AND s0.ordinal=r.ordinal AND s0.endpoint=0
-                JOIN resolved_sources s1
-                  ON s1.consumer=1 AND s1.ordinal=r.ordinal AND s1.endpoint=1
-            )
-            SELECT 1 FROM pairs GROUP BY low_id,high_id
-            HAVING low_id=high_id OR count(*)>1 LIMIT 1
-        """).fetchone()
-        if invalid is not None:
-            raise ValueError("duplicate/degenerate track cross segment pair")
+        ranges = [(item.evidence_offset, item.evidence_offset + len(item.events))
+                  for item in getattr(self, "_plugin_results", ())
+                  if item.evidence_kind == "orthogonal_cross_track"]
+        if not ranges:
+            ranges = [(0, self.counts[1])]
+        for start, stop in ranges:
+            invalid = connection.execute("""
+                WITH pairs AS (
+                    SELECT least(s0.resolved_id,s1.resolved_id) low_id,
+                           greatest(s0.resolved_id,s1.resolved_id) high_id
+                    FROM cross_raw r
+                    JOIN resolved_sources s0
+                      ON s0.consumer=1 AND s0.ordinal=r.ordinal AND s0.endpoint=0
+                    JOIN resolved_sources s1
+                      ON s1.consumer=1 AND s1.ordinal=r.ordinal AND s1.endpoint=1
+                    WHERE r.ordinal >= ? AND r.ordinal < ?
+                )
+                SELECT 1 FROM pairs GROUP BY low_id,high_id
+                HAVING low_id=high_id OR count(*)>1 LIMIT 1
+            """, (start, stop)).fetchone()
+            if invalid is not None:
+                raise ValueError("duplicate/degenerate track cross segment pair")
         connection.execute("BEGIN TRANSACTION")
         try:
             connection.execute("""
@@ -542,6 +558,21 @@ class WriterRelation:
             SELECT detect_id,candidate_id,low_resolved_id,high_resolved_id,x,y,lon,lat
             FROM validated_cross ORDER BY ordinal
         """, ())
+
+    def _identity_for_ordinal(self, kind, ordinal):
+        for item in getattr(self, "_plugin_results", ()):
+            evidence = "cross" if item.evidence_kind == "orthogonal_cross_track" else "turn"
+            rows = item.events if item.events is not None else item.candidates
+            if evidence == kind and item.evidence_offset <= ordinal < item.evidence_offset + len(rows):
+                return item.algorithm_id, item.instance_id, ordinal - item.evidence_offset, ordinal
+        if getattr(self, "_plugin_results", ()):
+            raise ValueError("missing algorithm instance identity for persisted evidence")
+        return None, None, None, None
+
+    def with_instance_identity(self, kind, rows):
+        with _closing_optional(rows) as iterator:
+            for ordinal, row in enumerate(iterator):
+                yield (*row, *self._identity_for_ordinal(kind, ordinal))
 
     def _require_detect_id(self, detect_id: str) -> None:
         if detect_id != self._detect_id:

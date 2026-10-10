@@ -1,66 +1,94 @@
-# turn_threehold 与 HDBSCAN 实验
+# turn_threehold 多实例与聚类实验
 
-这两个算法仅由实验工作台配置加载，不注册到常规 Pipeline TOML。
-常规 Detect 继续使用局部热点统计量（G*）筛选和 DBSCAN 聚类。
+Detect 的普通 Pipeline 与实验工作台使用同一插件配置。候选算法在自己的参数表中
+组织具名实例；顶层选择算法，`output_instances` 选择参与联合聚类的实例。
+现有默认 Pipeline 保持 G* 与 cross，角度筛选需在配置中显式选择。
 
-## 配置与运行
+## 配置
 
-在现有实验 TOML 中新增命名方案，选中所需方案后运行原有实验命令：
+以下是现有完整配置中 Detect 算法部分的示例，其他公共 Detect 参数仍保留在
+`[detect]`；每组实例参数必须完整填写，不做实例间继承。
 
 ```toml
-[schemes.turn_threehold.detect]
-turn_candidate_algorithm = "turn_threehold"
-clustering_algorithm = "dbscan"
-min_turn_deg = 45.0
+[detect]
+candidates = ["turn_threehold", "cross"]
+cluster_algorithm = "dbscan"
 
-[schemes.turn_threehold_hdbscan.detect]
-turn_candidate_algorithm = "turn_threehold"
-clustering_algorithm = "hdbscan"
-min_turn_deg = 45.0
+[detect.candidate.turn_threehold]
+output_instances = ["turn_30"]
+
+[detect.candidate.turn_threehold.params.turn_30]
+turn_window = 3
+min_turn_deg = 30.0
+max_turn_deg = 150.0
+min_leg_m = 5.0
+min_movement_speed_mps = 1.0
+
+[detect.candidate.turn_threehold.params.turn_60]
+turn_window = 3
+min_turn_deg = 60.0
+max_turn_deg = 150.0
+min_leg_m = 5.0
+min_movement_speed_mps = 1.0
+
+[detect.cluster.dbscan.params]
+eps_m = 20.0
+min_samples = 3
 ```
+
+示例值用于说明配置结构，不是调优结论。cross 的完整参数保留在它自己的
+`[detect.candidate.cross.params.<实例名>]` 中，并用自己的 `output_instances` 选择。
+`cluster_algorithm` 为选择键，`detect.cluster` 为参数表，避免 TOML 同名标量与表冲突。
+
+## 独立评测与联合运行
 
 ```sh
-make -C /data/workspace/Multimodal-GEO-roadnet pipeline-experiment ARGS='run --scheme turn_threehold'
-make -C /data/workspace/Multimodal-GEO-roadnet pipeline-experiment ARGS='run --scheme turn_threehold_hdbscan --refine-id REFINE_UUID'
+make pipeline-experiment ARGS='run --scheme turn_threehold --independent-instances'
+make pipeline-experiment ARGS='run --scheme turn_threehold --refine-id REFINE_UUID'
 ```
 
-默认使用现有案例和基础参数，包括跨轨迹开关。需要仅测试转向候选时，在方案中添加
-`use_cross_track_candidates = false`。也可以在实验 TOML 的 `[detect]` 设置算法作为
-各方案的共同默认值；普通 Pipeline 配置会拒绝这两个实验参数。
+方案名称以实际实验配置为准。`--independent-instances` 依次运行选中算法的全部
+具名参数实例，每次仅使用一个实例单独聚类、归档和评价；不会生成参数笛卡尔积。
+普通运行只拼接各算法 `output_instances` 指定的候选，再统一聚类。同一源事件
+来自不同算法或实例时保留多行，各自贡献密度，并保存各自的来源身份。
 
-省略实验算法参数时，默认 `turn_candidate_algorithm="g_star"`、
-`clustering_algorithm="dbscan"`。HDBSCAN 也可与原 G* 筛选组合对比。
+turn_threehold 保留已有窗口、最小轨迹长度、速度与最大转向角条件，最终严格筛选
+`abs(turn_deg) > min_turn_deg`。只改变最小角度的兼容实例共用最宽阈值提取，再筛选
+各自子集；其他提取参数不同则分组计算。独立评测批次也共享候选提取，每个实例
+仍分别聚类。共享结果仅在本批次存活，正常结束或异常时统一释放。
 
-## 输入与筛选
+切换 HDBSCAN 时设 `cluster_algorithm = "hdbscan"`，并配置
+`[detect.cluster.hdbscan.params]` 的 `eps_m`、`min_samples`。其中 `eps_m` 表示
+簇合并阈值，DBSCAN 中则为邻域半径；两者结果不保证相同。容器依赖锁文件包含
+scikit-learn，更新后需要重建 Pipeline 镜像。
 
-实验继续从已完成的 Refine Run 读取列式轨迹数据，复用其坐标参考系、保留点与注入点。
-显式指定 `--refine-id` 时仍检查输入案例、源数据和 Refine 参数是否一致。
-相同输入与 Refine 参数的多个实验方案在同批次共享 Refine。
+## 插件与存储
 
-turn_threehold 保留已有转向事件提取的窗口、最小轨迹长度、速度和最大转向角条件，
-随后直接筛选 `abs(turn_deg) > min_turn_deg`，不计算 G*。`min_turn_deg` 即 n，
-45° 为示例；左右转都保留，等于阈值的点被剔除。筛选保持列式字段、事件索引、
-来源引用与顺序，`g_star_z` 及其有效性标记不会被改写。
+在专用候选或聚类插件包内新增模块，导出 `PLUGIN` 描述对象即可被发现，无需维护
+中央算法名称清单。描述声明稳定算法 ID、无默认值的参数数据类、点类型及执行函数。
+算法 ID 与 Python 函数名称独立；重复 ID、未知算法、未知参数及不支持的数据类型
+在运行前报错。当前仅接入 `candidate_points`，片段输出另行适配下游。
 
-## 聚类与输出
+数据库结构 v11 为候选证据及几何镜像保留算法、实例、实例局部编号与证据编号，
+`detect_candidate_instances` 保存每次运行各实例的有效参数、数量及偏移。
+实验归档保留选择与独立评测归属，供后续界面使用。本次不实现实例切换界面、
+Top N 排名高亮或自动晋级；将来 Top N 可生成同一个 `output_instances` 接口。
 
-转向候选和跨轨迹候选继续合并后联合聚类。HDBSCAN 与 DBSCAN 使用相同坐标输入、
-标签格式和簇组装逻辑，返回相同的成员引用、来源计数、来源比例、中心和半径结构。
-来源消融分析的重新聚类也使用所选算法，后续拓扑验证、持久化、Parquet 导出和评价
-复用实验工作台流程。参数快照与配置摘要包含算法选择，历史恢复保留这些选择。
+## 迁移
 
-HDBSCAN 使用 scikit-learn 实现，依据
-[官方接口](https://scikit-learn.org/stable/modules/generated/sklearn.cluster.HDBSCAN.html)
-映射现有参数：
+旧扁平 Detect 参数不再作为普通运行格式。历史快照原样保存，显式恢复转换：
 
-| 参数 | HDBSCAN 含义 |
-| --- | --- |
-| `candidate_dbscan_eps_m` | `cluster_selection_epsilon`，单位米的簇合并阈值 |
-| `candidate_dbscan_min_samples` | `min_samples`，包含点本身；同时设置 `min_cluster_size=max(2, min_samples)` |
+```sh
+make pipeline-experiment ARGS='restore EXPERIMENT_UUID --output /data/experiments/restored.toml --migrate-detect'
+```
 
-允许单簇结果，采用欧氏距离和单任务计算。非有限坐标及不足最小簇大小的输入标为
-噪声 `-1`；有效簇按首个成员出现顺序编号为 `0, 1, …`。同一输入顺序和参数下重复
-运行结果稳定。输入输出结构兼容不意味着两种算法产生相同的簇；HDBSCAN 的
-`eps_m` 是簇合并阈值，而 DBSCAN 使用它作为邻域半径。
+缺失旧算法身份时，可补充 `--legacy-turn-algorithm` 和
+`--legacy-cluster-algorithm`；无法补齐必填参数会明确报错。
 
-安装更新后的依赖或重建 Pipeline 镜像后运行实验，新增依赖为 scikit-learn。
+部署前先备份数据库，并通过已有显式迁移入口升级旧结构：
+
+```sh
+docker compose --env-file .env -f infra/docker/compose.dev.yml run --rm pipeline python -m pipeline init-db --migrate-artifacts
+```
+
+本次仅在隔离且回滚的 PostgreSQL 测试中验证迁移，没有升级运行数据库。

@@ -20,8 +20,6 @@ from ..candidates.detect_turn_events import empty_turn_batch, concatenate_turn_b
 from ..candidates.detect_cross_track_pairs import empty_cross_batch
 from ..candidates.detect_grid_crossings import run_grid_cross_track_task
 from ..candidates.dbscan_index import ActiveGridLinks, index_typecode
-from ..candidates.turn_threehold import select_turn_threehold_events
-from ..candidates.hdbscan import run_hdbscan as _run_hdbscan
 from ..telemetry.console_logging import log_info
 from ..telemetry.heartbeat import heartbeat_progress, operation_heartbeat
 from .performance_timing import PerfTracker
@@ -35,60 +33,9 @@ def _perf_iter(perf, iterable, *, name, total=None, track=True):
 _NOISE=-1
 _UNVISITED=-2
 
-@dataclass(frozen=True)
-class IntersectConfig(TrackModel):
-    """Detect configuration for turn and cross-track detection.
-
-    PRD v2 Detect §7
-    """
-
-    # ── Mode toggles ───────────────────────────────────────────────
-    use_turn_events: bool
-    use_cross_track_candidates: bool
-
-    # ── Turn event detection (Method 1) ────────────────────────────
-    turn_window: int
-    min_turn_deg: float
-    max_turn_deg: float
-    min_leg_m: float
-    min_movement_speed_mps: float
-
-    # ── Getis-Ord G* hotspot scoring ───────────────────────────────
-    g_star_radius_m: float
-    g_star_min_z: float
-
-    # ── DBSCAN (all candidate points together) ────────────────────
-    candidate_dbscan_eps_m: float
-    candidate_dbscan_min_samples: int
-
-    # ── Cross-track orthogonal detection (Method 3) ──────────────────
-    cross_track_min_avg_speed: float
-    cross_track_straightness_deg: float
-    cross_track_min_angle_deg: float
-    cross_track_max_angle_deg: float
-    # Structural memory bounds owned by candidates.build_patches.
-    cross_track_grid_cell_m: float
-    cross_track_pair_batch_size: int
-    cross_track_max_grid_cells_per_segment: int
-
-    # ── Ablation centroid matching ────────────────────────────────
-    merge_centroid_distance_m: float
-
-    # ── Topology verification (shared) ─────────────────────────────
-    min_intersection_radius_m: float
-    topology_radius_padding_m: float
-    branch_threshold_deg: float
-    min_branches: int
-    min_observations: int
-    min_directed_transitions: int
-    bearing_window: int
-
-    # ── Spatial sliding window (DB mode) ───────────────────────────
-    spatial_window_size: tuple[float, float]
-    spatial_window_overlap: float
-    stream_batch_size: int
-    cross_track_task_grid_m: float
-    cross_track_task_threads: int
+from ..config.detect_config import DetectConfig as IntersectConfig
+from ..plugins.execution import CandidateResult, CompositeRelation, execute_candidates
+from ..plugins.discovery import cluster_plugins
 
 
 @dataclass(frozen=True)
@@ -111,23 +58,25 @@ class _IntersectRunConfig(IntersectConfig):
     source_table: str | None
     refine_id: str | None
     live_status: Any
-    # Experiment-only options; not fields of the regular Pipeline config.
-    turn_candidate_algorithm: str = "g_star"
-    clustering_algorithm: str = "dbscan"
 
 
 @dataclass(frozen=True)
 class IntersectResult(TrackModel):
-    turn_events: TurnBatch | TurnEventRelation
-    hotspot_events: TurnBatch
+    turn_events: TurnBatch | TurnEventRelation | CompositeRelation
+    hotspot_events: TurnBatch | CompositeRelation
     clusters: list[HotspotCluster]
     topologies: list[IntersectionTopology]
     report: IntersectReport
     spatial_context: SpatialContext
     observations: list[ObservationBatch] = field(default_factory=list)
-    cross_track_candidates: CrossCandidateBatch | CrossCandidateRelation = field(default_factory=empty_cross_batch)
+    cross_track_candidates: CrossCandidateBatch | CrossCandidateRelation | CompositeRelation = field(default_factory=empty_cross_batch)
+
+    candidate_results: tuple[CandidateResult, ...] = ()
+    execution_resources: Any = field(default=None, repr=False, compare=False)
 
     def close(self):
+        if self.execution_resources is not None:
+            self.execution_resources.close()
         try:
             close=getattr(self.turn_events,"close",None)
             if close: close()
@@ -212,8 +161,6 @@ def _compute_getis_ord_g_star(events, radius_m, **_kwargs):
 
 
 def _select_hotspot_events(events,cfg,**kwargs):
-    if getattr(cfg,"turn_candidate_algorithm","g_star") == "turn_threehold":
-        return select_turn_threehold_events(events,cfg,**kwargs)
     scores=_compute_getis_ord_g_star(events,cfg.g_star_radius_m,**kwargs)
     pieces=[]
     for batch in _batches(events):
@@ -233,8 +180,9 @@ def _cluster_hdbscan(events,transformer,*,eps_m,min_samples,source="turn",**kwar
 
 def _cluster_density(events,transformer,*,eps_m,min_samples,source="turn",clustering_algorithm="dbscan",**kwargs):
     xy,indices,sources=_coordinates(events)
-    runner = _run_hdbscan if clustering_algorithm == "hdbscan" else _run_dbscan
-    labels=np.asarray(runner(xy[:,0],xy[:,1],eps_m=eps_m,min_samples=min_samples,**kwargs),dtype=np.int64)
+    plugin = cluster_plugins()[clustering_algorithm]
+    params = plugin.params_type(eps_m=eps_m, min_samples=min_samples)
+    labels=np.asarray(plugin.run(xy[:,0],xy[:,1],params=params,**kwargs),dtype=np.int64)
     clusters=[]
     for cid in np.unique(labels[labels>=0]):
         positions=np.flatnonzero(labels==cid)
@@ -294,7 +242,7 @@ def _merge_clusters(clusters,merge_distance_m,transformer,**_kwargs):
     return kept
 
 
-def _cluster_from_points(point_sources,transformer,*,eps_m,min_samples,clustering_algorithm="dbscan",**kwargs):
+def _cluster_from_points(point_sources,transformer,*,eps_m=None,min_samples=None,clustering_algorithm="dbscan",cluster_params=None,**kwargs):
     """Jointly cluster all enabled sources, preserving membership identities."""
     point_sources=tuple((kind,events) for kind,events in point_sources if len(events))
     total=sum(len(events) for _,events in point_sources)
@@ -313,12 +261,13 @@ def _cluster_from_points(point_sources,transformer,*,eps_m,min_samples,clusterin
         calculation_indices[offset:stop]=source_indices
         point_source_ids[offset:stop]=from_source_ids
         point_kinds[offset:stop]=kind
-        if hasattr(events,"iter_source_batches") or hasattr(events,"to_source_id"):
+        if getattr(events,"supports_secondary_sources",hasattr(events,"iter_source_batches") or hasattr(events,"to_source_id")):
             secondary_sources.append((events,calculation_indices[offset:stop],offset))
         offset=stop
     del source_xy,source_indices,from_source_ids
-    runner = _run_hdbscan if clustering_algorithm == "hdbscan" else _run_dbscan
-    labels=np.asarray(runner(xy[:,0],xy[:,1],eps_m=eps_m,min_samples=min_samples,**kwargs),dtype=np.int64)
+    plugin = cluster_plugins()[clustering_algorithm]
+    params = cluster_params if cluster_params is not None else plugin.params_type(eps_m=eps_m, min_samples=min_samples)
+    labels=np.asarray(plugin.run(xy[:,0],xy[:,1],params=params,**kwargs),dtype=np.int64)
     secondary_ids=defaultdict(set)
     for events,expected_indices,offset in secondary_sources:
         batches=events.iter_source_batches() if hasattr(events,"iter_source_batches") else ((events.calculation_index,events.from_source_id,events.to_source_id),)
@@ -355,7 +304,7 @@ def _cluster_from_points(point_sources,transformer,*,eps_m,min_samples,clusterin
 
 def _build_candidate_clusters(point_sources,cfg,transformer,*,disabled_sources=None,**kwargs):
     disabled=disabled_sources or set()
-    return _cluster_from_points(((kind,events) for kind,events in point_sources if kind not in disabled),transformer,eps_m=cfg.candidate_dbscan_eps_m,min_samples=cfg.candidate_dbscan_min_samples,clustering_algorithm=getattr(cfg,"clustering_algorithm","dbscan"),**kwargs)
+    return _cluster_from_points(((kind,events) for kind,events in point_sources if kind not in disabled),transformer,clustering_algorithm=cfg.cluster_algorithm,cluster_params=cfg.cluster[cfg.cluster_algorithm].params,**kwargs)
 
 
 def _annotate_source_ablation(clusters,point_sources,cfg,transformer,**kwargs):
@@ -369,14 +318,6 @@ def _annotate_source_ablation(clusters,point_sources,cfg,transformer,**kwargs):
         without[source]=np.asarray([(item.centroid_x,item.centroid_y) for item in rebuilt],dtype=np.float64).reshape(-1,2)
         del rebuilt
     return [replace(cluster,critical_sources=tuple(source for source in cluster.algorithm_sources if not any(math.hypot(cluster.centroid_x-other[0],cluster.centroid_y-other[1])<=cfg.merge_centroid_distance_m for other in without[source]))) for cluster in clusters]
-
-
-def _cluster_pipeline(turn_events,cross_candidates,transformer,cfg,**kwargs):
-    hotspot=_select_hotspot_events(turn_events,cfg,**kwargs) if cfg.use_turn_events and len(turn_events) else empty_turn_batch()
-    point_sources=(("turn",hotspot),("orthogonal_cross_track",cross_candidates))
-    clusters=_build_candidate_clusters(point_sources,cfg,transformer,**kwargs)
-    clusters=[replace(cluster,cluster_calculate_index=i) for i,cluster in enumerate(clusters)]
-    return hotspot,_annotate_source_ablation(clusters,point_sources,cfg,transformer,**kwargs)
 
 
 def _ratio_dict(counts):
@@ -398,62 +339,99 @@ def _empty_intersect_result(spatial_context):
     return IntersectResult(empty_turn_batch(),empty_turn_batch(),[],[],_build_intersect_report([],[],empty_turn_batch(),empty_turn_batch(),empty_cross_batch(),track_count=0),spatial_context)
 
 
-def _detect_intersections_db(conn,cfg,spatial_context,*,runtime,data_root,refine_reader=None,connect_worker=None):
-    if refine_reader is None:
-        raise V2Error("formal DB Detect requires a columnar reader")
-    if refine_reader.extent() is None:
-        return _empty_intersect_result(spatial_context)
-    with ExitStack() as cleanup:
-        event_store = TurnEventRelation(runtime, data_root)
-        cleanup.callback(event_store.close)
-        candidate_store = None
-        if cfg.use_cross_track_candidates:
-            candidate_store = CrossCandidateRelation(runtime, data_root)
-            cleanup.callback(candidate_store.close)
-        result = _run_columnar_db_detect(cfg,spatial_context,refine_reader,event_store=event_store,candidate_store=candidate_store,conn=conn,refine_id=cfg.refine_id,connect_worker=connect_worker,runtime=runtime,data_root=data_root)
-        # The result owns both relations after successful computation.
-        cleanup.pop_all()
-        return result
+class _CandidateExecutionContext:
+    def __init__(self, cfg, spatial_context, reader, *, runtime, data_root, conn, refine_id, connect_worker):
+        self.cfg = cfg
+        self.spatial_context = spatial_context
+        self.transformer = CoordinateTransformer(spatial_context)
+        self.reader = reader
+        self.runtime = runtime
+        self.data_root = data_root
+        self.conn = conn
+        self.refine_id = refine_id
+        self.connect_worker = connect_worker
+        self.resources = ExitStack()
 
+    def own(self, relation):
+        self.resources.callback(relation.close)
+        return relation
 
-def _run_columnar_db_detect(cfg,spatial_context,refine_reader,*,runtime,data_root,event_store=None,candidate_store=None,conn=None,refine_id=None,connect_worker=None):
-    transformer=CoordinateTransformer(spatial_context)
-    if refine_reader.extent() is None: return _empty_intersect_result(spatial_context)
-    turn_started = time.perf_counter()
-    live = cfg.live_status
-    with operation_heartbeat(
-        "Detect：转向事件检测",
-        emit=(lambda message: live.update(detail=message, elapsed=time.perf_counter()-turn_started)) if live is not None else None,
-    ):
-        batches = refine_reader.iter_turn_candidates(
-            cfg.source_table or cfg.db_table, cfg, batch_size=cfg.stream_batch_size,
-        ) if cfg.use_turn_events else ()
-        collected = [] if event_store is None else None
-        turn_count = 0
+    def read_turn_events(self, params):
+        if self.reader.extent() is None:
+            return empty_turn_batch()
+        relation = self.own(TurnEventRelation(self.runtime, self.data_root))
+        started = time.perf_counter()
+        live = getattr(self.cfg, "live_status", None)
+        with operation_heartbeat("Detect：转向事件检测", emit=(lambda message: live.update(detail=message, elapsed=time.perf_counter()-started)) if live is not None else None):
+            batches = self.reader.iter_turn_candidates(self.cfg.source_table or self.cfg.db_table, params, batch_size=self.cfg.stream_batch_size)
+            try:
+                for batch in batches:
+                    relation.append_batch(batch)
+                    heartbeat_progress(len(relation), unit="转向事件")
+            finally:
+                close = getattr(batches, "close", None)
+                if close:
+                    close()
+        relation.seal()
+        return relation
+
+    def filter_turn_events(self, events, predicate):
+        if not len(events):
+            return empty_turn_batch()
+        relation = self.own(TurnEventRelation(self.runtime, self.data_root))
+        batches = _batches(events)
+        count = 0
         try:
             for batch in batches:
-                if event_store is None:
-                    collected.append(batch)
-                else:
-                    event_store.append_batch(batch)
-                turn_count += len(batch)
-                heartbeat_progress(turn_count, unit="转向事件")
+                selected = batch.take(np.flatnonzero(predicate(batch)))
+                selected = replace(selected, calculation_index=np.arange(count, count + len(selected), dtype=np.int64))
+                relation.append_batch(selected)
+                count += len(selected)
         finally:
-            close = getattr(batches, "close", None)
-            if close is not None:
-                close()
-        if event_store is None:
-            turns = concatenate_turn_batches(collected)
-        else:
-            event_store.seal()
-            turns = event_store
-    crosses=empty_cross_batch()
-    if cfg.use_cross_track_candidates:
-        if conn is None or refine_id is None or connect_worker is None: raise V2Error("formal DB cross-track requires connection, refine_id, and worker connector")
-        crosses=run_grid_cross_track_task(refine_id,refine_reader.extent(),spatial_context,transformer,cfg,connect_worker=connect_worker,grid_cell_size_m=cfg.cross_track_task_grid_m,thread_count=cfg.cross_track_task_threads,max_segments=200_000,max_segment_bytes=268_435_456,max_grid_memberships=2_000_000,max_overflow_pair_space=20_000_000,max_candidates=500_000,max_result_bytes=536_870_912,candidate_store=candidate_store,live_status=cfg.live_status,runtime=runtime,data_root=data_root)
-    hotspot,clusters=_cluster_pipeline(turns,crosses,transformer,cfg)
-    topologies,clusters,observations=_build_topologies_from_reader(clusters,cfg,transformer,refine_reader=refine_reader)
-    return IntersectResult(turns,hotspot,clusters,topologies,_build_intersect_report(clusters,topologies,turns,hotspot,crosses,track_count=refine_reader.track_count()),spatial_context,observations,crosses)
+            batches.close()
+        relation.seal()
+        return relation
+
+    def select_gstar(self, events, params):
+        return _select_hotspot_events(events, params, live_status=getattr(self.cfg,"live_status",None))
+
+    def run_cross(self, params):
+        if self.reader.extent() is None:
+            return empty_cross_batch()
+        if self.conn is None or self.refine_id is None or self.connect_worker is None:
+            raise V2Error("formal DB cross-track requires connection, refine_id, and worker connector")
+        relation = self.own(CrossCandidateRelation(self.runtime, self.data_root))
+        return run_grid_cross_track_task(self.refine_id,self.reader.extent(),self.spatial_context,self.transformer,params,connect_worker=self.connect_worker,grid_cell_size_m=params.cross_track_task_grid_m,thread_count=params.cross_track_task_threads,max_segments=200_000,max_segment_bytes=268_435_456,max_grid_memberships=2_000_000,max_overflow_pair_space=20_000_000,max_candidates=500_000,max_result_bytes=536_870_912,candidate_store=relation,live_status=self.cfg.live_status,runtime=self.runtime,data_root=self.data_root,time_start=getattr(self.reader,"time_start",None),time_end=getattr(self.reader,"time_end",None))
+
+
+def _detect_intersections_db(conn,cfg,spatial_context,*,runtime,data_root,refine_reader=None,connect_worker=None,candidate_cache=None):
+    if refine_reader is None:
+        raise V2Error("formal DB Detect requires a columnar reader")
+    return _run_columnar_db_detect(cfg,spatial_context,refine_reader,conn=conn,refine_id=getattr(cfg,"refine_id",None),connect_worker=connect_worker,runtime=runtime,data_root=data_root,candidate_cache=candidate_cache)
+
+
+def _run_columnar_db_detect(cfg,spatial_context,refine_reader,*,runtime,data_root,event_store=None,candidate_store=None,conn=None,refine_id=None,connect_worker=None,candidate_cache=None):
+    transformer=CoordinateTransformer(spatial_context)
+    empty_input = refine_reader.extent() is None
+    execution = _CandidateExecutionContext(cfg,spatial_context,refine_reader,runtime=runtime,data_root=data_root,conn=conn,refine_id=refine_id,connect_worker=connect_worker)
+    try:
+        results = execute_candidates(cfg, execution, **({"candidate_cache": candidate_cache} if candidate_cache is not None else {}))
+        turns = CompositeRelation((item.events,item.evidence_offset) for item in results if item.evidence_kind == "turn")
+        hotspot = CompositeRelation((item.candidates,item.evidence_offset) for item in results if item.evidence_kind == "turn")
+        crosses = CompositeRelation((item.events,item.evidence_offset) for item in results if item.evidence_kind == "orthogonal_cross_track")
+        point_sources = tuple((item.source_key, CompositeRelation(((item.candidates,item.evidence_offset),))) for item in results)
+        clusters = _build_candidate_clusters(point_sources,cfg,transformer)
+        clusters = _annotate_source_ablation(clusters,point_sources,cfg,transformer)
+        topologies,clusters,observations=([],clusters,[]) if empty_input else _build_topologies_from_reader(clusters,cfg,transformer,refine_reader=refine_reader)
+        report = _build_intersect_report(clusters,topologies,turns,hotspot,crosses,track_count=0 if empty_input else refine_reader.track_count())
+        turn_sources = {item.source_key for item in results if item.evidence_kind == "turn"}
+        cross_sources = {item.source_key for item in results if item.evidence_kind == "orthogonal_cross_track"}
+        report = replace(report, cluster_count_turn=sum(bool(turn_sources.intersection(c.algorithm_sources)) for c in clusters), cluster_count_cross_track=sum(bool(cross_sources.intersection(c.algorithm_sources)) for c in clusters))
+        return IntersectResult(turns,hotspot,clusters,topologies,report,spatial_context,observations,crosses,results,execution.resources)
+    except BaseException:
+        execution.resources.close()
+        raise
+
 
 def detect_intersections(
     *,
@@ -465,10 +443,11 @@ def detect_intersections(
     refine_reader: RefineDatasetReader | None = None,
     runtime: RuntimeConfig,
     data_root: str | Path | None = None,
+    candidate_cache=None,
 ) -> IntersectResult:
     """Run Detect from one completed Refine Run and its columnar dataset."""
     cfg = _IntersectRunConfig(
-        **config.as_dict(),
+        **{item.name: getattr(config, item.name) for item in fields(IntersectConfig)},
         db_table=context.db_table,
         kept_table=context.kept_table,
         source_table=context.source_table,
@@ -507,7 +486,7 @@ def detect_intersections(
         raise V2Error("formal DB Detect requires runtime and data_root")
     return _detect_intersections_db(
         conn, cfg, refine.spatial_context, runtime=runtime, data_root=data_root,
-        refine_reader=refine_reader, connect_worker=connect_worker,
+        refine_reader=refine_reader, connect_worker=connect_worker, candidate_cache=candidate_cache,
     )
 
 def _neighbors_indices(

@@ -40,11 +40,15 @@ def load_completed_refine_ref(
     store: PipelineStore,
     refine_id: str,
     record: Any | None = None,
+    time_start: Any | None = None,
+    time_end: Any | None = None,
 ) -> RefineStageRef:
     record = store.get_refine_run(refine_id) if record is None else record
     if record.status != "completed":
         raise ValueError(f"Refine Run {refine_id} is not completed")
-    return RefineStageRef(refine_id, record.source_table, record.spatial_context)
+    from ..time_selection import validate_refine_time
+    start, end = validate_refine_time(store, record, time_start, time_end)
+    return RefineStageRef(refine_id, record.source_table, record.spatial_context, start, end)
 
 
 def run_refine_stage(

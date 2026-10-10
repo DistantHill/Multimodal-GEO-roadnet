@@ -73,7 +73,8 @@ def test_turn_rows_preserve_order_mapping_and_values_in_bounded_batches(monkeypa
         count = writer._insert_turn_events(
             SimpleNamespace(cursor=lambda: nullcontext(None)), 'd', ws, batch_size=batch_size,
         )
-    assert copied == [
+    assert all(row[-4:] == (None, None, None, None) for row in copied)
+    assert [row[:-4] for row in copied] == [
         ('d', None, 200, 0., 90., 90., .5, None),
         ('d', 42, 201, 1., 91., 90., 1.5, 2.5),
         ('d', None, 202, 2., 92., 90., 2.5, None),
