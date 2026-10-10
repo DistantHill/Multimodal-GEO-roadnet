@@ -20,11 +20,11 @@ def convert_legacy_detect(raw: dict[str, Any], *, turn_algorithm: str, cluster_a
     Legacy algorithm choice lived outside Detect in experimental plans, so callers
     must provide that choice explicitly; conversion does not guess it.
     """
-    if turn_algorithm not in {"g_star", "turn_threehold", "turn_angle"}:
+    if turn_algorithm not in {"g_star", "turn_threshold", "turn_angle"}:
         raise ConfigError(f"cannot convert legacy turn algorithm: {turn_algorithm}")
     if cluster_algorithm not in {"dbscan", "hdbscan"}:
         raise ConfigError(f"cannot convert legacy clustering algorithm: {cluster_algorithm}")
-    turn_algorithm = "turn_threehold" if turn_algorithm == "turn_angle" else turn_algorithm
+    turn_algorithm = "turn_threshold" if turn_algorithm == "turn_angle" else turn_algorithm
     required = {"use_turn_events", "use_cross_track_candidates", "candidate_dbscan_eps_m", "candidate_dbscan_min_samples", *GSTAR_FIELDS, *CROSS_FIELDS}
     missing = required - raw.keys()
     if missing:

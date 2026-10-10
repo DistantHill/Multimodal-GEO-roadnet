@@ -1,4 +1,4 @@
-"""turn_threehold: select turn candidates by angle without computing Getis-Ord G*."""
+"""turn_threshold: select turn candidates by angle without computing Getis-Ord G*."""
 from __future__ import annotations
 
 import math
@@ -9,15 +9,15 @@ from ..telemetry.heartbeat import operation_heartbeat
 from .detect_turn_events import concatenate_turn_batches
 
 
-def select_turn_threehold_events(events, cfg, **_kwargs) -> TurnBatch:
+def select_turn_threshold_events(events, cfg, **_kwargs) -> TurnBatch:
     """Keep abs(turn_deg) > min_turn_deg in original order and retain provenance."""
     threshold = cfg.min_turn_deg
     if not math.isfinite(threshold) or not 0 <= threshold <= 180:
-        raise ValueError("turn_threehold min_turn_deg must be finite and within [0, 180]")
+        raise ValueError("turn_threshold min_turn_deg must be finite and within [0, 180]")
     batches = iter((events,)) if isinstance(events, TurnBatch) else events.iter_batches()
     pieces = []
     try:
-        with operation_heartbeat("turn_threehold：按转向角筛选"):
+        with operation_heartbeat("turn_threshold：按转向角筛选"):
             for batch in batches:
                 keep = np.flatnonzero(np.abs(batch.turn_deg) > threshold)
                 if len(keep):

@@ -10,21 +10,21 @@ from track.v2.experiments import runner
 def test_named_algorithms_share_refine_and_have_distinct_snapshots(tmp_path, monkeypatch):
     original = workspace(tmp_path)
     payload = original.payload
-    payload["experiment"]["schemes"] = ["turn", "turn_threehold", "hdbscan"]
+    payload["experiment"]["schemes"] = ["turn", "turn_threshold", "hdbscan"]
     import copy
     angle = copy.deepcopy(payload["detect"])
-    angle["candidates"] = ["turn_threehold"]
+    angle["candidates"] = ["turn_threshold"]
     density = copy.deepcopy(angle)
     density["cluster_algorithm"] = "hdbscan"
     density["cluster"]["hdbscan"] = copy.deepcopy(density["cluster"]["dbscan"])
-    payload["schemes"]["turn_threehold"] = {"detect": angle}
+    payload["schemes"]["turn_threshold"] = {"detect": angle}
     payload["schemes"]["hdbscan"] = {"detect": density}
     text = toml_text(payload)
     assert tomllib.loads(text) == payload
     original.config_path.write_text(text)
     loaded = load_workspace(original.config_path, password="test")
     assert loaded.configs["turn"].detect.candidates == ("g_star",)
-    assert loaded.configs["turn_threehold"].detect.candidates == ("turn_threehold",)
+    assert loaded.configs["turn_threshold"].detect.candidates == ("turn_threshold",)
     assert loaded.configs["hdbscan"].detect.cluster_algorithm == "hdbscan"
     assert len({refine_key(loaded.case, cfg) for cfg in loaded.configs.values()}) == 1
     assert len({cfg.snapshot_parameters()["config_digest"] for cfg in loaded.configs.values()}) == 3

@@ -19,12 +19,12 @@ def load(raw):
 
 def test_multiple_instances_and_unselected_algorithm_are_preserved():
     raw = payload()
-    table = raw["detect"]["candidate"]["turn_threehold"]
+    table = raw["detect"]["candidate"]["turn_threshold"]
     table["params"]["strict"] = {**table["params"]["default"], "min_turn_deg": 60.0}
     config = load(raw).detect
     assert config.candidates == ("g_star", "cross")
-    assert config.candidate["turn_threehold"].output_instances == ("default",)
-    assert config.candidate["turn_threehold"].params["strict"].min_turn_deg == 60.0
+    assert config.candidate["turn_threshold"].output_instances == ("default",)
+    assert config.candidate["turn_threshold"].params["strict"].min_turn_deg == 60.0
 
 @pytest.mark.parametrize("change,match", [
     (lambda d: d.update(candidates=[]), "candidates"),

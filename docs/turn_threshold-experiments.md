@@ -1,4 +1,4 @@
-# turn_threehold 多实例与聚类实验
+# turn_threshold 多实例与聚类实验
 
 Detect 的普通 Pipeline 与实验工作台使用同一插件配置。候选算法在自己的参数表中
 组织具名实例；顶层选择算法，`output_instances` 选择参与联合聚类的实例。
@@ -11,20 +11,20 @@ Detect 的普通 Pipeline 与实验工作台使用同一插件配置。候选算
 
 ```toml
 [detect]
-candidates = ["turn_threehold", "cross"]
+candidates = ["turn_threshold", "cross"]
 cluster_algorithm = "dbscan"
 
-[detect.candidate.turn_threehold]
+[detect.candidate.turn_threshold]
 output_instances = ["turn_30"]
 
-[detect.candidate.turn_threehold.params.turn_30]
+[detect.candidate.turn_threshold.params.turn_30]
 turn_window = 3
 min_turn_deg = 30.0
 max_turn_deg = 150.0
 min_leg_m = 5.0
 min_movement_speed_mps = 1.0
 
-[detect.candidate.turn_threehold.params.turn_60]
+[detect.candidate.turn_threshold.params.turn_60]
 turn_window = 3
 min_turn_deg = 60.0
 max_turn_deg = 150.0
@@ -43,8 +43,8 @@ min_samples = 3
 ## 独立评测与联合运行
 
 ```sh
-make pipeline-experiment ARGS='run --scheme turn_threehold --independent-instances'
-make pipeline-experiment ARGS='run --scheme turn_threehold --refine-id REFINE_UUID'
+make pipeline-experiment ARGS='run --scheme turn_threshold --independent-instances'
+make pipeline-experiment ARGS='run --scheme turn_threshold --refine-id REFINE_UUID'
 ```
 
 方案名称以实际实验配置为准。`--independent-instances` 依次运行选中算法的全部
@@ -52,7 +52,7 @@ make pipeline-experiment ARGS='run --scheme turn_threehold --refine-id REFINE_UU
 普通运行只拼接各算法 `output_instances` 指定的候选，再统一聚类。同一源事件
 来自不同算法或实例时保留多行，各自贡献密度，并保存各自的来源身份。
 
-turn_threehold 保留已有窗口、最小轨迹长度、速度与最大转向角条件，最终严格筛选
+turn_threshold 保留已有窗口、最小轨迹长度、速度与最大转向角条件，最终严格筛选
 `abs(turn_deg) > min_turn_deg`。只改变最小角度的兼容实例共用最宽阈值提取，再筛选
 各自子集；其他提取参数不同则分组计算。独立评测批次也共享候选提取，每个实例
 仍分别聚类。共享结果仅在本批次存活，正常结束或异常时统一释放。

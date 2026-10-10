@@ -112,7 +112,7 @@ class ExperimentCase:
 def load_case(name: str, raw: dict[str, Any], base: Path) -> ExperimentCase:
     if not isinstance(raw, dict):
         raise ValueError(f"case {name}: expected table")
-    allowed = {"source_table", "time_start", "time_end", "region_file", "bbox", "truth_file"}
+    allowed = {"source_table", "time_start", "time_end", "region_file", "region_layer", "region_id", "bbox", "truth_file"}
     if set(raw) - allowed:
         raise ValueError(f"case {name}: unknown keys {sorted(set(raw) - allowed)}")
     source = raw.get("source_table")
@@ -133,8 +133,24 @@ def load_case(name: str, raw: dict[str, Any], base: Path) -> ExperimentCase:
         if not isinstance(region_value, str):
             raise ValueError(f"case {name}: region_file must be a path string")
         region_file = (base / region_value).resolve()
-        geometry = polygon_geometry(json.loads(region_file.read_text(encoding="utf-8")))
+        if region_file.suffix.lower() == ".gpkg":
+            from .intersection_hpo.labels import load_polygon_file
+            layer = raw.get("region_layer")
+            region_id = raw.get("region_id")
+            if region_id is None:
+                raise ValueError(f"case {name}: GPKG region_file requires region_id")
+            features, _ = load_polygon_file(region_file, layer=layer)
+            selected = [feature for feature in features if feature["id"] == str(region_id)]
+            if len(selected) != 1:
+                raise ValueError(f"case {name}: region_id must identify exactly one GPKG polygon")
+            geometry = polygon_geometry(selected[0])
+        else:
+            if raw.get("region_layer") is not None or raw.get("region_id") is not None:
+                raise ValueError(f"case {name}: region_layer/region_id require a GPKG region_file")
+            geometry = polygon_geometry(json.loads(region_file.read_text(encoding="utf-8")))
     else:
+        if raw.get("region_layer") is not None or raw.get("region_id") is not None:
+            raise ValueError(f"case {name}: region_layer/region_id require a GPKG region_file")
         from shapely.geometry import box, mapping
         corners = bbox_value
         if not isinstance(corners, list) or len(corners) != 2 or any(not isinstance(p, list) or len(p) != 2 for p in corners):

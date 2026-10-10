@@ -1,0 +1,51 @@
+# Copy to the runtime data directory and replace the dataset paths/identifiers.
+# experiment_config uses the existing experiment workspace format. Its selected
+# scheme must declare only turn_threshold with one output instance; baseline
+# below must equal that instance's min_turn_deg. Production defaults stay separate.
+[hpo]
+experiment_config = "/data/roadnet/experiments/intersection-workspace.toml"
+scheme = "turn_threshold"
+# Direct GPKG inputs; GeoJSON regions remain supported as well.
+labels_file = "/data/roadnet/experiments/labeled_intersections.gpkg"
+labels_layer = "labeled_intersections"
+labels_id_field = "fid"
+regions_file = "/data/roadnet/experiments/reviewed-regions.gpkg"
+regions_layer = "regions"
+# Optional separately supplied negative polygons, never added to truth labels.
+# negative_regions_file = "/data/roadnet/experiments/negative-regions.gpkg"
+# negative_regions_layer = "negative_regions"
+output_root = "/data/roadnet/experiments/hpo/turn-threshold-v1"
+seed = 42
+# REQUIRED placeholders intentionally fail validation until actual values exist.
+label_version = "REQUIRED_REVIEWED_LABEL_VERSION"
+trajectory_snapshot = "REQUIRED_IMMUTABLE_SOURCE_SNAPSHOT_OR_DIGEST"
+threshold_min = 15.0
+threshold_max = 90.0
+baseline = 45.0
+# Counts are indivisible manually drawn regions, not individual intersections.
+# Actual tune regions must supply at least these counts; L3 uses all tune regions.
+l1_positive_count = 2
+l2_positive_count = 4
+l2_negative_count = 2
+
+[search]
+trial_budget = 60
+pilot_count = 12
+promotion_top_k = 5
+exploration_slots = 1
+recall_slots = 1
+# Illustrative explicit policy; calibrate on this dataset before accepting it.
+l1_recall_slack = 0.15
+l1_density_limit = 10000.0
+min_l2_l3_spearman = 0.5
+
+# Region metadata may be stored in the GPKG attributes or here by feature ID.
+# For separate negative GPKG, keys use "negative:<fid>" and kind="negative".
+# Each workspace case supports region_file=.gpkg + region_layer + region_id.
+# Replace examples with actual cases/groups and complete manual review status.
+# [region_metadata."1"]
+# case = "roi_1"
+# spatial_group = "group_1"
+# split = "tune"
+# kind = "positive"
+# reviewed_complete = true

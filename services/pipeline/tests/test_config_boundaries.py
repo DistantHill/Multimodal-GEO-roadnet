@@ -60,6 +60,7 @@ REMOVED_ENVIRONMENT_KEYS = {
     "ROADNET_DIFF_DSN",
 }
 EXPERIMENT_ENTRYPOINT = PIPELINE_ROOT / "src/track/v2/cli/experiment.py"
+HPO_ENTRYPOINT = PIPELINE_ROOT / "src/track/v2/experiments/intersection_hpo/__main__.py"
 
 REMOVED_CLI_OPTIONS = {
     "--config",
@@ -166,7 +167,9 @@ def test_removed_configuration_cli_options_do_not_return() -> None:
                 continue
             option = node.args[0]
             if isinstance(option, ast.Constant) and option.value in REMOVED_CLI_OPTIONS:
-                if path == EXPERIMENT_ENTRYPOINT and option.value == "--config":
+                # Experiment coordinators select one external workspace file;
+                # production per-setting CLI overrides remain prohibited.
+                if path in {EXPERIMENT_ENTRYPOINT, HPO_ENTRYPOINT} and option.value == "--config":
                     continue
                 violations.append(
                     f"{path.relative_to(REPOSITORY_ROOT)}:{node.lineno} {option.value}"

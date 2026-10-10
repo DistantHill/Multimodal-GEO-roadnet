@@ -1,13 +1,13 @@
 """Existing G* turn candidate selection, independently evaluated per instance."""
 from dataclasses import dataclass
 import math
-from .turn_threehold import TurnThreeholdParams
+from .turn_threshold import TurnThresholdParams
 from ..plugins.core import CandidatePlugin
 from ..plugins.execution import CandidateResult
 
 
 @dataclass(frozen=True)
-class GStarParams(TurnThreeholdParams):
+class GStarParams(TurnThresholdParams):
     g_star_radius_m: float
     g_star_min_z: float
 

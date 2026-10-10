@@ -48,7 +48,7 @@ def intersect_config(**changes: Any):
     common.update({key: value for key, value in changes.items() if key in common})
     flat.update({key: value for key, value in changes.items() if key not in common})
     candidate = dict(common["candidate"])
-    for identity in ("g_star", "turn_threehold", "cross"):
+    for identity in ("g_star", "turn_threshold", "cross"):
         algorithm = candidate[identity]
         params = algorithm.params["default"]
         overrides = {item.name: flat[item.name] for item in fields(params) if item.name in flat}

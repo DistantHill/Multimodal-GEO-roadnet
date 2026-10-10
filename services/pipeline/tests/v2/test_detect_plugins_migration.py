@@ -47,15 +47,15 @@ def test_same_source_is_retained_per_instance_and_identity_is_unique(connection)
     import psycopg
     conn = connection
     detect = seed_detect(conn)
-    first = add_turn(conn, detect, "turn_threehold", "turn_30", 0, 0)
-    second = add_turn(conn, detect, "turn_threehold", "turn_60", 0, 1)
+    first = add_turn(conn, detect, "turn_threshold", "turn_30", 0, 0)
+    second = add_turn(conn, detect, "turn_threshold", "turn_60", 0, 1)
     assert first != second
     with pytest.raises(psycopg.errors.UniqueViolation):
         with conn.transaction():
-            add_turn(conn, detect, "turn_threehold", "turn_30", 0, 0)
+            add_turn(conn, detect, "turn_threshold", "turn_30", 0, 0)
     with pytest.raises(psycopg.errors.CheckViolation):
         with conn.transaction():
-            add_turn(conn, detect, "turn_threehold", None, 1, 2)
+            add_turn(conn, detect, "turn_threshold", None, 1, 2)
     add_turn(conn, detect)
     with pytest.raises(psycopg.errors.UniqueViolation):
         with conn.transaction():
@@ -81,6 +81,6 @@ def test_v10_migration_preserves_old_rows_and_allows_new_instance_rows(connectio
         migrate_detect_plugins_v11(cur)
     assert conn.execute("SELECT version FROM pipeline_schema_versions WHERE component='track.v2'").fetchone() == (11,)
     assert conn.execute("SELECT algorithm_id,instance_id,local_candidate_id,evidence_index FROM turn_events WHERE id=%s", (old,)).fetchone() == (None,None,None,None)
-    add_turn(conn, detect, "turn_threehold", "turn_30", 0, 0)
-    add_turn(conn, detect, "turn_threehold", "turn_60", 0, 1)
+    add_turn(conn, detect, "turn_threshold", "turn_30", 0, 0)
+    add_turn(conn, detect, "turn_threshold", "turn_60", 0, 1)
     assert conn.execute("SELECT count(*) FROM turn_events WHERE detect_id=%s", (detect,)).fetchone() == (3,)

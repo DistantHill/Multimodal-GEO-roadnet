@@ -149,6 +149,13 @@ class MakePipelineCommandsTest(unittest.TestCase):
         self.assertIn("PIPELINE_GIT_COMMIT=", result.stdout)
         self.assertIn('experiment --config "/data/experiments/experiment.toml" run --scheme turn', result.stdout)
 
+    def test_hpo_uses_external_config_without_starting_full_pipeline(self):
+        result = self.dry_run("pipeline-hpo", "ARGS=audit", "HPO_CONFIG_PATH=/data/experiments/custom.toml")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PIPELINE_GIT_COMMIT=", result.stdout)
+        self.assertIn('track.v2.experiments.intersection_hpo --config "/data/experiments/custom.toml" audit', result.stdout)
+        self.assertNotIn("pipeline run", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

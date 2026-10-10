@@ -225,7 +225,7 @@ def run_batch(workspace: ExperimentWorkspace, *, explicit_refine_id: str | None 
             write_manifest(run_root / "manifest.json", record)
             write_manifest(run_root / "region.geojson", {"type": "Feature", "geometry": workspace.case.geometry, "properties": {}})
             if workspace.case.region_file:
-                (run_root / "region-source.geojson").write_bytes(workspace.case.region_file.read_bytes())
+                (run_root / ("region-source" + workspace.case.region_file.suffix)).write_bytes(workspace.case.region_file.read_bytes())
             if workspace.case.truth_file:
                 (run_root / "truth.geojson").write_bytes(workspace.case.truth_file.read_bytes())
             init_logger(config.logging.directory)

@@ -105,6 +105,11 @@ EXPERIMENT_DRAFT_USER = $(if $(filter init restore,$(firstword $(ARGS))),--user 
 pipeline-experiment:
 	$(COMPOSE_DEV) run --rm $(EXPERIMENT_DRAFT_USER) -e PIPELINE_GIT_COMMIT="$(PIPELINE_GIT_COMMIT)" pipeline python -m pipeline experiment --config "$(EXPERIMENT_CONFIG_PATH)" $(ARGS)
 
+.PHONY: pipeline-hpo
+HPO_CONFIG_PATH ?= /data/experiments/intersection-hpo.toml
+pipeline-hpo:
+	$(COMPOSE_DEV) run --rm -e PIPELINE_GIT_COMMIT="$(PIPELINE_GIT_COMMIT)" pipeline python -m track.v2.experiments.intersection_hpo --config "$(HPO_CONFIG_PATH)" $(ARGS)
+
 vision-build:
 	$(COMPOSE_DEV) --profile vision build vision
 

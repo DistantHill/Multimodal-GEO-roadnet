@@ -7,7 +7,7 @@ from ..plugins.execution import CandidateResult, FilteredTurnRelation
 
 
 @dataclass(frozen=True)
-class TurnThreeholdParams:
+class TurnThresholdParams:
     turn_window: int
     min_turn_deg: float
     max_turn_deg: float
@@ -42,8 +42,8 @@ def run(context, params, requested_instances):
             threshold = params[name].min_turn_deg
             events = parent if name == broadest else context.filter_turn_events(parent, lambda batch, threshold=threshold: np.abs(batch.turn_deg) >= threshold)
             candidates = FilteredTurnRelation(events, threshold)
-            results[name] = CandidateResult("turn_threehold", name, "turn", candidates, events, params[name])
+            results[name] = CandidateResult("turn_threshold", name, "turn", candidates, events, params[name])
     return results
 
 
-PLUGIN = CandidatePlugin("turn_threehold", TurnThreeholdParams, "candidate_points", run)
+PLUGIN = CandidatePlugin("turn_threshold", TurnThresholdParams, "candidate_points", run)

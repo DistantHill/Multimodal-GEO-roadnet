@@ -257,6 +257,8 @@ make dev-down
 `make test` 会运行 Backend 与 Pipeline 的 pytest 套件。提交或性能报告必须列出实际执行的验证命令和结果，并逐项说明已知失败；不要用来源仓库或“legacy 基线”笼统替代当前验证状态。
 ## 交叉口实验评价入口
 
+单参数 `turn_threshold` 分层调参使用 `make pipeline-hpo`，支持 GeoPackage 标注、固定区域、Pilot 校准及 PostgreSQL 实验存档。配置与执行顺序见 [转角阈值分层调参](docs/intersection-hpo.md) 。
+
 实验入口管理仓库外单份 TOML、命名案例、批量参数方案和实验历史。`ARGS` 是传给实验命令的参数：`init` 初始化、`run` 运行、`list` 查看历史。下面的命令可在任意目录执行，查看历史且不启动算法：
 
 ```sh

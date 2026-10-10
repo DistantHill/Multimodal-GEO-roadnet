@@ -5,7 +5,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from track.v2.candidate_plugins.turn_threehold import TurnThreeholdParams, run
+from track.v2.candidate_plugins.turn_threshold import TurnThresholdParams, run
 from track.v2.plugins.execution import CandidateResult, CompositeRelation, execute_candidates
 from track.v2.plugins.core import CandidatePlugin
 from track.v2.intersections.detect_intersections import _CandidateExecutionContext
@@ -15,7 +15,7 @@ from .writer_relation_helpers import turn_batch
 
 
 def parameters(threshold, window=1):
-    return TurnThreeholdParams(window, threshold, 179., 1., 0.)
+    return TurnThresholdParams(window, threshold, 179., 1., 0.)
 
 
 class Reader:
@@ -97,7 +97,7 @@ def test_executor_requests_only_selected_instances_in_algorithm_and_instance_ord
         def execute(ctx, params, requested):
             calls.append((identity, requested, tuple(params)))
             return {name: CandidateResult(identity, name, "turn", batch, batch, params[name]) for name in reversed(requested)}
-        return CandidatePlugin(identity, TurnThreeholdParams, "candidate_points", execute)
+        return CandidatePlugin(identity, TurnThresholdParams, "candidate_points", execute)
     config = SimpleNamespace(candidates=("b", "a"), candidate={"a": SimpleNamespace(params={"one": parameters(30.), "unused": parameters(60.)}, output_instances=("one",)), "b": SimpleNamespace(params={"low": parameters(30.), "high": parameters(60.)}, output_instances=("high", "low"))})
     with patch("track.v2.plugins.execution.candidate_plugins", return_value={name: plugin(name) for name in ("a", "b")}):
         results = execute_candidates(config, object())
@@ -118,7 +118,7 @@ def test_executor_does_not_continue_after_plugin_failure():
     def later(*args):
         calls.append("later")
     config = SimpleNamespace(candidates=("first", "second"), candidate={name: SimpleNamespace(params={"one": parameters(30.)}, output_instances=("one",)) for name in ("first", "second")})
-    with patch("track.v2.plugins.execution.candidate_plugins", return_value={"first": CandidatePlugin("first", TurnThreeholdParams, "candidate_points", fail), "second": CandidatePlugin("second", TurnThreeholdParams, "candidate_points", later)}):
+    with patch("track.v2.plugins.execution.candidate_plugins", return_value={"first": CandidatePlugin("first", TurnThresholdParams, "candidate_points", fail), "second": CandidatePlugin("second", TurnThresholdParams, "candidate_points", later)}):
         with pytest.raises(ValueError, match="failed candidate"):
             execute_candidates(config, object())
     assert calls == ["fail"]
@@ -133,12 +133,12 @@ def test_independent_detect_instances_share_batch_extraction_and_close_after_bat
     reader.descriptor = SimpleNamespace(refine_id="refine")
     definitions = {"low": parameters(30.), "high": parameters(60.)}
     contexts = []
-    with DetectExecutionCache({"turn_threehold": ("low", "high")}) as cache:
+    with DetectExecutionCache({"turn_threshold": ("low", "high")}) as cache:
         for selected in ("low", "high"):
             execution = context(tmp_path, reader)
             execution.refine_id = "refine"
             contexts.append(execution)
-            config = SimpleNamespace(candidates=("turn_threehold",), candidate={"turn_threehold": CandidateAlgorithmConfig((selected,), definitions)})
+            config = SimpleNamespace(candidates=("turn_threshold",), candidate={"turn_threshold": CandidateAlgorithmConfig((selected,), definitions)})
             results = execute_candidates(config, execution, candidate_cache=cache)
             assert len(results) == 1 and results[0].instance_id == selected
             expected = batch.take(np.flatnonzero(np.abs(angles) > definitions[selected].min_turn_deg))
@@ -163,11 +163,11 @@ def test_batch_candidate_cache_does_not_reuse_other_time_selection(tmp_path):
     reader = Reader(turn_batch(2, turn_deg=angles, score=np.abs(angles)))
     reader.descriptor = SimpleNamespace(refine_id="refine")
     definitions = {"one": parameters(30.)}
-    with DetectExecutionCache({"turn_threehold": ("one",)}) as cache:
+    with DetectExecutionCache({"turn_threshold": ("one",)}) as cache:
         for start in ("first", "second"):
             reader.time_start = start
             execution = context(tmp_path, reader)
-            config = SimpleNamespace(candidates=("turn_threehold",), candidate={"turn_threehold": CandidateAlgorithmConfig(("one",), definitions)})
+            config = SimpleNamespace(candidates=("turn_threshold",), candidate={"turn_threshold": CandidateAlgorithmConfig(("one",), definitions)})
             execute_candidates(config, execution, candidate_cache=cache)
             execution.resources.close()
         assert len(reader.calls) == 2

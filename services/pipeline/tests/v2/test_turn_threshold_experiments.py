@@ -6,7 +6,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from track.v2.candidates.turn_threehold import select_turn_threehold_events
+from track.v2.candidates.turn_threshold import select_turn_threshold_events
 from track.v2.candidates.hdbscan import run_hdbscan
 from track.v2.candidates.turn_event_relation import TurnEventRelation
 from track.v2.candidates.detect_cross_track_pairs import empty_cross_batch
@@ -49,20 +49,20 @@ def assert_batch_equal(actual, expected):
 
 
 @pytest.mark.parametrize("on_disk", [False, True])
-def test_turn_threehold_strict_absolute_threshold_preserves_all_columns(tmp_path, on_disk):
+def test_turn_threshold_strict_absolute_threshold_preserves_all_columns(tmp_path, on_disk):
     angles = np.asarray([44., 45., -45., 46., -46., 90.])
     batch = turn_batch(6, turn_deg=angles, score=np.abs(angles),
                        g_star_z_valid=np.zeros(6, dtype=np.bool_))
-    cfg = experiment_config(turn_candidate_algorithm="turn_threehold", min_turn_deg=45.)
+    cfg = experiment_config(turn_candidate_algorithm="turn_threshold", min_turn_deg=45.)
     with TurnEventRelation(runtime_config(), tmp_path, batch_size=2) as relation:
         relation.append_batch(batch)
         relation.seal()
         source = relation if on_disk else batch
         with patch.object(detect, "_compute_getis_ord_g_star", side_effect=AssertionError("G* called")):
-            params = cfg.candidate["turn_threehold"].params["default"]
-            actual = select_turn_threehold_events(source, params)
+            params = cfg.candidate["turn_threshold"].params["default"]
+            actual = select_turn_threshold_events(source, params)
         assert_batch_equal(actual, batch.take(np.asarray([3, 4, 5])))
-        assert_batch_equal(select_turn_threehold_events(source, replace(params, min_turn_deg=89.)),
+        assert_batch_equal(select_turn_threshold_events(source, replace(params, min_turn_deg=89.)),
                            batch.take(np.asarray([5])))
         assert len(source) == 6
 
@@ -96,10 +96,10 @@ def test_joint_clustering_and_ablation_use_selected_algorithm(algorithm):
     crosses = _batch(CrossCandidateBatch, 2, calculation_index=np.asarray([70, 71]),
                      xy=np.asarray([[2., 0.], [3., 0.]]), from_source_id=np.asarray(["a", "a"]),
                      to_source_id=np.asarray(["b", "b"]))
-    cfg = experiment_config(turn_candidate_algorithm="turn_threehold", clustering_algorithm=algorithm,
+    cfg = experiment_config(turn_candidate_algorithm="turn_threshold", clustering_algorithm=algorithm,
                   candidate_dbscan_eps_m=10., candidate_dbscan_min_samples=4)
     with patch.object(detect, "_compute_getis_ord_g_star", side_effect=AssertionError("G* called")):
-        selected = select_turn_threehold_events(turns, cfg.candidate["turn_threehold"].params["default"])
+        selected = select_turn_threshold_events(turns, cfg.candidate["turn_threshold"].params["default"])
         sources = (("turn", selected), ("orthogonal_cross_track", crosses))
         clusters = detect._build_candidate_clusters(sources, cfg, TRANSFORMER)
         clusters = detect._annotate_source_ablation(clusters, sources, cfg, TRANSFORMER)
@@ -114,7 +114,7 @@ def test_joint_clustering_and_ablation_use_selected_algorithm(algorithm):
 
 
 def test_runtime_preserves_experiment_options_and_parent_refine_context(tmp_path):
-    cfg = experiment_config(turn_candidate_algorithm="turn_threehold", clustering_algorithm="hdbscan")
+    cfg = experiment_config(turn_candidate_algorithm="turn_threshold", clustering_algorithm="hdbscan")
     parent = SimpleNamespace(refine_id="r", source_table="trajectory_points", status="completed", spatial_context=CONTEXT)
     reader = SimpleNamespace(descriptor=SimpleNamespace(refine_id="r"))
     with (
@@ -124,12 +124,12 @@ def test_runtime_preserves_experiment_options_and_parent_refine_context(tmp_path
         assert detect.detect_intersections(config=cfg, context=detect_context(refine_id="r"),
             conn=object(), refine_reader=reader, runtime=runtime_config(), data_root=tmp_path) == "result"
     runtime_cfg = run.call_args.args[1]
-    assert runtime_cfg.candidates == ("turn_threehold", "cross")
+    assert runtime_cfg.candidates == ("turn_threshold", "cross")
     assert runtime_cfg.cluster_algorithm == "hdbscan"
     assert run.call_args.args[2] == CONTEXT
 
 
-@pytest.mark.parametrize("switch,value", [("turn_candidate_algorithm", "turn_threehold"), ("clustering_algorithm", "hdbscan")])
+@pytest.mark.parametrize("switch,value", [("turn_candidate_algorithm", "turn_threshold"), ("clustering_algorithm", "hdbscan")])
 def test_regular_pipeline_rejects_experimental_switches(tmp_path, switch, value):
     import tomllib
     from pathlib import Path

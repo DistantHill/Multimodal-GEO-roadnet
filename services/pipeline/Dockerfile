@@ -29,7 +29,7 @@ FROM python:3.12-slim AS runtime
 USER root
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
-        ca-certificates curl gzip libexpat1 tar \
+        ca-certificates curl gdal-bin gzip libexpat1 tar \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Codex into the image so it is available without installing it at runtime.

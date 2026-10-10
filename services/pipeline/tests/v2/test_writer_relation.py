@@ -563,8 +563,8 @@ def test_plugin_instance_sources_keep_duplicate_turns_and_cluster_assignments(tm
     from track.v2.plugins.execution import CandidateResult, CompositeRelation
     events = _turns([0])
     params = None
-    first = CandidateResult('turn_threehold', 'low', 'turn', events, events, params, 0)
-    second = CandidateResult('turn_threehold', 'high', 'turn', events, events, params, 1)
+    first = CandidateResult('turn_threshold', 'low', 'turn', events, events, params, 0)
+    second = CandidateResult('turn_threshold', 'high', 'turn', events, events, params, 1)
     with _relation(tmp_path) as relation:
         relation.collect_sources(NS(turn_events=CompositeRelation(((events, 0), (events, 1))),
             cross_track_candidates=_crosses([]), candidate_results=(first, second)), [], {}, {})
@@ -576,7 +576,7 @@ def test_plugin_instance_sources_keep_duplicate_turns_and_cluster_assignments(tm
         rows = list(relation.with_instance_identity('turn', relation.iter_rows(0, 'detect')))
     assert len(rows) == 2
     assert [row[1] for row in rows] == [10, 20]
-    assert [row[-4:] for row in rows] == [('turn_threehold', 'low', 0, 0), ('turn_threehold', 'high', 0, 1)]
+    assert [row[-4:] for row in rows] == [('turn_threshold', 'low', 0, 0), ('turn_threshold', 'high', 0, 1)]
 
 
 def test_plugin_instances_allow_same_cross_pair_but_reject_duplicate_within_instance(tmp_path):

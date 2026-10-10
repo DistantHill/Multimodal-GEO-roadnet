@@ -5,7 +5,7 @@
 状态：已确认（实施完成，待用户验收）
 创建日期：2026-10-09
 更新日期：2026-10-10
-算法命名：转向角阈值筛选算法统一称为 `turn_threehold`；附录 QA 保留当时原文中的旧名称。
+算法命名：转向角阈值筛选算法统一称为 `turn_threshold`；附录 QA 保留当时原文中的旧名称。
 访谈进度：Q1–Q19 已收答，当前范围与关键行为已收敛；Q20 全文设计已确认，用户授权三个 gpt-6.1-sol / medium 子代理实施。
 
 ## 1. 背景与问题
@@ -20,11 +20,11 @@
 
 2026-10-10 新核查：
 - Refine reader 先从完整输入形成窗口和转向角，再按最小角度筛选；同输入与其他提取参数、只改变最小角度时，较严格阈值结果是较宽阈值结果的子集。
-- turn_threehold 最终边界为 abs(turn_deg) > min_turn_deg；不能改为 >=。
+- turn_threshold 最终边界为 abs(turn_deg) > min_turn_deg；不能改为 >=。
 - SQL 在筛选后生成 calculation_index，独立计算与从父集合筛选的行编号可能不同；来源引用与实例局部编号应分离。
 - 当前评价针对 Detect 最终交叉口，支持 precision/recall/f1 等；尚无按算法实例归组的排名接口，历史列表是分页的。Top N 不能靠排序当前列表页实现。
 
-依据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/results/read_parquet.py:320](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/results/read_parquet.py:320) ； [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/turn_threehold.py:22](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/turn_threehold.py:22) ； [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/pipeline/experiments/archive.py:150](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/pipeline/experiments/archive.py:150) 。
+依据： [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/results/read_parquet.py:320](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/trajectories/results/read_parquet.py:320) ； [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/turn_threshold.py:22](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/track/v2/candidates/turn_threshold.py:22) ； [/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/pipeline/experiments/archive.py:150](/data/workspace/Multimodal-GEO-roadnet/services/pipeline/src/pipeline/experiments/archive.py:150) 。
 
 ## 2. 目标与非目标
 
@@ -44,7 +44,7 @@
 
 ## 3. 需求与使用场景
 
-顶层 candidates 选择算法，如 turn_threehold、cross；参数调优由算法层组织。turn_threehold 下 params 持有 turn_30、turn_60 等具名参数集合，不再把这些实例提升为 detect.candidate 下的顶层节点（Q17 批注 1、2）。
+顶层 candidates 选择算法，如 turn_threshold、cross；参数调优由算法层组织。turn_threshold 下 params 持有 turn_30、turn_60 等具名参数集合，不再把这些实例提升为 detect.candidate 下的顶层节点（Q17 批注 1、2）。
 用户在算法内部寻找独立聚类表现较好的参数，再按指标选 Top N 送入后续消融；不自动遍历所有算法参数的笛卡尔积（Q14、Q16）。
 
 前端目标：历史结果按算法组织，在详情地图上方显示该算法 1 至 n 个实例选项；点击显示对应参数结果；Top N 选项背景高亮。当前选中与 Top N 应可分别表达，具体样式尚未实现。排名指标、比较范围、同分/缺失评分规则尚未确认，不将示例 n=2 固化。
@@ -56,7 +56,7 @@
 Q17 更正此前 Q14 的 TOML 示例：
 - 保留“算法与参数实例分离”的概念。
 - 否定 [detect.candidate.turn_30] + plugin 的实例平铺表达。
-- 改为 [detect.candidate.turn_threehold] 下 params 中维护具名实例。
+- 改为 [detect.candidate.turn_threshold] 下 params 中维护具名实例。
 - 顶层 candidates 只包含算法 ID。
 
 有效执行语义：
@@ -75,16 +75,16 @@ Q20 已确认第 2–8 节完整设计并授权实施。未来界面和自动 To
 
 ```toml
 [detect]
-candidates = ["turn_threehold", "cross"]
+candidates = ["turn_threshold", "cross"]
 cluster_algorithm = "dbscan"
 
-[detect.candidate.turn_threehold]
+[detect.candidate.turn_threshold]
 output_instances = ["turn_30"]
 
-[detect.candidate.turn_threehold.params.turn_30]
+[detect.candidate.turn_threshold.params.turn_30]
 min_turn_deg = 30.0
 
-[detect.candidate.turn_threehold.params.turn_60]
+[detect.candidate.turn_threshold.params.turn_60]
 min_turn_deg = 60.0
 ```
 
@@ -95,7 +95,7 @@ output_instances 是必填的算法内部输出选择，引用本算法 params �
 
 建议接口：
 - 候选插件接收本算法参数实例集合、本次请求的实例集合与运行上下文，返回按实例索引的候选结果句柄。普通运行请求 output_instances；独立评测请求相应实例，各自聚类并关联参数与运行结果。
-- 插件可在内部制定共享提取和筛选计划；不让中央编排器硬编码 turn_threehold 等优化规则。
+- 插件可在内部制定共享提取和筛选计划；不让中央编排器硬编码 turn_threshold 等优化规则。
 - 结果保留算法 ID、实例 ID、实例局部候选 ID、底层来源引用与输入范围。
 - 统一输出声明 candidate_points；不支持的输出类型运行前报错，不自动转换。
 - 普通运行只导出 output_instances（Q19）；未选中的实例不进入聚类。插件内部只计算本次请求所需的结果及复用中间产物，不因 params 中有其他配置就运行无关实例。
@@ -142,7 +142,7 @@ Q20 已确认的具体验证：
 
 ## 8. 实施与验证计划
 
-已获实施授权，步骤为：算法/实例配置 → 注册发现与插件参数组接口 → 点结果适配 → turn_threehold 子集复用 → 既有评测与存储接入 → 回归。本次不改前端、不实现 Top N 或自动消融组合生成（Q16、Q18）。
+已获实施授权，步骤为：算法/实例配置 → 注册发现与插件参数组接口 → 点结果适配 → turn_threshold 子集复用 → 既有评测与存储接入 → 回归。本次不改前端、不实现 Top N 或自动消融组合生成（Q16、Q18）。
 按项目要求运行 make test 与隔离 PostgreSQL 集成测试；实际结果见本节实施验证记录。本次未启动冒烟或全量 Pipeline 数据运行。
 保存当前无关工作区变更，不自动清理或提交。
 
@@ -150,11 +150,11 @@ Q20 已确认的具体验证：
 
 - 已建立仓库内部候选与聚类注册表，限定专用包发现显式 `PLUGIN` 描述；参数类型与声明校验在执行前完成。
 - 已将普通与实验 Detect 配置统一为算法选择、算法内具名参数和 `output_instances`；当前 Pipeline 配置保留 G* 与 cross 的原有默认选择。
-- 已实现 turn_threehold 兼容参数组的最宽集合提取与子集筛选，联合运行及 `--independent-instances` 批次均复用提取；各实例单独聚类，批次结束或异常释放关系。
+- 已实现 turn_threshold 兼容参数组的最宽集合提取与子集筛选，联合运行及 `--independent-instances` 批次均复用提取；各实例单独聚类，批次结束或异常释放关系。
 - 已贯通算法/实例身份、参数快照、结果数量及证据偏移；结构 v11 支持跨实例同源证据多行，旧行身份保持空值。仅隔离数据库验证，未对运行数据库迁移。
 - 已支持旧实验快照显式 `restore --migrate-detect`，不修改历史快照；旧运行配置不再隐式兼容。
 - 已补齐已有 scikit-learn 声明对应的依赖锁文件及哈希，重建 Pipeline 测试镜像。
-- 前端实例切换、Top N 高亮与自动晋级未纳入本轮，使用说明见 [turn_threehold 实验](turn_threehold-experiments.md) 。
+- 前端实例切换、Top N 高亮与自动晋级未纳入本轮，使用说明见 [turn_threshold 实验](turn_threshold-experiments.md) 。
 
 ### 验证记录（2026-10-10）
 
@@ -175,7 +175,7 @@ Q20 已确认的具体验证：
 Q18=B、Q19=A 已确认；Q20 原文“确认设计，并开三个subagent gpt 6.1 sol Medium进行实施”同时确认设计并授权实施。按要求启动三个子代理，主代理集成审查；尚未完成验收。
 
 
-实现记录（2026-10-10）：TOML 不允许同名键同时是标量和子表，因此将聚类选择键修正为 cluster_algorithm，聚类参数仍在 [detect.cluster.<算法>.params]；仅修正配置语法表达，选择行为不变。候选角度算法在本轮开始前已由其他工作改名 turn_threehold，沿用当前仓库命名，不回退。
+实现记录（2026-10-10）：TOML 不允许同名键同时是标量和子表，因此将聚类选择键修正为 cluster_algorithm，聚类参数仍在 [detect.cluster.<算法>.params]；仅修正配置语法表达，选择行为不变。候选角度算法在本轮开始前已由其他工作改名 turn_threshold，沿用当前仓库命名，不回退。
 
 ## 附录：完整 QA 记录
 
