@@ -20,6 +20,8 @@ from ..candidates.detect_turn_events import empty_turn_batch, concatenate_turn_b
 from ..candidates.detect_cross_track_pairs import empty_cross_batch
 from ..candidates.detect_grid_crossings import run_grid_cross_track_task
 from ..candidates.dbscan_index import ActiveGridLinks, index_typecode
+from ..candidates.turn_threehold import select_turn_threehold_events
+from ..candidates.hdbscan import run_hdbscan as _run_hdbscan
 from ..telemetry.console_logging import log_info
 from ..telemetry.heartbeat import heartbeat_progress, operation_heartbeat
 from .performance_timing import PerfTracker
@@ -109,6 +111,9 @@ class _IntersectRunConfig(IntersectConfig):
     source_table: str | None
     refine_id: str | None
     live_status: Any
+    # Experiment-only options; not fields of the regular Pipeline config.
+    turn_candidate_algorithm: str = "g_star"
+    clustering_algorithm: str = "dbscan"
 
 
 @dataclass(frozen=True)
@@ -207,6 +212,8 @@ def _compute_getis_ord_g_star(events, radius_m, **_kwargs):
 
 
 def _select_hotspot_events(events,cfg,**kwargs):
+    if getattr(cfg,"turn_candidate_algorithm","g_star") == "turn_threehold":
+        return select_turn_threehold_events(events,cfg,**kwargs)
     scores=_compute_getis_ord_g_star(events,cfg.g_star_radius_m,**kwargs)
     pieces=[]
     for batch in _batches(events):
@@ -217,8 +224,17 @@ def _select_hotspot_events(events,cfg,**kwargs):
 
 
 def _cluster_dbscan(events,transformer,*,eps_m,min_samples,source="turn",**kwargs):
+    return _cluster_density(events,transformer,eps_m=eps_m,min_samples=min_samples,source=source,**kwargs)
+
+
+def _cluster_hdbscan(events,transformer,*,eps_m,min_samples,source="turn",**kwargs):
+    return _cluster_density(events,transformer,eps_m=eps_m,min_samples=min_samples,source=source,clustering_algorithm="hdbscan",**kwargs)
+
+
+def _cluster_density(events,transformer,*,eps_m,min_samples,source="turn",clustering_algorithm="dbscan",**kwargs):
     xy,indices,sources=_coordinates(events)
-    labels=np.asarray(_run_dbscan(xy[:,0],xy[:,1],eps_m=eps_m,min_samples=min_samples,**kwargs),dtype=np.int64)
+    runner = _run_hdbscan if clustering_algorithm == "hdbscan" else _run_dbscan
+    labels=np.asarray(runner(xy[:,0],xy[:,1],eps_m=eps_m,min_samples=min_samples,**kwargs),dtype=np.int64)
     clusters=[]
     for cid in np.unique(labels[labels>=0]):
         positions=np.flatnonzero(labels==cid)
@@ -278,8 +294,8 @@ def _merge_clusters(clusters,merge_distance_m,transformer,**_kwargs):
     return kept
 
 
-def _cluster_from_points(point_sources,transformer,*,eps_m,min_samples,**kwargs):
-    """Cluster all enabled candidate sources in one DBSCAN pass."""
+def _cluster_from_points(point_sources,transformer,*,eps_m,min_samples,clustering_algorithm="dbscan",**kwargs):
+    """Jointly cluster all enabled sources, preserving membership identities."""
     point_sources=tuple((kind,events) for kind,events in point_sources if len(events))
     total=sum(len(events) for _,events in point_sources)
     if not total:
@@ -301,7 +317,8 @@ def _cluster_from_points(point_sources,transformer,*,eps_m,min_samples,**kwargs)
             secondary_sources.append((events,calculation_indices[offset:stop],offset))
         offset=stop
     del source_xy,source_indices,from_source_ids
-    labels=np.asarray(_run_dbscan(xy[:,0],xy[:,1],eps_m=eps_m,min_samples=min_samples,**kwargs),dtype=np.int64)
+    runner = _run_hdbscan if clustering_algorithm == "hdbscan" else _run_dbscan
+    labels=np.asarray(runner(xy[:,0],xy[:,1],eps_m=eps_m,min_samples=min_samples,**kwargs),dtype=np.int64)
     secondary_ids=defaultdict(set)
     for events,expected_indices,offset in secondary_sources:
         batches=events.iter_source_batches() if hasattr(events,"iter_source_batches") else ((events.calculation_index,events.from_source_id,events.to_source_id),)
@@ -338,7 +355,7 @@ def _cluster_from_points(point_sources,transformer,*,eps_m,min_samples,**kwargs)
 
 def _build_candidate_clusters(point_sources,cfg,transformer,*,disabled_sources=None,**kwargs):
     disabled=disabled_sources or set()
-    return _cluster_from_points(((kind,events) for kind,events in point_sources if kind not in disabled),transformer,eps_m=cfg.candidate_dbscan_eps_m,min_samples=cfg.candidate_dbscan_min_samples,**kwargs)
+    return _cluster_from_points(((kind,events) for kind,events in point_sources if kind not in disabled),transformer,eps_m=cfg.candidate_dbscan_eps_m,min_samples=cfg.candidate_dbscan_min_samples,clustering_algorithm=getattr(cfg,"clustering_algorithm","dbscan"),**kwargs)
 
 
 def _annotate_source_ablation(clusters,point_sources,cfg,transformer,**kwargs):

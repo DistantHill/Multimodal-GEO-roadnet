@@ -36,6 +36,12 @@ def parameter_comments() -> dict[tuple[str, ...], str]:
     return comments
 
 
+EXPERIMENT_ALGORITHM_COMMENTS = {
+    "turn_candidate_algorithm": "实验筛选算法：g_star 或 turn_threehold；turn_threehold 按 abs(turn_deg) > min_turn_deg 筛选，跳过 G*。",
+    "clustering_algorithm": "实验聚类算法：dbscan 或 hdbscan；转向和跨轨迹候选仍联合聚类。",
+}
+
+
 EXPERIMENT_COMMENTS = {
     "experiment": {"case": "本次使用的案例名称，对应 cases 下的分组。",
                    "schemes": "本次依次运行的参数方案名称，对应 schemes 下的分组。",
@@ -77,6 +83,9 @@ def toml_text(payload: dict[str, Any]) -> str:
             result = EXPERIMENT_COMMENTS[prefix[0]].get(key)
             if result:
                 return result
+        if prefix == ("detect",) or (len(prefix) == 3 and prefix[0] == "schemes" and prefix[2] == "detect"):
+            if key in EXPERIMENT_ALGORITHM_COMMENTS:
+                return EXPERIMENT_ALGORITHM_COMMENTS[key]
         if prefix and prefix[0] == "schemes":
             return comments.get((*prefix[2:], key))
         if prefix == ("archive",):

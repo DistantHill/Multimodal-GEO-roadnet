@@ -6,13 +6,14 @@ import hashlib
 import json
 import math
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ..config import PipelineConfig
 from ..config.pipeline_config_loader import load_pipeline_payload
+from ..intersections.detect_intersections import IntersectConfig
 from ..db.source_table import SourceTableContract, quote_table_name
 
 EXPERIMENT_SECTIONS = {"experiment", "cases", "schemes", "evaluation", "archive"}
@@ -162,6 +163,37 @@ def merge_parameters(base: dict[str, Any], overrides: dict[str, Any]) -> dict[st
 
 
 @dataclass(frozen=True)
+class ExperimentDetectConfig(IntersectConfig):
+    """Algorithm switches owned by experiments, excluded from Pipeline TOML."""
+    turn_candidate_algorithm: str = "g_star"
+    clustering_algorithm: str = "dbscan"
+
+    def __post_init__(self) -> None:
+        if self.turn_candidate_algorithm not in ("g_star", "turn_threehold"):
+            raise ValueError("turn_candidate_algorithm must be 'g_star' or 'turn_threehold'")
+        if self.clustering_algorithm not in ("dbscan", "hdbscan"):
+            raise ValueError("clustering_algorithm must be 'dbscan' or 'hdbscan'")
+
+
+def load_experiment_payload(base: dict[str, Any], overrides: dict[str, Any] | None = None,
+                            **kwargs: Any) -> PipelineConfig:
+    """Extract experimental switches before invoking the strict Pipeline loader."""
+    experimental = copy.deepcopy(base)
+    if isinstance(experimental.get("detect"), dict):
+        experimental["detect"].setdefault("turn_candidate_algorithm", "g_star")
+        experimental["detect"].setdefault("clustering_algorithm", "dbscan")
+    experimental = merge_parameters(experimental, overrides or {})
+    switches = {}
+    if isinstance(experimental.get("detect"), dict):
+        for key in ("turn_candidate_algorithm", "clustering_algorithm"):
+            if key in experimental["detect"]:
+                switches[key] = experimental["detect"].pop(key)
+    config = load_pipeline_payload(experimental, **kwargs)
+    detect = ExperimentDetectConfig(**config.detect.as_dict(), **switches)
+    return replace(config, detect=detect)
+
+
+@dataclass(frozen=True)
 class ExperimentWorkspace:
     config_path: Path
     root: Path
@@ -196,7 +228,7 @@ def load_workspace(path: str | Path, *, password: str, case_name: str | None = N
         raise ValueError("archive accepts only connection settings without credentials")
     if not validate_run:
         base = {k: v for k, v in payload.items() if k not in EXPERIMENT_SECTIONS}
-        config = load_pipeline_payload(base, base_directory=path.parent, postgres_password=password)
+        config = load_experiment_payload(base, base_directory=path.parent, postgres_password=password)
         root = (path.parent / selection["workspace"]).resolve() if selection.get("workspace") else config.paths.data_root / "experiments"
         if not root.is_relative_to(config.paths.data_root.resolve()):
             raise ValueError("experiment workspace must be under configured paths.data_root")
@@ -223,7 +255,7 @@ def load_workspace(path: str | Path, *, password: str, case_name: str | None = N
         overrides = payload["schemes"][name]
         if set(overrides) - {"projection", "refine", "detect", "runtime", "resources"}:
             raise ValueError("schemes may override projection/refine/detect/runtime/resources only")
-        configs[name] = load_pipeline_payload(merge_parameters(base, overrides), base_directory=path.parent, postgres_password=password)
+        configs[name] = load_experiment_payload(base, overrides, base_directory=path.parent, postgres_password=password)
     root = (path.parent / selection["workspace"]).resolve() if selection.get("workspace") else configs[selected[0]].paths.data_root / "experiments"
     data_root = configs[selected[0]].paths.data_root.resolve()
     if not root.is_relative_to(data_root):
