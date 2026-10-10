@@ -25,6 +25,7 @@ from ..telemetry.heartbeat import heartbeat_progress, operation_heartbeat
 from .performance_timing import PerfTracker
 from .progress import report_detect_progress
 from .extract_topology import _build_topologies_from_reader
+from .candidate_geometry import candidate_circle
 from ..trajectories.query_refine_points import fetch_refine_run_row
 
 def _perf_iter(perf, iterable, *, name, total=None, track=True):
@@ -186,9 +187,9 @@ def _cluster_density(events,transformer,*,eps_m,min_samples,source="turn",cluste
     clusters=[]
     for cid in np.unique(labels[labels>=0]):
         positions=np.flatnonzero(labels==cid)
-        center=xy[positions].mean(axis=0); lon,lat=transformer.inverse(*center)
+        center,radius=candidate_circle(xy[positions]); lon,lat=transformer.inverse(*center)
         members=MemberBatch(np.full(len(positions),source,dtype=object),indices[positions],np.arange(len(positions),dtype=np.int64),sources[positions],np.ones(len(positions),dtype=np.bool_))
-        clusters.append(HotspotCluster(cluster_calculate_index=int(cid),centroid_x=float(center[0]),centroid_y=float(center[1]),centroid_lon=lon,centroid_lat=lat,radius_m=float(np.linalg.norm(xy[positions]-center,axis=1).max()),cluster_ref=f"cluster_{source}_{cid}",members=members,source=source,algorithm_sources=(source,),source_ids=tuple(sorted(set(str(value) for value in sources[positions]))),source_counts={source:len(positions)},source_ratios={source:1.0}))
+        clusters.append(HotspotCluster(cluster_calculate_index=int(cid),centroid_x=float(center[0]),centroid_y=float(center[1]),centroid_lon=lon,centroid_lat=lat,radius_m=radius,cluster_ref=f"cluster_{source}_{cid}",members=members,source=source,algorithm_sources=(source,),source_ids=tuple(sorted(set(str(value) for value in sources[positions]))),source_counts={source:len(positions)},source_ratios={source:1.0}))
     return clusters
 
 
@@ -290,7 +291,7 @@ def _cluster_from_points(point_sources,transformer,*,eps_m=None,min_samples=None
     clusters=[]
     for cid in np.unique(labels[labels>=0]):
         positions=np.flatnonzero(labels==cid)
-        center=xy[positions].mean(axis=0)
+        center,radius=candidate_circle(xy[positions])
         lon,lat=transformer.inverse(*center)
         member_kinds=point_kinds[positions]
         counts={str(kind):int(np.count_nonzero(member_kinds==kind)) for kind in np.unique(member_kinds)}
@@ -298,7 +299,7 @@ def _cluster_from_points(point_sources,transformer,*,eps_m=None,min_samples=None
         sources.update(secondary_ids[int(cid)])
         members=MemberBatch(member_kinds,calculation_indices[positions],np.arange(len(positions),dtype=np.int64),point_source_ids[positions],np.ones(len(positions),dtype=np.bool_))
         algorithm_sources=tuple(sorted(counts))
-        clusters.append(HotspotCluster(cluster_calculate_index=int(cid),centroid_x=float(center[0]),centroid_y=float(center[1]),centroid_lon=lon,centroid_lat=lat,radius_m=float(np.linalg.norm(xy[positions]-center,axis=1).max()),cluster_ref=f"cluster_candidates_{cid}",members=members,source=algorithm_sources[0] if len(algorithm_sources)==1 else "merged",algorithm_sources=algorithm_sources,source_ids=tuple(sorted(sources)),source_counts=counts,source_ratios=_ratio_dict(counts)))
+        clusters.append(HotspotCluster(cluster_calculate_index=int(cid),centroid_x=float(center[0]),centroid_y=float(center[1]),centroid_lon=lon,centroid_lat=lat,radius_m=radius,cluster_ref=f"cluster_candidates_{cid}",members=members,source=algorithm_sources[0] if len(algorithm_sources)==1 else "merged",algorithm_sources=algorithm_sources,source_ids=tuple(sorted(sources)),source_counts=counts,source_ratios=_ratio_dict(counts)))
     return clusters
 
 
