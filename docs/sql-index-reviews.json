@@ -428,5 +428,69 @@
   "services/pipeline/tests/v2/test_refine_parquet_postgres.py#bf9f268d0c0cfe3079d4d87f0284c0e4bc8838d7be3a9fc5cfc49d90d453d12b": {
     "status": "not-applicable",
     "reason": "隔离 PostgreSQL 测试按 refine_id 写入标量 heading_cal，测试正常导出新增属性，无空间谓词或几何计算。"
+  },
+  "services/pipeline/src/track/v2/trajectories/results/read_parquet.py#60ca9c1a8c506510cf6ad5163d3271825051aefc72ab6544185ec2f9d90ae481": {
+    "status": "not-applicable",
+    "reason": "DuckDB reads immutable local Refine Parquet; no PostGIS spatial index exists on these views. WGS84 lon/lat bbox predicates use numeric columns. Turn windows deliberately retain original sequence positions and require every window point inside bbox before emitting events, so filtering rows before the window would falsely connect exit/reentry points."
+  },
+  "services/pipeline/src/track/v2/trajectories/results/read_parquet.py#61e32be12ab43eb47ef1ede444d4d5c5b26241cda51036287173839054e1792e": {
+    "status": "not-applicable",
+    "reason": "DuckDB reads immutable local Refine Parquet; no PostGIS spatial index exists on these views. WGS84 lon/lat bbox predicates use numeric columns. Turn windows deliberately retain original sequence positions and require every window point inside bbox before emitting events, so filtering rows before the window would falsely connect exit/reentry points."
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_refine.py#0ecefc2cdc9e80e23653be39cc63b048ca8cd3b49d06e00c82ca6be06f9958df": {
+    "status": "not-applicable",
+    "reason": "DuckDB读取父Refine或精确ROI筛选后的本地Parquet；Parquet没有持久空间索引。父输入先用EPSG:4326经纬度包围盒及时间谓词缩小候选，再逐批精确covers；后续SQL仅本地序列断段、排序、物化或计数，不查询PostgreSQL空间关系。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_refine.py#1630826dd934b3c2a8d1b996b4be640985edd42f5f5ee1f2d3959edd6288fffb": {
+    "status": "not-applicable",
+    "reason": "DuckDB读取父Refine或精确ROI筛选后的本地Parquet；Parquet没有持久空间索引。父输入先用EPSG:4326经纬度包围盒及时间谓词缩小候选，再逐批精确covers；后续SQL仅本地序列断段、排序、物化或计数，不查询PostgreSQL空间关系。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_refine.py#38f94fdf88d8f34cb708ae760d07343d7946bde022ec778c499fb9d130f3d5ae": {
+    "status": "not-applicable",
+    "reason": "DuckDB读取父Refine或精确ROI筛选后的本地Parquet；Parquet没有持久空间索引。父输入先用EPSG:4326经纬度包围盒及时间谓词缩小候选，再逐批精确covers；后续SQL仅本地序列断段、排序、物化或计数，不查询PostgreSQL空间关系。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_refine.py#b094ad2f277c4c65df03c148355705088478e91edf93454975cf8abf3287cb34": {
+    "status": "not-applicable",
+    "reason": "DuckDB读取父Refine或精确ROI筛选后的本地Parquet；Parquet没有持久空间索引。父输入先用EPSG:4326经纬度包围盒及时间谓词缩小候选，再逐批精确covers；后续SQL仅本地序列断段、排序、物化或计数，不查询PostgreSQL空间关系。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_refine.py#beba49402fc87fa70d841028d66a6b450b9529951d3994747dda0690afbfcd7a": {
+    "status": "not-applicable",
+    "reason": "DuckDB读取父Refine或精确ROI筛选后的本地Parquet；Parquet没有持久空间索引。父输入先用EPSG:4326经纬度包围盒及时间谓词缩小候选，再逐批精确covers；后续SQL仅本地序列断段、排序、物化或计数，不查询PostgreSQL空间关系。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_refine.py#e7a7ac981845c3c2a6b5cc0b4e8b9e4f2f8143dd098a7c688e28f26b6b2dc74c": {
+    "status": "not-applicable",
+    "reason": "DuckDB读取父Refine或精确ROI筛选后的本地Parquet；Parquet没有持久空间索引。父输入先用EPSG:4326经纬度包围盒及时间谓词缩小候选，再逐批精确covers；后续SQL仅本地序列断段、排序、物化或计数，不查询PostgreSQL空间关系。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_adapter.py#c0c81c3465d498ed1042404ace08f338b4f0b4a090bde768b7b9a7e104b80ded": {
+    "status": "not-applicable",
+    "reason": "无FROM的标量SELECT，仅将参数给定的米制圆心buffer后转换为EPSG:4326并序列化，与正式Detect最终面生成表达式相同；没有表候选行可由空间索引筛选。"
+  },
+  "services/pipeline/tests/test_intersection_hpo_local_refine.py#b5f2d1e0eca1ba0437dcb772069268f94a9f2ae6b19b0448d1c7f1ab6776a810": {
+    "status": "not-applicable",
+    "reason": "仅DuckDB复制/tmp下合成测试Parquet并按point_id变更经度，以验证ROI外点被排除及片段头注入点；固定fixture文件无空间索引，不查询PostgreSQL空间关系。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_cli.py#f8ead639aed144622e8bbe51b5f9accd641725c7af479244e746cd1048619fd1": {
+    "status": "not-applicable",
+    "reason": "启动前通过to_regclass/系统目录检查评价存档表及PostGIS扩展是否存在；只查询数据库结构元数据，无空间数据筛选。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_refine.py#1696cc8337aaaa95cfe54f552db05b3f574505bef998c031a986b2934899e539": {
+    "status": "not-applicable",
+    "reason": "仅对精确covers筛选后的本地Parquet验证原始vehicle/subtrack/sequence标识非空非负、序号唯一和子轨迹单vehicle归属。没有空间谓词，Parquet无持久空间索引；不扫描PostgreSQL表。"
+  },
+  "services/pipeline/tests/test_intersection_hpo_local_cli.py#fde9c5013bf506100d196c3c865dc3acdc36530b46f661826f62a1b0463de3b3": {
+    "status": "not-applicable",
+    "reason": "启动前元数据检查的模拟测试，验证只读to_regclass查询。无真实空间数据表扫描或空间计算，空间索引不适用。"
+  },
+  "services/pipeline/tests/test_intersection_hpo_local_adapter_postgres.py#17d7f76abee28c2eaa1cff0d9ca77e86ce422be809ebfa40dc6cb0487d3783c6": {
+    "status": "not-applicable",
+    "reason": "集成测试使用唯一临时schema/临时表：定义或读取单个合成路口、按experiment主键检查事务可见性；没有空间候选筛选需求，不读取业务轨迹表。"
+  },
+  "services/pipeline/tests/test_intersection_hpo_local_adapter_postgres.py#3a788597cf91a33d0f509ddef215f4c1b601e5ec23deee1873135c5ef64c7ebe": {
+    "status": "not-applicable",
+    "reason": "集成测试使用唯一临时schema/临时表：定义或读取单个合成路口、按experiment主键检查事务可见性；没有空间候选筛选需求，不读取业务轨迹表。"
+  },
+  "services/pipeline/tests/test_intersection_hpo_local_adapter_postgres.py#e817d2ec0788a8696ce0dc20eb0fb96423d69cbe08bb42b6cb4cb022f69cd893": {
+    "status": "not-applicable",
+    "reason": "集成测试使用唯一临时schema/临时表：定义或读取单个合成路口、按experiment主键检查事务可见性；没有空间候选筛选需求，不读取业务轨迹表。"
   }
 }

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import math
+import os
 import subprocess
 import tomllib
 from dataclasses import dataclass, field
@@ -58,7 +59,7 @@ def code_revision() -> str:
         commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
                                 capture_output=True, text=True, check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
-        commit = "no-commit"
+        commit = os.environ.get("PIPELINE_GIT_COMMIT", "no-commit")
     return f"{commit}:source-sha256:{digest.hexdigest()}"
 
 

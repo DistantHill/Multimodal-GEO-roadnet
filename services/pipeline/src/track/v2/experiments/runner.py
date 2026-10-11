@@ -143,6 +143,13 @@ def evaluate_local(workspace: ExperimentWorkspace, experiment_id: str, *, truth_
 
 
 def run_batch(workspace: ExperimentWorkspace, *, explicit_refine_id: str | None = None, independent_instances: bool = False) -> list[dict[str, Any]]:
+    from shapely.geometry import shape, box
+    input_bbox = None
+    if explicit_refine_id:
+        region = shape(workspace.case.geometry)
+        if not region.equals(box(*region.bounds)):
+            raise ValueError("reusing Refine with strict spatial selection requires a rectangular bbox")
+        input_bbox = region.bounds
     commit = code_commit()
     if not commit:
         raise ValueError("current commit is unavailable; use make pipeline-experiment or set PIPELINE_GIT_COMMIT")
@@ -258,7 +265,9 @@ def run_batch(workspace: ExperimentWorkspace, *, explicit_refine_id: str | None 
                     detected = run_detect_stage(store=store, postgres_config=config.postgres, refine=refine_ref,
                         detect_config=config.detect, runtime_config=config.runtime, paths_config=config.paths,
                         verify_sha256=config.resources.verify_artifact_sha256, parameters=parameters, emit=lambda event: None,
-                        candidate_cache=candidate_cache)
+                        candidate_cache=candidate_cache,
+                        **({"bbox": input_bbox}
+                           if explicit_refine_id else {}))
                     record["detect_id"] = detected.ref.detect_id
                     record["stats"].update(asdict(detected.persisted))
                     record["stats"]["candidate_instances"] = candidate_instance_stats(conn, detected.ref.detect_id)

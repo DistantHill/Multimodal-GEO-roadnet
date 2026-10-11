@@ -89,8 +89,31 @@ make -C /data/workspace/Multimodal-GEO-roadnet pipeline-experiment ARGS='run --c
 make -C /data/workspace/Multimodal-GEO-roadnet pipeline-experiment ARGS='list'
 ```
 
-多个方案顺序执行；同批次相同输入和 Refine 参数共享 Refine。不同批次需要显式传入 --refine-id，且输入和参数必须一致。
+多个方案顺序执行；同批次相同输入和 Refine 参数共享 Refine。通过 `--refine-id` 可复用已完成的 Refine，所选时间必须在其覆盖范围内。
+
+复用 Refine 的 `turn_threshold` 实验按案例矩形 bbox 严格限制 Detect 计算：转向事件所需的整个邻域窗口必须在 bbox 内，拓扑计算只使用连续的区域内片段，离开再进入区域不会生成跨越区域外的连线。原始 Refine 不修改；片段交点保留父轨迹点索引。当前仅支持矩形区域和单一 `turn_threshold` 算法，其他组合直接报错。
+
+Detect 持久化仍保留所选时间内完整的父 Refine 点序列，以满足现有点身份、顺序和交点引用约束；这些区域外点不参与本次候选、聚类或拓扑计算。因此复用全域 Refine 时，持久化耗时和解析点数量仍可能显著大于 bbox 内计算量。
 Make 入口把宿主机当前 commit 传给容器，不保存工作树改动。直接调用 Python CLI 时，可通过 PIPELINE_GIT_COMMIT 提供 commit。
+
+## 局部 TPE 参数优化
+
+本节为2026-10-11确认的独立优化入口，使用现有父 Refine，不调用上述普通实验的完整点序列持久化路径。规格与问答见 [交叉口评价规格说明](intersection-evaluation-spec.md) 。
+
+单独的 TOML 只包含 `[local_hpo]`：`experiment_config`、`scheme`、`labels_file`、`output_root`、`parent_refine_id` 为必填；`labels_layer` 默认 `TP_intersection_fuping`，`labels_id_field` 默认 `fid`，`processing_srid` 默认32649。路径相对该 TOML 解析，输出目录必须在配置的数据根目录内、仓库外。时间、来源表和固定 Detect 参数来自 `experiment_config`；方案须只有一个 `turn_threshold` 输出实例。数据库存档固定使用 `roadnet_eval`。
+
+```sh
+python -m track.v2.experiments.intersection_hpo.local_cli run --config /data/experiments/local_hpo.toml
+python -m track.v2.experiments.intersection_hpo.local_cli status --config /data/experiments/local_hpo.toml
+```
+
+`run` 先准备可复用输入，再恢复或开始搜索；`prepare` 只准备输入，`status` 只读取本地状态。源码身份、标注、父产物、时间与固定参数发生变化时必须使用新的输出目录；同一输入重复运行会核对已提交结果，不重算成功调用。生产启动显式传入实际 `PIPELINE_GIT_COMMIT`，另外记录源码及依赖哈希，不保存源码快照。
+
+标注先按完全相同几何去重并告警，再用seed42按类型、空间位置及可获得的结构特征固定嵌套20/50/全部子集。评价区为所选原面并集；计算区为米制外扩200米后的并集。父Refine仅扫描准备一次，局部缓存只保留计算区内及边界的点，离开重入拆段，不带区外邻点。预测与真值以完整面质心是否被评价区覆盖判定归属，包含边界且不裁切几何；匹配同时要求中心距离≤30米、IoU≥0.70。所有层级都计算包含FP的F1。
+
+L1为45°基线、9个固定种子随机初始化和最多30个TPE建议，共最多40次；只用L1 F1反馈TPE。L1前12进入L2，L2前8进入L3；最终按L3 F1排名。范围30–90°，失败和中断均消耗调用预算；成功不足时仅晋级已有组，不无限补足。每组端到端结果独立提交，基础设施或共同输入错误停批次，专门几何数值失败保留错误后继续。
+
+输出保留各级排名、逐调用结果、不可变输入清单及最优配置。`best_config.toml` 为普通实验配置，沿用原案例区域并显式注明与局部评价区不同；它不是追加的预算内评估，不会自动执行。`best_local_config.toml` 可幂等恢复本次优化。相关性在搜索完成后分析，不用作中途停止条件。
 
 ## 历史、评价与清理
 

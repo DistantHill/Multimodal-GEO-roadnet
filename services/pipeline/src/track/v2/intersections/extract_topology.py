@@ -158,12 +158,14 @@ def _build_topologies_from_reader(clusters, cfg, transformer, *, refine_reader):
     reader_selections = refine_reader.iter_topology_tracks(
         cfg.source_table or cfg.db_table, windows, batch_size=cfg.stream_batch_size,
     )
-    selections = ((i, selection.points) for selection in reader_selections
+    selections = ((i, selection.points, getattr(selection, "point_offset", 0)) for selection in reader_selections
                   for i in selection.window_indices)
     try:
-        for i,track in selections:
+        for i,track,point_offset in selections:
             cluster=clusters[i]
             obs,cross=_extract_entry_exit_observations_batch({track.subtrack_index:track},cluster=cluster,transformer=transformer,radius_m=max(cfg.min_intersection_radius_m,cluster.radius_m+cfg.topology_radius_padding_m),bearing_window=cfg.bearing_window,first_crossing_index=int(offsets[i]))
+            if point_offset:
+                cross = replace(cross, point_index=cross.point_index + point_offset)
             offsets[i]+=len(cross); crossing_pieces[i].append(cross); observation_pieces[i].append(obs)
     finally:
         close=getattr(selections,"close",None)

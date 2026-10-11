@@ -74,8 +74,9 @@ def load_labels(path: str | Path, *, layer: str = "labeled_intersections", id_fi
             missing_types += 1
         elif value == UNCLASSIFIED:
             missing_types += 1
-        elif value not in INTERSECTION_TYPES:
-            raise ValueError(f"unsupported intersection type: {value}")
+        elif not isinstance(value, str):
+            raise ValueError("intersection type must be a string or null")
     return features, {**metadata, "missing_type_count": missing_types,
-                      "allowed_types": [*INTERSECTION_TYPES, UNCLASSIFIED],
+                      "allowed_types": list(dict.fromkeys([*INTERSECTION_TYPES, UNCLASSIFIED,
+                                                           *sorted({f["properties"]["type"] for f in features})])),
                       "warnings": ["Intersection types not yet annotated; type-specific conclusions unavailable"] if missing_types else []}

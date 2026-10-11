@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 import json
 import math
 from pathlib import Path
@@ -29,6 +29,7 @@ class TopologyTrackSelection:
     window_indices: tuple[int, ...]
     track_key: str
     points: RefinementSubtrack
+    point_offset: int = 0
 
 
 class RefineDatasetReader:
@@ -38,7 +39,7 @@ class RefineDatasetReader:
         self, publication_root: Path | str, descriptor: ArtifactDescriptor, state: str,
         runtime: RuntimeConfig, *, verify_sha256: bool = False,
         data_root: Path | str | None = None,
-        time_start=None, time_end=None,
+        time_start=None, time_end=None, bbox=None,
     ) -> None:
         validate_published(
             publication_root, descriptor, state, verify_sha256=verify_sha256,
@@ -48,6 +49,7 @@ class RefineDatasetReader:
         self._schema_version = _validate_schema(descriptor)
         from ...time_selection import time_bounds
         self.time_start, self.time_end = time_bounds(time_start, time_end)
+        self.bbox = validate_bbox(bbox)
         self._descriptor = descriptor
         self._runtime = runtime
         self._root = Path(publication_root).resolve(strict=True)
@@ -188,7 +190,8 @@ class RefineDatasetReader:
         connection = self._require_open()
         row = connection.execute("""
           SELECT min(x), min(y), max(x), max(y) FROM refine_points
-        """).fetchone()
+          WHERE (? IS NULL OR (lon BETWEEN ? AND ? AND lat BETWEEN ? AND ?))
+        """, bbox_parameters(self.bbox)).fetchone()
         if row is None or row[0] is None:
             return None
         extent = tuple(float(value) for value in row)
@@ -311,7 +314,8 @@ class RefineDatasetReader:
                 track = _subtrack_from_point_columns(columns, source_table)
                 columns.clear()
                 del columns
-                yield TopologyTrackSelection(canonical[key[0]][1], str(key[1]), track)
+                for offset, fragment in bbox_fragments(track, self.bbox):
+                    yield TopologyTrackSelection(canonical[key[0]][1], str(key[1]), fragment, offset)
                 del track
         finally:
             if self._connection is not None:
@@ -331,17 +335,21 @@ class RefineDatasetReader:
         if not all(math.isfinite(value) and value>=0 for value in thresholds) or cfg.min_turn_deg>cfg.max_turn_deg:
             raise RefineParquetError("turn thresholds are invalid")
         yield from self._iter_turn_candidates_sql(
-            connection, self._descriptor.refine_id, source_table, cfg, batch_size,
+            connection, self._descriptor.refine_id, source_table, cfg, batch_size, self.bbox,
         )
 
     @staticmethod
-    def _iter_turn_candidates_sql(connection, refine_id, source_table, cfg, batch_size):
+    def _iter_turn_candidates_sql(connection, refine_id, source_table, cfg, batch_size, bbox=None):
         window = cfg.turn_window
         last_exit = window - 1
         result = connection.execute(f"""
           WITH neighbors AS (
             SELECT *,
               row_number() OVER track - 1 AS point_index,
+              bool_and(? IS NULL OR (lon BETWEEN ? AND ? AND lat BETWEEN ? AND ?))
+                OVER (PARTITION BY vehicle_id, subtrack_index
+                      ORDER BY refined_sequence_in_subtrack, point_kind, point_id
+                      ROWS BETWEEN {window} PRECEDING AND {window} FOLLOWING) AS inside_bbox,
               lag(x, {window}) OVER track AS in_x,
               lag(y, {window}) OVER track AS in_y,
               lead(x, {window}) OVER track AS out_x,
@@ -380,7 +388,7 @@ class RefineDatasetReader:
               (degrees(atan2(entry_sin, entry_cos))+360.0) % 360.0 AS entry_bearing,
               (degrees(atan2(exit_sin, exit_cos))+360.0) % 360.0 AS exit_bearing
             FROM neighbors
-            WHERE in_x IS NOT NULL AND out_x IS NOT NULL
+            WHERE inside_bbox AND in_x IS NOT NULL AND out_x IS NOT NULL
               AND entry_sin IS NOT NULL AND exit_sin IS NOT NULL
           ), angles AS (
             SELECT *, (exit_bearing-entry_bearing+540.0) % 360.0 - 180.0 AS turn_deg
@@ -398,7 +406,7 @@ class RefineDatasetReader:
                  coalesce(source_id, ?) AS event_source_id
           FROM selected
           ORDER BY vehicle_id, subtrack_index, point_index
-        """, [refine_id, cfg.min_leg_m, cfg.min_leg_m,
+        """, [*bbox_parameters(bbox), refine_id, cfg.min_leg_m, cfg.min_leg_m,
                cfg.min_movement_speed_mps, cfg.min_turn_deg, cfg.max_turn_deg,
                source_table])
         while rows := result.fetchmany(batch_size):
@@ -752,3 +760,36 @@ def _subtrack_from_point_columns(columns, source_table):
         after_sequence=columns["after_sequence"],generated_reason=columns["generated_reason"],
         heading_cal=columns["heading_cal"],
     )
+
+
+def validate_bbox(bbox):
+    if bbox is None:
+        return None
+    if len(bbox) != 4 or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in bbox):
+        raise ValueError("bbox must contain four finite WGS84 coordinates")
+    west, south, east, north = map(float, bbox)
+    if not (-180 <= west < east <= 180 and -90 <= south < north <= 90):
+        raise ValueError("bbox must be ordered WGS84 bounds")
+    return west, south, east, north
+
+
+def bbox_parameters(bbox):
+    if bbox is None:
+        return [None, None, None, None, None]
+    west, south, east, north = bbox
+    return [west, west, east, south, north]
+
+
+def bbox_fragments(track, bbox):
+    """Keep contiguous inside runs; offsets retain parent point identities."""
+    if bbox is None:
+        yield 0, track
+        return
+    west, south, east, north = bbox
+    lon, lat = track.lonlat.T
+    inside = (lon >= west) & (lon <= east) & (lat >= south) & (lat <= north)
+    edges = np.diff(np.r_[False, inside, False].astype(np.int8))
+    for start, stop in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+        values = {f.name: getattr(track, f.name)[start:stop] for f in fields(track)
+                  if isinstance(getattr(track, f.name), np.ndarray)}
+        yield int(start), replace(track, **values)

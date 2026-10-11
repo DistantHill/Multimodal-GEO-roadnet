@@ -42,7 +42,12 @@ def run_detect_stage(
     emit: EventSink,
     time_start=None, time_end=None,
     candidate_cache=None,
+    bbox=None,
 ) -> DetectStageResult:
+    from ..trajectories.results.read_parquet import validate_bbox
+    bbox = validate_bbox(bbox)
+    if bbox is not None and detect_config.candidates != ("turn_threshold",):
+        raise ValueError("strict bbox currently supports only turn_threshold")
     from ..time_selection import validate_refine_time
     start = end = None
     requested_start = refine.time_start if time_start is None else time_start
@@ -57,6 +62,9 @@ def run_detect_stage(
         "time_start": start.isoformat() if start else None,
         "time_end": end.isoformat() if end else None,
     }
+    if bbox is not None:
+        parameters["detect_input_bbox"] = list(bbox)
+        parameters["detect_input_bbox_policy"] = "strict_contiguous_fragments"
     detect_id = store.start_detect_run(
         refine_id=refine.refine_id,
         parameters=parameters,
@@ -90,6 +98,7 @@ def run_detect_stage(
             verify_sha256=verify_sha256,
             data_root=paths_config.data_root,
             time_start=start, time_end=end,
+            **({"bbox": bbox} if bbox is not None else {}),
         )
         with reader:
             connect_worker = None

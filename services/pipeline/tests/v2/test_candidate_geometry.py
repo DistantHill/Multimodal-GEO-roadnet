@@ -93,3 +93,81 @@ def test_clustering_uses_robust_circle_without_dropping_members(joint):
 def test_invalid_geometry_is_rejected(points):
     with pytest.raises(ValueError):
         candidate_circle(np.asarray(points))
+
+
+def test_slow_almost_collinear_cluster_has_verified_mean_distance_gap(monkeypatch):
+    from track.v2.intersections import candidate_geometry as geometry
+
+    # Along a million-metre span, a nearly flat objective need not produce
+    # micrometre centre steps. The projected 1-D optimum is a global lower
+    # bound on the 2-D mean-distance objective.
+    points = np.random.default_rng(2).normal(size=(1000, 2)) * [1e6, 1.]
+    points += [335000., 3845000.]
+    monkeypatch.setattr(geometry, "_FAST_ITERATIONS", 16)
+    monkeypatch.setattr(geometry, "_MAX_ITERATIONS", 64)
+    center, radius = candidate_circle(points)
+    distances = np.hypot(*(points - center).T)
+    lower_bound = np.mean(np.abs(points[:, 0] - np.median(points[:, 0])))
+    assert np.mean(distances) - lower_bound <= 1.0
+    assert radius == np.sort(distances)[949]
+
+
+def test_objective_certificate_bounds_known_triangle_optimum():
+    from track.v2.intersections.candidate_geometry import _optimality_gap
+
+    points = np.array([[0., 0.], [1000., 0.], [0., 1000.]])
+    optimum_coordinate = 1000 * (3 - math.sqrt(3)) / 6
+    optimum = np.array([optimum_coordinate, optimum_coordinate])
+    optimum_objective = np.mean(np.hypot(*(points - optimum).T))
+    for center in (np.zeros(2), optimum, np.array([700., -200.])):
+        bound, objective = _optimality_gap(points, center)
+        assert 0 <= objective - optimum_objective <= bound + 1e-10
+
+
+def test_near_coincident_certificate_charges_approximation_error():
+    from track.v2.intersections.candidate_geometry import _optimality_gap
+
+    points = np.array([[0., 0.], [0., 1e-9], [1e6, 0.]])
+    bound, objective = _optimality_gap(points, np.zeros(2))
+    # The near member is not exactly coincident: its allowance is nonzero.
+    assert bound > 0
+    assert objective == pytest.approx(1e6 / 3)
+    assert bound < 1.0
+
+
+def test_nonunique_median_is_accepted_by_objective_without_position_claim():
+    points = np.array([[0., 0.], [1e6, 0.]])
+    center, _ = candidate_circle(points)
+    # Every centre on this segment has exactly the same optimal objective.
+    assert np.mean(np.hypot(*(points - center).T)) == 500000.
+    assert 0 <= center[0] <= 1e6
+    assert center[1] == 0
+
+
+def test_iteration_limit_without_acceptance_is_explicit_numerical_failure(monkeypatch):
+    from track.v2.intersections import candidate_geometry as geometry
+
+    monkeypatch.setattr(geometry, "_MAX_ITERATIONS", 0)
+    monkeypatch.setattr(geometry, "_FAST_ITERATIONS", 0)
+    with pytest.raises(geometry.CandidateGeometryNumericalError) as captured:
+        candidate_circle(np.array([[0., 0.], [1000., 0.], [0., 1000.]]))
+    diagnostics = captured.value.diagnostics
+    assert diagnostics["point_count"] == 3
+    assert diagnostics["iterations"] == 0
+    assert diagnostics["objective_gap_bound_m"] > diagnostics["tolerance_m"] == 1.0
+    assert "points" not in diagnostics
+
+
+def test_unrepresentable_span_is_explicit_numerical_failure():
+    from track.v2.intersections.candidate_geometry import CandidateGeometryNumericalError
+
+    largest = np.finfo(np.float64).max
+    with pytest.raises(CandidateGeometryNumericalError):
+        candidate_circle(np.array([[-largest, 0.], [largest, 0.], [largest, 0.]]))
+
+
+def test_repeated_large_finite_coordinates_do_not_overflow_median_average():
+    largest = np.finfo(np.float64).max
+    center, radius = candidate_circle(np.array([[largest, largest]] * 2))
+    np.testing.assert_array_equal(center, [largest, largest])
+    assert radius == 0
