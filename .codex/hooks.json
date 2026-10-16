@@ -1,5 +1,5 @@
 {
-  "description": "Grilling: reuse or create a Spec and persist every QA round.",
+  "description": "Project grilling Spec and SQL spatial-index review hooks; HTML preview is user-level.",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -9,6 +9,16 @@
             "command": "python3 \"$(git rev-parse --show-toplevel)/scripts/hooks/grilling_spec.py\"",
             "timeout": 5,
             "statusMessage": "Loading grilling Spec workflow"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/reid/.codex/hooks/html-preview/html_result_policy.py",
+            "timeout": 5,
+            "statusMessage": "Generating interactive HTML results"
           }
         ]
       }

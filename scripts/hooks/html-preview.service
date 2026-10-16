@@ -1,0 +1,12 @@
+[Unit]
+Description=Shared HTML preview on localhost:18765
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.codex/hooks/html-preview/html_preview.py --serve
+Restart=always
+RestartSec=2
+UMask=0077
+
+[Install]
+WantedBy=default.target
