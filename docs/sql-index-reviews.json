@@ -612,5 +612,73 @@
   "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#c39e79e560e0872301f0202608d416537d93c6d4643d62f86726cbb167cb0e59": {
     "status": "not-applicable",
     "reason": "同事务COPY后更新该诊断表的规划统计信息，使新增run_id及事件标识关联行数估计正确；ANALYZE不进行业务空间检索。身份关联使用run_id/source_key/calculation_index B-tree；geom GiST为EPSG:4326。真实L2新增UUID的关联SELECT修复前计划见docs/validation/sql-plans/hpo-debug-member-before.json，ANALYZE后完全相同SELECT的EXPLAIN见docs/validation/sql-plans/hpo-debug-member-after.json；前者Nested Loop估计1行，后者Hash Join。正式UPDATE的无执行EXPLAIN另存hpo-debug-member-after-update.json，也使用Hash Join。"
+  },
+  "../../../tmp/roadnet-radius-profile.py#0cc903a3538dc783a5994fc24030c4409ca938f0a8c6537d3ea445622090e3f8": {
+    "status": "not-applicable",
+    "reason": "Run metadata or complete run-scoped radius/centroid scalar statistics; no geometry predicates. A spatial region filter would change the population being profiled."
+  },
+  "../../../tmp/roadnet-radius-profile.py#88b2f8fc5ddf02f57ffc3a1972dbd2a56751155733088240ccda7193c69d33a7": {
+    "status": "not-applicable",
+    "reason": "Run metadata or complete run-scoped radius/centroid scalar statistics; no geometry predicates. A spatial region filter would change the population being profiled."
+  },
+  "../../../tmp/roadnet-radius-profile.py#93656e7ab99e4d444b3ab52d04605b129cf06796bdd2bfd98f441f22d9c2c417": {
+    "status": "not-applicable",
+    "reason": "Run metadata or complete run-scoped radius/centroid scalar statistics; no geometry predicates. A spatial region filter would change the population being profiled."
+  },
+  "../../../tmp/roadnet-radius-profile.py#f9df0497351adba10812d0f570093af77749749ec2deb46c5c4008c28f0ac56b": {
+    "status": "not-applicable",
+    "reason": "Run metadata or complete run-scoped radius/centroid scalar statistics; no geometry predicates. A spatial region filter would change the population being profiled."
+  },
+  "../../../tmp/roadnet-radius-profile.py#dce1eb4526255d338cdcd82b507959e35a1cd433d731dbec45802fb18e4ac8fa": {
+    "status": "not-applicable",
+    "reason": "Run metadata or complete run-scoped radius/centroid scalar statistics; no geometry predicates. A spatial region filter would change the population being profiled."
+  },
+  "../../../tmp/roadnet-radius-members.py#a802f526c64919d1cf5317d8e1cb7066c61c61840e8d462e488c49b2298ae041": {
+    "status": "not-applicable",
+    "reason": "按 detect_id 与 candidate_intersection_id 精确选取完整候选成员，然后计算 EPSG:4326 → EPSG:32649 坐标。必须保留远距离成员来诊断巨簇，几何半径筛选会丢失诊断对象；GiST 空间索引不适用于这种完整身份集合读取。真实 EXPLAIN 已检查：run0 turn 使用 idx_turn_events_candidate 和 resolved_points_id_detect_key；run1 cross 选择顺序扫描，其选择覆盖约87万条成员。"
+  },
+  "../../../tmp/roadnet-radius-members.py#039b76e711bbd5b854479db0699b265c91b463f0af5c85d2a369b70de4ce5a1f": {
+    "status": "not-applicable",
+    "reason": "按 detect_id 与 candidate_intersection_id 精确选取完整候选成员，然后计算 EPSG:4326 → EPSG:32649 坐标。必须保留远距离成员来诊断巨簇，几何半径筛选会丢失诊断对象；GiST 空间索引不适用于这种完整身份集合读取。真实 EXPLAIN 已检查：run0 turn 使用 idx_turn_events_candidate 和 resolved_points_id_detect_key；run1 cross 选择顺序扫描，其选择覆盖约87万条成员。"
+  },
+  "docs/validation/sql-plans/grid-runtime-20261014/grid-1-0.sql#1910777aa529d37ec67262e18a245216caa5f8614fc8ff1364859eb12470b37d": {
+    "status": "uses-index",
+    "indexes": [
+      "idx_trajectory_points_geom_utm32649"
+    ],
+    "crs": "EPSG:32649",
+    "plan": "/data/tmp/road-network/codex-artifacts/sql-plans/grid-runtime-20261014/grid-1-0-cursor-explain.json",
+    "reason": "正式 fetch_points_in_grid 生成的完整参数化 SQL，按当前 Refine 与四个慢网格分别 EXPLAIN SELECT 和 DECLARE CURSOR。源点分支使用 EPSG:32649 表达式 GiST 的空间 Index Cond；注入点分支仍为纯 x/y 条件并顺序扫描，未将其误记为使用空间索引。邻点允许网格外上下文，采用 Refine/子轨迹顺序 B-tree 而非空间索引。",
+    "plan_sha256": "240341bb92b22ab4d97b66418bc069b4d55396ce828ba9192e12508060dab70a"
+  },
+  "docs/validation/sql-plans/grid-runtime-20261014/grid-2-1.sql#1910777aa529d37ec67262e18a245216caa5f8614fc8ff1364859eb12470b37d": {
+    "status": "uses-index",
+    "indexes": [
+      "idx_trajectory_points_geom_utm32649"
+    ],
+    "crs": "EPSG:32649",
+    "plan": "/data/tmp/road-network/codex-artifacts/sql-plans/grid-runtime-20261014/grid-2-1-cursor-explain.json",
+    "reason": "正式 fetch_points_in_grid 生成的完整参数化 SQL，按当前 Refine 与四个慢网格分别 EXPLAIN SELECT 和 DECLARE CURSOR。源点分支使用 EPSG:32649 表达式 GiST 的空间 Index Cond；注入点分支仍为纯 x/y 条件并顺序扫描，未将其误记为使用空间索引。邻点允许网格外上下文，采用 Refine/子轨迹顺序 B-tree 而非空间索引。",
+    "plan_sha256": "b2d1b260dc0aed34a7c7f1cc099f707f98325342613fbebaec9ed303136f4253"
+  },
+  "docs/validation/sql-plans/grid-runtime-20261014/grid-0-0.sql#1910777aa529d37ec67262e18a245216caa5f8614fc8ff1364859eb12470b37d": {
+    "status": "uses-index",
+    "indexes": [
+      "idx_trajectory_points_geom_utm32649"
+    ],
+    "crs": "EPSG:32649",
+    "plan": "/data/tmp/road-network/codex-artifacts/sql-plans/grid-runtime-20261014/grid-0-0-cursor-explain.json",
+    "reason": "正式 fetch_points_in_grid 生成的完整参数化 SQL，按当前 Refine 与四个慢网格分别 EXPLAIN SELECT 和 DECLARE CURSOR。源点分支使用 EPSG:32649 表达式 GiST 的空间 Index Cond；注入点分支仍为纯 x/y 条件并顺序扫描，未将其误记为使用空间索引。邻点允许网格外上下文，采用 Refine/子轨迹顺序 B-tree 而非空间索引。",
+    "plan_sha256": "c2f1e859402cb58f207538185640739113101388fd508b5a8f5328715970f5a7"
+  },
+  "docs/validation/sql-plans/grid-runtime-20261014/grid-2-0.sql#1910777aa529d37ec67262e18a245216caa5f8614fc8ff1364859eb12470b37d": {
+    "status": "uses-index",
+    "indexes": [
+      "idx_trajectory_points_geom_utm32649"
+    ],
+    "crs": "EPSG:32649",
+    "plan": "/data/tmp/road-network/codex-artifacts/sql-plans/grid-runtime-20261014/grid-2-0-cursor-explain.json",
+    "reason": "正式 fetch_points_in_grid 生成的完整参数化 SQL，按当前 Refine 与四个慢网格分别 EXPLAIN SELECT 和 DECLARE CURSOR。源点分支使用 EPSG:32649 表达式 GiST 的空间 Index Cond；注入点分支仍为纯 x/y 条件并顺序扫描，未将其误记为使用空间索引。邻点允许网格外上下文，采用 Refine/子轨迹顺序 B-tree 而非空间索引。",
+    "plan_sha256": "b841e331b362ffa63f3f5bf162e2fcfa3773e9417f8d3ccce92a7a6827e525a4"
   }
 }
