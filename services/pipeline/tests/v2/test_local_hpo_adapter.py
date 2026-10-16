@@ -89,7 +89,7 @@ def harness(tmp_path, monkeypatch):
             self.connection.records[record["id"]] = copy.deepcopy(record)
         def append_evaluation(self, identifier, truth, rules):
             assert self.connection.depth >= 1
-            assert rules == {"mode": "both", "distance_m": 30., "iou_threshold": .70}
+            assert rules == {"mode": "center_distance", "distance_m": 30.}
             if state["fail_evaluation"]:
                 raise OSError("archive unavailable")
             metrics = {"tp": 1, "fp": 0, "fn": 0, "precision": 1., "recall": 1., "f1": 1.}
@@ -251,6 +251,7 @@ def test_later_archive_reevaluation_does_not_change_recovered_search_objective(h
 
 @pytest.mark.parametrize("rules", [
     {"mode": "iou", "iou_threshold": .70, "region_policy": "centroid_covers"},
+    {"mode": "both", "distance_m": 30., "iou_threshold": .70, "region_policy": "centroid_covers"},
     {**adapter.RULES, "distance_m": 31., "region_policy": "centroid_covers"},
     {**adapter.RULES, "region_policy": "all_features"},
 ])

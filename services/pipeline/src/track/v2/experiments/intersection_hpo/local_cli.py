@@ -64,7 +64,8 @@ def load_local_config(path: str | Path) -> LocalConfig:
 
 
 def _config_identity(config, workspace) -> dict:
-    return {'config': {key: str(value) if isinstance(value, Path) else value for key, value in asdict(config).items() if key != 'config_path'},
+    from .local_adapter import RULES, LABEL_SEMANTICS
+    return {'evaluation': {**RULES, 'region_policy': 'centroid_covers'}, 'label_semantics': LABEL_SEMANTICS,'config': {key: str(value) if isinstance(value, Path) else value for key, value in asdict(config).items() if key != 'config_path'},
             'experiment_sha256': hashlib.sha256(config.experiment_config.read_bytes()).hexdigest(),
             'labels_sha256': hashlib.sha256(config.labels_file.read_bytes()).hexdigest(),
             'source_revision': code_revision(), 'case': workspace.case.snapshot(),
@@ -159,13 +160,15 @@ def write_local_best(config, workspace, inputs: dict, threshold: float) -> tuple
         case['region_file'] = str((config.experiment_config.parent / case['region_file']).resolve())
     case['truth_file'] = str(truth_path.resolve())
     payload['cases'] = {workspace.case.name: case}
-    payload['evaluation'] = {'mode': 'both', 'distance_m': 30., 'iou_threshold': .70}
+    from .local_adapter import RULES
+    payload['evaluation'] = dict(RULES)
     payload['parser']['field_specs_path'] = str(effective.parser.field_specs_path)
     payload['logging']['directory'] = str(effective.logging.directory)
     payload['paths'] = {key: str(value) for key, value in asdict(effective.paths).items()}
     ordinary = root / 'best_config.toml'
     ordinary.write_text('# Selected parameters for a separate ordinary experiment; not launched automatically.\n'
                         '# Original case region differs from local computation/evaluation ROI.\n'
+                        '# Truth faces mark intersection locations; matching uses 30m center distance, not area overlap.\n'
                         '# Truth is the fixed deduplicated L3 truth; a new run is outside the 60-call search budget.\n'
                         + toml_text(payload))
     resume = root / 'best_local_config.toml'

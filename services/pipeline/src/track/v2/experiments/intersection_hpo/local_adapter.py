@@ -24,7 +24,8 @@ from .config import code_revision
 from .local_search import NumericalTrialError
 
 
-RULES = {"mode": "both", "distance_m": 30.0, "iou_threshold": 0.70}
+RULES = {"mode": "center_distance", "distance_m": 30.0}
+LABEL_SEMANTICS = "location_region"
 _LOGGER = logging.getLogger(__name__)
 # Scalar geometry calculations use the same expression as the Detect writer.
 # There are no table rows to narrow through a spatial index.

@@ -552,5 +552,65 @@
   "services/pipeline/src/track/v2/cli/init_db.py#a3de6e1a043a880c0b8b2d9ca509f14ab806fd3dbedb60c6c5527f2571846773": {
     "status": "not-applicable",
     "reason": "DDL 新建 injected 点表的 UTM 32649 表达式 GiST 索引，本身不是候选空间查询；实际使用计划见 polygon-raster-utm-buffer.json。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#293e5baf19a5a654227f9a47655af038a9ced518dcb5b3dfa213bb330418cdb3": {
+    "status": "not-applicable",
+    "reason": "局部Detect完整诊断存档：DDL创建专用表与run_id/B-tree、EPSG:4326 GiST索引，COPY写入已固定计算ROI的全部中间结果，或按run_id和事件标识等值关联/计数。输入SELECT仅遍历已精确ROI筛选的本地Parquet，无持久空间索引。此语句不执行新的空间范围候选检索。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#556365bded5a73fdb289386e68784ff331e4a9498ca13b0bd11a1e5f6b218d9d": {
+    "status": "not-applicable",
+    "reason": "局部Detect完整诊断存档：DDL创建专用表与run_id/B-tree、EPSG:4326 GiST索引，COPY写入已固定计算ROI的全部中间结果，或按run_id和事件标识等值关联/计数。输入SELECT仅遍历已精确ROI筛选的本地Parquet，无持久空间索引。此语句不执行新的空间范围候选检索。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#d7b4a18a39628d97647d2bd8f8d5139961ca3da718411644c7e9a24dbc68f880": {
+    "status": "not-applicable",
+    "reason": "局部Detect完整诊断存档：DDL创建专用表与run_id/B-tree、EPSG:4326 GiST索引，COPY写入已固定计算ROI的全部中间结果，或按run_id和事件标识等值关联/计数。输入SELECT仅遍历已精确ROI筛选的本地Parquet，无持久空间索引。此语句不执行新的空间范围候选检索。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#6cfeb689c6fe93f16b8974ad6f80388bf6a9f209e82f93968b133cc01207ba39": {
+    "status": "not-applicable",
+    "reason": "局部Detect完整诊断存档：DDL创建专用表与run_id/B-tree、EPSG:4326 GiST索引，COPY写入已固定计算ROI的全部中间结果，或按run_id和事件标识等值关联/计数。输入SELECT仅遍历已精确ROI筛选的本地Parquet，无持久空间索引。此语句不执行新的空间范围候选检索。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#6a65cdc8d3a18bba73a2d1c54fc5580e62743d27f7d9aac2e7e49e4b398cdbc2": {
+    "status": "not-applicable",
+    "reason": "局部Detect完整诊断存档：DDL创建专用表与run_id/B-tree、EPSG:4326 GiST索引，COPY写入已固定计算ROI的全部中间结果，或按run_id和事件标识等值关联/计数。输入SELECT仅遍历已精确ROI筛选的本地Parquet，无持久空间索引。此语句不执行新的空间范围候选检索。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#a101e89b9b71c895bd9ca8689c9096fcdc07262e08e4cab25e8d262674e56e30": {
+    "status": "not-applicable",
+    "reason": "局部Detect完整诊断存档：DDL创建专用表与run_id/B-tree、EPSG:4326 GiST索引，COPY写入已固定计算ROI的全部中间结果，或按run_id和事件标识等值关联/计数。输入SELECT仅遍历已精确ROI筛选的本地Parquet，无持久空间索引。此语句不执行新的空间范围候选检索。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#2571f93b315379f3d4f56d694bc0f2d0f507595f274cde5f50d05903f8e5bb21": {
+    "status": "not-applicable",
+    "reason": "局部Detect完整诊断存档：DDL创建专用表与run_id/B-tree、EPSG:4326 GiST索引，COPY写入已固定计算ROI的全部中间结果，或按run_id和事件标识等值关联/计数。输入SELECT仅遍历已精确ROI筛选的本地Parquet，无持久空间索引。此语句不执行新的空间范围候选检索。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#82237ac9420461ae9e48fffe3db647782b390d31a1b6f107811758e9dc8ce938": {
+    "status": "not-applicable",
+    "reason": "局部Detect完整诊断存档：DDL创建专用表与run_id/B-tree、EPSG:4326 GiST索引，COPY写入已固定计算ROI的全部中间结果，或按run_id和事件标识等值关联/计数。输入SELECT仅遍历已精确ROI筛选的本地Parquet，无持久空间索引。此语句不执行新的空间范围候选检索。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#6798b9cd2ace1ac4578e61fb62727f8f6afc61047494b004ea4b8d11ada365ca": {
+    "status": "not-applicable",
+    "reason": "局部Detect完整诊断存档：DDL创建专用表与run_id/B-tree、EPSG:4326 GiST索引，COPY写入已固定计算ROI的全部中间结果，或按run_id和事件标识等值关联/计数。输入SELECT仅遍历已精确ROI筛选的本地Parquet，无持久空间索引。此语句不执行新的空间范围候选检索。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#19eb7608071cb75fa6aba2a178d95852c245dfc7d5b0f74426d99bf213030d63": {
+    "status": "not-applicable",
+    "reason": "局部Detect完整诊断存档：DDL创建专用表与run_id/B-tree、EPSG:4326 GiST索引，COPY写入已固定计算ROI的全部中间结果，或按run_id和事件标识等值关联/计数。输入SELECT仅遍历已精确ROI筛选的本地Parquet，无持久空间索引。此语句不执行新的空间范围候选检索。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#100aa491ec1dc33ee1161f419f914e68ce1169ff027a058c2f67975e3157fb7d": {
+    "status": "not-applicable",
+    "reason": "局部Detect完整诊断存档：DDL创建专用表与run_id/B-tree、EPSG:4326 GiST索引，COPY写入已固定计算ROI的全部中间结果，或按run_id和事件标识等值关联/计数。输入SELECT仅遍历已精确ROI筛选的本地Parquet，无持久空间索引。此语句不执行新的空间范围候选检索。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#02f80a47319d68275dc760768bf76cda1f3dad3d5acd688112f5fda38c2952f1": {
+    "status": "not-applicable",
+    "reason": "按run_id读取已存最终面并对已计算的in_evaluation_roi JSON布尔标记计数；空间归属在相同完整几何上预先计算，该SQL没有空间谓词，只需run_id索引。"
+  },
+  "services/pipeline/tests/v2/test_local_hpo_debug.py#fde9c5013bf506100d196c3c865dc3acdc36530b46f661826f62a1b0463de3b3": {
+    "status": "not-applicable",
+    "reason": "模拟诊断writer的单元测试，用CREATE前缀识别DDL字符串；不执行空间查询，不涉及业务数据或空间索引。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#297becc09160e33de2fae636682d85bce4783df47f11aa9ae09a065ca0befbca": {
+    "status": "not-applicable",
+    "reason": "同事务COPY后更新该诊断表的规划统计信息，使新增run_id及事件标识关联行数估计正确；ANALYZE不进行业务空间检索。身份关联使用run_id/source_key/calculation_index B-tree；geom GiST为EPSG:4326。真实L2新增UUID的关联SELECT修复前计划见docs/validation/sql-plans/hpo-debug-member-before.json，ANALYZE后完全相同SELECT的EXPLAIN见docs/validation/sql-plans/hpo-debug-member-after.json；前者Nested Loop估计1行，后者Hash Join。正式UPDATE的无执行EXPLAIN另存hpo-debug-member-after-update.json，也使用Hash Join。"
+  },
+  "services/pipeline/src/track/v2/experiments/intersection_hpo/local_debug.py#c39e79e560e0872301f0202608d416537d93c6d4643d62f86726cbb167cb0e59": {
+    "status": "not-applicable",
+    "reason": "同事务COPY后更新该诊断表的规划统计信息，使新增run_id及事件标识关联行数估计正确；ANALYZE不进行业务空间检索。身份关联使用run_id/source_key/calculation_index B-tree；geom GiST为EPSG:4326。真实L2新增UUID的关联SELECT修复前计划见docs/validation/sql-plans/hpo-debug-member-before.json，ANALYZE后完全相同SELECT的EXPLAIN见docs/validation/sql-plans/hpo-debug-member-after.json；前者Nested Loop估计1行，后者Hash Join。正式UPDATE的无执行EXPLAIN另存hpo-debug-member-after-update.json，也使用Hash Join。"
   }
 }

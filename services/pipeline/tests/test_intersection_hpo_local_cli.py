@@ -68,6 +68,8 @@ def test_prepare_freezes_identity_before_overwriting_inputs(tmp_path, monkeypatc
     _, _, _, identity = cli.prepare(config)
     assert calls[0]['seed'] == 42 and calls[0]['sizes'] == (20, 50)
     assert identity['inputs_sha256'] == 'inputs'
+    assert identity['evaluation'] == {'mode': 'center_distance', 'distance_m': 30., 'region_policy': 'centroid_covers'}
+    assert identity['label_semantics'] == 'location_region'
     cli.prepare(config)
     config.labels_file.write_text('changed')
     with pytest.raises(ValueError, match='identity changed'):
@@ -135,7 +137,7 @@ def test_best_export_uses_frozen_deduplicated_truth_and_resume_identity(tmp_path
     payload = tomllib.loads(ordinary.read_text())
     assert json.loads(Path(payload['cases']['sample']['truth_file']).read_text()) == truth
     assert 'Original case region differs' in ordinary.read_text()
-    assert payload['evaluation'] == {'mode': 'both', 'distance_m': 30., 'iou_threshold': .70}
+    assert payload['evaluation'] == {'mode': 'center_distance', 'distance_m': 30.}
     assert payload['schemes']['only']['detect']['min_turn_deg'] == 57.25
     assert cli._config_identity(cli.load_local_config(resume), selected) == before
 
@@ -182,3 +184,29 @@ def test_archive_preflight_reads_metadata_without_initializing(monkeypatch, miss
         cli._archive_preflight(selected)
     assert connection.read_only is True
     assert observed['statement'] == cli.ARCHIVE_PREFLIGHT_SQL
+
+
+def test_old_iou_objective_cannot_resume_into_location_objective(tmp_path, monkeypatch):
+    config = cli.load_local_config(config_file(tmp_path))
+    selected = workspace(tmp_path)
+    monkeypatch.setattr(cli, 'load_workspace', lambda *a, **k: selected)
+    monkeypatch.setattr('track.v2.experiments.intersection_hpo.adapters.threshold_config', lambda *a: None)
+    monkeypatch.setattr(cli, 'code_revision', lambda: 'fixed-code')
+    monkeypatch.setattr(cli, '_archive_preflight', lambda *a: None)
+    monkeypatch.setattr(cli, '_prepare_caches', lambda *a: {'cache_key': 'cache'})
+    calls = []
+    def inputs(*args, **kwargs):
+        calls.append(True)
+        return {'sha256': 'inputs', 'levels': {}}
+    monkeypatch.setattr(cli, 'prepare_local_inputs', inputs)
+    cli.prepare(config)
+    marker = config.output_root / 'preparation.json'
+    old = json.loads(marker.read_text())
+    old['config_identity']['evaluation'] = {'mode': 'both', 'distance_m': 30., 'iou_threshold': .70, 'region_policy': 'centroid_covers'}
+    old['config_identity'].pop('label_semantics')
+    marker.write_text(json.dumps(old))
+    before = marker.read_bytes()
+    with pytest.raises(ValueError, match='identity changed'):
+        cli.prepare(config)
+    assert len(calls) == 1
+    assert marker.read_bytes() == before
