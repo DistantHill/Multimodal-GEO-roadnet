@@ -492,5 +492,65 @@
   "services/pipeline/tests/test_intersection_hpo_local_adapter_postgres.py#e817d2ec0788a8696ce0dc20eb0fb96423d69cbe08bb42b6cb4cb022f69cd893": {
     "status": "not-applicable",
     "reason": "集成测试使用唯一临时schema/临时表：定义或读取单个合成路口、按experiment主键检查事务可见性；没有空间候选筛选需求，不读取业务轨迹表。"
+  },
+  "services/pipeline/src/track/v2/raster/polygon_inputs.py#114f6c6c01876ad152cc6c8e379f08ae257244a9d1728f0a5498f2a116520671": {
+    "status": "not-applicable",
+    "reason": "读取 GeoPackage 图层元数据，不筛选空间要素。"
+  },
+  "services/pipeline/src/track/v2/raster/polygon_inputs.py#77adaf491a69f0005d53d05bbe8637c2fa1dfd1d90ca7b34ded7ff3bee1889ac": {
+    "status": "not-applicable",
+    "reason": "按 srs_id 读取坐标参考系元数据，不涉及空间筛选。"
+  },
+  "services/pipeline/src/track/v2/raster/polygon_inputs.py#62ee9bde3e223e3dace39e93406c868204f0e87c64edf93e942d786cc31dbe65": {
+    "status": "not-applicable",
+    "reason": "用户要求遍历输入图层全部 polygon，完整读取所有要素，不能用空间索引排除任何要素。"
+  },
+  "services/pipeline/src/track/v2/raster/polygon_query.py#1e782d862db3c055a9ab0a319c33329cb4140f32373159e2842949b250d0f609": {
+    "status": "uses-index",
+    "indexes": [
+      "idx_trajectory_points_geom",
+      "idx_injected_points_geom"
+    ],
+    "crs": "EPSG:4326",
+    "plan": "/data/tmp/road-network/codex-artifacts/sql-plans/polygon-raster.json",
+    "plan_sha256": "9d66ae40507690384596bed0d86dcbd7e01f3aa1b9fa3516a2412a2a5a8bcee4"
+  },
+  "services/pipeline/tests/v2/test_polygon_raster.py#9de9467092dfe3782d222f1211cdb7f4e1ceecf7805e2b9cc316a8614a46ceda": {
+    "status": "not-applicable",
+    "reason": "测试用临时 SQLite GeoPackage 结构与完整要素插入，不执行空间查询或空间计算。"
+  },
+  "services/pipeline/tests/v2/test_polygon_raster.py#f45b2ca79c989c49bfa328caf820d2c4a3d4096314b0fc02fae5977ed7fa519c": {
+    "status": "not-applicable",
+    "reason": "测试用临时 SQLite GeoPackage 结构与完整要素插入，不执行空间查询或空间计算。"
+  },
+  "services/pipeline/tests/v2/test_polygon_raster.py#29d463179dd140c22336b6149aff5aedbadc3f6ef1ad8c9b62bda7216e793a22": {
+    "status": "not-applicable",
+    "reason": "隔离临时表测试夹具的 DDL 或单行参数化插入，构造点几何但不搜索候选数据；无需空间索引。生产筛选 SQL 单独提供真实空间索引计划。"
+  },
+  "services/pipeline/tests/v2/test_polygon_raster.py#72eee989faadd778213b9c79a4d75ba418e2ebc7aa641bcd55d780c44efb421e": {
+    "status": "not-applicable",
+    "reason": "隔离临时表测试夹具的 DDL 或单行参数化插入，构造点几何但不搜索候选数据；无需空间索引。生产筛选 SQL 单独提供真实空间索引计划。"
+  },
+  "services/pipeline/tests/v2/test_polygon_raster.py#816cde8fc3f22272fa7afa21228a1012175875bfb0c7e32dc78a8cb09424bcc3": {
+    "status": "not-applicable",
+    "reason": "隔离临时表测试夹具的 DDL 或单行参数化插入，构造点几何但不搜索候选数据；无需空间索引。生产筛选 SQL 单独提供真实空间索引计划。"
+  },
+  "services/pipeline/tests/v2/test_polygon_raster.py#c017cde83183e5afb7caa33389ef65fa5c9e7164cc687da5f8ef98cd729e61e9": {
+    "status": "not-applicable",
+    "reason": "隔离临时表测试夹具的 DDL 或单行参数化插入，构造点几何但不搜索候选数据；无需空间索引。生产筛选 SQL 单独提供真实空间索引计划。"
+  },
+  "services/pipeline/src/track/v2/raster/polygon_query.py#fd04e1f1325bc9a36ae12a7f6c50e54d6c8a83b98fb29ca5d441c969f8fae957": {
+    "status": "uses-index",
+    "indexes": [
+      "idx_trajectory_points_geom_utm32649",
+      "idx_injected_points_geom_utm32649"
+    ],
+    "crs": "EPSG:32649",
+    "plan": "/data/tmp/road-network/codex-artifacts/sql-plans/polygon-raster-utm-buffer.json",
+    "plan_sha256": "d6e1496d988379c0320b380e2c863e758bda6f0a804b777549323b2682cb9bcf"
+  },
+  "services/pipeline/src/track/v2/cli/init_db.py#a3de6e1a043a880c0b8b2d9ca509f14ab806fd3dbedb60c6c5527f2571846773": {
+    "status": "not-applicable",
+    "reason": "DDL 新建 injected 点表的 UTM 32649 表达式 GiST 索引，本身不是候选空间查询；实际使用计划见 polygon-raster-utm-buffer.json。"
   }
 }

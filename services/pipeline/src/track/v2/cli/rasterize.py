@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import uuid
+from pathlib import Path
 
 from ..config import connect
 from ..db.schema import require_current_schema
@@ -30,7 +31,15 @@ def main() -> int:
     parser.add_argument("--time-start", help="Inclusive ISO timestamp with timezone; empty uses Refine start")
     parser.add_argument("--time-end", help="Exclusive ISO timestamp with timezone; empty uses Refine end")
     parser.add_argument("--ask-password", action="store_true")
+    parser.add_argument("--polygons", type=Path, nargs='+',
+                        help="TP_*.gpkg / FP_*.gpkg: one labelled sample per polygon")
+    parser.add_argument("--buffer-m", type=float, default=300.0,
+                        help="Outward polygon buffer in metres before taking the image bbox (default 300)")
+    parser.add_argument("--polygon-label", choices=['TP', 'FP'],
+                        help="Explicit label for inputs without a TP_/FP_ prefix, e.g. validation truth")
     args = parser.parse_args()
+    if args.polygons and (args.bounds or not args.time_start or not args.time_end):
+        parser.error("--polygons requires --time-start and --time-end and cannot use --bounds")
     try:
         config = load_startup_config(ask_password=args.ask_password)
         request = RasterRunRequest(args.refine_id, config.paths.data_root,
@@ -38,6 +47,15 @@ def main() -> int:
                                    time_start=args.time_start, time_end=args.time_end)
         with connect(config.postgres) as conn:
             require_current_schema(conn)
+            if args.polygons:
+                from ..raster.polygon_samples import run_polygon_samples
+                output = run_polygon_samples(
+                    conn, refine_id=args.refine_id, paths=args.polygons,
+                    output_root=config.paths.data_root, time_start=args.time_start,
+                    time_end=args.time_end, config=config.raster,
+                    buffer_m=args.buffer_m, label_override=args.polygon_label)
+                print_json({"output_directory": str(output), "gallery": str(output / 'index.html')})
+                return 0
             result = run_rasterization(conn, request, config.raster)
         print_json({"raster_run_id": result.raster_run_id,
                     "output_directory": str(result.output_directory),

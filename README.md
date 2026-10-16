@@ -295,6 +295,57 @@ Pipeline 命令行和栅格化命令均支持 `--time-start` / `--time-end`。�
 实际运行使用的数据库。本次测试只在隔离 schema 中验证迁移，不自动修改业务数据库。
 
 
+## 按 polygon 生成带标签的栅格样本
+
+`python -m pipeline rasterize --polygons` 接收一个或多个 `TP_*.gpkg` / `FP_*.gpkg`，
+按文件名前缀标注 TP / FP。逐图层、逐要素生成样本，保留 feature ID、原属性和原文件
+SHA-256；不合并或去重 polygon。输入要求为有效、非空的 Polygon / MultiPolygon，
+支持孔洞和坐标系转换；不自动修复无效几何。
+
+```sh
+python -m pipeline rasterize \
+  --refine-id 6c9acb0c-f356-49ce-81d0-2dd7dad51e68 \
+  --time-start 2023-03-01T00:00:00+08:00 \
+  --time-end 2023-03-07T00:00:00+08:00 \
+  --buffer-m 300 \
+  --polygons /data/labels/FP_intersection_fuping.gpkg /data/labels/TP_intersection_fuping.gpkg /data/labels/TP_intersection_fupingjiaoqu.gpkg /data/labels/TP_intersection_yanliang.gpkg
+```
+
+通过 `PIPELINE_CONFIG_PATH` 选择配置；本例使用 `services/pipeline/config/pipeline.toml` ，
+读取 `[raster].resolution_m = 10.0`。两端时间必须显式给定并包含时区，按左闭右开
+区间筛选，所以例子包含北京时间 3 月 6 日全天。此样本入口直接筛选已有 Refine 点，
+即使窗口内无数据也保留空样本，不补造窗口内缺失的点。
+
+kept 和 injected 分支均按 `ST_Transform(geom, 32649)` 的 UTM 表达式 GiST 索引
+筛选；kept 再连接本次 Refine 成员。索引分别为 `idx_trajectory_points_geom_utm32649`
+和 `idx_injected_points_geom_utm32649`，数据库初始化已包含两者。两分支均执行时间
+条件，再用 `UNION ALL` 连接，不排序、不去重。
+
+`--buffer-m` 默认 300 米：原始 polygon 投影到 UTM 后向外 buffer，再取外接矩形，
+以 `ST_Covers` 筛选矩形内全部点；矩形角落位于 buffer 外的点也保留。300 米在
+10 m/px 下对应向外约 30 像素。原始 polygon 不扩大，映射到同一网格作为分割标签，
+掩膜按像元中心覆盖生成，保留孔洞。可用 `--polygon-label TP` 为验证文件显式标注。
+
+每个样本按矩形范围向外对齐全局像元网格；恰在东侧或南侧网格线上的边界点也有
+对应像元，因此图像边界最多多出一个像元的网格对齐空间。各样本复用 raster 的非零
+像元 Q95、线性分位数插值和平方根灰度映射；Q95 在每个矩形窗口内计算，灰度不能直接作为
+跨样本的绝对点密度比较，绝对计数保存在 `raw_count.tif` 。重叠 polygon 可以包含
+相同点，因此样本点数之和不是去重后的全区域点数。
+
+产物位于 `DATA_ROOT/raster/polygon-samples/<run_id>/` ，包括：
+
+- `index.html` ：可按 TP / FP / 空样本筛选的本地预览页。
+- `contact_sheet_*.jpg` ：每页最多 40 个样本的标注总览。
+- `samples.csv` 、 `annotations.geojson` 、 `run_manifest.json` ：标签、计数、地理几何与来源记录。
+- 各样本的 `gray.png` 、 `gray_uint8.tif` 、 `raw_count.tif` ：原生分辨率图像与计数。
+- 各样本的 `annotation.json` ：TP/FP 标签、WGS84 几何、像素边缘坐标系几何（含孔洞）、网格、Q95。
+- 各样本的 `polygon_mask.png` ：原始 polygon 的二值掩膜；此几何掩膜与训练前景类别政策分开保存。
+- 各样本的 `annotated.png` ：带标签和边界的最近邻放大预览；原始灰度图不叠加文字或边界。
+
+样本尺寸取决于 polygon 大小，不按 `tile_size_px` 放大或填充为 1024 像素训练切片。
+所有样本和 GeoTIFF 验证成功后才发布最终目录；失败不会留下完整状态的半成品。
+YOLOv8 分割数据转换、训练和独立验证见 `services/vision/README.md` 。
+
 ## Refine 航向与短子轨迹
 
 三份 Pipeline 运行 TOML 的 `[refine].min_subtrack_points` 暂定为 10，必须是正整数。

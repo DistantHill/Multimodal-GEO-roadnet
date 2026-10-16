@@ -678,6 +678,11 @@ INDEX_STATEMENTS: list[tuple[str, str]] = [
         "ON injected_points USING GIST (geom)",
     ),
     (
+        "idx_injected_points_geom_utm32649",
+        "CREATE INDEX IF NOT EXISTS idx_injected_points_geom_utm32649 "
+        "ON injected_points USING GIST (ST_Transform(geom, 32649))",
+    ),
+    (
         "idx_resolved_points_final",
         "CREATE INDEX IF NOT EXISTS idx_resolved_points_final "
         "ON resolved_subtrack_points(detect_id, subtrack_index, sequence_in_subtrack)",
