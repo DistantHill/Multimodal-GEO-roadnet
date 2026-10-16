@@ -5,7 +5,9 @@ import ast
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -104,6 +106,17 @@ def plan_nodes(value):
             yield from plan_nodes(child)
 
 
+def external_plan_root(root: Path) -> Path:
+    """Use the same DATA_ROOT resolution as the user's artifact-routing hook."""
+    source = Path(__file__).with_name('artifact_routing.py')
+    spec = importlib.util.spec_from_file_location('_sql_artifact_routing', source)
+    routing = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(routing)
+    configured, _ = routing.data_root(root, dict(os.environ))
+    base = configured if configured is not None else routing.FALLBACK_ROOT / routing.project_name(root)
+    return (base / 'codex-artifacts').resolve()
+
+
 def review_error(root: Path, record: dict) -> str | None:
     if not isinstance(record, dict):
         return '缺少 SQL 空间索引检查记录'
@@ -122,12 +135,16 @@ def review_error(root: Path, record: dict) -> str | None:
     if not isinstance(plan_name, str) or not plan_name:
         return '必须提供 EXPLAIN (FORMAT JSON) 计划文件'
     plan_path = (root / plan_name).resolve()
-    if not plan_path.is_relative_to(root):
-        return '计划文件必须位于项目内'
+    external = not plan_path.is_relative_to(root)
+    if external and not plan_path.is_relative_to(external_plan_root(root)):
+        return '外部计划文件必须位于项目 DATA_ROOT 或备用目录下的 codex-artifacts 目录内'
     try:
-        plan = json.loads(plan_path.read_text())
+        contents = plan_path.read_bytes()
+        plan = json.loads(contents)
     except (OSError, ValueError):
         return '计划文件不存在或不是有效 JSON'
+    if external and record.get('plan_sha256') != hashlib.sha256(contents).hexdigest():
+        return '外部计划文件必须提供与实际内容一致的 plan_sha256'
     # Merely mentioning an index in SQL or a Filter is not index access.
     used = {node.get('Index Name') for node in plan_nodes(plan)
             if node.get('Node Type') in {'Index Scan', 'Index Only Scan', 'Bitmap Index Scan'}

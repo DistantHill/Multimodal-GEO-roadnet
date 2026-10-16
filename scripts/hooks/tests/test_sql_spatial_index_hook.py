@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 import uuid
 
 spec = importlib.util.spec_from_file_location('sql_spatial_index', Path(__file__).resolve().parents[1] / 'sql_spatial_index.py')
@@ -128,6 +129,38 @@ class SqlSpatialHookTest(unittest.TestCase):
         self.event('PostToolUse')
         self.source.unlink()
         self.assertIsNone(self.event('Stop'))
+
+    def test_external_plan_requires_approved_data_root_and_matching_digest(self):
+        with tempfile.TemporaryDirectory() as data:
+            plan = Path(data) / 'codex-artifacts' / 'sql-plans' / 'plan.json'
+            plan.parent.mkdir(parents=True)
+            plan.write_text(json.dumps([{'Plan': {'Node Type': 'Bitmap Index Scan',
+                'Index Name': 'points_geom', 'Index Cond': '(geom && $1)'}}]))
+            record = {'status': 'uses-index', 'indexes': ['points_geom'],
+                      'crs': 'EPSG:4326', 'plan': str(plan)}
+            with patch.dict(hook.os.environ, {'DATA_ROOT': data}):
+                self.assertIn('plan_sha256', hook.review_error(self.root, record))
+                record['plan_sha256'] = hook.hashlib.sha256(plan.read_bytes()).hexdigest()
+                self.assertIsNone(hook.review_error(self.root, record))
+                plan.write_text(json.dumps([{'Plan': {'Node Type': 'Seq Scan'}}]))
+                self.assertIn('plan_sha256', hook.review_error(self.root, record))
+                record['plan_sha256'] = hook.hashlib.sha256(plan.read_bytes()).hexdigest()
+                self.assertIn('扫描节点', hook.review_error(self.root, record))
+            with patch.dict(hook.os.environ, {'DATA_ROOT': str(self.root / 'different')}):
+                self.assertIn('外部计划文件必须', hook.review_error(self.root, record))
+
+    def test_external_plan_symlink_must_not_escape_approved_directory(self):
+        with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / 'plan.json'
+            target.write_text('[]')
+            link = Path(data) / 'codex-artifacts' / 'plan.json'
+            link.parent.mkdir()
+            link.symlink_to(target)
+            record = {'status': 'uses-index', 'indexes': ['points_geom'],
+                      'crs': 'EPSG:4326', 'plan': str(link),
+                      'plan_sha256': hook.hashlib.sha256(target.read_bytes()).hexdigest()}
+            with patch.dict(hook.os.environ, {'DATA_ROOT': data}):
+                self.assertIn('外部计划文件必须', hook.review_error(self.root, record))
 
     def test_tools_outside_project_do_not_touch_state(self):
         self.assertIsNone(hook.handle({'cwd': '/', 'hook_event_name': 'PostToolUse'}, self.root))

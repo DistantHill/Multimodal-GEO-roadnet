@@ -55,6 +55,20 @@ Backend and Pipeline tests use `pytest`. Name files `test_*.py` and test behavio
 末尾内容；监控记录保存到仓库外。启动方式见 README 的“全量测试日志监控”。
 按用户请求或任务完成后一次性读取记录，不用会话内轮询脚本来替代日志轮询。
 
+## 运行产物与临时文件（项目记忆）
+
+- 测试运行证据 JSON、验证结果、轮询及监控记录、运行日志、截图、导出数据和开发
+  中间文件默认保存在仓库外，不随意写入当前工作目录或 Git 工作区。
+- 优先读取项目 `DATA_ROOT`：进程环境变量优先，其次项目根目录的 ` .env ` 。
+  在该目录下使用 ` codex-artifacts/<项目标识>/<会话标识>/ ` ，按 `evidence`、`logs`、
+  `metrics`、`screenshots`、`exports`、`scratch` 等用途分类，需要时才创建。
+- 没有配置 `DATA_ROOT`，或其路径落在仓库内部时，使用
+  ` /data/tmp/<项目名>/codex-artifacts/<项目标识>/<会话标识>/ ` ，不要退回仓库保存。
+- 每轮开始先结合会话任务判断可能产生的运行产物，规划对应目录；结束时记录实际
+  使用的路径。源码、测试代码、正式文档和应纳入版本管理的配置照常保留在仓库。
+- SQL 审查登记及其受专门 hook 约束的计划文件仍遵循上方 SQL 审查流程；本条不免除
+  审查，也不自动迁移已有证据。HTML 产物按预览 hook 规则保存在已登记的仓库外保存区；源码模板保留在仓库。
+
 ## Commits and Pull Requests
 
 This checkout has no valid Git history, so no convention can be inferred. Use concise imperative messages, preferably Conventional Commit style (for example, `feat: add pipeline run endpoint`). PRs should explain architectural impact, list validation commands, identify configuration or data-directory changes, and include UI screenshots when relevant. Never commit `.env`, credentials, runtime data, model weights, database files, or Qdrant storage.
