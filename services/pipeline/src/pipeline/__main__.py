@@ -1,103 +1,76 @@
+"""One CLI, one selected TOML; algorithm flags and environment overrides absent."""
 from __future__ import annotations
 
 import argparse
-import signal
+import json
+from pathlib import Path
 import sys
-import tempfile
-import time
-from track.v2.config import PipelineConfig
-from track.v2.cli._load_config import load_startup_config
+
+from .config import load_config
 
 
-def check_config(config: PipelineConfig) -> int:
-    print(f"paths.data_root={config.paths.data_root}")
-    print(f"paths.parquet_directory={config.paths.parquet_directory}")
-    print(f"logging.directory={config.logging.directory}")
-    print(f"postgres.host={config.postgres.host}")
-    roots = {
-        "paths.data_root": config.paths.data_root,
-        "paths.parquet_directory": config.paths.parquet_directory,
-        "logging.directory": config.logging.directory,
-    }
-    if any(not path.is_absolute() for path in roots.values()):
-        print("ERROR: runtime roots must be absolute paths")
-        return 1
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Road-network parameter experiment workbench")
+    parser.add_argument("command", choices=("run", "tune", "preview-labels", "list-labels", "check-config", "inspect"))
+    parser.add_argument("--config", type=Path, default=Path("pipeline.toml"), help="The only parameter/input configuration")
+    args = parser.parse_args(argv)
     try:
-        data_root = config.paths.data_root.resolve(strict=False)
-        for name, path in roots.items():
-            path.mkdir(parents=True, exist_ok=True)
-            if not path.is_dir():
-                raise OSError(f"{name} is not a directory: {path}")
-            with tempfile.NamedTemporaryFile(dir=path):
-                pass
-    except (OSError, ValueError) as exc:
-        print(f"ERROR: invalid runtime directory: {exc}")
-        return 1
-    return 0
-
-
-def serve(config: PipelineConfig) -> int:
-    """Keep the independent batch runtime available in the Compose stack."""
-
-    print("Pipeline runtime ready. Start a run with `python -m pipeline run ...`.")
-    print(f"Runtime data root: {config.paths.data_root}")
-    stopped = False
-
-    def stop(_signum: int, _frame: object) -> None:
-        nonlocal stopped
-        stopped = True
-
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
-    while not stopped:
-        time.sleep(1)
-    return 0
-
-
-def main() -> int:
-    delegated_modules = {
-        "experiment": "experiment",
-        "artifacts": "reconcile_artifacts",
-        "delete-run": "delete_run",
-        "import-trajectories": "import_trajectories",
-        "init-db": "init_db",
-        "replay": "replay_run",
-        "run": "run_pipeline",
-        "semantic-diff": "compare_run_lineages",
-        "rasterize": "rasterize",
-    }
-    if len(sys.argv) > 1 and sys.argv[1] in delegated_modules:
-        command, forwarded = sys.argv[1], sys.argv[2:]
-        if command == "experiment":
-            from track.v2.cli.experiment import main as delegated_main
-        elif command == "init-db":
-            from track.v2.cli.init_db import main as delegated_main
-        elif command == "artifacts":
-            from track.v2.cli.reconcile_artifacts import main as delegated_main
-        elif command == "run":
-            from track.v2.cli.run_pipeline import main as delegated_main
-        elif command == "semantic-diff":
-            from track.v2.cli.compare_run_lineages import main as delegated_main
-        elif command == "delete-run":
-            from track.v2.cli.delete_run import main as delegated_main
-        elif command == "import-trajectories":
-            from track.v2.cli.import_trajectories import main as delegated_main
-        elif command == "rasterize":
-            from track.v2.cli.rasterize import main as delegated_main
+        config = load_config(args.config)
+        if args.command == "check-config":
+            from .resources import _native_module, validate_heap_profiler
+            native = _native_module()
+            result = {"status": "VALID", "config": str(args.config.resolve()),
+                      "native_extension": native.__file__, "processing_crs": config["input"]["processing_crs"],
+                      "output_root": config["output"]["root"], "database_enabled": config["database"]["enabled"]}
+            if config["resources"]["heap_profile"]:
+                result["heap_profiler"] = validate_heap_profiler()
+            if config["labels"]:
+                from .labels import load_labels
+                labels = load_labels(config["labels"], config["input"]["processing_crs"], args.config.resolve().parent)
+                result["labels"] = labels.metadata
+            if config["tuning"]["search_space"]:
+                from .tune import validate_search_space
+                result["search_space"] = validate_search_space(config)
+        elif args.command == "list-labels":
+            from .labels import list_layers
+            paths = sorted({item["path"] for item in config["labels"].values()
+                            if isinstance(item, dict) and "path" in item})
+            result = {path: list_layers(path) for path in paths}
+        elif args.command == "preview-labels":
+            from .labels import load_labels, prepare_labels
+            labels = load_labels(config["labels"], config["input"]["processing_crs"], args.config.resolve().parent)
+            result = prepare_labels(labels, Path(config["output"]["root"]) / "labels")
+        elif args.command == "inspect":
+            latest = json.loads((Path(config["output"]["root"]) / "latest.json").read_text())
+            result = json.loads((Path(latest["run_dir"]) / "run.json").read_text())
+        elif args.command == "run":
+            from .runner import run_pipeline
+            run = run_pipeline(config, args.config)
+            result = {"status": "COMPLETE", "run_id": run["run_id"], "run_dir": run["run_dir"],
+                      "counts": run["manifest"]["counts"], "resources": run["metrics"]}
         else:
-            from track.v2.cli.replay_run import main as delegated_main
-
-        sys.argv = [f"track.v2.cli.{delegated_modules[command]}", *forwarded]
-        return delegated_main()
-
-    parser = argparse.ArgumentParser(description="Roadnet pipeline runtime")
-    parser.add_argument("command", choices=("check-config", "serve"))
-    parser.add_argument("--ask-password", action="store_true")
-    args = parser.parse_args()
-    config = load_startup_config(ask_password=args.ask_password)
-    if args.command == "check-config":
-        return check_config(config)
-    return serve(config)
+            from .runner import monitor_options, run_isolated, run_pipeline
+            from .resources import ResourceMonitor
+            from .source import prepare_source
+            from .tune import tune
+            from .labels import load_labels
+            labels = load_labels(config["labels"], config["input"]["processing_crs"], args.config.resolve().parent)
+            with ResourceMonitor(Path(config["output"]["root"]) / "input-resources", **monitor_options(config)) as monitor:
+                with monitor.stage("input"):
+                    source = prepare_source(config, Path(config["output"]["root"]), monitor)
+            callback = lambda effective, region, directory: run_isolated(effective, args.config,
+                source=source, region=region, output_dir=directory)
+            result = tune(config, args.config, callback, source.identity, labels=labels)
+            best = run_pipeline(result["best_config"], Path(result["best_config_path"]), source=source)
+            result["best_full_run"] = {"run_id": best["run_id"], "run_dir": best["run_dir"], "counts": best["manifest"]["counts"]}
+            from .artifacts import write_json
+            write_json(Path(result["best_config_path"]).parent / "best-full-run.json", result["best_full_run"])
+            result.pop("best_config", None)
+        print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+        return 0
+    except (ValueError, RuntimeError, OSError) as error:
+        print(f"ERROR [{type(error).__name__}]: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
