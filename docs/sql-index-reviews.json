@@ -680,5 +680,133 @@
     "plan": "/data/tmp/road-network/codex-artifacts/sql-plans/grid-runtime-20261014/grid-2-0-cursor-explain.json",
     "reason": "正式 fetch_points_in_grid 生成的完整参数化 SQL，按当前 Refine 与四个慢网格分别 EXPLAIN SELECT 和 DECLARE CURSOR。源点分支使用 EPSG:32649 表达式 GiST 的空间 Index Cond；注入点分支仍为纯 x/y 条件并顺序扫描，未将其误记为使用空间索引。邻点允许网格外上下文，采用 Refine/子轨迹顺序 B-tree 而非空间索引。",
     "plan_sha256": "b841e331b362ffa63f3f5bf162e2fcfa3773e9417f8d3ccce92a7a6827e525a4"
+  },
+  "services/pipeline/src/pipeline/database.py#764b937727a4fbb44f87f91b1fcdb62e279c900c64095029588147ee886d048e": {
+    "status": "not-applicable",
+    "reason": "以 Set 开头的连接环境变量缺失提示，被静态扫描器识别为 SQL；实际为 Python ValueError 文本，不执行数据库语句。"
+  },
+  "services/pipeline/src/pipeline/database.py#f895a02b4cc41b19fa720b76ee338e04a03e0f0a45483cc26ff7efd742b2f586": {
+    "status": "not-applicable",
+    "reason": "仅读取 pg_extension 检查 PostGIS 是否已安装，属于系统元数据检查，无空间过滤或几何计算，不适用空间索引。"
+  },
+  "services/pipeline/src/pipeline/database.py#aa9db02df759752d9c95e2c0d3802656f6e95ae20f65f803180fd2e57417692d": {
+    "status": "not-applicable",
+    "reason": "创建用户指定的最终成果 schema，属于 DDL，不读取空间数据，也不执行空间候选检索，无可供 EXPLAIN 的空间查询计划。"
+  },
+  "services/pipeline/src/pipeline/database.py#e6528527a847d81cc29a0a3add0fb923896884fab6f00ed568251acd0580981c": {
+    "status": "not-applicable",
+    "reason": "仅为最终 intersections 或 centerlines 创建含主键、阶段血缘、完整属性和 EPSG:4326 geometry 的表结构；DDL 不执行空间筛选。后续独立 DDL 创建 geom GiST 索引；没有连接真实 PostgreSQL，未声称验证在线索引使用。"
+  },
+  "services/pipeline/src/pipeline/database.py#7a3e682cddcf8280ed7895ce5bb6090099cff1d99095bb39d0dffed38267f586": {
+    "status": "not-applicable",
+    "reason": "为最终成果表的 EPSG:4326 geom 列创建 GiST 空间索引，本语句是索引 DDL，不是通过空间谓词检索行的查询，因而不使用 uses-index 查询计划声明；真实 PostgreSQL 索引创建尚未在线验证。"
+  },
+  "services/pipeline/src/pipeline/database.py#e74b134c4b9ca174b15db07febc140a97117a88cdb55136ba6053d99c524b6ba": {
+    "status": "not-applicable",
+    "reason": "直接将已转换为 EPSG:4326 的最终交叉口/中心线通过参数化 VALUES 和 ST_GeomFromWKB 写入；不存在读取空间候选、回表或空间筛选步骤。目标 geom 列配置 GiST 索引供后续交互查询使用，该 INSERT 没有可用空间索引筛选语义。"
+  },
+  "services/pipeline/tests/workbench/test_database.py#137e91d70db13c3894fdc15f39feba7b952e4d5b718b65be857723d0b32067c3": {
+    "status": "not-applicable",
+    "reason": "本地连接替身测试中的字符串断言，用于确认发布模块不会发送 CREATE EXTENSION；该文字不被执行，无空间查询计划。"
+  },
+  "services/pipeline/tests/workbench/test_database.py#90fbed669d7977875e71f8ea975a8081cfc2af9824be72b2ff715352cf27f20d": {
+    "status": "not-applicable",
+    "reason": "本地连接替身测试中的字符串断言，用于确认发布模块不会发送 TRUNCATE；该文字不被执行，无空间查询计划。"
+  },
+  "services/pipeline/tests/workbench/test_database.py#65daeb378bdec35d90224389f6e10917bcc0b94c90c489014ba156dd6cbf9350": {
+    "status": "not-applicable",
+    "reason": "本地连接替身测试中的字符串断言，用于确认发布模块不会发送 DELETE；该文字不被执行，无空间查询计划。"
+  },
+  "services/pipeline/tests/workbench/test_database.py#fde9c5013bf506100d196c3c865dc3acdc36530b46f661826f62a1b0463de3b3": {
+    "status": "not-applicable",
+    "reason": "本地连接替身测试中的字符串断言，用于确认缺少 PostGIS 时在任何 CREATE 语句前失败；该文字不被执行，无空间查询计划。"
+  },
+  "services/pipeline/tests/workbench/test_database.py#adadcfaec81fa8e3f035a7527ed4d429118cc207010eba6f108f3771d559eb0e": {
+    "status": "not-applicable",
+    "reason": "本地连接替身测试通过 CREATE SCHEMA 文本前缀定位已捕获的 DDL，以检查标识符转义；这是断言字符串，没有发送到数据库。"
+  },
+  "services/pipeline/tests/workbench/test_database.py#ebc5703b87c2fb28e6b40cbe62a2c2abf4584991c6e492d00a6dc2f3625b72b3": {
+    "status": "not-applicable",
+    "reason": "本地连接替身测试中的预期 SQL 文本，确认包含分号和引号的用户 schema 名被完整作为一个引用标识符，不会执行嵌入的 DROP SCHEMA；该字符串只用于相等断言，不连接数据库。"
+  },
+  "services/pipeline/src/pipeline/clip.py#450bbe29a7ea24c70166828896c523741b987117cd67fc0bf340a9c76f4f0124": {
+    "status": "not-applicable",
+    "reason": "从精炼结果 Parquet 读取自包含点记录，并按 vehicle_id/subtrack_id/sequence 外排，确保跨 Arrow 批次仍保留完整子轨迹供 C++ 裁切。查询没有空间筛选；文件扫描没有可用的 PostgreSQL/GiST 空间索引，按位置截断会破坏完整轨迹上下文。"
+  },
+  "services/pipeline/src/pipeline/detect.py#c1b4873a44d8c282e4bc8535f57de3e528fd7d2fd73744ef9a71b474401b948a": {
+    "status": "not-applicable",
+    "reason": "从精炼点 Parquet 按车辆、子轨迹索引和序号外排，向 C++ 转向算子提供全部连续点；没有空间谓词，必须保留完整轨迹顺序。来源是独立文件而非具有空间索引的数据库表。"
+  },
+  "services/pipeline/src/pipeline/detect.py#35284c8405c981476ab08f70f16eeacc8b805d322f766afd7f3adcf04cfb8036": {
+    "status": "not-applicable",
+    "reason": "扫描线段 Parquet 中满足长度上限的全部记录，用同一 processing_crs 米制坐标下的标量 bbox 计算网格覆盖次数，提前检查 max_grid_memberships；这是全体合格线段的容量统计，不是空间邻域检索，文件中没有可用的 GiST/R-tree 索引。"
+  },
+  "services/pipeline/src/pipeline/detect.py#92bd89270e3e75e9aab37e566c57283bba0657f1864669b600cd8b0fbd07c1c7": {
+    "status": "not-applicable",
+    "reason": "按标量 length_m 条件统计所有被长度上限排除的 Parquet 线段，供阶段计数审计；无空间谓词，也无空间候选可通过索引缩小而保持完整计数。"
+  },
+  "services/pipeline/src/pipeline/detect.py#a1c48be5d3dfec19d184c808e119f14d7180d385acf7eefe0bbbe1ce228e2ca6": {
+    "status": "not-applicable",
+    "reason": "读取通过长度检查的全部 Parquet 线段，使用与 processing_crs 一致的米制 bbox 枚举其覆盖网格并外排到 segment_tiles.parquet。此步骤是在构建文件中的网格候选组织，尚无可使用的数据库空间索引；提前的覆盖数检查限制复制规模，后续 C++ 在网格内执行精确空间计算。"
+  },
+  "services/pipeline/src/pipeline/detect.py#1fa8af7bc462e9d2aaa6b71c750380684340f71acf9e0c84b4f34300f4ecc795": {
+    "status": "not-applicable",
+    "reason": "按 tile_x/tile_y/segment_order 顺序流式读取已生成的线段网格 Parquet，逐网格交给 C++ 求交并保持分组完整；需遍历全部网格，不存在限定空间范围的数据库检索。文件无 GiST 空间索引，候选范围由预先保存的网格身份控制。"
+  },
+  "services/pipeline/src/pipeline/detect.py#893702c5520ebc9b666d1ee97e3456b62e007df2fc040f60bcafefc9afd66a4b": {
+    "status": "not-applicable",
+    "reason": "拓扑验证已先按 tile_x/tile_y 及米制 bbox 相交条件缩小 Parquet 候选，坐标与 input.processing_crs 和 topology_radius_m 一致，再去重并由 C++ 做精确邻域验证。来源是文件扫描，不存在 PostgreSQL GiST/R-tree 索引；实际 DuckDB EXPLAIN (FORMAT JSON) 显示 READ_PARQUET 节点及 bbox Filters 下推，未把文件谓词下推冒充空间索引扫描。"
+  },
+  "services/pipeline/src/pipeline/fit.py#d4e609a5ef4eb23aaf831143abb40a5481dd5b861d795ace84578a13693783b0": {
+    "status": "not-applicable",
+    "reason": "在裁切结果 Parquet 中按 clip_type 标量类型选取交叉口之间的片段，按端点身份 pair_a/pair_b/clip_id 外排并保留每个拟合组的全部成员。没有几何检索谓词；文件无数据库空间索引，空间过滤会改变拟合组的样本集合。"
+  },
+  "services/pipeline/src/pipeline/legacy.py#9020ad193e32d0d3e4d1213fb9a47dd7ccddc3ba10af027e3c9b6651c45f92ff": {
+    "status": "not-applicable",
+    "reason": "兼容入口 argparse 的 delete-run 子命令名称被 SQL_START 误识别；此字符串不是 SQL 语句，不在新参数试验台执行数据库删除。"
+  },
+  "services/pipeline/src/pipeline/refine.py#c7c2b5aba25a06104b122b48440282910f35e3899cf35c6af762a3b3650d65bb": {
+    "status": "not-applicable",
+    "reason": "静态 hook 捕获的是运行时拼接查询的 SELECT 前缀。实际查询添加车辆/序号排序，区域实验还添加同一 processing_crs 下含 context_halo_m 的 x/y 范围；两种完整 SQL 已另外按真实内容哈希登记并 EXPLAIN 检查。来源是自包含 Parquet，无数据库空间索引；区域分支使用 READ_PARQUET 标量范围谓词下推。"
+  },
+  "services/pipeline/src/pipeline/source.py#34597eecd5fbc555fbba9175997e9dd93f653b38958c9c5e74cc6591101bdaae": {
+    "status": "not-applicable",
+    "reason": "以 Set 开头的来源连接密钥缺失提示，被扫描器识别为 SQL；实际为 Python ValueError 文本，不执行数据库语句。"
+  },
+  "services/pipeline/src/pipeline/source.py#ccafaaa2c2ca730fb62de1bb5498d88ec40f5c680c575e871d1ac64a242bb7a9": {
+    "status": "not-applicable",
+    "reason": "在只读 REPEATABLE READ 事务内，通过命名游标分批导出用户指定来源表的完整不可变快照，保留所有原始属性。查询没有空间谓词；全量快照必须覆盖所有位置，空间索引筛选会改变快照语义。来源表不执行 DDL/DML，也不声称该全表读取使用空间索引。"
+  },
+  "services/pipeline/src/pipeline/source.py#34f583811146b2b45bfe5ee74a565168bf27689f0af9f6f0bc201c00ad70824d": {
+    "status": "not-applicable",
+    "reason": "对归一化 Parquet 的 source_id 分组检查主键重复，必须检查全部有效输入点；仅涉及身份和计数，没有几何计算或空间筛选。"
+  },
+  "services/pipeline/src/pipeline/source.py#631fdcf108119d54af9745514a308d7be30245118c47c890d24752bcdb636006": {
+    "status": "not-applicable",
+    "reason": "对归一化 Parquet 的 vehicle_code 分组并检查 distinct vehicle_id，检测车辆身份哈希碰撞；仅处理标量身份，不涉及空间谓词或几何计算。"
+  },
+  "services/pipeline/src/pipeline/source.py#c25c52ec72fda6273efa996f9ffbb9c81ed1859777d336ff468fedb7d5b31fb1": {
+    "status": "not-applicable",
+    "reason": "对完整归一化 Parquet 按车辆、时间及来源主键外排，通过 row_number 确定连续 source_seq，保存每行全部属性与几何。没有空间谓词，空间过滤会改变序号及轨迹完整性；DuckDB 文件扫描/外排无可应用的 PostgreSQL 空间索引。"
+  },
+  "services/pipeline/tests/workbench/test_source.py#9ad56a31800effaa5bfdcebe8cf43cc53deddb96e1111f5d24a22efa66bfbab9": {
+    "status": "not-applicable",
+    "reason": "测试从临时 Parquet 按 vehicle_id/sequence 读取少量固定记录，验证 Arrow 批次边界不拆分车辆组；查询无空间谓词或几何计算，文件没有数据库空间索引。"
+  },
+  "services/pipeline/tests/workbench/test_source.py#aa47910af29528f98f652d8548452d64e94be8b7b4ae1ee4d07555c611c41dc1": {
+    "status": "not-applicable",
+    "reason": "测试读取注册为 DuckDB 关系的内存 Arrow points 数据并按 vehicle 身份排序，验证行数和点数组长度的分组资源上限；无空间过滤或几何运算，内存测试关系没有空间索引。"
+  },
+  "services/pipeline/src/pipeline/refine.py#577d101ec85f51b92c5432df071b297d780bb80823befb4eac38a1e2f704e8b2": {
+    "status": "not-applicable",
+    "reason": "运行时组合后的全域 refine 查询：从完整 Parquet 快照按车辆和来源序号外排，必须保留全部位置。没有空间过滤，文件无可用的数据库空间索引；实际 DuckDB EXPLAIN (FORMAT JSON) 显示 READ_PARQUET 文件扫描。",
+    "runtime_composed": true,
+    "sql": "SELECT * FROM read_parquet(?) ORDER BY vehicle_id, source_seq"
+  },
+  "services/pipeline/src/pipeline/refine.py#c8c51a7152dc43be0eb791cc5ee72ba107e0b8e4cce0d406462de853bbdc2290": {
+    "status": "not-applicable",
+    "reason": "运行时组合后的区域 refine 查询：先以 processing_crs 米制坐标的 region+halo 范围过滤，再按车辆和来源序号排序。来源是 Parquet 文件，不存在数据库空间索引；实际 DuckDB EXPLAIN (FORMAT JSON) 显示 READ_PARQUET 节点中的 x/y Filters 下推，序号断裂由编排层分段以保留轨迹语义。",
+    "runtime_composed": true,
+    "sql": "SELECT * FROM read_parquet(?) WHERE x >= ? AND y >= ? AND x <= ? AND y <= ? ORDER BY vehicle_id, source_seq"
   }
 }

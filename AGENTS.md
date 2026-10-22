@@ -2,30 +2,28 @@
 
 ## Project Structure
 
-- `apps/frontend/` contains the standalone Node UI and production Nginx image.
-- `apps/backend/` contains the FastAPI service, with `src/backend/` and `tests/`.
-- `services/pipeline/` is the independent Pipeline runtime. Keep Cleaner, Detect, Clip, Fitting, Network, persistence, and replay stages here; do not run long jobs in Backend request handlers.
-- `services/vision/` contains the optional YOLOv8 GPU batch runtime and tracking export tools. Keep model weights under the ignored `models/` path or an external `MODEL_ROOT`.
-- `db/postgres/` and `db/qdrant/` contain only initialization, schema, migration, and collection definitions. PostgreSQL and Qdrant run from `/data/services`; runtime database data belongs under `/data/service-data`.
-- `infra/docker/` contains Compose files. Runtime trajectory, Parquet, exports, and model files stay outside the repository and mount through `DATA_ROOT`.
+- The active product is the standalone parameter workbench. Keep Refine, Detect, Clip, Fit, Network, evaluation and experiment orchestration in flat modules under `services/pipeline/src/pipeline/`.
+- `services/pipeline/native/` contains the C++17 operators and resource sampler. Python orchestrates these operators; no Python geometry-algorithm fallback is part of the new entry point.
+- Root `pipeline.toml` is the sole active parameter/input authority. Intermediate artifacts stay in external Parquet/GeoJSON files; PostgreSQL publication is optional and only stores final intersections and centerlines.
+- `apps/`, `services/vision/`, `infra/docker/`, `db/`, and `services/pipeline/src/track/v2/` remain legacy reference material. Frontend/backend changes are outside the current workbench scope. Historical deployments require their matching baseline checkout; see `docs/legacy-runtime.md`.
+- Runtime trajectories, Parquet, exports, logs, build wheels and model files stay outside the repository. Never run long jobs in Backend request handlers.
 
 ## Build, Test, and Development Commands
 
 ```sh
-cp .env.example .env
-make dev-up          # Build and start the development stack
-make dev-logs        # Follow service logs
-make test            # Run Backend and Pipeline pytest suites in containers
-make pipeline-check  # Validate Pipeline runtime configuration and data mount
-make dev-config      # Validate the development Compose file
-make dev-down        # Stop the development stack
+CC=gcc CXX=g++ make install  # Install locked dependencies and compile the native wheel
+make test                   # Run the core workbench tests without PG/UI
+make pipeline-check         # Validate root pipeline.toml and native/label dependencies
+make pipeline-run           # Run the five stages
+make pipeline-preview       # Export a static label preview
+make pipeline-tune          # Run Optuna and replay the best completed configuration
 ```
 
-Check frontend production assets with `docker run --rm roadnet-dev-frontend npm run build`. Use Compose service names (`postgres`, `qdrant`, `backend`), not container IPs.
+`PYTHON`, `BUILD_ROOT` and `PIPELINE_CONFIG` select the interpreter, external build destination and one TOML file. They do not override individual algorithm parameters. The current Pipeline Dockerfile builds the standalone core; it is not a drop-in image for historical Compose commands.
 
 ## Coding Style and Naming
 
-Use Python 3.11+, four-space indentation, type hints where practical, and `snake_case` for modules, functions, and variables. Keep packages under each service’s `src/`. Use ESM JavaScript, two-space indentation, `camelCase` variables/functions, and `PascalCase` UI components. Move code to `libs/` only when stable and shared by at least two runtime units.
+Use Python 3.12+, C++17, four-space indentation, type hints where practical, and `snake_case` for modules, functions, and variables. Keep packages under each service’s `src/`. Move code to `libs/` only when stable and shared by at least two runtime units.
 
 ## SQL 空间索引要求
 
@@ -46,9 +44,12 @@ Use Python 3.11+, four-space indentation, type hints where practical, and `snake
 
 ## Testing Guidelines
 
-Backend and Pipeline tests use `pytest`. Name files `test_*.py` and test behavior, not implementation details. Run `make test` before submitting. Add regression coverage for path, configuration, API, or migration changes; no threshold is configured.
+Core workbench tests use `pytest` under `services/pipeline/tests/workbench/`. Name files `test_*.py` and test behavior, not implementation details. Run `make test` before submitting. Add regression coverage for path, configuration, API, or migration changes; no threshold is configured. Legacy tests remain available but are not presented as workbench acceptance.
 
-本项目的 Pipeline 冒烟测试使用 `services/pipeline/config/pipeline-roadnet-test.toml`；Pipeline 全量测试使用 `services/pipeline/config/pipeline.toml`。提到“冒烟测试”或“全量测试”时按此配置区分，并在测试记录中注明实际使用的配置。
+当前参数试验台只以根 `pipeline.toml` 或明确选定的一份同格式 TOML 运行。测试自己生成
+合成数据与临时 TOML；报告中注明实际配置、数据规模和是否命中输入缓存，不把合成验收
+称为真实数据全量验收。历史运行的冒烟配置 `services/pipeline/config/pipeline-roadnet-test.toml`
+和全量配置 `services/pipeline/config/pipeline.toml` 只适用于原基线；引用旧记录时仍需区分。
 
 全量测试启动后，不在 agent session 内循环等待、轮询进程或反复读取日志。
 使用独立后台脚本 `scripts/watch_pipeline_log.py` 每 10 分钟记录一次本次日志的
@@ -71,7 +72,7 @@ Backend and Pipeline tests use `pytest`. Name files `test_*.py` and test behavio
 
 ## Commits and Pull Requests
 
-This checkout has no valid Git history, so no convention can be inferred. Use concise imperative messages, preferably Conventional Commit style (for example, `feat: add pipeline run endpoint`). PRs should explain architectural impact, list validation commands, identify configuration or data-directory changes, and include UI screenshots when relevant. Never commit `.env`, credentials, runtime data, model weights, database files, or Qdrant storage.
+Use concise imperative messages, preferably Conventional Commit style (for example, `refactor: build native parameter workbench`). PRs should explain architectural impact, list validation commands and their scope, and identify configuration or data-directory changes. Never commit `.env`, credentials, runtime data, model weights, database files, or Qdrant storage.
 
 ## Security and Configuration
 

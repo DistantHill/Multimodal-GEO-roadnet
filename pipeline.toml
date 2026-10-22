@@ -1,0 +1,140 @@
+# 参数试验台唯一输入。路径相对于本文件；密码仅通过下面指定名称的环境变量读取。
+# 先修改 input.path / source_crs / processing_crs，再运行 make pipeline-check。
+version = 1
+
+[input]
+kind = "parquet"                    # parquet / csv / postgres
+path = "/data/trajectories/*.parquet"
+dataset_id = "freight-trajectories"
+source_crs = "EPSG:4326"
+processing_crs = "EPSG:32650"         # 示例为 UTM 50N；按数据区域选择以米为单位的投影
+speed_unit = "km/h"                 # km/h / m/s
+timestamp_unit = "iso"              # iso / s / ms / us / ns
+timezone = "Asia/Shanghai"          # 仅用于没有时区的 ISO 时间
+# kind=postgres 时只读导出为独立 Parquet 快照，不改写源表。
+table = "public.trajectory_points"
+dsn_env = "ROADNET_SOURCE_DSN"
+
+[input.columns]
+id = "id"                          # 所选输入内必须全局唯一；重复键立即报错
+vehicle_id = "vehicle_id"
+timestamp = "timestamp"
+x = "lon"
+y = "lat"
+heading = "heading"                # 缺少时可写 ""，由几何计算航向
+speed = "speed"                    # 缺少时可写 ""，由相邻时空位置计算
+
+[output]
+root = "/data/roadnet-workbench"     # 运行数据位于仓库外
+geojson = true                     # 仅关键特征导出 GeoJSON；大中间产物为 GeoParquet
+
+[resources]
+sample_interval_ms = 100
+soft_memory_mb = 4096               # 十进制 MB；0 不设软预算；不是操作系统硬上限
+max_wall_s = 0                      # 0 不设预算；在安全批次边界检查
+include_children = true
+heap_profile = false               # true 需启动前 LD_PRELOAD 完整 gperftools libtcmalloc
+# DuckDB 排序可溢写到输出目录；这一项仅约束 DuckDB，不代表进程总内存。
+duckdb_memory_mb = 512
+threads = 2
+batch_rows = 65536
+max_vehicle_points = 1000000
+max_candidates = 1000000
+max_pair_checks = 100000000
+max_grid_memberships = 10000000
+max_fit_points = 1000000
+max_tile_segments = 500000
+
+[refine]
+max_gap_s = 120.0
+min_speed_mps = 0.5
+max_stationary_duration_s = 60.0
+stationary_radius_m = 15.0
+max_speed_mps = 70.0
+min_heading_delta_deg = 80.0
+max_heading_delta_deg = 100.0
+max_extension_m = 200.0
+min_subtrack_points = 2
+inject_orthogonal = true
+
+[detect]
+tile_size_m = 1000.0
+max_segment_length_m = 1000.0
+turn_window = 2                     # 中间点与左右各两点
+min_turn_deg = 30.0
+max_turn_deg = 160.0
+min_leg_m = 5.0
+min_movement_speed_mps = 0.5
+cross_grid_size_m = 100.0
+min_cross_angle_deg = 30.0
+cross_straightness_deg = 30.0
+cross_min_speed_mps = 0.0
+cluster_eps_m = 25.0
+cluster_min_samples = 3
+topology_radius_m = 30.0
+arm_merge_angle_deg = 25.0
+min_arms = 3
+min_vehicles = 2
+
+[clip]
+include_boundary_clips = true
+min_length_m = 5.0
+
+[fit]
+fit_sample_spacing_m = 5.0
+point_spacing_m = 5.0
+min_clips_per_pair = 2
+emit_directional = true
+
+[network]
+include_isolated_nodes = true
+
+# 按需取消以下标注配置的注释。GeoPackage 多层数据必须明确 layer；SHP 需同名配套文件。
+# Point / Polygon / MultiPolygon 用于交叉口，LineString / MultiLineString 用于中心线。
+# [labels.intersections]
+# path = "/data/labels/reviewed.gpkg"  # 或 /data/labels/intersections.shp
+# layer = "intersections"
+# id_field = "id"
+# [labels.centerlines]
+# path = "/data/labels/reviewed.gpkg"
+# layer = "centerlines"
+# id_field = "id"
+# [labels.regions]
+# path = "/data/labels/reviewed.gpkg"
+# layer = "regions"
+# id_field = "id"
+# split_field = "split"             # tune / holdout；所有试验的区域顺序相同
+# reviewed_field = "reviewed"       # 每个区域需显式声明完整标注，才能计算误报/F1
+# 简单单区域可改用下列声明（投影米制坐标）；仅一个区域没有中途剪枝机会。
+# [labels]
+# reviewed_bbox = [500000.0, 4400000.0, 501000.0, 4401000.0]
+# reviewed_complete = true
+
+[tuning]
+n_trials = 30                      # 总试验预算；增加它可续跑同一 study
+seed = 42
+study_name = "roadnet"
+objective = "intersection_f1"       # centerline_f1 / combined_f1 需要中心线标注
+startup_trials = 5
+warmup_steps = 0
+context_halo_m = 1200.0             # 评分只用区域核心；拟合需扩展到包含完整两端交叉口
+matching_radius_m = 40.0
+line_tolerance_m = 10.0
+# timeout_s = 3600.0                # 调参协调器本次调用预算，已开始试验运行到边界
+
+[tuning.search_space."detect.min_turn_deg"]
+type = "float"
+low = 20.0
+high = 70.0
+step = 5.0
+
+[tuning.search_space."detect.cluster_eps_m"]
+type = "float"
+low = 15.0
+high = 40.0
+step = 5.0
+
+[database]
+enabled = false                    # 仅完整运行发布关键特征；各试验不写数据库
+dsn_env = "ROADNET_RESULT_DSN"
+schema = "roadnet_workbench"        # 仅 intersections / centerlines 两张业务表
